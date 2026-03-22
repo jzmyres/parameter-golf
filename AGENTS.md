@@ -1,0 +1,70 @@
+# Parameter Golf — Agent Instructions
+
+## Role
+You are an autonomous ML researcher. Your goal: achieve the lowest possible val_bpb on the FineWeb validation set within the Parameter Golf constraints.
+
+## Scope
+- **CAN modify**: `train_gpt.py` (model architecture, optimizer, training loop, hyperparameters)
+- **CANNOT modify**: `data/`, tokenizer, evaluation harness, `records/`
+- **CANNOT**: install new packages, modify `pyproject.toml`/`requirements.txt`
+
+## Architectural Requirements
+You MUST incorporate these three architectural innovations into the transformer backbone:
+
+1. **RevDEQ** (arxiv:2509.12917) — Reversible Deep Equilibrium Model for the main backbone. Output defined as fixed point of a learned function. Exact gradients, no regularization needed.
+
+2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Additional non-linearities encouraged: sigmoid gating on routing (arxiv:2505.06708), learned gate scalars. Fully differentiable, no top-k, no token dropping.
+
+3. **MLA with Gated Attention** (DeepSeek MLA + arxiv:2505.06708) — Low-rank KV compression with decoupled RoPE, plus head-specific sigmoid gates after SDPA for query-dependent sparse modulation of attention outputs.
+
+## Hard Constraints (NEVER violate)
+- Artifact <= 16,000,000 bytes (code + compressed model)
+- Training <= 600 seconds wall clock on 8xH100 SXM
+- Code must work with DDP (torchrun, any GPU count)
+- Evaluation metric: val_bpb on FineWeb validation set
+
+## Experiment Protocol
+
+### Iteration 0
+Start from the converged consensus config of the top 3 leaderboard entries (documented in CLAUDE.md). Run it unmodified to establish baseline. This MUST succeed before any modifications.
+
+### Loop (run indefinitely)
+1. `git log --oneline -20` + read `results.tsv` — understand history
+2. Plan ONE focused change (architecture, hyperparameters, or training)
+3. Write tests first (TDD)
+4. Implement the change in `train_gpt.py`
+5. `git commit -m "experiment: <description>"`
+6. Run training: redirect to `run.log`
+7. Extract: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+8. Log to `results.tsv`
+9. If improved AND artifact <= 16MB:
+   - Run `/simplify` skill
+   - Keep the commit (branch advances)
+10. If not improved: `git revert HEAD`
+11. GOTO 1
+
+### Decision Rules
+- **Keep**: val_bpb improved AND artifact <= 16MB
+- **Discard**: val_bpb equal or worse, OR artifact > 16MB
+- **Crash**: fix trivial bugs and retry; skip fundamentally broken ideas
+- **Timeout**: kill runs exceeding 15 minutes, treat as failure
+
+### Never
+- Never pause to ask "should I continue?" — run autonomously
+- Never modify evaluation or data loading code
+- Never commit `results.tsv` (keep untracked)
+- Never skip TDD — tests before implementation
+- Never skip `/simplify` before committing successful experiments
+- Never introduce GPU-count-specific code without proper DDP guards
+
+## Git Convention
+- Branch: `autoresearch/<tag>`
+- Commit prefix: `experiment:` for experiments, `fix:` for bug fixes
+- Results.tsv is untracked — git is the experiment history
+
+## Crash Recovery
+- Read `tail -n 50 run.log` for stack trace
+- If OOM: reduce batch size or model size
+- If NaN: check learning rates, gradient clipping
+- If timeout: reduce model complexity
+- After 3 failed fix attempts on same idea, skip and move on
