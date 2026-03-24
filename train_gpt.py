@@ -46,7 +46,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 42))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 10000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
