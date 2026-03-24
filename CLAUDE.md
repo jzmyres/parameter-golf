@@ -119,8 +119,12 @@ d4e5f6g	0.000000	0	crash	soft routing OOM
 ### 1. RevDEQ (Reversible Deep Equilibrium Model)
 - Paper: https://arxiv.org/abs/2509.12917
 - The main transformer backbone MUST use RevDEQ: model output defined as fixed point of a learned function
-- Enables exact gradients, no regularization needed, fewer function evaluations
-- Reversible design allows memory-efficient training
+- **Coupled-state iteration** with relaxation beta=0.8:
+  - `y_{n+1} = (1-beta)*y_n + beta*f(z_n, x0)`
+  - `z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}, x0)`
+- **Algebraically reversible**: z_n reconstructed exactly from z_{n+1}, y_{n+1}
+- Track: equilibrium residual `||z - f(z)||` and reconstruction error
+- Enables exact gradients, O(1) memory, no regularization needed
 
 ### 2. Soft Dense Routing (Dense MoE — no sparsity)
 - Inspired by Soft MoE (arxiv:2308.00951) but fully dense — ALL experts process ALL tokens
