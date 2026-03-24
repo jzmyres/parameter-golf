@@ -89,6 +89,9 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
+    kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 128))
+    rope_dim_fraction = float(os.environ.get("ROPE_DIM_FRACTION", 0.5))
+
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
@@ -276,7 +279,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -563,6 +566,95 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
+class MLAttention(nn.Module):
+    """Multi-head Latent Attention with Gated Attention (DeepSeek MLA + arxiv:2505.06708).
+
+    Low-rank KV compression: project to latent space, decompress on-the-fly.
+    Decoupled RoPE: split heads into RoPE and non-RoPE components.
+    Gated Attention: per-head sigmoid gate after SDPA.
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        kv_latent_dim: int = 128,
+        rope_base: float = 10000.0,
+        qk_gain_init: float = 1.5,
+        rope_dim_fraction: float = 0.5,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        self.kv_latent_dim = kv_latent_dim
+        # RoPE applies to a fraction of head_dim; rest uses compressed non-RoPE path
+        self.rope_dim = max(2, int(self.head_dim * rope_dim_fraction) // 2 * 2)  # ensure even
+        self.nope_dim = self.head_dim - self.rope_dim
+
+        # Query projection
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        # KV compression: project to shared latent, then decompress
+        self.c_kv_down = CastedLinear(dim, kv_latent_dim, bias=False)  # compress
+        self.c_k_up = CastedLinear(kv_latent_dim, num_kv_heads * self.nope_dim, bias=False)  # decompress K (non-RoPE)
+        self.c_v_up = CastedLinear(kv_latent_dim, num_kv_heads * self.head_dim, bias=False)  # decompress V
+        # Decoupled RoPE: separate projection for the RoPE portion of K
+        self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
+        # Output projection
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        # Per-head gains and gates
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.attn_gate = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))  # sigmoid gate per head
+        self.rotary = Rotary(self.rope_dim, base=rope_base)
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        # Query: full head_dim
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        # Split query into RoPE and non-RoPE parts
+        q_rope = q[..., :self.rope_dim]
+        q_nope = q[..., self.rope_dim:]
+
+        # KV: compress then decompress
+        kv_latent = self.c_kv_down(x)
+        k_nope = self.c_k_up(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
+        v = self.c_v_up(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Decoupled RoPE key
+        k_rope = self.c_k_rope(x).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
+
+        # RMS norm on Q and K components
+        q_rope = _rms_norm(q_rope)
+        q_nope = _rms_norm(q_nope)
+        k_rope = _rms_norm(k_rope)
+        k_nope = _rms_norm(k_nope)
+
+        # Apply RoPE to the RoPE portions
+        cos, sin = self.rotary(seqlen, x.device, q_rope.dtype)
+        q_rope = apply_rotary_emb(q_rope, cos, sin)
+        k_rope = apply_rotary_emb(k_rope, cos, sin)
+
+        # Concatenate RoPE and non-RoPE parts
+        q_full = torch.cat([q_rope, q_nope], dim=-1)
+        k_full = torch.cat([k_rope, k_nope], dim=-1)
+
+        # Apply Q gain
+        q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
+
+        # Scaled dot-product attention with GQA
+        y = F.scaled_dot_product_attention(
+            q_full, k_full, v, attn_mask=None, is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
+
+        # Gated attention: per-head sigmoid gate
+        gate = torch.sigmoid(self.attn_gate.to(dtype=y.dtype))[None, :, None, None]
+        y = y * gate
+
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
@@ -616,11 +708,15 @@ class BigramHashEmbedding(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
+                 rope_base: float, qk_gain_init: float, kv_latent_dim: int = 128,
+                 rope_dim_fraction: float = 0.5):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = MLAttention(dim, num_heads, num_kv_heads, kv_latent_dim=kv_latent_dim,
+                                rope_base=rope_base, qk_gain_init=qk_gain_init,
+                                rope_dim_fraction=rope_dim_fraction)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -651,6 +747,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        kv_latent_dim: int = 128,
+        rope_dim_fraction: float = 0.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -667,7 +765,8 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                      kv_latent_dim=kv_latent_dim, rope_dim_fraction=rope_dim_fraction)
                 for _ in range(num_layers)
             ]
         )
@@ -920,6 +1019,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        kv_latent_dim=args.kv_latent_dim,
+        rope_dim_fraction=args.rope_dim_fraction,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
