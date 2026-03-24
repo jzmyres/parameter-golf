@@ -89,9 +89,6 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
-    num_experts = int(os.environ.get("NUM_EXPERTS", 4))
-    deq_iterations = int(os.environ.get("DEQ_ITERATIONS", 0))  # 0=standard stacked, >0=shared-weight iterations
-
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
@@ -279,7 +276,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -579,45 +576,6 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class SoftDenseMLP(nn.Module):
-    """Dense MoE: all experts process all tokens, sigmoid-gated routing.
-
-    Uses a single large MLP with grouped computation for efficiency.
-    The total hidden dim = mlp_mult * dim, split across num_experts groups.
-    """
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 4):
-        super().__init__()
-        self.num_experts = num_experts
-        total_hidden = int(mlp_mult * dim)
-        self.expert_hidden = total_hidden // num_experts
-        # Single large fc/proj for all experts (efficient batched compute)
-        self.fc = CastedLinear(dim, total_hidden, bias=False)
-        self.proj = CastedLinear(total_hidden, dim, bias=False)
-        self.proj._zero_init = True
-        # Routing: softmax weights + per-expert sigmoid gate
-        self.router = CastedLinear(dim, num_experts, bias=False)
-        self.expert_gate = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
-
-    def forward(self, x: Tensor) -> Tensor:
-        bsz, seq, dim = x.shape
-        # Route: softmax routing weights with sigmoid gating
-        route_logits = self.router(x)  # (bsz, seq, num_experts)
-        route_weights = torch.softmax(route_logits, dim=-1)
-        gate = torch.sigmoid(self.expert_gate.to(dtype=x.dtype))
-        route_weights = route_weights * gate[None, None, :]  # (bsz, seq, E)
-
-        # Single batched FC + relu^2 (same as standard MLP)
-        h = torch.relu(self.fc(x))  # (bsz, seq, total_hidden)
-        h = h.square()
-
-        # Reshape to (bsz, seq, E, expert_hidden), weight by routing, reshape back
-        h = h.view(bsz, seq, self.num_experts, self.expert_hidden)
-        h = h * route_weights.unsqueeze(-1)  # (bsz, seq, E, expert_hidden)
-        h = h.view(bsz, seq, -1)  # (bsz, seq, total_hidden)
-
-        return self.proj(h)
-
-
 class SmearGate(nn.Module):
     """Blend each token's embedding with the previous token's embedding."""
     def __init__(self, dim: int):
@@ -658,13 +616,12 @@ class BigramHashEmbedding(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
-                 rope_base: float, qk_gain_init: float, num_experts: int = 0):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = SoftDenseMLP(dim, mlp_mult, num_experts) if num_experts > 1 else MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -694,8 +651,6 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
-        num_experts: int = 0,
-        deq_iterations: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -703,37 +658,19 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.deq_iterations = deq_iterations
-        self.num_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.smear = SmearGate(model_dim)
-
-        if deq_iterations > 0:
-            # RevDEQ: single shared block iterated deq_iterations times
-            self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
-                                      rope_base, qk_gain_init, num_experts=num_experts)
-            self.blocks = None
-            self.num_encoder_layers = 0
-            self.num_decoder_layers = 0
-            self.num_skip_weights = 0
-            self.skip_weights = nn.Parameter(torch.zeros(0))
-            # Per-iteration mixing scalars for the DEQ
-            self.iter_scales = nn.Parameter(torch.ones(deq_iterations, dtype=torch.float32))
-        else:
-            # Standard stacked transformer
-            self.shared_block = None
-            self.num_encoder_layers = num_layers // 2
-            self.num_decoder_layers = num_layers - self.num_encoder_layers
-            self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-            self.blocks = nn.ModuleList(
-                [
-                    Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          num_experts=num_experts)
-                    for _ in range(num_layers)
-                ]
-            )
+        self.blocks = nn.ModuleList(
+            [
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                for _ in range(num_layers)
+            ]
+        )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -743,7 +680,7 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        num_layers = self.deq_iterations if self.deq_iterations > 0 else len(self.blocks)
+        num_layers = len(self.blocks)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -754,33 +691,21 @@ class GPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
-    def _run_backbone(self, x: Tensor) -> Tensor:
-        """Run the transformer backbone (shared block DEQ or stacked blocks)."""
-        x0 = x
-        if self.deq_iterations > 0:
-            # RevDEQ: iterate shared block
-            for t in range(self.deq_iterations):
-                x = self.shared_block(x, x0)
-                x = x * self.iter_scales[t].to(dtype=x.dtype)
-        else:
-            # Standard stacked transformer with U-Net skips
-            skips: list[Tensor] = []
-            for i in range(self.num_encoder_layers):
-                x = self.blocks[i](x, x0)
-                skips.append(x)
-            for i in range(self.num_decoder_layers):
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x = self.blocks[self.num_encoder_layers + i](x, x0)
-        return x
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
         x = self.smear(x)
-        x = self._run_backbone(x)
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -798,7 +723,15 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
         x = self.smear(x)
-        x = self._run_backbone(x)
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -987,8 +920,6 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
-        num_experts=args.num_experts,
-        deq_iterations=args.deq_iterations,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -997,11 +928,7 @@ def main() -> None:
     compiled_model = base_model  # skip compile for training; use compiled forward_logits for eval
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Collect block params from either shared_block (DEQ) or blocks (standard)
-    if base_model.shared_block is not None:
-        block_named_params = list(base_model.shared_block.named_parameters())
-    else:
-        block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
@@ -1012,8 +939,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if hasattr(base_model, 'iter_scales') and base_model.iter_scales is not None and base_model.iter_scales.numel() > 0:
-        scalar_params.append(base_model.iter_scales)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
