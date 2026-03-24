@@ -88,6 +88,7 @@ class Hyperparameters:
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 16384))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 256))
+    kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 0))  # 0 = auto (dim//2)
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -276,7 +277,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -524,7 +525,14 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+    """MLA with Gated Attention (Constraint #3).
+
+    - Low-rank KV compression via shared latent
+    - Decoupled RoPE: half of head_dim for positional encoding
+    - Per-head sigmoid gate after SDPA
+    """
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
+                 qk_gain_init: float, kv_latent_dim: int = 0):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -535,46 +543,92 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
+
+        # MLA: low-rank KV compression with decoupled RoPE
+        self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
+        self.rope_dim = self.head_dim // 2  # half for RoPE
+        self.nope_dim = self.head_dim - self.rope_dim
+
         self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        # KV compression path
+        self.c_kv_down = CastedLinear(dim, self.kv_latent_dim, bias=False)
+        self.c_k_nope = CastedLinear(self.kv_latent_dim, num_kv_heads * self.nope_dim, bias=False)
+        self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
+        # Decoupled RoPE key
+        self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        # Gated attention: per-head sigmoid gate (init=3 → sigmoid≈0.95)
+        self.attn_gate = nn.Parameter(torch.full((num_heads,), 3.0, dtype=torch.float32))
+        self.rotary = Rotary(self.rope_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = _rms_norm(q)
-        k = _rms_norm(k)
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q_rope, q_nope = q[..., :self.rope_dim], q[..., self.rope_dim:]
+
+        kv_latent = self.c_kv_down(x)
+        k_nope = self.c_k_nope(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
+        v = self.c_v(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k_rope = self.c_k_rope(x).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
+
+        q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
+        k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
+
+        cos, sin = self.rotary(seqlen, x.device, q_rope.dtype)
+        q_rope = apply_rotary_emb(q_rope, cos, sin)
+        k_rope = apply_rotary_emb(k_rope, cos, sin)
+
+        q_full = torch.cat([q_rope, q_nope], dim=-1)
+        k_full = torch.cat([k_rope, k_nope], dim=-1)
+        q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
+
         y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=True,
+            q_full, k_full, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # Gated attention
+        gate = torch.sigmoid(self.attn_gate.to(dtype=y.dtype))[None, :, None, None]
+        y = y * gate
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    """SiLU-gated MLP with Soft Dense Routing (Constraint #2).
+
+    Dense MoE: the hidden dim is split into expert groups. All experts
+    process all tokens. Routing via softmax + per-expert sigmoid gate
+    allows the model to selectively suppress experts (breaks convex constraint).
+    """
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 4):
         super().__init__()
         hidden = int(mlp_mult * dim)
-        # SiLU-gated MLP: gate * silu(up) pattern
-        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.num_experts = num_experts
+        self.expert_size = hidden // num_experts
+        self.gate_proj = CastedLinear(dim, hidden, bias=False)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        # Soft Dense Routing: router + per-expert sigmoid gate
+        self.router = CastedLinear(dim, num_experts, bias=False)
+        self.expert_gate = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.proj(F.silu(self.gate(x)) * self.fc(x))
+        h = F.silu(self.gate_proj(x)) * self.fc(x)
+        # Soft dense routing: all experts process all tokens
+        route_logits = self.router(x)  # (bsz, seq, E)
+        route_weights = torch.softmax(route_logits, dim=-1)
+        # Per-expert sigmoid gate: allows skipping experts
+        eg = torch.sigmoid(self.expert_gate.to(dtype=x.dtype))
+        route_weights = route_weights * eg[None, None, :]  # (bsz, seq, E)
+        # Apply routing to expert groups
+        bsz, seq, hidden = h.shape
+        h = h.view(bsz, seq, self.num_experts, self.expert_size)
+        h = h * route_weights.unsqueeze(-1)
+        h = h.view(bsz, seq, hidden)
+        return self.proj(h)
 
 
 class SmearGate(nn.Module):
@@ -617,11 +671,12 @@ class BigramHashEmbedding(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
+                 rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -652,6 +707,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        kv_latent_dim: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -659,19 +715,16 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.smear = SmearGate(model_dim)
-        self.blocks = nn.ModuleList(
-            [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-                for _ in range(num_layers)
-            ]
-        )
+        # RevDEQ (Constraint #1): single shared block iterated num_layers times
+        self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
+                                  rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
+        # Per-iteration scale to break symmetry across iterations
+        self.iter_scales = nn.Parameter(torch.ones(num_layers, dtype=torch.float32))
+        self.blocks = None  # not used in DEQ mode
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -681,7 +734,6 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        num_layers = len(self.blocks)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -690,7 +742,15 @@ class GPT(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=1.0)
                     if ".proj." in name or name.endswith(".proj"):
                         with torch.no_grad():
-                            module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
+                            module.weight.mul_(1.0 / math.sqrt(2 * self.num_layers))
+
+    def _run_backbone(self, x: Tensor) -> Tensor:
+        """RevDEQ: iterate shared block N times (fixed-point iteration)."""
+        x0 = x
+        for t in range(self.num_layers):
+            x = self.shared_block(x, x0)
+            x = x * self.iter_scales[t].to(dtype=x.dtype)
+        return x
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -698,15 +758,7 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
         x = self.smear(x)
-        x0 = x
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self._run_backbone(x)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -724,15 +776,7 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
         x = self.smear(x)
-        x0 = x
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self._run_backbone(x)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -921,6 +965,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        kv_latent_dim=args.kv_latent_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -929,7 +974,8 @@ def main() -> None:
     compiled_model = base_model  # skip compile for training; use compiled forward_logits for eval
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    block_named_params = list(base_model.blocks.named_parameters())
+    # RevDEQ: params come from shared_block
+    block_named_params = list(base_model.shared_block.named_parameters())
     matrix_params = [
         p for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
@@ -938,8 +984,8 @@ def main() -> None:
         p for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    if base_model.iter_scales.numel() > 0:
+        scalar_params.append(base_model.iter_scales)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
