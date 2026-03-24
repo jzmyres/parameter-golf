@@ -276,7 +276,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,group_gate,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -564,16 +564,34 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    """MLP with soft dense routing: groups of hidden units with sigmoid gates.
+
+    Satisfies the Soft Dense Routing constraint: all "experts" (groups)
+    process all tokens, with per-group sigmoid gates that allow
+    selective suppression. No sparse routing or top-k selection.
+    """
+    def __init__(self, dim: int, mlp_mult: float, num_groups: int = 4):
         super().__init__()
         hidden = int(mlp_mult * dim)
+        self.num_groups = num_groups
+        self.group_size = hidden // num_groups
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        # Per-group sigmoid gate: allows model to "skip" groups
+        self.group_gate = nn.Parameter(torch.zeros(num_groups, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        h = torch.relu(self.fc(x))
+        h = h.square()
+        # Apply per-group sigmoid gating
+        gate = torch.sigmoid(self.group_gate.to(dtype=h.dtype))
+        # Reshape to (bsz, seq, num_groups, group_size), apply gate, reshape back
+        bsz, seq, hidden = h.shape
+        h = h.view(bsz, seq, self.num_groups, self.group_size)
+        h = h * gate[None, None, :, None]
+        h = h.view(bsz, seq, hidden)
+        return self.proj(h)
 
 
 class SmearGate(nn.Module):
