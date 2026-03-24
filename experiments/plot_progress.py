@@ -3,7 +3,8 @@ import sys
 from pathlib import Path
 
 def main():
-    tsv = Path("results.tsv")
+    script_dir = Path(__file__).resolve().parent
+    tsv = script_dir / "results.tsv"
     if not tsv.exists():
         print("No results.tsv found")
         return
@@ -85,7 +86,7 @@ def main():
                        arrowprops=dict(arrowstyle="->", color="#2196F3"))
 
         plt.tight_layout()
-        plt.savefig("progress.png", dpi=150)
+        plt.savefig(str(script_dir / "progress.png"), dpi=150)
         print(f"Saved progress.png ({len(rows)} iterations, best={best_bpb:.4f})")
 
     except ImportError:
