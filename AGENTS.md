@@ -13,7 +13,7 @@ You MUST incorporate these three architectural innovations into the transformer 
 
 1. **RevDEQ** (arxiv:2509.12917) — Reversible Deep Equilibrium Model for the main backbone. Output defined as fixed point of a learned function. Exact gradients, no regularization needed.
 
-2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Additional non-linearities encouraged: sigmoid gating on routing (arxiv:2505.06708), learned gate scalars. Fully differentiable, no top-k, no token dropping.
+2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Per-expert **sigmoid gating AFTER softmax** routing to break convex constraint (allows skipping experts). Learned gate scalars per expert. Fully differentiable, no top-k, no token dropping.
 
 3. **MLA with Gated Attention** (DeepSeek MLA + arxiv:2505.06708) — Low-rank KV compression with decoupled RoPE, plus head-specific sigmoid gates after SDPA for query-dependent sparse modulation of attention outputs.
 
@@ -41,7 +41,9 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
    - Run `/simplify` skill
    - Keep the commit (branch advances)
 10. If not improved: `git revert HEAD`
-11. GOTO 1
+11. Track consecutive non-improvements (reset on any improvement)
+12. If 50 consecutive non-improvements → STOP and ask user for guidance
+13. Otherwise GOTO 1
 
 ### Decision Rules
 - **Keep**: val_bpb improved AND artifact <= 16MB
@@ -50,12 +52,12 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 - **Timeout**: kill runs exceeding 15 minutes, treat as failure
 
 ### Never
-- Never pause to ask "should I continue?" — run autonomously
 - Never modify evaluation or data loading code
 - Never commit `results.tsv` (keep untracked)
 - Never skip TDD — tests before implementation
 - Never skip `/simplify` before committing successful experiments
 - Never introduce GPU-count-specific code without proper DDP guards
+- **Stop after 50 consecutive non-improvements** and seek user guidance
 
 ## Git Convention
 - Branch: `autoresearch/<tag>`

@@ -57,7 +57,7 @@ This is the consensus of the top 3 leaderboard entries. Use as starting point.
 
 ## How to Run
 
-### Dev mode (1-2x L40S)
+### Dev mode (2x L40S — primary dev hardware)
 ```bash
 conda activate opg
 # Single GPU:
@@ -87,18 +87,18 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
 4. Initialize `results.tsv` with header row
 5. Run iteration 0 (converged baseline) to establish baseline val_bpb
 
-### Experiment Loop (LOOP FOREVER)
+### Experiment Loop
 1. Read git state: `git log --oneline -20` + `results.tsv`
 2. Make ONE focused change to `train_gpt.py`
 3. Write/update tests (TDD — tests BEFORE implementation)
 4. `git commit` the change
 5. Run: redirect output to `run.log` (do NOT flood context)
-6. Read results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+6. Read results: `grep "val_bpb:\|peak_vram_mb:\|artifact.*bytes" run.log`
 7. If grep empty -> crash. Run `tail -n 50 run.log`, attempt fix
 8. Log to `results.tsv` (do NOT commit results.tsv)
 9. If val_bpb improved AND artifact <= 16MB -> run `/simplify`, then keep
 10. If val_bpb equal or worse -> `git revert` to previous good state
-11. **NEVER STOP** — run indefinitely until manually interrupted
+11. Track consecutive non-improvements. **STOP after 50 consecutive non-improvements** and seek user guidance
 
 ### Time Budget
 - **10 minutes max** per experiment (wall clock training)
@@ -125,9 +125,10 @@ d4e5f6g	0.000000	0	crash	soft routing OOM
 ### 2. Soft Dense Routing (Dense MoE — no sparsity)
 - Inspired by Soft MoE (arxiv:2308.00951) but fully dense — ALL experts process ALL tokens
 - No top-k selection, no token dropping, no sparse gating
-- Routing weights via softmax over experts, but encourage additional non-linearities:
-  - Sigmoid gating on routing weights (like gated attention, arxiv:2505.06708)
-  - Learned gate scalars per expert
+- Routing weights via softmax over experts, with **sigmoid gating** to break convex constraint:
+  - Per-expert sigmoid gate AFTER softmax routing: `effective_weight = sigmoid(gate_i) * softmax_weight_i`
+  - This allows the model to "skip" experts by driving sigmoid gate toward 0
+  - Learned gate scalars per expert, initialized near 0 (sigmoid ≈ 0.5)
 - Fully differentiable, no discrete routing decisions
 
 ### 3. Multi-head Latent Attention (MLA) with Gated Attention — DeepSeek
