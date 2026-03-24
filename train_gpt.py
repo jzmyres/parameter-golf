@@ -86,7 +86,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 16384))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 32768))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 256))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
