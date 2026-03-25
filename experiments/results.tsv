@@ -51,3 +51,8 @@ c918102	1.4278	15466336	discard	seed=1337 (worse init)
 bf993e6	1.5380	6432969	keep	All 3 constraints: RevDEQ+MLA+SoftDense (baseline for constrained arch)
 dc64426	0.0000	0	crash	dim=1024 10iter OOM
 40472f5	1.6609	6416473	keep	Proper RevDEQ coupled-state + MLA + SoftDense (constrained baseline)
+4eeec4e	1.5798	7504939	keep	3-iter DEQ x 768d (much better, more steps)
+d725585	3.0915	6472347	discard	memory-efficient RevDEQ (diverged, gradient too weak)
+884fad0	1.5405	7286450	keep	2-iter DEQ x 768d (better, more steps)
+101a661	1.5641	9894267	discard	2-iter DEQ x 1024d (too slow, fewer steps)
+cf4708e	1.5399	9013686	keep	2-iter DEQ x 896d (marginal improvement)
