@@ -68,3 +68,5 @@ f6a3b15	1.4328	9352308	discard	DEQ beta=0.3 (same as 0.5, marginal worse post-qu
 31e71c3	1.4337	9847452	discard	mlp_mult=3.0 (slightly worse, slower)
 f531c01	1.4563	7360042	discard	960d smaller bigram (worse)
 2f34052	1.4511	9400000	discard	tied_embed_lr=0.05 (worse, expert collapsed)
+12e3436	1.4313	9674593	keep	warmdown=100 (marginal 0.0003 improvement)
+023d7d3	1.4349	9511661	discard	warmdown=80 (worse)
