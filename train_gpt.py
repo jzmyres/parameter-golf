@@ -840,7 +840,7 @@ class GPT(nn.Module):
         ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         # Add expert load balancing loss (small weight)
         balance_loss = getattr(self.shared_block.mlp, '_balance_loss', torch.tensor(0.0))
-        return ce_loss + 0.005 * balance_loss
+        return ce_loss + 0.01 * balance_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
