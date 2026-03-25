@@ -624,13 +624,19 @@ class MLP(nn.Module):
         eg = torch.sigmoid(self.expert_gate.to(dtype=x.dtype))
         route_weights = route_weights * eg[None, None, :]  # (bsz, seq, E)
 
-        # Expert diagnostics (no grad, only during eval or periodically)
+        # Load balancing: encourage equal usage across experts
+        if self.training:
+            mean_weights = route_weights.mean(dim=(0, 1))  # (E,)
+            target = torch.ones_like(mean_weights) / self.num_experts
+            self._balance_loss = F.mse_loss(mean_weights, target)
+        else:
+            self._balance_loss = torch.tensor(0.0, device=x.device)
+
+        # Expert diagnostics (eval only)
         if not self.training:
             with torch.no_grad():
-                # Usage balance: mean routing weight per expert (should be ~1/E for balanced)
-                mean_weights = route_weights.mean(dim=(0, 1))  # (E,)
+                mean_weights = route_weights.mean(dim=(0, 1))
                 self._expert_usage = mean_weights.float().cpu().tolist()
-                # Per-token sparsity: entropy of routing distribution (high=uniform, low=sparse)
                 entropy = -(route_weights * (route_weights + 1e-8).log()).sum(-1).mean()
                 self._expert_entropy = entropy.item()
 
@@ -831,7 +837,10 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        # Add expert load balancing loss (small weight)
+        balance_loss = getattr(self.shared_block.mlp, '_balance_loss', torch.tensor(0.0))
+        return ce_loss + 0.01 * balance_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
