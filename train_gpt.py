@@ -92,7 +92,7 @@ class Hyperparameters:
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
-    swa_every = int(os.environ.get("SWA_EVERY", 10))
+    swa_every = int(os.environ.get("SWA_EVERY", 50))
 
 # -----------------------------
 # MUON OPTIMIZER
