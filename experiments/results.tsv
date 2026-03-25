@@ -88,3 +88,4 @@ cf7af5e	1.4077	9629550	keep	lr=0.06 — NEW OVERALL BEST! Beats unconstrained!
 f027f49	1.4064	9600000	keep	lr=0.05 (new best, better DEQ convergence)
 1b08bc7	1.4046	9456021	keep	lr=0.04 (new best! DEQ residual=6427)
 048408c	1.4045	9294086	keep	lr=0.03 (marginal 0.0001, DEQ residual=5212)
+b79819d	1.4066	9300000	discard	lr=0.02 (too low, DEQ converges but model undertrains)
