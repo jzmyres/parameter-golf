@@ -758,7 +758,7 @@ class GPT(nn.Module):
         # RevDEQ (Constraint #1): single shared block with coupled-state fixed-point iteration
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
-        self.deq_beta = 0.3  # relaxation parameter for coupled-state iteration
+        self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
         self.blocks = None  # not used in DEQ mode
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
