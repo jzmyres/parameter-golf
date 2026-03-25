@@ -66,3 +66,5 @@ f6a3b15	1.4328	9352308	discard	DEQ beta=0.3 (same as 0.5, marginal worse post-qu
 1fc7616	1.4366	9592548	discard	8 experts (slightly worse than 4)
 3402f78	1.4351	9514535	discard	KV latent=640 (slightly worse)
 31e71c3	1.4337	9847452	discard	mlp_mult=3.0 (slightly worse, slower)
+f531c01	1.4563	7360042	discard	960d smaller bigram (worse)
+2f34052	1.4511	9400000	discard	tied_embed_lr=0.05 (worse, expert collapsed)
