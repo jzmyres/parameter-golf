@@ -92,3 +92,4 @@ b79819d	1.4066	9300000	discard	lr=0.02 (too low, DEQ converges but model undertr
 8f0c2d1	1.3999	9377222	keep	warmdown=150 lr=0.03 — NEW BEST UNDER 1.40!
 b07d97f	1.3990	9377222	keep	warmdown=200 (new best 1.3990!)
 309480a	1.3976	9625092	keep	warmdown=250 (new best 1.3976!)
+3258512	1.3971	9281937	keep	warmdown=300 (new best 1.3971)
