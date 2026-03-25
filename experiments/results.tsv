@@ -90,3 +90,5 @@ f027f49	1.4064	9600000	keep	lr=0.05 (new best, better DEQ convergence)
 048408c	1.4045	9294086	keep	lr=0.03 (marginal 0.0001, DEQ residual=5212)
 b79819d	1.4066	9300000	discard	lr=0.02 (too low, DEQ converges but model undertrains)
 8f0c2d1	1.3999	9377222	keep	warmdown=150 lr=0.03 — NEW BEST UNDER 1.40!
+b07d97f	1.3990	9377222	keep	warmdown=200 (new best 1.3990!)
+309480a	1.3976	9625092	keep	warmdown=250 (new best 1.3976!)
