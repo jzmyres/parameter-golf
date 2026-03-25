@@ -602,7 +602,7 @@ class MLP(nn.Module):
     process all tokens. Routing via softmax + per-expert sigmoid gate
     allows the model to selectively suppress experts (breaks convex constraint).
     """
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 4):
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 8):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
