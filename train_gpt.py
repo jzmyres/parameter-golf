@@ -623,12 +623,42 @@ class MLP(nn.Module):
         # Per-expert sigmoid gate: allows skipping experts
         eg = torch.sigmoid(self.expert_gate.to(dtype=x.dtype))
         route_weights = route_weights * eg[None, None, :]  # (bsz, seq, E)
+
+        # Expert diagnostics (no grad, only during eval or periodically)
+        if not self.training:
+            with torch.no_grad():
+                # Usage balance: mean routing weight per expert (should be ~1/E for balanced)
+                mean_weights = route_weights.mean(dim=(0, 1))  # (E,)
+                self._expert_usage = mean_weights.float().cpu().tolist()
+                # Per-token sparsity: entropy of routing distribution (high=uniform, low=sparse)
+                entropy = -(route_weights * (route_weights + 1e-8).log()).sum(-1).mean()
+                self._expert_entropy = entropy.item()
+
         # Apply routing to expert groups
         bsz, seq, hidden = h.shape
         h = h.view(bsz, seq, self.num_experts, self.expert_size)
         h = h * route_weights.unsqueeze(-1)
         h = h.view(bsz, seq, hidden)
         return self.proj(h)
+
+    def get_expert_diagnostics(self) -> dict:
+        """Return expert usage and orthogonality diagnostics."""
+        diag = {}
+        if hasattr(self, '_expert_usage'):
+            diag['usage'] = self._expert_usage
+        if hasattr(self, '_expert_entropy'):
+            diag['entropy'] = self._expert_entropy
+        # Expert orthogonality: cosine similarity between expert weight groups
+        w = self.fc.weight.float()  # (hidden, dim)
+        group_w = w.view(self.num_experts, self.expert_size, -1)  # (E, expert_size, dim)
+        # Mean representation per expert
+        group_mean = group_w.mean(dim=1)  # (E, dim)
+        group_norm = group_mean / (group_mean.norm(dim=-1, keepdim=True) + 1e-8)
+        cos_sim = group_norm @ group_norm.T  # (E, E)
+        # Off-diagonal mean (should be ~0 for orthogonal)
+        mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=cos_sim.device)
+        diag['ortho_cos_sim'] = cos_sim[mask].mean().item()
+        return diag
 
 
 class SmearGate(nn.Module):
@@ -1148,10 +1178,22 @@ def main() -> None:
                 deq_info = f" deq_residual:{base_model._deq_residuals[-1]:.6f}"
             if hasattr(base_model, '_deq_recon_error'):
                 deq_info += f" deq_recon_err:{base_model._deq_recon_error:.6f}"
+            # Expert diagnostics
+            expert_info = ""
+            mlp = base_model.shared_block.mlp if hasattr(base_model, 'shared_block') else None
+            if mlp is not None and hasattr(mlp, 'get_expert_diagnostics'):
+                diag = mlp.get_expert_diagnostics()
+                if 'usage' in diag:
+                    usage_str = ",".join(f"{u:.3f}" for u in diag['usage'])
+                    expert_info = f" expert_usage:[{usage_str}]"
+                if 'entropy' in diag:
+                    expert_info += f" expert_entropy:{diag['entropy']:.4f}"
+                if 'ortho_cos_sim' in diag:
+                    expert_info += f" expert_ortho:{diag['ortho_cos_sim']:.4f}"
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
-                f"{deq_info}"
+                f"{deq_info}{expert_info}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
