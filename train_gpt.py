@@ -1166,6 +1166,9 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    # EMA state (maintained alongside SWA)
+    ema_decay = 0.997
+    ema_state: dict[str, Tensor] | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1247,6 +1250,14 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
+        # EMA: update running average every step
+        if ema_state is None:
+            ema_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+        else:
+            with torch.no_grad():
+                for name, t in base_model.state_dict().items():
+                    ema_state[name].mul_(ema_decay).add_(t.detach().cpu(), alpha=1 - ema_decay)
+
         # SWA: collect checkpoints during warmdown
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
             if swa_state is None:
@@ -1281,12 +1292,12 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA if collected
-    if args.swa_enabled and swa_state is not None and swa_count > 1:
-        log0(f"swa:applying averaged {swa_count} checkpoints")
+    # Apply EMA weights (preferred over SWA)
+    if ema_state is not None:
+        log0(f"ema:applying (decay={ema_decay})")
         current_state = base_model.state_dict()
         avg_state = {
-            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+            name: tensor.to(dtype=current_state[name].dtype)
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
