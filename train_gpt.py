@@ -759,6 +759,10 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
+        # Diffusion-AR: low-rank self-refinement projection (hidden → correction)
+        self.refine_down = CastedLinear(model_dim, 64, bias=False)
+        self.refine_up = CastedLinear(64, model_dim, bias=False)
+        self.refine_up._zero_init = True  # start disabled
         self.blocks = None  # not used in DEQ mode
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -798,10 +802,17 @@ class GPT(nn.Module):
         self._deq_residuals: list[float] = []
 
         for t in range(self.num_layers):
-            # Coupled state update
-            f_z = self.shared_block(z, x0)
+            # Diffusion-AR: refine x0 using current state (self-refinement)
+            if t > 0:
+                correction = self.refine_up(F.silu(self.refine_down(z)))
+                x0_refined = x0 + correction
+            else:
+                x0_refined = x0
+
+            # Coupled state update with refined input
+            f_z = self.shared_block(z, x0_refined)
             y_new = (1 - beta) * y + beta * f_z
-            f_y = self.shared_block(y_new, x0)
+            f_y = self.shared_block(y_new, x0_refined)
             z_new = (1 - beta) * z + beta * f_y
 
             y = y_new
