@@ -17,7 +17,11 @@ Challenge: March 18 – April 30, 2026. Prize: $1M in OpenAI compute credits.
 - `results.tsv` — Experiment log (untracked by git)
 
 ## Current SOTA
-val_bpb = 1.1428 (thwu1, 2026-03-20)
+val_bpb = 1.1194 (abaybektursun, 2026-03-23)
+Key techniques: LeakyReLU(0.5)², TTT, Parallel Muon, XSA, GPTQ-lite, EMA
+
+## Training Budget
+1.5x of original = 900 seconds on 8xH100 SXM (relaxed from 600s)
 
 ## Converged Best-Known Config (Iteration 0 Baseline)
 This is the consensus of the top 3 leaderboard entries. Use as starting point.
