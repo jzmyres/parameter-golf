@@ -20,3 +20,4 @@ e0d7d63	4.2312	9500000	discard	EMA decay=0.997 (catastrophic, early weights domi
 7c3f55c	1.3624	15763337	discard	dim=864 bigram=208 (narrower model hurts)
 4b4e7e2	1.3445	15471090	keep	optimized DEQ (1125 steps, deq_res=12373 recon=0.0)
 5470c99	1.3443	15500000	keep	warmdown=650 (marginal 0.0002)
+0367cfc	1.3440	15500000	keep	warmdown=700 (deq_res=10239 recon=0.0)
