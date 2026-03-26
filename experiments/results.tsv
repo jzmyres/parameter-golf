@@ -8,3 +8,4 @@ e0d7d63	4.2312	9500000	discard	EMA decay=0.997 (catastrophic, early weights domi
 8bf5d59	1.3657	9500000	keep	warmdown=500 (deq_res=7057 recon=11001)
 38b0ee7	1.3654	9500000	keep	warmdown=600 (deq_res=6075 recon=9841)
 3b732b5	1.3660	9500000	discard	warmdown=700 (deq_res=5478 recon=8715)
+17aad49	1.3672	9500000	discard	XSA learnable (overhead, fewer steps)
