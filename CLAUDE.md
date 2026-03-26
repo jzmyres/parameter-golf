@@ -150,7 +150,21 @@ d4e5f6g	0.000000	0	crash	soft routing OOM
   - Enables larger learning rates and better training stability
   - Negligible parameter overhead (one gate vector per head)
 
-### 4. Parameter Golf Hard Constraints (ENFORCED)
+### 4. FSQ (Finite Scalar Quantization) with Low-Rank Non-Linear Bottleneck
+- Apply FSQ in a low-rank intermediate space within the model
+- Use non-linearity (SiLU/GELU) before/after FSQ to recover expressiveness lost by low rank
+- FSQ discretizes continuous values to a finite set of scalars
+- The low-rank bottleneck compresses representations before quantization
+- Non-linearity after FSQ expands back to full expressiveness
+
+### 5. Diffusion-AR (Autoregressive + Single-Step Diffusion)
+- Each DEQ iteration incorporates a diffusion-like denoising step
+- The model refines soft token predictions across iterations
+- AR-like: step i+1 depends on step i via shared KV state
+- Diffusion-like: each step starts from a noisy soft distribution and denoises
+- Dual signal: current token prediction (CTP) + next token prediction (NTP)
+
+### 6. Parameter Golf Hard Constraints (ENFORCED)
 - Artifact size <= 16,000,000 bytes (code + compressed model)
 - Training time <= 600 seconds on 8xH100 SXM
 - Must use FineWeb validation set for evaluation

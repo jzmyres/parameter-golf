@@ -277,7 +277,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,fsq.scale,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -706,6 +706,38 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
+class FSQBottleneck(nn.Module):
+    """Finite Scalar Quantization with low-rank non-linear bottleneck (Constraint #4).
+
+    Compresses hidden state to low-rank, applies FSQ discretization,
+    then expands back with non-linearity to recover expressiveness.
+    """
+    def __init__(self, dim: int, bottleneck_dim: int = 32, num_levels: int = 8):
+        super().__init__()
+        self.down = CastedLinear(dim, bottleneck_dim, bias=False)
+        self.up = CastedLinear(bottleneck_dim, dim, bias=False)
+        self.up._zero_init = True  # start as identity skip
+        self.num_levels = num_levels
+        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+
+    def _fsq(self, x: Tensor) -> Tensor:
+        """Finite Scalar Quantization: round to nearest level."""
+        # Scale to [-1, 1], quantize to num_levels, scale back
+        x_bounded = torch.tanh(x)
+        step = 2.0 / (self.num_levels - 1)
+        if self.training:
+            # Straight-through estimator: quantize forward, identity backward
+            x_q = (torch.round(x_bounded / step) * step)
+            return x_bounded + (x_q - x_bounded).detach()
+        return torch.round(x_bounded / step) * step
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = F.silu(self.down(x))  # non-linearity before FSQ
+        h = self._fsq(h)           # discretize
+        h = F.silu(h)              # non-linearity after FSQ (recover expressiveness)
+        return self.scale.to(dtype=x.dtype) * self.up(h)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0):
@@ -714,6 +746,7 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.mlp = MLP(dim, mlp_mult)
+        self.fsq = FSQBottleneck(dim)  # FSQ constraint
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -723,7 +756,10 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        # FSQ bottleneck: adds discretized low-rank correction
+        x = x + self.fsq(x)
         return x
 
 
@@ -759,6 +795,10 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
+        # Diffusion-AR (Constraint #5): soft embedding refinement per DEQ iteration
+        self.diffar_down = CastedLinear(model_dim, 64, bias=False)
+        self.diffar_up = CastedLinear(64, model_dim, bias=False)
+        self.diffar_up._zero_init = True
         self.blocks = None  # not used in DEQ mode
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -798,10 +838,17 @@ class GPT(nn.Module):
         self._deq_residuals: list[float] = []
 
         for t in range(self.num_layers):
-            # Coupled state update
-            f_z = self.shared_block(z, x0)
+            # Diffusion-AR: refine input using current state (soft denoising)
+            if t > 0:
+                correction = self.diffar_up(F.silu(self.diffar_down(z)))
+                x0_refined = x0 + correction
+            else:
+                x0_refined = x0
+
+            # Coupled state update with refined input
+            f_z = self.shared_block(z, x0_refined)
             y_new = (1 - beta) * y + beta * f_z
-            f_y = self.shared_block(y_new, x0)
+            f_y = self.shared_block(y_new, x0_refined)
             z_new = (1 - beta) * z + beta * f_y
 
             y = y_new
