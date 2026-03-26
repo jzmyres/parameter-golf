@@ -18,3 +18,4 @@ e0d7d63	4.2312	9500000	discard	EMA decay=0.997 (catastrophic, early weights domi
 548509f	1.3481	16861421	discard	bigram=65536x224 (artifact >16MB!)
 31a7e51	1.3529	16134872	discard	bigram=65536x208 (artifact >16MB)
 7c3f55c	1.3624	15763337	discard	dim=864 bigram=208 (narrower model hurts)
+4b4e7e2	1.3445	15471090	keep	optimized DEQ (1125 steps, deq_res=12373 recon=0.0)
