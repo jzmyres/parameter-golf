@@ -62,7 +62,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 896))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 2.5))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.5))  # wider since LeakyReLU² uses 2 projections vs 3
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 1000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -596,18 +596,16 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """SiLU-gated MLP with Soft Dense Routing (Constraint #2).
+    """LeakyReLU(0.5)² MLP with Soft Dense Routing (Constraint #2).
 
-    Dense MoE: the hidden dim is split into expert groups. All experts
-    process all tokens. Routing via softmax + per-expert sigmoid gate
-    allows the model to selectively suppress experts (breaks convex constraint).
+    Dense MoE with 2 projections (fc + proj). LeakyReLU(0.5)² activation
+    preserves gradient flow for negatives while being more compressible.
     """
     def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
         self.expert_size = hidden // num_experts
-        self.gate_proj = CastedLinear(dim, hidden, bias=False)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -616,7 +614,7 @@ class MLP(nn.Module):
         self.expert_gate = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        h = F.silu(self.gate_proj(x)) * self.fc(x)
+        h = F.leaky_relu(self.fc(x), negative_slope=0.5).square()
         # Soft dense routing: all experts process all tokens
         route_logits = self.router(x)  # (bsz, seq, E)
         route_weights = torch.softmax(route_logits, dim=-1)
