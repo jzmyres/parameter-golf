@@ -1,1 +1,5 @@
 commit	val_bpb	artifact_bytes	status	description
+976bc11	1.3693	9600000	keep	1.5x budget baseline (1050 steps)
+6c4134d	1.4197	9852469	discard	LeakyReLU²+batch1M+mlp4x (too slow, 407 steps)
+0bd69be	1.3818	9800000	discard	LeakyReLU² mlp=3.5 (worse, fewer steps)
+467971b	1.3930	9400000	discard	3-iter DEQ lr=0.02 (fewer steps)
