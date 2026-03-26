@@ -87,7 +87,7 @@ class Hyperparameters:
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 65536))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 160))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 192))
     kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 0))  # 0 = auto (dim//2)
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
