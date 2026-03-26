@@ -27,3 +27,4 @@ b3ee030	1.3450	15500000	discard	Diffusion-AR refine (marginal worse, needs more 
 dcd880f	1.3466	15451060	discard	seed=2024 (within noise)
 0415095	1.3443	15160791	discard	DEQ beta=0.4 (marginal worse)
 755c351	1.3446	15500000	discard	embed_init=0.003 (marginal worse)
+7d2209f	1.3464	15500000	discard	softcap=40 (worse)
