@@ -4,3 +4,5 @@ commit	val_bpb	artifact_bytes	status	description
 0bd69be	1.3818	9800000	discard	LeakyReLU² mlp=3.5 (worse, fewer steps)
 467971b	1.3930	9400000	discard	3-iter DEQ lr=0.02 (fewer steps)
 e0d7d63	4.2312	9500000	discard	EMA decay=0.997 (catastrophic, early weights dominate)
+773afea	1.3662	9500000	keep	warmdown=450 (improved, deq_res=5999 recon=11713)
+8bf5d59	1.3657	9500000	keep	warmdown=500 (deq_res=7057 recon=11001)
