@@ -24,3 +24,4 @@ e0d7d63	4.2312	9500000	discard	EMA decay=0.997 (catastrophic, early weights domi
 9914519	1.3448	15457696	discard	warmdown=800 (slightly worse)
 b3ee030	1.3450	15500000	discard	Diffusion-AR refine (marginal worse, needs more steps)
 7d65fa1	1.3496	15500000	discard	muon_warmup=800 (worse, DEQ unstable)
+dcd880f	1.3466	15451060	discard	seed=2024 (within noise)
