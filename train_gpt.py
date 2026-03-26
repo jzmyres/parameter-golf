@@ -277,7 +277,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,xsa_scale,expert_gate,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -561,8 +561,6 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         # Gated attention: per-head sigmoid gate (init=3 → sigmoid≈0.95)
         self.attn_gate = nn.Parameter(torch.full((num_heads,), 3.0, dtype=torch.float32))
-        # XSA: learnable scale for self-value subtraction (init=0, starts disabled)
-        self.xsa_scale = nn.Parameter(torch.zeros(1, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -590,13 +588,6 @@ class CausalSelfAttention(nn.Module):
             q_full, k_full, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-        # XSA: subtract self-value to exclude self-position info (arxiv:2603.09078)
-        # Expand v to match num_heads for GQA
-        if self.num_kv_heads != self.num_heads:
-            v_expanded = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-        else:
-            v_expanded = v
-        y = y - self.xsa_scale.to(dtype=y.dtype) * v_expanded
         # Gated attention
         gate = torch.sigmoid(self.attn_gate.to(dtype=y.dtype))[None, :, None, None]
         y = y * gate
