@@ -560,7 +560,7 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         # Gated attention: per-head sigmoid gate (init=3 → sigmoid≈0.95)
-        self.attn_gate = nn.Parameter(torch.full((num_heads,), 3.0, dtype=torch.float32))
+        self.attn_gate = nn.Parameter(torch.full((num_heads,), 5.0, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
