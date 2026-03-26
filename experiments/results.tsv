@@ -16,3 +16,4 @@ e0d7d63	4.2312	9500000	discard	EMA decay=0.997 (catastrophic, early weights domi
 9233dd4	1.3514	14021112	keep	bigram=65536x160 (deq_res=4246 recon=9551)
 218d9b8	1.3503	15108553	keep	bigram=65536x192 (deq_res=8691 recon=9510)
 548509f	1.3481	16861421	discard	bigram=65536x224 (artifact >16MB!)
+31a7e51	1.3529	16134872	discard	bigram=65536x208 (artifact >16MB)
