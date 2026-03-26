@@ -3,3 +3,4 @@ commit	val_bpb	artifact_bytes	status	description
 6c4134d	1.4197	9852469	discard	LeakyReLU²+batch1M+mlp4x (too slow, 407 steps)
 0bd69be	1.3818	9800000	discard	LeakyReLU² mlp=3.5 (worse, fewer steps)
 467971b	1.3930	9400000	discard	3-iter DEQ lr=0.02 (fewer steps)
+e0d7d63	4.2312	9500000	discard	EMA decay=0.997 (catastrophic, early weights dominate)
