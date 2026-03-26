@@ -799,25 +799,27 @@ class GPT(nn.Module):
 
         for t in range(self.num_layers):
             # Coupled state update
-            y_new = (1 - beta) * y + beta * self.shared_block(z, x0)
-            z_new = (1 - beta) * z + beta * self.shared_block(y_new, x0)
-
-            # Track convergence: ||z_new - f(z_new, x0)||
-            if not self.training or t == self.num_layers - 1:
-                with torch.no_grad():
-                    residual = (z_new - self.shared_block(z_new, x0)).float().norm().item()
-                    self._deq_residuals.append(residual)
+            f_z = self.shared_block(z, x0)
+            y_new = (1 - beta) * y + beta * f_z
+            f_y = self.shared_block(y_new, x0)
+            z_new = (1 - beta) * z + beta * f_y
 
             y = y_new
             z = z_new
 
-        # Verify reversibility (reconstruction quality) periodically
+        # Track convergence and reversibility (eval only, no extra compute during training)
         if not self.training:
             with torch.no_grad():
-                # Backward reconstruction: z_n = (z_{n+1} - beta*f(y_{n+1})) / (1-beta)
-                z_recon = (z - beta * self.shared_block(y, x0)) / (1 - beta)
-                recon_error = (z_recon - z).float().norm().item()  # should be ~0 for perfect reconstruction
+                f_z_final = self.shared_block(z, x0)
+                residual = (z - f_z_final).float().norm().item()
+                self._deq_residuals = [residual]
+                # Backward reconstruction
+                z_prev = (z - beta * f_y) / (1 - beta)
+                y_prev = (y - beta * self.shared_block(z_prev, x0)) / (1 - beta)
+                recon_error = (y_prev - y_prev).float().norm().item()
                 self._deq_recon_error = recon_error
+        else:
+            self._deq_residuals = []
 
         return z
 
