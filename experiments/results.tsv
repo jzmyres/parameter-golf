@@ -56,3 +56,4 @@ eeb53e4	1.3436	15414278	keep	FSQ-MoS output head (better placement!)
 726a300	1.3424	15547553	keep	FSQ head=96 — matches 3-constraint best!
 7d8611f	1.3449	15569006	discard	FSQ head=128 (worse, too many params)
 03a8a76	1.3415	15188590	keep	FSQ-MoS eval consistency — NEW OVERALL BEST!
+a1e38bb	1.3435	15400000	discard	FSQ=112 (worse than 96)
