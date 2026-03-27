@@ -879,19 +879,23 @@ class GPT(nn.Module):
         x = self._run_backbone(x)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-        # FSQ-MoS: combine standard head with FSQ-refined head
-        x_fsq = x + self.fsq_head(x)  # FSQ adds low-rank discrete correction
+        # True MoS: mixture of 2 softmax experts
+        # Expert 1: standard projection, Expert 2: FSQ-refined projection
+        x_fsq = x + self.fsq_head(x)
         if self.tie_embeddings:
-            logits_proj = F.linear(x_fsq, self.tok_emb.weight)
+            logits1 = F.linear(x, self.tok_emb.weight)      # standard expert
+            logits2 = F.linear(x_fsq, self.tok_emb.weight)  # FSQ expert
         else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x_fsq)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        # Add expert load balancing loss (small weight)
-        balance_loss = getattr(self.shared_block.mlp, '_balance_loss', torch.tensor(0.0))
-        return ce_loss + 0.0 * balance_loss  # disabled — 2 experts self-balance
+            logits1 = self.lm_head(x)
+            logits2 = self.lm_head(x_fsq)
+        # Mix softmaxes (not logits) — true MoS
+        logits1 = self.logit_softcap * torch.tanh(logits1 / self.logit_softcap)
+        logits2 = self.logit_softcap * torch.tanh(logits2 / self.logit_softcap)
+        p1 = F.softmax(logits1.float(), dim=-1)
+        p2 = F.softmax(logits2.float(), dim=-1)
+        p_mix = 0.5 * p1 + 0.5 * p2  # equal mixture
+        ntp_loss = F.nll_loss(p_mix.clamp(min=1e-8).log(), targets, reduction="mean")
+        return ntp_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
