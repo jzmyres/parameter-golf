@@ -66,3 +66,4 @@ e428db2	1.3417	15200000	discard	warmdown=750 (marginal worse)
 b901a37	1.3598	13475015	discard	dim=928 bigram=49152 (worse, fewer steps)
 a4bc4cd	1.3403	15200000	keep	softcap=25 — NEW BEST!
 eeda57c	1.3398	15200000	keep	softcap=20 — NEW BEST!
+95d7755	1.3414	15200000	discard	softcap=15 (worse)
