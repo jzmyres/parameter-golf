@@ -91,7 +91,7 @@ class Hyperparameters:
     kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 0))  # 0 = auto (dim//2)
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.3))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.25))
     swa_every = int(os.environ.get("SWA_EVERY", 25))
 
 # -----------------------------
