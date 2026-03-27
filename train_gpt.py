@@ -712,7 +712,7 @@ class FSQBottleneck(nn.Module):
     Compresses hidden state to low-rank, applies FSQ discretization,
     then expands back with non-linearity to recover expressiveness.
     """
-    def __init__(self, dim: int, bottleneck_dim: int = 32, num_levels: int = 8):
+    def __init__(self, dim: int, bottleneck_dim: int = 32, num_levels: int = 12):
         super().__init__()
         self.down = CastedLinear(dim, bottleneck_dim, bias=False)
         self.up = CastedLinear(bottleneck_dim, dim, bias=False)
