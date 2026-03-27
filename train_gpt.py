@@ -60,7 +60,7 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 2))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 896))
+    model_dim = int(os.environ.get("MODEL_DIM", 928))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 2.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -86,7 +86,7 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 65536))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 49152))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 192))
     kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 0))  # 0 = auto (dim//2)
 
