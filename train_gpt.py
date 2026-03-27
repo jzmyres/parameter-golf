@@ -794,8 +794,8 @@ class GPT(nn.Module):
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
         # Diffusion-AR (Constraint #5): soft embedding refinement per DEQ iteration
-        self.diffar_down = CastedLinear(model_dim, 96, bias=False)
-        self.diffar_up = CastedLinear(96, model_dim, bias=False)
+        self.diffar_down = CastedLinear(model_dim, 64, bias=False)
+        self.diffar_up = CastedLinear(64, model_dim, bias=False)
         self.diffar_up._zero_init = True
         self.blocks = None  # not used in DEQ mode
         # FSQ-MoS: param-efficient output head via FSQ bottleneck
