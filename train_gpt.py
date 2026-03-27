@@ -756,10 +756,10 @@ class Block(nn.Module):
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        # FSQ bottleneck between attn and MLP
+        x = x + self.fsq(x)
         mlp_out = self.mlp(self.mlp_norm(x))
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
-        # FSQ bottleneck: adds discretized low-rank correction
-        x = x + self.fsq(x)
         return x
 
 
