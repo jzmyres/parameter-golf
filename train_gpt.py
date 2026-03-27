@@ -799,7 +799,7 @@ class GPT(nn.Module):
         self.diffar_up._zero_init = True
         self.blocks = None  # not used in DEQ mode
         # FSQ-MoS: param-efficient output head via FSQ bottleneck
-        self.fsq_head = FSQBottleneck(model_dim, bottleneck_dim=96, num_levels=8)
+        self.fsq_head = FSQBottleneck(model_dim, bottleneck_dim=96, num_levels=6)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
