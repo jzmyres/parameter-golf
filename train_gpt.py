@@ -800,10 +800,6 @@ class GPT(nn.Module):
         self.blocks = None  # not used in DEQ mode
         # FSQ-MoS: param-efficient output head via FSQ bottleneck
         self.fsq_head = FSQBottleneck(model_dim, bottleneck_dim=96, num_levels=8)
-        # CTP (Current Token Prediction) auxiliary head — denoising signal
-        self.ctp_proj = CastedLinear(model_dim, 64, bias=False)
-        self.ctp_head = CastedLinear(64, vocab_size, bias=False)
-        self.ctp_head._zero_init = True
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -892,12 +888,10 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_fsq)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        ntp_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        # CTP auxiliary loss: predict current token (denoising signal)
-        ctp_logits = self.ctp_head(F.silu(self.ctp_proj(x)))
-        ctp_targets = input_ids.reshape(-1)
-        ctp_loss = F.cross_entropy(ctp_logits.float(), ctp_targets, reduction="mean")
-        return ntp_loss + 0.1 * ctp_loss
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        # Add expert load balancing loss (small weight)
+        balance_loss = getattr(self.shared_block.mlp, '_balance_loss', torch.tensor(0.0))
+        return ce_loss + 0.0 * balance_loss  # disabled — 2 experts self-balance
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
