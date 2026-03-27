@@ -793,6 +793,9 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
+        # Causal 1D conv for local context mixing before DEQ
+        self.local_conv = nn.Conv1d(model_dim, model_dim, kernel_size=3, padding=2, groups=model_dim, bias=False)
+        nn.init.zeros_(self.local_conv.weight)  # start as identity
         # Diffusion-AR (Constraint #5): soft embedding refinement per DEQ iteration
         self.diffar_down = CastedLinear(model_dim, 64, bias=False)
         self.diffar_up = CastedLinear(64, model_dim, bias=False)
@@ -876,6 +879,8 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
         x = self.smear(x)
+        # Causal local conv for n-gram context
+        x = x + self.local_conv(x.transpose(1, 2))[:, :, :x.size(1)].transpose(1, 2)
         x = self._run_backbone(x)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -899,6 +904,7 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
         x = self.smear(x)
+        x = x + self.local_conv(x.transpose(1, 2))[:, :, :x.size(1)].transpose(1, 2)
         x = self._run_backbone(x)
         x = self.final_norm(x)
         # FSQ-MoS: same as training forward
