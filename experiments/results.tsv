@@ -46,3 +46,4 @@ c678db9	1.3449	15318453	keep	all 5 constraints: RevDEQ+MLA+SoftDense+FSQ+DiffAR 
 e7b3511	1.3487	15375637	discard	smaller FSQ=16 DiffAR=32 (worse)
 2ba0645	1.3457	15190905	discard	FSQ levels=5 (worse)
 1baadc6	1.3469	15326314	discard	lr=0.025 5-constraint (worse)
+55d2dde	1.3494	15400000	discard	FSQ bottleneck=48 (worse)
