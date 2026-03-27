@@ -840,7 +840,7 @@ class GPT(nn.Module):
         for t in range(self.num_layers):
             # Diffusion-AR: refine input using current state (soft denoising)
             if t > 0:
-                correction = self.diffar_up(torch.tanh(self.diffar_down(z)))
+                correction = self.diffar_up(F.silu(self.diffar_down(z)))
                 x0_refined = x0 + correction
             else:
                 x0_refined = x0
