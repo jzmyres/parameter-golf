@@ -888,10 +888,17 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_fsq)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        # Add expert load balancing loss (small weight)
-        balance_loss = getattr(self.shared_block.mlp, '_balance_loss', torch.tensor(0.0))
-        return ce_loss + 0.0 * balance_loss  # disabled — 2 experts self-balance
+        ntp_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        # Multi-token prediction: also predict t+2 (2-ahead) via low-rank head
+        bsz_seq = x.shape[0]
+        if bsz_seq > 2:
+            # Shift targets by 1 more position for 2-ahead prediction
+            targets_2 = torch.cat([targets[1:], targets[:1]])  # shift left by 1
+            mtp_logits = self.fsq_head.up(F.silu(self.fsq_head.down(x)))  # reuse FSQ projections
+            mtp_logits = F.linear(mtp_logits, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(mtp_logits)
+            mtp_loss = F.cross_entropy(mtp_logits.float(), targets_2, reduction="mean")
+            return ntp_loss + 0.05 * mtp_loss
+        return ntp_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
