@@ -901,6 +901,8 @@ class GPT(nn.Module):
         x = self.smear(x)
         x = self._run_backbone(x)
         x = self.final_norm(x)
+        # FSQ-MoS: same as training forward
+        x = x + self.fsq_head(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
