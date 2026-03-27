@@ -80,7 +80,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.85))
     beta2 = float(os.environ.get("BETA2", 0.90))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.2))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.15))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.04))
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval; set >0 for sliding window (final only)
