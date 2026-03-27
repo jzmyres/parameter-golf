@@ -70,3 +70,4 @@ eeda57c	1.3398	15200000	keep	softcap=20 — NEW BEST!
 f72a357	1.3399	15200000	discard	qk_gain=1.2 (tied, 0.0001 worse post-quant)
 7273b7f	1.3406	15200000	discard	embed_lr=0.02 (worse)
 823ca59	1.3397	15200000	keep	beta2=0.90 (marginal 0.0001)
+f575c08	1.3399	15310707	discard	beta2=0.85 (marginal worse)
