@@ -67,3 +67,4 @@ b901a37	1.3598	13475015	discard	dim=928 bigram=49152 (worse, fewer steps)
 a4bc4cd	1.3403	15200000	keep	softcap=25 — NEW BEST!
 eeda57c	1.3398	15200000	keep	softcap=20 — NEW BEST!
 95d7755	1.3414	15200000	discard	softcap=15 (worse)
+f72a357	1.3399	15200000	discard	qk_gain=1.2 (tied, 0.0001 worse post-quant)
