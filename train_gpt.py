@@ -746,7 +746,7 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.mlp = MLP(dim, mlp_mult)
-        self.fsq = FSQBottleneck(dim)  # FSQ constraint
+        # FSQ moved to output head for param-efficient MoS
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -758,8 +758,6 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_out = self.mlp(self.mlp_norm(x))
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
-        # FSQ bottleneck: adds discretized low-rank correction
-        x = x + self.fsq(x)
         return x
 
 
@@ -800,6 +798,8 @@ class GPT(nn.Module):
         self.diffar_up = CastedLinear(64, model_dim, bias=False)
         self.diffar_up._zero_init = True
         self.blocks = None  # not used in DEQ mode
+        # FSQ-MoS: param-efficient output head via FSQ bottleneck
+        self.fsq_head = FSQBottleneck(model_dim, bottleneck_dim=32, num_levels=8)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -879,12 +879,14 @@ class GPT(nn.Module):
         x = self._run_backbone(x)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
+        # FSQ-MoS: combine standard head with FSQ-refined head
+        x_fsq = x + self.fsq_head(x)  # FSQ adds low-rank discrete correction
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x_fsq, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(x_fsq)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         # Add expert load balancing loss (small weight)
