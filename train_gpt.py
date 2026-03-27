@@ -712,7 +712,7 @@ class FSQBottleneck(nn.Module):
     Compresses hidden state to low-rank, applies FSQ discretization,
     then expands back with non-linearity to recover expressiveness.
     """
-    def __init__(self, dim: int, bottleneck_dim: int = 32, num_levels: int = 8):
+    def __init__(self, dim: int, bottleneck_dim: int = 16, num_levels: int = 8):
         super().__init__()
         self.down = CastedLinear(dim, bottleneck_dim, bias=False)
         self.up = CastedLinear(bottleneck_dim, dim, bias=False)
@@ -796,8 +796,8 @@ class GPT(nn.Module):
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
         # Diffusion-AR (Constraint #5): soft embedding refinement per DEQ iteration
-        self.diffar_down = CastedLinear(model_dim, 64, bias=False)
-        self.diffar_up = CastedLinear(64, model_dim, bias=False)
+        self.diffar_down = CastedLinear(model_dim, 32, bias=False)
+        self.diffar_up = CastedLinear(32, model_dim, bias=False)
         self.diffar_up._zero_init = True
         self.blocks = None  # not used in DEQ mode
         self.final_norm = RMSNorm()
