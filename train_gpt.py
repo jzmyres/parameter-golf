@@ -732,9 +732,9 @@ class FSQBottleneck(nn.Module):
         return torch.round(x_bounded / step) * step
 
     def forward(self, x: Tensor) -> Tensor:
-        h = F.silu(self.down(x))  # non-linearity before FSQ
+        h = F.gelu(self.down(x))   # non-linearity before FSQ
         h = self._fsq(h)           # discretize
-        h = F.silu(h)              # non-linearity after FSQ (recover expressiveness)
+        h = F.gelu(h)              # non-linearity after FSQ (recover expressiveness)
         return self.scale.to(dtype=x.dtype) * self.up(h)
 
 
