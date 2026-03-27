@@ -845,10 +845,10 @@ class GPT(nn.Module):
             else:
                 x0_refined = x0
 
-            # Coupled state update with refined input + pre-norm
-            f_z = self.shared_block(_rms_norm(z), x0_refined)
+            # Coupled state update with refined input
+            f_z = self.shared_block(z, x0_refined)
             y_new = (1 - beta) * y + beta * f_z
-            f_y = self.shared_block(_rms_norm(y_new), x0_refined)
+            f_y = self.shared_block(y_new, x0_refined)
             z_new = (1 - beta) * z + beta * f_y
 
             y = y_new
