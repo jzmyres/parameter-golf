@@ -555,7 +555,7 @@ class CausalSelfAttention(nn.Module):
 
         # MLA: low-rank KV compression with decoupled RoPE
         self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
-        self.rope_dim = self.head_dim // 2  # half for RoPE
+        self.rope_dim = self.head_dim // 4  # quarter for RoPE (partial RoPE)
         self.nope_dim = self.head_dim - self.rope_dim
 
         self.c_q = CastedLinear(dim, dim, bias=False)
