@@ -332,21 +332,17 @@ def _classify_param(name: str) -> str:
         return "attn"
     return "other"
 
-INTN_CLIP_Q = 0.999  # quantile for intN clipping (reduces outlier sensitivity)
-
 def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Quantile-based clipping: less sensitive to outliers than amax
-        row_clip = torch.quantile(t32.abs(), INTN_CLIP_Q, dim=1)
-        scale = (row_clip / clip_range).clamp_min(1e-12).to(torch.float16)
+        row_max = t32.abs().amax(dim=1)
+        scale = (row_max / clip_range).clamp_min(1e-12).to(torch.float16)
         scale = scale.clamp_min(torch.finfo(torch.float16).tiny)
-        clipped = torch.clamp(t32, -row_clip[:, None], row_clip[:, None])
-        q = torch.clamp(torch.round(clipped / scale.float()[:, None]), -(clip_range+1), clip_range).to(torch.int8)
+        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -(clip_range+1), clip_range).to(torch.int8)
         return q, scale
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INTN_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(max(clip_abs / clip_range, 1e-12), dtype=torch.float16)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale.float()), -(clip_range+1), clip_range).to(torch.int8)
+    amax = t32.abs().max().item()
+    scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), -(clip_range+1), clip_range).to(torch.int8)
     return q, scale
 
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
