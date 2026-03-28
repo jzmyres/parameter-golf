@@ -88,7 +88,7 @@ class Hyperparameters:
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 65536))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 192))
-    kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 384))  # smaller latent = faster, more steps
+    kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 0))  # 0 = auto (dim//2)
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.3))
