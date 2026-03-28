@@ -335,11 +335,23 @@ def _classify_param(name: str) -> str:
 def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
+        # Optimal scale search: try 3 candidate scales and pick best MSE
         row_max = t32.abs().amax(dim=1)
-        scale = (row_max / clip_range).clamp_min(1e-12).to(torch.float16)
-        scale = scale.clamp_min(torch.finfo(torch.float16).tiny)
-        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -(clip_range+1), clip_range).to(torch.int8)
-        return q, scale
+        best_q = None
+        best_scale = None
+        best_mse = float("inf")
+        for alpha in [0.95, 1.0, 1.05]:
+            rm = row_max * alpha
+            s = (rm / clip_range).clamp_min(1e-12).to(torch.float16)
+            s = s.clamp_min(torch.finfo(torch.float16).tiny)
+            q_try = torch.clamp(torch.round(t32 / s.float()[:, None]), -(clip_range+1), clip_range).to(torch.int8)
+            recon = q_try.float() * s.float()[:, None]
+            mse = (t32 - recon).pow(2).mean().item()
+            if mse < best_mse:
+                best_mse = mse
+                best_q = q_try
+                best_scale = s
+        return best_q, best_scale
     amax = t32.abs().max().item()
     scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -(clip_range+1), clip_range).to(torch.int8)
