@@ -793,6 +793,8 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
+        # Per-iteration learned beta: allows each DEQ step to have different relaxation
+        self.deq_iter_beta = nn.Parameter(torch.full((num_layers,), 0.5, dtype=torch.float32))
         # Diffusion-AR (Constraint #5): soft embedding refinement per DEQ iteration
         self.diffar_down = CastedLinear(model_dim, 64, bias=False)
         self.diffar_up = CastedLinear(64, model_dim, bias=False)
@@ -840,6 +842,8 @@ class GPT(nn.Module):
         z_prev_iter = z  # track for convergence
         for t in range(self.num_layers):
             z_prev_iter = z  # state before this iteration
+            # Per-iteration learned beta (sigmoid to keep in [0,1])
+            beta_t = torch.sigmoid(self.deq_iter_beta[t]).to(dtype=x.dtype)
             # Diffusion-AR: refine input using current state (soft denoising)
             if t > 0:
                 correction = self.diffar_up(F.silu(self.diffar_down(z)))
@@ -847,11 +851,11 @@ class GPT(nn.Module):
             else:
                 x0_refined = x0
 
-            # Coupled state update with refined input
+            # Coupled state update with per-iteration relaxation
             f_z = self.shared_block(z, x0_refined)
-            y_new = (1 - beta) * y + beta * f_z
+            y_new = (1 - beta_t) * y + beta_t * f_z
             f_y = self.shared_block(y_new, x0_refined)
-            z_new = (1 - beta) * z + beta * f_y
+            z_new = (1 - beta_t) * z + beta_t * f_y
 
             y = y_new
             z = z_new
@@ -869,12 +873,11 @@ class GPT(nn.Module):
                 # Start from final (y_T, z_T), reverse T steps using x0
                 y_r, z_r = y, z
                 for t_rev in range(self.num_layers - 1, -1, -1):
-                    # At each reverse step, undo: z_{t+1} = (1-b)*z_t + b*f(y_{t+1}, x0)
-                    # and y_{t+1} = (1-b)*y_t + b*f(z_t, x0)
+                    beta_rev = torch.sigmoid(self.deq_iter_beta[t_rev]).to(dtype=x.dtype)
                     f_yr = self.shared_block(y_r, x0)
-                    z_r = (z_r - beta * f_yr) / (1 - beta)
+                    z_r = (z_r - beta_rev * f_yr) / (1 - beta_rev)
                     f_zr = self.shared_block(z_r, x0)
-                    y_r = (y_r - beta * f_zr) / (1 - beta)
+                    y_r = (y_r - beta_rev * f_zr) / (1 - beta_rev)
                 # Recon error: distance from initial embedding (zeros)
                 recon_error = z_r.float().norm().item() + y_r.float().norm().item()
                 self._deq_recon_error = recon_error
