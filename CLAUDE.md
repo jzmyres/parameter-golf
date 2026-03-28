@@ -94,7 +94,11 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
 ### Experiment Loop
 1. Read git state: `git log --oneline -20` + `results.tsv`
 2. Make ONE focused change to `train_gpt.py`
-2a. Run `python experiments/smoke_test.py` to verify DEQ recon error ~0 and loss doesn't diverge
+2a. Run `python experiments/smoke_test.py` — MUST PASS before long training. Checks:
+   - Loss decreases (not diverging)
+   - DEQ reconstruction error stays < 1.0 (relative) and does not increase
+   - DEQ iter convergence ||z_T - z_{T-1}|| does not diverge
+   - No NaN/Inf gradients
 3. Write/update tests (TDD — tests BEFORE implementation)
 4. `git commit` the change
 5. Run: redirect output to `run.log` (do NOT flood context)
