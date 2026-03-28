@@ -109,10 +109,16 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
 - **Training logs**: Save full stdout/stderr to `experiments/training_logs/`
   - `baseline.log` — the current best config (re-run when best changes)
   - `current.log` — the current experiment being tested
-- **Metrics comparison**: After each iteration, run `python experiments/plot_metrics.py` to generate `experiments/metrics_comparison.png` (3x3 grid: train loss, step avg, val BPB, DEQ residual, DEQ recon, expert usage, expert entropy, expert ortho, summary)
+- **Metrics comparison**: After each iteration, run `python experiments/plot_metrics.py` to generate `experiments/metrics_comparison.png`
+  - 4x3 grid with FULL TRAINING CURVES (not just final values):
+    - Row 1: Train Loss curve, Val BPB curve, Step Avg (ms) curve
+    - Row 2: DEQ Residual curve, DEQ Recon Error curve, DEQ Iter Convergence curve
+    - Row 3: Expert Usage (per expert) curve, Expert Entropy curve, Expert Orthogonality curve
+    - Row 4: Summary text comparing ALL final values between baseline and current
 - **Progress plot**: After each iteration, run `python experiments/plot_progress.py` to update `experiments/progress.png` and `experiments/progress_full.png`
-- **All metrics tracked**: train_loss, val_loss, val_bpb, step_avg_ms, deq_residual, deq_recon_err, expert_usage (per expert), expert_entropy, expert_ortho
+- **All metrics tracked**: train_loss, val_loss, val_bpb, step_avg_ms, deq_residual, deq_recon_err, deq_iter_conv, expert_usage (per expert), expert_entropy, expert_ortho
 - Only track 2 configs for detailed comparison: baseline (best) vs current experiment
+- **Prioritize architecture exploration** over hyperparameter tuning; search for relevant papers/techniques
 
 ### Time Budget
 - **10 minutes max** per experiment (wall clock training)
