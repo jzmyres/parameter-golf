@@ -860,10 +860,17 @@ class GPT(nn.Module):
                 f_z_final = self.shared_block(z, x0)
                 residual = (z - f_z_final).float().norm().item()
                 self._deq_residuals = [residual]
-                # Backward reconstruction
+                # Backward reconstruction: verify algebraic reversibility
+                # Reconstruct previous states from final (y, z) and f_y
                 z_prev = (z - beta * f_y) / (1 - beta)
-                y_prev = (y - beta * self.shared_block(z_prev, x0)) / (1 - beta)
-                recon_error = (y_prev - y_prev).float().norm().item()
+                f_zprev = self.shared_block(z_prev, x0)
+                y_prev = (y - beta * f_zprev) / (1 - beta)
+                # Forward verify: re-run from reconstructed states
+                f_zp = self.shared_block(z_prev, x0)
+                y_check = (1 - beta) * y_prev + beta * f_zp
+                f_yc = self.shared_block(y_check, x0)
+                z_check = (1 - beta) * z_prev + beta * f_yc
+                recon_error = (z_check - z).float().norm().item() + (y_check - y).float().norm().item()
                 self._deq_recon_error = recon_error
         else:
             self._deq_residuals = []

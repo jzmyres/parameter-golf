@@ -102,7 +102,17 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
 8. Log to `results.tsv` (do NOT commit results.tsv)
 9. If val_bpb improved AND artifact <= 16MB -> run `/simplify`, then keep
 10. If val_bpb equal or worse -> `git revert` to previous good state
-11. Track consecutive non-improvements. **STOP after 50 consecutive non-improvements** and seek user guidance
+11. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
+12. Run `python experiments/plot_metrics.py` and `python experiments/plot_progress.py` to update plots
+
+### Logging & Plotting (REQUIRED every iteration)
+- **Training logs**: Save full stdout/stderr to `experiments/training_logs/`
+  - `baseline.log` — the current best config (re-run when best changes)
+  - `current.log` — the current experiment being tested
+- **Metrics comparison**: After each iteration, run `python experiments/plot_metrics.py` to generate `experiments/metrics_comparison.png` (3x3 grid: train loss, step avg, val BPB, DEQ residual, DEQ recon, expert usage, expert entropy, expert ortho, summary)
+- **Progress plot**: After each iteration, run `python experiments/plot_progress.py` to update `experiments/progress.png` and `experiments/progress_full.png`
+- **All metrics tracked**: train_loss, val_loss, val_bpb, step_avg_ms, deq_residual, deq_recon_err, expert_usage (per expert), expert_entropy, expert_ortho
+- Only track 2 configs for detailed comparison: baseline (best) vs current experiment
 
 ### Time Budget
 - **10 minutes max** per experiment (wall clock training)

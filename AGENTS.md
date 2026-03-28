@@ -34,16 +34,18 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 3. Write tests first (TDD)
 4. Implement the change in `train_gpt.py`
 5. `git commit -m "experiment: <description>"`
-6. Run training: redirect to `run.log`
-7. Extract: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-8. Log to `results.tsv`
-9. If improved AND artifact <= 16MB:
-   - Run `/simplify` skill
-   - Keep the commit (branch advances)
-10. If not improved: `git revert HEAD`
-11. Track consecutive non-improvements (reset on any improvement)
-12. If 50 consecutive non-improvements → STOP and ask user for guidance
-13. Otherwise GOTO 1
+6. Run training: redirect to `experiments/training_logs/current.log`
+7. Extract: `grep "val_bpb:\|peak_vram_mb:\|artifact.*bytes" experiments/training_logs/current.log`
+8. Log to `experiments/results.tsv`
+9. Run `python experiments/plot_metrics.py` and `python experiments/plot_progress.py` to update plots
+10. If improved AND artifact <= 16MB:
+    - Run `/simplify` skill
+    - Keep the commit (branch advances)
+    - Copy `current.log` to `baseline.log` (new baseline)
+11. If not improved: `git revert HEAD`
+12. Track consecutive non-improvements (reset on any improvement)
+13. If 100 consecutive non-improvements → STOP and ask user for guidance
+14. Otherwise GOTO 1
 
 ### Decision Rules
 - **Keep**: val_bpb improved AND artifact <= 16MB
@@ -57,7 +59,7 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 - Never skip TDD — tests before implementation
 - Never skip `/simplify` before committing successful experiments
 - Never introduce GPU-count-specific code without proper DDP guards
-- **Stop after 50 consecutive non-improvements** and seek user guidance
+- **Stop after 100 consecutive non-improvements** and seek user guidance
 
 ## Git Convention
 - Branch: `autoresearch/<tag>`
