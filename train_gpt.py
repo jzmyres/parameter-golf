@@ -640,7 +640,7 @@ class MLP(nn.Module):
         self.expert_gate = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        h = F.leaky_relu(self.gate_proj(x), 0.5).square() * self.fc(x)
+        h = F.silu(self.gate_proj(x)) * self.fc(x)
         # Soft dense routing: all experts process all tokens
         route_logits = self.router(x)  # (bsz, seq, E)
         route_weights = torch.softmax(route_logits, dim=-1)
