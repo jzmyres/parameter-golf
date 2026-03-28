@@ -781,7 +781,9 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_out = self.mlp(self.mlp_norm(x))
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        # Iteration-aware gate: modulate MLP contribution based on input similarity to x0
+        iter_gate = torch.sigmoid((x * x0).sum(-1, keepdim=True) / (x.shape[-1] ** 0.5))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out * iter_gate
         return x
 
 
