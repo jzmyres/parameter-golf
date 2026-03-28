@@ -731,8 +731,6 @@ class FSQBottleneck(nn.Module):
         self.up._zero_init = True  # start as identity skip
         self.num_levels = num_levels
         self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
-        # RFSQ: per-dimension adaptive scaling before quantization
-        self.pre_quant_scale = nn.Parameter(torch.ones(bottleneck_dim, dtype=torch.float32))
 
     def _fsq(self, x: Tensor) -> Tensor:
         """Finite Scalar Quantization: round to nearest level."""
@@ -747,7 +745,6 @@ class FSQBottleneck(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         h = F.silu(self.down(x))  # non-linearity before FSQ
-        h = h * self.pre_quant_scale.to(dtype=h.dtype)  # RFSQ: per-dim adaptive scale
         h = self._fsq(h)           # discretize
         h = F.silu(h)              # non-linearity after FSQ (recover expressiveness)
         return self.scale.to(dtype=x.dtype) * self.up(h)
