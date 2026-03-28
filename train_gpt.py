@@ -340,7 +340,7 @@ def quantize_intN_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
         best_q = None
         best_scale = None
         best_mse = float("inf")
-        for alpha in [0.90, 0.95, 0.975, 1.0, 1.025, 1.05]:
+        for alpha in [0.95, 1.0, 1.05]:
             rm = row_max * alpha
             s = (rm / clip_range).clamp_min(1e-12).to(torch.float16)
             s = s.clamp_min(torch.finfo(torch.float16).tiny)
