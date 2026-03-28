@@ -1317,7 +1317,7 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         # Late QAT: enable fake quantization during last 15% of warmdown
         global _QAT_ACTIVE
-        _QAT_ACTIVE = scale < 0.15
+        _QAT_ACTIVE = scale < 0.10
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
