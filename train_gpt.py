@@ -480,9 +480,18 @@ class RMSNorm(nn.Module):
         return _rms_norm(x, self.eps)
 
 
+_QAT_ACTIVE = False  # Global flag for Late QAT
+
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
+        # Late QAT: add fake quantization noise during warmdown
+        if _QAT_ACTIVE and self.training and w.ndim == 2 and w.numel() > 8192:
+            clip = getattr(self, '_qat_clip', 31)
+            amax = w.abs().amax(dim=-1, keepdim=True)
+            s = (amax / clip).clamp_min(1e-12)
+            w_q = torch.clamp(torch.round(w / s), -(clip+1), clip) * s
+            w = w + (w_q - w).detach()  # STE: quantized forward, identity backward
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
@@ -608,9 +617,12 @@ class MLP(nn.Module):
         self.num_experts = num_experts
         self.expert_size = hidden // num_experts
         self.gate_proj = CastedLinear(dim, hidden, bias=False)
+        self.gate_proj._qat_clip = 15  # int5 for MLP
         self.fc = CastedLinear(dim, hidden, bias=False)
+        self.fc._qat_clip = 15
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.proj._qat_clip = 15
         # Soft Dense Routing: router + per-expert sigmoid gate
         self.router = CastedLinear(dim, num_experts, bias=False)
         self.expert_gate = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
@@ -1291,6 +1303,9 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        # Late QAT: enable fake quantization during last 15% of warmdown
+        global _QAT_ACTIVE
+        _QAT_ACTIVE = scale < 0.15
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
