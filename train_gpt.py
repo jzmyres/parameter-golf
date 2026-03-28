@@ -880,21 +880,21 @@ class GPT(nn.Module):
                 # Inter-iteration convergence: ||z_T - z_{T-1}||
                 iter_convergence = (z - z_prev_iter).float().norm().item()
                 self._deq_iter_convergence = iter_convergence
-                # Backward reconstruction in float32 for numerical stability
-                y_r = y.float()
-                z_r = z.float()
-                x0_f = x0.float()
+                # Backward reconstruction: same precision as forward for consistency
+                y_r, z_r = y.clone(), z.clone()
                 for t_rev in range(self.num_layers - 1, -1, -1):
                     if t_rev > 0:
-                        z_at_t = z_history[t_rev].float()
-                        x0_rev = x0_f + self.diffar_up(F.silu(self.diffar_down(z_at_t))).float()
+                        z_at_t = z_history[t_rev]
+                        x0_rev = x0 + self.diffar_up(F.silu(self.diffar_down(z_at_t)))
                     else:
-                        x0_rev = x0_f
-                    f_yr = self.shared_block(y_r.to(x0.dtype), x0_rev.to(x0.dtype)).float()
+                        x0_rev = x0
+                    f_yr = self.shared_block(y_r, x0_rev)
                     z_r = (z_r - beta * f_yr) / (1 - beta)
-                    f_zr = self.shared_block(z_r.to(x0.dtype), x0_rev.to(x0.dtype)).float()
+                    f_zr = self.shared_block(z_r, x0_rev)
                     y_r = (y_r - beta * f_zr) / (1 - beta)
-                recon_error = z_r.norm().item() + y_r.norm().item()
+                # Relative reconstruction error (normalized by state norm)
+                state_norm = max(z.float().norm().item(), 1.0)
+                recon_error = (z_r.float().norm().item() + y_r.float().norm().item()) / state_norm
                 self._deq_recon_error = recon_error
         else:
             self._deq_residuals = []
