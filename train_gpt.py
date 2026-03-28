@@ -837,7 +837,9 @@ class GPT(nn.Module):
         # Store final residual for convergence tracking
         self._deq_residuals: list[float] = []
 
+        z_prev_iter = z  # track for convergence
         for t in range(self.num_layers):
+            z_prev_iter = z  # state before this iteration
             # Diffusion-AR: refine input using current state (soft denoising)
             if t > 0:
                 correction = self.diffar_up(F.silu(self.diffar_down(z)))
@@ -860,17 +862,21 @@ class GPT(nn.Module):
                 f_z_final = self.shared_block(z, x0)
                 residual = (z - f_z_final).float().norm().item()
                 self._deq_residuals = [residual]
-                # Backward reconstruction: verify algebraic reversibility
-                # Reconstruct previous states from final (y, z) and f_y
-                z_prev = (z - beta * f_y) / (1 - beta)
-                f_zprev = self.shared_block(z_prev, x0)
-                y_prev = (y - beta * f_zprev) / (1 - beta)
-                # Forward verify: re-run from reconstructed states
-                f_zp = self.shared_block(z_prev, x0)
-                y_check = (1 - beta) * y_prev + beta * f_zp
-                f_yc = self.shared_block(y_check, x0)
-                z_check = (1 - beta) * z_prev + beta * f_yc
-                recon_error = (z_check - z).float().norm().item() + (y_check - y).float().norm().item()
+                # Inter-iteration convergence: ||z_T - z_{T-1}||
+                iter_convergence = (z - z_prev_iter).float().norm().item()
+                self._deq_iter_convergence = iter_convergence
+                # Backward reconstruction: reverse all iterations to recover initial (0, 0)
+                # Start from final (y_T, z_T), reverse T steps using x0
+                y_r, z_r = y, z
+                for t_rev in range(self.num_layers - 1, -1, -1):
+                    # At each reverse step, undo: z_{t+1} = (1-b)*z_t + b*f(y_{t+1}, x0)
+                    # and y_{t+1} = (1-b)*y_t + b*f(z_t, x0)
+                    f_yr = self.shared_block(y_r, x0)
+                    z_r = (z_r - beta * f_yr) / (1 - beta)
+                    f_zr = self.shared_block(z_r, x0)
+                    y_r = (y_r - beta * f_zr) / (1 - beta)
+                # Recon error: distance from initial embedding (zeros)
+                recon_error = z_r.float().norm().item() + y_r.float().norm().item()
                 self._deq_recon_error = recon_error
         else:
             self._deq_residuals = []
@@ -1247,6 +1253,8 @@ def main() -> None:
                 deq_info = f" deq_residual:{base_model._deq_residuals[-1]:.6f}"
             if hasattr(base_model, '_deq_recon_error'):
                 deq_info += f" deq_recon_err:{base_model._deq_recon_error:.6f}"
+            if hasattr(base_model, '_deq_iter_convergence'):
+                deq_info += f" deq_iter_conv:{base_model._deq_iter_convergence:.6f}"
             # Expert diagnostics
             expert_info = ""
             mlp = base_model.shared_block.mlp if hasattr(base_model, 'shared_block') else None
