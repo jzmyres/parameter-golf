@@ -850,7 +850,10 @@ class GPT(nn.Module):
         self._deq_residuals: list[float] = []
 
         z_prev_iter = z  # track for convergence
-        z_history = [z]  # store z at each iteration for backward reconstruction
+        # Store coupled states in fp64 for exact backward reconstruction (RevDEQ paper)
+        y_64 = y.double()
+        z_64 = z.double()
+        z_history_64 = [z_64]  # fp64 z at each iteration
         for t in range(self.num_layers):
             z_prev_iter = z  # state before this iteration
             # Diffusion-AR: refine input using current state (soft denoising)
@@ -860,15 +863,14 @@ class GPT(nn.Module):
             else:
                 x0_refined = x0
 
-            # Coupled state update with refined input
+            # Coupled state update with fp64 add/subtract (RevDEQ paper recommendation)
             f_z = self.shared_block(z, x0_refined)
-            y_new = (1 - beta) * y + beta * f_z
-            f_y = self.shared_block(y_new, x0_refined)
-            z_new = (1 - beta) * z + beta * f_y
-
-            y = y_new
-            z = z_new
-            z_history.append(z)
+            y_64 = (1 - beta) * y_64 + beta * f_z.double()
+            y = y_64.to(x.dtype)
+            f_y = self.shared_block(y, x0_refined)
+            z_64 = (1 - beta) * z_64 + beta * f_y.double()
+            z = z_64.to(x.dtype)
+            z_history_64.append(z_64.clone())
 
         # Track convergence and reversibility (eval only, no extra compute during training)
         if not self.training:
@@ -880,21 +882,24 @@ class GPT(nn.Module):
                 # Inter-iteration convergence: ||z_T - z_{T-1}||
                 iter_convergence = (z - z_prev_iter).float().norm().item()
                 self._deq_iter_convergence = iter_convergence
-                # Backward reconstruction: same precision as forward for consistency
-                y_r, z_r = y.clone(), z.clone()
+                # Backward reconstruction in fp64 (RevDEQ paper: fp64 for reversible ops)
+                y_r64 = y_64.clone()
+                z_r64 = z_64.clone()
                 for t_rev in range(self.num_layers - 1, -1, -1):
                     if t_rev > 0:
-                        z_at_t = z_history[t_rev]
+                        z_at_t = z_history_64[t_rev].to(x.dtype)
                         x0_rev = x0 + self.diffar_up(F.silu(self.diffar_down(z_at_t)))
                     else:
                         x0_rev = x0
-                    f_yr = self.shared_block(y_r, x0_rev)
-                    z_r = (z_r - beta * f_yr) / (1 - beta)
-                    f_zr = self.shared_block(z_r, x0_rev)
-                    y_r = (y_r - beta * f_zr) / (1 - beta)
-                # Relative reconstruction error (normalized by state norm)
-                state_norm = max(z.float().norm().item(), 1.0)
-                recon_error = (z_r.float().norm().item() + y_r.float().norm().item()) / state_norm
+                    y_r_cast = y_r64.to(x.dtype)
+                    f_yr = self.shared_block(y_r_cast, x0_rev)
+                    z_r64 = (z_r64 - beta * f_yr.double()) / (1 - beta)
+                    z_r_cast = z_r64.to(x.dtype)
+                    f_zr = self.shared_block(z_r_cast, x0_rev)
+                    y_r64 = (y_r64 - beta * f_zr.double()) / (1 - beta)
+                # Relative reconstruction error (should be near 0)
+                state_norm = max(z_64.norm().item(), 1.0)
+                recon_error = (z_r64.norm().item() + y_r64.norm().item()) / state_norm
                 self._deq_recon_error = recon_error
         else:
             self._deq_residuals = []
