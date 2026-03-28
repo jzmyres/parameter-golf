@@ -875,7 +875,7 @@ class GPT(nn.Module):
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
-        # x = self.smear(x)  # disabled — bigram provides token-pair context
+        x = self.smear(x)
         x = self._run_backbone(x)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -898,7 +898,7 @@ class GPT(nn.Module):
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
-        # x = self.smear(x)  # disabled — bigram provides token-pair context
+        x = self.smear(x)
         x = self._run_backbone(x)
         x = self.final_norm(x)
         # FSQ-MoS: same as training forward
