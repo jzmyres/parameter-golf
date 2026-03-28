@@ -277,7 +277,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,deq_gate,expert_gate,fsq.scale,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,fsq.scale,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -793,8 +793,6 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
-        # Learnable residual gate for DEQ state mixing
-        self.deq_gate = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         # Diffusion-AR (Constraint #5): soft embedding refinement per DEQ iteration
         self.diffar_down = CastedLinear(model_dim, 64, bias=False)
         self.diffar_up = CastedLinear(64, model_dim, bias=False)
@@ -855,10 +853,6 @@ class GPT(nn.Module):
 
             y = y_new
             z = z_new
-
-        # Learnable residual from initial embedding
-        g = torch.sigmoid(self.deq_gate.to(dtype=z.dtype))
-        z = (1 - g) * z + g * x0
 
         # Track convergence and reversibility (eval only, no extra compute during training)
         if not self.training:
