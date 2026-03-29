@@ -59,7 +59,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 3))  # DEQ solver iters per refinement step (min 3 for fixed-point convergence)
+    num_layers = int(os.environ.get("NUM_LAYERS", 2))  # DEQ solver iters per refinement step
     num_refinements = int(os.environ.get("NUM_REFINEMENTS", 1))  # predict→soft_embed→re-encode cycles
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 640))
@@ -1248,10 +1248,10 @@ class GPT(nn.Module):
         # This produced the best val_bpb (1.4291). Absolute MSE consistently worse.
         if self.training:
             z_norm_sq = z.detach().float().pow(2).sum().clamp_min(1.0)
-            if y_acc is not None:
-                self._convergence_loss = (y_acc - z).float().pow(2).sum() / z_norm_sq
-            elif z_prev is not None:
+            if z_prev is not None:
                 self._convergence_loss = (z - z_prev).float().pow(2).sum() / z_norm_sq
+            elif y_acc is not None:
+                self._convergence_loss = (y_acc - z).float().pow(2).sum() / z_norm_sq
             else:
                 f_z = self.shared_block(z, x0_refined)
                 self._convergence_loss = (z - f_z).float().pow(2).sum() / z_norm_sq
