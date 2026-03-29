@@ -698,11 +698,6 @@ class CausalSelfAttention(nn.Module):
             q_full, k_full, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-        # XSA (Exclusive Self-Attention, arxiv:2603.09078): project out self-value direction
-        # Removes attention-to-self bias, improves context modeling. Zero params.
-        v_xsa = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1) if self.num_kv_heads != self.num_heads else v
-        vn = F.normalize(v_xsa, dim=-1)
-        y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
         # Gated attention: query-dependent per-head gate (arxiv:2505.06708)
         y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
