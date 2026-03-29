@@ -754,94 +754,104 @@ def _fsq_ste(x: Tensor, num_levels: int, training: bool) -> Tensor:
 class MoSHead(nn.Module):
     """Mixture-of-Softmaxes dual head (Constraint #4+#5).
 
-    Shared low-rank experts produce dual predictions:
-    - CTP (denoising): predict current token via B_denoise
-    - NTP (next-token): predict next token via B_NTP
-
-    Uses frozen expert (backbone embedding) + trainable low-rank experts.
+    Architecture: shared experts + specialized experts per head.
+    - Shared experts: used by BOTH CTP and NTP (parameter efficient)
+    - CTP-specialized expert: only for denoising head
+    - NTP-specialized expert: only for next-token head
     FSQ applied in intermediate space (Constraint #4).
     """
     def __init__(self, d_model: int, vocab_size: int, rank: int = 64,
-                 num_experts: int = 2, fsq_levels: int = 8):
+                 num_shared: int = 2, num_specialized: int = 1, fsq_levels: int = 8):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.rank = rank
-        self.num_experts = num_experts
+        self.num_shared = num_shared
+        self.num_specialized = num_specialized
+        self.num_experts = num_shared + num_specialized  # per head
         self.fsq_levels = fsq_levels
-        # Gate: 1 frozen + num_experts trainable
-        self.gate = nn.Linear(d_model, 1 + num_experts, bias=True)
-        # Shared A matrices per expert: [E, d_model, rank]
-        self.A = nn.Parameter(torch.empty(num_experts, d_model, rank))
-        # Dual B matrices: separate for CTP and NTP
+        # Gate: routes over shared + specialized experts per head
+        # CTP gate: num_shared + num_specialized
+        # NTP gate: num_shared + num_specialized (different specialized)
+        self.gate_ctp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
+        self.gate_ntp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
+        # Shared A projections: [num_shared, d_model, rank]
+        self.A_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
+        # Specialized A projections: 1 for CTP, 1 for NTP
+        self.A_ctp = nn.Parameter(torch.empty(num_specialized, d_model, rank))
+        self.A_ntp = nn.Parameter(torch.empty(num_specialized, d_model, rank))
+        # Dual B matrices (shared across all experts within each head)
         self.B_denoise = nn.Parameter(torch.empty(vocab_size, rank))
         self.B_NTP = nn.Parameter(torch.empty(vocab_size, rank))
-        # FSQ scale (Constraint #4): applied in low-rank space
-        self.fsq_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         self._init_params()
 
     def _init_params(self):
-        nn.init.zeros_(self.gate.weight)
-        nn.init.zeros_(self.gate.bias)
-        self.gate.bias.data[0] = 2.0  # frozen expert starts favored
-        for e in range(self.num_experts):
-            nn.init.xavier_uniform_(self.A.data[e])
-        # B initialized to zeros — trainable experts contribute nothing at init
-        nn.init.zeros_(self.B_denoise)
-        nn.init.zeros_(self.B_NTP)
+        for gate in [self.gate_ctp, self.gate_ntp]:
+            nn.init.normal_(gate.weight, std=0.01)
+            nn.init.zeros_(gate.bias)
+        for A in [self.A_shared, self.A_ctp, self.A_ntp]:
+            for e in range(A.shape[0]):
+                nn.init.xavier_uniform_(A.data[e])
+        nn.init.xavier_uniform_(self.B_denoise)
+        nn.init.xavier_uniform_(self.B_NTP)
 
     def init_from_embedding(self, embed_weight: Tensor):
         """Initialize from backbone embedding via SVD."""
         W = embed_weight.float().cpu()
         U, S, Vt = torch.linalg.svd(W, full_matrices=False)
         r = self.rank
-        A_base = Vt[:r, :].T.contiguous()  # [d_model, rank]
-        B_init = U[:, :r] * S[:r].unsqueeze(0)  # [vocab, rank]
-        dev, dt = self.A.device, self.A.dtype
-        self.A.data.copy_(A_base.to(dev, dt).unsqueeze(0).expand(self.num_experts, -1, -1).contiguous())
+        A_base = Vt[:r, :].T.contiguous()
+        B_init = U[:, :r] * S[:r].unsqueeze(0)
+        dev, dt = self.A_shared.device, self.A_shared.dtype
+        for A in [self.A_shared, self.A_ctp, self.A_ntp]:
+            A.data.copy_(A_base.to(dev, dt).unsqueeze(0).expand(A.shape[0], -1, -1).contiguous())
         self.B_denoise.data.copy_(B_init.to(dev, dt))
         self.B_NTP.data.copy_(B_init.to(dev, dt))
 
     def _fsq(self, x: Tensor) -> Tensor:
         return _fsq_ste(x, self.fsq_levels, self.training)
 
-    def forward(self, h: Tensor, frozen_W: Tensor) -> tuple[Tensor, Tensor]:
+    def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
+                      A_spec: Tensor, B: Tensor) -> Tensor:
+        """Compute log-probs for one head (CTP or NTP)."""
+        N = x.shape[0]
+        alpha = F.softmax(gate(x).float(), dim=-1)  # [N, num_shared+num_spec]
+        log_alpha = alpha.clamp(min=1e-8).log()
+        log_p = x.new_full((N, self.vocab_size), -torch.inf, dtype=torch.float32)
+        # Shared experts
+        for e in range(self.num_shared):
+            u = self._fsq(x.to(A_shared.dtype) @ A_shared[e])
+            logits = u.to(B.dtype) @ B.t()
+            log_p = torch.logaddexp(log_p, log_alpha[:, e:e+1] + F.log_softmax(logits.float(), dim=-1))
+        # Specialized experts
+        for e in range(self.num_specialized):
+            u = self._fsq(x.to(A_spec.dtype) @ A_spec[e])
+            logits = u.to(B.dtype) @ B.t()
+            idx = self.num_shared + e
+            log_p = torch.logaddexp(log_p, log_alpha[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
+        return log_p, alpha
+
+    def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         """Return (log_p_denoise, log_p_ntp), each [*, V]."""
         orig_shape = h.shape[:-1]
-        x = h.reshape(-1, self.d_model)  # [N, d]
+        x = h.reshape(-1, self.d_model)
 
-        # Gate: mixture weights (1 frozen + E trainable)
-        alpha = F.softmax(self.gate(x).float(), dim=-1)  # [N, 1+E]
-        log_alpha = alpha.log()
+        log_p_d, alpha_d = self._head_forward(x, self.gate_ctp, self.A_shared, self.A_ctp, self.B_denoise)
+        log_p_n, alpha_n = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
 
-        # Sparsity + balance regularization on gate weights
         if self.training:
-            mean_alpha = alpha.mean(dim=0)  # [1+E]
-            target = torch.ones_like(mean_alpha) / (1 + self.num_experts)
-            self._balance_loss = F.mse_loss(mean_alpha, target)
-            self._sparsity_loss = alpha.abs().mean()
+            bal = torch.tensor(0.0, device=x.device)
+            spar = torch.tensor(0.0, device=x.device)
+            for alpha in [alpha_d, alpha_n]:
+                mean_a = alpha.mean(dim=0)
+                target = torch.ones_like(mean_a) / alpha.shape[-1]
+                bal = bal + F.mse_loss(mean_a, target)
+                spar = spar + alpha.abs().mean()
+            self._balance_loss = bal
+            self._sparsity_loss = spar
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
-
-        # Frozen expert: full-rank h @ W^T (same for both heads)
-        logits_frozen = x.float() @ frozen_W.float().t()
-        log_pe_frozen = F.log_softmax(logits_frozen, dim=-1)
-        la_frozen = log_alpha[:, 0:1]
-        log_p_d = la_frozen + log_pe_frozen
-        log_p_n = la_frozen + log_pe_frozen
-
-        # Trainable experts: low-rank with FSQ
-        for e in range(self.num_experts):
-            u = x.to(self.A.dtype) @ self.A[e]
-            u = self._fsq(u)
-            logits_d = u.to(self.B_denoise.dtype) @ self.B_denoise.t()
-            logits_n = u.to(self.B_NTP.dtype) @ self.B_NTP.t()
-            log_pe_d = F.log_softmax(logits_d.float(), dim=-1)
-            log_pe_n = F.log_softmax(logits_n.float(), dim=-1)
-            la = log_alpha[:, 1 + e: 2 + e]
-            log_p_d = torch.logaddexp(log_p_d, la + log_pe_d)
-            log_p_n = torch.logaddexp(log_p_n, la + log_pe_n)
 
         return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
 
@@ -905,7 +915,7 @@ class GPT(nn.Module):
         # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
         self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
         # MoS output head (Constraints #4+#5): shared experts, dual B for CTP/NTP
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=64, num_experts=2, fsq_levels=8)
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=64, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm()
         self._init_weights()
 
@@ -924,17 +934,26 @@ class GPT(nn.Module):
         # Initialize MoS head from embedding weights
         self.mos_head.init_from_embedding(self.tok_emb.weight.data)
 
-    def _get_soft_embedding(self, z: Tensor) -> Tensor:
-        """Diffusion-AR: build soft embedding from current state predictions.
+    def _get_soft_embedding(self, z: Tensor, topk: int = 32) -> Tensor:
+        """Diffusion-AR: build soft embedding from CTP + NTP predictions.
 
-        Uses frozen expert (tok_emb) for stability. Full MoS predictions are
-        too noisy early in training and destabilize DEQ convergence.
+        For each position i, combines two signals via frozen expert:
+        - CTP[i] = h[i] @ W^T  →  predicts token at position i (from context 0..i)
+        - NTP[i-1] = h[i-1] @ W^T  →  predicts next token after i-1 (= token i)
+        Average logits, take top-k, build sparse soft embedding.
         """
         with torch.no_grad():
             h = self.final_norm(z)
             W = self.tok_emb.weight.data  # [V, d]
-            probs = F.softmax(h.float() @ W.float().t(), dim=-1)
-            soft_embed = probs @ W.float()  # [B, T, d]
+            logits = h.float() @ W.float().t()  # [B, T, V]
+            # CTP[i] = logits[i], NTP[i-1] shifted = logits[i-1]
+            logits_shifted = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+            avg_logits = 0.5 * (logits + logits_shifted)
+            # Top-k from combined distribution
+            topk_logits, topk_idx = avg_logits.topk(topk, dim=-1)  # [B, T, K]
+            topk_probs = F.softmax(topk_logits, dim=-1)
+            topk_embeds = F.embedding(topk_idx, W)  # [B, T, K, d]
+            soft_embed = (topk_probs.unsqueeze(-1) * topk_embeds).sum(-2)  # [B, T, d]
         return self.diffar_scale.to(dtype=z.dtype) * soft_embed.to(z.dtype)
 
     def _run_backbone(self, x: Tensor) -> Tensor:
@@ -1051,7 +1070,7 @@ class GPT(nn.Module):
         for w, n_exp in [
             (self.shared_block.mlp.fc.weight.float(), self.shared_block.mlp.num_experts),
             (self.shared_block.attn.proj.weight.float(), self.shared_block.attn.num_experts),
-            (self.mos_head.A.reshape(-1, self.mos_head.rank).float(), self.mos_head.num_experts),
+            (self.mos_head.A_shared.reshape(-1, self.mos_head.rank).float(), self.mos_head.num_shared),
         ]:
             if n_exp < 2:
                 continue
@@ -1065,7 +1084,7 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
-        log_p_ctp, log_p_ntp = self.mos_head(x, self.tok_emb.weight)
+        log_p_ctp, log_p_ntp = self.mos_head(x)
         V = self.tok_emb.num_embeddings
         ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
         ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
@@ -1078,7 +1097,7 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
-        _, log_p_ntp = self.mos_head(x, self.tok_emb.weight)
+        _, log_p_ntp = self.mos_head(x)
         return log_p_ntp
 
 
@@ -1295,7 +1314,10 @@ def main() -> None:
 
     # MoS head parameters: all go to Adam (A is 3D, not compatible with Muon)
     mos = base_model.mos_head
-    scalar_params.extend([mos.A, mos.B_denoise, mos.B_NTP, mos.gate.weight, mos.gate.bias, mos.fsq_scale])
+    # MoS head: all params go to Adam (3D A tensors not compatible with Muon)
+    mos_params = [mos.A_shared, mos.A_ctp, mos.A_ntp, mos.B_denoise, mos.B_NTP,
+                  mos.gate_ctp.weight, mos.gate_ctp.bias, mos.gate_ntp.weight, mos.gate_ntp.bias]
+    scalar_params.extend(mos_params)
 
     optimizer_tok = torch.optim.AdamW(
         tok_params,
