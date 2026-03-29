@@ -1263,10 +1263,12 @@ class GPT(nn.Module):
             else:
                 f_z = self.shared_block(z, x0_refined)
                 self._convergence_loss = ((z - f_z).float().pow(2).sum() / numel).sqrt() / z_rms
-            # Training diagnostics
+            # Training diagnostics — use RELATIVE convergence (||z_T - z_{T-1}|| / ||z_T||)
+            # so the metric is scale-invariant and meaningful as activations grow.
             if z_prev is not None:
+                z_norm_diag = z.detach().float().norm().clamp_min(1.0)
                 self._deq_residuals = [(z - z_prev).float().norm().item()]
-                self._deq_iter_convergence = self._deq_residuals[0]
+                self._deq_iter_convergence = self._deq_residuals[0] / z_norm_diag.item()
             if y_acc is not None:
                 self._deq_yz_gap = delta_con.item()
 
@@ -1274,8 +1276,9 @@ class GPT(nn.Module):
         if not self.training:
             with torch.no_grad():
                 f_z_final = self.shared_block(z, x0_refined)
+                z_norm_diag = z.float().norm().clamp_min(1.0).item()
                 self._deq_residuals = [(z - f_z_final).float().norm().item()]
-                self._deq_iter_convergence = (z - z_prev).float().norm().item()
+                self._deq_iter_convergence = (z - z_prev).float().norm().item() / z_norm_diag
                 # fp64 backward reconstruction of last DEQ solve
                 z_init_64 = (x0_refined if self.num_refinements > 0 else x0).to(torch.float64)
                 yr_acc, zr_acc = y_acc.clone(), z_acc.clone()
