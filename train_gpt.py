@@ -62,7 +62,7 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", 2))  # DEQ solver iters per refinement step
     num_refinements = int(os.environ.get("NUM_REFINEMENTS", 1))  # predict→soft_embed→re-encode cycles
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 896))
+    model_dim = int(os.environ.get("MODEL_DIM", 640))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 2.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -89,7 +89,7 @@ class Hyperparameters:
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 65536))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 192))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 160))
     kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 0))  # 0 = auto (dim//2)
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
