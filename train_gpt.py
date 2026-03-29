@@ -796,17 +796,12 @@ class MoSHead(nn.Module):
         nn.init.xavier_uniform_(self.B_NTP)
 
     def init_from_embedding(self, embed_weight: Tensor):
-        """Initialize from backbone embedding via SVD."""
-        W = embed_weight.float().cpu()
-        U, S, Vt = torch.linalg.svd(W, full_matrices=False)
-        r = self.rank
-        A_base = Vt[:r, :].T.contiguous()
-        B_init = U[:, :r] * S[:r].unsqueeze(0)
-        dev, dt = self.A_shared.device, self.A_shared.dtype
-        for A in [self.A_shared, self.A_ctp, self.A_ntp]:
-            A.data.copy_(A_base.to(dev, dt).unsqueeze(0).expand(A.shape[0], -1, -1).contiguous())
-        self.B_denoise.data.copy_(B_init.to(dev, dt))
-        self.B_NTP.data.copy_(B_init.to(dev, dt))
+        """No-op: all params use xavier init from _init_params (training from scratch).
+
+        SVD init was removed because it biases shared experts toward current-token
+        prediction, creating a CTP/NTP gradient conflict.
+        """
+        pass
 
     def _fsq(self, x: Tensor) -> Tensor:
         return _fsq_ste(x, self.fsq_levels, self.training)
@@ -915,7 +910,7 @@ class GPT(nn.Module):
         # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
         self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
         # MoS output head (Constraints #4+#5): shared experts, dual B for CTP/NTP
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=64, num_shared=2, num_specialized=1, fsq_levels=8)
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm()
         self._init_weights()
 
