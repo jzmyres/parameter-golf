@@ -1152,12 +1152,15 @@ class GPT(nn.Module):
         - NTP[i-1] from MoSHead: predicts next token after i-1 (= token i)
         Mix probabilities, take top-k, build sparse soft embedding.
         """
-        with torch.no_grad(), torch.autocast(device_type=z.device.type, enabled=False):
+        with torch.no_grad():
             h = self.final_norm(z)
             was_training = self.mos_head.training
             self.mos_head.train(False)
-            log_p_ctp, log_p_ntp = self.mos_head(h.float())  # [B,T,V] log-probs
+            log_p_ctp, log_p_ntp = self.mos_head(h)  # [B,T,V] log-probs
             self.mos_head.train(was_training)
+            # Clear autocast cache to prevent stale weight caching from poisoning
+            # subsequent calls with gradients enabled (PyTorch autocast bug).
+            torch.clear_autocast_cache()
 
             log_p_ntp_shifted = torch.cat([log_p_ntp[:, :1], log_p_ntp[:, :-1]], dim=1)
             p_mix = 0.5 * (log_p_ctp.float().exp() + log_p_ntp_shifted.float().exp())
