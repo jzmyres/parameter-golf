@@ -874,7 +874,8 @@ class GPT(nn.Module):
         self._deq_residuals: list[float] = []
 
         z_prev_iter = z
-        z_hist_acc = [z_acc.clone()]  # accumulator history for reconstruction
+        # Only store fp64 history during eval (saves VRAM during training)
+        z_hist_acc = [z_acc.clone()] if not self.training else []
         for t in range(self.num_layers):
             z_prev_iter = z
             # Diffusion-AR: refine input using current state (soft denoising)
@@ -891,7 +892,8 @@ class GPT(nn.Module):
             f_y = self.shared_block(y, x0_refined)
             z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
             z = z_acc.to(dtype)
-            z_hist_acc.append(z_acc.clone())
+            if not self.training:
+                z_hist_acc.append(z_acc.clone())
 
         # Convergence loss for training (encourage fixed-point convergence)
         if self.training:
