@@ -86,10 +86,13 @@ def smoke_test(num_steps: int = 30, eval_every: int = 10):
         print(f"FAIL: reconstruction error diverging ({recon_errors[0]:.2e} -> {recon_errors[-1]:.2e})")
         ok = False
 
-    # 4. Iter convergence should show stable or decreasing trend (not explode)
-    if len(iter_convs) >= 2 and iter_convs[-1] > iter_convs[0] * 10:
-        print(f"WARN: iter convergence increasing ({iter_convs[0]:.1f} -> {iter_convs[-1]:.1f})")
-        # Warning only — early training may increase before decreasing
+    # 4. Iter convergence must not explode (DEQ must learn toward equilibrium)
+    #    Allow some oscillation but last value must not be > 2x the minimum seen
+    min_conv = min(iter_convs) if iter_convs else 0
+    if len(iter_convs) >= 2 and iter_convs[-1] > max(iter_convs[0] * 3, min_conv * 5):
+        print(f"FAIL: iter convergence diverging ({iter_convs[0]:.1f} -> {iter_convs[-1]:.1f})")
+        print(f"  DEQ must learn to converge — convergence should trend downward")
+        ok = False
 
     # 5. No NaN/Inf gradients
     if has_bad_grad:

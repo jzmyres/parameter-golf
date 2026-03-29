@@ -149,9 +149,13 @@ d4e5f6g	0.000000	0	crash	soft routing OOM
   - `z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}, x0)`
 - **fp64 accumulators** for add/subtract operations (paper recommendation) — ensures exact reversibility
 - **Reconstruction error MUST be < 1e-8** (verified by smoke test before every run)
-- **Convergence regularization**: 0.01 * ||z_T - z_{T-1}||²/||z_T||² added to loss to encourage fixed-point convergence
+- **Convergence regularization**: 1.0 * ||z_T - z_{T-1}||²/||z_T||² added to loss to encourage fixed-point convergence
 - Track: equilibrium residual `||z - f(z)||`, reconstruction error, and iter convergence `||z_T - z_{T-1}||`
-- Smoke test (`experiments/smoke_test.py`) MUST pass before any long training run
+- Smoke test (`experiments/smoke_test.py`) MUST pass before any long training run:
+  - Recon error < 1e-8 (HARD)
+  - Iter convergence must not diverge > 3x from initial (trending toward equilibrium)
+  - Loss must not increase by > 0.5
+  - No NaN/Inf gradients
 
 ### 2. Soft Dense Routing (Dense MoE — no sparsity)
 - Inspired by Soft MoE (arxiv:2308.00951) but fully dense — ALL experts process ALL tokens

@@ -938,7 +938,7 @@ class GPT(nn.Module):
         ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         # DEQ convergence regularization: encourage ||z_T - z_{T-1}|| → 0
         conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ce_loss.device))
-        return ce_loss + 0.01 * conv_loss
+        return ce_loss + 1.0 * conv_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
