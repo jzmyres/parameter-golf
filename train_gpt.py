@@ -287,7 +287,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
         "CONTROL_TENSOR_NAME_PATTERNS",
         # Keep only small control tensors in fp32. Avoid broad substrings like "expert_gate"
         # which can match large expert weight tensors (e.g., shared_block.mlp.expert_gate).
-        "attn_gate_logit,mlp_gate_logit,resid_mix,resid_mixes,q_gain,"
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,"
         "skip_weight,skip_weights,smear.gate,bigram.scale,diffar_scale,gate_bias,"
         "expert_gate_logits,expert_gate_ctp_logits,expert_gate_ntp_logits",
     ).split(",")
@@ -930,23 +930,18 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.mlp = MLP(dim, mlp_mult)
-        # Gated residual for DEQ stability: x_out = (1-g)*x + g*f(x)
-        # Convex combination ensures ||x_out|| ≤ max(||x||, ||f(x)||) — naturally bounded.
-        # Init gate_logit=-4 → sigmoid≈0.018 → near-identity (DEQ warm start safe).
-        # Aligns with coupled-state damping: z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}).
-        self.attn_gate_logit = nn.Parameter(torch.full((dim,), -4.0, dtype=torch.float32))
-        self.mlp_gate_logit = nn.Parameter(torch.full((dim,), -4.0, dtype=torch.float32))
+        # Small init for DEQ stability — block starts as near-identity
+        self.attn_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_gate = torch.sigmoid(self.attn_gate_logit).to(dtype=x.dtype)[None, None, :]
         attn_out = self.attn(self.attn_norm(x))
-        x = (1 - attn_gate) * x + attn_gate * attn_out
-        mlp_gate = torch.sigmoid(self.mlp_gate_logit).to(dtype=x.dtype)[None, None, :]
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_out = self.mlp(self.mlp_norm(x))
-        x = (1 - mlp_gate) * x + mlp_gate * mlp_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 
