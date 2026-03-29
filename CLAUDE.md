@@ -162,61 +162,78 @@ c3d4e5f	1.150000	16100000	discard	MLA attention (artifact too large)
 d4e5f6g	0.000000	0	crash	soft routing OOM
 ```
 
+## Optimization Goal
+
+Find the architecture that satisfies ALL constraints below while yielding **optimal val_bpb**.
+Optimize for **throughput** (steps/sec) and **convergence rate** (bpb/step) — both directly improve final perf within the fixed time budget.
+
+When proposing architecture improvements:
+- Include references to papers and git repos for verification
+- Test specific claims (e.g., where to place gates, what initialization helps)
+- Measure throughput impact — a 5% bpb improvement that costs 20% throughput may net negative
+
 ## Architectural Constraints (MUST SATISFY)
 
 ### 1. RevDEQ (Reversible Deep Equilibrium Model)
 - Paper: https://arxiv.org/abs/2509.12917
+- Reference: `/home/mzhong4/work/research/rdeq/WIP-ARWDEQ/code/arwdeq/qwen3_utmoe_revdeq.py`
 - The main transformer backbone MUST use RevDEQ: model output defined as fixed point of a learned function
 - **Coupled-state iteration** with relaxation beta=0.5:
   - `y_{n+1} = (1-beta)*y_n + beta*f(z_n, x0)`
   - `z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}, x0)`
-- **fp64 accumulators** for add/subtract operations (paper recommendation) — ensures exact reversibility
+- **Warm start**: y₀=x, z₀=x where x is the **soft embedding** — initially one-hot token embedding, iteratively updated by CTP/NTP predictions across DEQ iterations
+- **fp64 accumulators** for add/subtract operations — ensures exact reversibility
 - **Reconstruction error MUST be < 1e-8** (verified by smoke test before every run)
-- **Convergence regularization**: 1.0 * ||z_T - z_{T-1}||²/||z_T||² added to loss to encourage fixed-point convergence
-- Track: equilibrium residual `||z - f(z)||`, reconstruction error, and iter convergence `||z_T - z_{T-1}||`
-- Smoke test (`experiments/smoke_test.py`) MUST pass before any long training run:
+- **Convergence regularization**: 1.0 * ||z_T - z_{T-1}||²/||z_T||² added to loss
+- Track: equilibrium residual, reconstruction error, iter convergence
+- Smoke test MUST pass before any long training run:
   - Recon error < 1e-8 (HARD)
-  - Iter convergence must not diverge > 3x from initial (trending toward equilibrium)
-  - Loss must not increase by > 0.5
+  - Iter convergence must not diverge > 3x from initial
+  - Loss must decrease
   - No NaN/Inf gradients
 
-### 2. Soft Dense Routing (Dense MoE — no sparsity)
-- Inspired by Soft MoE (arxiv:2308.00951) but fully dense — ALL experts process ALL tokens
-- No top-k selection, no token dropping, no sparse gating
-- Routing weights via softmax over experts, with **sigmoid gating** to break convex constraint:
-  - Per-expert sigmoid gate AFTER softmax routing: `effective_weight = sigmoid(gate_i) * softmax_weight_i`
-  - This allows the model to "skip" experts by driving sigmoid gate toward 0
-  - Learned gate scalars per expert, initialized near 0 (sigmoid ≈ 0.5)
+### 2. Soft Dense Routing (Dense MoE)
+- Paper: Soft MoE (arxiv:2308.00951) — adapted for dense routing
+- ALL experts process ALL tokens — no top-k selection, no token dropping
+- Routing weights via softmax + input-dependent sigmoid gate
+- **Sparsity is NOT hard-required** but encouraged via regularization:
+  - **Per-token sparsity**: L1 on routing weights encourages each token to concentrate on fewer experts
+  - **Global balance**: across all tokens, expert usage should be balanced (MSE or CV loss)
+  - This applies to ALL expert groups: MLP experts AND MoS head experts
 - Fully differentiable, no discrete routing decisions
 
-### 3. Multi-head Latent Attention (MLA) with Gated Attention — DeepSeek
-- Replace standard MHA/GQA with MLA
+### 3. Multi-head Latent Attention (MLA) with Gated Attention
+- Paper (MLA): DeepSeek-V2 (arxiv:2405.04434)
+- Paper (Gated Attn): "Gated Attention for Large Language Models" (arxiv:2505.06708)
+  - Repo: https://github.com/YuchuanTian/GatedAttn (NeurIPS 2025 Best Paper)
 - Low-rank KV compression: project to latent space, cache compressed, decompress on-the-fly
 - Decoupled RoPE: split heads into RoPE and non-RoPE components
-- Absorb decompression into subsequent linear layers where possible
-- **Gated Attention** (arxiv:2505.06708): apply head-specific sigmoid gate after SDPA
-  - Query-dependent sparse gating scores modulate attention output per head
-  - Mitigates attention sinks, improves long-context performance
-  - Enables larger learning rates and better training stability
-  - Negligible parameter overhead (one gate vector per head)
+- **Gated Attention**: query-dependent per-head sigmoid gate after SDPA
+  - Gate logits from expanded Q projection: `c_q outputs dim + num_heads`
+  - Each token gets its own gate value per head (NOT a fixed scalar)
+  - The paper claims: (1) mitigates attention sinks, (2) enables larger LR, (3) improves stability
+  - **Test these claims** — verify the gate position (after SDPA, before output proj) improves perf
+  - If a different gate position works better, document the finding
 
 ### 4. FSQ (Finite Scalar Quantization) in MoS Head
-- Apply FSQ in an intermediate projection space within the MoS output head
-- FSQ discretizes continuous values to a finite set of scalars via STE
-- Low-rank is NOT required — rank can be tuned as long as 16MB artifact size is met
+- Paper: FSQ (arxiv:2309.15505)
+- Apply FSQ via STE in an intermediate projection space within the MoS output head
+- Rank is flexible — tune as long as 16MB artifact size is met
 - With V=1024, even full-rank projections are affordable (~917K params = 3.5MB fp16)
 
-### 5. Diffusion-AR (Autoregressive + Single-Step Diffusion)
-- Each DEQ iteration incorporates a diffusion-like denoising step
-- The model refines soft token predictions across iterations
-- AR-like: step i+1 depends on step i via shared KV state
-- Diffusion-like: each step starts from a noisy soft distribution and denoises
+### 5. Diffusion-AR (Autoregressive + Iterative Refinement)
+- Reference: `/home/mzhong4/work/research/tsu/WIP-TSU/code/model.py`
+- **Iterative soft embedding refinement** across DEQ iterations:
+  - Iter 0: x₀ = tok_emb(input_ids) — one-hot embedding lookup
+  - After iter 0: MoS head produces CTP and NTP predictions (top-k probabilities)
+  - Iter 1+: x₀ refined with soft embedding from top-k predictions → weighted sum of embeddings
+  - This creates a predict → refine → predict loop across DEQ iterations
 - **Dual-head prediction** (REQUIRED):
-  - **CTP (Current Token Prediction)**: denoise the current position's soft embedding → predict the current token
-  - **NTP (Next Token Prediction)**: standard autoregressive next-token prediction
-  - Both losses contribute to training; each position produces 2 predictions from separate heads
-  - CTP is feasible with causal attention (token at position i attends to 0..i including itself)
-  - Track and plot CTP and NTP losses separately in experiments/metrics_comparison.png
+  - **CTP (Current Token Prediction)**: predict current token (denoising head)
+  - **NTP (Next Token Prediction)**: predict next token (standard AR head)
+  - Both from MoS head with shared experts + separate B matrices (B_denoise, B_NTP)
+  - CTP is feasible with causal attention (token at position i attends to 0..i)
+  - Track and plot CTP and NTP losses separately
 
 ### 6. Parameter Golf Hard Constraints (ENFORCED)
 - Artifact size <= 16,000,000 bytes (code + compressed model)
@@ -224,7 +241,7 @@ d4e5f6g	0.000000	0	crash	soft routing OOM
 - Must use FineWeb validation set for evaluation
 - Tokenizer: SentencePiece BPE, vocab=1024
 
-### 5. DDP Compatibility
+### 7. DDP Compatibility
 - All code MUST work with both single-GPU and multi-GPU (torchrun DDP)
 - Dev on 1-2x L40S, validate on 8xH100
 - Never use GPU-count-specific logic without proper world_size handling
