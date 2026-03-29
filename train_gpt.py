@@ -1152,11 +1152,11 @@ class GPT(nn.Module):
         - NTP[i-1] from MoSHead: predicts next token after i-1 (= token i)
         Mix probabilities, take top-k, build sparse soft embedding.
         """
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type=z.device.type, enabled=False):
             h = self.final_norm(z)
             was_training = self.mos_head.training
             self.mos_head.train(False)
-            log_p_ctp, log_p_ntp = self.mos_head(h)  # [B,T,V] log-probs
+            log_p_ctp, log_p_ntp = self.mos_head(h.float())  # [B,T,V] log-probs
             self.mos_head.train(was_training)
 
             log_p_ntp_shifted = torch.cat([log_p_ntp[:, :1], log_p_ntp[:, :-1]], dim=1)
@@ -1850,7 +1850,7 @@ def main() -> None:
 
     # Save metadata for weight tracking
     if master_process:
-        import json, subprocess
+        import json
         git_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                                   capture_output=True, text=True, cwd=os.path.dirname(__file__)).stdout.strip()
         meta = {
