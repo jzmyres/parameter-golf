@@ -117,21 +117,26 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
 6. Read results: `grep "val_bpb:\|peak_vram_mb:\|artifact.*bytes" run.log`
 7. If grep empty -> crash. Run `tail -n 50 run.log`, attempt fix
 8. Log to `results.tsv` (do NOT commit results.tsv)
-9. **ALWAYS** run `bash experiments/update_results.sh` to rotate logs and regenerate plots:
-   - Rotates `current.log` → `previous.log` (preserves last iteration)
+9. **ALWAYS** run `bash experiments/update_results.sh` to rotate logs+weights and regenerate plots:
+   - Rotates `current.log` → `previous.log`, `current/weights` → `previous/weights`
    - Copies `run.log` → `current.log`
-   - Regenerates `metrics_comparison.png`, `metrics_previous.png`, `progress.png`, `progress_full.png`
-10. If val_bpb improved AND artifact <= 16MB -> run code review + `/simplify`, then keep
-11. If val_bpb equal or worse -> `git revert` to previous good state
-12. If new best: copy `current.log` → `baseline.log` (re-run baseline only when best changes)
+   - Regenerates all plots
+10. If val_bpb improved AND artifact <= 16MB:
+    - Run code review + `/simplify`, then keep
+    - Promote to baseline: `bash experiments/update_results.sh --promote`
     - **ALWAYS review + `/simplify` before committing improvements** to keep code clean
+11. If val_bpb equal or worse -> `git revert` to previous good state (weights stay in previous/)
 13. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
 
-### Logging & Plotting (REQUIRED every iteration)
-- **Training logs**: Save full stdout/stderr to `experiments/training_logs/`
-  - `baseline.log` — the current best config (re-run when best changes)
-  - `previous.log` — the last iteration's log (auto-rotated by `update_results.sh`)
-  - `current.log` — the current experiment being tested
+### Logging, Weights & Plotting (REQUIRED every iteration)
+- **Training logs**: `experiments/training_logs/`
+  - `baseline.log` — best config (promoted via `--promote`)
+  - `previous.log` — last iteration (auto-rotated)
+  - `current.log` — this iteration
+- **Model weights**: `experiments/weights/`
+  - `baseline/` — best config weights (promoted via `--promote`)
+  - `previous/` — last iteration weights (auto-rotated)
+  - `current/` — this iteration weights (written by train_gpt.py)
 - **Metrics comparison**: After each iteration, run `python experiments/plot_metrics.py` to generate `experiments/metrics_comparison.png`
   - 4x3 grid with FULL TRAINING CURVES (not just final values):
     - Row 1: Train Loss curve, Val BPB curve, Step Avg (ms) curve

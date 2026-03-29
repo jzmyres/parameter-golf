@@ -12,6 +12,8 @@ logs/
 # Autoresearch generated outputs
 results.tsv
 run.log
+final_model.*
 experiments/training_logs/
+experiments/weights/
 experiments/*.png
-experiments/final_model.*
+experiments/__pycache__/

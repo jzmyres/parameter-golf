@@ -1482,11 +1482,11 @@ def main() -> None:
         base_model.load_state_dict(avg_state, strict=True)
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
-    # All autoresearch outputs go to experiments/
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiments")
-    os.makedirs(out_dir, exist_ok=True)
-    model_path = os.path.join(out_dir, "final_model.pt")
-    quant_path = os.path.join(out_dir, "final_model.int6.ptz")
+    # Weights go to experiments/weights/current/ (rotated by update_results.sh)
+    weights_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiments", "weights", "current")
+    os.makedirs(weights_dir, exist_ok=True)
+    model_path = os.path.join(weights_dir, "final_model.pt")
+    quant_path = os.path.join(weights_dir, "final_model.int6.ptz")
 
     if master_process:
         torch.save(base_model.state_dict(), model_path)
@@ -1548,6 +1548,26 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int6_{_COMPRESSOR}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Save metadata for weight tracking
+    if master_process:
+        import json, subprocess
+        git_hash = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                  capture_output=True, text=True, cwd=os.path.dirname(__file__)).stdout.strip()
+        meta = {
+            "git_commit": git_hash,
+            "val_bpb": round(q_val_bpb, 8),
+            "val_loss": round(q_val_loss, 8),
+            "artifact_bytes": quant_file_bytes + code_bytes,
+            "quant_bytes": quant_file_bytes,
+            "steps": step,
+            "train_time_s": round(approx_training_time_ms / 1000, 1),
+            "params": sum(p.numel() for p in base_model.parameters()),
+        }
+        meta_path = os.path.join(weights_dir, "meta.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        log0(f"Saved weight metadata to {meta_path}")
 
     if distributed:
         dist.destroy_process_group()
