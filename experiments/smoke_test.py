@@ -87,10 +87,8 @@ def smoke_test(num_steps: int = 30, eval_every: int = 10):
         ok = False
 
     # 4. Iter convergence must not explode (DEQ must learn toward equilibrium)
-    #    Allow some oscillation but last value must not be > 2x the minimum seen
-    min_conv = min(iter_convs) if iter_convs else 0
-    if len(iter_convs) >= 2 and iter_convs[-1] > max(iter_convs[0] * 3, min_conv * 5):
-        print(f"FAIL: iter convergence diverging ({iter_convs[0]:.1f} -> {iter_convs[-1]:.1f})")
+    if len(iter_convs) >= 2 and iter_convs[-1] > iter_convs[0] * 3:
+        print(f"FAIL: iter convergence diverging ({iter_convs[0]:.1f} -> {iter_convs[-1]:.1f}, ratio={iter_convs[-1]/iter_convs[0]:.1f}x)")
         print(f"  DEQ must learn to converge — convergence should trend downward")
         ok = False
 

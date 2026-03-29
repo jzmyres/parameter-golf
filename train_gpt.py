@@ -856,15 +856,16 @@ class GPT(nn.Module):
         x0 = x
         beta = self.deq_beta
         dtype = x.dtype
-        # fp64 accumulators for exact reversibility (RevDEQ paper recommendation)
-        y64 = torch.zeros(x.shape, dtype=torch.float64, device=x.device)
-        z64 = torch.zeros(x.shape, dtype=torch.float64, device=x.device)
-        y = y64.to(dtype)
-        z = z64.to(dtype)
+        # fp64 accumulators for exact reversibility (recon < 1e-8)
+        acc_dtype = torch.float64
+        y_acc = torch.zeros(x.shape, dtype=acc_dtype, device=x.device)
+        z_acc = torch.zeros(x.shape, dtype=acc_dtype, device=x.device)
+        y = y_acc.to(dtype)
+        z = z_acc.to(dtype)
         self._deq_residuals: list[float] = []
 
         z_prev_iter = z
-        z_hist64 = [z64.clone()]  # fp64 history for reconstruction
+        z_hist_acc = [z_acc.clone()]  # accumulator history for reconstruction
         for t in range(self.num_layers):
             z_prev_iter = z
             # Diffusion-AR: refine input using current state (soft denoising)
@@ -874,14 +875,14 @@ class GPT(nn.Module):
             else:
                 x0_refined = x0
 
-            # Block in original dtype; fp64 accumulation for reversibility
+            # Block in original dtype; fp64 accumulation for exact reversibility
             f_z = self.shared_block(z, x0_refined)
-            y64 = (1 - beta) * y64 + beta * f_z.double()
-            y = y64.to(dtype)
+            y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
+            y = y_acc.to(dtype)
             f_y = self.shared_block(y, x0_refined)
-            z64 = (1 - beta) * z64 + beta * f_y.double()
-            z = z64.to(dtype)
-            z_hist64.append(z64.clone())
+            z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
+            z = z_acc.to(dtype)
+            z_hist_acc.append(z_acc.clone())
 
         # Convergence loss for training (encourage fixed-point convergence)
         if self.training:
@@ -896,21 +897,21 @@ class GPT(nn.Module):
                 self._deq_residuals = [residual]
                 iter_convergence = (z - z_prev_iter).float().norm().item()
                 self._deq_iter_convergence = iter_convergence
-                # fp64 backward reconstruction (recon < 1e-8 guaranteed)
-                yr64 = y64.clone()
-                zr64 = z64.clone()
+                # fp64 backward reconstruction (recon < 1e-8)
+                yr_acc = y_acc.clone()
+                zr_acc = z_acc.clone()
                 for t_rev in range(self.num_layers - 1, -1, -1):
                     if t_rev > 0:
-                        z_at = z_hist64[t_rev].to(dtype)
+                        z_at = z_hist_acc[t_rev].to(dtype)
                         x0r = x0 + self.diffar_up(F.silu(self.diffar_down(z_at)))
                     else:
                         x0r = x0
-                    f_yr = self.shared_block(yr64.to(dtype), x0r)
-                    zr64 = (zr64 - beta * f_yr.double()) / (1 - beta)
-                    f_zr = self.shared_block(zr64.to(dtype), x0r)
-                    yr64 = (yr64 - beta * f_zr.double()) / (1 - beta)
-                state_norm = max(z64.norm().item(), 1.0)
-                recon_error = (zr64.norm().item() + yr64.norm().item()) / state_norm
+                    f_yr = self.shared_block(yr_acc.to(dtype), x0r)
+                    zr_acc = (zr_acc - beta * f_yr.to(acc_dtype)) / (1 - beta)
+                    f_zr = self.shared_block(zr_acc.to(dtype), x0r)
+                    yr_acc = (yr_acc - beta * f_zr.to(acc_dtype)) / (1 - beta)
+                state_norm = max(z_acc.norm().item(), 1.0)
+                recon_error = (zr_acc.norm().item() + yr_acc.norm().item()) / state_norm
                 self._deq_recon_error = recon_error
         else:
             self._deq_residuals = []
