@@ -25,7 +25,7 @@ def plot_subset(rows, start_idx, title, outpath, annotate_best=True):
 
     for i, (bpb, status, desc) in enumerate(rows):
         x = start_idx + i + 1
-        if status == "keep":
+        if status in ("keep", "baseline"):
             xs_keep.append(x)
             ys_keep.append(bpb)
             if bpb < best_bpb:
@@ -68,7 +68,9 @@ def plot_subset(rows, start_idx, title, outpath, annotate_best=True):
 
 def main():
     script_dir = Path(__file__).resolve().parent
-    tsv = script_dir / "results.tsv"
+    project_root = script_dir.parent
+    # results.tsv lives in project root, not experiments/
+    tsv = project_root / "results.tsv"
     if not tsv.exists():
         print("No results.tsv found")
         return

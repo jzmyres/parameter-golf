@@ -176,8 +176,9 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
 
 if __name__ == "__main__":
     expdir = Path(__file__).resolve().parent
-    baseline = expdir / "training_logs" / "baseline.log"
-    current = expdir / "training_logs" / "current.log"
+    logdir = expdir / "training_logs"
+    baseline = logdir / "baseline.log"
+    current = logdir / "current.log"
 
     if not baseline.exists():
         print(f"No baseline log at {baseline}")
@@ -186,4 +187,15 @@ if __name__ == "__main__":
         print("No current log — using baseline for both")
         current = baseline
 
+    # Main plot: baseline vs current
     plot_comparison(str(baseline), str(current), str(expdir))
+
+    # If previous.log exists, also generate baseline vs previous for comparison
+    previous = logdir / "previous.log"
+    if previous.exists():
+        plot_comparison(str(baseline), str(previous), str(expdir))
+        import shutil
+        shutil.move(str(expdir / "metrics_comparison.png"), str(expdir / "metrics_previous.png"))
+        # Re-generate the main plot (baseline vs current)
+        plot_comparison(str(baseline), str(current), str(expdir))
+        print("Saved metrics_previous.png (baseline vs previous iteration)")

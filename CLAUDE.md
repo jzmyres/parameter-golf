@@ -15,6 +15,18 @@ Challenge: March 18 – April 30, 2026. Prize: $1M in OpenAI compute credits.
 - `data/` — Dataset and tokenizer (READ-ONLY, never modify)
 - `records/` — Historical leaderboard submissions (READ-ONLY reference)
 - `results.tsv` — Experiment log (untracked by git)
+- `experiments/update_results.sh` — Log rotation + plot regeneration (run after EVERY iteration)
+
+## Reference Implementations (READ-ONLY)
+- **RevDEQ**: `/home/mzhong4/work/research/rdeq/WIP-ARWDEQ/code/arwdeq/qwen3_utmoe_revdeq.py`
+  - RevDEQ solver with custom autograd.Function, fp64 accumulators, Kahan compensation
+  - Gated low-rank input injection: `z_hat = z + alpha * B(A(LN(x)))`
+  - Warm start: y0=x, z0=x (initialize solver state from input)
+- **TSU (CTP/NTP/MoS)**: `/home/mzhong4/work/research/tsu/WIP-TSU/code/model.py`
+  - MoSLowRankOutputHead: frozen expert + trainable low-rank experts, dual B matrices
+  - CTP labels: `_derive_ctp_labels(input_ids, k=0)` → current token prediction
+  - Dirichlet sampling: `sample_dirichlet_lowrank_topk()` for soft embedding
+  - TSUEmbedding: low-rank V→rank→d_model via SVD init
 
 ## Current SOTA
 val_bpb = 1.1194 (abaybektursun, 2026-03-23)
@@ -105,16 +117,19 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
 6. Read results: `grep "val_bpb:\|peak_vram_mb:\|artifact.*bytes" run.log`
 7. If grep empty -> crash. Run `tail -n 50 run.log`, attempt fix
 8. Log to `results.tsv` (do NOT commit results.tsv)
-9. If val_bpb improved AND artifact <= 16MB -> run `/simplify`, then keep
-10. If val_bpb equal or worse -> `git revert` to previous good state
-11. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
-12. **ALWAYS** update plots after EVERY iteration:
-   - `python experiments/plot_metrics.py` → `experiments/metrics_comparison.png`
-   - `python experiments/plot_progress.py` → `experiments/progress.png` + `experiments/progress_full.png`
+9. **ALWAYS** run `bash experiments/update_results.sh` to rotate logs and regenerate plots:
+   - Rotates `current.log` → `previous.log` (preserves last iteration)
+   - Copies `run.log` → `current.log`
+   - Regenerates `metrics_comparison.png`, `metrics_previous.png`, `progress.png`, `progress_full.png`
+10. If val_bpb improved AND artifact <= 16MB -> run `/simplify`, then keep
+11. If val_bpb equal or worse -> `git revert` to previous good state
+12. If new best: copy `current.log` → `baseline.log` (re-run baseline only when best changes)
+13. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
 
 ### Logging & Plotting (REQUIRED every iteration)
 - **Training logs**: Save full stdout/stderr to `experiments/training_logs/`
   - `baseline.log` — the current best config (re-run when best changes)
+  - `previous.log` — the last iteration's log (auto-rotated by `update_results.sh`)
   - `current.log` — the current experiment being tested
 - **Metrics comparison**: After each iteration, run `python experiments/plot_metrics.py` to generate `experiments/metrics_comparison.png`
   - 4x3 grid with FULL TRAINING CURVES (not just final values):
