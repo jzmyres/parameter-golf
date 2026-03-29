@@ -1138,12 +1138,6 @@ class GPT(nn.Module):
         # RevDEQ (Constraint #1): single shared block with coupled-state fixed-point iteration
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
-        # DEQ contraction: apply spectral normalization to all 2D+ weight matrices
-        # in the shared block. This bounds ||W||_2 ≤ 1, helping ensure f_theta is
-        # a contraction mapping for fixed-point convergence.
-        for module in self.shared_block.modules():
-            if isinstance(module, (nn.Linear, CastedLinear)):
-                torch.nn.utils.parametrizations.spectral_norm(module, name='weight')
         self.deq_beta = 0.5  # relaxation parameter (0.5 gives exact fp64 reconstruction)
         # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
         self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
