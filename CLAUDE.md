@@ -192,14 +192,15 @@ When proposing architecture improvements:
   - Loss must decrease
   - No NaN/Inf gradients
 
-### 2. Soft Dense Routing (Dense MoE)
+### 2. Soft Dense Routing (Dense MoE on ALL components)
 - Paper: Soft MoE (arxiv:2308.00951) — adapted for dense routing
 - ALL experts process ALL tokens — no top-k selection, no token dropping
 - Routing weights via softmax + input-dependent sigmoid gate
-- **Sparsity is NOT hard-required** but encouraged via regularization:
-  - **Per-token sparsity**: L1 on routing weights encourages each token to concentrate on fewer experts
-  - **Global balance**: across all tokens, expert usage should be balanced (MSE or CV loss)
-  - This applies to ALL expert groups: MLP experts AND MoS head experts
+- **Applied to ALL components**: attention output, MLP hidden, MoS output heads
+- **Regularization** (per-token sparsity + global balance + orthogonality):
+  - **Per-token sparsity**: L1 on routing weights (each token concentrates on fewer experts)
+  - **Global balance**: MSE between mean expert usage and uniform target
+  - **Expert orthogonality**: |cos_sim| between expert weight groups → 0 (not ±1)
 - Fully differentiable, no discrete routing decisions
 
 ### 3. Multi-head Latent Attention (MLA) with Gated Attention

@@ -548,15 +548,62 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+class SoftDenseRouter(nn.Module):
+    """Shared soft dense routing module for all MoE components.
+
+    Per-token routing: softmax weights × input-dependent sigmoid gates.
+    Provides sparsity (L1) + balance (MSE) regularization and diagnostics.
+    """
+    def __init__(self, dim: int, num_experts: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.router = CastedLinear(dim, num_experts, bias=False)
+        self.expert_gate = CastedLinear(dim, num_experts, bias=True)
+        # Small router init → near-uniform routing at start
+        nn.init.normal_(self.router.weight, std=0.01)
+        # Gate bias=1.0 → sigmoid≈0.73, experts start open (avoids suppression)
+        nn.init.zeros_(self.expert_gate.weight)
+        nn.init.constant_(self.expert_gate.bias, 1.0)
+        # Diagnostics (set during forward)
+        self._balance_loss = None
+        self._sparsity_loss = None
+        self._expert_usage = None
+        self._expert_entropy = None
+        self._expert_balance_cv = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Returns routing weights [*, num_experts]."""
+        route_logits = self.router(x)
+        route_weights = torch.softmax(route_logits, dim=-1)
+        eg = torch.sigmoid(self.expert_gate(x))
+        route_weights = route_weights * eg
+        if self.training:
+            mean_weights = route_weights.mean(dim=tuple(range(route_weights.ndim - 1)))
+            target = torch.ones_like(mean_weights) / self.num_experts
+            self._balance_loss = F.mse_loss(mean_weights, target)
+            self._sparsity_loss = route_weights.abs().mean()
+        else:
+            self._balance_loss = torch.tensor(0.0, device=x.device)
+            self._sparsity_loss = torch.tensor(0.0, device=x.device)
+            with torch.no_grad():
+                mean_weights = route_weights.mean(dim=tuple(range(route_weights.ndim - 1)))
+                self._expert_usage = mean_weights.float().cpu().tolist()
+                per_token_ent = -(route_weights * (route_weights + 1e-8).log()).sum(-1)
+                self._expert_entropy = per_token_ent.mean().item()
+                self._expert_balance_cv = (mean_weights.std() / mean_weights.mean()).item()
+        return route_weights
+
+
 class CausalSelfAttention(nn.Module):
-    """MLA with Gated Attention (Constraint #3).
+    """MLA with Gated Attention + Soft Dense Routing (Constraints #2, #3).
 
     - Low-rank KV compression via shared latent
     - Decoupled RoPE: half of head_dim for positional encoding
-    - Per-head sigmoid gate after SDPA
+    - Query-dependent per-head sigmoid gate after SDPA
+    - Soft dense routing on output projection (MoE for attention)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
-                 qk_gain_init: float, kv_latent_dim: int = 0):
+                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 2):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -565,6 +612,8 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        self.num_experts = num_experts
+        self.expert_size = dim // num_experts
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
 
@@ -585,6 +634,8 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
+        # Soft dense routing on attention output (MoE for attention)
+        self.attn_router = SoftDenseRouter(dim, num_experts)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -617,91 +668,38 @@ class CausalSelfAttention(nn.Module):
         # Gated attention: query-dependent per-head gate (arxiv:2505.06708)
         y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        # Soft dense routing on attention output
+        route_weights = self.attn_router(x)  # [B, T, E]
+        y = y.view(bsz, seqlen, self.num_experts, self.expert_size)
+        y = y * route_weights.unsqueeze(-1)
+        y = y.view(bsz, seqlen, dim)
         return self.proj(y)
 
 
 class MLP(nn.Module):
-    """SiLU-gated MLP with Soft Dense Routing (Constraint #2).
-
-    Dense MoE: the hidden dim is split into expert groups. All experts
-    process all tokens. Routing via softmax + per-expert sigmoid gate
-    allows the model to selectively suppress experts (breaks convex constraint).
-    """
+    """SiLU-gated MLP with Soft Dense Routing (Constraint #2)."""
     def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
         self.expert_size = hidden // num_experts
         self.gate_proj = CastedLinear(dim, hidden, bias=False)
-        self.gate_proj._qat_clip = 15  # int5 for MLP
+        self.gate_proj._qat_clip = 15
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.fc._qat_clip = 15
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
         self.proj._qat_clip = 15
-        # Soft Dense Routing: router + input-dependent per-expert sigmoid gate
-        self.router = CastedLinear(dim, num_experts, bias=False)
-        self.expert_gate = CastedLinear(dim, num_experts, bias=True)
-        nn.init.zeros_(self.expert_gate.weight)
-        nn.init.zeros_(self.expert_gate.bias)
+        self.mlp_router = SoftDenseRouter(dim, num_experts)
 
     def forward(self, x: Tensor) -> Tensor:
         h = F.silu(self.gate_proj(x)) * self.fc(x)
-        # Soft dense routing: all experts process all tokens
-        route_logits = self.router(x)  # (bsz, seq, E)
-        route_weights = torch.softmax(route_logits, dim=-1)
-        # Input-dependent per-expert sigmoid gate: allows skipping experts per-token
-        eg = torch.sigmoid(self.expert_gate(x))  # (bsz, seq, E)
-        route_weights = route_weights * eg  # (bsz, seq, E)
-
-        # Load balancing: encourage equal usage across experts
-        if self.training:
-            mean_weights = route_weights.mean(dim=(0, 1))  # (E,)
-            target = torch.ones_like(mean_weights) / self.num_experts
-            self._balance_loss = F.mse_loss(mean_weights, target)
-        else:
-            self._balance_loss = torch.tensor(0.0, device=x.device)
-
-        # Expert diagnostics (eval only)
-        if not self.training:
-            with torch.no_grad():
-                # Global usage balance (across all tokens) — want uniform
-                mean_weights = route_weights.mean(dim=(0, 1))
-                self._expert_usage = mean_weights.float().cpu().tolist()
-                # Per-token sparsity: low entropy = concentrated on few experts (good)
-                per_token_entropy = -(route_weights * (route_weights + 1e-8).log()).sum(-1)
-                self._expert_entropy = per_token_entropy.mean().item()
-                # Usage balance: CV of expert load (lower = more balanced)
-                self._expert_balance_cv = (mean_weights.std() / mean_weights.mean()).item()
-
-        # Apply routing to expert groups
+        route_weights = self.mlp_router(x)
         bsz, seq, hidden = h.shape
         h = h.view(bsz, seq, self.num_experts, self.expert_size)
         h = h * route_weights.unsqueeze(-1)
         h = h.view(bsz, seq, hidden)
         return self.proj(h)
-
-    def get_expert_diagnostics(self) -> dict:
-        """Return expert usage and orthogonality diagnostics."""
-        diag = {}
-        if hasattr(self, '_expert_usage'):
-            diag['usage'] = self._expert_usage
-        if hasattr(self, '_expert_entropy'):
-            diag['entropy'] = self._expert_entropy
-        if hasattr(self, '_expert_balance_cv'):
-            diag['balance_cv'] = self._expert_balance_cv
-        # Expert orthogonality: cosine similarity between expert weight groups
-        w = self.fc.weight.float()  # (hidden, dim)
-        group_w = w.view(self.num_experts, self.expert_size, -1)  # (E, expert_size, dim)
-        # Mean representation per expert
-        group_mean = group_w.mean(dim=1)  # (E, dim)
-        group_norm = group_mean / (group_mean.norm(dim=-1, keepdim=True) + 1e-8)
-        cos_sim = group_norm @ group_norm.T  # (E, E)
-        # Off-diagonal mean (should be ~0 for orthogonal)
-        mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=cos_sim.device)
-        # Absolute cosine similarity (want ~0 for orthogonal experts)
-        diag['ortho_cos_sim'] = cos_sim[mask].abs().mean().item()
-        return diag
 
 
 class SmearGate(nn.Module):
@@ -808,33 +806,44 @@ class MoSHead(nn.Module):
         return _fsq_ste(x, self.fsq_levels, self.training)
 
     def forward(self, h: Tensor, frozen_W: Tensor) -> tuple[Tensor, Tensor]:
-        """Return (log_p_denoise, log_p_ntp), each [N, V]."""
+        """Return (log_p_denoise, log_p_ntp), each [*, V]."""
+        orig_shape = h.shape[:-1]
         x = h.reshape(-1, self.d_model)  # [N, d]
-        N, V = x.shape[0], self.vocab_size
 
-        # Gate: mixture weights in log-space
-        log_alpha = F.log_softmax(self.gate(x).float(), dim=-1)  # [N, 1+E]
+        # Gate: mixture weights (1 frozen + E trainable)
+        alpha = F.softmax(self.gate(x).float(), dim=-1)  # [N, 1+E]
+        log_alpha = alpha.log()
+
+        # Sparsity + balance regularization on gate weights
+        if self.training:
+            mean_alpha = alpha.mean(dim=0)  # [1+E]
+            target = torch.ones_like(mean_alpha) / (1 + self.num_experts)
+            self._balance_loss = F.mse_loss(mean_alpha, target)
+            self._sparsity_loss = alpha.abs().mean()
+        else:
+            self._balance_loss = torch.tensor(0.0, device=x.device)
+            self._sparsity_loss = torch.tensor(0.0, device=x.device)
 
         # Frozen expert: full-rank h @ W^T (same for both heads)
         logits_frozen = x.float() @ frozen_W.float().t()
         log_pe_frozen = F.log_softmax(logits_frozen, dim=-1)
-        la_frozen = log_alpha[:, 0:1]  # [N, 1]
+        la_frozen = log_alpha[:, 0:1]
         log_p_d = la_frozen + log_pe_frozen
         log_p_n = la_frozen + log_pe_frozen
 
         # Trainable experts: low-rank with FSQ
         for e in range(self.num_experts):
-            u = x.to(self.A.dtype) @ self.A[e]  # [N, rank]
+            u = x.to(self.A.dtype) @ self.A[e]
             u = self._fsq(u)
             logits_d = u.to(self.B_denoise.dtype) @ self.B_denoise.t()
             logits_n = u.to(self.B_NTP.dtype) @ self.B_NTP.t()
             log_pe_d = F.log_softmax(logits_d.float(), dim=-1)
             log_pe_n = F.log_softmax(logits_n.float(), dim=-1)
-            la = log_alpha[:, 1 + e: 2 + e]  # [N, 1]
+            la = log_alpha[:, 1 + e: 2 + e]
             log_p_d = torch.logaddexp(log_p_d, la + log_pe_d)
             log_p_n = torch.logaddexp(log_p_n, la + log_pe_n)
 
-        return log_p_d, log_p_n
+        return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
 
 
 class Block(nn.Module):
@@ -916,15 +925,15 @@ class GPT(nn.Module):
         self.mos_head.init_from_embedding(self.tok_emb.weight.data)
 
     def _get_soft_embedding(self, z: Tensor) -> Tensor:
-        """Diffusion-AR: build soft embedding from predicted token distribution.
+        """Diffusion-AR: build soft embedding from current state predictions.
 
-        With V=1024, direct matmul (probs @ W) is faster than top-k + gather.
+        Uses frozen expert (tok_emb) for stability. Full MoS predictions are
+        too noisy early in training and destabilize DEQ convergence.
         """
         with torch.no_grad():
             h = self.final_norm(z)
             W = self.tok_emb.weight.data  # [V, d]
-            logits = h.float() @ W.float().t()  # [B, T, V]
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(h.float() @ W.float().t(), dim=-1)
             soft_embed = probs @ W.float()  # [B, T, d]
         return self.diffar_scale.to(dtype=z.dtype) * soft_embed.to(z.dtype)
 
@@ -1020,6 +1029,34 @@ class GPT(nn.Module):
         x = self._run_backbone(x)
         return self.final_norm(x)
 
+    def _collect_routing_losses(self, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
+        """Collect balance, sparsity, and orthogonality losses from all routers."""
+        zero = torch.tensor(0.0, device=device)
+        bal, spar, ortho = zero, zero, zero
+        # All SoftDenseRouters: attn + mlp
+        routers = [self.shared_block.attn.attn_router, self.shared_block.mlp.mlp_router]
+        for r in routers:
+            bal = bal + getattr(r, '_balance_loss', zero)
+            spar = spar + getattr(r, '_sparsity_loss', zero)
+        # MoS head routing
+        bal = bal + getattr(self.mos_head, '_balance_loss', zero)
+        spar = spar + getattr(self.mos_head, '_sparsity_loss', zero)
+        # Orthogonality: |cos_sim| between expert weight groups → 0
+        for w, n_exp in [
+            (self.shared_block.mlp.fc.weight.float(), self.shared_block.mlp.num_experts),
+            (self.shared_block.attn.proj.weight.float(), self.shared_block.attn.num_experts),
+            (self.mos_head.A.reshape(-1, self.mos_head.rank).float(), self.mos_head.num_experts),
+        ]:
+            if n_exp < 2:
+                continue
+            expert_size = w.shape[0] // n_exp
+            groups = w.view(n_exp, expert_size, -1).mean(dim=1)  # [E, feat]
+            groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
+            cos = groups @ groups.T
+            mask = ~torch.eye(n_exp, dtype=torch.bool, device=cos.device)
+            ortho = ortho + cos[mask].abs().mean()
+        return bal, spar, ortho
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
         log_p_ctp, log_p_ntp = self.mos_head(x, self.tok_emb.weight)
@@ -1027,11 +1064,11 @@ class GPT(nn.Module):
         ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
         ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
         conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ntp_loss.device))
-        bal_loss = getattr(self.shared_block.mlp, '_balance_loss', torch.tensor(0.0, device=ntp_loss.device))
+        bal_loss, spar_loss, ortho_loss = self._collect_routing_losses(ntp_loss.device)
         self._ntp_loss = ntp_loss.detach().item()
         self._ctp_loss = ctp_loss.detach().item()
         self._conv_loss = conv_loss.detach().item() if isinstance(conv_loss, torch.Tensor) else 0.0
-        return ntp_loss + 0.1 * ctp_loss + 1.0 * conv_loss + 0.01 * bal_loss
+        return ntp_loss + 0.1 * ctp_loss + 1.0 * conv_loss + 0.1 * bal_loss + 0.001 * spar_loss + 0.01 * ortho_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
