@@ -58,7 +58,8 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 2))
+    num_layers = int(os.environ.get("NUM_LAYERS", 2))  # DEQ solver iters per refinement step
+    num_refinements = int(os.environ.get("NUM_REFINEMENTS", 1))  # predict→soft_embed→re-encode cycles
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 896))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -892,6 +893,7 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         kv_latent_dim: int = 0,
+        num_refinements: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -899,7 +901,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.num_layers = num_layers
+        self.num_layers = num_layers       # DEQ solver iters per refinement
+        self.num_refinements = num_refinements  # predict→soft_embed→re-encode cycles
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
@@ -951,88 +954,82 @@ class GPT(nn.Module):
             soft_embed = (topk_probs.unsqueeze(-1) * topk_embeds).sum(-2)  # [B, T, d]
         return self.diffar_scale.to(dtype=z.dtype) * soft_embed.to(z.dtype)
 
+    def _deq_solve(self, x0: Tensor, z_init: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Run DEQ coupled-state solver for given x0.
+
+        Returns (z, z_prev, y_acc, z_acc) where z_prev is the second-to-last state
+        for convergence measurement.
+        """
+        beta = self.deq_beta
+        dtype = x0.dtype
+        acc_dtype = torch.float64
+        y_acc = z_init.to(acc_dtype)
+        z_acc = z_init.to(acc_dtype)
+        y, z = z_init, z_init
+
+        z_prev = z
+        for t in range(self.num_layers):
+            z_prev = z
+            f_z = self.shared_block(z, x0)
+            y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
+            y = y_acc.to(dtype)
+            f_y = self.shared_block(y, x0)
+            z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
+            z = z_acc.to(dtype)
+
+        return z, z_prev, y_acc, z_acc
+
     def _run_backbone(self, x: Tensor) -> Tensor:
-        """RevDEQ: coupled-state fixed-point iteration (arxiv:2509.12917).
+        """Decoupled DEQ solver + Diffusion-AR refinement.
 
-        Uses coupled states (y, z) with relaxation parameter beta:
-          y_{n+1} = (1-beta)*y_n + beta*f(z_n, x0)
-          z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}, x0)
-
-        Diffusion-AR (Constraint #5): after iter 0, the model's own predictions
-        are fed back as soft embeddings to refine x0 for subsequent iterations.
+        DEQ iters (num_layers): coupled-state solver steps within one solve.
+        Refinement steps (num_refinements): predict → soft_embed → re-solve cycles.
+        Total block calls = (1 + num_refinements) × num_layers × 2.
         """
         x0 = x
-        beta = self.deq_beta
+        z = x  # warm start
         dtype = x.dtype
-        # fp64 accumulators for exact reversibility (recon < 1e-8)
-        # Initialize y, z from input (warm start, per RevDEQ reference)
-        acc_dtype = torch.float64
-        y_acc = x.to(acc_dtype)
-        z_acc = x.to(acc_dtype)
-        y = x
-        z = x
         self._deq_residuals: list[float] = []
+        prev_soft_embed = None
+        x0_refined = x0  # track for reconstruction
 
-        z_prev_iter = z
-        prev_soft_embed = None  # for EMA blending across iterations
-        # Store history during eval only (for exact backward reconstruction)
-        z_hist = [z] if not self.training else []
-        soft_embed_hist = []  # store soft embeds used (for recon)
-        for t in range(self.num_layers):
-            z_prev_iter = z
-            # Diffusion-AR: refine x0 with EMA-blended soft embedding
-            if t > 0:
+        for r in range(1 + self.num_refinements):
+            if r > 0:
                 new_soft_embed = self._get_soft_embedding(z)
                 if prev_soft_embed is not None:
                     soft_embed = 0.5 * new_soft_embed + 0.5 * prev_soft_embed
                 else:
                     soft_embed = new_soft_embed
                 prev_soft_embed = soft_embed.detach()
-                if not self.training:
-                    soft_embed_hist.append(soft_embed)
                 x0_refined = x0 + soft_embed
+                z = x0_refined  # warm start from refined input (not old fixed point)
             else:
-                if not self.training:
-                    soft_embed_hist.append(None)
                 x0_refined = x0
 
-            # Block in original dtype; fp64 accumulation for exact reversibility
-            f_z = self.shared_block(z, x0_refined)
-            y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
-            y = y_acc.to(dtype)
-            f_y = self.shared_block(y, x0_refined)
-            z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
-            z = z_acc.to(dtype)
-            if not self.training:
-                z_hist.append(z.clone())
+            z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        # Convergence loss for training (encourage fixed-point convergence)
+        # Convergence loss (training)
         if self.training:
             z_norm_sq = z.float().pow(2).sum().clamp_min(1.0)
-            self._convergence_loss = (z - z_prev_iter).float().pow(2).sum() / z_norm_sq
+            self._convergence_loss = (z - z_prev).float().pow(2).sum() / z_norm_sq
 
-        # Track diagnostics (eval only)
+        # Diagnostics (eval only)
         if not self.training:
             with torch.no_grad():
-                f_z_final = self.shared_block(z, x0)
-                residual = (z - f_z_final).float().norm().item()
-                self._deq_residuals = [residual]
-                iter_convergence = (z - z_prev_iter).float().norm().item()
-                self._deq_iter_convergence = iter_convergence
-                # fp64 backward reconstruction (recon < 1e-8)
-                yr_acc = y_acc.clone()
-                zr_acc = z_acc.clone()
-                for t_rev in range(self.num_layers - 1, -1, -1):
-                    se = soft_embed_hist[t_rev] if t_rev < len(soft_embed_hist) else None
-                    x0r = x0 + se if se is not None else x0
-                    f_yr = self.shared_block(yr_acc.to(dtype), x0r)
-                    zr_acc = (zr_acc - beta * f_yr.to(acc_dtype)) / (1 - beta)
-                    f_zr = self.shared_block(zr_acc.to(dtype), x0r)
-                    yr_acc = (yr_acc - beta * f_zr.to(acc_dtype)) / (1 - beta)
-                # Check reconstruction back to initial state (y0=x, z0=x)
-                x0_64 = x0.to(acc_dtype)
-                state_norm = max(x0_64.norm().item(), 1.0)
-                recon_error = ((zr_acc - x0_64).norm().item() + (yr_acc - x0_64).norm().item()) / state_norm
+                f_z_final = self.shared_block(z, x0_refined)
+                self._deq_residuals = [(z - f_z_final).float().norm().item()]
+                self._deq_iter_convergence = (z - z_prev).float().norm().item()
+                # fp64 backward reconstruction of last DEQ solve
+                z_init_64 = (x0_refined if self.num_refinements > 0 else x0).to(torch.float64)
+                yr_acc, zr_acc = y_acc.clone(), z_acc.clone()
+                beta = self.deq_beta
+                for _ in range(self.num_layers):
+                    f_yr = self.shared_block(yr_acc.to(dtype), x0_refined)
+                    zr_acc = (zr_acc - beta * f_yr.to(torch.float64)) / (1 - beta)
+                    f_zr = self.shared_block(zr_acc.to(dtype), x0_refined)
+                    yr_acc = (yr_acc - beta * f_zr.to(torch.float64)) / (1 - beta)
+                state_norm = max(z_init_64.norm().item(), 1.0)
+                recon_error = ((zr_acc - z_init_64).norm().item() + (yr_acc - z_init_64).norm().item()) / state_norm
                 self._deq_recon_error = recon_error
         else:
             self._deq_residuals = []
@@ -1088,9 +1085,9 @@ class GPT(nn.Module):
         self._ntp_loss = ntp_loss.detach().item()
         self._ctp_loss = ctp_loss.detach().item()
         self._conv_loss = conv_loss.detach().item() if isinstance(conv_loss, torch.Tensor) else 0.0
-        # CTP weight scales with refinement steps: at iter 0 input is clean (nothing to denoise),
-        # CTP becomes meaningful only after soft embedding refinement kicks in
-        ctp_weight = 0.1 * max(self.num_layers - 1, 0)
+        # CTP weight scales with refinement steps: at step 0 input is clean one-hot,
+        # CTP becomes meaningful only after soft embedding refinement
+        ctp_weight = 0.1 * self.num_refinements
         return ntp_loss + ctp_weight * ctp_loss + 1.0 * conv_loss + 0.1 * bal_loss + 0.001 * spar_loss + 0.01 * ortho_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1281,6 +1278,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim,
+        num_refinements=args.num_refinements,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):

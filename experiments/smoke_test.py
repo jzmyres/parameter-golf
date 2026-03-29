@@ -49,7 +49,7 @@ def _get_expert_diagnostics(model):
     return diag
 
 
-def smoke_test(num_steps: int = 80, eval_every: int = 20):
+def smoke_test(num_steps: int = 120, eval_every: int = 20):
     args = Hyperparameters()
     model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
@@ -139,13 +139,21 @@ def smoke_test(num_steps: int = 80, eval_every: int = 20):
         print(f"FAIL: reconstruction error diverging ({recon_errors[0]:.2e} -> {recon_errors[-1]:.2e})")
         ok = False
 
-    # 4. Convergence should not explode (warn at 3×, fail at 100×)
-    if len(iter_convs) >= 2:
+    # 4. Convergence must not explode, and should decrease in second half
+    if len(iter_convs) >= 4:
+        mid = len(iter_convs) // 2
+        second_half_trend = iter_convs[-1] - iter_convs[mid]
+        if second_half_trend > 0:
+            print(f"WARN: convergence still increasing in second half "
+                  f"({iter_convs[mid]:.1f} -> {iter_convs[-1]:.1f})")
         ratio = iter_convs[-1] / max(iter_convs[0], 1e-6)
-        if ratio > 3.0:
-            print(f"WARN: iter convergence increasing ({iter_convs[0]:.1f} -> {iter_convs[-1]:.1f}, ratio={ratio:.1f}x)")
         if ratio > 100:
             print(f"FAIL: iter convergence exploding ({iter_convs[0]:.1f} -> {iter_convs[-1]:.1f})")
+            ok = False
+    elif len(iter_convs) >= 2:
+        ratio = iter_convs[-1] / max(iter_convs[0], 1e-6)
+        if ratio > 100:
+            print(f"FAIL: iter convergence exploding")
             ok = False
 
     # 5. No NaN/Inf gradients

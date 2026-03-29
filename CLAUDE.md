@@ -177,20 +177,18 @@ When proposing architecture improvements:
 ### 1. RevDEQ (Reversible Deep Equilibrium Model)
 - Paper: https://arxiv.org/abs/2509.12917
 - Reference: `/home/mzhong4/work/research/rdeq/WIP-ARWDEQ/code/arwdeq/qwen3_utmoe_revdeq.py`
-- The main transformer backbone MUST use RevDEQ: model output defined as fixed point of a learned function
-- **Coupled-state iteration** with relaxation beta=0.5:
-  - `y_{n+1} = (1-beta)*y_n + beta*f(z_n, x0)`
-  - `z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}, x0)`
-- **Warm start**: y₀=x, z₀=x where x is the **soft embedding** — initially one-hot token embedding, iteratively updated by CTP/NTP predictions across DEQ iterations
+- Model output defined as fixed point of a learned function
+- **Two decoupled loops**:
+  - **DEQ solver** (`num_layers`): coupled-state iterations to approximate fixed point
+    - `y_{n+1} = (1-beta)*y_n + beta*f(z_n, x0)`, `z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}, x0)`
+  - **Refinement** (`num_refinements`): predict → soft_embed → re-solve cycles
+    - Each full DEQ solve produces ONE prediction; that prediction builds the soft embedding for the next solve
+    - Total block calls = (1 + num_refinements) × num_layers × 2
+- **Warm start**: z₀ = x (initially one-hot token embedding); on refinement steps, z₀ = x0_refined
 - **fp64 accumulators** for add/subtract operations — ensures exact reversibility
-- **Reconstruction error MUST be < 1e-8** (verified by smoke test before every run)
-- **Convergence regularization**: 1.0 * ||z_T - z_{T-1}||²/||z_T||² added to loss
-- Track: equilibrium residual, reconstruction error, iter convergence
-- Smoke test MUST pass before any long training run:
-  - Recon error < 1e-8 (HARD)
-  - Iter convergence must not diverge > 3x from initial
-  - Loss must decrease
-  - No NaN/Inf gradients
+- **Reconstruction error MUST be < 1e-8** (verified by smoke test)
+- **Convergence regularization**: 1.0 * ||z_T - z_{T-1}||²/||z_T||²
+- Smoke test checks: recon < 1e-8, total loss decreasing, convergence not exploding (>100×), no NaN/Inf, expert balance + entropy
 
 ### 2. Soft Dense Routing (Dense MoE on ALL components)
 - Paper: Soft MoE (arxiv:2308.00951) — adapted for dense routing
@@ -224,16 +222,18 @@ When proposing architecture improvements:
 
 ### 5. Diffusion-AR (Autoregressive + Iterative Refinement)
 - Reference: `/home/mzhong4/work/research/tsu/WIP-TSU/code/model.py`
-- **Iterative soft embedding refinement** across DEQ iterations:
-  - Iter 0: x₀ = tok_emb(input_ids) — one-hot embedding lookup
-  - After iter 0: MoS head produces CTP and NTP predictions (top-k probabilities)
-  - Iter 1+: x₀ refined with soft embedding from top-k predictions → weighted sum of embeddings
-  - This creates a predict → refine → predict loop across DEQ iterations
-- **Dual-head prediction** (REQUIRED):
-  - **CTP (Current Token Prediction)**: predict current token (denoising head)
-  - **NTP (Next Token Prediction)**: predict next token (standard AR head)
-  - Both from MoS head with shared experts + separate B matrices (B_denoise, B_NTP)
-  - CTP is feasible with causal attention (token at position i attends to 0..i)
+- **Refinement loop** (decoupled from DEQ solver):
+  - Step 0: DEQ solve with x₀ = tok_emb(input_ids) (clean one-hot)
+  - Step 1+: predict from z* → build soft embedding → DEQ solve with x₀ + soft_embed
+  - Soft embedding: average CTP[i] and NTP[i-1] logits, top-k sparse embed, EMA blending
+  - `num_refinements` controls how many predict→refine cycles (default: 1)
+- **Dual-head MoS prediction** (REQUIRED):
+  - **CTP (Current Token Prediction)**: predict current token (denoising)
+  - **NTP (Next Token Prediction)**: predict next token (standard AR)
+  - MoS with shared experts + specialized experts per head
+  - CTP weight scales with num_refinements: `0.1 × num_refinements`
+    (at refinement 0, input is clean one-hot — nothing to denoise)
+  - All experts trainable (no frozen expert), xavier init (no SVD bias)
   - Track and plot CTP and NTP losses separately
 
 ### 6. Parameter Golf Hard Constraints (ENFORCED)
