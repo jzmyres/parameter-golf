@@ -60,7 +60,8 @@ def smoke_test(num_steps: int = 80, eval_every: int = 20):
     ).cuda()
 
     opt = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=0.01)
-    losses, recon_errors, iter_convs, residuals = [], [], [], []
+    losses, ntp_losses, ctp_losses = [], [], []
+    recon_errors, iter_convs, residuals = [], [], []
     expert_snapshots = []
 
     for i in range(num_steps):
@@ -80,6 +81,8 @@ def smoke_test(num_steps: int = 80, eval_every: int = 20):
         opt.step()
         opt.zero_grad()
         losses.append(loss.item())
+        ntp_losses.append(getattr(model, '_ntp_loss', 0.0))
+        ctp_losses.append(getattr(model, '_ctp_loss', 0.0))
 
         if (i + 1) % eval_every == 0:
             model.eval()
@@ -93,8 +96,8 @@ def smoke_test(num_steps: int = 80, eval_every: int = 20):
             iter_convs.append(model._deq_iter_convergence)
             diag = _get_expert_diagnostics(model)
             expert_snapshots.append(diag)
-            print(f"  step {i+1}: loss={losses[-1]:.4f} recon={model._deq_recon_error:.2e} "
-                  f"iter_conv={model._deq_iter_convergence:.1f} residual={r:.1f}")
+            print(f"  step {i+1}: loss={losses[-1]:.4f} ntp={ntp_losses[-1]:.4f} ctp={ctp_losses[-1]:.4f} "
+                  f"recon={model._deq_recon_error:.2e} iter_conv={model._deq_iter_convergence:.1f} residual={r:.1f}")
             if "mlp_usage" in diag:
                 print(f"    mlp: usage={diag['mlp_usage']} entropy={diag['mlp_entropy']:.4f} "
                       f"balance_cv={diag['mlp_balance_cv']:.4f} ortho={diag.get('mlp_ortho', 0):.4f}")
@@ -105,20 +108,23 @@ def smoke_test(num_steps: int = 80, eval_every: int = 20):
     # --- Results ---
     print(f"\n--- Smoke Test Results ---")
     print(f"Params:            {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Loss:              {losses[0]:.4f} -> {losses[-1]:.4f} (delta={losses[-1]-losses[0]:+.4f})")
+    print(f"Total loss:        {losses[0]:.4f} -> {losses[-1]:.4f} (delta={losses[-1]-losses[0]:+.4f})")
+    print(f"NTP loss:          {ntp_losses[0]:.4f} -> {ntp_losses[-1]:.4f} (delta={ntp_losses[-1]-ntp_losses[0]:+.4f})")
+    print(f"CTP loss:          {ctp_losses[0]:.4f} -> {ctp_losses[-1]:.4f} (delta={ctp_losses[-1]-ctp_losses[0]:+.4f})")
     print(f"Recon errors:      {' -> '.join(f'{e:.2e}' for e in recon_errors)}")
     print(f"Iter convergence:  {' -> '.join(f'{c:.1f}' for c in iter_convs)}")
     print(f"DEQ residuals:     {' -> '.join(f'{r:.1f}' for r in residuals)}")
 
     ok = True
 
-    # 1. Loss should decrease (compare first quarter avg vs last quarter avg)
+    # 1. Losses should decrease (compare first quarter avg vs last quarter avg)
     q = max(len(losses) // 4, 1)
-    first_q = sum(losses[:q]) / q
-    last_q = sum(losses[-q:]) / q
-    if last_q > first_q:
-        print(f"FAIL: training loss not decreasing (first_q={first_q:.4f} -> last_q={last_q:.4f})")
-        ok = False
+    for name, vals in [("total", losses), ("NTP", ntp_losses), ("CTP", ctp_losses)]:
+        first_q_avg = sum(vals[:q]) / q
+        last_q_avg = sum(vals[-q:]) / q
+        if last_q_avg > first_q_avg:
+            print(f"FAIL: {name} loss not decreasing (first_q={first_q_avg:.4f} -> last_q={last_q_avg:.4f})")
+            ok = False
 
     # 2. Reconstruction error MUST be < 1e-8
     if any(e > 1e-8 for e in recon_errors):
