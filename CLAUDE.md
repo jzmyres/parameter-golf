@@ -33,7 +33,8 @@ val_bpb = 1.1194 (abaybektursun, 2026-03-23)
 Key techniques: LeakyReLU(0.5)², TTT, Parallel Muon, XSA, GPTQ-lite, EMA
 
 ## Training Budget
-2x of original = 1200 seconds on 8xH100 SXM (relaxed from 600s to 20 min)
+- **8xH100 SXM (competition)**: 600 seconds (10 min) — original competition constraint
+- **2xL40S (dev)**: 1200 seconds (20 min) — relaxed for development hardware
 
 ## Converged Best-Known Config (Iteration 0 Baseline)
 This is the consensus of the top 3 leaderboard entries. Use as starting point.
@@ -241,7 +242,7 @@ When proposing architecture improvements:
 
 ### 6. Parameter Golf Hard Constraints (ENFORCED)
 - Artifact size <= 16,000,000 bytes (code + compressed model)
-- Training time <= 1200 seconds (20 min) on 8xH100 SXM
+- Training time <= 600 seconds on 8xH100 SXM (competition), <= 1200 seconds on 2xL40S (dev)
 - Must use FineWeb validation set for evaluation
 - Tokenizer: SentencePiece BPE, vocab=1024
 
