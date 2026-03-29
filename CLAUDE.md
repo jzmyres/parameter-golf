@@ -108,7 +108,9 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
 9. If val_bpb improved AND artifact <= 16MB -> run `/simplify`, then keep
 10. If val_bpb equal or worse -> `git revert` to previous good state
 11. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
-12. Run `python experiments/plot_metrics.py` and `python experiments/plot_progress.py` to update plots
+12. **ALWAYS** update plots after EVERY iteration:
+   - `python experiments/plot_metrics.py` → `experiments/metrics_comparison.png`
+   - `python experiments/plot_progress.py` → `experiments/progress.png` + `experiments/progress_full.png`
 
 ### Logging & Plotting (REQUIRED every iteration)
 - **Training logs**: Save full stdout/stderr to `experiments/training_logs/`
