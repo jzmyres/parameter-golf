@@ -960,15 +960,26 @@ class GPT(nn.Module):
         self._deq_residuals: list[float] = []
 
         z_prev_iter = z
-        # Store z history during eval only (for exact backward reconstruction)
+        prev_soft_embed = None  # for EMA blending across iterations
+        # Store history during eval only (for exact backward reconstruction)
         z_hist = [z] if not self.training else []
+        soft_embed_hist = []  # store soft embeds used (for recon)
         for t in range(self.num_layers):
             z_prev_iter = z
-            # Diffusion-AR: refine x0 with prediction-feedback soft embedding
+            # Diffusion-AR: refine x0 with EMA-blended soft embedding
             if t > 0:
-                soft_embed = self._get_soft_embedding(z)
+                new_soft_embed = self._get_soft_embedding(z)
+                if prev_soft_embed is not None:
+                    soft_embed = 0.5 * new_soft_embed + 0.5 * prev_soft_embed
+                else:
+                    soft_embed = new_soft_embed
+                prev_soft_embed = soft_embed.detach()
+                if not self.training:
+                    soft_embed_hist.append(soft_embed)
                 x0_refined = x0 + soft_embed
             else:
+                if not self.training:
+                    soft_embed_hist.append(None)
                 x0_refined = x0
 
             # Block in original dtype; fp64 accumulation for exact reversibility
@@ -998,13 +1009,8 @@ class GPT(nn.Module):
                 yr_acc = y_acc.clone()
                 zr_acc = z_acc.clone()
                 for t_rev in range(self.num_layers - 1, -1, -1):
-                    if t_rev > 0:
-                        # Use stored z from BEFORE this iteration for soft embedding
-                        z_at = z_hist[t_rev]  # z state entering iteration t_rev
-                        soft_embed_r = self._get_soft_embedding(z_at)
-                        x0r = x0 + soft_embed_r
-                    else:
-                        x0r = x0
+                    se = soft_embed_hist[t_rev] if t_rev < len(soft_embed_hist) else None
+                    x0r = x0 + se if se is not None else x0
                     f_yr = self.shared_block(yr_acc.to(dtype), x0r)
                     zr_acc = (zr_acc - beta * f_yr.to(acc_dtype)) / (1 - beta)
                     f_zr = self.shared_block(zr_acc.to(dtype), x0r)
