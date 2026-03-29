@@ -660,10 +660,14 @@ class MLP(nn.Module):
         # Expert diagnostics (eval only)
         if not self.training:
             with torch.no_grad():
+                # Global usage balance (across all tokens) — want uniform
                 mean_weights = route_weights.mean(dim=(0, 1))
                 self._expert_usage = mean_weights.float().cpu().tolist()
-                entropy = -(route_weights * (route_weights + 1e-8).log()).sum(-1).mean()
-                self._expert_entropy = entropy.item()
+                # Per-token sparsity: low entropy = concentrated on few experts (good)
+                per_token_entropy = -(route_weights * (route_weights + 1e-8).log()).sum(-1)
+                self._expert_entropy = per_token_entropy.mean().item()
+                # Usage balance: CV of expert load (lower = more balanced)
+                self._expert_balance_cv = (mean_weights.std() / mean_weights.mean()).item()
 
         # Apply routing to expert groups
         bsz, seq, hidden = h.shape
@@ -679,6 +683,8 @@ class MLP(nn.Module):
             diag['usage'] = self._expert_usage
         if hasattr(self, '_expert_entropy'):
             diag['entropy'] = self._expert_entropy
+        if hasattr(self, '_expert_balance_cv'):
+            diag['balance_cv'] = self._expert_balance_cv
         # Expert orthogonality: cosine similarity between expert weight groups
         w = self.fc.weight.float()  # (hidden, dim)
         group_w = w.view(self.num_experts, self.expert_size, -1)  # (E, expert_size, dim)
@@ -688,7 +694,8 @@ class MLP(nn.Module):
         cos_sim = group_norm @ group_norm.T  # (E, E)
         # Off-diagonal mean (should be ~0 for orthogonal)
         mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=cos_sim.device)
-        diag['ortho_cos_sim'] = cos_sim[mask].mean().item()
+        # Absolute cosine similarity (want ~0 for orthogonal experts)
+        diag['ortho_cos_sim'] = cos_sim[mask].abs().mean().item()
         return diag
 
 
@@ -941,6 +948,9 @@ class GPT(nn.Module):
         ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         # DEQ convergence regularization: encourage ||z_T - z_{T-1}|| → 0
         conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ce_loss.device))
+        # Store individual losses for logging
+        self._ntp_loss = ce_loss.detach().item()
+        self._conv_loss = conv_loss.detach().item() if isinstance(conv_loss, torch.Tensor) else 0.0
         return ce_loss + 1.0 * conv_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1302,6 +1312,8 @@ def main() -> None:
                     expert_info = f" expert_usage:[{usage_str}]"
                 if 'entropy' in diag:
                     expert_info += f" expert_entropy:{diag['entropy']:.4f}"
+                if 'balance_cv' in diag:
+                    expert_info += f" expert_balance_cv:{diag['balance_cv']:.4f}"
                 if 'ortho_cos_sim' in diag:
                     expert_info += f" expert_ortho:{diag['ortho_cos_sim']:.4f}"
             log0(
@@ -1371,8 +1383,11 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            ntp = getattr(base_model, '_ntp_loss', 0.0)
+            conv = getattr(base_model, '_conv_loss', 0.0)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"ntp_loss:{ntp:.4f} conv_loss:{conv:.6f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
