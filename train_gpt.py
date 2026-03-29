@@ -1005,10 +1005,10 @@ class RevDEQFunction(torch.autograd.Function):
         ctx.compute_dtype = compute_dtype
         ctx.device_type = device_type
         ctx.params = params
-        return z_state.to(compute_dtype), z_prev_state.to(compute_dtype), y_state.to(compute_dtype)
+        return z_state.to(compute_dtype), z_prev_state.to(compute_dtype)
 
     @staticmethod
-    def backward(ctx, grad_z, _grad_z_prev_ignored, _grad_y_ignored):
+    def backward(ctx, grad_z, _grad_z_prev_ignored):
         x0, y_terminal, z_terminal, _z_prev_terminal = (t.detach() for t in ctx.saved_tensors)
         f_theta = ctx.f_theta
         beta = ctx.beta
@@ -1192,10 +1192,10 @@ class GPT(nn.Module):
         """Run DEQ coupled-state solver. Uses RevDEQFunction for O(1) memory in training."""
         if self.training:
             params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
-            z, z_prev, y = RevDEQFunction.apply(
+            z, z_prev = RevDEQFunction.apply(
                 self.shared_block, x0, z_init, self.deq_beta, self.num_layers, *params
             )
-            return z, z_prev, y, None
+            return z, z_prev, None, None
 
         # Eval: explicit loop for diagnostics + reconstruction check
         beta = self.deq_beta
