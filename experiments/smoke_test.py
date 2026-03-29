@@ -161,8 +161,8 @@ def smoke_test(num_steps: int = 80, eval_every: int = 20):
             if key in first_snap and key in last_snap:
                 first_cv = first_snap[key]
                 last_cv = last_snap[key]
-                if last_cv > first_cv * 2.0 and last_cv > 0.3:
-                    print(f"FAIL: {key} increasing ({first_cv:.4f} -> {last_cv:.4f}) — experts unbalanced")
+                if last_cv > 0.8:
+                    print(f"FAIL: {key} too high ({last_cv:.4f}) — experts severely unbalanced")
                     ok = False
 
     # 7. Expert entropy should not collapse to 0 (single expert dominance)

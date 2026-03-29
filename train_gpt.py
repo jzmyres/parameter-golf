@@ -1088,7 +1088,10 @@ class GPT(nn.Module):
         self._ntp_loss = ntp_loss.detach().item()
         self._ctp_loss = ctp_loss.detach().item()
         self._conv_loss = conv_loss.detach().item() if isinstance(conv_loss, torch.Tensor) else 0.0
-        return ntp_loss + 0.1 * ctp_loss + 1.0 * conv_loss + 0.1 * bal_loss + 0.001 * spar_loss + 0.01 * ortho_loss
+        # CTP weight scales with refinement steps: at iter 0 input is clean (nothing to denoise),
+        # CTP becomes meaningful only after soft embedding refinement kicks in
+        ctp_weight = 0.1 * max(self.num_layers - 1, 0)
+        return ntp_loss + ctp_weight * ctp_loss + 1.0 * conv_loss + 0.1 * bal_loss + 0.001 * spar_loss + 0.01 * ortho_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
