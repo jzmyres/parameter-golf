@@ -1249,24 +1249,18 @@ class GPT(nn.Module):
 
             z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        # Convergence loss (RevDEQ paper): hinge on RMS(y_K - z_K) / RMS(z_K)
-        # At a true fixed point, y=z. The hinge only penalizes when the gap exceeds delta0.
+        # Convergence loss: absolute MSE(y_K, z_K) — drives toward true fixed point y=z.
+        # Using absolute (not relative) per user requirement: fixed point means ||y-z|| → 0.
         if self.training:
             numel = max(z.numel(), 1)
-            z_rms = (z.detach().float().pow(2).sum() / numel).sqrt().clamp_min(1e-6)
             if y_acc is not None:
-                # Paper formulation with RMS normalization: relu(RMS(y-z)/RMS(z) - delta0)
-                yz_rms = ((y_acc - z).float().pow(2).sum() / numel).sqrt()
-                delta_con = yz_rms / z_rms
-                delta0 = 0.1  # hinge threshold (tighter than paper's 0.5 since we use RMS)
-                self._convergence_loss = F.relu(delta_con - delta0)
+                # Absolute convergence: mean squared error between coupled states
+                self._convergence_loss = (y_acc - z).float().pow(2).mean()
             elif z_prev is not None:
-                zz_rms = ((z - z_prev).float().pow(2).sum() / numel).sqrt()
-                delta_con = zz_rms / z_rms
-                self._convergence_loss = F.relu(delta_con - delta0)
+                self._convergence_loss = (z - z_prev).float().pow(2).mean()
             else:
                 f_z = self.shared_block(z, x0_refined)
-                self._convergence_loss = ((z - f_z).float().pow(2).sum() / numel).sqrt() / z_rms
+                self._convergence_loss = (z - f_z).float().pow(2).mean()
             # Track BOTH absolute and relative convergence:
             # - Absolute: ||z_T - z_{T-1}|| (for eval pass/fail — fixed point means this → 0)
             # - Relative: ||z_T - z_{T-1}|| / ||z_T|| (for diagnostics — scale-invariant)
@@ -1277,7 +1271,7 @@ class GPT(nn.Module):
                 self._deq_iter_convergence = abs_conv  # absolute for logging/eval
                 self._deq_iter_convergence_rel = abs_conv / z_norm_diag  # relative for diagnostics
             if y_acc is not None:
-                self._deq_yz_gap = delta_con.item()
+                self._deq_yz_gap = (y_acc - z).float().norm().item()
 
         # Diagnostics (eval only)
         if not self.training:
