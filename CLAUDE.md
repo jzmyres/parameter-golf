@@ -191,7 +191,12 @@ d4e5f6g	0.000000	0	crash	soft routing OOM
 - The model refines soft token predictions across iterations
 - AR-like: step i+1 depends on step i via shared KV state
 - Diffusion-like: each step starts from a noisy soft distribution and denoises
-- Dual signal: current token prediction (CTP) + next token prediction (NTP)
+- **Dual-head prediction** (REQUIRED):
+  - **CTP (Current Token Prediction)**: denoise the current position's soft embedding → predict the current token
+  - **NTP (Next Token Prediction)**: standard autoregressive next-token prediction
+  - Both losses contribute to training; each position produces 2 predictions from separate heads
+  - CTP is feasible with causal attention (token at position i attends to 0..i including itself)
+  - Track and plot CTP and NTP losses separately in experiments/metrics_comparison.png
 
 ### 6. Parameter Golf Hard Constraints (ENFORCED)
 - Artifact size <= 16,000,000 bytes (code + compressed model)
