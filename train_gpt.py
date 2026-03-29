@@ -581,7 +581,8 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         # Gated attention: per-head sigmoid gate (init=3 → sigmoid≈0.95)
-        self.attn_gate = nn.Parameter(torch.full((num_heads,), 3.0, dtype=torch.float32))
+        # Gate init near 0 for DEQ stability (identity mapping at init, contraction guaranteed)
+        self.attn_gate = nn.Parameter(torch.full((num_heads,), 0.0, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -771,8 +772,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.mlp = MLP(dim, mlp_mult)
         # FSQ moved to output head for param-efficient MoS
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        # Small init for DEQ stability — block starts as near-identity
+        self.attn_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
