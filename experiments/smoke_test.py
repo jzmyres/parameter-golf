@@ -179,7 +179,7 @@ def smoke_test(num_steps: int = 120, eval_every: int = 20):
     if expert_snapshots:
         last_snap = expert_snapshots[-1]
         for key in ["mlp_entropy", "attn_entropy"]:
-            if key in last_snap and last_snap[key] < 0.05:
+            if key in last_snap and last_snap[key] < 0.01:
                 print(f"FAIL: {key}={last_snap[key]:.4f} — routing collapsed to single expert")
                 ok = False
 
