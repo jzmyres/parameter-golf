@@ -833,6 +833,10 @@ class GPT(nn.Module):
         self.blocks = None  # not used in DEQ mode
         # FSQ-MoS: param-efficient output head via FSQ bottleneck
         self.fsq_head = FSQBottleneck(model_dim, bottleneck_dim=96, num_levels=8)
+        # CTP head: low-rank projection for current token prediction (denoising)
+        self.ctp_down = CastedLinear(model_dim, 64, bias=False)
+        self.ctp_up = CastedLinear(64, model_dim, bias=False)
+        self.ctp_up._zero_init = True
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -936,24 +940,41 @@ class GPT(nn.Module):
         x = _rms_norm(x)
         x = self.smear(x)
         x = self._run_backbone(x)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        # FSQ-MoS: combine standard head with FSQ-refined head
-        x_fsq = x + self.fsq_head(x)  # FSQ adds low-rank discrete correction
+        x_out = self.final_norm(x)
+        bsz, seq_len, dim = x_out.shape
+        x_flat = x_out.reshape(-1, dim)
+
+        # --- NTP: Next Token Prediction (standard autoregressive) ---
+        x_fsq = x_flat + self.fsq_head(x_flat)
         if self.tie_embeddings:
-            logits_proj = F.linear(x_fsq, self.tok_emb.weight)
+            logits_ntp = F.linear(x_fsq, self.tok_emb.weight)
         else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x_fsq)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        # DEQ convergence regularization: encourage ||z_T - z_{T-1}|| → 0
-        conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ce_loss.device))
+            logits_ntp = self.lm_head(x_fsq)
+        logits_ntp = self.logit_softcap * torch.tanh(logits_ntp / self.logit_softcap)
+        ntp_targets = target_ids.reshape(-1)  # next token at each position
+        ntp_loss = F.cross_entropy(logits_ntp.float(), ntp_targets, reduction="mean")
+
+        # --- CTP: Current Token Prediction (denoising) ---
+        # Predict the current token at each position using a separate low-rank head
+        x_ctp = x_flat + self.ctp_up(F.silu(self.ctp_down(x_flat)))
+        if self.tie_embeddings:
+            logits_ctp = F.linear(x_ctp, self.tok_emb.weight)
+        else:
+            logits_ctp = self.lm_head(x_ctp)
+        logits_ctp = self.logit_softcap * torch.tanh(logits_ctp / self.logit_softcap)
+        ctp_targets = input_ids.reshape(-1)  # current token at each position
+        ctp_loss = F.cross_entropy(logits_ctp.float(), ctp_targets, reduction="mean")
+
+        # --- Convergence regularization ---
+        conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ntp_loss.device))
+
         # Store individual losses for logging
-        self._ntp_loss = ce_loss.detach().item()
+        self._ntp_loss = ntp_loss.detach().item()
+        self._ctp_loss = ctp_loss.detach().item()
         self._conv_loss = conv_loss.detach().item() if isinstance(conv_loss, torch.Tensor) else 0.0
-        return ce_loss + 1.0 * conv_loss
+
+        # Total loss: NTP + CTP + convergence
+        return ntp_loss + 0.5 * ctp_loss + 1.0 * conv_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1386,10 +1407,11 @@ def main() -> None:
         )
         if should_log_train:
             ntp = getattr(base_model, '_ntp_loss', 0.0)
+            ctp = getattr(base_model, '_ctp_loss', 0.0)
             conv = getattr(base_model, '_conv_loss', 0.0)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"ntp_loss:{ntp:.4f} conv_loss:{conv:.6f} "
+                f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} conv_loss:{conv:.6f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
