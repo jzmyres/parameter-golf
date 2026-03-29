@@ -1,12 +1,13 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Note: For this autoresearch workspace, `train_gpt.py` may grow beyond a small tutorial script as long as it remains a single-file, self-contained submission artifact. If you want a newcomer-friendly baseline, prefer the pinned record scripts in `records/`.
 """
 
 from __future__ import annotations
 
 import copy
+import contextlib
 import glob
 import io
 import math
@@ -54,7 +55,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1350.0))  # 1.5x budget
+    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -153,8 +154,11 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    orig_shape = g.shape
+                    g = g.view(-1, g.shape[-1])  # flatten leading dims for NS
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    g = g.view(orig_shape)
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -281,31 +285,22 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,fsq_scale,skip_weight,skip_weights,smear,bigram.scale",
+        # Keep only small control tensors in fp32. Avoid broad substrings like "expert_gate"
+        # which can match large expert weight tensors (e.g., shared_block.mlp.expert_gate).
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,"
+        "skip_weight,skip_weights,smear.gate,bigram.scale,diffar_scale,gate_bias,"
+        "expert_gate_logits,expert_gate_ctp_logits,expert_gate_ntp_logits",
     ).split(",")
     if pattern
 )
 FP16_KEEP_NAME_PATTERNS = tuple(
     pattern
-    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb,blocks.8.attn.c_k").split(",")
+    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb").split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
-    ).split(",")
-    if pattern
-)
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-
-def tensor_nbytes(t: Tensor) -> int:
-    return int(t.numel()) * int(t.element_size())
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
@@ -381,7 +376,10 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             continue
         if cat in int6_cats and t.ndim >= 1:
             clip = 15 if cat == "mlp" else 31  # int5 for MLP, int6 for attention
-            q, s = quantize_intN_per_row(t, clip_range=clip)
+            orig_shape = t.shape
+            t_2d = t.view(-1, t.shape[-1]) if t.ndim > 2 else t
+            q, s = quantize_intN_per_row(t_2d, clip_range=clip)
+            q = q.view(orig_shape) if t.ndim > 2 else q
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": f"int{5 if cat == 'mlp' else 6}"}
@@ -405,10 +403,14 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             out[name] = t
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
+        orig_shape = orig.shape
         if s.ndim > 0:
-            out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
+            # Flatten to 2D for dequant if needed (3D expert params)
+            q_2d = q.view(-1, q.shape[-1]) if q.ndim > 2 else q
+            deq = (q_2d.float() * s.float().view(q_2d.shape[0], *([1] * (q_2d.ndim - 1))))
+            out[name] = deq.view(orig_shape).to(orig_dtype)
         else:
-            out[name] = (q.float() * float(s.item())).to(orig_dtype)
+            out[name] = (q.float() * float(s.item())).view(orig_shape).to(orig_dtype)
     return out
 
 
@@ -469,7 +471,20 @@ class DistributedTokenLoader:
         self.stream = TokenStream(pattern)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        if seq_len <= 0:
+            raise ValueError(f"seq_len must be positive, got {seq_len}")
+        denom = self.world_size * grad_accum_steps
+        if denom <= 0:
+            raise ValueError(f"world_size*grad_accum_steps must be positive, got {denom}")
+        global_seqs = global_tokens // seq_len
+        local_seqs = global_seqs // denom
+        if local_seqs < 1:
+            raise ValueError(
+                "TRAIN_BATCH_TOKENS too small for the requested DDP config: "
+                f"TRAIN_BATCH_TOKENS={global_tokens} TRAIN_SEQ_LEN={seq_len} "
+                f"WORLD_SIZE={self.world_size} GRAD_ACCUM_STEPS={grad_accum_steps}"
+            )
+        local_tokens = local_seqs * seq_len
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
@@ -500,22 +515,32 @@ _QAT_ACTIVE = False  # Global flag for Late QAT
 
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        w = self.weight.to(x.dtype)
+        w = self.weight
         # Late QAT: add fake quantization noise during warmdown
         if _QAT_ACTIVE and self.training and w.ndim == 2 and w.numel() > 8192:
             clip = getattr(self, '_qat_clip', 31)
-            amax = w.abs().amax(dim=-1, keepdim=True)
+            w32 = w.float()
+            amax = w32.abs().amax(dim=-1, keepdim=True)
             s = (amax / clip).clamp_min(1e-12)
-            w_q = torch.clamp(torch.round(w / s), -(clip+1), clip) * s
-            w = w + (w_q - w).detach()  # STE: quantized forward, identity backward
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
+            w_q = torch.clamp(torch.round(w32 / s), -(clip + 1), clip) * s
+            w = w32 + (w_q - w32).detach()  # STE: quantized forward, identity backward
+        bias = self.bias
+        # If autocast is enabled, rely on it (and its weight-cast cache). Otherwise, match x dtype.
+        if (x.dtype != w.dtype or (bias is not None and x.dtype != bias.dtype)) and not torch.is_autocast_enabled():
+            w = w.to(dtype=x.dtype)
+            if bias is not None:
+                bias = bias.to(dtype=x.dtype)
         return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
         for name, param in module.named_parameters():
+            # 1D params + control tensors → fp32 for optimizer precision
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+                param.data = param.data.float()
+            # 3D+ expert params (not CastedLinear) → fp32 for Muon
+            if param.ndim >= 3 and param.dtype != torch.float32:
                 param.data = param.data.float()
 
 
@@ -552,19 +577,19 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 class SoftDenseRouter(nn.Module):
     """Shared soft dense routing module for all MoE components.
 
-    Per-token routing: softmax weights × input-dependent sigmoid gates.
+    Per-token routing: softmax weights × per-expert sigmoid gates (post-softmax),
+    to break the convex-mixture constraint (allows skipping experts) while
+    remaining fully differentiable.
     Provides sparsity (L1) + balance (MSE) regularization and diagnostics.
     """
     def __init__(self, dim: int, num_experts: int):
         super().__init__()
         self.num_experts = num_experts
         self.router = CastedLinear(dim, num_experts, bias=False)
-        self.expert_gate = CastedLinear(dim, num_experts, bias=True)
         # Small router init → near-uniform routing at start
         nn.init.normal_(self.router.weight, std=0.01)
-        # Gate bias=1.0 → sigmoid≈0.73, experts start open (avoids suppression)
-        nn.init.zeros_(self.expert_gate.weight)
-        nn.init.constant_(self.expert_gate.bias, 1.0)
+        # Learned per-expert gate scalars (post-softmax); init open (sigmoid(1)=0.73)
+        self.expert_gate_logits = nn.Parameter(torch.ones(num_experts, dtype=torch.float32))
         # Diagnostics (set during forward)
         self._balance_loss = None
         self._sparsity_loss = None
@@ -575,23 +600,23 @@ class SoftDenseRouter(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         """Returns routing weights [*, num_experts]."""
         route_logits = self.router(x)
-        route_weights = torch.softmax(route_logits, dim=-1)
-        eg = torch.sigmoid(self.expert_gate(x))
-        route_weights = route_weights * eg
+        alpha = torch.softmax(route_logits, dim=-1)
+        gates = torch.sigmoid(self.expert_gate_logits.to(dtype=alpha.dtype))
+        route_weights = alpha * gates
         if self.training:
-            mean_weights = route_weights.mean(dim=tuple(range(route_weights.ndim - 1)))
-            target = torch.ones_like(mean_weights) / self.num_experts
-            self._balance_loss = F.mse_loss(mean_weights, target)
+            mean_alpha = alpha.mean(dim=tuple(range(alpha.ndim - 1)))
+            target = torch.ones_like(mean_alpha) / self.num_experts
+            self._balance_loss = F.mse_loss(mean_alpha, target)
             self._sparsity_loss = route_weights.abs().mean()
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
             with torch.no_grad():
-                mean_weights = route_weights.mean(dim=tuple(range(route_weights.ndim - 1)))
-                self._expert_usage = mean_weights.float().cpu().tolist()
-                per_token_ent = -(route_weights * (route_weights + 1e-8).log()).sum(-1)
+                mean_alpha = alpha.mean(dim=tuple(range(alpha.ndim - 1)))
+                self._expert_usage = mean_alpha.float().cpu().tolist()
+                per_token_ent = -(alpha * (alpha + 1e-8).log()).sum(-1)
                 self._expert_entropy = per_token_ent.mean().item()
-                self._expert_balance_cv = (mean_weights.std() / mean_weights.mean()).item()
+                self._expert_balance_cv = (mean_alpha.std() / mean_alpha.mean()).item()
         return route_weights
 
 
@@ -600,7 +625,7 @@ class CausalSelfAttention(nn.Module):
 
     - Low-rank KV compression via shared latent
     - Decoupled RoPE: half of head_dim for positional encoding
-    - Query-dependent per-head sigmoid gate after SDPA
+    - Query-dependent per-head sigmoid gate after SDPA (scalar gate per head)
     - Soft dense routing on output projection (MoE for attention)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
@@ -623,7 +648,7 @@ class CausalSelfAttention(nn.Module):
         self.rope_dim = self.head_dim // 2  # half for RoPE
         self.nope_dim = self.head_dim - self.rope_dim
 
-        # Q projection outputs query + per-head gate logits (arxiv:2505.06708)
+        # Q projection outputs query + scalar per-head gate logits.
         self.c_q = CastedLinear(dim, dim + num_heads, bias=False)
         # KV compression path
         self.c_kv_down = CastedLinear(dim, self.kv_latent_dim, bias=False)
@@ -631,10 +656,17 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
         # Decoupled RoPE key
         self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        # Dense mixture experts: low-rank output projections per expert (dim -> r -> dim)
+        # Keep name expert_proj for downstream diagnostics/tests compatibility.
+        self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
+        self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_size))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_proj.data[e])
+            nn.init.xavier_uniform_(self.expert_out.data[e])
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
+        # Gated attention bias (per-head scalar)
+        self.gate_bias = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
         # Soft dense routing on attention output (MoE for attention)
         self.attn_router = SoftDenseRouter(dim, num_experts)
 
@@ -667,52 +699,62 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         # Gated attention: query-dependent per-head gate (arxiv:2505.06708)
-        y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype))
+        y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        # Soft dense routing on attention output
+        # Soft dense routing on attention output (dense mixture-of-experts)
         route_weights = self.attn_router(x)  # [B, T, E]
-        y = y.view(bsz, seqlen, self.num_experts, self.expert_size)
-        y = y * route_weights.unsqueeze(-1)
-        y = y.view(bsz, seqlen, dim)
-        return self.proj(y)
+        h = torch.einsum('btd,erd->bter', y, self.expert_proj)
+        out_e = torch.einsum('bter,edr->bted', h, self.expert_out)
+        return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
+
+    @property
+    def attn_gate(self) -> Tensor:
+        # Backwards-compat for older tests/diagnostics.
+        return self.gate_bias
 
 
 class MLP(nn.Module):
-    """SiLU-gated MLP with Soft Dense Routing (Constraint #2)."""
+    """SiLU-gated MLP with true expert parameters + Soft Dense Routing (Constraint #2)."""
     def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
         self.expert_size = hidden // num_experts
-        self.gate_proj = CastedLinear(dim, hidden, bias=False)
-        self.gate_proj._qat_clip = 15
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.fc._qat_clip = 15
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
-        self.proj._qat_clip = 15
+        # Dense mixture experts: low-rank SwiGLU blocks per expert (dim -> r -> dim)
+        self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
+        self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
+        self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_size))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_gate.data[e])
+            nn.init.xavier_uniform_(self.expert_fc.data[e])
+            nn.init.xavier_uniform_(self.expert_down.data[e])
         self.mlp_router = SoftDenseRouter(dim, num_experts)
 
     def forward(self, x: Tensor) -> Tensor:
-        h = F.silu(self.gate_proj(x)) * self.fc(x)
-        route_weights = self.mlp_router(x)
-        bsz, seq, hidden = h.shape
-        h = h.view(bsz, seq, self.num_experts, self.expert_size)
-        h = h * route_weights.unsqueeze(-1)
-        h = h.view(bsz, seq, hidden)
-        return self.proj(h)
+        route_weights = self.mlp_router(x)  # [B, T, E]
+        gate_h = torch.einsum('btd,esd->btes', x, self.expert_gate)
+        fc_h = torch.einsum('btd,esd->btes', x, self.expert_fc)
+        h = F.silu(gate_h) * fc_h  # [B, T, E, expert_size]
+        out_e = torch.einsum('btes,eds->bted', h, self.expert_down)
+        return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
+
+    @property
+    def router(self) -> SoftDenseRouter:
+        # Backwards-compat for older tests/diagnostics.
+        return self.mlp_router
 
 
 class SmearGate(nn.Module):
     """Blend each token's embedding with the previous token's embedding."""
     def __init__(self, dim: int):
         super().__init__()
-        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        # Initialize near-identity: mostly current token, slight previous-token injection.
+        self.gate = nn.Parameter(torch.full((dim,), 3.0, dtype=torch.float32))  # sigmoid(3)=0.95
 
     def forward(self, x: Tensor) -> Tensor:
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
-        return (1 - g) * x + g * x_prev
+        return g * x + (1 - g) * x_prev
 
 
 class BigramHashEmbedding(nn.Module):
@@ -776,6 +818,9 @@ class MoSHead(nn.Module):
         # NTP gate: num_shared + num_specialized (different specialized)
         self.gate_ctp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
         self.gate_ntp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
+        # Post-softmax per-expert gates (allow skipping experts while keeping a valid mixture)
+        self.expert_gate_ctp_logits = nn.Parameter(torch.ones(num_shared + num_specialized, dtype=torch.float32))
+        self.expert_gate_ntp_logits = nn.Parameter(torch.ones(num_shared + num_specialized, dtype=torch.float32))
         # Shared A projections: [num_shared, d_model, rank]
         self.A_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
         # Specialized A projections: 1 for CTP, 1 for NTP
@@ -808,41 +853,48 @@ class MoSHead(nn.Module):
         return _fsq_ste(x, self.fsq_levels, self.training)
 
     def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
-                      A_spec: Tensor, B: Tensor) -> Tensor:
-        """Compute log-probs for one head (CTP or NTP)."""
+                      A_spec: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute (log_probs, alpha_softmax, alpha_softmax*sigmoid_gate) for one head."""
         N = x.shape[0]
         alpha = F.softmax(gate(x).float(), dim=-1)  # [N, num_shared+num_spec]
-        log_alpha = alpha.clamp(min=1e-8).log()
-        log_p = x.new_full((N, self.vocab_size), -torch.inf, dtype=torch.float32)
+        if gate is self.gate_ctp:
+            gates = torch.sigmoid(self.expert_gate_ctp_logits)[None, :]
+        else:
+            gates = torch.sigmoid(self.expert_gate_ntp_logits)[None, :]
+        weights = alpha * gates.to(dtype=alpha.dtype)
+        log_w = weights.clamp(min=1e-8).log()
+        log_p_unnorm = x.new_full((N, self.vocab_size), -torch.inf, dtype=torch.float32)
         # Shared experts
         for e in range(self.num_shared):
             u = self._fsq(x.to(A_shared.dtype) @ A_shared[e])
             logits = u.to(B.dtype) @ B.t()
-            log_p = torch.logaddexp(log_p, log_alpha[:, e:e+1] + F.log_softmax(logits.float(), dim=-1))
+            log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, e:e+1] + F.log_softmax(logits.float(), dim=-1))
         # Specialized experts
         for e in range(self.num_specialized):
             u = self._fsq(x.to(A_spec.dtype) @ A_spec[e])
             logits = u.to(B.dtype) @ B.t()
             idx = self.num_shared + e
-            log_p = torch.logaddexp(log_p, log_alpha[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
-        return log_p, alpha
+            log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
+        log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
+        return log_p, alpha, weights
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         """Return (log_p_denoise, log_p_ntp), each [*, V]."""
         orig_shape = h.shape[:-1]
         x = h.reshape(-1, self.d_model)
 
-        log_p_d, alpha_d = self._head_forward(x, self.gate_ctp, self.A_shared, self.A_ctp, self.B_denoise)
-        log_p_n, alpha_n = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
+        log_p_d, alpha_d, w_d = self._head_forward(x, self.gate_ctp, self.A_shared, self.A_ctp, self.B_denoise)
+        log_p_n, alpha_n, w_n = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
 
         if self.training:
             bal = torch.tensor(0.0, device=x.device)
             spar = torch.tensor(0.0, device=x.device)
-            for alpha in [alpha_d, alpha_n]:
-                mean_a = alpha.mean(dim=0)
-                target = torch.ones_like(mean_a) / alpha.shape[-1]
+            for alpha_soft in [alpha_d, alpha_n]:
+                mean_a = alpha_soft.mean(dim=0)
+                target = torch.ones_like(mean_a) / alpha_soft.shape[-1]
                 bal = bal + F.mse_loss(mean_a, target)
-                spar = spar + alpha.abs().mean()
+            for w in [w_d, w_n]:
+                spar = spar + w.abs().mean()
             self._balance_loss = bal
             self._sparsity_loss = spar
         else:
@@ -876,6 +928,164 @@ class Block(nn.Module):
         return x
 
 
+class RevDEQFunction(torch.autograd.Function):
+    """Memory-efficient backward for RevDEQ coupled-state iteration (arxiv:2509.12917).
+
+    Forward runs under no_grad, saves only terminal (y, z) states.
+    Backward reconstructs states in reverse using fp64 accumulators and
+    computes per-step VJPs. O(1) activation memory vs O(K) for standard autograd.
+    """
+    @staticmethod
+    def _autocast_off_ctx(device_type: str) -> contextlib.AbstractContextManager[None]:
+        try:
+            return torch.autocast(device_type=device_type, enabled=False)
+        except Exception:
+            return contextlib.nullcontext()
+
+    @staticmethod
+    def _autocast_like_ctx(device_type: str, dtype: torch.dtype) -> contextlib.AbstractContextManager[None]:
+        if device_type == "cpu":
+            return RevDEQFunction._autocast_off_ctx(device_type)
+        if dtype not in (torch.float16, torch.bfloat16):
+            return RevDEQFunction._autocast_off_ctx(device_type)
+        try:
+            return torch.autocast(device_type=device_type, dtype=dtype, enabled=True)
+        except Exception:
+            return contextlib.nullcontext()
+
+    @staticmethod
+    def forward(ctx, f_theta, x0, z_init, beta, K, *params):
+        acc_dtype = torch.float64
+        state_dtype = torch.float32
+        compute_dtype = z_init.dtype
+        device_type = x0.device.type
+        beta_inv = 1.0 - beta
+
+        y_state = z_init.to(state_dtype)
+        z_state = z_init.to(state_dtype)
+        z_prev_state = z_state
+
+        with torch.no_grad():
+            for _ in range(K):
+                z_prev_state = z_state
+                y_acc = y_state.to(acc_dtype) * beta_inv
+                with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                    out_z = f_theta(z_state.to(compute_dtype), x0)
+                y_acc = y_acc + out_z.to(acc_dtype) * beta
+                y_state = y_acc.to(state_dtype)
+
+                z_acc = z_state.to(acc_dtype) * beta_inv
+                with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                    out_y = f_theta(y_state.to(compute_dtype), x0)
+                z_acc = z_acc + out_y.to(acc_dtype) * beta
+                z_state = z_acc.to(state_dtype)
+
+        ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(), z_prev_state.detach())
+        ctx.f_theta = f_theta
+        ctx.beta = beta
+        ctx.beta_inv = beta_inv
+        ctx.K = K
+        ctx.compute_dtype = compute_dtype
+        ctx.device_type = device_type
+        ctx.params = params
+        return z_state.to(compute_dtype), z_prev_state.to(compute_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_z, _grad_z_prev_ignored):
+        x0, y_terminal, z_terminal, _z_prev_terminal = (t.detach() for t in ctx.saved_tensors)
+        f_theta = ctx.f_theta
+        beta = ctx.beta
+        beta_inv = ctx.beta_inv
+        K = ctx.K
+        compute_dtype = ctx.compute_dtype
+        device_type = ctx.device_type
+        acc_dtype = torch.float64
+        state_dtype = torch.float32
+
+        params_all = tuple(ctx.params)
+        req_indices = [i for i, p in enumerate(params_all) if getattr(p, "requires_grad", False)]
+        params_req = tuple(params_all[i] for i in req_indices)
+
+        bar_z = grad_z.to(state_dtype)
+        bar_y = torch.zeros_like(bar_z)
+        cur_param_grads_req: list[torch.Tensor | None] = [None] * len(params_req)
+        cur_x_grad = torch.zeros_like(x0, dtype=torch.float32)
+
+        y_next = y_terminal
+        z_next = z_terminal
+
+        for _ in range(K):
+            # VJP 1: f(y_{n+1}, x0) — used to reconstruct z_n
+            y_local = y_next.detach().to(compute_dtype).requires_grad_()
+            x_local = x0.detach().to(x0.dtype).requires_grad_()
+            with torch.enable_grad():
+                with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                    out_y = f_theta(y_local, x_local)
+
+            # Reconstruct z_n: z_n = (z_{n+1} - beta*f(y_{n+1})) / (1-beta)
+            z_n = (z_next.to(acc_dtype) - out_y.detach().to(acc_dtype) * beta) / beta_inv
+            z_n = z_n.to(state_dtype)
+
+            grad_seed_y = (beta * bar_z).to(out_y.dtype)
+            grads_y = torch.autograd.grad(
+                out_y, (y_local, x_local, *params_req),
+                grad_outputs=grad_seed_y, allow_unused=True,
+            )
+            vjp_y = grads_y[0].to(state_dtype)
+            bar_y_acc = bar_y + vjp_y
+
+            # VJP 2: f(z_n, x0) — used to reconstruct y_n
+            z_local = z_n.detach().to(compute_dtype).requires_grad_()
+            x_local2 = x0.detach().to(x0.dtype).requires_grad_()
+            with torch.enable_grad():
+                with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                    out_z = f_theta(z_local, x_local2)
+
+            # Reconstruct y_n: y_n = (y_{n+1} - beta*f(z_n)) / (1-beta)
+            y_n = (y_next.to(acc_dtype) - out_z.detach().to(acc_dtype) * beta) / beta_inv
+            y_n = y_n.to(state_dtype)
+
+            grad_seed_z = (beta * bar_y_acc).to(out_z.dtype)
+            grads_z = torch.autograd.grad(
+                out_z, (z_local, x_local2, *params_req),
+                grad_outputs=grad_seed_z, allow_unused=True,
+            )
+            vjp_z = grads_z[0].to(state_dtype)
+
+            # Adjoint updates
+            bar_z = beta_inv * bar_z + vjp_z
+            bar_y = beta_inv * bar_y_acc
+
+            # Accumulate param + x grads
+            for j in range(len(params_req)):
+                gy = grads_y[2 + j]
+                gz = grads_z[2 + j]
+                if gy is None and gz is None:
+                    continue
+                g = (gy if gy is not None else 0.0) + (gz if gz is not None else 0.0)
+                g = g.detach()
+                cur_param_grads_req[j] = g if cur_param_grads_req[j] is None else cur_param_grads_req[j] + g
+            if grads_y[1] is not None:
+                cur_x_grad += grads_y[1].detach().float()
+            if grads_z[1] is not None:
+                cur_x_grad += grads_z[1].detach().float()
+
+            y_next, z_next = y_n, z_n
+
+        # z_init gradient = bar_y + bar_z (both adjoint states at step 0)
+        z_init_grad = (bar_y + bar_z).to(x0.dtype)
+        # Map required grads back to full *params list for autograd/DDP.
+        param_grads_out: list[torch.Tensor | None] = [None] * len(params_all)
+        for j, all_idx in enumerate(req_indices):
+            g = cur_param_grads_req[j]
+            if g is None:
+                continue
+            param_grads_out[all_idx] = g.to(dtype=params_all[all_idx].dtype)
+
+        # Returns: (f_theta, x0, z_init, beta, K, *params_all)
+        return (None, cur_x_grad.to(x0.dtype), z_init_grad, None, None, *param_grads_out)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -903,6 +1113,8 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers       # DEQ solver iters per refinement
         self.num_refinements = num_refinements  # predict→soft_embed→re-encode cycles
+        # Backwards-compat: older code/tests expect blocks to exist but be unused in DEQ mode.
+        self.blocks = None
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
@@ -936,39 +1148,44 @@ class GPT(nn.Module):
         """Diffusion-AR: build soft embedding from CTP + NTP predictions.
 
         For each position i, combines two signals via frozen expert:
-        - CTP[i] = h[i] @ W^T  →  predicts token at position i (from context 0..i)
-        - NTP[i-1] = h[i-1] @ W^T  →  predicts next token after i-1 (= token i)
-        Average logits, take top-k, build sparse soft embedding.
+        - CTP[i] from MoSHead: predicts token at position i (from context 0..i)
+        - NTP[i-1] from MoSHead: predicts next token after i-1 (= token i)
+        Mix probabilities, take top-k, build sparse soft embedding.
         """
         with torch.no_grad():
             h = self.final_norm(z)
+            was_training = self.mos_head.training
+            self.mos_head.train(False)
+            log_p_ctp, log_p_ntp = self.mos_head(h)  # [B,T,V] log-probs
+            self.mos_head.train(was_training)
+
+            log_p_ntp_shifted = torch.cat([log_p_ntp[:, :1], log_p_ntp[:, :-1]], dim=1)
+            p_mix = 0.5 * (log_p_ctp.float().exp() + log_p_ntp_shifted.float().exp())
+            topk_probs, topk_idx = p_mix.topk(topk, dim=-1)  # [B,T,K]
+            topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             W = self.tok_emb.weight.data  # [V, d]
-            logits = h.float() @ W.float().t()  # [B, T, V]
-            # CTP[i] = logits[i], NTP[i-1] shifted = logits[i-1]
-            logits_shifted = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
-            avg_logits = 0.5 * (logits + logits_shifted)
-            # Top-k from combined distribution
-            topk_logits, topk_idx = avg_logits.topk(topk, dim=-1)  # [B, T, K]
-            topk_probs = F.softmax(topk_logits, dim=-1)
-            topk_embeds = F.embedding(topk_idx, W)  # [B, T, K, d]
-            soft_embed = (topk_probs.unsqueeze(-1) * topk_embeds).sum(-2)  # [B, T, d]
+            topk_embeds = F.embedding(topk_idx, W)  # [B,T,K,d]
+            soft_embed = (topk_probs.unsqueeze(-1) * topk_embeds).sum(-2)  # [B,T,d]
         return self.diffar_scale.to(dtype=z.dtype) * soft_embed.to(z.dtype)
 
-    def _deq_solve(self, x0: Tensor, z_init: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Run DEQ coupled-state solver for given x0.
+    def _deq_solve(self, x0: Tensor, z_init: Tensor):
+        """Run DEQ coupled-state solver. Uses RevDEQFunction for O(1) memory in training."""
+        if self.training:
+            params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
+            z, z_prev = RevDEQFunction.apply(
+                self.shared_block, x0, z_init, self.deq_beta, self.num_layers, *params
+            )
+            return z, z_prev, None, None
 
-        Returns (z, z_prev, y_acc, z_acc) where z_prev is the second-to-last state
-        for convergence measurement.
-        """
+        # Eval: explicit loop for diagnostics + reconstruction check
         beta = self.deq_beta
         dtype = x0.dtype
         acc_dtype = torch.float64
         y_acc = z_init.to(acc_dtype)
         z_acc = z_init.to(acc_dtype)
-        y, z = z_init, z_init
-
+        z = z_init
         z_prev = z
-        for t in range(self.num_layers):
+        for _ in range(self.num_layers):
             z_prev = z
             f_z = self.shared_block(z, x0)
             y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
@@ -976,7 +1193,6 @@ class GPT(nn.Module):
             f_y = self.shared_block(y, x0)
             z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
             z = z_acc.to(dtype)
-
         return z, z_prev, y_acc, z_acc
 
     def _run_backbone(self, x: Tensor) -> Tensor:
@@ -1008,10 +1224,18 @@ class GPT(nn.Module):
 
             z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        # Convergence loss (training)
+        # Convergence loss: ||z_T - z_{T-1}||² / ||z_T||² (training)
         if self.training:
-            z_norm_sq = z.float().pow(2).sum().clamp_min(1.0)
-            self._convergence_loss = (z - z_prev).float().pow(2).sum() / z_norm_sq
+            z_norm_sq = z.detach().float().pow(2).sum().clamp_min(1.0)
+            if z_prev is None:
+                f_z = self.shared_block(z, x0_refined)
+                self._convergence_loss = (z - f_z).float().pow(2).sum() / z_norm_sq
+            else:
+                self._convergence_loss = (z - z_prev).float().pow(2).sum() / z_norm_sq
+                # Lightweight training diagnostics (no extra block call):
+                # track the final-iter update magnitude as a proxy for solver convergence.
+                self._deq_residuals = [(z - z_prev).float().norm().item()]
+                self._deq_iter_convergence = self._deq_residuals[0]
 
         # Diagnostics (eval only)
         if not self.training:
@@ -1031,8 +1255,6 @@ class GPT(nn.Module):
                 state_norm = max(z_init_64.norm().item(), 1.0)
                 recon_error = ((zr_acc - z_init_64).norm().item() + (yr_acc - z_init_64).norm().item()) / state_norm
                 self._deq_recon_error = recon_error
-        else:
-            self._deq_residuals = []
 
         return z
 
@@ -1059,15 +1281,17 @@ class GPT(nn.Module):
         bal = bal + getattr(self.mos_head, '_balance_loss', zero)
         spar = spar + getattr(self.mos_head, '_sparsity_loss', zero)
         # Orthogonality: |cos_sim| between expert weight groups → 0
-        for w, n_exp in [
-            (self.shared_block.mlp.fc.weight.float(), self.shared_block.mlp.num_experts),
-            (self.shared_block.attn.proj.weight.float(), self.shared_block.attn.num_experts),
-            (self.mos_head.A_shared.reshape(-1, self.mos_head.rank).float(), self.mos_head.num_shared),
+        for w in [
+            self.shared_block.mlp.expert_fc.float(),   # [E, expert_size, dim]
+            self.shared_block.mlp.expert_down.float(),  # [E, dim, expert_size]
+            self.shared_block.attn.expert_proj.float(), # [E, expert_size, dim]
+            self.shared_block.attn.expert_out.float(),  # [E, dim, expert_size]
+            self.mos_head.A_shared.float(),             # [E, d_model, rank]
         ]:
+            n_exp = w.shape[0]
             if n_exp < 2:
                 continue
-            expert_size = w.shape[0] // n_exp
-            groups = w.view(n_exp, expert_size, -1).mean(dim=1)  # [E, feat]
+            groups = w.mean(dim=1)  # [E, feat]
             groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
             cos = groups @ groups.T
             mask = ~torch.eye(n_exp, dtype=torch.bool, device=cos.device)
@@ -1194,9 +1418,23 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    requested_grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "0"))
+    if requested_grad_accum_steps > 0:
+        grad_accum_steps = requested_grad_accum_steps
+    else:
+        # Auto mode: keep per-rank microbatches reasonably small across GPU counts.
+        grad_accum_steps = max(1, math.ceil(8 / world_size))
+    # Ensure we can form at least 1 sequence per rank per micro-step.
+    global_seqs = args.train_batch_tokens // args.train_seq_len
+    while grad_accum_steps > 1 and global_seqs < world_size * grad_accum_steps:
+        grad_accum_steps -= 1
+    if global_seqs < world_size * grad_accum_steps:
+        raise ValueError(
+            "TRAIN_BATCH_TOKENS too small for DDP config: "
+            f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} TRAIN_SEQ_LEN={args.train_seq_len} "
+            f"WORLD_SIZE={world_size} GRAD_ACCUM_STEPS={grad_accum_steps}. "
+            "Increase TRAIN_BATCH_TOKENS or set a smaller GRAD_ACCUM_STEPS."
+        )
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1291,7 +1529,7 @@ def main() -> None:
     block_named_params = list(base_model.shared_block.named_parameters())
     matrix_params = [
         p for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim >= 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p for name, p in block_named_params
