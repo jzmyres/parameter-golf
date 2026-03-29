@@ -14,7 +14,8 @@ def parse_log(logpath: str) -> dict:
     """Parse training log for all metrics."""
     lines = Path(logpath).read_text().split("\n")
     data = {
-        "train_steps": [], "train_loss": [], "step_avg_ms": [], "train_time_ms": [],
+        "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
+        "step_avg_ms": [], "train_time_ms": [],
         "val_steps": [], "val_loss": [], "val_bpb": [],
         "deq_residual": [], "deq_recon": [], "deq_iter_conv": [],
         "expert_usage_0": [], "expert_usage_1": [], "expert_entropy": [],
@@ -23,12 +24,17 @@ def parse_log(logpath: str) -> dict:
 
     for line in lines:
         # Training steps
-        m = re.search(r"^step:(\d+)/\d+ train_loss:([\d.]+) train_time:(\d+)ms step_avg:([\d.]+)ms", line)
+        m = re.search(r"^step:(\d+)/\d+ train_loss:([\d.]+).*train_time:(\d+)ms step_avg:([\d.]+)ms", line)
         if m:
             data["train_steps"].append(int(m.group(1)))
             data["train_loss"].append(float(m.group(2)))
             data["train_time_ms"].append(float(m.group(3)))
             data["step_avg_ms"].append(float(m.group(4)))
+            # Parse NTP and CTP losses from training lines
+            m_ntp = re.search(r"ntp_loss:([\d.]+)", line)
+            data["ntp_loss"].append(float(m_ntp.group(1)) if m_ntp else 0.0)
+            m_ctp = re.search(r"ctp_loss:([\d.]+)", line)
+            data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else 0.0)
 
         # Validation steps
         m = re.search(r"^step:(\d+)/\d+ val_loss:([\d.]+) val_bpb:([\d.]+)", line)
@@ -91,8 +97,20 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
     fig, axes = plt.subplots(4, 3, figsize=(18, 16))
     fig.suptitle("Baseline vs Current Experiment — Full Diagnostics", fontsize=16, fontweight="bold")
 
-    # Row 1: Training metrics
-    _plot_line(axes[0, 0], b, c, "train_loss", "train_loss", "train_steps", "train_steps", "Train Loss")
+    # Row 1: Training metrics (NTP + CTP breakdown)
+    ax_loss = axes[0, 0]
+    for d, color, label in [(b, "b", "Baseline"), (c, "r", "Current")]:
+        if d["train_loss"]:
+            ax_loss.plot(d["train_steps"], d["train_loss"], f"{color}-", alpha=0.7, label=f"{label} Total", linewidth=1.5)
+        if d["ntp_loss"] and any(v > 0 for v in d["ntp_loss"]):
+            ax_loss.plot(d["train_steps"], d["ntp_loss"], f"{color}--", alpha=0.5, label=f"{label} NTP", linewidth=1)
+        if d["ctp_loss"] and any(v > 0 for v in d["ctp_loss"]):
+            ax_loss.plot(d["train_steps"], d["ctp_loss"], f"{color}:", alpha=0.5, label=f"{label} CTP", linewidth=1)
+    ax_loss.set_title("Train Loss (Total / NTP / CTP)", fontsize=11)
+    ax_loss.set_xlabel("Step")
+    ax_loss.legend(fontsize=7)
+    ax_loss.grid(True, alpha=0.3)
+
     _plot_line(axes[0, 1], b, c, "val_bpb", "val_bpb", "val_steps", "val_steps", "Val BPB")
     _plot_line(axes[0, 2], b, c, "step_avg_ms", "step_avg_ms", "train_steps", "train_steps", "Step Avg (ms)")
 

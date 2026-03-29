@@ -52,7 +52,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 650))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1350.0))  # 1.5x budget
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -71,8 +71,8 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
@@ -249,7 +249,10 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                _ = model(x, y)
+            # Use NTP-only loss for val (exclude CTP and convergence terms)
+            base_m = model.module if hasattr(model, 'module') else model
+            batch_loss = torch.tensor(base_m._ntp_loss, device=device)
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -277,7 +280,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,fsq.scale,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,attn_gate,expert_gate,fsq_scale,skip_weight,skip_weights,smear,bigram.scale",
     ).split(",")
     if pattern
 )
@@ -570,7 +573,8 @@ class CausalSelfAttention(nn.Module):
         self.rope_dim = self.head_dim // 2  # half for RoPE
         self.nope_dim = self.head_dim - self.rope_dim
 
-        self.c_q = CastedLinear(dim, dim, bias=False)
+        # Q projection outputs query + per-head gate logits (arxiv:2505.06708)
+        self.c_q = CastedLinear(dim, dim + num_heads, bias=False)
         # KV compression path
         self.c_kv_down = CastedLinear(dim, self.kv_latent_dim, bias=False)
         self.c_k_nope = CastedLinear(self.kv_latent_dim, num_kv_heads * self.nope_dim, bias=False)
@@ -580,15 +584,15 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        # Gated attention: per-head sigmoid gate (init=3 → sigmoid≈0.95)
-        # Gate init near 0 for DEQ stability (identity mapping at init, contraction guaranteed)
-        self.attn_gate = nn.Parameter(torch.full((num_heads,), 0.0, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        q_rope, q_nope = q[..., :self.rope_dim], q[..., self.rope_dim:]
+        # Q projection outputs query vectors + per-head gate logits
+        q_and_gate = self.c_q(x)  # [B, T, dim + num_heads]
+        q_raw = q_and_gate[..., :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        gate_logits = q_and_gate[..., dim:].reshape(bsz, seqlen, self.num_heads, 1).transpose(1, 2)
+        q_rope, q_nope = q_raw[..., :self.rope_dim], q_raw[..., self.rope_dim:]
 
         kv_latent = self.c_kv_down(x)
         k_nope = self.c_k_nope(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
@@ -610,9 +614,8 @@ class CausalSelfAttention(nn.Module):
             q_full, k_full, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-        # Gated attention
-        gate = torch.sigmoid(self.attn_gate.to(dtype=y.dtype))[None, :, None, None]
-        y = y * gate
+        # Gated attention: query-dependent per-head gate (arxiv:2505.06708)
+        y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -636,18 +639,20 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
         self.proj._qat_clip = 15
-        # Soft Dense Routing: router + per-expert sigmoid gate
+        # Soft Dense Routing: router + input-dependent per-expert sigmoid gate
         self.router = CastedLinear(dim, num_experts, bias=False)
-        self.expert_gate = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
+        self.expert_gate = CastedLinear(dim, num_experts, bias=True)
+        nn.init.zeros_(self.expert_gate.weight)
+        nn.init.zeros_(self.expert_gate.bias)
 
     def forward(self, x: Tensor) -> Tensor:
         h = F.silu(self.gate_proj(x)) * self.fc(x)
         # Soft dense routing: all experts process all tokens
         route_logits = self.router(x)  # (bsz, seq, E)
         route_weights = torch.softmax(route_logits, dim=-1)
-        # Per-expert sigmoid gate: allows skipping experts
-        eg = torch.sigmoid(self.expert_gate.to(dtype=x.dtype))
-        route_weights = route_weights * eg[None, None, :]  # (bsz, seq, E)
+        # Input-dependent per-expert sigmoid gate: allows skipping experts per-token
+        eg = torch.sigmoid(self.expert_gate(x))  # (bsz, seq, E)
+        route_weights = route_weights * eg  # (bsz, seq, E)
 
         # Load balancing: encourage equal usage across experts
         if self.training:
@@ -738,36 +743,98 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
-class FSQBottleneck(nn.Module):
-    """Finite Scalar Quantization with low-rank non-linear bottleneck (Constraint #4).
+def _fsq_ste(x: Tensor, num_levels: int, training: bool) -> Tensor:
+    """FSQ with straight-through estimator: tanh → round to nearest level."""
+    x_bounded = torch.tanh(x)
+    step = 2.0 / (num_levels - 1)
+    if training:
+        x_q = torch.round(x_bounded / step) * step
+        return x_bounded + (x_q - x_bounded).detach()
+    return torch.round(x_bounded / step) * step
 
-    Compresses hidden state to low-rank, applies FSQ discretization,
-    then expands back with non-linearity to recover expressiveness.
+
+class MoSHead(nn.Module):
+    """Mixture-of-Softmaxes dual head (Constraint #4+#5).
+
+    Shared low-rank experts produce dual predictions:
+    - CTP (denoising): predict current token via B_denoise
+    - NTP (next-token): predict next token via B_NTP
+
+    Uses frozen expert (backbone embedding) + trainable low-rank experts.
+    FSQ applied in intermediate space (Constraint #4).
     """
-    def __init__(self, dim: int, bottleneck_dim: int = 32, num_levels: int = 8):
+    def __init__(self, d_model: int, vocab_size: int, rank: int = 64,
+                 num_experts: int = 2, fsq_levels: int = 8):
         super().__init__()
-        self.down = CastedLinear(dim, bottleneck_dim, bias=False)
-        self.up = CastedLinear(bottleneck_dim, dim, bias=False)
-        self.up._zero_init = True  # start as identity skip
-        self.num_levels = num_levels
-        self.scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        self.rank = rank
+        self.num_experts = num_experts
+        self.fsq_levels = fsq_levels
+        # Gate: 1 frozen + num_experts trainable
+        self.gate = nn.Linear(d_model, 1 + num_experts, bias=True)
+        # Shared A matrices per expert: [E, d_model, rank]
+        self.A = nn.Parameter(torch.empty(num_experts, d_model, rank))
+        # Dual B matrices: separate for CTP and NTP
+        self.B_denoise = nn.Parameter(torch.empty(vocab_size, rank))
+        self.B_NTP = nn.Parameter(torch.empty(vocab_size, rank))
+        # FSQ scale (Constraint #4): applied in low-rank space
+        self.fsq_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        self._init_params()
+
+    def _init_params(self):
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        self.gate.bias.data[0] = 2.0  # frozen expert starts favored
+        for e in range(self.num_experts):
+            nn.init.xavier_uniform_(self.A.data[e])
+        # B initialized to zeros — trainable experts contribute nothing at init
+        nn.init.zeros_(self.B_denoise)
+        nn.init.zeros_(self.B_NTP)
+
+    def init_from_embedding(self, embed_weight: Tensor):
+        """Initialize from backbone embedding via SVD."""
+        W = embed_weight.float().cpu()
+        U, S, Vt = torch.linalg.svd(W, full_matrices=False)
+        r = self.rank
+        A_base = Vt[:r, :].T.contiguous()  # [d_model, rank]
+        B_init = U[:, :r] * S[:r].unsqueeze(0)  # [vocab, rank]
+        dev, dt = self.A.device, self.A.dtype
+        self.A.data.copy_(A_base.to(dev, dt).unsqueeze(0).expand(self.num_experts, -1, -1).contiguous())
+        self.B_denoise.data.copy_(B_init.to(dev, dt))
+        self.B_NTP.data.copy_(B_init.to(dev, dt))
 
     def _fsq(self, x: Tensor) -> Tensor:
-        """Finite Scalar Quantization: round to nearest level."""
-        # Scale to [-1, 1], quantize to num_levels, scale back
-        x_bounded = torch.tanh(x)
-        step = 2.0 / (self.num_levels - 1)
-        if self.training:
-            # Straight-through estimator: quantize forward, identity backward
-            x_q = (torch.round(x_bounded / step) * step)
-            return x_bounded + (x_q - x_bounded).detach()
-        return torch.round(x_bounded / step) * step
+        return _fsq_ste(x, self.fsq_levels, self.training)
 
-    def forward(self, x: Tensor) -> Tensor:
-        h = F.silu(self.down(x))  # non-linearity before FSQ
-        h = self._fsq(h)           # discretize
-        h = F.silu(h)              # non-linearity after FSQ (recover expressiveness)
-        return self.scale.to(dtype=x.dtype) * self.up(h)
+    def forward(self, h: Tensor, frozen_W: Tensor) -> tuple[Tensor, Tensor]:
+        """Return (log_p_denoise, log_p_ntp), each [N, V]."""
+        x = h.reshape(-1, self.d_model)  # [N, d]
+        N, V = x.shape[0], self.vocab_size
+
+        # Gate: mixture weights in log-space
+        log_alpha = F.log_softmax(self.gate(x).float(), dim=-1)  # [N, 1+E]
+
+        # Frozen expert: full-rank h @ W^T (same for both heads)
+        logits_frozen = x.float() @ frozen_W.float().t()
+        log_pe_frozen = F.log_softmax(logits_frozen, dim=-1)
+        la_frozen = log_alpha[:, 0:1]  # [N, 1]
+        log_p_d = la_frozen + log_pe_frozen
+        log_p_n = la_frozen + log_pe_frozen
+
+        # Trainable experts: low-rank with FSQ
+        for e in range(self.num_experts):
+            u = x.to(self.A.dtype) @ self.A[e]  # [N, rank]
+            u = self._fsq(u)
+            logits_d = u.to(self.B_denoise.dtype) @ self.B_denoise.t()
+            logits_n = u.to(self.B_NTP.dtype) @ self.B_NTP.t()
+            log_pe_d = F.log_softmax(logits_d.float(), dim=-1)
+            log_pe_n = F.log_softmax(logits_n.float(), dim=-1)
+            la = log_alpha[:, 1 + e: 2 + e]  # [N, 1]
+            log_p_d = torch.logaddexp(log_p_d, la + log_pe_d)
+            log_p_n = torch.logaddexp(log_p_n, la + log_pe_n)
+
+        return log_p_d, log_p_n
 
 
 class Block(nn.Module):
@@ -826,17 +893,11 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.deq_beta = 0.5  # relaxation parameter for coupled-state iteration
-        # Diffusion-AR (Constraint #5): soft embedding refinement per DEQ iteration
-        self.diffar_down = CastedLinear(model_dim, 64, bias=False)
-        self.diffar_up = CastedLinear(64, model_dim, bias=False)
-        self.diffar_up._zero_init = True
-        self.blocks = None  # not used in DEQ mode
-        # FSQ-MoS: param-efficient output head via FSQ bottleneck
-        self.fsq_head = FSQBottleneck(model_dim, bottleneck_dim=96, num_levels=8)
+        # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
+        self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
+        # MoS output head (Constraints #4+#5): shared experts, dual B for CTP/NTP
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=64, num_experts=2, fsq_levels=8)
         self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        if self.lm_head is not None:
-            self.lm_head._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -851,6 +912,21 @@ class GPT(nn.Module):
                     if ".proj." in name or name.endswith(".proj"):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * self.num_layers))
+        # Initialize MoS head from embedding weights
+        self.mos_head.init_from_embedding(self.tok_emb.weight.data)
+
+    def _get_soft_embedding(self, z: Tensor) -> Tensor:
+        """Diffusion-AR: build soft embedding from predicted token distribution.
+
+        With V=1024, direct matmul (probs @ W) is faster than top-k + gather.
+        """
+        with torch.no_grad():
+            h = self.final_norm(z)
+            W = self.tok_emb.weight.data  # [V, d]
+            logits = h.float() @ W.float().t()  # [B, T, V]
+            probs = F.softmax(logits, dim=-1)
+            soft_embed = probs @ W.float()  # [B, T, d]
+        return self.diffar_scale.to(dtype=z.dtype) * soft_embed.to(z.dtype)
 
     def _run_backbone(self, x: Tensor) -> Tensor:
         """RevDEQ: coupled-state fixed-point iteration (arxiv:2509.12917).
@@ -859,29 +935,30 @@ class GPT(nn.Module):
           y_{n+1} = (1-beta)*y_n + beta*f(z_n, x0)
           z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}, x0)
 
-        This is algebraically reversible — enabling exact gradients
-        with O(1) memory via backward reconstruction.
+        Diffusion-AR (Constraint #5): after iter 0, the model's own predictions
+        are fed back as soft embeddings to refine x0 for subsequent iterations.
         """
         x0 = x
         beta = self.deq_beta
         dtype = x.dtype
         # fp64 accumulators for exact reversibility (recon < 1e-8)
+        # Initialize y, z from input (warm start, per RevDEQ reference)
         acc_dtype = torch.float64
-        y_acc = torch.zeros(x.shape, dtype=acc_dtype, device=x.device)
-        z_acc = torch.zeros(x.shape, dtype=acc_dtype, device=x.device)
-        y = y_acc.to(dtype)
-        z = z_acc.to(dtype)
+        y_acc = x.to(acc_dtype)
+        z_acc = x.to(acc_dtype)
+        y = x
+        z = x
         self._deq_residuals: list[float] = []
 
         z_prev_iter = z
-        # Only store fp64 history during eval (saves VRAM during training)
-        z_hist_acc = [z_acc.clone()] if not self.training else []
+        # Store z history during eval only (for exact backward reconstruction)
+        z_hist = [z] if not self.training else []
         for t in range(self.num_layers):
             z_prev_iter = z
-            # Diffusion-AR: refine input using current state (soft denoising)
+            # Diffusion-AR: refine x0 with prediction-feedback soft embedding
             if t > 0:
-                correction = self.diffar_up(F.silu(self.diffar_down(z)))
-                x0_refined = x0 + correction
+                soft_embed = self._get_soft_embedding(z)
+                x0_refined = x0 + soft_embed
             else:
                 x0_refined = x0
 
@@ -893,7 +970,7 @@ class GPT(nn.Module):
             z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
             z = z_acc.to(dtype)
             if not self.training:
-                z_hist_acc.append(z_acc.clone())
+                z_hist.append(z.clone())
 
         # Convergence loss for training (encourage fixed-point convergence)
         if self.training:
@@ -913,63 +990,53 @@ class GPT(nn.Module):
                 zr_acc = z_acc.clone()
                 for t_rev in range(self.num_layers - 1, -1, -1):
                     if t_rev > 0:
-                        z_at = z_hist_acc[t_rev].to(dtype)
-                        x0r = x0 + self.diffar_up(F.silu(self.diffar_down(z_at)))
+                        # Use stored z from BEFORE this iteration for soft embedding
+                        z_at = z_hist[t_rev]  # z state entering iteration t_rev
+                        soft_embed_r = self._get_soft_embedding(z_at)
+                        x0r = x0 + soft_embed_r
                     else:
                         x0r = x0
                     f_yr = self.shared_block(yr_acc.to(dtype), x0r)
                     zr_acc = (zr_acc - beta * f_yr.to(acc_dtype)) / (1 - beta)
                     f_zr = self.shared_block(zr_acc.to(dtype), x0r)
                     yr_acc = (yr_acc - beta * f_zr.to(acc_dtype)) / (1 - beta)
-                state_norm = max(z_acc.norm().item(), 1.0)
-                recon_error = (zr_acc.norm().item() + yr_acc.norm().item()) / state_norm
+                # Check reconstruction back to initial state (y0=x, z0=x)
+                x0_64 = x0.to(acc_dtype)
+                state_norm = max(x0_64.norm().item(), 1.0)
+                recon_error = ((zr_acc - x0_64).norm().item() + (yr_acc - x0_64).norm().item()) / state_norm
                 self._deq_recon_error = recon_error
         else:
             self._deq_residuals = []
 
         return z
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _encode(self, input_ids: Tensor) -> Tensor:
+        """Shared embedding + backbone: input_ids → normalized hidden states."""
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
         x = self.smear(x)
         x = self._run_backbone(x)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        # FSQ-MoS: combine standard head with FSQ-refined head
-        x_fsq = x + self.fsq_head(x)  # FSQ adds low-rank discrete correction
-        if self.tie_embeddings:
-            logits_proj = F.linear(x_fsq, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x_fsq)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        # DEQ convergence regularization: encourage ||z_T - z_{T-1}|| → 0
-        conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ce_loss.device))
-        # Store individual losses for logging
-        self._ntp_loss = ce_loss.detach().item()
+        return self.final_norm(x)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self._encode(input_ids)
+        log_p_ctp, log_p_ntp = self.mos_head(x, self.tok_emb.weight)
+        V = self.tok_emb.num_embeddings
+        ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
+        ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
+        conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ntp_loss.device))
+        bal_loss = getattr(self.shared_block.mlp, '_balance_loss', torch.tensor(0.0, device=ntp_loss.device))
+        self._ntp_loss = ntp_loss.detach().item()
+        self._ctp_loss = ctp_loss.detach().item()
         self._conv_loss = conv_loss.detach().item() if isinstance(conv_loss, torch.Tensor) else 0.0
-        return ce_loss + 1.0 * conv_loss
+        return ntp_loss + 0.1 * ctp_loss + 1.0 * conv_loss + 0.01 * bal_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        x = _rms_norm(x)
-        x = self.smear(x)
-        x = self._run_backbone(x)
-        x = self.final_norm(x)
-        # FSQ-MoS: same as training forward
-        x = x + self.fsq_head(x)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            logits_proj = self.lm_head(x)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        x = self._encode(input_ids)
+        _, log_p_ntp = self.mos_head(x, self.tok_emb.weight)
+        return log_p_ntp
 
 
 def eval_val_sliding(
@@ -1014,9 +1081,10 @@ def eval_val_sliding(
                 x_batch[i, :wlen] = chunk[:-1]
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = base_model.forward_logits(x_batch)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
+                log_probs = base_model.forward_logits(x_batch)
+            # MoS head returns log-probs directly → use nll_loss
+            nll = F.nll_loss(
+                log_probs.reshape(-1, log_probs.size(-1)).float(),
                 y_batch.reshape(-1),
                 reduction="none",
             ).reshape(bsz, seq_len)
@@ -1182,6 +1250,10 @@ def main() -> None:
         if base_model.bigram.proj is not None:
             matrix_params.append(base_model.bigram.proj.weight)
 
+    # MoS head parameters: all go to Adam (A is 3D, not compatible with Muon)
+    mos = base_model.mos_head
+    scalar_params.extend([mos.A, mos.B_denoise, mos.B_NTP, mos.gate.weight, mos.gate.bias, mos.fsq_scale])
+
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -1206,14 +1278,6 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1386,10 +1450,11 @@ def main() -> None:
         )
         if should_log_train:
             ntp = getattr(base_model, '_ntp_loss', 0.0)
+            ctp = getattr(base_model, '_ctp_loss', 0.0)
             conv = getattr(base_model, '_conv_loss', 0.0)
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"ntp_loss:{ntp:.4f} conv_loss:{conv:.6f} "
+                f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} conv_loss:{conv:.6f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
