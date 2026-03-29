@@ -62,7 +62,7 @@ class Hyperparameters:
     num_layers = int(os.environ.get("NUM_LAYERS", 1))  # DEQ solver iters per refinement step
     num_refinements = int(os.environ.get("NUM_REFINEMENTS", 1))  # predict→soft_embed→re-encode cycles
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 640))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 2.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
