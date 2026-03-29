@@ -1700,20 +1700,32 @@ def main() -> None:
                 deq_info += f" deq_iter_conv:{base_model._deq_iter_convergence:.6f}"
             if hasattr(base_model, '_deq_iter_convergence_rel'):
                 deq_info += f" deq_iter_conv_rel:{base_model._deq_iter_convergence_rel:.6f}"
-            # Expert diagnostics
+            # Expert diagnostics — per-component (MLP, Attention)
             expert_info = ""
-            mlp = base_model.shared_block.mlp if hasattr(base_model, 'shared_block') else None
-            if mlp is not None and hasattr(mlp, 'get_expert_diagnostics'):
-                diag = mlp.get_expert_diagnostics()
-                if 'usage' in diag:
-                    usage_str = ",".join(f"{u:.3f}" for u in diag['usage'])
-                    expert_info = f" expert_usage:[{usage_str}]"
-                if 'entropy' in diag:
-                    expert_info += f" expert_entropy:{diag['entropy']:.4f}"
-                if 'balance_cv' in diag:
-                    expert_info += f" expert_balance_cv:{diag['balance_cv']:.4f}"
-                if 'ortho_cos_sim' in diag:
-                    expert_info += f" expert_ortho:{diag['ortho_cos_sim']:.4f}"
+            if hasattr(base_model, 'shared_block'):
+                for comp_name, comp in [("mlp", base_model.shared_block.mlp),
+                                         ("attn", base_model.shared_block.attn)]:
+                    router = getattr(comp, f'{comp_name}_router', None)
+                    if router is None:
+                        router = getattr(comp, 'attn_router', None)
+                    if router is not None and router._expert_usage is not None:
+                        usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
+                        expert_info += f" {comp_name}_usage:[{usage_str}]"
+                        expert_info += f" {comp_name}_entropy:{router._expert_entropy:.4f}"
+                        expert_info += f" {comp_name}_cv:{router._expert_balance_cv:.4f}"
+                # Combined expert usage (backward compat for plot parser)
+                mlp_r = base_model.shared_block.mlp.mlp_router
+                if mlp_r._expert_usage is not None:
+                    usage_str = ",".join(f"{u:.3f}" for u in mlp_r._expert_usage)
+                    expert_info += f" expert_usage:[{usage_str}]"
+                    expert_info += f" expert_entropy:{mlp_r._expert_entropy:.4f}"
+                    expert_info += f" expert_balance_cv:{mlp_r._expert_balance_cv:.4f}"
+                # Orthogonality (MLP)
+                mlp = base_model.shared_block.mlp
+                if hasattr(mlp, 'get_expert_diagnostics'):
+                    diag = mlp.get_expert_diagnostics()
+                    if 'ortho_cos_sim' in diag:
+                        expert_info += f" expert_ortho:{diag['ortho_cos_sim']:.4f}"
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1757,7 +1769,9 @@ def main() -> None:
                 group["lr"] = group["base_lr"] * scale
 
         if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            _preclip_grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm).item()
+        else:
+            _preclip_grad_norm = 0.0
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1787,6 +1801,7 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} conv_loss:{conv:.6f} "
+                f"grad_norm:{_preclip_grad_norm:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
