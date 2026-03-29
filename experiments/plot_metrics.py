@@ -2,13 +2,19 @@
 
 Shows full training curves for ALL diagnostic metrics:
 - Row 1: Train Loss, Val BPB, Step Avg (ms)
-- Row 2: DEQ Residual, DEQ Recon Error, DEQ Iter Convergence
-- Row 3: Expert Usage (per expert), Expert Entropy, Expert Orthogonality
-- Row 4: Summary text with final values comparison
+- Row 2: NTP Loss, CTP Loss, (empty)
+- Row 3: DEQ Residual, DEQ Recon Error, DEQ Iter Convergence
+- Row 4: Load Balance (per expert), Expert Entropy, Expert Orthogonality
+- Row 5: Summary text with final values comparison
 """
 import re
 import sys
 from pathlib import Path
+
+# Consistent colors: blue for Baseline, orange for Current
+COLOR_BASELINE = "#1f77b4"  # matplotlib default blue
+COLOR_CURRENT = "#ff7f0e"   # matplotlib default orange
+
 
 def parse_log(logpath: str) -> dict:
     """Parse training log for all metrics."""
@@ -18,8 +24,8 @@ def parse_log(logpath: str) -> dict:
         "step_avg_ms": [], "train_time_ms": [],
         "val_steps": [], "val_loss": [], "val_bpb": [],
         "deq_residual": [], "deq_recon": [], "deq_iter_conv": [],
-        "expert_usage_0": [], "expert_usage_1": [], "expert_entropy": [],
-        "expert_ortho": [],
+        "expert_usage": [],  # list of lists (variable number of experts)
+        "expert_entropy": [], "expert_ortho": [],
     }
 
     for line in lines:
@@ -54,25 +60,23 @@ def parse_log(logpath: str) -> dict:
                 data[key].append(float(m2.group(1)) if m2 else 0.0)
             m2 = re.search(r"expert_usage:\[([\d.,]+)\]", line)
             if m2:
-                usage = m2.group(1).split(",")
-                data["expert_usage_0"].append(float(usage[0]))
-                data["expert_usage_1"].append(float(usage[1]) if len(usage) > 1 else 0.0)
+                usage = [float(v) for v in m2.group(1).split(",")]
+                data["expert_usage"].append(usage)
             else:
-                data["expert_usage_0"].append(0.0)
-                data["expert_usage_1"].append(0.0)
+                data["expert_usage"].append([])
 
     return data
 
 
 def _plot_line(ax, b, c, b_key, c_key, b_steps, c_steps, title, ylabel=None):
-    """Plot two line series on the same axis."""
+    """Plot two line series on the same axis with consistent colors."""
     if b[b_key] and c[c_key]:
-        ax.plot(b[b_steps], b[b_key], "b-", alpha=0.7, label="Baseline", linewidth=1.5)
-        ax.plot(c[c_steps], c[c_key], "r-", alpha=0.7, label="Current", linewidth=1.5)
+        ax.plot(b[b_steps], b[b_key], color=COLOR_BASELINE, alpha=0.7, label="Baseline", linewidth=1.5)
+        ax.plot(c[c_steps], c[c_key], color=COLOR_CURRENT, alpha=0.7, label="Current", linewidth=1.5)
     elif b[b_key]:
-        ax.plot(b[b_steps], b[b_key], "b-", alpha=0.7, label="Baseline", linewidth=1.5)
+        ax.plot(b[b_steps], b[b_key], color=COLOR_BASELINE, alpha=0.7, label="Baseline", linewidth=1.5)
     elif c[c_key]:
-        ax.plot(c[c_steps], c[c_key], "r-", alpha=0.7, label="Current", linewidth=1.5)
+        ax.plot(c[c_steps], c[c_key], color=COLOR_CURRENT, alpha=0.7, label="Current", linewidth=1.5)
     ax.set_title(title, fontsize=11)
     ax.set_xlabel("Step")
     if ylabel:
@@ -94,61 +98,67 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
     b = parse_log(baseline_log)
     c = parse_log(current_log)
 
-    fig, axes = plt.subplots(4, 3, figsize=(18, 16))
+    fig, axes = plt.subplots(5, 3, figsize=(18, 22))
     fig.suptitle("Baseline vs Current Experiment — Full Diagnostics", fontsize=16, fontweight="bold")
 
-    # Row 1: Training metrics (NTP + CTP breakdown)
-    ax_loss = axes[0, 0]
-    for d, color, label in [(b, "b", "Baseline"), (c, "r", "Current")]:
-        if d["train_loss"]:
-            ax_loss.plot(d["train_steps"], d["train_loss"], f"{color}-", alpha=0.7, label=f"{label} Total", linewidth=1.5)
-        if d["ntp_loss"] and any(v > 0 for v in d["ntp_loss"]):
-            ax_loss.plot(d["train_steps"], d["ntp_loss"], f"{color}--", alpha=0.5, label=f"{label} NTP", linewidth=1)
-        if d["ctp_loss"] and any(v > 0 for v in d["ctp_loss"]):
-            ax_loss.plot(d["train_steps"], d["ctp_loss"], f"{color}:", alpha=0.5, label=f"{label} CTP", linewidth=1)
-    ax_loss.set_title("Train Loss (Total / NTP / CTP)", fontsize=11)
-    ax_loss.set_xlabel("Step")
-    ax_loss.legend(fontsize=7)
-    ax_loss.grid(True, alpha=0.3)
-
+    # Row 1: Training metrics (total loss, val bpb, step avg)
+    _plot_line(axes[0, 0], b, c, "train_loss", "train_loss", "train_steps", "train_steps", "Train Loss (Total)")
     _plot_line(axes[0, 1], b, c, "val_bpb", "val_bpb", "val_steps", "val_steps", "Val BPB")
     _plot_line(axes[0, 2], b, c, "step_avg_ms", "step_avg_ms", "train_steps", "train_steps", "Step Avg (ms)")
 
-    # Row 2: DEQ diagnostics
-    _plot_line(axes[1, 0], b, c, "deq_residual", "deq_residual", "val_steps", "val_steps",
+    # Row 2: NTP Loss, CTP Loss, (empty)
+    _plot_line(axes[1, 0], b, c, "ntp_loss", "ntp_loss", "train_steps", "train_steps", "NTP Loss")
+    _plot_line(axes[1, 1], b, c, "ctp_loss", "ctp_loss", "train_steps", "train_steps", "CTP Loss")
+    axes[1, 2].axis("off")
+
+    # Row 3: DEQ diagnostics
+    _plot_line(axes[2, 0], b, c, "deq_residual", "deq_residual", "val_steps", "val_steps",
                "DEQ Residual ||z - f(z)||")
-    _plot_line(axes[1, 1], b, c, "deq_recon", "deq_recon", "val_steps", "val_steps",
+    _plot_line(axes[2, 1], b, c, "deq_recon", "deq_recon", "val_steps", "val_steps",
                "DEQ Reconstruction Error")
-    _plot_line(axes[1, 2], b, c, "deq_iter_conv", "deq_iter_conv", "val_steps", "val_steps",
+    _plot_line(axes[2, 2], b, c, "deq_iter_conv", "deq_iter_conv", "val_steps", "val_steps",
                "DEQ Iter Conv ||z_T - z_{T-1}||")
 
-    # Row 3: Expert diagnostics
-    # Expert usage per expert (line plot over val steps)
-    ax_usage = axes[2, 0]
-    if b["expert_usage_0"]:
-        ax_usage.plot(b["val_steps"], b["expert_usage_0"], "b-", label="B-E0", linewidth=1.5)
-        ax_usage.plot(b["val_steps"], b["expert_usage_1"], "b--", label="B-E1", linewidth=1.5)
-    if c["expert_usage_0"]:
-        ax_usage.plot(c["val_steps"], c["expert_usage_0"], "r-", label="C-E0", linewidth=1.5)
-        ax_usage.plot(c["val_steps"], c["expert_usage_1"], "r--", label="C-E1", linewidth=1.5)
-    ax_usage.set_title("Expert Usage", fontsize=11)
-    ax_usage.set_xlabel("Step")
-    ax_usage.legend(fontsize=8)
-    ax_usage.grid(True, alpha=0.3)
+    # Row 4: Expert diagnostics
+    # Load Balance: one line per expert per config
+    ax_lb = axes[3, 0]
+    # Determine max number of experts across both configs
+    max_experts = 0
+    for usage_list in b["expert_usage"] + c["expert_usage"]:
+        if len(usage_list) > max_experts:
+            max_experts = len(usage_list)
 
-    _plot_line(axes[2, 1], b, c, "expert_entropy", "expert_entropy", "val_steps", "val_steps",
+    if max_experts > 0:
+        # Line styles for different experts
+        line_styles = ["-", "--", ":", "-."]
+        for ei in range(max_experts):
+            b_vals = [u[ei] if ei < len(u) else 0.0 for u in b["expert_usage"]]
+            c_vals = [u[ei] if ei < len(u) else 0.0 for u in c["expert_usage"]]
+            ls = line_styles[ei % len(line_styles)]
+            if b_vals and b["val_steps"]:
+                ax_lb.plot(b["val_steps"], b_vals, color=COLOR_BASELINE, linestyle=ls,
+                           alpha=0.7, label=f"B Expert {ei}", linewidth=1.5)
+            if c_vals and c["val_steps"]:
+                ax_lb.plot(c["val_steps"], c_vals, color=COLOR_CURRENT, linestyle=ls,
+                           alpha=0.7, label=f"C Expert {ei}", linewidth=1.5)
+    ax_lb.set_title("Load Balance (per Expert)", fontsize=11)
+    ax_lb.set_xlabel("Step")
+    ax_lb.legend(fontsize=7)
+    ax_lb.grid(True, alpha=0.3)
+
+    _plot_line(axes[3, 1], b, c, "expert_entropy", "expert_entropy", "val_steps", "val_steps",
                "Expert Entropy")
-    _plot_line(axes[2, 2], b, c, "expert_ortho", "expert_ortho", "val_steps", "val_steps",
+    _plot_line(axes[3, 2], b, c, "expert_ortho", "expert_ortho", "val_steps", "val_steps",
                "Expert Orthogonality (cos sim)")
 
-    # Row 4: Summary text
+    # Row 5: Summary text
     for j in range(3):
-        axes[3, j].axis("off")
+        axes[4, j].axis("off")
 
     summary_lines = []
     if b["val_bpb"] and c["val_bpb"]:
         delta = c["val_bpb"][-1] - b["val_bpb"][-1]
-        summary_lines.append(f"Val BPB:    {b['val_bpb'][-1]:.4f} → {c['val_bpb'][-1]:.4f} (Δ={delta:+.4f})")
+        summary_lines.append(f"Val BPB:    {b['val_bpb'][-1]:.4f} -> {c['val_bpb'][-1]:.4f} (d={delta:+.4f})")
     if b["train_steps"] and c["train_steps"]:
         summary_lines.append(f"Steps:      {b['train_steps'][-1]} vs {c['train_steps'][-1]}")
     if b["train_loss"] and c["train_loss"]:
@@ -169,8 +179,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
         summary_lines.append(f"Ortho:      {b['expert_ortho'][-1]:.4f} vs {c['expert_ortho'][-1]:.4f}")
 
     summary = "\n".join(summary_lines)
-    axes[3, 1].text(0.0, 0.5, summary, fontsize=11, family="monospace",
-                   verticalalignment="center", transform=axes[3, 1].transAxes)
+    axes[4, 1].text(0.0, 0.5, summary, fontsize=11, family="monospace",
+                   verticalalignment="center", transform=axes[4, 1].transAxes)
 
     plt.tight_layout()
     plt.savefig(str(Path(outdir) / "metrics_comparison.png"), dpi=150)
