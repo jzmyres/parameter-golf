@@ -79,18 +79,19 @@ def smoke_test(num_steps: int = 30, eval_every: int = 10):
         print("FAIL: loss increased by > 0.5")
         ok = False
 
-    # 2. Reconstruction error must stay small (< 1.0 relative)
-    if any(e > 1.0 for e in recon_errors):
-        print(f"FAIL: reconstruction error > 1.0 (got {max(recon_errors):.4f})")
+    # 2. Reconstruction error must stay small (< 0.5 relative)
+    #    RevDEQ requires algebraic reversibility — recon should be near-zero
+    if any(e > 0.5 for e in recon_errors):
+        print(f"FAIL: reconstruction error > 0.5 (got {max(recon_errors):.4f})")
         ok = False
 
     # 3. Reconstruction error should not increase (must be stable or decreasing)
-    if len(recon_errors) >= 2 and recon_errors[-1] > recon_errors[0] * 10:
+    if len(recon_errors) >= 2 and recon_errors[-1] > recon_errors[0] * 5:
         print(f"FAIL: reconstruction error diverging ({recon_errors[0]:.4f} -> {recon_errors[-1]:.4f})")
         ok = False
 
-    # 4. Iter convergence should not diverge wildly
-    if len(iter_convs) >= 2 and iter_convs[-1] > iter_convs[0] * 10:
+    # 4. Iter convergence should not diverge wildly (5x tolerance)
+    if len(iter_convs) >= 2 and iter_convs[-1] > iter_convs[0] * 5:
         print(f"FAIL: iter convergence diverging ({iter_convs[0]:.1f} -> {iter_convs[-1]:.1f})")
         ok = False
 
