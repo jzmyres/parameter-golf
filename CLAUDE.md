@@ -121,9 +121,10 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
    - Rotates `current.log` → `previous.log` (preserves last iteration)
    - Copies `run.log` → `current.log`
    - Regenerates `metrics_comparison.png`, `metrics_previous.png`, `progress.png`, `progress_full.png`
-10. If val_bpb improved AND artifact <= 16MB -> run `/simplify`, then keep
+10. If val_bpb improved AND artifact <= 16MB -> run code review + `/simplify`, then keep
 11. If val_bpb equal or worse -> `git revert` to previous good state
 12. If new best: copy `current.log` → `baseline.log` (re-run baseline only when best changes)
+    - **ALWAYS review + `/simplify` before committing improvements** to keep code clean
 13. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
 
 ### Logging & Plotting (REQUIRED every iteration)
@@ -194,12 +195,11 @@ d4e5f6g	0.000000	0	crash	soft routing OOM
   - Enables larger learning rates and better training stability
   - Negligible parameter overhead (one gate vector per head)
 
-### 4. FSQ (Finite Scalar Quantization) with Low-Rank Non-Linear Bottleneck
-- Apply FSQ in a low-rank intermediate space within the model
-- Use non-linearity (SiLU/GELU) before/after FSQ to recover expressiveness lost by low rank
-- FSQ discretizes continuous values to a finite set of scalars
-- The low-rank bottleneck compresses representations before quantization
-- Non-linearity after FSQ expands back to full expressiveness
+### 4. FSQ (Finite Scalar Quantization) in MoS Head
+- Apply FSQ in an intermediate projection space within the MoS output head
+- FSQ discretizes continuous values to a finite set of scalars via STE
+- Low-rank is NOT required — rank can be tuned as long as 16MB artifact size is met
+- With V=1024, even full-rank projections are affordable (~917K params = 3.5MB fp16)
 
 ### 5. Diffusion-AR (Autoregressive + Single-Step Diffusion)
 - Each DEQ iteration incorporates a diffusion-like denoising step
