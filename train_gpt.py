@@ -287,7 +287,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
         "CONTROL_TENSOR_NAME_PATTERNS",
         # Keep only small control tensors in fp32. Avoid broad substrings like "expert_gate"
         # which can match large expert weight tensors (e.g., shared_block.mlp.expert_gate).
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,"
+        "attn_gate_logit,mlp_gate_logit,resid_mix,resid_mixes,q_gain,"
         "skip_weight,skip_weights,smear.gate,bigram.scale,diffar_scale,gate_bias,"
         "expert_gate_logits,expert_gate_ctp_logits,expert_gate_ntp_logits",
     ).split(",")
@@ -930,19 +930,23 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
         self.mlp = MLP(dim, mlp_mult)
-        # FSQ moved to output head for param-efficient MoS
-        # Small init for DEQ stability — block starts as near-identity
-        self.attn_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
+        # Gated residual for DEQ stability: x_out = (1-g)*x + g*f(x)
+        # Convex combination ensures ||x_out|| ≤ max(||x||, ||f(x)||) — naturally bounded.
+        # Init gate_logit=-4 → sigmoid≈0.018 → near-identity (DEQ warm start safe).
+        # Aligns with coupled-state damping: z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}).
+        self.attn_gate_logit = nn.Parameter(torch.full((dim,), -4.0, dtype=torch.float32))
+        self.mlp_gate_logit = nn.Parameter(torch.full((dim,), -4.0, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_gate = torch.sigmoid(self.attn_gate_logit).to(dtype=x.dtype)[None, None, :]
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = (1 - attn_gate) * x + attn_gate * attn_out
+        mlp_gate = torch.sigmoid(self.mlp_gate_logit).to(dtype=x.dtype)[None, None, :]
         mlp_out = self.mlp(self.mlp_norm(x))
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        x = (1 - mlp_gate) * x + mlp_gate * mlp_out
         return x
 
 
@@ -1263,12 +1267,15 @@ class GPT(nn.Module):
             else:
                 f_z = self.shared_block(z, x0_refined)
                 self._convergence_loss = ((z - f_z).float().pow(2).sum() / numel).sqrt() / z_rms
-            # Training diagnostics — use RELATIVE convergence (||z_T - z_{T-1}|| / ||z_T||)
-            # so the metric is scale-invariant and meaningful as activations grow.
+            # Track BOTH absolute and relative convergence:
+            # - Absolute: ||z_T - z_{T-1}|| (for eval pass/fail — fixed point means this → 0)
+            # - Relative: ||z_T - z_{T-1}|| / ||z_T|| (for diagnostics — scale-invariant)
             if z_prev is not None:
-                z_norm_diag = z.detach().float().norm().clamp_min(1.0)
-                self._deq_residuals = [(z - z_prev).float().norm().item()]
-                self._deq_iter_convergence = self._deq_residuals[0] / z_norm_diag.item()
+                abs_conv = (z - z_prev).float().norm().item()
+                z_norm_diag = z.detach().float().norm().clamp_min(1.0).item()
+                self._deq_residuals = [abs_conv]
+                self._deq_iter_convergence = abs_conv  # absolute for logging/eval
+                self._deq_iter_convergence_rel = abs_conv / z_norm_diag  # relative for diagnostics
             if y_acc is not None:
                 self._deq_yz_gap = delta_con.item()
 
@@ -1276,9 +1283,11 @@ class GPT(nn.Module):
         if not self.training:
             with torch.no_grad():
                 f_z_final = self.shared_block(z, x0_refined)
+                abs_conv = (z - z_prev).float().norm().item()
                 z_norm_diag = z.float().norm().clamp_min(1.0).item()
                 self._deq_residuals = [(z - f_z_final).float().norm().item()]
-                self._deq_iter_convergence = (z - z_prev).float().norm().item() / z_norm_diag
+                self._deq_iter_convergence = abs_conv  # absolute
+                self._deq_iter_convergence_rel = abs_conv / z_norm_diag  # relative
                 # fp64 backward reconstruction of last DEQ solve
                 z_init_64 = (x0_refined if self.num_refinements > 0 else x0).to(torch.float64)
                 yr_acc, zr_acc = y_acc.clone(), z_acc.clone()
@@ -1703,6 +1712,8 @@ def main() -> None:
                 deq_info += f" deq_recon_err:{base_model._deq_recon_error:.6f}"
             if hasattr(base_model, '_deq_iter_convergence'):
                 deq_info += f" deq_iter_conv:{base_model._deq_iter_convergence:.6f}"
+            if hasattr(base_model, '_deq_iter_convergence_rel'):
+                deq_info += f" deq_iter_conv_rel:{base_model._deq_iter_convergence_rel:.6f}"
             # Expert diagnostics
             expert_info = ""
             mlp = base_model.shared_block.mlp if hasattr(base_model, 'shared_block') else None

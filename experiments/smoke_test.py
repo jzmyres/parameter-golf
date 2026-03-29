@@ -83,7 +83,7 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
     ).cuda()
 
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=0.01)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     losses, ntp_losses, ctp_losses = [], [], []
     recon_errors, iter_convs, residuals = [], [], []
     expert_snapshots = []
