@@ -1244,35 +1244,17 @@ class GPT(nn.Module):
 
             z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        # Convergence loss: two components for proper DEQ fixed-point behavior.
-        # 1. Update penalty: ||z_T - z_{T-1}||² / ||z_T||² (drives solver convergence)
-        # 2. Jacobian penalty: ||f(z+eps)-f(z)||²/||eps||² (enforces contraction, Lip < 1)
+        # Convergence loss: ||z_T - z_{T-1}||² / ||z_T||² (relative, scale-invariant)
+        # This produced the best val_bpb (1.4291). Absolute MSE consistently worse.
         if self.training:
             z_norm_sq = z.detach().float().pow(2).sum().clamp_min(1.0)
             if z_prev is not None:
-                update_loss = (z - z_prev).float().pow(2).sum() / z_norm_sq
+                self._convergence_loss = (z - z_prev).float().pow(2).sum() / z_norm_sq
             elif y_acc is not None:
-                update_loss = (y_acc - z).float().pow(2).sum() / z_norm_sq
+                self._convergence_loss = (y_acc - z).float().pow(2).sum() / z_norm_sq
             else:
                 f_z = self.shared_block(z, x0_refined)
-                update_loss = (z - f_z).float().pow(2).sum() / z_norm_sq
-            # Jacobian regularization: finite-difference estimate of ||J_f||_F.
-            # Penalizes if Lipschitz constant exceeds 0.9 (contraction requirement).
-            # Only computed every 10 steps to avoid 2 extra block evals per step.
-            if not hasattr(self, '_jac_step_counter'):
-                self._jac_step_counter = 0
-            self._jac_step_counter += 1
-            jac_loss = torch.tensor(0.0, device=z.device)
-            if self._jac_step_counter % 10 == 0:
-                eps = torch.randn_like(z).detach() * 0.01
-                eps_norm_sq = eps.float().pow(2).sum().clamp_min(1e-8)
-                z_for_jac = z.detach()
-                f_z_jac = self.shared_block(z_for_jac, x0_refined)
-                f_zeps_jac = self.shared_block(z_for_jac + eps, x0_refined)
-                lip_sq = (f_zeps_jac - f_z_jac).float().pow(2).sum() / eps_norm_sq
-                jac_loss = F.relu(lip_sq - 0.81)  # hinge at 0.9²
-                self._jac_lip_sq = lip_sq.item()
-            self._convergence_loss = update_loss + jac_loss
+                self._convergence_loss = (z - f_z).float().pow(2).sum() / z_norm_sq
             # Track BOTH absolute and relative convergence
             if z_prev is not None:
                 abs_conv = (z - z_prev).float().norm().item()
