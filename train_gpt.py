@@ -1315,7 +1315,7 @@ class GPT(nn.Module):
         # CTP weight scales with refinement steps: at step 0 input is clean one-hot,
         # CTP becomes meaningful only after soft embedding refinement
         ctp_weight = 0.1 * self.num_refinements
-        return ntp_loss + ctp_weight * ctp_loss + 0.0 * conv_loss + 0.01 * bal_loss + 0.0001 * spar_loss + 0.001 * ortho_loss
+        return ntp_loss + ctp_weight * ctp_loss + 0.0 * conv_loss + 0.1 * bal_loss + 0.001 * spar_loss + 0.01 * ortho_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
