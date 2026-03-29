@@ -33,7 +33,7 @@ val_bpb = 1.1194 (abaybektursun, 2026-03-23)
 Key techniques: LeakyReLU(0.5)², TTT, Parallel Muon, XSA, GPTQ-lite, EMA
 
 ## Training Budget
-1.5x of original = 900 seconds on 8xH100 SXM (relaxed from 600s)
+2x of original = 1200 seconds on 8xH100 SXM (relaxed from 600s to 20 min)
 
 ## Converged Best-Known Config (Iteration 0 Baseline)
 This is the consensus of the top 3 leaderboard entries. Use as starting point.
@@ -187,7 +187,10 @@ When proposing architecture improvements:
 - **Warm start**: z₀ = x (initially one-hot token embedding); on refinement steps, z₀ = x0_refined
 - **fp64 accumulators** for add/subtract operations — ensures exact reversibility
 - **Reconstruction error MUST be < 1e-8** (verified by smoke test)
-- **Convergence regularization**: 1.0 * ||z_T - z_{T-1}||²/||z_T||²
+- **Convergence regularization (REQUIRED)**: The DEQ solver MUST be trained to find a fixed point.
+  Without convergence pressure, the model degenerates to a standard transformer with weight sharing — not a true DEQ.
+  Use conv_loss weight ≥ 0.01 to maintain fixed-point behavior: `conv_weight * ||z_T - z_{T-1}||²/||z_T||²`
+  The convergence error should decrease or plateau during training, NOT increase linearly.
 - Smoke test checks: recon < 1e-8, total loss decreasing, convergence not exploding (>100×), no NaN/Inf, expert balance + entropy
 
 ### 2. Soft Dense Routing (Dense MoE on ALL components)
@@ -238,7 +241,7 @@ When proposing architecture improvements:
 
 ### 6. Parameter Golf Hard Constraints (ENFORCED)
 - Artifact size <= 16,000,000 bytes (code + compressed model)
-- Training time <= 600 seconds on 8xH100 SXM
+- Training time <= 1200 seconds (20 min) on 8xH100 SXM
 - Must use FineWeb validation set for evaluation
 - Tokenizer: SentencePiece BPE, vocab=1024
 

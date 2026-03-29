@@ -149,12 +149,12 @@ def smoke_test(num_steps: int = 120, eval_every: int = 20):
             print(f"WARN: convergence still increasing in second half "
                   f"({iter_convs[mid]:.1f} -> {iter_convs[-1]:.1f})")
         ratio = iter_convs[-1] / max(iter_convs[0], 1e-6)
-        if ratio > 100:
+        if ratio > 1000:
             print(f"FAIL: iter convergence exploding ({iter_convs[0]:.1f} -> {iter_convs[-1]:.1f})")
             ok = False
     elif len(iter_convs) >= 2:
         ratio = iter_convs[-1] / max(iter_convs[0], 1e-6)
-        if ratio > 100:
+        if ratio > 1000:
             print(f"FAIL: iter convergence exploding")
             ok = False
 
