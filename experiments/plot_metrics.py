@@ -2,9 +2,9 @@
 
 Shows full training curves for ALL diagnostic metrics:
 - Row 1: Train Loss, Val BPB, Step Avg (ms)
-- Row 2: NTP Loss, CTP Loss, (empty)
+- Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
 - Row 3: DEQ Residual, DEQ Recon Error, DEQ Iter Convergence
-- Row 4: Load Balance (per expert), Expert Entropy, Expert Orthogonality
+- Row 4: Load Balance (per component per expert), Expert Entropy, Expert Orthogonality
 - Row 5: Summary text with final values comparison
 """
 import re
@@ -21,11 +21,16 @@ def parse_log(logpath: str) -> dict:
     lines = Path(logpath).read_text().split("\n")
     data = {
         "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
+        "grad_norm": [],
         "step_avg_ms": [], "train_time_ms": [],
         "val_steps": [], "val_loss": [], "val_bpb": [],
         "deq_residual": [], "deq_recon": [], "deq_iter_conv": [],
+        # Combined expert metrics (backward compat)
         "expert_usage": [],  # list of lists (variable number of experts)
         "expert_entropy": [], "expert_ortho": [],
+        # Per-component expert usage: each is list of lists
+        "mlp_usage": [], "attn_usage": [],
+        "mlp_entropy": [], "attn_entropy": [],
     }
 
     for line in lines:
@@ -41,6 +46,9 @@ def parse_log(logpath: str) -> dict:
             data["ntp_loss"].append(float(m_ntp.group(1)) if m_ntp else 0.0)
             m_ctp = re.search(r"ctp_loss:([\d.]+)", line)
             data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else 0.0)
+            # Parse pre-clip gradient norm
+            m_gn = re.search(r"grad_norm:([\d.]+)", line)
+            data["grad_norm"].append(float(m_gn.group(1)) if m_gn else 0.0)
 
         # Validation steps
         m = re.search(r"^step:(\d+)/\d+ val_loss:([\d.]+) val_bpb:([\d.]+)", line)
@@ -53,17 +61,27 @@ def parse_log(logpath: str) -> dict:
                 ("deq_residual", r"deq_residual:([\d.]+)"),
                 ("deq_recon", r"deq_recon_err:([\d.]+)"),
                 ("deq_iter_conv", r"deq_iter_conv:([\d.]+)"),
-                ("expert_entropy", r"expert_entropy:([\d.]+)"),
+                ("expert_entropy", r"(?<!\w_)expert_entropy:([\d.]+)"),
                 ("expert_ortho", r"expert_ortho:([-\d.]+)"),
             ]:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else 0.0)
-            m2 = re.search(r"expert_usage:\[([\d.,]+)\]", line)
+            # Combined expert usage (backward compat)
+            m2 = re.search(r"(?<!\w_)expert_usage:\[([\d.,]+)\]", line)
             if m2:
                 usage = [float(v) for v in m2.group(1).split(",")]
                 data["expert_usage"].append(usage)
             else:
                 data["expert_usage"].append([])
+            # Per-component expert usage
+            for comp in ("mlp", "attn"):
+                m_u = re.search(rf"{comp}_usage:\[([\d.,]+)\]", line)
+                if m_u:
+                    data[f"{comp}_usage"].append([float(v) for v in m_u.group(1).split(",")])
+                else:
+                    data[f"{comp}_usage"].append([])
+                m_e = re.search(rf"{comp}_entropy:([\d.]+)", line)
+                data[f"{comp}_entropy"].append(float(m_e.group(1)) if m_e else 0.0)
 
     return data
 
@@ -106,10 +124,11 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
     _plot_line(axes[0, 1], b, c, "val_bpb", "val_bpb", "val_steps", "val_steps", "Val BPB")
     _plot_line(axes[0, 2], b, c, "step_avg_ms", "step_avg_ms", "train_steps", "train_steps", "Step Avg (ms)")
 
-    # Row 2: NTP Loss, CTP Loss, (empty)
+    # Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
     _plot_line(axes[1, 0], b, c, "ntp_loss", "ntp_loss", "train_steps", "train_steps", "NTP Loss")
     _plot_line(axes[1, 1], b, c, "ctp_loss", "ctp_loss", "train_steps", "train_steps", "CTP Loss")
-    axes[1, 2].axis("off")
+    _plot_line(axes[1, 2], b, c, "grad_norm", "grad_norm", "train_steps", "train_steps",
+               "Pre-clip Grad Norm")
 
     # Row 3: DEQ diagnostics
     _plot_line(axes[2, 0], b, c, "deq_residual", "deq_residual", "val_steps", "val_steps",
@@ -120,16 +139,32 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
                "DEQ Iter Conv ||z_T - z_{T-1}||")
 
     # Row 4: Expert diagnostics
-    # Load Balance: one line per expert per config
+    # Load Balance: per-component (MLP, Attn) per-expert lines when available,
+    # falling back to combined expert_usage for older logs.
     ax_lb = axes[3, 0]
-    # Determine max number of experts across both configs
-    max_experts = 0
-    for usage_list in b["expert_usage"] + c["expert_usage"]:
-        if len(usage_list) > max_experts:
-            max_experts = len(usage_list)
+    _has_per_comp = any(len(u) > 0 for u in b.get("mlp_usage", []) + c.get("mlp_usage", []))
 
-    if max_experts > 0:
-        # Line styles for different experts
+    if _has_per_comp:
+        # Per-component expert usage: different colors per component, line styles per expert
+        comp_colors = {"mlp": ("#2ca02c", "#98df8a"), "attn": ("#d62728", "#ff9896")}
+        line_styles = ["-", "--", ":", "-."]
+        for comp in ("mlp", "attn"):
+            all_usage = b[f"{comp}_usage"] + c[f"{comp}_usage"]
+            max_e = max((len(u) for u in all_usage), default=0)
+            b_color, c_color = comp_colors[comp]
+            for ei in range(max_e):
+                ls = line_styles[ei % len(line_styles)]
+                b_vals = [u[ei] if ei < len(u) else 0.0 for u in b[f"{comp}_usage"]]
+                c_vals = [u[ei] if ei < len(u) else 0.0 for u in c[f"{comp}_usage"]]
+                if b_vals and b["val_steps"]:
+                    ax_lb.plot(b["val_steps"], b_vals, color=b_color, linestyle=ls,
+                               alpha=0.7, label=f"B {comp} E{ei}", linewidth=1.5)
+                if c_vals and c["val_steps"]:
+                    ax_lb.plot(c["val_steps"], c_vals, color=c_color, linestyle=ls,
+                               alpha=0.7, label=f"C {comp} E{ei}", linewidth=1.5)
+    else:
+        # Fallback: combined expert_usage (older logs)
+        max_experts = max((len(u) for u in b["expert_usage"] + c["expert_usage"]), default=0)
         line_styles = ["-", "--", ":", "-."]
         for ei in range(max_experts):
             b_vals = [u[ei] if ei < len(u) else 0.0 for u in b["expert_usage"]]
@@ -141,9 +176,9 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
             if c_vals and c["val_steps"]:
                 ax_lb.plot(c["val_steps"], c_vals, color=COLOR_CURRENT, linestyle=ls,
                            alpha=0.7, label=f"C Expert {ei}", linewidth=1.5)
-    ax_lb.set_title("Load Balance (per Expert)", fontsize=11)
+    ax_lb.set_title("Expert Usage (per Component)", fontsize=11)
     ax_lb.set_xlabel("Step")
-    ax_lb.legend(fontsize=7)
+    ax_lb.legend(fontsize=6, ncol=2)
     ax_lb.grid(True, alpha=0.3)
 
     _plot_line(axes[3, 1], b, c, "expert_entropy", "expert_entropy", "val_steps", "val_steps",
@@ -167,6 +202,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
         summary_lines.append(f"NTP Loss:   {b['ntp_loss'][-1]:.4f} vs {c['ntp_loss'][-1]:.4f}")
     if b["ctp_loss"] and c["ctp_loss"] and any(v > 0 for v in b["ctp_loss"]):
         summary_lines.append(f"CTP Loss:   {b['ctp_loss'][-1]:.4f} vs {c['ctp_loss'][-1]:.4f}")
+    if b["grad_norm"] and c["grad_norm"] and any(v > 0 for v in b["grad_norm"] + c["grad_norm"]):
+        summary_lines.append(f"Grad Norm:  {b['grad_norm'][-1]:.4f} vs {c['grad_norm'][-1]:.4f}")
     if b["deq_residual"] and c["deq_residual"]:
         summary_lines.append(f"DEQ Res:    {b['deq_residual'][-1]:.0f} vs {c['deq_residual'][-1]:.0f}")
     if b["deq_recon"] and c["deq_recon"]:
