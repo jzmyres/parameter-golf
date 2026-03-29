@@ -72,7 +72,7 @@ def _get_expert_diagnostics(model):
     return diag
 
 
-def smoke_test(num_steps: int = 120, eval_every: int = 20):
+def smoke_test(num_steps: int = 300, eval_every: int = 50):
     args = Hyperparameters()
     model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
