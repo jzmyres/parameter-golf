@@ -743,6 +743,24 @@ class MLP(nn.Module):
         # Backwards-compat for older tests/diagnostics.
         return self.mlp_router
 
+    def get_expert_diagnostics(self) -> dict:
+        """Bridge to router diagnostics + orthogonality from expert weights."""
+        diag: dict = {}
+        r = self.mlp_router
+        if r._expert_usage is not None:
+            diag["usage"] = r._expert_usage
+            diag["entropy"] = r._expert_entropy
+            diag["balance_cv"] = r._expert_balance_cv
+        # Orthogonality: pairwise cosine sim between expert weight groups
+        if self.num_experts >= 2:
+            with torch.no_grad():
+                groups = self.expert_fc.float().view(self.num_experts, -1)
+                groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
+                cos = groups @ groups.T
+                mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=cos.device)
+                diag["ortho_cos_sim"] = cos[mask].abs().mean().item()
+        return diag
+
 
 class SmearGate(nn.Module):
     """Blend each token's embedding with the previous token's embedding."""
