@@ -54,7 +54,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 2000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 98_304))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1200.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
