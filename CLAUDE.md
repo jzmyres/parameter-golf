@@ -144,12 +144,14 @@ d4e5f6g	0.000000	0	crash	soft routing OOM
 ### 1. RevDEQ (Reversible Deep Equilibrium Model)
 - Paper: https://arxiv.org/abs/2509.12917
 - The main transformer backbone MUST use RevDEQ: model output defined as fixed point of a learned function
-- **Coupled-state iteration** with relaxation beta=0.8:
+- **Coupled-state iteration** with relaxation beta=0.5:
   - `y_{n+1} = (1-beta)*y_n + beta*f(z_n, x0)`
   - `z_{n+1} = (1-beta)*z_n + beta*f(y_{n+1}, x0)`
-- **Algebraically reversible**: z_n reconstructed exactly from z_{n+1}, y_{n+1}
-- Track: equilibrium residual `||z - f(z)||` and reconstruction error
-- Enables exact gradients, O(1) memory, no regularization needed
+- **fp64 accumulators** for add/subtract operations (paper recommendation) — ensures exact reversibility
+- **Reconstruction error MUST be < 1e-8** (verified by smoke test before every run)
+- **Convergence regularization**: 0.01 * ||z_T - z_{T-1}||²/||z_T||² added to loss to encourage fixed-point convergence
+- Track: equilibrium residual `||z - f(z)||`, reconstruction error, and iter convergence `||z_T - z_{T-1}||`
+- Smoke test (`experiments/smoke_test.py`) MUST pass before any long training run
 
 ### 2. Soft Dense Routing (Dense MoE — no sparsity)
 - Inspired by Soft MoE (arxiv:2308.00951) but fully dense — ALL experts process ALL tokens

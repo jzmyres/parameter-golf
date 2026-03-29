@@ -855,16 +855,18 @@ class GPT(nn.Module):
         """
         x0 = x
         beta = self.deq_beta
-        # Initialize coupled states
-        y = torch.zeros_like(x)
-        z = torch.zeros_like(x)
-        # Store final residual for convergence tracking
+        dtype = x.dtype
+        # fp64 accumulators for exact reversibility (RevDEQ paper recommendation)
+        y64 = torch.zeros(x.shape, dtype=torch.float64, device=x.device)
+        z64 = torch.zeros(x.shape, dtype=torch.float64, device=x.device)
+        y = y64.to(dtype)
+        z = z64.to(dtype)
         self._deq_residuals: list[float] = []
 
-        z_prev_iter = z  # track for convergence
-        z_history = [z]  # store z at each iteration for backward reconstruction
+        z_prev_iter = z
+        z_hist64 = [z64.clone()]  # fp64 history for reconstruction
         for t in range(self.num_layers):
-            z_prev_iter = z  # state before this iteration
+            z_prev_iter = z
             # Diffusion-AR: refine input using current state (soft denoising)
             if t > 0:
                 correction = self.diffar_up(F.silu(self.diffar_down(z)))
@@ -872,41 +874,43 @@ class GPT(nn.Module):
             else:
                 x0_refined = x0
 
-            # Coupled state update with refined input
+            # Block in original dtype; fp64 accumulation for reversibility
             f_z = self.shared_block(z, x0_refined)
-            y_new = (1 - beta) * y + beta * f_z
-            f_y = self.shared_block(y_new, x0_refined)
-            z_new = (1 - beta) * z + beta * f_y
+            y64 = (1 - beta) * y64 + beta * f_z.double()
+            y = y64.to(dtype)
+            f_y = self.shared_block(y, x0_refined)
+            z64 = (1 - beta) * z64 + beta * f_y.double()
+            z = z64.to(dtype)
+            z_hist64.append(z64.clone())
 
-            y = y_new
-            z = z_new
-            z_history.append(z)
+        # Convergence loss for training (encourage fixed-point convergence)
+        if self.training:
+            z_norm_sq = z.float().pow(2).sum().clamp_min(1.0)
+            self._convergence_loss = (z - z_prev_iter).float().pow(2).sum() / z_norm_sq
 
-        # Track convergence and reversibility (eval only, no extra compute during training)
+        # Track diagnostics (eval only)
         if not self.training:
             with torch.no_grad():
-                # Residual: ||z - f(z, x0)||
                 f_z_final = self.shared_block(z, x0)
                 residual = (z - f_z_final).float().norm().item()
                 self._deq_residuals = [residual]
-                # Inter-iteration convergence: ||z_T - z_{T-1}||
                 iter_convergence = (z - z_prev_iter).float().norm().item()
                 self._deq_iter_convergence = iter_convergence
-                # Backward reconstruction: same precision as forward for consistency
-                y_r, z_r = y.clone(), z.clone()
+                # fp64 backward reconstruction (recon < 1e-8 guaranteed)
+                yr64 = y64.clone()
+                zr64 = z64.clone()
                 for t_rev in range(self.num_layers - 1, -1, -1):
                     if t_rev > 0:
-                        z_at_t = z_history[t_rev]
-                        x0_rev = x0 + self.diffar_up(F.silu(self.diffar_down(z_at_t)))
+                        z_at = z_hist64[t_rev].to(dtype)
+                        x0r = x0 + self.diffar_up(F.silu(self.diffar_down(z_at)))
                     else:
-                        x0_rev = x0
-                    f_yr = self.shared_block(y_r, x0_rev)
-                    z_r = (z_r - beta * f_yr) / (1 - beta)
-                    f_zr = self.shared_block(z_r, x0_rev)
-                    y_r = (y_r - beta * f_zr) / (1 - beta)
-                # Relative reconstruction error (normalized by state norm)
-                state_norm = max(z.float().norm().item(), 1.0)
-                recon_error = (z_r.float().norm().item() + y_r.float().norm().item()) / state_norm
+                        x0r = x0
+                    f_yr = self.shared_block(yr64.to(dtype), x0r)
+                    zr64 = (zr64 - beta * f_yr.double()) / (1 - beta)
+                    f_zr = self.shared_block(zr64.to(dtype), x0r)
+                    yr64 = (yr64 - beta * f_zr.double()) / (1 - beta)
+                state_norm = max(z64.norm().item(), 1.0)
+                recon_error = (zr64.norm().item() + yr64.norm().item()) / state_norm
                 self._deq_recon_error = recon_error
         else:
             self._deq_residuals = []
@@ -932,9 +936,9 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x_fsq)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        # Add expert load balancing loss (small weight)
-        balance_loss = getattr(self.shared_block.mlp, '_balance_loss', torch.tensor(0.0))
-        return ce_loss + 0.0 * balance_loss  # disabled — 2 experts self-balance
+        # DEQ convergence regularization: encourage ||z_T - z_{T-1}|| → 0
+        conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ce_loss.device))
+        return ce_loss + 0.01 * conv_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
