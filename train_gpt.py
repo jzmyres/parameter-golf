@@ -1125,7 +1125,7 @@ class GPT(nn.Module):
         # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
         self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
         # MoS output head (Constraints #4+#5): shared experts, dual B for CTP/NTP
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=128, num_shared=2, num_specialized=1, fsq_levels=8)
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm()
         self._init_weights()
 
