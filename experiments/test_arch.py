@@ -1,16 +1,25 @@
-"""Tests for all three architectural constraints + RevDEQ convergence."""
+"""Tests for all 5 architectural constraints + RevDEQ convergence."""
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 
-def test_all_constraints():
-    """Test that all 3 constraints are satisfied."""
+def _make_model(**overrides):
     from train_gpt import GPT
-    model = GPT(
+    defaults = dict(
         vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
         num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
         tied_embed_init_std=0.005, logit_softcap=30.0, rope_base=10000.0,
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
-    ).cuda().bfloat16()
+        kv_latent_dim=0, num_refinements=1,
+    )
+    defaults.update(overrides)
+    return GPT(**defaults).cuda().bfloat16()
+
+
+def test_all_constraints():
+    """Test that all 5 constraints are satisfied."""
+    model = _make_model()
 
     # Check constraint #1: RevDEQ
     assert model.shared_block is not None, "Must have shared_block (RevDEQ)"
@@ -24,23 +33,29 @@ def test_all_constraints():
     assert hasattr(attn, 'c_k_rope'), "Must have decoupled RoPE key"
     assert hasattr(attn, 'attn_gate'), "Must have gated attention"
 
-    # Check constraint #2: Soft Dense Routing
+    # Check constraint #2: Soft Dense Routing (Dense MoE)
     mlp = model.shared_block.mlp
-    assert hasattr(mlp, 'expert_gate'), "Must have expert_gate (soft dense routing)"
-    assert hasattr(mlp, 'router'), "Must have router"
+    assert hasattr(mlp, 'expert_gate'), "Must have expert_gate (3D per-expert params)"
+    assert hasattr(mlp, 'expert_fc'), "Must have expert_fc (3D per-expert params)"
+    assert hasattr(mlp, 'expert_down'), "Must have expert_down (3D per-expert params)"
+    assert hasattr(mlp, 'mlp_router'), "Must have mlp_router"
+    assert mlp.expert_gate.ndim == 3, f"expert_gate must be 3D, got {mlp.expert_gate.ndim}D"
 
-    print("PASS: All 3 constraints satisfied")
+    # Check constraint #4: FSQ in MoS Head
+    assert hasattr(model, 'mos_head'), "Must have MoS output head"
+    assert hasattr(model.mos_head, 'expert_gate_ctp_logits'), "Must have CTP expert gates"
+    assert hasattr(model.mos_head, 'expert_gate_ntp_logits'), "Must have NTP expert gates"
+
+    # Check constraint #5: Diffusion-AR (refinement)
+    assert model.num_refinements >= 1, "Must have at least 1 refinement step"
+    assert hasattr(model, 'diffar_scale'), "Must have diffar_scale"
+
+    print("PASS: All 5 constraints satisfied")
 
 
 def test_revdeq_convergence():
     """Test RevDEQ coupled-state iteration converges."""
-    from train_gpt import GPT
-    model = GPT(
-        vocab_size=1024, num_layers=8, model_dim=640, num_heads=10,
-        num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
-        tied_embed_init_std=0.005, logit_softcap=30.0, rope_base=10000.0,
-        qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
-    ).cuda().bfloat16()
+    model = _make_model(num_layers=8)
 
     x = torch.randint(0, 1024, (2, 32), device="cuda")
     y = torch.randint(0, 1024, (2, 32), device="cuda")
@@ -60,13 +75,7 @@ def test_revdeq_convergence():
 
 def test_revdeq_reversibility():
     """Test RevDEQ backward reconstruction quality."""
-    from train_gpt import GPT
-    model = GPT(
-        vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
-        num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
-        tied_embed_init_std=0.005, logit_softcap=30.0, rope_base=10000.0,
-        qk_gain_init=1.5,
-    ).cuda().bfloat16()
+    model = _make_model(bigram_vocab_size=0)
 
     x = torch.randint(0, 1024, (1, 16), device="cuda")
     y = torch.randint(0, 1024, (1, 16), device="cuda")

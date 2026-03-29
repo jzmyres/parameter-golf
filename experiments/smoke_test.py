@@ -32,16 +32,17 @@ def _get_expert_diagnostics(model):
         diag["mlp_usage"] = mr._expert_usage
         diag["mlp_entropy"] = mr._expert_entropy
         diag["mlp_balance_cv"] = mr._expert_balance_cv
-    # Orthogonality (from weight matrices)
+    # Orthogonality (from 3D expert weight tensors [num_experts, rows, cols])
     with torch.no_grad():
-        for name, w, n_exp in [
-            ("mlp", model.shared_block.mlp.fc.weight.float(), model.shared_block.mlp.num_experts),
-            ("attn", model.shared_block.attn.proj.weight.float(), model.shared_block.attn.num_experts),
+        for name, w in [
+            ("mlp", model.shared_block.mlp.expert_fc.float()),
+            ("attn", model.shared_block.attn.expert_proj.float()),
         ]:
+            n_exp = w.shape[0]
             if n_exp < 2:
                 continue
-            es = w.shape[0] // n_exp
-            groups = w.view(n_exp, es, -1).mean(dim=1)
+            # Flatten each expert's weights to a vector, compute pairwise cosine sim
+            groups = w.view(n_exp, -1)
             groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
             cos = groups @ groups.T
             mask = ~torch.eye(n_exp, dtype=torch.bool, device=cos.device)
@@ -57,6 +58,7 @@ def smoke_test(num_steps: int = 120, eval_every: int = 20):
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
     ).cuda()
 
     opt = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=0.01)
