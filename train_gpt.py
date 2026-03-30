@@ -629,7 +629,7 @@ class CausalSelfAttention(nn.Module):
     - Soft dense routing on output projection (MoE for attention)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
-                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 4):
+                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 2):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -656,11 +656,10 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
         # Decoupled RoPE key
         self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
-        # Full-dim low-rank experts: each expert projects dim → rank → dim
-        # rank = dim // num_experts to match param budget with old split approach
-        self.expert_rank = dim // num_experts
-        self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
-        self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
+        # Dense mixture experts: low-rank output projections per expert (dim -> r -> dim)
+        # Keep name expert_proj for downstream diagnostics/tests compatibility.
+        self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
+        self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_size))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_proj.data[e])
             nn.init.xavier_uniform_(self.expert_out.data[e])
@@ -715,26 +714,16 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """SiLU-gated MLP with full-dim low-rank experts + Soft Dense Routing (Constraint #2).
-
-    Each expert operates on the FULL hidden dimension via low-rank projections:
-      Expert_e(x) = down_e(SiLU(gate_e(x)) * fc_e(x))
-    where gate_e: [dim→rank], fc_e: [dim→rank], down_e: [rank→dim].
-    This gives each expert access to all dimensions (unlike partial-dim split).
-    """
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 4):
+    """SiLU-gated MLP with true expert parameters + Soft Dense Routing (Constraint #2)."""
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
-        # Full-dim low-rank: rank per expert to match total param budget
-        # With split: 2 experts × (hidden//2 × dim × 3) = 3 × hidden × dim
-        # With low-rank: E experts × (rank × dim × 3) = 3E × rank × dim
-        # Match total: rank = hidden / E
-        self.expert_rank = hidden // num_experts
-        # Each expert: dim → rank (full dim access) via SwiGLU, then rank → dim
-        self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
-        self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
-        self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
+        self.expert_size = hidden // num_experts
+        # Dense mixture experts: low-rank SwiGLU blocks per expert (dim -> r -> dim)
+        self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
+        self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
+        self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_size))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_gate.data[e])
             nn.init.xavier_uniform_(self.expert_fc.data[e])
@@ -743,10 +732,10 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         route_weights = self.mlp_router(x)  # [B, T, E]
-        gate_h = torch.einsum('btd,erd->bter', x, self.expert_gate)
-        fc_h = torch.einsum('btd,erd->bter', x, self.expert_fc)
-        h = F.silu(gate_h) * fc_h  # [B, T, E, rank]
-        out_e = torch.einsum('bter,edr->bted', h, self.expert_down)
+        gate_h = torch.einsum('btd,esd->btes', x, self.expert_gate)
+        fc_h = torch.einsum('btd,esd->btes', x, self.expert_fc)
+        h = F.silu(gate_h) * fc_h  # [B, T, E, expert_size]
+        out_e = torch.einsum('btes,eds->bted', h, self.expert_down)
         return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
 
     @property
