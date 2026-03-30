@@ -54,6 +54,14 @@ def _get_expert_diagnostics(model):
         diag["mlp_usage"] = mr._expert_usage
         diag["mlp_entropy"] = mr._expert_entropy
         diag["mlp_balance_cv"] = mr._expert_balance_cv
+    # MoS routing diagnostics
+    mos = model.mos_head
+    for head in ("ctp", "ntp"):
+        usage = getattr(mos, f'_{head}_expert_usage', None)
+        if usage is not None:
+            diag[f"mos_{head}_usage"] = usage
+            diag[f"mos_{head}_entropy"] = getattr(mos, f'_{head}_expert_entropy', 0)
+            diag[f"mos_{head}_balance_cv"] = getattr(mos, f'_{head}_expert_balance_cv', 0)
     # Orthogonality (from 3D expert weight tensors [num_experts, rows, cols])
     with torch.no_grad():
         for name, w in [
@@ -81,6 +89,7 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
+        attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
     ).cuda()
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
@@ -130,6 +139,11 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
             if "attn_usage" in diag:
                 print(f"    attn: usage={diag['attn_usage']} entropy={diag['attn_entropy']:.4f} "
                       f"balance_cv={diag['attn_balance_cv']:.4f} ortho={diag.get('attn_ortho', 0):.4f}")
+            for head in ("ctp", "ntp"):
+                if f"mos_{head}_usage" in diag:
+                    print(f"    mos_{head}: usage={diag[f'mos_{head}_usage']} "
+                          f"entropy={diag[f'mos_{head}_entropy']:.4f} "
+                          f"balance_cv={diag[f'mos_{head}_balance_cv']:.4f}")
 
     # --- Results ---
     print(f"\n--- Smoke Test Results ---")

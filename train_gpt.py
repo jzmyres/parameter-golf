@@ -91,6 +91,8 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 65536))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 224))
     kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 0))  # 0 = auto (dim//2)
+    attn_expert_rank = int(os.environ.get("ATTN_EXPERT_RANK", 0))  # 0 = auto (dim//2); full-dim low-rank
+    mlp_expert_rank = int(os.environ.get("MLP_EXPERT_RANK", 0))    # 0 = auto (hidden//2); full-dim low-rank
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.3))
@@ -629,7 +631,8 @@ class CausalSelfAttention(nn.Module):
     - Soft dense routing on output projection (MoE for attention)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
-                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 2):
+                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 2,
+                 expert_rank: int = 0):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -639,7 +642,8 @@ class CausalSelfAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.num_experts = num_experts
-        self.expert_size = dim // num_experts
+        # Full-dim low-rank: every expert sees all dims through rank bottleneck
+        self.expert_rank = expert_rank if expert_rank > 0 else dim // 2
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
 
@@ -656,10 +660,9 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
         # Decoupled RoPE key
         self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
-        # Dense mixture experts: low-rank output projections per expert (dim -> r -> dim)
-        # Keep name expert_proj for downstream diagnostics/tests compatibility.
-        self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
-        self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_size))
+        # Full-dim low-rank experts: each expert projects dim → rank → dim (sees all dims)
+        self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_proj.data[e])
             nn.init.xavier_uniform_(self.expert_out.data[e])
@@ -715,15 +718,15 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     """SiLU-gated MLP with true expert parameters + Soft Dense Routing (Constraint #2)."""
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2):
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2, expert_rank: int = 0):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
-        self.expert_size = hidden // num_experts
-        # Dense mixture experts: low-rank SwiGLU blocks per expert (dim -> r -> dim)
-        self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
-        self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_size, dim))
-        self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_size))
+        # Full-dim low-rank: every expert sees all dims through rank bottleneck
+        self.expert_rank = expert_rank if expert_rank > 0 else hidden // 2
+        self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_gate.data[e])
             nn.init.xavier_uniform_(self.expert_fc.data[e])
@@ -734,7 +737,7 @@ class MLP(nn.Module):
         route_weights = self.mlp_router(x)  # [B, T, E]
         gate_h = torch.einsum('btd,esd->btes', x, self.expert_gate)
         fc_h = torch.einsum('btd,esd->btes', x, self.expert_fc)
-        h = F.silu(gate_h) * fc_h  # [B, T, E, expert_size]
+        h = F.silu(gate_h) * fc_h  # [B, T, E, expert_rank]
         out_e = torch.einsum('btes,eds->bted', h, self.expert_down)
         return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
 
@@ -836,9 +839,8 @@ class MoSHead(nn.Module):
         # NTP gate: num_shared + num_specialized (different specialized)
         self.gate_ctp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
         self.gate_ntp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
-        # Post-softmax per-expert gates (allow skipping experts while keeping a valid mixture)
-        self.expert_gate_ctp_logits = nn.Parameter(torch.ones(num_shared + num_specialized, dtype=torch.float32))
-        self.expert_gate_ntp_logits = nn.Parameter(torch.ones(num_shared + num_specialized, dtype=torch.float32))
+        # MoS uses pure softmax routing (convex combination, sums to 1) per Mixtape paper.
+        # No sigmoid gates — the softmax bottleneck is broken by the mixture itself.
         # Shared A projections: [num_shared, d_model, rank]
         self.A_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
         # Specialized A projections: 1 for CTP, 1 for NTP
@@ -871,16 +873,11 @@ class MoSHead(nn.Module):
         return _fsq_ste(x, self.fsq_levels, self.training)
 
     def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
-                      A_spec: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        """Compute (log_probs, alpha_softmax, alpha_softmax*sigmoid_gate) for one head."""
+                      A_spec: Tensor, B: Tensor) -> tuple[Tensor, Tensor]:
+        """Compute (log_probs, alpha_softmax) for one head. Pure softmax routing (Mixtape)."""
         N = x.shape[0]
-        alpha = F.softmax(gate(x).float(), dim=-1)  # [N, num_shared+num_spec]
-        if gate is self.gate_ctp:
-            gates = torch.sigmoid(self.expert_gate_ctp_logits)[None, :]
-        else:
-            gates = torch.sigmoid(self.expert_gate_ntp_logits)[None, :]
-        weights = alpha * gates.to(dtype=alpha.dtype)
-        log_w = weights.clamp(min=1e-8).log()
+        alpha = F.softmax(gate(x).float(), dim=-1)  # [N, num_shared+num_spec] — convex combination
+        log_w = alpha.clamp(min=1e-8).log()
         log_p_unnorm = x.new_full((N, self.vocab_size), -torch.inf, dtype=torch.float32)
         # Shared experts
         for e in range(self.num_shared):
@@ -894,15 +891,15 @@ class MoSHead(nn.Module):
             idx = self.num_shared + e
             log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
         log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
-        return log_p, alpha, weights
+        return log_p, alpha
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         """Return (log_p_denoise, log_p_ntp), each [*, V]."""
         orig_shape = h.shape[:-1]
         x = h.reshape(-1, self.d_model)
 
-        log_p_d, alpha_d, w_d = self._head_forward(x, self.gate_ctp, self.A_shared, self.A_ctp, self.B_denoise)
-        log_p_n, alpha_n, w_n = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
+        log_p_d, alpha_d = self._head_forward(x, self.gate_ctp, self.A_shared, self.A_ctp, self.B_denoise)
+        log_p_n, alpha_n = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
 
         if self.training:
             bal = torch.tensor(0.0, device=x.device)
@@ -911,25 +908,34 @@ class MoSHead(nn.Module):
                 mean_a = alpha_soft.mean(dim=0)
                 target = torch.ones_like(mean_a) / alpha_soft.shape[-1]
                 bal = bal + F.mse_loss(mean_a, target)
-            for w in [w_d, w_n]:
-                spar = spar + w.abs().mean()
+                spar = spar + alpha_soft.abs().mean()
             self._balance_loss = bal
             self._sparsity_loss = spar
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
+            # Eval diagnostics for MoS routing
+            with torch.no_grad():
+                for name, alpha_soft in [("ctp", alpha_d), ("ntp", alpha_n)]:
+                    mean_a = alpha_soft.mean(dim=0)
+                    setattr(self, f'_{name}_expert_usage', mean_a.float().cpu().tolist())
+                    per_token_ent = -(alpha_soft * (alpha_soft + 1e-8).log()).sum(-1)
+                    setattr(self, f'_{name}_expert_entropy', per_token_ent.mean().item())
+                    setattr(self, f'_{name}_expert_balance_cv', (mean_a.std() / mean_a.mean()).item())
 
         return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
 
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
-                 rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0):
+                 rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
+                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                         kv_latent_dim=kv_latent_dim, expert_rank=attn_expert_rank)
+        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank)
         # Small init for DEQ stability — block starts as near-identity
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
@@ -1121,6 +1127,8 @@ class GPT(nn.Module):
         bigram_dim: int = 128,
         kv_latent_dim: int = 0,
         num_refinements: int = 1,
+        attn_expert_rank: int = 0,
+        mlp_expert_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1137,7 +1145,8 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         # RevDEQ (Constraint #1): single shared block with coupled-state fixed-point iteration
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
-                                  rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim)
+                                  rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
+                                  attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank)
         self.deq_beta = 0.5  # relaxation parameter (0.5 gives exact fp64 reconstruction)
         # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
         self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
@@ -1317,10 +1326,10 @@ class GPT(nn.Module):
         spar = spar + getattr(self.mos_head, '_sparsity_loss', zero)
         # Orthogonality: |cos_sim| between expert weight groups → 0
         for w in [
-            self.shared_block.mlp.expert_fc.float(),   # [E, expert_size, dim]
-            self.shared_block.mlp.expert_down.float(),  # [E, dim, expert_size]
-            self.shared_block.attn.expert_proj.float(), # [E, expert_size, dim]
-            self.shared_block.attn.expert_out.float(),  # [E, dim, expert_size]
+            self.shared_block.mlp.expert_fc.float(),   # [E, expert_rank, dim]
+            self.shared_block.mlp.expert_down.float(),  # [E, dim, expert_rank]
+            self.shared_block.attn.expert_proj.float(), # [E, expert_rank, dim]
+            self.shared_block.attn.expert_out.float(),  # [E, dim, expert_rank]
             self.mos_head.A_shared.float(),             # [E, d_model, rank]
         ]:
             n_exp = w.shape[0]
@@ -1552,6 +1561,8 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim,
         num_refinements=args.num_refinements,
+        attn_expert_rank=args.attn_expert_rank,
+        mlp_expert_rank=args.mlp_expert_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1704,7 +1715,7 @@ def main() -> None:
                 deq_info += f" deq_iter_conv:{base_model._deq_iter_convergence:.6f}"
             if hasattr(base_model, '_deq_iter_convergence_rel'):
                 deq_info += f" deq_iter_conv_rel:{base_model._deq_iter_convergence_rel:.6f}"
-            # Expert diagnostics — per-component (MLP, Attention)
+            # Expert diagnostics — per-component (MLP, Attention, MoS)
             expert_info = ""
             if hasattr(base_model, 'shared_block'):
                 for comp_name, comp in [("mlp", base_model.shared_block.mlp),
@@ -1730,6 +1741,15 @@ def main() -> None:
                     diag = mlp.get_expert_diagnostics()
                     if 'ortho_cos_sim' in diag:
                         expert_info += f" expert_ortho:{diag['ortho_cos_sim']:.4f}"
+                # MoS diagnostics (CTP + NTP routing)
+                mos = base_model.mos_head
+                for head_name in ["ctp", "ntp"]:
+                    usage = getattr(mos, f'_{head_name}_expert_usage', None)
+                    if usage is not None:
+                        usage_str = ",".join(f"{u:.3f}" for u in usage)
+                        expert_info += f" mos_{head_name}_usage:[{usage_str}]"
+                        expert_info += f" mos_{head_name}_entropy:{getattr(mos, f'_{head_name}_expert_entropy', 0):.4f}"
+                        expert_info += f" mos_{head_name}_cv:{getattr(mos, f'_{head_name}_expert_balance_cv', 0):.4f}"
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"

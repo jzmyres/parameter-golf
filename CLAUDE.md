@@ -197,11 +197,18 @@ When proposing architecture improvements:
 ### 2. Soft Dense Routing (Dense MoE on ALL components)
 - Paper: Soft MoE (arxiv:2308.00951) — adapted for dense routing
 - ALL experts process ALL tokens — no top-k selection, no token dropping
-- Routing weights via softmax + input-dependent sigmoid gate
+- **Router routes on component INPUT** (pre-computation), consistent across all components
+- **Full-dim low-rank experts**: every expert operates on the FULL model hidden dimension.
+  Use low-rank matrices (dim→rank→dim) to control parameter count.
+  Do NOT partition dimensions across experts (no `expert_size = dim // num_experts`).
+- **Attn/MLP routing**: softmax + per-expert sigmoid gate (SoftDenseRouter)
+- **MoS routing (exception)**: pure softmax only (convex combination summing to 1), NO sigmoid gates.
+  Per Mixtape paper ("Breaking the Softmax Bottleneck Efficiently", NeurIPS 2019).
+  The softmax bottleneck is broken by the mixture of softmaxes itself, not by gating.
 - **Applied to ALL components**: attention output, MLP hidden, MoS output heads
 - **Regularization** (per-token sparsity + global balance + orthogonality):
   - **Per-token sparsity**: L1 on routing weights (each token concentrates on fewer experts)
-  - **Global balance**: MSE between mean expert usage and uniform target
+  - **Global balance**: MSE between mean expert usage and uniform target (per-component)
   - **Expert orthogonality**: |cos_sim| between expert weight groups → 0 (not ±1)
 - Fully differentiable, no discrete routing decisions
 

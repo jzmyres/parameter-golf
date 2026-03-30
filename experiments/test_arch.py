@@ -43,8 +43,9 @@ def test_all_constraints():
 
     # Check constraint #4: FSQ in MoS Head
     assert hasattr(model, 'mos_head'), "Must have MoS output head"
-    assert hasattr(model.mos_head, 'expert_gate_ctp_logits'), "Must have CTP expert gates"
-    assert hasattr(model.mos_head, 'expert_gate_ntp_logits'), "Must have NTP expert gates"
+    assert hasattr(model.mos_head, 'gate_ctp'), "Must have CTP gate (pure softmax routing)"
+    assert hasattr(model.mos_head, 'gate_ntp'), "Must have NTP gate (pure softmax routing)"
+    assert not hasattr(model.mos_head, 'expert_gate_ctp_logits'), "Sigmoid gates removed (Mixtape)"
 
     # Check constraint #5: Diffusion-AR (refinement)
     assert model.num_refinements >= 1, "Must have at least 1 refinement step"
