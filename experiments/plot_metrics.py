@@ -31,6 +31,9 @@ def parse_log(logpath: str) -> dict:
         # Per-component expert usage: each is list of lists
         "mlp_usage": [], "attn_usage": [],
         "mlp_entropy": [], "attn_entropy": [],
+        # Per-component orthogonality and balance
+        "mlp_ortho": [], "attn_ortho": [], "mos_ortho": [],
+        "mlp_bal": [], "attn_bal": [], "mos_bal": [],
     }
 
     for line in lines:
@@ -82,6 +85,12 @@ def parse_log(logpath: str) -> dict:
                     data[f"{comp}_usage"].append([])
                 m_e = re.search(rf"{comp}_entropy:([\d.]+)", line)
                 data[f"{comp}_entropy"].append(float(m_e.group(1)) if m_e else 0.0)
+            # Per-component orthogonality and balance
+            for comp in ("mlp", "attn", "mos"):
+                m_o = re.search(rf"{comp}_ortho:([\d.]+)", line)
+                data[f"{comp}_ortho"].append(float(m_o.group(1)) if m_o else 0.0)
+                m_b = re.search(rf"{comp}_bal:([\d.]+)", line)
+                data[f"{comp}_bal"].append(float(m_b.group(1)) if m_b else 0.0)
 
     return data
 
@@ -116,7 +125,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
     b = parse_log(baseline_log)
     c = parse_log(current_log)
 
-    fig, axes = plt.subplots(5, 3, figsize=(18, 22))
+    fig, axes = plt.subplots(6, 3, figsize=(18, 26))
     fig.suptitle("Baseline vs Current Experiment — Full Diagnostics", fontsize=16, fontweight="bold")
 
     # Row 1: Training metrics (total loss, val bpb, step avg)
@@ -181,14 +190,66 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
     ax_lb.legend(fontsize=6, ncol=2)
     ax_lb.grid(True, alpha=0.3)
 
-    _plot_line(axes[3, 1], b, c, "expert_entropy", "expert_entropy", "val_steps", "val_steps",
-               "Expert Entropy")
-    _plot_line(axes[3, 2], b, c, "expert_ortho", "expert_ortho", "val_steps", "val_steps",
-               "Expert Orthogonality (cos sim)")
+    # Expert Entropy: per-component lines
+    ax_ent = axes[3, 1]
+    comp_colors_ent = {"mlp": "#2ca02c", "attn": "#d62728"}
+    for comp, color in comp_colors_ent.items():
+        key = f"{comp}_entropy"
+        if b[key] and any(v > 0 for v in b[key]):
+            ax_ent.plot(b["val_steps"], b[key], color=color, linestyle="-", alpha=0.7,
+                       label=f"B {comp}", linewidth=1.5)
+        if c[key] and any(v > 0 for v in c[key]):
+            ax_ent.plot(c["val_steps"], c[key], color=color, linestyle="--", alpha=0.7,
+                       label=f"C {comp}", linewidth=1.5)
+    # Fallback to combined entropy
+    if not any(v > 0 for v in b.get("mlp_entropy", []) + c.get("mlp_entropy", [])):
+        _plot_line(ax_ent, b, c, "expert_entropy", "expert_entropy", "val_steps", "val_steps", "")
+    ax_ent.set_title("Expert Entropy (per Component)", fontsize=11)
+    ax_ent.set_xlabel("Step")
+    ax_ent.legend(fontsize=7)
+    ax_ent.grid(True, alpha=0.3)
 
-    # Row 5: Summary text
+    # Expert Orthogonality: per-component lines
+    ax_ort = axes[3, 2]
+    for comp, color in {"mlp": "#2ca02c", "attn": "#d62728", "mos": "#9467bd"}.items():
+        key = f"{comp}_ortho"
+        if b[key] and any(v > 0 for v in b[key]):
+            ax_ort.plot(b["val_steps"], b[key], color=color, linestyle="-", alpha=0.7,
+                       label=f"B {comp}", linewidth=1.5)
+        if c[key] and any(v > 0 for v in c[key]):
+            ax_ort.plot(c["val_steps"], c[key], color=color, linestyle="--", alpha=0.7,
+                       label=f"C {comp}", linewidth=1.5)
+    if not any(v > 0 for v in b.get("mlp_ortho", []) + c.get("mlp_ortho", [])):
+        _plot_line(ax_ort, b, c, "expert_ortho", "expert_ortho", "val_steps", "val_steps", "")
+    ax_ort.set_title("Expert Orthogonality (per Component)", fontsize=11)
+    ax_ort.set_xlabel("Step")
+    ax_ort.legend(fontsize=7)
+    ax_ort.grid(True, alpha=0.3)
+
+    # Row 5: Regularization losses (balance, sparsity, conv_loss)
+    # Balance loss per component
+    ax_bal = axes[4, 0]
+    for comp, color in {"mlp": "#2ca02c", "attn": "#d62728", "mos": "#9467bd"}.items():
+        key = f"{comp}_bal"
+        if b[key] and any(v > 0 for v in b[key]):
+            ax_bal.plot(b["val_steps"], b[key], color=color, linestyle="-", alpha=0.7,
+                       label=f"B {comp}", linewidth=1.5)
+        if c[key] and any(v > 0 for v in c[key]):
+            ax_bal.plot(c["val_steps"], c[key], color=color, linestyle="--", alpha=0.7,
+                       label=f"C {comp}", linewidth=1.5)
+    ax_bal.set_title("Balance Loss (per Component)", fontsize=11)
+    ax_bal.set_xlabel("Step")
+    ax_bal.legend(fontsize=7)
+    ax_bal.grid(True, alpha=0.3)
+
+    # Conv loss (from training lines)
+    _plot_line(axes[4, 1], b, c, "ctp_loss", "ctp_loss", "train_steps", "train_steps",
+               "Convergence Loss (from train)")
+    axes[4, 2].axis("off")  # spare slot
+
+    # Row 6: Summary text
     for j in range(3):
-        axes[4, j].axis("off")
+        axes[5, j].axis("off")
 
     summary_lines = []
     if b["val_bpb"] and c["val_bpb"]:
@@ -216,8 +277,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
         summary_lines.append(f"Ortho:      {b['expert_ortho'][-1]:.4f} vs {c['expert_ortho'][-1]:.4f}")
 
     summary = "\n".join(summary_lines)
-    axes[4, 1].text(0.0, 0.5, summary, fontsize=11, family="monospace",
-                   verticalalignment="center", transform=axes[4, 1].transAxes)
+    axes[5, 1].text(0.0, 0.5, summary, fontsize=11, family="monospace",
+                   verticalalignment="center", transform=axes[5, 1].transAxes)
 
     plt.tight_layout()
     plt.savefig(str(Path(outdir) / "metrics_comparison.png"), dpi=150)
