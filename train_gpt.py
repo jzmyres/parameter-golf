@@ -606,7 +606,14 @@ class SoftDenseRouter(nn.Module):
         if self.training:
             mean_alpha = alpha.mean(dim=tuple(range(alpha.ndim - 1)))
             target = torch.ones_like(mean_alpha) / self.num_experts
-            self._balance_loss = F.mse_loss(mean_alpha, target)
+            # Combine MSE + entropy-based balance for stronger expert utilization:
+            # 1. MSE: pushes mean usage toward uniform
+            mse_bal = F.mse_loss(mean_alpha, target)
+            # 2. Negative entropy: penalizes low-entropy (collapsed) routing
+            ent = -(mean_alpha * (mean_alpha + 1e-8).log()).sum()
+            max_ent = math.log(self.num_experts)
+            ent_bal = (max_ent - ent) / max_ent  # normalized to [0, 1], 0=uniform
+            self._balance_loss = mse_bal + ent_bal
             self._sparsity_loss = route_weights.abs().mean()
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
@@ -1314,30 +1321,42 @@ class GPT(nn.Module):
         """Collect balance, sparsity, and orthogonality losses from all routers."""
         zero = torch.tensor(0.0, device=device)
         bal, spar, ortho = zero, zero, zero
-        # All SoftDenseRouters: attn + mlp
-        routers = [self.shared_block.attn.attn_router, self.shared_block.mlp.mlp_router]
-        for r in routers:
-            bal = bal + getattr(r, '_balance_loss', zero)
-            spar = spar + getattr(r, '_sparsity_loss', zero)
+        # Per-component routing losses (attn, mlp, mos)
+        for name, r in [("attn", self.shared_block.attn.attn_router),
+                         ("mlp", self.shared_block.mlp.mlp_router)]:
+            r_bal = getattr(r, '_balance_loss', zero)
+            r_spar = getattr(r, '_sparsity_loss', zero)
+            bal = bal + r_bal
+            spar = spar + r_spar
+            # Store per-component for logging
+            setattr(self, f'_{name}_balance_loss', r_bal.item() if isinstance(r_bal, Tensor) else 0.0)
+            setattr(self, f'_{name}_sparsity_loss', r_spar.item() if isinstance(r_spar, Tensor) else 0.0)
         # MoS head routing
-        bal = bal + getattr(self.mos_head, '_balance_loss', zero)
-        spar = spar + getattr(self.mos_head, '_sparsity_loss', zero)
+        mos_bal = getattr(self.mos_head, '_balance_loss', zero)
+        mos_spar = getattr(self.mos_head, '_sparsity_loss', zero)
+        bal = bal + mos_bal
+        spar = spar + mos_spar
+        self._mos_balance_loss = mos_bal.item() if isinstance(mos_bal, Tensor) else 0.0
         # Orthogonality: |cos_sim| between expert weight groups → 0
-        for w in [
-            self.shared_block.mlp.expert_fc.float(),   # [E, expert_size, dim]
-            self.shared_block.mlp.expert_down.float(),  # [E, dim, expert_size]
-            self.shared_block.attn.expert_proj.float(), # [E, expert_size, dim]
-            self.shared_block.attn.expert_out.float(),  # [E, dim, expert_size]
-            self.mos_head.A_shared.float(),             # [E, d_model, rank]
+        for comp_name, weights in [
+            ("mlp", [self.shared_block.mlp.expert_fc.float(),
+                     self.shared_block.mlp.expert_down.float()]),
+            ("attn", [self.shared_block.attn.expert_proj.float(),
+                      self.shared_block.attn.expert_out.float()]),
+            ("mos", [self.mos_head.A_shared.float()]),
         ]:
-            n_exp = w.shape[0]
-            if n_exp < 2:
-                continue
-            groups = w.mean(dim=1)  # [E, feat]
-            groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
-            cos = groups @ groups.T
-            mask = ~torch.eye(n_exp, dtype=torch.bool, device=cos.device)
-            ortho = ortho + cos[mask].abs().mean()
+            comp_ortho = torch.tensor(0.0, device=device)
+            for w in weights:
+                n_exp = w.shape[0]
+                if n_exp < 2:
+                    continue
+                groups = w.view(n_exp, -1)
+                groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
+                cos = groups @ groups.T
+                mask = ~torch.eye(n_exp, dtype=torch.bool, device=cos.device)
+                comp_ortho = comp_ortho + cos[mask].abs().mean()
+            ortho = ortho + comp_ortho
+            setattr(self, f'_{comp_name}_ortho_loss', comp_ortho.item())
         return bal, spar, ortho
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1731,12 +1750,16 @@ def main() -> None:
                     expert_info += f" expert_usage:[{usage_str}]"
                     expert_info += f" expert_entropy:{mlp_r._expert_entropy:.4f}"
                     expert_info += f" expert_balance_cv:{mlp_r._expert_balance_cv:.4f}"
-                # Orthogonality (MLP)
-                mlp = base_model.shared_block.mlp
-                if hasattr(mlp, 'get_expert_diagnostics'):
-                    diag = mlp.get_expert_diagnostics()
-                    if 'ortho_cos_sim' in diag:
-                        expert_info += f" expert_ortho:{diag['ortho_cos_sim']:.4f}"
+                # Per-component orthogonality
+                for cn in ["mlp", "attn", "mos"]:
+                    o = getattr(base_model, f'_{cn}_ortho_loss', None)
+                    if o is not None:
+                        expert_info += f" {cn}_ortho:{o:.4f}"
+                # Per-component balance losses (from training)
+                for cn in ["mlp", "attn", "mos"]:
+                    b = getattr(base_model, f'_{cn}_balance_loss', None)
+                    if b is not None:
+                        expert_info += f" {cn}_bal:{b:.4f}"
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
