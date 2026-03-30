@@ -15,6 +15,8 @@ import re
 import sys
 from pathlib import Path
 
+import numpy as np
+
 # Consistent colors: blue for Baseline, orange for Current
 COLOR_BASELINE = "#1f77b4"  # matplotlib default blue
 COLOR_CURRENT = "#ff7f0e"   # matplotlib default orange
@@ -32,15 +34,10 @@ def parse_log(logpath: str) -> dict:
         "val_steps": [], "val_loss": [], "val_bpb": [],
         "deq_residual": [], "deq_recon": [], "deq_iter_conv": [],
         # Combined expert metrics (backward compat)
-        "expert_usage": [],  # list of lists (variable number of experts)
-        "expert_entropy": [], "expert_ortho": [],
-        # Per-component expert usage: each is list of lists
-        "mlp_usage": [], "attn_usage": [],
-        "mlp_entropy": [], "attn_entropy": [],
-        # MoS per-head routing diagnostics
-        "mos_ctp_usage": [], "mos_ntp_usage": [],
-        "mos_ctp_entropy": [], "mos_ntp_entropy": [],
-        "mos_ctp_cv": [], "mos_ntp_cv": [],
+        "expert_usage": [], "expert_entropy": [], "expert_ortho": [],
+        # Per-component: usage (list of lists), entropy, cv
+        **{f"{p}_{s}": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
+           for s in ("usage", "entropy", "cv")},
         # Per-component orthogonality and balance
         "mlp_ortho": [], "attn_ortho": [], "mos_ortho": [],
         "mlp_bal": [], "attn_bal": [], "mos_bal": [],
@@ -86,26 +83,15 @@ def parse_log(logpath: str) -> dict:
                 data["expert_usage"].append(usage)
             else:
                 data["expert_usage"].append([])
-            # Per-component expert usage (attn, mlp)
-            for comp in ("mlp", "attn"):
-                m_u = re.search(rf"{comp}_usage:\[([\d.,]+)\]", line)
-                if m_u:
-                    data[f"{comp}_usage"].append([float(v) for v in m_u.group(1).split(",")])
-                else:
-                    data[f"{comp}_usage"].append([])
-                m_e = re.search(rf"{comp}_entropy:([\d.]+)", line)
-                data[f"{comp}_entropy"].append(float(m_e.group(1)) if m_e else 0.0)
-            # MoS per-head routing diagnostics
-            for head in ("ctp", "ntp"):
-                m_u = re.search(rf"mos_{head}_usage:\[([\d.,]+)\]", line)
-                if m_u:
-                    data[f"mos_{head}_usage"].append([float(v) for v in m_u.group(1).split(",")])
-                else:
-                    data[f"mos_{head}_usage"].append([])
-                m_e = re.search(rf"mos_{head}_entropy:([\d.]+)", line)
-                data[f"mos_{head}_entropy"].append(float(m_e.group(1)) if m_e else 0.0)
-                m_cv = re.search(rf"mos_{head}_cv:([\d.]+)", line)
-                data[f"mos_{head}_cv"].append(float(m_cv.group(1)) if m_cv else 0.0)
+            # Per-component expert usage + entropy + cv
+            for prefix in ("mlp", "attn", "mos_ctp", "mos_ntp"):
+                m_u = re.search(rf"{prefix}_usage:\[([\d.,]+)\]", line)
+                data[f"{prefix}_usage"].append(
+                    [float(v) for v in m_u.group(1).split(",")] if m_u else [])
+                m_e = re.search(rf"{prefix}_entropy:([\d.]+)", line)
+                data[f"{prefix}_entropy"].append(float(m_e.group(1)) if m_e else 0.0)
+                m_cv = re.search(rf"{prefix}_cv:([\d.]+)", line)
+                data[f"{prefix}_cv"].append(float(m_cv.group(1)) if m_cv else 0.0)
             # Per-component orthogonality and balance
             for comp in ("mlp", "attn", "mos"):
                 m_o = re.search(rf"{comp}_ortho:([\d.]+)", line)
@@ -118,7 +104,6 @@ def parse_log(logpath: str) -> dict:
 
 def _usage_stats(usage_list):
     """Compute min/max/mean/median per step from list of expert usage lists."""
-    import numpy as np
     mins, maxs, means, medians = [], [], [], []
     for u in usage_list:
         if u:
@@ -149,6 +134,26 @@ def _plot_line(ax, b, c, b_key, c_key, b_steps, c_steps, title, ylabel=None):
     if ylabel:
         ax.set_ylabel(ylabel)
     ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+
+_COMP3_COLORS = {"mlp": COMP_COLORS["mlp"], "attn": COMP_COLORS["attn"],
+                  "mos": COMP_COLORS["mos_ctp"]}
+
+
+def _plot_per_component(ax, b, c, suffix, title):
+    """Plot per-component (mlp/attn/mos) metric with baseline solid, current dashed."""
+    for comp, color in _COMP3_COLORS.items():
+        key = f"{comp}_{suffix}"
+        if b.get(key) and any(v > 0 for v in b[key]):
+            ax.plot(b["val_steps"], b[key], color=color, linestyle="-", alpha=0.7,
+                   label=f"B {comp}", linewidth=1.5)
+        if c.get(key) and any(v > 0 for v in c[key]):
+            ax.plot(c["val_steps"], c[key], color=color, linestyle="--", alpha=0.7,
+                   label=f"C {comp}", linewidth=1.5)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("Step")
+    ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 
 
@@ -256,38 +261,12 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
     ax_ent.grid(True, alpha=0.3)
 
     # Expert Orthogonality: per-component lines
-    ax_ort = axes[3, 2]
-    for comp, color in {"mlp": COMP_COLORS["mlp"], "attn": COMP_COLORS["attn"],
-                         "mos": COMP_COLORS["mos_ctp"]}.items():
-        key = f"{comp}_ortho"
-        if b.get(key) and any(v > 0 for v in b[key]):
-            ax_ort.plot(b["val_steps"], b[key], color=color, linestyle="-", alpha=0.7,
-                       label=f"B {comp}", linewidth=1.5)
-        if c.get(key) and any(v > 0 for v in c[key]):
-            ax_ort.plot(c["val_steps"], c[key], color=color, linestyle="--", alpha=0.7,
-                       label=f"C {comp}", linewidth=1.5)
+    _plot_per_component(axes[3, 2], b, c, "ortho", "Expert Orthogonality (per Component)")
     if not any(v > 0 for v in b.get("mlp_ortho", []) + c.get("mlp_ortho", [])):
-        _plot_line(ax_ort, b, c, "expert_ortho", "expert_ortho", "val_steps", "val_steps", "")
-    ax_ort.set_title("Expert Orthogonality (per Component)", fontsize=11)
-    ax_ort.set_xlabel("Step")
-    ax_ort.legend(fontsize=7)
-    ax_ort.grid(True, alpha=0.3)
+        _plot_line(axes[3, 2], b, c, "expert_ortho", "expert_ortho", "val_steps", "val_steps", "")
 
     # Row 5: Regularization losses (balance, conv_loss, spare)
-    ax_bal = axes[4, 0]
-    for comp, color in {"mlp": COMP_COLORS["mlp"], "attn": COMP_COLORS["attn"],
-                         "mos": COMP_COLORS["mos_ctp"]}.items():
-        key = f"{comp}_bal"
-        if b.get(key) and any(v > 0 for v in b[key]):
-            ax_bal.plot(b["val_steps"], b[key], color=color, linestyle="-", alpha=0.7,
-                       label=f"B {comp}", linewidth=1.5)
-        if c.get(key) and any(v > 0 for v in c[key]):
-            ax_bal.plot(c["val_steps"], c[key], color=color, linestyle="--", alpha=0.7,
-                       label=f"C {comp}", linewidth=1.5)
-    ax_bal.set_title("Balance Loss (per Component)", fontsize=11)
-    ax_bal.set_xlabel("Step")
-    ax_bal.legend(fontsize=7)
-    ax_bal.grid(True, alpha=0.3)
+    _plot_per_component(axes[4, 0], b, c, "bal", "Balance Loss (per Component)")
 
     # Conv loss
     _plot_line(axes[4, 1], b, c, "ctp_loss", "ctp_loss", "train_steps", "train_steps",

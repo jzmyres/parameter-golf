@@ -642,7 +642,6 @@ class CausalSelfAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.num_experts = num_experts
-        # Full-dim low-rank: every expert sees all dims through rank bottleneck
         self.expert_rank = expert_rank if expert_rank > 0 else dim // 2
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
@@ -722,7 +721,6 @@ class MLP(nn.Module):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
-        # Full-dim low-rank: every expert sees all dims through rank bottleneck
         self.expert_rank = expert_rank if expert_rank > 0 else hidden // 2
         self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
@@ -903,25 +901,26 @@ class MoSHead(nn.Module):
 
         if self.training:
             bal = torch.tensor(0.0, device=x.device)
-            spar = torch.tensor(0.0, device=x.device)
             for alpha_soft in [alpha_d, alpha_n]:
                 mean_a = alpha_soft.mean(dim=0)
                 target = torch.ones_like(mean_a) / alpha_soft.shape[-1]
                 bal = bal + F.mse_loss(mean_a, target)
-                spar = spar + alpha_soft.abs().mean()
             self._balance_loss = bal
-            self._sparsity_loss = spar
+            # No sparsity loss for MoS: pure softmax has constant mean (1/E), no gradient signal
+            self._sparsity_loss = torch.tensor(0.0, device=x.device)
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
-            # Eval diagnostics for MoS routing
             with torch.no_grad():
-                for name, alpha_soft in [("ctp", alpha_d), ("ntp", alpha_n)]:
+                for alpha_soft, usage_attr, ent_attr, cv_attr in [
+                    (alpha_d, '_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
+                    (alpha_n, '_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
+                ]:
                     mean_a = alpha_soft.mean(dim=0)
-                    setattr(self, f'_{name}_expert_usage', mean_a.float().cpu().tolist())
+                    setattr(self, usage_attr, mean_a.float().cpu().tolist())
                     per_token_ent = -(alpha_soft * (alpha_soft + 1e-8).log()).sum(-1)
-                    setattr(self, f'_{name}_expert_entropy', per_token_ent.mean().item())
-                    setattr(self, f'_{name}_expert_balance_cv', (mean_a.std() / mean_a.mean()).item())
+                    setattr(self, ent_attr, per_token_ent.mean().item())
+                    setattr(self, cv_attr, (mean_a.std() / mean_a.mean()).item())
 
         return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
 
@@ -1728,13 +1727,6 @@ def main() -> None:
                         expert_info += f" {comp_name}_usage:[{usage_str}]"
                         expert_info += f" {comp_name}_entropy:{router._expert_entropy:.4f}"
                         expert_info += f" {comp_name}_cv:{router._expert_balance_cv:.4f}"
-                # Combined expert usage (backward compat for plot parser)
-                mlp_r = base_model.shared_block.mlp.mlp_router
-                if mlp_r._expert_usage is not None:
-                    usage_str = ",".join(f"{u:.3f}" for u in mlp_r._expert_usage)
-                    expert_info += f" expert_usage:[{usage_str}]"
-                    expert_info += f" expert_entropy:{mlp_r._expert_entropy:.4f}"
-                    expert_info += f" expert_balance_cv:{mlp_r._expert_balance_cv:.4f}"
                 # Orthogonality (MLP)
                 mlp = base_model.shared_block.mlp
                 if hasattr(mlp, 'get_expert_diagnostics'):
