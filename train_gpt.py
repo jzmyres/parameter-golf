@@ -1303,11 +1303,15 @@ class GPT(nn.Module):
         """Collect balance, sparsity, and orthogonality losses from all routers."""
         zero = torch.tensor(0.0, device=device)
         bal, spar, ortho = zero, zero, zero
-        # All SoftDenseRouters: attn + mlp
-        routers = [self.shared_block.attn.attn_router, self.shared_block.mlp.mlp_router]
-        for r in routers:
-            bal = bal + getattr(r, '_balance_loss', zero)
-            spar = spar + getattr(r, '_sparsity_loss', zero)
+        # Per-component routing losses with stronger weight for attention (prevents collapse)
+        for name, r, bal_weight in [
+            ("attn", self.shared_block.attn.attn_router, 3.0),  # 3x weight for attention
+            ("mlp", self.shared_block.mlp.mlp_router, 1.0),
+        ]:
+            r_bal = getattr(r, '_balance_loss', zero)
+            r_spar = getattr(r, '_sparsity_loss', zero)
+            bal = bal + bal_weight * r_bal
+            spar = spar + r_spar
         # MoS head routing
         bal = bal + getattr(self.mos_head, '_balance_loss', zero)
         spar = spar + getattr(self.mos_head, '_sparsity_loss', zero)
@@ -1343,7 +1347,7 @@ class GPT(nn.Module):
         # CTP weight scales with refinement steps: at step 0 input is clean one-hot,
         # CTP becomes meaningful only after soft embedding refinement
         ctp_weight = 0.1 * self.num_refinements
-        return ntp_loss + ctp_weight * ctp_loss + 0.01 * conv_loss + 0.1 * bal_loss + 0.001 * spar_loss + 0.01 * ortho_loss
+        return ntp_loss + ctp_weight * ctp_loss + 0.01 * conv_loss + 0.5 * bal_loss + 0.001 * spar_loss + 0.01 * ortho_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
