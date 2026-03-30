@@ -629,7 +629,7 @@ class CausalSelfAttention(nn.Module):
     - Soft dense routing on output projection (MoE for attention)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
-                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 4):
+                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 2):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -722,7 +722,7 @@ class MLP(nn.Module):
     where gate_e: [dim→rank], fc_e: [dim→rank], down_e: [rank→dim].
     This gives each expert access to all dimensions (unlike partial-dim split).
     """
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 4):
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
