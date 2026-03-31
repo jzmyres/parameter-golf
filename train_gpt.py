@@ -57,6 +57,10 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1200.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    deq_beta = float(os.environ.get("DEQ_BETA", 0.5))
+    resid_mix_init_logit = float(os.environ.get("RESID_MIX_INIT_LOGIT", 5.0))
+    attn_scale_max = float(os.environ.get("ATTN_SCALE_MAX", 0.2))
+    mlp_scale_max = float(os.environ.get("MLP_SCALE_MAX", 0.2))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 2))  # DEQ solver iters per refinement step
@@ -1000,7 +1004,9 @@ class MoSHead(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
-                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0):
+                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
+                 resid_mix_init_logit: float = 5.0, attn_scale_max: float = 0.2,
+                 mlp_scale_max: float = 0.2):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -1010,15 +1016,33 @@ class Block(nn.Module):
         # Small init for DEQ stability — block starts as near-identity
         self.attn_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        if attn_scale_max <= 0.0:
+            raise ValueError(f"attn_scale_max must be > 0, got {attn_scale_max}")
+        if mlp_scale_max <= 0.0:
+            raise ValueError(f"mlp_scale_max must be > 0, got {mlp_scale_max}")
+        if resid_mix_init_logit <= 0.0:
+            raise ValueError(f"resid_mix_init_logit must be > 0, got {resid_mix_init_logit}")
+        self.attn_scale_max = float(attn_scale_max)
+        self.mlp_scale_max = float(mlp_scale_max)
+
+        # Constrain mixing weights via softmax (convex combination) but initialize
+        # near the historical behavior: mix ≈ [1, 0] (no x0 injection at init).
+        self.resid_mix = nn.Parameter(torch.empty(2, dim, dtype=torch.float32))
+        with torch.no_grad():
+            self.resid_mix[0].fill_(resid_mix_init_logit)
+            self.resid_mix[1].fill_(-resid_mix_init_logit)
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix = torch.softmax(self.resid_mix.float(), dim=0).to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_scale = self.attn_scale.float()
+        attn_scale = (attn_scale / self.attn_scale_max).tanh() * self.attn_scale_max
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_scale = self.mlp_scale.float()
+        mlp_scale = (mlp_scale / self.mlp_scale_max).tanh() * self.mlp_scale_max
         mlp_out = self.mlp(self.mlp_norm(x))
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 
@@ -1200,6 +1224,10 @@ class GPT(nn.Module):
         num_refinements: int = 1,
         attn_expert_rank: int = 0,
         mlp_expert_rank: int = 0,
+        deq_beta: float = 0.5,
+        resid_mix_init_logit: float = 5.0,
+        attn_scale_max: float = 0.2,
+        mlp_scale_max: float = 0.2,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1217,8 +1245,11 @@ class GPT(nn.Module):
         # RevDEQ (Constraint #1): single shared block with coupled-state fixed-point iteration
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
-                                  attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank)
-        self.deq_beta = 0.5  # relaxation parameter (0.5 gives exact fp64 reconstruction)
+                                  attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
+                                  resid_mix_init_logit=resid_mix_init_logit,
+                                  attn_scale_max=attn_scale_max,
+                                  mlp_scale_max=mlp_scale_max)
+        self.deq_beta = float(deq_beta)
         # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
         self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
         # MoS output head (Constraints #4+#5): shared experts, dual B for CTP/NTP
@@ -1634,6 +1665,10 @@ def main() -> None:
         num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank,
         mlp_expert_rank=args.mlp_expert_rank,
+        deq_beta=args.deq_beta,
+        resid_mix_init_logit=args.resid_mix_init_logit,
+        attn_scale_max=args.attn_scale_max,
+        mlp_scale_max=args.mlp_scale_max,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
