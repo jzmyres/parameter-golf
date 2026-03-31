@@ -34,6 +34,16 @@ done
 
 mkdir -p "$LOGDIR" "$WEIGHTS_DIR/baseline" "$WEIGHTS_DIR/previous" "$WEIGHTS_DIR/current"
 
+# If RUN_LOG is the torchrun console capture, resolve the actual per-run logfile
+# (train_gpt.py prints `logs/<uuid>.txt` on rank0).
+if [ -f "$RUN_LOG" ] && [ "$(basename "$RUN_LOG")" = "run.log" ]; then
+    hint=$(grep -oE 'logs/[0-9a-fA-F-]+\.txt' "$RUN_LOG" | tail -1 || true)
+    if [ -n "${hint:-}" ] && [ -f "$PROJECT_ROOT/$hint" ]; then
+        echo "Resolved run log: $RUN_LOG → $hint"
+        RUN_LOG="$PROJECT_ROOT/$hint"
+    fi
+fi
+
 # --- Step 1: Rotate logs (only if run.log is newer than current.log) ---
 ROTATED=false
 if [ ! -f "$RUN_LOG" ]; then
@@ -93,13 +103,21 @@ fi
 # --- Step 4: Regenerate plots ---
 cd "$PROJECT_ROOT"
 
-if python experiments/plot_metrics.py 2>/dev/null; then
+# Prefer a Python with matplotlib available for plotting.
+PLOT_PYTHON=(python)
+if ! python -c "import matplotlib" >/dev/null 2>&1; then
+    if command -v conda >/dev/null 2>&1 && conda env list 2>/dev/null | awk '{print $1}' | grep -qx "deq"; then
+        PLOT_PYTHON=(conda run -n deq python)
+    fi
+fi
+
+if "${PLOT_PYTHON[@]}" experiments/plot_metrics.py 2>/dev/null; then
     echo "Updated metrics_comparison.png"
 else
     echo "Warning: plot_metrics.py failed (matplotlib missing?)"
 fi
 
-if python experiments/plot_progress.py 2>/dev/null; then
+if "${PLOT_PYTHON[@]}" experiments/plot_progress.py 2>/dev/null; then
     echo "Updated progress.png"
 else
     echo "Warning: plot_progress.py failed"

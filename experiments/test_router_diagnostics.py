@@ -34,6 +34,54 @@ class TestRouterDiagnostics(unittest.TestCase):
         self.assertIsInstance(router._expert_usage, list)
         self.assertEqual(router._diag_step, 123)
 
+    def test_revdeq_shared_block_routers_log_and_have_grad_regularizers(self):
+        """RevDEQ forward runs the shared block under no_grad.
+
+        Ensure we still get:
+        - dense (train-step) mlp/attn router diagnostics when enabled
+        - balance regularizers that carry gradients (not detached)
+        """
+        from train_gpt import GPT, router_diagnostics
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for this test")
+
+        model = GPT(
+            vocab_size=64,
+            num_layers=2,
+            model_dim=96,
+            num_heads=4,
+            num_kv_heads=2,
+            mlp_mult=2.0,
+            tie_embeddings=True,
+            tied_embed_init_std=0.01,
+            logit_softcap=20.0,
+            rope_base=1000.0,
+            qk_gain_init=1.2,
+            bigram_vocab_size=0,
+            bigram_dim=0,
+            kv_latent_dim=0,
+            num_refinements=1,
+        ).cuda().bfloat16()
+        model.train(True)
+
+        x = torch.randint(0, 64, (1, 32), device="cuda")
+        y = torch.randint(0, 64, (1, 32), device="cuda")
+
+        with router_diagnostics(True, step_tag=1):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+        loss.backward()
+
+        mlp_r = model.shared_block.mlp.mlp_router
+        attn_r = model.shared_block.attn.attn_router
+        self.assertIsInstance(mlp_r._expert_usage, list)
+        self.assertIsInstance(attn_r._expert_usage, list)
+        self.assertIsNotNone(mlp_r._balance_loss)
+        self.assertIsNotNone(attn_r._balance_loss)
+        self.assertTrue(getattr(mlp_r._balance_loss, "requires_grad", False))
+        self.assertTrue(getattr(attn_r._balance_loss, "requires_grad", False))
+
 
 if __name__ == "__main__":
     unittest.main()

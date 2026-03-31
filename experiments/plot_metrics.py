@@ -69,14 +69,14 @@ def parse_log(logpath: str) -> dict:
             data["step_avg_ms"].append(float(m.group(4)))
             # Parse NTP and CTP losses from training lines
             m_ntp = re.search(rf"ntp_loss:{_FLOAT}", line)
-            data["ntp_loss"].append(float(m_ntp.group(1)) if m_ntp else 0.0)
+            data["ntp_loss"].append(float(m_ntp.group(1)) if m_ntp else math.nan)
             m_ctp = re.search(rf"ctp_loss:{_FLOAT}", line)
-            data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else 0.0)
+            data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else math.nan)
             m_conv = re.search(rf"conv_loss:{_FLOAT}", line)
-            data["conv_loss"].append(float(m_conv.group(1)) if m_conv else 0.0)
+            data["conv_loss"].append(float(m_conv.group(1)) if m_conv else math.nan)
             # Parse pre-clip gradient norm
             m_gn = re.search(rf"grad_norm:{_FLOAT}", line)
-            data["grad_norm"].append(float(m_gn.group(1)) if m_gn else 0.0)
+            data["grad_norm"].append(float(m_gn.group(1)) if m_gn else math.nan)
 
             # Train-time DEQ + expert diagnostics (optional). Missing values become NaN.
             for key, pat in [
@@ -99,9 +99,9 @@ def parse_log(logpath: str) -> dict:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else math.nan)
             for prefix in ("mlp", "attn", "mos_ctp", "mos_ntp"):
-                m_u = re.search(rf"{prefix}_usage:\[([\d.,]+)\]", line)
+                m_u = re.search(rf"{prefix}_usage:\[([\d.,\s]+)\]", line)
                 data[f"{prefix}_usage_train"].append(
-                    [float(v) for v in m_u.group(1).split(",")] if m_u else []
+                    [float(v.strip()) for v in m_u.group(1).split(",") if v.strip()] if m_u else []
                 )
 
         # Final post-quant metric (exact, if available)
@@ -129,17 +129,17 @@ def parse_log(logpath: str) -> dict:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else math.nan)
             # Combined expert usage (backward compat)
-            m2 = re.search(r"(?<!\w_)expert_usage:\[([\d.,]+)\]", line)
+            m2 = re.search(r"(?<!\w_)expert_usage:\[([\d.,\s]+)\]", line)
             if m2:
-                usage = [float(v) for v in m2.group(1).split(",")]
+                usage = [float(v.strip()) for v in m2.group(1).split(",") if v.strip()]
                 data["expert_usage"].append(usage)
             else:
                 data["expert_usage"].append([])
             # Per-component expert usage + entropy + cv
             for prefix in ("mlp", "attn", "mos_ctp", "mos_ntp"):
-                m_u = re.search(rf"{prefix}_usage:\[([\d.,]+)\]", line)
+                m_u = re.search(rf"{prefix}_usage:\[([\d.,\s]+)\]", line)
                 data[f"{prefix}_usage"].append(
-                    [float(v) for v in m_u.group(1).split(",")] if m_u else [])
+                    [float(v.strip()) for v in m_u.group(1).split(",") if v.strip()] if m_u else [])
                 m_e = re.search(rf"{prefix}_entropy:{_FLOAT}", line)
                 data[f"{prefix}_entropy"].append(float(m_e.group(1)) if m_e else math.nan)
                 m_cv = re.search(rf"{prefix}_cv:{_FLOAT}", line)

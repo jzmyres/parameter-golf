@@ -1453,6 +1453,15 @@ class GPT(nn.Module):
             if y_acc is not None:
                 self._deq_yz_gap = (y_acc - z).float().norm().item()
 
+            # RevDEQ forward runs the shared block under `no_grad`, so any router-side
+            # regularizers/diagnostics computed inside the DEQ solve are detached and can
+            # also be overwritten by backward replay. Refresh shared-block router stats
+            # on the terminal state here (outside the DEQ autograd.Function) so:
+            # - balance/sparsity losses have correct gradients
+            # - mlp/attn router diagnostics are available for dense train-step logging
+            _ = self.shared_block.attn.attn_router(self.shared_block.attn_norm(z))
+            _ = self.shared_block.mlp.mlp_router(self.shared_block.mlp_norm(z))
+
         # Diagnostics (eval only)
         if not self.training:
             with torch.no_grad():
