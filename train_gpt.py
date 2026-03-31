@@ -42,17 +42,22 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Enable it briefly around selected forward passes (e.g. train logging steps)
 # to get dense curves for expert/DEQ metrics without increasing validation cost.
 _ROUTER_DIAGNOSTICS_ACTIVE = False
+_ROUTER_DIAGNOSTICS_STEP: int | None = None
 
 
 @contextlib.contextmanager
-def router_diagnostics(enabled: bool = True):
+def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
     global _ROUTER_DIAGNOSTICS_ACTIVE
+    global _ROUTER_DIAGNOSTICS_STEP
     prev = _ROUTER_DIAGNOSTICS_ACTIVE
+    prev_step = _ROUTER_DIAGNOSTICS_STEP
     _ROUTER_DIAGNOSTICS_ACTIVE = bool(enabled)
+    _ROUTER_DIAGNOSTICS_STEP = step_tag if enabled else None
     try:
         yield
     finally:
         _ROUTER_DIAGNOSTICS_ACTIVE = prev
+        _ROUTER_DIAGNOSTICS_STEP = prev_step
 
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -104,6 +109,11 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.25))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.03))
+
+    # Routing regularization weights
+    attn_balance_mult = float(os.environ.get("ATTN_BALANCE_MULT", 3.0))
+    mlp_balance_mult = float(os.environ.get("MLP_BALANCE_MULT", 1.0))
+    bal_loss_coef = float(os.environ.get("BAL_LOSS_COEF", 0.5))
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
@@ -619,6 +629,7 @@ class SoftDenseRouter(nn.Module):
         self._expert_gates = None
         self._expert_entropy = None
         self._expert_balance_cv = None
+        self._diag_step: int | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         """Returns routing weights [*, num_experts]."""
@@ -627,9 +638,14 @@ class SoftDenseRouter(nn.Module):
         gates = torch.sigmoid(self.expert_gate_logits.to(dtype=alpha.dtype))
         route_weights = alpha * gates
         if self.training:
-            mean_alpha = alpha.mean(dim=tuple(range(alpha.ndim - 1)))
-            target = torch.ones_like(mean_alpha) / self.num_experts
-            self._balance_loss = F.mse_loss(mean_alpha, target)
+            # Balance on *effective* routing (post-gate), not raw softmax alpha.
+            # This directly targets the same distribution used by usage diagnostics.
+            reduce_dims = tuple(range(route_weights.ndim - 1))
+            w_sum = route_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            w_norm = route_weights / w_sum
+            mean_share = w_norm.mean(dim=reduce_dims)
+            target = torch.ones_like(mean_share) / self.num_experts
+            self._balance_loss = F.mse_loss(mean_share, target)
             self._sparsity_loss = route_weights.abs().mean()
             with torch.no_grad():
                 do_diag = bool(_ROUTER_DIAGNOSTICS_ACTIVE)
@@ -637,24 +653,18 @@ class SoftDenseRouter(nn.Module):
                     do_diag = dist.get_rank() == 0
                 if do_diag:
                     # Compute diagnostics from detached tensors to avoid autograd overhead.
-                    reduce_dims = tuple(range(route_weights.ndim - 1))
                     rw = route_weights.detach()
                     mean_mass = rw.mean(dim=reduce_dims)
                     self._expert_usage = mean_mass.float().cpu().tolist()
                     self._expert_gates = gates.detach().float().cpu().tolist()
 
-                    w_sum = rw.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                    w_norm = rw / w_sum
-                    per_token_ent = -(w_norm * (w_norm + 1e-8).log()).sum(-1)
+                    w_sum_d = rw.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    w_norm_d = rw / w_sum_d
+                    per_token_ent = -(w_norm_d * (w_norm_d + 1e-8).log()).sum(-1)
                     self._expert_entropy = per_token_ent.mean().item()
-                    mean_share = w_norm.mean(dim=reduce_dims)
-                    self._expert_balance_cv = (mean_share.std() / mean_share.mean().clamp_min(1e-8)).item()
-                else:
-                    # Avoid stale values when only some steps collect diagnostics.
-                    self._expert_usage = None
-                    self._expert_gates = None
-                    self._expert_entropy = None
-                    self._expert_balance_cv = None
+                    mean_share_d = w_norm_d.mean(dim=reduce_dims)
+                    self._expert_balance_cv = (mean_share_d.std() / mean_share_d.mean().clamp_min(1e-8)).item()
+                    self._diag_step = _ROUTER_DIAGNOSTICS_STEP
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
@@ -680,11 +690,13 @@ class SoftDenseRouter(nn.Module):
                     self._expert_entropy = per_token_ent.mean().item()
                     mean_share = w_norm.mean(dim=reduce_dims)
                     self._expert_balance_cv = (mean_share.std() / mean_share.mean().clamp_min(1e-8)).item()
+                    self._diag_step = _ROUTER_DIAGNOSTICS_STEP
                 else:
                     self._expert_usage = None
                     self._expert_gates = None
                     self._expert_entropy = None
                     self._expert_balance_cv = None
+                    self._diag_step = None
         return route_weights
 
 
@@ -930,6 +942,7 @@ class MoSHead(nn.Module):
         # Dual B matrices (shared across all experts within each head)
         self.B_denoise = nn.Parameter(torch.empty(vocab_size, rank))
         self.B_NTP = nn.Parameter(torch.empty(vocab_size, rank))
+        self._diag_step: int | None = None
         self._init_params()
 
     def _init_params(self):
@@ -1027,14 +1040,7 @@ class MoSHead(nn.Module):
                         per_token_ent = -(a * (a + 1e-8).log()).sum(-1)
                         setattr(self, ent_attr, per_token_ent.mean().item())
                         setattr(self, cv_attr, (mean_a.std() / mean_a.mean().clamp_min(1e-8)).item())
-                else:
-                    for usage_attr, ent_attr, cv_attr in [
-                        ('_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
-                        ('_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
-                    ]:
-                        setattr(self, usage_attr, None)
-                        setattr(self, ent_attr, None)
-                        setattr(self, cv_attr, None)
+                    self._diag_step = _ROUTER_DIAGNOSTICS_STEP
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
@@ -1052,6 +1058,7 @@ class MoSHead(nn.Module):
                         per_token_ent = -(alpha_soft * (alpha_soft + 1e-8).log()).sum(-1)
                         setattr(self, ent_attr, per_token_ent.mean().item())
                         setattr(self, cv_attr, (mean_a.std() / mean_a.mean()).item())
+                    self._diag_step = _ROUTER_DIAGNOSTICS_STEP
                 else:
                     for usage_attr, ent_attr, cv_attr in [
                         ('_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
@@ -1060,6 +1067,7 @@ class MoSHead(nn.Module):
                         setattr(self, usage_attr, None)
                         setattr(self, ent_attr, None)
                         setattr(self, cv_attr, None)
+                    self._diag_step = None
 
         return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
 
@@ -1291,6 +1299,9 @@ class GPT(nn.Module):
         resid_mix_init_logit: float = 5.0,
         attn_scale_max: float = 0.2,
         mlp_scale_max: float = 0.2,
+        attn_balance_mult: float = 3.0,
+        mlp_balance_mult: float = 1.0,
+        bal_loss_coef: float = 0.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1313,6 +1324,9 @@ class GPT(nn.Module):
                                   attn_scale_max=attn_scale_max,
                                   mlp_scale_max=mlp_scale_max)
         self.deq_beta = float(deq_beta)
+        self.attn_balance_mult = float(attn_balance_mult)
+        self.mlp_balance_mult = float(mlp_balance_mult)
+        self.bal_loss_coef = float(bal_loss_coef)
         # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
         self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
         # MoS output head (Constraints #4+#5): shared experts, dual B for CTP/NTP
@@ -1479,8 +1493,8 @@ class GPT(nn.Module):
         bal, spar, ortho = zero, zero, zero
         # Per-component routing losses with stronger weight for attention (prevents collapse)
         for name, r, bal_weight in [
-            ("attn", self.shared_block.attn.attn_router, 3.0),  # 3x weight for attention
-            ("mlp", self.shared_block.mlp.mlp_router, 1.0),
+            ("attn", self.shared_block.attn.attn_router, self.attn_balance_mult),
+            ("mlp", self.shared_block.mlp.mlp_router, self.mlp_balance_mult),
         ]:
             r_bal = getattr(r, '_balance_loss', zero)
             r_spar = getattr(r, '_sparsity_loss', zero)
@@ -1521,7 +1535,14 @@ class GPT(nn.Module):
         # CTP weight scales with refinement steps: at step 0 input is clean one-hot,
         # CTP becomes meaningful only after soft embedding refinement
         ctp_weight = 0.1 * self.num_refinements
-        return ntp_loss + ctp_weight * ctp_loss + 0.01 * conv_loss + 0.5 * bal_loss + 0.001 * spar_loss + 0.01 * ortho_loss
+        return (
+            ntp_loss
+            + ctp_weight * ctp_loss
+            + 0.01 * conv_loss
+            + self.bal_loss_coef * bal_loss
+            + 0.001 * spar_loss
+            + 0.01 * ortho_loss
+        )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
@@ -1732,6 +1753,9 @@ def main() -> None:
         resid_mix_init_logit=args.resid_mix_init_logit,
         attn_scale_max=args.attn_scale_max,
         mlp_scale_max=args.mlp_scale_max,
+        attn_balance_mult=args.attn_balance_mult,
+        mlp_balance_mult=args.mlp_balance_mult,
+        bal_loss_coef=args.bal_loss_coef,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1840,7 +1864,13 @@ def main() -> None:
             parts.append(f"deq_iter_conv_rel:{m._deq_iter_convergence_rel:.6f}")
         return (" " + " ".join(parts)) if parts else ""
 
-    def format_expert_info(m: nn.Module, *, include_gates: bool = False) -> str:
+    def format_expert_info(
+        m: nn.Module,
+        *,
+        include_gates: bool = False,
+        step: int | None = None,
+        require_step_match: bool = False,
+    ) -> str:
         parts: list[str] = []
 
         if hasattr(m, "shared_block"):
@@ -1848,7 +1878,12 @@ def main() -> None:
                 router = getattr(comp, f"{comp_name}_router", None)
                 if router is None:
                     router = getattr(comp, "attn_router", None)
-                if router is not None and getattr(router, "_expert_usage", None) is not None:
+                diag_ok = (
+                    router is not None
+                    and getattr(router, "_expert_usage", None) is not None
+                    and (not require_step_match or getattr(router, "_diag_step", None) == step)
+                )
+                if diag_ok:
                     usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
                     parts.append(f"{comp_name}_usage:[{usage_str}]")
                     ent = getattr(router, "_expert_entropy", None)
@@ -1880,9 +1915,10 @@ def main() -> None:
             if hasattr(mos, "get_head_orthogonality"):
                 parts.append(f"mos_ctp_ortho:{mos.get_head_orthogonality('ctp'):.4f}")
                 parts.append(f"mos_ntp_ortho:{mos.get_head_orthogonality('ntp'):.4f}")
+            mos_diag_ok = (not require_step_match) or (getattr(mos, "_diag_step", None) == step)
             for head_name in ["ctp", "ntp"]:
                 usage = getattr(mos, f"_{head_name}_expert_usage", None)
-                if usage is not None:
+                if usage is not None and mos_diag_ok:
                     usage_str = ",".join(f"{u:.3f}" for u in usage)
                     parts.append(f"mos_{head_name}_usage:[{usage_str}]")
                     ent = getattr(mos, f"_{head_name}_expert_entropy", None)
@@ -1941,7 +1977,7 @@ def main() -> None:
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             )
             deq_info = format_deq_info(base_model)
-            expert_info = format_expert_info(base_model, include_gates=True) if master_process else ""
+            expert_info = format_expert_info(base_model, include_gates=True, step=step) if master_process else ""
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1976,7 +2012,7 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 diag_enabled = master_process and will_log_train and micro_step == grad_accum_steps - 1
-                with router_diagnostics(diag_enabled):
+                with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -2022,7 +2058,7 @@ def main() -> None:
             ctp = getattr(base_model, '_ctp_loss', 0.0)
             conv = getattr(base_model, '_conv_loss', 0.0)
             deq_info = format_deq_info(base_model)
-            expert_info = format_expert_info(base_model) if master_process else ""
+            expert_info = format_expert_info(base_model, step=step, require_step_match=True) if master_process else ""
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} conv_loss:{conv:.6f} "

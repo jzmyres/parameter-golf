@@ -189,10 +189,18 @@ def _plot_line(ax, b, c, b_key, c_key, b_steps, c_steps, title, ylabel=None):
     bx, by = _filter_finite(b.get(b_steps, []), b.get(b_key, []))
     cx, cy = _filter_finite(c.get(c_steps, []), c.get(c_key, []))
     if bx and by:
-        ax.plot(bx, by, color=COLOR_BASELINE, alpha=0.7, label="Baseline", linewidth=1.5)
+        if len(by) < 2:
+            ax.scatter(bx, by, color=COLOR_BASELINE, alpha=0.85, label="Baseline", s=28)
+            ax.text(bx[0], by[0], f"{by[0]:.4f}", fontsize=8, ha="left", va="bottom", color=COLOR_BASELINE)
+        else:
+            ax.plot(bx, by, color=COLOR_BASELINE, alpha=0.7, label="Baseline", linewidth=1.5)
         plotted = True
     if cx and cy:
-        ax.plot(cx, cy, color=COLOR_CURRENT, alpha=0.7, label="Current", linewidth=1.5)
+        if len(cy) < 2:
+            ax.scatter(cx, cy, color=COLOR_CURRENT, alpha=0.85, label="Current", s=28)
+            ax.text(cx[0], cy[0], f"{cy[0]:.4f}", fontsize=8, ha="left", va="bottom", color=COLOR_CURRENT)
+        else:
+            ax.plot(cx, cy, color=COLOR_CURRENT, alpha=0.7, label="Current", linewidth=1.5)
         plotted = True
     ax.set_title(title, fontsize=11)
     ax.set_xlabel("Step")
@@ -218,34 +226,56 @@ def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
         if b_values is not None and _has_any_finite(b_values):
             bx, by = _filter_finite(b.get(steps_key, []), b_values)
             if bx and by:
-                ax.plot(
-                    bx,
-                    by,
-                    color=COLOR_BASELINE,
-                    linestyle="-",
-                    marker=marker,
-                    markersize=3,
-                    markevery=max(len(bx) // 12, 1),
-                    alpha=0.8,
-                    label=f"Baseline {comp_label}",
-                    linewidth=1.4,
-                )
+                if len(by) < 2:
+                    ax.scatter(
+                        bx,
+                        by,
+                        color=COLOR_BASELINE,
+                        marker=marker,
+                        alpha=0.85,
+                        s=24,
+                        label=f"Baseline {comp_label}",
+                    )
+                else:
+                    ax.plot(
+                        bx,
+                        by,
+                        color=COLOR_BASELINE,
+                        linestyle="-",
+                        marker=marker,
+                        markersize=3,
+                        markevery=max(len(bx) // 12, 1),
+                        alpha=0.8,
+                        label=f"Baseline {comp_label}",
+                        linewidth=1.4,
+                    )
                 any_plotted = True
         if c_values is not None and _has_any_finite(c_values):
             cx, cy = _filter_finite(c.get(steps_key, []), c_values)
             if cx and cy:
-                ax.plot(
-                    cx,
-                    cy,
-                    color=COLOR_CURRENT,
-                    linestyle="--",
-                    marker=marker,
-                    markersize=3,
-                    markevery=max(len(cx) // 12, 1),
-                    alpha=0.8,
-                    label=f"Current {comp_label}",
-                    linewidth=1.4,
-                )
+                if len(cy) < 2:
+                    ax.scatter(
+                        cx,
+                        cy,
+                        color=COLOR_CURRENT,
+                        marker=marker,
+                        alpha=0.85,
+                        s=24,
+                        label=f"Current {comp_label}",
+                    )
+                else:
+                    ax.plot(
+                        cx,
+                        cy,
+                        color=COLOR_CURRENT,
+                        linestyle="--",
+                        marker=marker,
+                        markersize=3,
+                        markevery=max(len(cx) // 12, 1),
+                        alpha=0.8,
+                        label=f"Current {comp_label}",
+                        linewidth=1.4,
+                    )
                 any_plotted = True
 
     ax.set_title(title, fontsize=11)

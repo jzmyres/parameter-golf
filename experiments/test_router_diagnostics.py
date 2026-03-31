@@ -21,14 +21,19 @@ class TestRouterDiagnostics(unittest.TestCase):
         self.assertIsNone(router._expert_usage)
 
         # When enabled: diagnostics are populated (usage, entropy, cv).
-        with router_diagnostics(True):
+        with router_diagnostics(True, step_tag=123):
             _ = router(x)
         self.assertIsInstance(router._expert_usage, list)
         self.assertEqual(len(router._expert_usage), 3)
         self.assertIsInstance(router._expert_entropy, float)
         self.assertIsInstance(router._expert_balance_cv, float)
+        self.assertEqual(router._diag_step, 123)
+
+        # Non-diagnostic forwards must not wipe diagnostics (RevDEQ backward replay safety).
+        _ = router(x)
+        self.assertIsInstance(router._expert_usage, list)
+        self.assertEqual(router._diag_step, 123)
 
 
 if __name__ == "__main__":
     unittest.main()
-
