@@ -38,6 +38,22 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # HYPERPARAMETERS
 # -----------------------------
 
+# Diagnostics collection is disabled by default during training for speed.
+# Enable it briefly around selected forward passes (e.g. train logging steps)
+# to get dense curves for expert/DEQ metrics without increasing validation cost.
+_ROUTER_DIAGNOSTICS_ACTIVE = False
+
+
+@contextlib.contextmanager
+def router_diagnostics(enabled: bool = True):
+    global _ROUTER_DIAGNOSTICS_ACTIVE
+    prev = _ROUTER_DIAGNOSTICS_ACTIVE
+    _ROUTER_DIAGNOSTICS_ACTIVE = bool(enabled)
+    try:
+        yield
+    finally:
+        _ROUTER_DIAGNOSTICS_ACTIVE = prev
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -615,6 +631,30 @@ class SoftDenseRouter(nn.Module):
             target = torch.ones_like(mean_alpha) / self.num_experts
             self._balance_loss = F.mse_loss(mean_alpha, target)
             self._sparsity_loss = route_weights.abs().mean()
+            with torch.no_grad():
+                do_diag = bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+                if do_diag and dist.is_available() and dist.is_initialized():
+                    do_diag = dist.get_rank() == 0
+                if do_diag:
+                    # Compute diagnostics from detached tensors to avoid autograd overhead.
+                    reduce_dims = tuple(range(route_weights.ndim - 1))
+                    rw = route_weights.detach()
+                    mean_mass = rw.mean(dim=reduce_dims)
+                    self._expert_usage = mean_mass.float().cpu().tolist()
+                    self._expert_gates = gates.detach().float().cpu().tolist()
+
+                    w_sum = rw.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    w_norm = rw / w_sum
+                    per_token_ent = -(w_norm * (w_norm + 1e-8).log()).sum(-1)
+                    self._expert_entropy = per_token_ent.mean().item()
+                    mean_share = w_norm.mean(dim=reduce_dims)
+                    self._expert_balance_cv = (mean_share.std() / mean_share.mean().clamp_min(1e-8)).item()
+                else:
+                    # Avoid stale values when only some steps collect diagnostics.
+                    self._expert_usage = None
+                    self._expert_gates = None
+                    self._expert_entropy = None
+                    self._expert_balance_cv = None
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
@@ -972,6 +1012,29 @@ class MoSHead(nn.Module):
             self._balance_loss = bal
             # No sparsity loss for MoS: pure softmax has constant mean (1/E), no gradient signal
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
+            with torch.no_grad():
+                do_diag = bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+                if do_diag and dist.is_available() and dist.is_initialized():
+                    do_diag = dist.get_rank() == 0
+                if do_diag:
+                    for alpha_soft, usage_attr, ent_attr, cv_attr in [
+                        (alpha_d, '_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
+                        (alpha_n, '_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
+                    ]:
+                        a = alpha_soft.detach()
+                        mean_a = a.mean(dim=0)
+                        setattr(self, usage_attr, mean_a.float().cpu().tolist())
+                        per_token_ent = -(a * (a + 1e-8).log()).sum(-1)
+                        setattr(self, ent_attr, per_token_ent.mean().item())
+                        setattr(self, cv_attr, (mean_a.std() / mean_a.mean().clamp_min(1e-8)).item())
+                else:
+                    for usage_attr, ent_attr, cv_attr in [
+                        ('_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
+                        ('_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
+                    ]:
+                        setattr(self, usage_attr, None)
+                        setattr(self, ent_attr, None)
+                        setattr(self, cv_attr, None)
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
@@ -1765,6 +1828,72 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    def format_deq_info(m: nn.Module) -> str:
+        parts: list[str] = []
+        if hasattr(m, "_deq_residuals") and getattr(m, "_deq_residuals"):
+            parts.append(f"deq_residual:{m._deq_residuals[-1]:.6f}")
+        if hasattr(m, "_deq_recon_error"):
+            parts.append(f"deq_recon_err:{m._deq_recon_error:.6f}")
+        if hasattr(m, "_deq_iter_convergence"):
+            parts.append(f"deq_iter_conv:{m._deq_iter_convergence:.6f}")
+        if hasattr(m, "_deq_iter_convergence_rel"):
+            parts.append(f"deq_iter_conv_rel:{m._deq_iter_convergence_rel:.6f}")
+        return (" " + " ".join(parts)) if parts else ""
+
+    def format_expert_info(m: nn.Module, *, include_gates: bool = False) -> str:
+        parts: list[str] = []
+
+        if hasattr(m, "shared_block"):
+            for comp_name, comp in [("mlp", m.shared_block.mlp), ("attn", m.shared_block.attn)]:
+                router = getattr(comp, f"{comp_name}_router", None)
+                if router is None:
+                    router = getattr(comp, "attn_router", None)
+                if router is not None and getattr(router, "_expert_usage", None) is not None:
+                    usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
+                    parts.append(f"{comp_name}_usage:[{usage_str}]")
+                    ent = getattr(router, "_expert_entropy", None)
+                    if ent is not None:
+                        parts.append(f"{comp_name}_entropy:{ent:.4f}")
+                    cv = getattr(router, "_expert_balance_cv", None)
+                    if cv is not None:
+                        parts.append(f"{comp_name}_cv:{cv:.4f}")
+                    if include_gates:
+                        gates = getattr(router, "_expert_gates", None)
+                        if gates is not None:
+                            gates_str = ",".join(f"{g:.3f}" for g in gates)
+                            parts.append(f"{comp_name}_gates:[{gates_str}]")
+
+            mlp = m.shared_block.mlp
+            if hasattr(mlp, "get_expert_diagnostics"):
+                diag = mlp.get_expert_diagnostics()
+                if "ortho_cos_sim" in diag:
+                    parts.append(f"mlp_ortho:{diag['ortho_cos_sim']:.4f}")
+                    parts.append(f"expert_ortho:{diag['ortho_cos_sim']:.4f}")
+            attn = m.shared_block.attn
+            if hasattr(attn, "get_expert_diagnostics"):
+                diag = attn.get_expert_diagnostics()
+                if "ortho_cos_sim" in diag:
+                    parts.append(f"attn_ortho:{diag['ortho_cos_sim']:.4f}")
+
+        if hasattr(m, "mos_head"):
+            mos = m.mos_head
+            if hasattr(mos, "get_head_orthogonality"):
+                parts.append(f"mos_ctp_ortho:{mos.get_head_orthogonality('ctp'):.4f}")
+                parts.append(f"mos_ntp_ortho:{mos.get_head_orthogonality('ntp'):.4f}")
+            for head_name in ["ctp", "ntp"]:
+                usage = getattr(mos, f"_{head_name}_expert_usage", None)
+                if usage is not None:
+                    usage_str = ",".join(f"{u:.3f}" for u in usage)
+                    parts.append(f"mos_{head_name}_usage:[{usage_str}]")
+                    ent = getattr(mos, f"_{head_name}_expert_entropy", None)
+                    cv = getattr(mos, f"_{head_name}_expert_balance_cv", None)
+                    if ent is not None:
+                        parts.append(f"mos_{head_name}_entropy:{ent:.4f}")
+                    if cv is not None:
+                        parts.append(f"mos_{head_name}_cv:{cv:.4f}")
+
+        return (" " + " ".join(parts)) if parts else ""
+
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1811,65 +1940,8 @@ def main() -> None:
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             )
-            # Log DEQ convergence metrics
-            deq_info = ""
-            if hasattr(base_model, '_deq_residuals') and base_model._deq_residuals:
-                deq_info = f" deq_residual:{base_model._deq_residuals[-1]:.6f}"
-            if hasattr(base_model, '_deq_recon_error'):
-                deq_info += f" deq_recon_err:{base_model._deq_recon_error:.6f}"
-            if hasattr(base_model, '_deq_iter_convergence'):
-                deq_info += f" deq_iter_conv:{base_model._deq_iter_convergence:.6f}"
-            if hasattr(base_model, '_deq_iter_convergence_rel'):
-                deq_info += f" deq_iter_conv_rel:{base_model._deq_iter_convergence_rel:.6f}"
-            # Expert diagnostics — per-component (MLP, Attention, MoS)
-            expert_info = ""
-            if master_process and hasattr(base_model, 'shared_block'):
-                for comp_name, comp in [("mlp", base_model.shared_block.mlp),
-                                         ("attn", base_model.shared_block.attn)]:
-                    router = getattr(comp, f'{comp_name}_router', None)
-                    if router is None:
-                        router = getattr(comp, 'attn_router', None)
-                    if router is not None and router._expert_usage is not None:
-                        usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
-                        expert_info += f" {comp_name}_usage:[{usage_str}]"
-                        if router._expert_entropy is not None:
-                            expert_info += f" {comp_name}_entropy:{router._expert_entropy:.4f}"
-                        if router._expert_balance_cv is not None:
-                            expert_info += f" {comp_name}_cv:{router._expert_balance_cv:.4f}"
-                        gates = getattr(router, "_expert_gates", None)
-                        if gates is not None:
-                            gates_str = ",".join(f"{g:.3f}" for g in gates)
-                            expert_info += f" {comp_name}_gates:[{gates_str}]"
-                # Orthogonality (MLP)
-                mlp = base_model.shared_block.mlp
-                if hasattr(mlp, 'get_expert_diagnostics'):
-                    diag = mlp.get_expert_diagnostics()
-                    if 'ortho_cos_sim' in diag:
-                        expert_info += f" mlp_ortho:{diag['ortho_cos_sim']:.4f}"
-                        # Backward-compat: older plots look for expert_ortho
-                        expert_info += f" expert_ortho:{diag['ortho_cos_sim']:.4f}"
-                # Orthogonality (Attention)
-                attn = base_model.shared_block.attn
-                if hasattr(attn, 'get_expert_diagnostics'):
-                    diag = attn.get_expert_diagnostics()
-                    if 'ortho_cos_sim' in diag:
-                        expert_info += f" attn_ortho:{diag['ortho_cos_sim']:.4f}"
-                # MoS diagnostics (CTP + NTP routing)
-                mos = base_model.mos_head
-                if hasattr(mos, 'get_head_orthogonality'):
-                    expert_info += f" mos_ctp_ortho:{mos.get_head_orthogonality('ctp'):.4f}"
-                    expert_info += f" mos_ntp_ortho:{mos.get_head_orthogonality('ntp'):.4f}"
-                for head_name in ["ctp", "ntp"]:
-                    usage = getattr(mos, f'_{head_name}_expert_usage', None)
-                    if usage is not None:
-                        usage_str = ",".join(f"{u:.3f}" for u in usage)
-                        expert_info += f" mos_{head_name}_usage:[{usage_str}]"
-                        ent = getattr(mos, f'_{head_name}_expert_entropy', None)
-                        cv = getattr(mos, f'_{head_name}_expert_balance_cv', None)
-                        if ent is not None:
-                            expert_info += f" mos_{head_name}_entropy:{ent:.4f}"
-                        if cv is not None:
-                            expert_info += f" mos_{head_name}_cv:{cv:.4f}"
+            deq_info = format_deq_info(base_model)
+            expert_info = format_expert_info(base_model, include_gates=True) if master_process else ""
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1893,12 +1965,19 @@ def main() -> None:
         _QAT_ACTIVE = scale < 0.10
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        next_step = step + 1
+        will_log_train = (
+            args.train_log_every > 0
+            and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
+        )
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                diag_enabled = master_process and will_log_train and micro_step == grad_accum_steps - 1
+                with router_diagnostics(diag_enabled):
+                    loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1942,11 +2021,14 @@ def main() -> None:
             ntp = getattr(base_model, '_ntp_loss', 0.0)
             ctp = getattr(base_model, '_ctp_loss', 0.0)
             conv = getattr(base_model, '_conv_loss', 0.0)
+            deq_info = format_deq_info(base_model)
+            expert_info = format_expert_info(base_model) if master_process else ""
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} conv_loss:{conv:.6f} "
                 f"grad_norm:{_preclip_grad_norm:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"{deq_info}{expert_info}"
             )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms

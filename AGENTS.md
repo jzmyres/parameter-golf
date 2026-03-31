@@ -29,6 +29,7 @@ You MUST incorporate these three architectural innovations into the transformer 
 Start from the converged consensus config of the top 3 leaderboard entries (documented in CLAUDE.md). Run it unmodified to establish baseline. This MUST succeed before any modifications.
 
 ### Loop (run indefinitely)
+0. Read `EXPERIENCE.md` — apply accumulated guardrails
 1. `git log --oneline -20` + read `results.tsv` — understand history
 2. Plan ONE focused change (architecture, hyperparameters, or training)
 3. Write tests first (TDD)
