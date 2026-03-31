@@ -4,17 +4,19 @@ This file records the latest rerun outcomes (numbers + pointers to logs/plots). 
 
 ## Latest Rerun
 
-- Branch/commit under test: `03d583d`
+- Branch/commit under test: `95f634d`
 - GPUs: `CUDA_VISIBLE_DEVICES=2,3` via `torchrun --nproc_per_node=2`
 - Seed: `42`
 - Steps: `2000`
 - Dataset: `data/datasets/fineweb10B_sp1024` (train shards present: `1`)
+- Batch: `TRAIN_BATCH_TOKENS=131072` (larger for efficiency)
+- Validation cadence: `VAL_LOSS_EVERY=0` (final-only; avoids full-val overhead)
 
 **Current (rerun)**
-- Log: `logs/current_03d583d_2000_rerun.txt`
-- In-training final validation: `val_bpb=1.5043` (from `step:2000/2000 ... val_bpb:...`)
-- Post-quant (scored): `val_bpb=1.51095852` (from `final_int6_zstd_roundtrip_exact`)
-- Artifact bytes (post-quant): `15233281`
+- Log: `logs/current_95f634d_2000_b131k_valend.txt`
+- In-training final validation (pre-quant): `val_bpb=1.5080` (from `step:2000/2000 ... val_bpb:...`)
+- Post-quant (scored): `val_bpb=1.51001207` (from `final_int6_zstd_roundtrip_exact`)
+- Artifact bytes (post-quant): `15240414`
 
 **Baseline (for comparison)**
 - Baseline log used by plots: `experiments/training_logs/baseline.log`
