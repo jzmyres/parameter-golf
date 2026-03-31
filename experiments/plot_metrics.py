@@ -4,24 +4,30 @@ Shows full training curves for ALL diagnostic metrics:
 - Row 1: Train Loss, Val BPB, Step Avg (ms)
 - Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
 - Row 3: DEQ Residual, DEQ Recon Error, DEQ Iter Convergence
-- Row 4: Expert Usage (min/max/mean/median per component), Expert Entropy, Expert Orthogonality
-- Row 5: Balance Loss (per component), Conv Loss, (spare)
+- Row 4: Expert Usage (min per component), Expert Entropy, Expert Orthogonality
+- Row 5: Expert Balance CV (per component), Conv Loss, (spare)
 - Row 6: Summary text with final values comparison
 
-Expert usage plots show min/max (shaded band), mean (solid), median (dashed) per component
-for scalability when expert count grows.
+All subplots use consistent colors: blue for Baseline, orange for Current.
+Components (mlp/attn/mos_ctp/mos_ntp) are encoded with markers.
 """
 import re
 import sys
 from pathlib import Path
 
-import numpy as np
-
 # Consistent colors: blue for Baseline, orange for Current
 COLOR_BASELINE = "#1f77b4"  # matplotlib default blue
 COLOR_CURRENT = "#ff7f0e"   # matplotlib default orange
-# Component colors
-COMP_COLORS = {"mlp": "#2ca02c", "attn": "#d62728", "mos_ctp": "#9467bd", "mos_ntp": "#8c564b"}
+
+# Component markers (keep consistent across subplots)
+COMP_MARKERS = {
+    "mlp": "o",
+    "attn": "s",
+    "mos_ctp": "^",
+    "mos_ntp": "x",
+}
+
+_FLOAT = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
 
 
 def parse_log(logpath: str) -> dict:
@@ -38,41 +44,40 @@ def parse_log(logpath: str) -> dict:
         # Per-component: usage (list of lists), entropy, cv
         **{f"{p}_{s}": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
            for s in ("usage", "entropy", "cv")},
-        # Per-component orthogonality and balance
-        "mlp_ortho": [], "attn_ortho": [], "mos_ortho": [],
-        "mlp_bal": [], "attn_bal": [], "mos_bal": [],
+        # Per-component orthogonality
+        "mlp_ortho": [], "attn_ortho": [], "mos_ctp_ortho": [], "mos_ntp_ortho": [], "mos_ortho": [],
     }
 
     for line in lines:
         # Training steps
-        m = re.search(r"^step:(\d+)/\d+ train_loss:([\d.]+).*train_time:(\d+)ms step_avg:([\d.]+)ms", line)
+        m = re.search(rf"^step:(\d+)/\d+ train_loss:{_FLOAT}.*train_time:{_FLOAT}ms step_avg:{_FLOAT}ms", line)
         if m:
             data["train_steps"].append(int(m.group(1)))
             data["train_loss"].append(float(m.group(2)))
             data["train_time_ms"].append(float(m.group(3)))
             data["step_avg_ms"].append(float(m.group(4)))
             # Parse NTP and CTP losses from training lines
-            m_ntp = re.search(r"ntp_loss:([\d.]+)", line)
+            m_ntp = re.search(rf"ntp_loss:{_FLOAT}", line)
             data["ntp_loss"].append(float(m_ntp.group(1)) if m_ntp else 0.0)
-            m_ctp = re.search(r"ctp_loss:([\d.]+)", line)
+            m_ctp = re.search(rf"ctp_loss:{_FLOAT}", line)
             data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else 0.0)
             # Parse pre-clip gradient norm
-            m_gn = re.search(r"grad_norm:([\d.]+)", line)
+            m_gn = re.search(rf"grad_norm:{_FLOAT}", line)
             data["grad_norm"].append(float(m_gn.group(1)) if m_gn else 0.0)
 
         # Validation steps
-        m = re.search(r"^step:(\d+)/\d+ val_loss:([\d.]+) val_bpb:([\d.]+)", line)
+        m = re.search(rf"^step:(\d+)/\d+ val_loss:{_FLOAT} val_bpb:{_FLOAT}", line)
         if m:
             data["val_steps"].append(int(m.group(1)))
             data["val_loss"].append(float(m.group(2)))
             data["val_bpb"].append(float(m.group(3)))
             # Parse individual DEQ/expert metrics
             for key, pat in [
-                ("deq_residual", r"deq_residual:([\d.]+)"),
-                ("deq_recon", r"deq_recon_err:([\d.]+)"),
-                ("deq_iter_conv", r"deq_iter_conv:([\d.]+)"),
-                ("expert_entropy", r"(?<!\w_)expert_entropy:([\d.]+)"),
-                ("expert_ortho", r"expert_ortho:([-\d.]+)"),
+                ("deq_residual", rf"deq_residual:{_FLOAT}"),
+                ("deq_recon", rf"deq_recon_err:{_FLOAT}"),
+                ("deq_iter_conv", rf"deq_iter_conv:{_FLOAT}"),
+                ("expert_entropy", rf"(?<!\w_)expert_entropy:{_FLOAT}"),
+                ("expert_ortho", rf"expert_ortho:{_FLOAT}"),
             ]:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else 0.0)
@@ -88,36 +93,25 @@ def parse_log(logpath: str) -> dict:
                 m_u = re.search(rf"{prefix}_usage:\[([\d.,]+)\]", line)
                 data[f"{prefix}_usage"].append(
                     [float(v) for v in m_u.group(1).split(",")] if m_u else [])
-                m_e = re.search(rf"{prefix}_entropy:([\d.]+)", line)
+                m_e = re.search(rf"{prefix}_entropy:{_FLOAT}", line)
                 data[f"{prefix}_entropy"].append(float(m_e.group(1)) if m_e else 0.0)
-                m_cv = re.search(rf"{prefix}_cv:([\d.]+)", line)
+                m_cv = re.search(rf"{prefix}_cv:{_FLOAT}", line)
                 data[f"{prefix}_cv"].append(float(m_cv.group(1)) if m_cv else 0.0)
-            # Per-component orthogonality and balance
-            for comp in ("mlp", "attn", "mos"):
-                m_o = re.search(rf"{comp}_ortho:([\d.]+)", line)
+            # Per-component orthogonality
+            for comp in ("mlp", "attn", "mos", "mos_ctp", "mos_ntp"):
+                m_o = re.search(rf"{comp}_ortho:{_FLOAT}", line)
                 data[f"{comp}_ortho"].append(float(m_o.group(1)) if m_o else 0.0)
-                m_b = re.search(rf"{comp}_bal:([\d.]+)", line)
-                data[f"{comp}_bal"].append(float(m_b.group(1)) if m_b else 0.0)
+            # No balance-loss keys are logged; use *_cv fields for balance diagnostics.
 
     return data
 
 
-def _usage_stats(usage_list):
-    """Compute min/max/mean/median per step from list of expert usage lists."""
-    mins, maxs, means, medians = [], [], [], []
-    for u in usage_list:
-        if u:
-            arr = np.array(u)
-            mins.append(arr.min())
-            maxs.append(arr.max())
-            means.append(arr.mean())
-            medians.append(np.median(arr))
-        else:
-            mins.append(0.0)
-            maxs.append(0.0)
-            means.append(0.0)
-            medians.append(0.0)
-    return mins, maxs, means, medians
+def usage_min_series(data: dict, key: str) -> list[float]:
+    """Return min expert usage per step for a usage list-of-lists key."""
+    out: list[float] = []
+    for u in data.get(key, []):
+        out.append(min(u) if u else 0.0)
+    return out
 
 
 def _plot_line(ax, b, c, b_key, c_key, b_steps, c_steps, title, ylabel=None):
@@ -137,40 +131,50 @@ def _plot_line(ax, b, c, b_key, c_key, b_steps, c_steps, title, ylabel=None):
     ax.grid(True, alpha=0.3)
 
 
-_COMP3_COLORS = {"mlp": COMP_COLORS["mlp"], "attn": COMP_COLORS["attn"],
-                  "mos": COMP_COLORS["mos_ctp"]}
+def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
+    """Plot multiple component series with Baseline=blue and Current=orange.
 
+    Components are encoded via markers for readability across all subplots.
+    """
+    any_plotted = False
+    for comp_label, b_values, c_values in component_series:
+        marker = COMP_MARKERS.get(comp_label, None)
+        if b_values is not None and any(v != 0 for v in b_values):
+            ax.plot(
+                b[steps_key],
+                b_values,
+                color=COLOR_BASELINE,
+                linestyle="-",
+                marker=marker,
+                markersize=3,
+                markevery=max(len(b[steps_key]) // 12, 1),
+                alpha=0.8,
+                label=f"Baseline {comp_label}",
+                linewidth=1.4,
+            )
+            any_plotted = True
+        if c_values is not None and any(v != 0 for v in c_values):
+            ax.plot(
+                c[steps_key],
+                c_values,
+                color=COLOR_CURRENT,
+                linestyle="--",
+                marker=marker,
+                markersize=3,
+                markevery=max(len(c[steps_key]) // 12, 1),
+                alpha=0.8,
+                label=f"Current {comp_label}",
+                linewidth=1.4,
+            )
+            any_plotted = True
 
-def _plot_per_component(ax, b, c, suffix, title):
-    """Plot per-component (mlp/attn/mos) metric with baseline solid, current dashed."""
-    for comp, color in _COMP3_COLORS.items():
-        key = f"{comp}_{suffix}"
-        if b.get(key) and any(v > 0 for v in b[key]):
-            ax.plot(b["val_steps"], b[key], color=color, linestyle="-", alpha=0.7,
-                   label=f"B {comp}", linewidth=1.5)
-        if c.get(key) and any(v > 0 for v in c[key]):
-            ax.plot(c["val_steps"], c[key], color=color, linestyle="--", alpha=0.7,
-                   label=f"C {comp}", linewidth=1.5)
     ax.set_title(title, fontsize=11)
     ax.set_xlabel("Step")
-    ax.legend(fontsize=7)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    if any_plotted:
+        ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.3)
-
-
-def _plot_usage_stats(ax, data, steps_key, usage_key, color, label_prefix, linestyle="-"):
-    """Plot expert usage as min-max shaded band + mean solid + median dashed."""
-    usage_list = data[usage_key]
-    if not usage_list or not any(u for u in usage_list):
-        return
-    mins, maxs, means, medians = _usage_stats(usage_list)
-    steps = data[steps_key]
-    if not steps:
-        return
-    ax.fill_between(steps, mins, maxs, color=color, alpha=0.15)
-    ax.plot(steps, means, color=color, linestyle=linestyle, alpha=0.8,
-            label=f"{label_prefix} mean", linewidth=1.5)
-    ax.plot(steps, medians, color=color, linestyle="--", alpha=0.5,
-            label=f"{label_prefix} median", linewidth=1.0)
 
 
 def plot_comparison(baseline_log: str, current_log: str, outdir: str):
@@ -209,64 +213,78 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str):
                "DEQ Iter Conv ||z_T - z_{T-1}||")
 
     # Row 4: Expert diagnostics (usage, entropy, orthogonality)
-    # Usage: min/max/mean/median per component (Attn, MLP, MoS CTP, MoS NTP)
+    # Usage: min per component (Attn, MLP, MoS CTP, MoS NTP)
     ax_usage = axes[3, 0]
-    usage_keys = [
-        ("mlp", "mlp_usage", COMP_COLORS["mlp"]),
-        ("attn", "attn_usage", COMP_COLORS["attn"]),
-        ("mos_ctp", "mos_ctp_usage", COMP_COLORS["mos_ctp"]),
-        ("mos_ntp", "mos_ntp_usage", COMP_COLORS["mos_ntp"]),
-    ]
-    has_any_usage = False
-    for comp_label, ukey, color in usage_keys:
-        for dataset, prefix, ls in [(b, f"B {comp_label}", "-"), (c, f"C {comp_label}", "-")]:
-            if any(u for u in dataset.get(ukey, [])):
-                has_any_usage = True
-                _plot_usage_stats(ax_usage, dataset, "val_steps", ukey, color, prefix, ls)
-
-    if not has_any_usage:
+    usage_series = []
+    for comp_label, key in [
+        ("mlp", "mlp_usage"),
+        ("attn", "attn_usage"),
+        ("mos_ctp", "mos_ctp_usage"),
+        ("mos_ntp", "mos_ntp_usage"),
+    ]:
+        usage_series.append((comp_label, usage_min_series(b, key), usage_min_series(c, key)))
+    if not any(any(v != 0 for v in s[1] + s[2]) for s in usage_series):
         # Fallback: combined expert_usage (older logs)
-        _plot_usage_stats(ax_usage, b, "val_steps", "expert_usage", COLOR_BASELINE, "B")
-        _plot_usage_stats(ax_usage, c, "val_steps", "expert_usage", COLOR_CURRENT, "C")
-
-    ax_usage.set_title("Expert Usage (min/max/mean/median per Component)", fontsize=11)
-    ax_usage.set_xlabel("Step")
-    ax_usage.set_ylabel("Usage fraction")
-    ax_usage.legend(fontsize=6, ncol=2)
-    ax_usage.grid(True, alpha=0.3)
+        usage_series = [("expert", usage_min_series(b, "expert_usage"), usage_min_series(c, "expert_usage"))]
+    _plot_components(
+        ax_usage,
+        b,
+        c,
+        "val_steps",
+        usage_series,
+        "Expert Usage (min per Component)",
+        ylabel="Min usage fraction",
+    )
 
     # Expert Entropy: per-component lines (Attn, MLP, MoS CTP, MoS NTP)
     ax_ent = axes[3, 1]
-    ent_keys = [
-        ("mlp", "mlp_entropy", COMP_COLORS["mlp"]),
-        ("attn", "attn_entropy", COMP_COLORS["attn"]),
-        ("mos_ctp", "mos_ctp_entropy", COMP_COLORS["mos_ctp"]),
-        ("mos_ntp", "mos_ntp_entropy", COMP_COLORS["mos_ntp"]),
-    ]
-    has_any_ent = False
-    for comp_label, ekey, color in ent_keys:
-        if b.get(ekey) and any(v > 0 for v in b[ekey]):
-            ax_ent.plot(b["val_steps"], b[ekey], color=color, linestyle="-", alpha=0.7,
-                       label=f"B {comp_label}", linewidth=1.5)
-            has_any_ent = True
-        if c.get(ekey) and any(v > 0 for v in c[ekey]):
-            ax_ent.plot(c["val_steps"], c[ekey], color=color, linestyle="--", alpha=0.7,
-                       label=f"C {comp_label}", linewidth=1.5)
-            has_any_ent = True
-    if not has_any_ent:
-        _plot_line(ax_ent, b, c, "expert_entropy", "expert_entropy", "val_steps", "val_steps", "")
-    ax_ent.set_title("Expert Entropy (per Component)", fontsize=11)
-    ax_ent.set_xlabel("Step")
-    ax_ent.legend(fontsize=7)
-    ax_ent.grid(True, alpha=0.3)
+    entropy_series = []
+    for comp_label, key in [
+        ("mlp", "mlp_entropy"),
+        ("attn", "attn_entropy"),
+        ("mos_ctp", "mos_ctp_entropy"),
+        ("mos_ntp", "mos_ntp_entropy"),
+    ]:
+        entropy_series.append((comp_label, b.get(key, []), c.get(key, [])))
+    if not any(any(v != 0 for v in s[1] + s[2]) for s in entropy_series):
+        # Fallback: combined expert_entropy (older logs)
+        entropy_series = [("expert", b.get("expert_entropy", []), c.get("expert_entropy", []))]
+    _plot_components(ax_ent, b, c, "val_steps", entropy_series, "Expert Entropy (per Component)", ylabel="Entropy")
 
-    # Expert Orthogonality: per-component lines
-    _plot_per_component(axes[3, 2], b, c, "ortho", "Expert Orthogonality (per Component)")
-    if not any(v > 0 for v in b.get("mlp_ortho", []) + c.get("mlp_ortho", [])):
-        _plot_line(axes[3, 2], b, c, "expert_ortho", "expert_ortho", "val_steps", "val_steps", "")
+    # Expert Orthogonality: per-component lines (formatted like entropy plot)
+    ax_ortho = axes[3, 2]
+    ortho_series = []
+    for comp_label, key in [
+        ("mlp", "mlp_ortho"),
+        ("attn", "attn_ortho"),
+        ("mos_ctp", "mos_ctp_ortho"),
+        ("mos_ntp", "mos_ntp_ortho"),
+    ]:
+        ortho_series.append((comp_label, b.get(key, []), c.get(key, [])))
+    if not any(any(v != 0 for v in s[1] + s[2]) for s in ortho_series):
+        # Fallback: legacy key (MLP-only)
+        ortho_series = [("mlp", b.get("expert_ortho", []), c.get("expert_ortho", []))]
+    _plot_components(
+        ax_ortho,
+        b,
+        c,
+        "val_steps",
+        ortho_series,
+        "Expert Orthogonality (per Component)",
+        ylabel="Mean |cos|",
+    )
 
-    # Row 5: Regularization losses (balance, conv_loss, spare)
-    _plot_per_component(axes[4, 0], b, c, "bal", "Balance Loss (per Component)")
+    # Row 5: Balance diagnostics (CV), conv_loss, spare
+    ax_bal = axes[4, 0]
+    bal_series = []
+    for comp_label, key in [
+        ("mlp", "mlp_cv"),
+        ("attn", "attn_cv"),
+        ("mos_ctp", "mos_ctp_cv"),
+        ("mos_ntp", "mos_ntp_cv"),
+    ]:
+        bal_series.append((comp_label, b.get(key, []), c.get(key, [])))
+    _plot_components(ax_bal, b, c, "val_steps", bal_series, "Expert Balance CV (per Component)", ylabel="CV")
 
     # Conv loss
     _plot_line(axes[4, 1], b, c, "ctp_loss", "ctp_loss", "train_steps", "train_steps",

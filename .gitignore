@@ -9,11 +9,14 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+# Local scratch / agent state
+.remember/
 # Autoresearch generated outputs
-results.tsv
-run.log
 final_model.*
 experiments/training_logs/
 experiments/weights/
 experiments/*.png
 experiments/__pycache__/
+# Local experiment artifacts (never commit)
+experiments/test_runs/
+experiments/archive/

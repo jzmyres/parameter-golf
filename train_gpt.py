@@ -596,6 +596,7 @@ class SoftDenseRouter(nn.Module):
         self._balance_loss = None
         self._sparsity_loss = None
         self._expert_usage = None
+        self._expert_gates = None
         self._expert_entropy = None
         self._expert_balance_cv = None
 
@@ -614,11 +615,32 @@ class SoftDenseRouter(nn.Module):
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
             with torch.no_grad():
-                mean_alpha = alpha.mean(dim=tuple(range(alpha.ndim - 1)))
-                self._expert_usage = mean_alpha.float().cpu().tolist()
-                per_token_ent = -(alpha * (alpha + 1e-8).log()).sum(-1)
-                self._expert_entropy = per_token_ent.mean().item()
-                self._expert_balance_cv = (mean_alpha.std() / mean_alpha.mean()).item()
+                # Avoid host-transfer overhead on non-master ranks during DDP eval.
+                # These diagnostics are only used for logging/plotting.
+                do_diag = True
+                if dist.is_available() and dist.is_initialized():
+                    do_diag = dist.get_rank() == 0
+                if do_diag:
+                    # "Actual usage" after the post-softmax sigmoid gates: alpha * gate.
+                    # This is the effective expert weight applied to expert outputs.
+                    reduce_dims = tuple(range(route_weights.ndim - 1))
+                    mean_mass = route_weights.mean(dim=reduce_dims)
+                    self._expert_usage = mean_mass.float().cpu().tolist()
+                    self._expert_gates = gates.float().cpu().tolist()
+
+                    # Diagnostics of the *relative* post-gate distribution:
+                    # normalize by per-token total routed mass (can be < 1 due to gates).
+                    w_sum = route_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    w_norm = route_weights / w_sum
+                    per_token_ent = -(w_norm * (w_norm + 1e-8).log()).sum(-1)
+                    self._expert_entropy = per_token_ent.mean().item()
+                    mean_share = w_norm.mean(dim=reduce_dims)
+                    self._expert_balance_cv = (mean_share.std() / mean_share.mean().clamp_min(1e-8)).item()
+                else:
+                    self._expert_usage = None
+                    self._expert_gates = None
+                    self._expert_entropy = None
+                    self._expert_balance_cv = None
         return route_weights
 
 
@@ -713,6 +735,23 @@ class CausalSelfAttention(nn.Module):
     def attn_gate(self) -> Tensor:
         # Backwards-compat for older tests/diagnostics.
         return self.gate_bias
+
+    def get_expert_diagnostics(self) -> dict:
+        """Bridge to router diagnostics + orthogonality from expert weights."""
+        diag: dict = {}
+        r = self.attn_router
+        if r._expert_usage is not None:
+            diag["usage"] = r._expert_usage
+            diag["entropy"] = r._expert_entropy
+            diag["balance_cv"] = r._expert_balance_cv
+        if self.num_experts >= 2:
+            with torch.no_grad():
+                groups = self.expert_out.float().view(self.num_experts, -1)
+                groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
+                cos = groups @ groups.T
+                mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=cos.device)
+                diag["ortho_cos_sim"] = cos[mask].abs().mean().item()
+        return diag
 
 
 class MLP(nn.Module):
@@ -867,6 +906,27 @@ class MoSHead(nn.Module):
         """
         pass
 
+    def get_head_orthogonality(self, head: str) -> float:
+        """Average |cosine similarity| between experts within a head's A matrices.
+
+        Head experts are the shared experts plus that head's specialized experts.
+        """
+        if head not in ("ctp", "ntp"):
+            raise ValueError(f"head must be 'ctp' or 'ntp', got {head!r}")
+        if self.num_shared + self.num_specialized < 2:
+            return 0.0
+        A_spec = self.A_ctp if head == "ctp" else self.A_ntp
+        with torch.no_grad():
+            groups = (
+                torch.cat([self.A_shared, A_spec], dim=0)
+                .float()
+                .reshape(self.num_shared + self.num_specialized, -1)
+            )
+            groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
+            cos = groups @ groups.T
+            mask = ~torch.eye(groups.shape[0], dtype=torch.bool, device=cos.device)
+            return cos[mask].abs().mean().item()
+
     def _fsq(self, x: Tensor) -> Tensor:
         return _fsq_ste(x, self.fsq_levels, self.training)
 
@@ -912,15 +972,27 @@ class MoSHead(nn.Module):
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
             with torch.no_grad():
-                for alpha_soft, usage_attr, ent_attr, cv_attr in [
-                    (alpha_d, '_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
-                    (alpha_n, '_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
-                ]:
-                    mean_a = alpha_soft.mean(dim=0)
-                    setattr(self, usage_attr, mean_a.float().cpu().tolist())
-                    per_token_ent = -(alpha_soft * (alpha_soft + 1e-8).log()).sum(-1)
-                    setattr(self, ent_attr, per_token_ent.mean().item())
-                    setattr(self, cv_attr, (mean_a.std() / mean_a.mean()).item())
+                do_diag = True
+                if dist.is_available() and dist.is_initialized():
+                    do_diag = dist.get_rank() == 0
+                if do_diag:
+                    for alpha_soft, usage_attr, ent_attr, cv_attr in [
+                        (alpha_d, '_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
+                        (alpha_n, '_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
+                    ]:
+                        mean_a = alpha_soft.mean(dim=0)
+                        setattr(self, usage_attr, mean_a.float().cpu().tolist())
+                        per_token_ent = -(alpha_soft * (alpha_soft + 1e-8).log()).sum(-1)
+                        setattr(self, ent_attr, per_token_ent.mean().item())
+                        setattr(self, cv_attr, (mean_a.std() / mean_a.mean()).item())
+                else:
+                    for usage_attr, ent_attr, cv_attr in [
+                        ('_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
+                        ('_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
+                    ]:
+                        setattr(self, usage_attr, None)
+                        setattr(self, ent_attr, None)
+                        setattr(self, cv_attr, None)
 
         return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
 
@@ -1716,7 +1788,7 @@ def main() -> None:
                 deq_info += f" deq_iter_conv_rel:{base_model._deq_iter_convergence_rel:.6f}"
             # Expert diagnostics — per-component (MLP, Attention, MoS)
             expert_info = ""
-            if hasattr(base_model, 'shared_block'):
+            if master_process and hasattr(base_model, 'shared_block'):
                 for comp_name, comp in [("mlp", base_model.shared_block.mlp),
                                          ("attn", base_model.shared_block.attn)]:
                     router = getattr(comp, f'{comp_name}_router', None)
@@ -1725,23 +1797,44 @@ def main() -> None:
                     if router is not None and router._expert_usage is not None:
                         usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
                         expert_info += f" {comp_name}_usage:[{usage_str}]"
-                        expert_info += f" {comp_name}_entropy:{router._expert_entropy:.4f}"
-                        expert_info += f" {comp_name}_cv:{router._expert_balance_cv:.4f}"
+                        if router._expert_entropy is not None:
+                            expert_info += f" {comp_name}_entropy:{router._expert_entropy:.4f}"
+                        if router._expert_balance_cv is not None:
+                            expert_info += f" {comp_name}_cv:{router._expert_balance_cv:.4f}"
+                        gates = getattr(router, "_expert_gates", None)
+                        if gates is not None:
+                            gates_str = ",".join(f"{g:.3f}" for g in gates)
+                            expert_info += f" {comp_name}_gates:[{gates_str}]"
                 # Orthogonality (MLP)
                 mlp = base_model.shared_block.mlp
                 if hasattr(mlp, 'get_expert_diagnostics'):
                     diag = mlp.get_expert_diagnostics()
                     if 'ortho_cos_sim' in diag:
+                        expert_info += f" mlp_ortho:{diag['ortho_cos_sim']:.4f}"
+                        # Backward-compat: older plots look for expert_ortho
                         expert_info += f" expert_ortho:{diag['ortho_cos_sim']:.4f}"
+                # Orthogonality (Attention)
+                attn = base_model.shared_block.attn
+                if hasattr(attn, 'get_expert_diagnostics'):
+                    diag = attn.get_expert_diagnostics()
+                    if 'ortho_cos_sim' in diag:
+                        expert_info += f" attn_ortho:{diag['ortho_cos_sim']:.4f}"
                 # MoS diagnostics (CTP + NTP routing)
                 mos = base_model.mos_head
+                if hasattr(mos, 'get_head_orthogonality'):
+                    expert_info += f" mos_ctp_ortho:{mos.get_head_orthogonality('ctp'):.4f}"
+                    expert_info += f" mos_ntp_ortho:{mos.get_head_orthogonality('ntp'):.4f}"
                 for head_name in ["ctp", "ntp"]:
                     usage = getattr(mos, f'_{head_name}_expert_usage', None)
                     if usage is not None:
                         usage_str = ",".join(f"{u:.3f}" for u in usage)
                         expert_info += f" mos_{head_name}_usage:[{usage_str}]"
-                        expert_info += f" mos_{head_name}_entropy:{getattr(mos, f'_{head_name}_expert_entropy', 0):.4f}"
-                        expert_info += f" mos_{head_name}_cv:{getattr(mos, f'_{head_name}_expert_balance_cv', 0):.4f}"
+                        ent = getattr(mos, f'_{head_name}_expert_entropy', None)
+                        cv = getattr(mos, f'_{head_name}_expert_balance_cv', None)
+                        if ent is not None:
+                            expert_info += f" mos_{head_name}_entropy:{ent:.4f}"
+                        if cv is not None:
+                            expert_info += f" mos_{head_name}_cv:{cv:.4f}"
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
