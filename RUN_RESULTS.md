@@ -35,4 +35,4 @@ After the run:
 ## Plots
 
 - Baseline vs Current: `experiments/metrics_comparison.png`
-- Baseline vs Previous: `experiments/metrics_previous.png`
+`experiments/metrics_comparison.png` is the only comparison plot.
