@@ -314,6 +314,25 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     return tokens[: usable + 1]
 
 
+def _eval_seq_bounds(total_seqs: int, eval_batch_seqs: int, rank: int, world_size: int, *, full_eval: bool) -> tuple[int, int, int]:
+    """Return (seq_start, seq_end, global_eval_seqs) for validation.
+
+    - If `full_eval`, evaluate the entire validation set.
+    - Otherwise, evaluate a fixed prefix of `eval_batch_seqs` sequences (for fast, comparable curves).
+    """
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if total_seqs < 0:
+        raise ValueError(f"total_seqs must be non-negative, got {total_seqs}")
+    if full_eval or eval_batch_seqs <= 0:
+        global_eval_seqs = total_seqs
+    else:
+        global_eval_seqs = min(total_seqs, int(eval_batch_seqs))
+    seq_start = (global_eval_seqs * rank) // world_size
+    seq_end = (global_eval_seqs * (rank + 1)) // world_size
+    return int(seq_start), int(seq_end), int(global_eval_seqs)
+
+
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -325,6 +344,8 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    *,
+    full_eval: bool,
 ) -> tuple[float, float]:
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
@@ -335,8 +356,9 @@ def eval_val(
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    # Fast in-training validation: evaluate a fixed, small number of sequences for a smooth curve.
+    # Full validation (entire set) is reserved for the final step.
+    seq_start, seq_end, _ = _eval_seq_bounds(total_seqs, args.eval_batch_seqs, rank, world_size, full_eval=full_eval)
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -2227,11 +2249,13 @@ def main() -> None:
             val_loss, val_bpb = eval_val(
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                full_eval=last_step,
             )
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, include_gates=True, step=step) if master_process else ""
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"val_mode:{'full' if last_step else 'fast'} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
                 f"{deq_info}{expert_info}"
             )
@@ -2409,6 +2433,7 @@ def main() -> None:
         q_val_loss, q_val_bpb = eval_val(
             args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            full_eval=True,
         )
     torch.cuda.synchronize()
     log0(
