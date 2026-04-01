@@ -118,13 +118,9 @@ class Hyperparameters:
     attn_balance_mult = 10.0
     mlp_balance_mult = 1.0
     bal_loss_coef = 1.0
-    # Orthogonality regularization experiment:
-    # - Disable output-space ortho penalty (still tracked as a hard-constraint metric).
-    # - Use a cheap weight-space proxy penalty to see if it transfers.
-    mos_ortho_out_coef = 0.0
-    attn_ortho_out_coef = 0.0
-    mlp_ortho_out_coef = 0.0
-    ortho_w_coef = 0.05
+    mos_ortho_out_coef = 0.05
+    attn_ortho_out_coef = 0.05
+    mlp_ortho_out_coef = 0.05
     conv_loss_coef = 0.0
 
     deq_backward = "autograd"  # {autograd, revdeq}
@@ -169,7 +165,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--mos-ortho-out-coef", type=float, default=None)
     p.add_argument("--attn-ortho-out-coef", type=float, default=None)
     p.add_argument("--mlp-ortho-out-coef", type=float, default=None)
-    p.add_argument("--ortho-w-coef", type=float, default=None)
     p.add_argument("--conv-loss-coef", type=float, default=None)
     p.add_argument("--bigram-vocab-size", type=int, default=None)
     p.add_argument("--bigram-dim", type=int, default=None)
@@ -1494,7 +1489,6 @@ class GPT(nn.Module):
         mos_ortho_out_coef: float = 0.05,
         attn_ortho_out_coef: float = 0.05,
         mlp_ortho_out_coef: float = 0.05,
-        ortho_w_coef: float = 0.0,
         conv_loss_coef: float = 0.0,
         deq_backward: str = "autograd",
     ):
@@ -1525,7 +1519,6 @@ class GPT(nn.Module):
         self.mos_ortho_out_coef = float(mos_ortho_out_coef)
         self.attn_ortho_out_coef = float(attn_ortho_out_coef)
         self.mlp_ortho_out_coef = float(mlp_ortho_out_coef)
-        self.ortho_w_coef = float(ortho_w_coef)
         self.conv_loss_coef = float(conv_loss_coef)
         if deq_backward not in ("autograd", "revdeq"):
             raise ValueError(f"deq_backward must be autograd|revdeq, got {deq_backward!r}")
@@ -1742,45 +1735,6 @@ class GPT(nn.Module):
         spar = spar + getattr(self.mos_head, '_sparsity_loss', zero)
         return bal, spar, ortho
 
-    def _weight_space_ortho_loss(self, device: torch.device) -> Tensor:
-        """Cheap proxy orthogonality penalty computed in weight space (no DEQ extra pass)."""
-        parts: list[Tensor] = []
-        # Attn experts
-        attn = self.shared_block.attn
-        if getattr(attn, "num_experts", 0) >= 2:
-            w = torch.cat(
-                [
-                    attn.expert_proj.reshape(attn.num_experts, -1),
-                    attn.expert_out.reshape(attn.num_experts, -1),
-                ],
-                dim=-1,
-            ).float()
-            parts.append(mean_abs_offdiag_cosine(w))
-        # MLP experts
-        mlp = self.shared_block.mlp
-        if getattr(mlp, "num_experts", 0) >= 2:
-            w = torch.cat(
-                [
-                    mlp.expert_gate.reshape(mlp.num_experts, -1),
-                    mlp.expert_fc.reshape(mlp.num_experts, -1),
-                    mlp.expert_down.reshape(mlp.num_experts, -1),
-                ],
-                dim=-1,
-            ).float()
-            parts.append(mean_abs_offdiag_cosine(w))
-        # MoS CTP/NTP experts (A matrices define per-expert projections; B is shared per head).
-        mos = self.mos_head
-        e_mos = int(getattr(mos, "num_shared", 0) + getattr(mos, "num_specialized", 0))
-        if e_mos >= 2:
-            w_ctp = torch.cat([mos.A_shared, mos.A_ctp], dim=0).reshape(e_mos, -1).float()
-            w_ntp = torch.cat([mos.A_shared, mos.A_ntp], dim=0).reshape(e_mos, -1).float()
-            parts.append(mean_abs_offdiag_cosine(w_ctp))
-            parts.append(mean_abs_offdiag_cosine(w_ntp))
-        if not parts:
-            return torch.tensor(0.0, device=device)
-        out = torch.stack([p.to(device=device) for p in parts]).mean()
-        return out
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
         log_p_ctp, log_p_ntp = self.mos_head(x)
@@ -1810,9 +1764,6 @@ class GPT(nn.Module):
                 attn_ortho_loss = a.to(device=ntp_loss.device)
             if isinstance(m, torch.Tensor):
                 mlp_ortho_loss = m.to(device=ntp_loss.device)
-        ortho_w_loss = torch.tensor(0.0, device=ntp_loss.device)
-        if self.ortho_w_coef > 0.0:
-            ortho_w_loss = self._weight_space_ortho_loss(ntp_loss.device)
         return (
             ntp_loss
             + ctp_weight * ctp_loss
@@ -1822,7 +1773,6 @@ class GPT(nn.Module):
             + self.mos_ortho_out_coef * mos_ortho_loss
             + self.attn_ortho_out_coef * attn_ortho_loss
             + self.mlp_ortho_out_coef * mlp_ortho_loss
-            + self.ortho_w_coef * ortho_w_loss
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -2045,7 +1995,6 @@ def main() -> None:
         mos_ortho_out_coef=args.mos_ortho_out_coef,
         attn_ortho_out_coef=args.attn_ortho_out_coef,
         mlp_ortho_out_coef=args.mlp_ortho_out_coef,
-        ortho_w_coef=args.ortho_w_coef,
         conv_loss_coef=args.conv_loss_coef,
         deq_backward=args.deq_backward,
     ).to(device).bfloat16()
@@ -2202,52 +2151,16 @@ def main() -> None:
                     parts.append(f"mlp_ortho:{diag['ortho_cos_sim']:.4f}")
                     parts.append(f"expert_ortho:{diag['ortho_cos_sim']:.4f}")
             # Weight-space orthogonality proxy (alignment check with output-space).
-            try:
-                with torch.no_grad():
-                    w = torch.cat(
-                        [
-                            mlp.expert_gate.reshape(mlp.num_experts, -1),
-                            mlp.expert_fc.reshape(mlp.num_experts, -1),
-                            mlp.expert_down.reshape(mlp.num_experts, -1),
-                        ],
-                        dim=-1,
-                    ).float()
-                    parts.append(f"mlp_ortho_w:{float(mean_abs_offdiag_cosine(w).item()):.4f}")
-            except Exception:
-                pass
             attn = m.shared_block.attn
             if hasattr(attn, "get_expert_diagnostics"):
                 diag = attn.get_expert_diagnostics()
                 if "ortho_cos_sim" in diag:
                     parts.append(f"attn_ortho:{diag['ortho_cos_sim']:.4f}")
-            try:
-                with torch.no_grad():
-                    w = torch.cat(
-                        [
-                            attn.expert_proj.reshape(attn.num_experts, -1),
-                            attn.expert_out.reshape(attn.num_experts, -1),
-                        ],
-                        dim=-1,
-                    ).float()
-                    parts.append(f"attn_ortho_w:{float(mean_abs_offdiag_cosine(w).item()):.4f}")
-            except Exception:
-                pass
-
         if hasattr(m, "mos_head"):
             mos = m.mos_head
             if hasattr(mos, "get_head_orthogonality"):
                 parts.append(f"mos_ctp_ortho:{mos.get_head_orthogonality('ctp'):.4f}")
                 parts.append(f"mos_ntp_ortho:{mos.get_head_orthogonality('ntp'):.4f}")
-            try:
-                with torch.no_grad():
-                    e_mos = int(getattr(mos, "num_shared", 0) + getattr(mos, "num_specialized", 0))
-                    if e_mos >= 2:
-                        w_ctp = torch.cat([mos.A_shared, mos.A_ctp], dim=0).reshape(e_mos, -1).float()
-                        w_ntp = torch.cat([mos.A_shared, mos.A_ntp], dim=0).reshape(e_mos, -1).float()
-                        parts.append(f"mos_ctp_ortho_w:{float(mean_abs_offdiag_cosine(w_ctp).item()):.4f}")
-                        parts.append(f"mos_ntp_ortho_w:{float(mean_abs_offdiag_cosine(w_ntp).item()):.4f}")
-            except Exception:
-                pass
             mos_diag_ok = (not require_step_match) or (getattr(mos, "_diag_step", None) == step)
             for head_name in ["ctp", "ntp"]:
                 usage = getattr(mos, f"_{head_name}_expert_usage", None)

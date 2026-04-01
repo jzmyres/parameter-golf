@@ -10,7 +10,6 @@ Shows full training curves for ALL diagnostic metrics:
 
 All subplots use consistent colors: blue for Baseline, orange for Current.
 Components (mlp/attn/mos_ctp/mos_ntp) are encoded with line styles.
-Orthogonality is shown in two spaces: output-space (main constraint) and weight-space (proxy).
 """
 import re
 import sys
@@ -53,13 +52,12 @@ def parse_log(logpath: str) -> dict:
            for s in ("usage", "entropy", "cv")},
         # Per-component orthogonality
         "mlp_ortho": [], "attn_ortho": [], "mos_ctp_ortho": [], "mos_ntp_ortho": [], "mos_ortho": [],
-        "mlp_ortho_w": [], "attn_ortho_w": [], "mos_ctp_ortho_w": [], "mos_ntp_ortho_w": [],
         # Train-time diagnostics (dense, logged alongside train_loss when enabled)
         "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
         **{f"{p}_{s}_train": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
            for s in ("usage", "entropy", "cv")},
         "mlp_ortho_train": [], "attn_ortho_train": [], "mos_ctp_ortho_train": [], "mos_ntp_ortho_train": [],
-        "mlp_ortho_w_train": [], "attn_ortho_w_train": [], "mos_ctp_ortho_w_train": [], "mos_ntp_ortho_w_train": [],
+        # (no weight-space orthogonality keys; enforce/plot output-space only)
         # Final post-quant scoring metric (what the submission is scored on)
         "final_postquant_val_loss": None,
         "final_postquant_val_bpb": None,
@@ -104,10 +102,6 @@ def parse_log(logpath: str) -> dict:
                 ("mos_ntp_cv_train", rf"mos_ntp_cv:{_FLOAT}"),
                 ("mlp_ortho_train", rf"mlp_ortho:{_FLOAT}"),
                 ("attn_ortho_train", rf"attn_ortho:{_FLOAT}"),
-                ("mlp_ortho_w_train", rf"mlp_ortho_w:{_FLOAT}"),
-                ("attn_ortho_w_train", rf"attn_ortho_w:{_FLOAT}"),
-                ("mos_ctp_ortho_w_train", rf"mos_ctp_ortho_w:{_FLOAT}"),
-                ("mos_ntp_ortho_w_train", rf"mos_ntp_ortho_w:{_FLOAT}"),
                 ("mos_ctp_ortho_train", rf"mos_ctp_ortho:{_FLOAT}"),
                 ("mos_ntp_ortho_train", rf"mos_ntp_ortho:{_FLOAT}"),
             ]:
@@ -164,9 +158,6 @@ def parse_log(logpath: str) -> dict:
             for comp in ("mlp", "attn", "mos", "mos_ctp", "mos_ntp"):
                 m_o = re.search(rf"{comp}_ortho:{_FLOAT}", line)
                 data[f"{comp}_ortho"].append(float(m_o.group(1)) if m_o else math.nan)
-            for comp in ("mlp", "attn", "mos_ctp", "mos_ntp"):
-                m_o = re.search(rf"{comp}_ortho_w:{_FLOAT}", line)
-                data[f"{comp}_ortho_w"].append(float(m_o.group(1)) if m_o else math.nan)
             # No balance-loss keys are logged; use *_cv fields for balance diagnostics.
 
     return data
@@ -512,38 +503,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         "Convergence Loss (from train)",
     )
 
-    # Weight-space orthogonality subplot (proxy; sanity-check alignment with output-space).
-    ax_ortho_w = axes[4, 2]
-    steps_key, _ = _prefer_train("mlp_ortho_w_train", "mlp_ortho_w")
-    w_series = []
-    for comp_label, key in [
-        ("mlp", "mlp_ortho_w_train" if steps_key == "train_steps" else "mlp_ortho_w"),
-        ("attn", "attn_ortho_w_train" if steps_key == "train_steps" else "attn_ortho_w"),
-        ("mos_ctp", "mos_ctp_ortho_w_train" if steps_key == "train_steps" else "mos_ctp_ortho_w"),
-        ("mos_ntp", "mos_ntp_ortho_w_train" if steps_key == "train_steps" else "mos_ntp_ortho_w"),
-    ]:
-        w_series.append((comp_label, b.get(key, []), c.get(key, [])))
-    _plot_components(
-        ax_ortho_w,
-        b,
-        c,
-        steps_key,
-        w_series,
-        "Weight-Space Orthogonality (per Component)",
-        ylabel="Mean |cos|",
-    )
-    all_w = []
-    for _, bv, cv in w_series:
-        all_w.extend([v for v in (bv or []) if _is_finite(v)])
-        all_w.extend([v for v in (cv or []) if _is_finite(v)])
-    hi = max(all_w) if all_w else 0.01
-    ax_ortho_w.set_ylim(0.0, max(0.01, hi * 1.2))
-
-    # Row 6: Val BPB bars + summary text
-    axes[5, 2].axis("off")
-
     # Pre vs post-quant val_bpb (post-quant is the scored metric)
-    ax_postq = axes[5, 0]
+    ax_postq = axes[4, 2]
     ax_postq.set_title("Val BPB (Pre vs Post-Quant)", fontsize=11)
     b_pre = b["val_bpb"][-1] if b.get("val_bpb") else None
     c_pre = c["val_bpb"][-1] if c.get("val_bpb") else None
@@ -597,6 +558,10 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_postq.set_xticks([])
         ax_postq.set_yticks([])
 
+    # Row 6: summary text only
+    axes[5, 0].axis("off")
+    axes[5, 2].axis("off")
+
     summary_lines = []
     if b["val_bpb"] and c["val_bpb"]:
         delta = c["val_bpb"][-1] - b["val_bpb"][-1]
@@ -630,11 +595,6 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         summary_lines.append(f"MLP ortho:  {b['mlp_ortho'][-1]:.4f} vs {c['mlp_ortho'][-1]:.4f}")
     if b.get("attn_ortho") and c.get("attn_ortho"):
         summary_lines.append(f"Attn ortho: {b['attn_ortho'][-1]:.4f} vs {c['attn_ortho'][-1]:.4f}")
-    if b.get("mlp_ortho_w") and c.get("mlp_ortho_w"):
-        summary_lines.append(f"MLP ortho_w:{b['mlp_ortho_w'][-1]:.4f} vs {c['mlp_ortho_w'][-1]:.4f}")
-    if b.get("attn_ortho_w") and c.get("attn_ortho_w"):
-        summary_lines.append(f"Attn ortho_w:{b['attn_ortho_w'][-1]:.4f} vs {c['attn_ortho_w'][-1]:.4f}")
-
     summary = "\n".join(summary_lines)
     axes[5, 1].text(0.0, 0.5, summary, fontsize=11, family="monospace",
                    verticalalignment="center", transform=axes[5, 1].transAxes)
@@ -659,19 +619,6 @@ if __name__ == "__main__":
         print("No current log — using baseline for both")
         current = baseline
 
-    # Main plot: baseline vs current
-    ok_main = plot_comparison(str(baseline), str(current), str(expdir))
-
-    # If previous.log exists, also generate baseline vs previous for comparison
-    previous = logdir / "previous.log"
-    if previous.exists():
-        ok_prev = plot_comparison(str(baseline), str(previous), str(expdir))
-        if ok_prev and (expdir / "metrics_comparison.png").exists():
-            import shutil
-            shutil.move(str(expdir / "metrics_comparison.png"), str(expdir / "metrics_previous.png"))
-            print("Saved metrics_previous.png (baseline vs previous iteration)")
-        # Re-generate the main plot (baseline vs current)
-        ok_main = plot_comparison(str(baseline), str(current), str(expdir)) or ok_main
-
-    if not ok_main:
+    ok = plot_comparison(str(baseline), str(current), str(expdir))
+    if not ok:
         sys.exit(1)

@@ -6,7 +6,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Track and compare the *scored* metric (post-quant) separately from any in-training validation.
 - Always report both the final in-training validation and the final post-quant result.
 - Name metrics by what they actually measure; don’t reuse a proxy metric under a different label.
-- Regularize in the same space you diagnose (e.g. output-space diversity vs weight-space proxies).
+- Prefer enforcing hard constraints in the space you diagnose; remove proxy regularizers if they don’t transfer.
 - Treat expert health metrics as non-negotiable guardrails; optimize everything else inside that envelope.
 
 ## Logging
