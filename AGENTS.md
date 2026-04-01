@@ -37,7 +37,7 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 
 ### Loop (run indefinitely)
 0. Read `EXPERIENCE.md` — apply accumulated guardrails
-0b. After each fix, add a short, general lesson to `EXPERIENCE.md`
+0b. After each fix, add **one short, general** lesson to `EXPERIENCE.md` (wisdom, not run-specific details)
 1. `git log --oneline -20` + read `results.tsv` — understand history
 2. Plan ONE focused change (architecture, hyperparameters, or training)
 3. Write tests first (TDD)

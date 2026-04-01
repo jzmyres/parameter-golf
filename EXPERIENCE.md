@@ -24,6 +24,8 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Make plotting resilient to partial runs (missing finals) so early debugging doesn’t break.
 - For near-zero diagnostics, log/plot with enough precision (e.g. scientific notation + log scale).
 - Diagnostics should run in consistent precision; mixed-precision drift can look like “instability”.
+- Prefer line styles (not point clouds) for multi-component time series, and always include a legend for the encoding.
+- When adding new logged keys, update the parser and add a small unit test so plots don’t silently degrade.
 
 ## RevDEQ
 - FP64 add/sub is a *reversibility* tool (reconstruction accuracy), not a default training requirement.

@@ -123,6 +123,10 @@ class Hyperparameters:
     mlp_ortho_out_coef = 0.05
 
     deq_backward = "autograd"  # {autograd, revdeq}
+    deq_k_jitter = True
+    deq_k_min = 2
+    deq_k_max = 6
+    deq_k_eval = 6
 
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = 32
@@ -169,6 +173,10 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--swa-start-frac", type=float, default=None)
     p.add_argument("--swa-every", type=int, default=None)
     p.add_argument("--deq-backward", type=str, default=None, choices=["autograd", "revdeq"])
+    p.add_argument("--deq-k-jitter", type=int, default=None, help="1/0; sample K per optimizer step")
+    p.add_argument("--deq-k-min", type=int, default=None)
+    p.add_argument("--deq-k-max", type=int, default=None)
+    p.add_argument("--deq-k-eval", type=int, default=None)
     ns, unknown = p.parse_known_args(argv)
     if unknown:
         raise SystemExit(f"Unknown args: {unknown}")
@@ -177,6 +185,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         if v is not None:
             key = k.replace("-", "_")
             if key == "swa_enabled":
+                out[key] = bool(int(v))
+            elif key == "deq_k_jitter":
                 out[key] = bool(int(v))
             else:
                 out[key] = v
@@ -331,6 +341,9 @@ def eval_val(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
     model.eval()
+    base_m = model.module if hasattr(model, "module") else model
+    prev_k = getattr(base_m, "_deq_k_override", None)
+    base_m._deq_k_override = int(getattr(args, "deq_k_eval", base_m.num_layers))
     with torch.inference_mode():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
@@ -342,7 +355,6 @@ def eval_val(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 _ = model(x, y)
             # Use NTP-only loss for val (exclude CTP and convergence terms)
-            base_m = model.module if hasattr(model, 'module') else model
             batch_loss = torch.tensor(base_m._ntp_loss, device=device)
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -359,6 +371,13 @@ def eval_val(
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    if prev_k is None:
+        try:
+            delattr(base_m, "_deq_k_override")
+        except Exception:
+            base_m._deq_k_override = 0
+    else:
+        base_m._deq_k_override = prev_k
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
@@ -1541,11 +1560,12 @@ class GPT(nn.Module):
         """
         beta = self.deq_beta
         dtype = x0.dtype
+        K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
 
         if self.training and self.deq_backward == "revdeq":
             params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
             z, z_prev = RevDEQFunction.apply(
-                self.shared_block, x0, z_init, beta, self.num_layers, *params
+                self.shared_block, x0, z_init, beta, K, *params
             )
             return z, z_prev, None, None
 
@@ -1555,7 +1575,7 @@ class GPT(nn.Module):
         z_acc = z_init.to(acc_dtype)
         z = z_init
         z_prev = z
-        for _ in range(self.num_layers):
+        for _ in range(K):
             z_prev = z
             f_z = self.shared_block(z, x0)
             y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
@@ -1594,6 +1614,7 @@ class GPT(nn.Module):
             else:
                 x0_refined = x0
 
+            self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
             z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
         # Convergence loss: ||z_T - z_{T-1}||² / ||z_T||² (relative, scale-invariant)
@@ -1900,6 +1921,7 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    k_rng = random.Random(args.seed + 12345)
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -2046,6 +2068,8 @@ def main() -> None:
 
     def format_deq_info(m: nn.Module) -> str:
         parts: list[str] = []
+        if hasattr(m, "_deq_k_last"):
+            parts.append(f"deq_k:{int(m._deq_k_last)}")
         if hasattr(m, "_deq_residuals") and getattr(m, "_deq_residuals"):
             parts.append(f"deq_residual:{m._deq_residuals[-1]:.6f}")
         recon = getattr(m, "_deq_recon_error", None)
@@ -2157,6 +2181,13 @@ def main() -> None:
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
+            if args.deq_k_jitter:
+                k = k_rng.randint(args.deq_k_min, args.deq_k_max)
+                if distributed:
+                    k_t = torch.tensor([k], device=device, dtype=torch.int64)
+                    dist.broadcast(k_t, src=0)
+                    k = int(k_t.item())
+                base_model._deq_k_override = int(k)
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -2227,6 +2258,13 @@ def main() -> None:
             args.train_log_every > 0
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
+        if args.deq_k_jitter:
+            k = k_rng.randint(args.deq_k_min, args.deq_k_max) if rank == 0 else 0
+            if distributed:
+                k_t = torch.tensor([k], device=device, dtype=torch.int64)
+                dist.broadcast(k_t, src=0)
+                k = int(k_t.item())
+            base_model._deq_k_override = int(k)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1

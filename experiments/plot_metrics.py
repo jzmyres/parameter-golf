@@ -10,6 +10,7 @@ Shows full training curves for ALL diagnostic metrics:
 
 All subplots use consistent colors: blue for Baseline, orange for Current.
 Components (mlp/attn/mos_ctp/mos_ntp) are encoded with line styles.
+Orthogonality is shown in two spaces: output-space (main constraint) and weight-space (proxy).
 """
 import re
 import sys
@@ -257,7 +258,7 @@ def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
                         color=COLOR_BASELINE,
                         linestyle=linestyle,
                         alpha=0.8,
-                        linewidth=2.0,
+                        linewidth=2.3,
                     )
                 any_plotted = True
         if c_values is not None and _has_any_finite(c_values):
@@ -278,7 +279,7 @@ def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
                         color=COLOR_CURRENT,
                         linestyle=linestyle,
                         alpha=0.8,
-                        linewidth=2.0,
+                        linewidth=2.3,
                     )
                 any_plotted = True
 
@@ -291,6 +292,29 @@ def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
         ax.set_xticks([])
         ax.set_yticks([])
     ax.grid(True, alpha=0.3)
+
+    if any_plotted:
+        try:
+            from matplotlib.lines import Line2D
+        except Exception:
+            return
+        # Two legends: colors (baseline/current) + line styles (components).
+        color_handles = [
+            Line2D([0], [0], color=COLOR_BASELINE, lw=2.5, label="Baseline"),
+            Line2D([0], [0], color=COLOR_CURRENT, lw=2.5, label="Current"),
+        ]
+        style_handles = []
+        for comp_label, _, _ in component_series:
+            if comp_label not in COMP_LINESTYLES:
+                continue
+            style_handles.append(
+                Line2D([0], [0], color="#333333", lw=2.5, linestyle=COMP_LINESTYLES[comp_label], label=comp_label)
+            )
+        if color_handles:
+            leg1 = ax.legend(handles=color_handles, loc="upper left", fontsize=8, frameon=False)
+            ax.add_artist(leg1)
+        if style_handles:
+            ax.legend(handles=style_handles, loc="upper right", fontsize=8, frameon=False)
 
 
 def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
@@ -377,8 +401,6 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     _plot_line(axes[2, 0], b, c, key, key, steps_key, steps_key, "DEQ Residual ||z - f(z)||")
     steps_key, key = _prefer_train("deq_recon_train", "deq_recon")
     _plot_line(axes[2, 1], b, c, key, key, steps_key, steps_key, "DEQ Reconstruction Error")
-    # Recon error can be near machine precision; symlog makes tiny-but-nonzero values visible.
-    axes[2, 1].set_yscale("symlog", linthresh=1e-12)
     steps_key, key = _prefer_train("deq_iter_conv_rel_train", "deq_iter_conv_rel")
     _plot_line(axes[2, 2], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv (relative)")
 
@@ -452,7 +474,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         c,
         steps_key,
         ortho_series,
-        "Expert Orthogonality (per Component)",
+        "Output-Space Orthogonality (per Component)",
         ylabel="Mean |cos|",
     )
     # Orthogonality is naturally bounded in [0, 1] (mean abs cosine); keep linear for interpretability.
@@ -543,9 +565,26 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_postq.set_xticks([])
         ax_postq.set_yticks([])
 
-    # Row 6: Summary text
-    for j in range(3):
-        axes[5, j].axis("off")
+    # Row 6: left plot + summary text
+    axes[5, 1].axis("off")
+    axes[5, 2].axis("off")
+
+    # Weight-space orthogonality subplot (alignment check; proxy for output-space).
+    ax_ortho_w = axes[5, 0]
+    steps_key, _ = _prefer_train("mlp_ortho_w_train", "mlp_ortho_w")
+    w_series = []
+    for comp_label, key in [
+        ("mlp", "mlp_ortho_w_train" if steps_key == "train_steps" else "mlp_ortho_w"),
+        ("attn", "attn_ortho_w_train" if steps_key == "train_steps" else "attn_ortho_w"),
+    ]:
+        w_series.append((comp_label, b.get(key, []), c.get(key, [])))
+    _plot_components(ax_ortho_w, b, c, steps_key, w_series, "Weight-Space Orthogonality (MLP/Attn)", ylabel="Mean |cos|")
+    all_w = []
+    for _, bv, cv in w_series:
+        all_w.extend([v for v in (bv or []) if _is_finite(v)])
+        all_w.extend([v for v in (cv or []) if _is_finite(v)])
+    hi = max(all_w) if all_w else 0.01
+    ax_ortho_w.set_ylim(0.0, max(0.01, hi * 1.2))
 
     summary_lines = []
     if b["val_bpb"] and c["val_bpb"]:
