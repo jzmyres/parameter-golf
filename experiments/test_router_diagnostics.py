@@ -62,6 +62,7 @@ class TestRouterDiagnostics(unittest.TestCase):
             bigram_dim=0,
             kv_latent_dim=0,
             num_refinements=1,
+            deq_backward="revdeq",
         ).cuda().bfloat16()
         model.train(True)
 

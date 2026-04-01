@@ -76,7 +76,7 @@ def test_revdeq_convergence():
 
 def test_revdeq_reversibility():
     """Test RevDEQ backward reconstruction quality."""
-    model = _make_model(bigram_vocab_size=0)
+    model = _make_model(bigram_vocab_size=0, deq_backward="revdeq")
 
     x = torch.randint(0, 1024, (1, 16), device="cuda")
     y = torch.randint(0, 1024, (1, 16), device="cuda")

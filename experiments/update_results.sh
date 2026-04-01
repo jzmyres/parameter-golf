@@ -89,6 +89,17 @@ fi
 
 # --- Step 3: Promote current → baseline (if --promote) ---
 if [ "$PROMOTE" = true ]; then
+    # Backup existing baseline before overwriting.
+    if [ -f "$LOGDIR/baseline.log" ]; then
+        cp "$LOGDIR/baseline.log" "$LOGDIR/baseline_backup.log"
+        echo "Backed up: baseline.log → baseline_backup.log"
+    fi
+    if ls "$WEIGHTS_DIR/baseline/"* 1>/dev/null 2>&1; then
+        mkdir -p "$WEIGHTS_DIR/baseline_backup"
+        rm -f "$WEIGHTS_DIR/baseline_backup/"*
+        cp "$WEIGHTS_DIR/baseline/"* "$WEIGHTS_DIR/baseline_backup/" 2>/dev/null || true
+        echo "Backed up: baseline weights + metadata → baseline_backup/"
+    fi
     if [ -f "$LOGDIR/current.log" ]; then
         cp "$LOGDIR/current.log" "$LOGDIR/baseline.log"
         echo "Promoted: current.log → baseline.log"

@@ -10,6 +10,7 @@ import copy
 import contextlib
 import glob
 import io
+import argparse
 import math
 import os
 import random
@@ -60,73 +61,126 @@ def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
         _ROUTER_DIAGNOSTICS_STEP = prev_step
 
 class Hyperparameters:
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    # Do not override experiment configuration via environment variables.
+    # (Exception: CUDA/DDP runtime env like CUDA_VISIBLE_DEVICES/RANK/WORLD_SIZE.)
+    data_path = "./data/datasets/fineweb10B_sp1024"
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
-    seed = int(os.environ.get("SEED", 42))
+    tokenizer_path = "./data/tokenizers/fineweb_1024_bpe.model"
+    run_id = ""
+    seed = 42
 
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 10000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
+    # Experiment knobs: set defaults in code (do not use environment variables).
+    val_batch_size = 524_288
+    val_loss_every = 200  # sparse but meaningful validation curve
+    train_log_every = 100
 
-    iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 2000))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 98_304))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 1200.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    deq_beta = float(os.environ.get("DEQ_BETA", 0.5))
-    resid_mix_init_logit = float(os.environ.get("RESID_MIX_INIT_LOGIT", 5.0))
-    attn_scale_max = float(os.environ.get("ATTN_SCALE_MAX", 0.2))
-    mlp_scale_max = float(os.environ.get("MLP_SCALE_MAX", 0.2))
+    iterations = 1000
+    warmdown_iters = 1000
+    warmup_steps = 20
+    train_batch_tokens = 524_288  # default: keep prior stable batch size
+    train_seq_len = 2048
+    max_wallclock_seconds = 0.0  # 0 disables wallclock early-stop
+    qk_gain_init = 1.5
+    deq_beta = 0.2
+    resid_mix_init_logit = 5.0
+    attn_scale_max = 0.2
+    mlp_scale_max = 0.2
 
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 2))  # DEQ solver iters per refinement step
-    num_refinements = int(os.environ.get("NUM_REFINEMENTS", 1))  # predict→soft_embed→re-encode cycles
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 640))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 2.5))
-    tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    rope_base = float(os.environ.get("ROPE_BASE", 1000.0))
-    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 20.0))
+    vocab_size = 1024
+    num_layers = 2  # DEQ solver iters per refinement step
+    num_refinements = 1  # predict→soft_embed→re-encode cycles
+    num_kv_heads = 4
+    model_dim = 640
+    num_heads = 8
+    mlp_mult = 2.5
+    tie_embeddings = True
+    rope_base = 1000.0
+    logit_softcap = 20.0
 
-    embed_lr = float(os.environ.get("EMBED_LR", 0.6))
-    head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
-    tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 800))
-    beta1 = float(os.environ.get("BETA1", 0.85))
-    beta2 = float(os.environ.get("BETA2", 0.90))
-    adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.25))
-    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.03))
+    embed_lr = 0.6
+    head_lr = 0.008
+    tied_embed_lr = 0.03
+    tied_embed_init_std = 0.005
+    matrix_lr = 0.02
+    scalar_lr = 0.02
+    muon_momentum = 0.99
+    muon_backend_steps = 5
+    muon_momentum_warmup_start = 0.92
+    muon_momentum_warmup_steps = 800
+    beta1 = 0.85
+    beta2 = 0.90
+    adam_eps = 1e-8
+    grad_clip_norm = 0.25
+    weight_decay = 0.03
 
     # Routing regularization weights
-    attn_balance_mult = float(os.environ.get("ATTN_BALANCE_MULT", 3.0))
-    mlp_balance_mult = float(os.environ.get("MLP_BALANCE_MULT", 1.0))
-    bal_loss_coef = float(os.environ.get("BAL_LOSS_COEF", 0.5))
+    attn_balance_mult = 10.0
+    mlp_balance_mult = 1.0
+    bal_loss_coef = 1.0
+    mos_ortho_out_coef = 0.10
+    attn_ortho_out_coef = 0.05
+    mlp_ortho_out_coef = 0.05
 
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval; set >0 for sliding window (final only)
-    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    deq_backward = "autograd"  # {autograd, revdeq}
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 65536))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 224))
-    kv_latent_dim = int(os.environ.get("KV_LATENT_DIM", 0))  # 0 = auto (dim//2)
-    attn_expert_rank = int(os.environ.get("ATTN_EXPERT_RANK", 0))  # 0 = auto (dim//2); full-dim low-rank
-    mlp_expert_rank = int(os.environ.get("MLP_EXPERT_RANK", 0))    # 0 = auto (hidden//2); full-dim low-rank
+    eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
+    eval_batch_seqs = 32
 
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.3))
-    swa_every = int(os.environ.get("SWA_EVERY", 25))
+    # Architecture knobs (defaults only; override via CLI, not env)
+    bigram_vocab_size = 65536
+    bigram_dim = 224
+    kv_latent_dim = 0  # 0 = auto (dim//2)
+    attn_expert_rank = 0  # 0 = auto (dim//2)
+    mlp_expert_rank = 0  # 0 = auto (hidden//2)
+
+    # SWA knobs (defaults only; override via CLI, not env)
+    swa_enabled = True
+    swa_start_frac = 0.3
+    swa_every = 25
+
+
+def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
+    """Parse optional CLI overrides for experiment knobs (no env overrides)."""
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument("--data-path", type=str, default=None)
+    p.add_argument("--tokenizer-path", type=str, default=None)
+    p.add_argument("--run-id", type=str, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--iterations", type=int, default=None)
+    p.add_argument("--train-batch-tokens", type=int, default=None)
+    p.add_argument("--train-seq-len", type=int, default=None)
+    p.add_argument("--val-batch-size", type=int, default=None)
+    p.add_argument("--val-loss-every", type=int, default=None)
+    p.add_argument("--train-log-every", type=int, default=None)
+    p.add_argument("--max-wallclock-seconds", type=float, default=None)
+    p.add_argument("--attn-balance-mult", type=float, default=None)
+    p.add_argument("--mlp-balance-mult", type=float, default=None)
+    p.add_argument("--bal-loss-coef", type=float, default=None)
+    p.add_argument("--mos-ortho-out-coef", type=float, default=None)
+    p.add_argument("--attn-ortho-out-coef", type=float, default=None)
+    p.add_argument("--mlp-ortho-out-coef", type=float, default=None)
+    p.add_argument("--bigram-vocab-size", type=int, default=None)
+    p.add_argument("--bigram-dim", type=int, default=None)
+    p.add_argument("--kv-latent-dim", type=int, default=None)
+    p.add_argument("--attn-expert-rank", type=int, default=None)
+    p.add_argument("--mlp-expert-rank", type=int, default=None)
+    p.add_argument("--swa-enabled", type=int, default=None, help="1/0")
+    p.add_argument("--swa-start-frac", type=float, default=None)
+    p.add_argument("--swa-every", type=int, default=None)
+    p.add_argument("--deq-backward", type=str, default=None, choices=["autograd", "revdeq"])
+    ns, unknown = p.parse_known_args(argv)
+    if unknown:
+        raise SystemExit(f"Unknown args: {unknown}")
+    out: dict[str, object] = {}
+    for k, v in vars(ns).items():
+        if v is not None:
+            key = k.replace("-", "_")
+            if key == "swa_enabled":
+                out[key] = bool(int(v))
+            else:
+                out[key] = v
+    return out
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -313,23 +367,27 @@ def eval_val(
 # POST-TRAINING QUANTIZATION (INT8 legacy + INT6 mixed)
 # -----------------------------
 
-CONTROL_TENSOR_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "CONTROL_TENSOR_NAME_PATTERNS",
-        # Keep only small control tensors in fp32. Avoid broad substrings like "expert_gate"
-        # which can match large expert weight tensors (e.g., shared_block.mlp.expert_gate).
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,"
-        "skip_weight,skip_weights,smear.gate,bigram.scale,diffar_scale,gate_bias,"
-        "expert_gate_logits,expert_gate_ctp_logits,expert_gate_ntp_logits",
-    ).split(",")
-    if pattern
+CONTROL_TENSOR_NAME_PATTERNS = (
+    # Keep only small control tensors in fp32. Avoid broad substrings like "expert_gate"
+    # which can match large expert weight tensors (e.g., shared_block.mlp.expert_gate).
+    "attn_scale",
+    "attn_scales",
+    "mlp_scale",
+    "mlp_scales",
+    "resid_mix",
+    "resid_mixes",
+    "q_gain",
+    "skip_weight",
+    "skip_weights",
+    "smear.gate",
+    "bigram.scale",
+    "diffar_scale",
+    "gate_bias",
+    "expert_gate_logits",
+    "expert_gate_ctp_logits",
+    "expert_gate_ntp_logits",
 )
-FP16_KEEP_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get("FP16_KEEP_NAME_PATTERNS", "tok_emb").split(",")
-    if pattern
-)
+FP16_KEEP_NAME_PATTERNS = ("tok_emb",)
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
@@ -606,6 +664,19 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
+    """Mean off-diagonal |cosine similarity| for a [E, D] tensor."""
+    if groups.ndim != 2:
+        raise ValueError(f"groups must be rank-2 [E,D], got shape {tuple(groups.shape)}")
+    e = groups.shape[0]
+    if e < 2:
+        return groups.new_zeros(())
+    g = groups / (groups.norm(dim=-1, keepdim=True) + eps)
+    cos = g @ g.T
+    mask = ~torch.eye(e, dtype=torch.bool, device=cos.device)
+    return cos[mask].abs().mean()
+
+
 class SoftDenseRouter(nn.Module):
     """Shared soft dense routing module for all MoE components.
 
@@ -749,6 +820,9 @@ class CausalSelfAttention(nn.Module):
         self.gate_bias = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
         # Soft dense routing on attention output (MoE for attention)
         self.attn_router = SoftDenseRouter(dim, num_experts)
+        self.out_ortho_coef = 0.0
+        self._out_ortho_cos_sim: float | None = None
+        self._out_ortho_loss: Tensor | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -774,17 +848,47 @@ class CausalSelfAttention(nn.Module):
         k_full = torch.cat([k_rope, k_nope], dim=-1)
         q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
 
-        y = F.scaled_dot_product_attention(
-            q_full, k_full, v, attn_mask=None, is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        # PyTorch versions differ on whether SDPA supports the `enable_gqa` flag.
+        # Fall back to explicit KV head expansion for older versions.
+        try:
+            y = F.scaled_dot_product_attention(
+                q_full, k_full, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        except TypeError:
+            k_use, v_use = k_full, v
+            if self.num_kv_heads != self.num_heads:
+                rep = self.num_heads // self.num_kv_heads
+                k_use = k_full.repeat_interleave(rep, dim=1)
+                v_use = v.repeat_interleave(rep, dim=1)
+            y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
         # Gated attention: query-dependent per-head gate (arxiv:2505.06708)
         y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         # Soft dense routing on attention output (dense mixture-of-experts)
         route_weights = self.attn_router(x)  # [B, T, E]
-        h = torch.einsum('btd,erd->bter', y, self.expert_proj)
-        out_e = torch.einsum('bter,edr->bted', h, self.expert_out)
+        # einsum requires matching dtypes; keep compute in activation dtype under autocast.
+        expert_proj = self.expert_proj.to(dtype=y.dtype)
+        expert_out = self.expert_out.to(dtype=y.dtype)
+        h = torch.einsum('btd,erd->bter', y, expert_proj)
+        out_e = torch.einsum('bter,edr->bted', h, expert_out)
+        # Output-space orthogonality. When autograd-unrolling DEQ, this can be used as a
+        # true loss term (differentiable). In RevDEQFunction mode, it remains diagnostic-only.
+        self._out_ortho_loss = None
+        need_loss = bool(self.training and torch.is_grad_enabled() and self.out_ortho_coef > 0.0)
+        do_diag = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+        if do_diag and dist.is_available() and dist.is_initialized():
+            do_diag = dist.get_rank() == 0
+        if need_loss:
+            mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
+            ortho = mean_abs_offdiag_cosine(mu)
+            self._out_ortho_loss = ortho
+            if do_diag:
+                self._out_ortho_cos_sim = float(ortho.detach().item())
+        elif do_diag:
+            with torch.no_grad():
+                mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
+                self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu).item())
         return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
 
     @property
@@ -800,13 +904,8 @@ class CausalSelfAttention(nn.Module):
             diag["usage"] = r._expert_usage
             diag["entropy"] = r._expert_entropy
             diag["balance_cv"] = r._expert_balance_cv
-        if self.num_experts >= 2:
-            with torch.no_grad():
-                groups = self.expert_out.float().view(self.num_experts, -1)
-                groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
-                cos = groups @ groups.T
-                mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=cos.device)
-                diag["ortho_cos_sim"] = cos[mask].abs().mean().item()
+        if self._out_ortho_cos_sim is not None:
+            diag["ortho_cos_sim"] = self._out_ortho_cos_sim
         return diag
 
 
@@ -825,13 +924,35 @@ class MLP(nn.Module):
             nn.init.xavier_uniform_(self.expert_fc.data[e])
             nn.init.xavier_uniform_(self.expert_down.data[e])
         self.mlp_router = SoftDenseRouter(dim, num_experts)
+        self.out_ortho_coef = 0.0
+        self._out_ortho_cos_sim: float | None = None
+        self._out_ortho_loss: Tensor | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         route_weights = self.mlp_router(x)  # [B, T, E]
-        gate_h = torch.einsum('btd,esd->btes', x, self.expert_gate)
-        fc_h = torch.einsum('btd,esd->btes', x, self.expert_fc)
+        # einsum requires matching dtypes; keep compute in activation dtype under autocast.
+        expert_gate = self.expert_gate.to(dtype=x.dtype)
+        expert_fc = self.expert_fc.to(dtype=x.dtype)
+        expert_down = self.expert_down.to(dtype=x.dtype)
+        gate_h = torch.einsum('btd,esd->btes', x, expert_gate)
+        fc_h = torch.einsum('btd,esd->btes', x, expert_fc)
         h = F.silu(gate_h) * fc_h  # [B, T, E, expert_rank]
-        out_e = torch.einsum('btes,eds->bted', h, self.expert_down)
+        out_e = torch.einsum('btes,eds->bted', h, expert_down)
+        self._out_ortho_loss = None
+        need_loss = bool(self.training and torch.is_grad_enabled() and self.out_ortho_coef > 0.0)
+        do_diag = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+        if do_diag and dist.is_available() and dist.is_initialized():
+            do_diag = dist.get_rank() == 0
+        if need_loss:
+            mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
+            ortho = mean_abs_offdiag_cosine(mu)
+            self._out_ortho_loss = ortho
+            if do_diag:
+                self._out_ortho_cos_sim = float(ortho.detach().item())
+        elif do_diag:
+            with torch.no_grad():
+                mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
+                self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu).item())
         return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
 
     @property
@@ -847,14 +968,8 @@ class MLP(nn.Module):
             diag["usage"] = r._expert_usage
             diag["entropy"] = r._expert_entropy
             diag["balance_cv"] = r._expert_balance_cv
-        # Orthogonality: pairwise cosine sim between expert weight groups
-        if self.num_experts >= 2:
-            with torch.no_grad():
-                groups = self.expert_fc.float().view(self.num_experts, -1)
-                groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
-                cos = groups @ groups.T
-                mask = ~torch.eye(self.num_experts, dtype=torch.bool, device=cos.device)
-                diag["ortho_cos_sim"] = cos[mask].abs().mean().item()
+        if self._out_ortho_cos_sim is not None:
+            diag["ortho_cos_sim"] = self._out_ortho_cos_sim
         return diag
 
 
@@ -943,6 +1058,8 @@ class MoSHead(nn.Module):
         self.B_denoise = nn.Parameter(torch.empty(vocab_size, rank))
         self.B_NTP = nn.Parameter(torch.empty(vocab_size, rank))
         self._diag_step: int | None = None
+        self._ctp_ortho_out: Tensor | None = None
+        self._ntp_ortho_out: Tensor | None = None
         self._init_params()
 
     def _init_params(self):
@@ -964,12 +1081,15 @@ class MoSHead(nn.Module):
         pass
 
     def get_head_orthogonality(self, head: str) -> float:
-        """Average |cosine similarity| between experts within a head's A matrices.
+        """Return latest output/latent-space orthogonality for the head (logged metric).
 
-        Head experts are the shared experts plus that head's specialized experts.
+        Falls back to weight-space cosine only if no output-space value was computed yet.
         """
         if head not in ("ctp", "ntp"):
             raise ValueError(f"head must be 'ctp' or 'ntp', got {head!r}")
+        t = self._ctp_ortho_out if head == "ctp" else self._ntp_ortho_out
+        if t is not None:
+            return float(t.detach().float().item())
         if self.num_shared + self.num_specialized < 2:
             return 0.0
         A_spec = self.A_ctp if head == "ctp" else self.A_ntp
@@ -988,33 +1108,45 @@ class MoSHead(nn.Module):
         return _fsq_ste(x, self.fsq_levels, self.training)
 
     def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
-                      A_spec: Tensor, B: Tensor) -> tuple[Tensor, Tensor]:
-        """Compute (log_probs, alpha_softmax) for one head. Pure softmax routing (Mixtape)."""
+                      A_spec: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute (log_probs, alpha_softmax, ortho_out) for one head.
+
+        `ortho_out` is output/latent-space orthogonality: mean off-diagonal |cos|
+        between per-expert mean pre-FSQ latents (x @ A_e).
+        """
         N = x.shape[0]
         alpha = F.softmax(gate(x).float(), dim=-1)  # [N, num_shared+num_spec] — convex combination
         log_w = alpha.clamp(min=1e-8).log()
         log_p_unnorm = x.new_full((N, self.vocab_size), -torch.inf, dtype=torch.float32)
+        mu_groups: list[Tensor] = []
         # Shared experts
         for e in range(self.num_shared):
-            u = self._fsq(x.to(A_shared.dtype) @ A_shared[e])
+            t = x.to(A_shared.dtype) @ A_shared[e]  # [N, rank]
+            mu_groups.append(t.float().mean(dim=0))
+            u = self._fsq(t)
             logits = u.to(B.dtype) @ B.t()
             log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, e:e+1] + F.log_softmax(logits.float(), dim=-1))
         # Specialized experts
         for e in range(self.num_specialized):
-            u = self._fsq(x.to(A_spec.dtype) @ A_spec[e])
+            t = x.to(A_spec.dtype) @ A_spec[e]  # [N, rank]
+            mu_groups.append(t.float().mean(dim=0))
+            u = self._fsq(t)
             logits = u.to(B.dtype) @ B.t()
             idx = self.num_shared + e
             log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
         log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
-        return log_p, alpha
+        ortho_out = mean_abs_offdiag_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
+        return log_p, alpha, ortho_out
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         """Return (log_p_denoise, log_p_ntp), each [*, V]."""
         orig_shape = h.shape[:-1]
         x = h.reshape(-1, self.d_model)
 
-        log_p_d, alpha_d = self._head_forward(x, self.gate_ctp, self.A_shared, self.A_ctp, self.B_denoise)
-        log_p_n, alpha_n = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
+        log_p_d, alpha_d, ortho_ctp = self._head_forward(x, self.gate_ctp, self.A_shared, self.A_ctp, self.B_denoise)
+        log_p_n, alpha_n, ortho_ntp = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
+        self._ctp_ortho_out = ortho_ctp
+        self._ntp_ortho_out = ortho_ntp
 
         if self.training:
             bal = torch.tensor(0.0, device=x.device)
@@ -1155,6 +1287,7 @@ class RevDEQFunction(torch.autograd.Function):
         z_prev_state = z_state
 
         with torch.no_grad():
+            out_y = None
             for _ in range(K):
                 z_prev_state = z_state
                 y_acc = y_state.to(acc_dtype) * beta_inv
@@ -1168,6 +1301,14 @@ class RevDEQFunction(torch.autograd.Function):
                     out_y = f_theta(y_state.to(compute_dtype), x0)
                 z_acc = z_acc + out_y.to(acc_dtype) * beta
                 z_state = z_acc.to(state_dtype)
+
+            # Cheap residual proxy available without extra block calls.
+            # Uses the last computed f(y) from the final forward iteration.
+            if out_y is not None:
+                try:
+                    f_theta._deq_residual_proxy = float((z_state - out_y.to(state_dtype)).norm().item())
+                except Exception:
+                    f_theta._deq_residual_proxy = None
 
         ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(), z_prev_state.detach())
         ctx.f_theta = f_theta
@@ -1302,6 +1443,10 @@ class GPT(nn.Module):
         attn_balance_mult: float = 3.0,
         mlp_balance_mult: float = 1.0,
         bal_loss_coef: float = 0.5,
+        mos_ortho_out_coef: float = 0.05,
+        attn_ortho_out_coef: float = 0.05,
+        mlp_ortho_out_coef: float = 0.05,
+    deq_backward: str = "autograd",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1327,6 +1472,16 @@ class GPT(nn.Module):
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
         self.bal_loss_coef = float(bal_loss_coef)
+        self.mos_ortho_out_coef = float(mos_ortho_out_coef)
+        self.attn_ortho_out_coef = float(attn_ortho_out_coef)
+        self.mlp_ortho_out_coef = float(mlp_ortho_out_coef)
+        if deq_backward not in ("autograd", "revdeq"):
+            raise ValueError(f"deq_backward must be autograd|revdeq, got {deq_backward!r}")
+        self.deq_backward = deq_backward
+        # Route the output-space orthogonality coefficients into the expert modules so they
+        # can materialize differentiable losses when using autograd-unrolled DEQ.
+        self.shared_block.attn.out_ortho_coef = self.attn_ortho_out_coef
+        self.shared_block.mlp.out_ortho_coef = self.mlp_ortho_out_coef
         # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
         self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
         # MoS output head (Constraints #4+#5): shared experts, dual B for CTP/NTP
@@ -1377,18 +1532,25 @@ class GPT(nn.Module):
         return self.diffar_scale.to(dtype=z.dtype) * soft_embed.to(z.dtype)
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
-        """Run DEQ coupled-state solver. Uses RevDEQFunction for O(1) memory in training."""
-        if self.training:
+        """Run DEQ coupled-state solver.
+
+        - Training:
+          - deq_backward=revdeq: RevDEQFunction (O(1) activation memory)
+          - deq_backward=autograd: explicit unroll (stores activations; enables output-space regularizers)
+        - Eval: explicit unroll for diagnostics (uses fp64 accumulators only for revdeq diagnostics)
+        """
+        beta = self.deq_beta
+        dtype = x0.dtype
+
+        if self.training and self.deq_backward == "revdeq":
             params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
             z, z_prev = RevDEQFunction.apply(
-                self.shared_block, x0, z_init, self.deq_beta, self.num_layers, *params
+                self.shared_block, x0, z_init, beta, self.num_layers, *params
             )
             return z, z_prev, None, None
 
-        # Eval: explicit loop for diagnostics + reconstruction check
-        beta = self.deq_beta
-        dtype = x0.dtype
-        acc_dtype = torch.float64
+        # Explicit coupled-state unroll (autograd-enabled in training).
+        acc_dtype = torch.float64 if (not self.training and self.deq_backward == "revdeq") else torch.float32
         y_acc = z_init.to(acc_dtype)
         z_acc = z_init.to(acc_dtype)
         z = z_init
@@ -1414,6 +1576,8 @@ class GPT(nn.Module):
         z = x  # warm start
         dtype = x.dtype
         self._deq_residuals: list[float] = []
+        # Avoid leaking stale eval-only diagnostics into train-step logs.
+        self._deq_recon_error = None
         prev_soft_embed = None
         x0_refined = x0  # track for reconstruction
 
@@ -1447,18 +1611,27 @@ class GPT(nn.Module):
             if z_prev is not None:
                 abs_conv = (z - z_prev).float().norm().item()
                 z_norm_diag = z.detach().float().norm().clamp_min(1.0).item()
-                self._deq_residuals = [abs_conv]
+                # Iter convergence: last solver update size.
                 self._deq_iter_convergence = abs_conv  # absolute for logging
                 self._deq_iter_convergence_rel = abs_conv / z_norm_diag  # relative
+                # Residual proxy: use RevDEQFunction's cached proxy when available; otherwise
+                # fall back to the last update magnitude (always defined in unrolled mode).
+                proxy = getattr(self.shared_block, "_deq_residual_proxy", None)
+                self._deq_residuals = [float(proxy)] if proxy is not None else [abs_conv]
+                do_diag = bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+                if do_diag and dist.is_available() and dist.is_initialized():
+                    do_diag = dist.get_rank() == 0
+                if do_diag:
+                    with torch.no_grad():
+                        f_z_final = self.shared_block(z, x0_refined)
+                        self._deq_residuals = [(z - f_z_final).float().norm().item()]
             if y_acc is not None:
                 self._deq_yz_gap = (y_acc - z).float().norm().item()
 
-            # RevDEQ forward runs the shared block under `no_grad`, so any router-side
-            # regularizers/diagnostics computed inside the DEQ solve are detached and can
-            # also be overwritten by backward replay. Refresh shared-block router stats
-            # on the terminal state here (outside the DEQ autograd.Function) so:
-            # - balance/sparsity losses have correct gradients
-            # - mlp/attn router diagnostics are available for dense train-step logging
+            # Define router regularizers/diagnostics on the terminal equilibrium state.
+            # This unifies behavior across DEQ backward modes and ensures:
+            # - balance/sparsity losses target the actual terminal state
+            # - dense train-step router diagnostics are consistent (rank0 only)
             _ = self.shared_block.attn.attn_router(self.shared_block.attn_norm(z))
             _ = self.shared_block.mlp.mlp_router(self.shared_block.mlp_norm(z))
 
@@ -1471,18 +1644,19 @@ class GPT(nn.Module):
                 self._deq_residuals = [(z - f_z_final).float().norm().item()]
                 self._deq_iter_convergence = abs_conv  # absolute
                 self._deq_iter_convergence_rel = abs_conv / z_norm_diag  # relative
-                # fp64 backward reconstruction of last DEQ solve
-                z_init_64 = (x0_refined if self.num_refinements > 0 else x0).to(torch.float64)
-                yr_acc, zr_acc = y_acc.clone(), z_acc.clone()
-                beta = self.deq_beta
-                for _ in range(self.num_layers):
-                    f_yr = self.shared_block(yr_acc.to(dtype), x0_refined)
-                    zr_acc = (zr_acc - beta * f_yr.to(torch.float64)) / (1 - beta)
-                    f_zr = self.shared_block(zr_acc.to(dtype), x0_refined)
-                    yr_acc = (yr_acc - beta * f_zr.to(torch.float64)) / (1 - beta)
-                state_norm = max(z_init_64.norm().item(), 1.0)
-                recon_error = ((zr_acc - z_init_64).norm().item() + (yr_acc - z_init_64).norm().item()) / state_norm
-                self._deq_recon_error = recon_error
+                if self.deq_backward == "revdeq" and y_acc is not None and z_acc is not None:
+                    # fp64 backward reconstruction of last DEQ solve (RevDEQ diagnostics only).
+                    z_init_64 = (x0_refined if self.num_refinements > 0 else x0).to(torch.float64)
+                    yr_acc, zr_acc = y_acc.to(torch.float64).clone(), z_acc.to(torch.float64).clone()
+                    beta = self.deq_beta
+                    for _ in range(self.num_layers):
+                        f_yr = self.shared_block(yr_acc.to(dtype), x0_refined)
+                        zr_acc = (zr_acc - beta * f_yr.to(torch.float64)) / (1 - beta)
+                        f_zr = self.shared_block(zr_acc.to(dtype), x0_refined)
+                        yr_acc = (yr_acc - beta * f_zr.to(torch.float64)) / (1 - beta)
+                    state_norm = max(z_init_64.norm().item(), 1.0)
+                    recon_error = ((zr_acc - z_init_64).norm().item() + (yr_acc - z_init_64).norm().item()) / state_norm
+                    self._deq_recon_error = recon_error
 
         return z
 
@@ -1512,22 +1686,6 @@ class GPT(nn.Module):
         # MoS head routing
         bal = bal + getattr(self.mos_head, '_balance_loss', zero)
         spar = spar + getattr(self.mos_head, '_sparsity_loss', zero)
-        # Orthogonality: |cos_sim| between expert weight groups → 0
-        for w in [
-            self.shared_block.mlp.expert_fc.float(),   # [E, expert_rank, dim]
-            self.shared_block.mlp.expert_down.float(),  # [E, dim, expert_rank]
-            self.shared_block.attn.expert_proj.float(), # [E, expert_rank, dim]
-            self.shared_block.attn.expert_out.float(),  # [E, dim, expert_rank]
-            self.mos_head.A_shared.float(),             # [E, d_model, rank]
-        ]:
-            n_exp = w.shape[0]
-            if n_exp < 2:
-                continue
-            groups = w.mean(dim=1)  # [E, feat]
-            groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
-            cos = groups @ groups.T
-            mask = ~torch.eye(n_exp, dtype=torch.bool, device=cos.device)
-            ortho = ortho + cos[mask].abs().mean()
         return bal, spar, ortho
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1537,20 +1695,37 @@ class GPT(nn.Module):
         ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
         ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
         conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ntp_loss.device))
-        bal_loss, spar_loss, ortho_loss = self._collect_routing_losses(ntp_loss.device)
+        bal_loss, spar_loss, _ = self._collect_routing_losses(ntp_loss.device)
         self._ntp_loss = ntp_loss.detach().item()
         self._ctp_loss = ctp_loss.detach().item()
         self._conv_loss = conv_loss.detach().item() if isinstance(conv_loss, torch.Tensor) else 0.0
         # CTP weight scales with refinement steps: at step 0 input is clean one-hot,
         # CTP becomes meaningful only after soft embedding refinement
         ctp_weight = 0.1 * self.num_refinements
+        mos_ortho_loss = torch.tensor(0.0, device=ntp_loss.device)
+        if getattr(self.mos_head, "_ctp_ortho_out", None) is not None and getattr(self.mos_head, "_ntp_ortho_out", None) is not None:
+            mos_ortho_loss = self.mos_head._ctp_ortho_out + self.mos_head._ntp_ortho_out
+        # Expert output-space orthogonality regularization (principled):
+        # Only differentiable in autograd-unroll mode.
+        zero = torch.tensor(0.0, device=ntp_loss.device)
+        attn_ortho_loss = zero
+        mlp_ortho_loss = zero
+        if self.deq_backward == "autograd":
+            a = getattr(self.shared_block.attn, "_out_ortho_loss", None)
+            m = getattr(self.shared_block.mlp, "_out_ortho_loss", None)
+            if isinstance(a, torch.Tensor):
+                attn_ortho_loss = a.to(device=ntp_loss.device)
+            if isinstance(m, torch.Tensor):
+                mlp_ortho_loss = m.to(device=ntp_loss.device)
         return (
             ntp_loss
             + ctp_weight * ctp_loss
             + 0.01 * conv_loss
             + self.bal_loss_coef * bal_loss
             + 0.001 * spar_loss
-            + 0.01 * ortho_loss
+            + self.mos_ortho_out_coef * mos_ortho_loss
+            + self.attn_ortho_out_coef * attn_ortho_loss
+            + self.mlp_ortho_out_coef * mlp_ortho_loss
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1648,7 +1823,15 @@ def main() -> None:
     global zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
+    cli_overrides = _parse_cli_overrides(sys.argv[1:])
     args = Hyperparameters()
+    for k, v in cli_overrides.items():
+        setattr(args, k, v)
+    # Resolve derived paths after CLI overrides.
+    args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
+    args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
+    if not getattr(args, "run_id", ""):
+        args.run_id = str(uuid.uuid4())
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -1657,12 +1840,8 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    requested_grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "0"))
-    if requested_grad_accum_steps > 0:
-        grad_accum_steps = requested_grad_accum_steps
-    else:
-        # Auto mode: keep per-rank microbatches reasonably small across GPU counts.
-        grad_accum_steps = max(1, math.ceil(8 / world_size))
+    # Auto mode: keep per-rank microbatches reasonably small across GPU counts.
+    grad_accum_steps = max(1, math.ceil(8 / world_size))
     # Ensure we can form at least 1 sequence per rank per micro-step.
     global_seqs = args.train_batch_tokens // args.train_seq_len
     while grad_accum_steps > 1 and global_seqs < world_size * grad_accum_steps:
@@ -1696,13 +1875,13 @@ def main() -> None:
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
-        print(logfile)
+        print(logfile, flush=True)
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
             return
         if console:
-            print(msg)
+            print(msg, flush=True)
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
@@ -1765,6 +1944,10 @@ def main() -> None:
         attn_balance_mult=args.attn_balance_mult,
         mlp_balance_mult=args.mlp_balance_mult,
         bal_loss_coef=args.bal_loss_coef,
+        mos_ortho_out_coef=args.mos_ortho_out_coef,
+        attn_ortho_out_coef=args.attn_ortho_out_coef,
+        mlp_ortho_out_coef=args.mlp_ortho_out_coef,
+        deq_backward=args.deq_backward,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1865,8 +2048,11 @@ def main() -> None:
         parts: list[str] = []
         if hasattr(m, "_deq_residuals") and getattr(m, "_deq_residuals"):
             parts.append(f"deq_residual:{m._deq_residuals[-1]:.6f}")
-        if hasattr(m, "_deq_recon_error"):
-            parts.append(f"deq_recon_err:{m._deq_recon_error:.6f}")
+        recon = getattr(m, "_deq_recon_error", None)
+        if recon is not None:
+            # Reconstruction error can be extremely small; log in scientific notation to avoid
+            # quantizing it to zero in logs/plots.
+            parts.append(f"deq_recon_err:{float(recon):.3e}")
         if hasattr(m, "_deq_iter_convergence"):
             parts.append(f"deq_iter_conv:{m._deq_iter_convergence:.6f}")
         if hasattr(m, "_deq_iter_convergence_rel"):
@@ -1913,11 +2099,37 @@ def main() -> None:
                 if "ortho_cos_sim" in diag:
                     parts.append(f"mlp_ortho:{diag['ortho_cos_sim']:.4f}")
                     parts.append(f"expert_ortho:{diag['ortho_cos_sim']:.4f}")
+            # Weight-space orthogonality proxy (alignment check with output-space).
+            try:
+                with torch.no_grad():
+                    w = torch.cat(
+                        [
+                            mlp.expert_gate.reshape(mlp.num_experts, -1),
+                            mlp.expert_fc.reshape(mlp.num_experts, -1),
+                            mlp.expert_down.reshape(mlp.num_experts, -1),
+                        ],
+                        dim=-1,
+                    ).float()
+                    parts.append(f"mlp_ortho_w:{float(mean_abs_offdiag_cosine(w).item()):.4f}")
+            except Exception:
+                pass
             attn = m.shared_block.attn
             if hasattr(attn, "get_expert_diagnostics"):
                 diag = attn.get_expert_diagnostics()
                 if "ortho_cos_sim" in diag:
                     parts.append(f"attn_ortho:{diag['ortho_cos_sim']:.4f}")
+            try:
+                with torch.no_grad():
+                    w = torch.cat(
+                        [
+                            attn.expert_proj.reshape(attn.num_experts, -1),
+                            attn.expert_out.reshape(attn.num_experts, -1),
+                        ],
+                        dim=-1,
+                    ).float()
+                    parts.append(f"attn_ortho_w:{float(mean_abs_offdiag_cosine(w).item()):.4f}")
+            except Exception:
+                pass
 
         if hasattr(m, "mos_head"):
             mos = m.mos_head

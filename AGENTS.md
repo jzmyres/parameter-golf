@@ -22,6 +22,13 @@ You MUST incorporate these three architectural innovations into the transformer 
 - Training <= 600 seconds wall clock on 8xH100 SXM
 - Code must work with DDP (torchrun, any GPU count)
 - Evaluation metric: val_bpb on FineWeb validation set
+- **Expert health MUST be satisfied by end of training** (final-only hard constraints):
+  - Per-component min usage ≥ 0.15
+  - Per-component balance CV ≤ 0.20
+  - MLP/Attn orthogonality (mean |cos|) ≤ 0.20
+  - These are guardrails for expressiveness/optimization; do not accept runs that violate them.
+- **Fixed-point behavior is a desired goal**, not a hard constraint: monitor relative convergence/residuals and improve if it does not harm expert health or val_bpb.
+- RevDEQ precision reminder: use FP64 add/sub + reconstruction diagnostics only when using the RevDEQ backward path; autograd-unroll is the right tool when you need output-space regularizers (see `EXPERIENCE.md`).
 
 ## Experiment Protocol
 
@@ -30,6 +37,7 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 
 ### Loop (run indefinitely)
 0. Read `EXPERIENCE.md` — apply accumulated guardrails
+0b. After each fix, add a short, general lesson to `EXPERIENCE.md`
 1. `git log --oneline -20` + read `results.tsv` — understand history
 2. Plan ONE focused change (architecture, hyperparameters, or training)
 3. Write tests first (TDD)

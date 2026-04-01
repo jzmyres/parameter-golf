@@ -9,7 +9,7 @@ Shows full training curves for ALL diagnostic metrics:
 - Row 6: Summary text with final values comparison
 
 All subplots use consistent colors: blue for Baseline, orange for Current.
-Components (mlp/attn/mos_ctp/mos_ntp) are encoded with markers.
+Components (mlp/attn/mos_ctp/mos_ntp) are encoded with line styles.
 """
 import re
 import sys
@@ -20,13 +20,15 @@ from pathlib import Path
 COLOR_BASELINE = "#1f77b4"  # matplotlib default blue
 COLOR_CURRENT = "#ff7f0e"   # matplotlib default orange
 
-# Component markers (keep consistent across subplots)
-COMP_MARKERS = {
-    "mlp": "o",
-    "attn": "s",
-    "mos_ctp": "^",
-    "mos_ntp": "x",
+# Component line styles (primary encoding)
+COMP_LINESTYLES = {
+    "mlp": "-",
+    "attn": "--",
+    "mos_ctp": ":",
+    "mos_ntp": "-.",
 }
+
+COMP_SCATTER_SIZE = 72
 
 _FLOAT = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
 
@@ -35,13 +37,14 @@ def parse_log(logpath: str) -> dict:
     """Parse training log for all metrics."""
     lines = Path(logpath).read_text().split("\n")
     data = {
+        "train_batch_tokens": None,
         "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
         "conv_loss": [],
         "grad_norm": [],
         "step_avg_ms": [], "train_time_ms": [],
         "val_steps": [], "val_loss": [], "val_bpb": [],
         # Validation-time diagnostics (sparse unless VAL_LOSS_EVERY is small)
-        "deq_residual": [], "deq_recon": [], "deq_iter_conv": [],
+        "deq_residual": [], "deq_recon": [], "deq_iter_conv": [], "deq_iter_conv_rel": [],
         # Combined expert metrics (backward compat)
         "expert_usage": [], "expert_entropy": [], "expert_ortho": [],
         # Per-component: usage (list of lists), entropy, cv
@@ -49,17 +52,23 @@ def parse_log(logpath: str) -> dict:
            for s in ("usage", "entropy", "cv")},
         # Per-component orthogonality
         "mlp_ortho": [], "attn_ortho": [], "mos_ctp_ortho": [], "mos_ntp_ortho": [], "mos_ortho": [],
+        "mlp_ortho_w": [], "attn_ortho_w": [],
         # Train-time diagnostics (dense, logged alongside train_loss when enabled)
-        "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [],
+        "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
         **{f"{p}_{s}_train": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
            for s in ("usage", "entropy", "cv")},
         "mlp_ortho_train": [], "attn_ortho_train": [], "mos_ctp_ortho_train": [], "mos_ntp_ortho_train": [],
+        "mlp_ortho_w_train": [], "attn_ortho_w_train": [],
         # Final post-quant scoring metric (what the submission is scored on)
         "final_postquant_val_loss": None,
         "final_postquant_val_bpb": None,
     }
 
     for line in lines:
+        m = re.search(r"train_batch_tokens:(\d+)", line)
+        if m and data["train_batch_tokens"] is None:
+            data["train_batch_tokens"] = int(m.group(1))
+
         # Training steps
         m = re.search(rf"^step:(\d+)/\d+ train_loss:{_FLOAT}.*train_time:{_FLOAT}ms step_avg:{_FLOAT}ms", line)
         if m:
@@ -83,6 +92,7 @@ def parse_log(logpath: str) -> dict:
                 ("deq_residual_train", rf"deq_residual:{_FLOAT}"),
                 ("deq_recon_train", rf"deq_recon_err:{_FLOAT}"),
                 ("deq_iter_conv_train", rf"deq_iter_conv:{_FLOAT}"),
+                ("deq_iter_conv_rel_train", rf"deq_iter_conv_rel:{_FLOAT}"),
                 ("mlp_entropy_train", rf"mlp_entropy:{_FLOAT}"),
                 ("attn_entropy_train", rf"attn_entropy:{_FLOAT}"),
                 ("mos_ctp_entropy_train", rf"mos_ctp_entropy:{_FLOAT}"),
@@ -93,6 +103,8 @@ def parse_log(logpath: str) -> dict:
                 ("mos_ntp_cv_train", rf"mos_ntp_cv:{_FLOAT}"),
                 ("mlp_ortho_train", rf"mlp_ortho:{_FLOAT}"),
                 ("attn_ortho_train", rf"attn_ortho:{_FLOAT}"),
+                ("mlp_ortho_w_train", rf"mlp_ortho_w:{_FLOAT}"),
+                ("attn_ortho_w_train", rf"attn_ortho_w:{_FLOAT}"),
                 ("mos_ctp_ortho_train", rf"mos_ctp_ortho:{_FLOAT}"),
                 ("mos_ntp_ortho_train", rf"mos_ntp_ortho:{_FLOAT}"),
             ]:
@@ -123,6 +135,7 @@ def parse_log(logpath: str) -> dict:
                 ("deq_residual", rf"deq_residual:{_FLOAT}"),
                 ("deq_recon", rf"deq_recon_err:{_FLOAT}"),
                 ("deq_iter_conv", rf"deq_iter_conv:{_FLOAT}"),
+                ("deq_iter_conv_rel", rf"deq_iter_conv_rel:{_FLOAT}"),
                 ("expert_entropy", rf"(?<!\w_)expert_entropy:{_FLOAT}"),
                 ("expert_ortho", rf"expert_ortho:{_FLOAT}"),
             ]:
@@ -148,6 +161,9 @@ def parse_log(logpath: str) -> dict:
             for comp in ("mlp", "attn", "mos", "mos_ctp", "mos_ntp"):
                 m_o = re.search(rf"{comp}_ortho:{_FLOAT}", line)
                 data[f"{comp}_ortho"].append(float(m_o.group(1)) if m_o else math.nan)
+            for comp in ("mlp", "attn"):
+                m_o = re.search(rf"{comp}_ortho_w:{_FLOAT}", line)
+                data[f"{comp}_ortho_w"].append(float(m_o.group(1)) if m_o else math.nan)
             # No balance-loss keys are logged; use *_cv fields for balance diagnostics.
 
     return data
@@ -218,11 +234,11 @@ def _plot_line(ax, b, c, b_key, c_key, b_steps, c_steps, title, ylabel=None):
 def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
     """Plot multiple component series with Baseline=blue and Current=orange.
 
-    Components are encoded via markers for readability across all subplots.
+    Components are encoded via line styles for readability.
     """
     any_plotted = False
     for comp_label, b_values, c_values in component_series:
-        marker = COMP_MARKERS.get(comp_label, None)
+        linestyle = COMP_LINESTYLES.get(comp_label, "-")
         if b_values is not None and _has_any_finite(b_values):
             bx, by = _filter_finite(b.get(steps_key, []), b_values)
             if bx and by:
@@ -231,23 +247,17 @@ def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
                         bx,
                         by,
                         color=COLOR_BASELINE,
-                        marker=marker,
                         alpha=0.85,
-                        s=24,
-                        label=f"Baseline {comp_label}",
+                        s=COMP_SCATTER_SIZE,
                     )
                 else:
                     ax.plot(
                         bx,
                         by,
                         color=COLOR_BASELINE,
-                        linestyle="-",
-                        marker=marker,
-                        markersize=3,
-                        markevery=max(len(bx) // 12, 1),
+                        linestyle=linestyle,
                         alpha=0.8,
-                        label=f"Baseline {comp_label}",
-                        linewidth=1.4,
+                        linewidth=2.0,
                     )
                 any_plotted = True
         if c_values is not None and _has_any_finite(c_values):
@@ -258,23 +268,17 @@ def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
                         cx,
                         cy,
                         color=COLOR_CURRENT,
-                        marker=marker,
                         alpha=0.85,
-                        s=24,
-                        label=f"Current {comp_label}",
+                        s=COMP_SCATTER_SIZE,
                     )
                 else:
                     ax.plot(
                         cx,
                         cy,
                         color=COLOR_CURRENT,
-                        linestyle="--",
-                        marker=marker,
-                        markersize=3,
-                        markevery=max(len(cx) // 12, 1),
+                        linestyle=linestyle,
                         alpha=0.8,
-                        label=f"Current {comp_label}",
-                        linewidth=1.4,
+                        linewidth=2.0,
                     )
                 any_plotted = True
 
@@ -282,9 +286,7 @@ def _plot_components(ax, b, c, steps_key, component_series, title, ylabel=None):
     ax.set_xlabel("Step")
     if ylabel:
         ax.set_ylabel(ylabel)
-    if any_plotted:
-        ax.legend(fontsize=7, ncol=2)
-    else:
+    if not any_plotted:
         ax.text(0.5, 0.5, "Not logged", ha="center", va="center", fontsize=10, transform=ax.transAxes)
         ax.set_xticks([])
         ax.set_yticks([])
@@ -313,17 +315,56 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         return "val_steps", val_key
 
     def _prefer_train_usage(train_key: str, val_key: str) -> tuple[str, str]:
-        if any(b.get(train_key, [])) or any(c.get(train_key, [])):
+        # usage keys are lists-of-lists; treat "logged" as "any non-empty entry"
+        if any(len(u) for u in b.get(train_key, [])) or any(len(u) for u in c.get(train_key, [])):
             return "train_steps", train_key
         return "val_steps", val_key
 
     fig, axes = plt.subplots(6, 3, figsize=(18, 26))
     fig.suptitle("Baseline vs Current Experiment — Full Diagnostics", fontsize=16, fontweight="bold")
 
+    # Global legend (colors = run, line style = component)
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([0], [0], color=COLOR_BASELINE, lw=2.2, label="Baseline"),
+        Line2D([0], [0], color=COLOR_CURRENT, lw=2.2, label="Current"),
+    ]
+    for comp in ("mlp", "attn", "mos_ctp", "mos_ntp"):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                lw=2.0,
+                linestyle=COMP_LINESTYLES.get(comp, "-"),
+                label=comp,
+            )
+        )
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.965), ncol=3, frameon=False, fontsize=9)
+    fig.subplots_adjust(top=0.93)
+
     # Row 1: Training metrics (total loss, val bpb, step avg)
     _plot_line(axes[0, 0], b, c, "train_loss", "train_loss", "train_steps", "train_steps", "Train Loss (Total)")
     _plot_line(axes[0, 1], b, c, "val_bpb", "val_bpb", "val_steps", "val_steps", "Val BPB")
-    _plot_line(axes[0, 2], b, c, "step_avg_ms", "step_avg_ms", "train_steps", "train_steps", "Step Avg (ms)")
+    # Normalize step time to make runs with different batch sizes comparable.
+    def _ms_per_mtok(d: dict) -> list[float]:
+        tbt = d.get("train_batch_tokens", None)
+        if not tbt:
+            return list(d.get("step_avg_ms", []))
+        return [ms * 1e6 / float(tbt) for ms in d.get("step_avg_ms", [])]
+
+    b["step_ms_per_mtok"] = _ms_per_mtok(b)
+    c["step_ms_per_mtok"] = _ms_per_mtok(c)
+    _plot_line(
+        axes[0, 2],
+        b,
+        c,
+        "step_ms_per_mtok",
+        "step_ms_per_mtok",
+        "train_steps",
+        "train_steps",
+        "Step Avg (ms / 1M tok)",
+    )
 
     # Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
     _plot_line(axes[1, 0], b, c, "ntp_loss", "ntp_loss", "train_steps", "train_steps", "NTP Loss")
@@ -336,8 +377,10 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     _plot_line(axes[2, 0], b, c, key, key, steps_key, steps_key, "DEQ Residual ||z - f(z)||")
     steps_key, key = _prefer_train("deq_recon_train", "deq_recon")
     _plot_line(axes[2, 1], b, c, key, key, steps_key, steps_key, "DEQ Reconstruction Error")
-    steps_key, key = _prefer_train("deq_iter_conv_train", "deq_iter_conv")
-    _plot_line(axes[2, 2], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv ||z_T - z_{T-1}||")
+    # Recon error can be near machine precision; symlog makes tiny-but-nonzero values visible.
+    axes[2, 1].set_yscale("symlog", linthresh=1e-12)
+    steps_key, key = _prefer_train("deq_iter_conv_rel_train", "deq_iter_conv_rel")
+    _plot_line(axes[2, 2], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv (relative)")
 
     # Row 4: Expert diagnostics (usage, entropy, orthogonality). Prefer train-logged series for dense curves.
     # Usage: min per component (Attn, MLP, MoS CTP, MoS NTP)
@@ -412,6 +455,13 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         "Expert Orthogonality (per Component)",
         ylabel="Mean |cos|",
     )
+    # Orthogonality is naturally bounded in [0, 1] (mean abs cosine); keep linear for interpretability.
+    all_vals = []
+    for _, bv, cv in ortho_series:
+        all_vals.extend([v for v in (bv or []) if _is_finite(v)])
+        all_vals.extend([v for v in (cv or []) if _is_finite(v)])
+    hi = max(all_vals) if all_vals else 1.0
+    ax_ortho.set_ylim(0.0, max(1.0, hi * 1.05))
 
     # Row 5: Balance diagnostics (CV), conv_loss, spare
     ax_bal = axes[4, 0]
@@ -448,32 +498,33 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
 
     width = 0.35
     x = [0.0, 1.0]
-    pre_vals = [b_pre, c_pre]
-    post_vals = [b_post, c_post]
+    # Matplotlib bar() can't handle None; use NaN for "missing".
+    pre_vals = [float(b_pre) if b_pre is not None else math.nan, float(c_pre) if c_pre is not None else math.nan]
+    post_vals = [float(b_post) if b_post is not None else math.nan, float(c_post) if c_post is not None else math.nan]
     pre_colors = [COLOR_BASELINE, COLOR_CURRENT]
     post_colors = [COLOR_BASELINE, COLOR_CURRENT]
 
     plotted_any = False
-    if any(v is not None for v in pre_vals):
+    if any(_is_finite(v) for v in pre_vals):
         ax_postq.bar([xi - width / 2 for xi in x], pre_vals, width=width, color=pre_colors, alpha=0.45, label="Pre-quant")
         plotted_any = True
-    if any(v is not None for v in post_vals):
+    if any(_is_finite(v) for v in post_vals):
         ax_postq.bar([xi + width / 2 for xi in x], post_vals, width=width, color=post_colors, alpha=0.90, label="Post-quant")
         plotted_any = True
 
     if plotted_any:
         for xi, v in zip([x[0] - width / 2, x[1] - width / 2], pre_vals, strict=False):
-            if v is not None:
+            if _is_finite(v):
                 ax_postq.text(xi, v, f"{v:.4f}", ha="center", va="bottom", fontsize=9)
         for xi, v in zip([x[0] + width / 2, x[1] + width / 2], post_vals, strict=False):
-            if v is not None:
+            if _is_finite(v):
                 ax_postq.text(xi, v, f"{v:.4f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
         ax_postq.set_xticks(x)
         ax_postq.set_xticklabels(["Baseline", "Current"])
         ax_postq.set_ylabel("val_bpb")
         ax_postq.legend(fontsize=8)
         ax_postq.grid(True, axis="y", alpha=0.3)
-        vals = [v for v in pre_vals + post_vals if v is not None]
+        vals = [v for v in pre_vals + post_vals if _is_finite(v)]
         if vals:
             lo = min(vals)
             hi = max(vals)
@@ -518,13 +569,21 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     if b["deq_residual"] and c["deq_residual"]:
         summary_lines.append(f"DEQ Res:    {b['deq_residual'][-1]:.0f} vs {c['deq_residual'][-1]:.0f}")
     if b["deq_recon"] and c["deq_recon"]:
-        summary_lines.append(f"Recon Err:  {b['deq_recon'][-1]:.1f} vs {c['deq_recon'][-1]:.1f}")
+        summary_lines.append(f"Recon Err:  {b['deq_recon'][-1]:.3e} vs {c['deq_recon'][-1]:.3e}")
     if b["deq_iter_conv"] and c["deq_iter_conv"]:
         summary_lines.append(f"Iter Conv:  {b['deq_iter_conv'][-1]:.1f} vs {c['deq_iter_conv'][-1]:.1f}")
     if b["expert_entropy"] and c["expert_entropy"]:
         summary_lines.append(f"Entropy:    {b['expert_entropy'][-1]:.4f} vs {c['expert_entropy'][-1]:.4f}")
     if b["expert_ortho"] and c["expert_ortho"]:
         summary_lines.append(f"Ortho:      {b['expert_ortho'][-1]:.4f} vs {c['expert_ortho'][-1]:.4f}")
+    if b.get("mlp_ortho") and c.get("mlp_ortho"):
+        summary_lines.append(f"MLP ortho:  {b['mlp_ortho'][-1]:.4f} vs {c['mlp_ortho'][-1]:.4f}")
+    if b.get("attn_ortho") and c.get("attn_ortho"):
+        summary_lines.append(f"Attn ortho: {b['attn_ortho'][-1]:.4f} vs {c['attn_ortho'][-1]:.4f}")
+    if b.get("mlp_ortho_w") and c.get("mlp_ortho_w"):
+        summary_lines.append(f"MLP ortho_w:{b['mlp_ortho_w'][-1]:.4f} vs {c['mlp_ortho_w'][-1]:.4f}")
+    if b.get("attn_ortho_w") and c.get("attn_ortho_w"):
+        summary_lines.append(f"Attn ortho_w:{b['attn_ortho_w'][-1]:.4f} vs {c['attn_ortho_w'][-1]:.4f}")
 
     summary = "\n".join(summary_lines)
     axes[5, 1].text(0.0, 0.5, summary, fontsize=11, family="monospace",

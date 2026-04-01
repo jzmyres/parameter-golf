@@ -90,6 +90,7 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
+        deq_backward="revdeq",
     ).cuda()
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
@@ -169,15 +170,19 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
             else:
                 print(f"WARN: {name} loss not decreasing (first_q={first_q_avg:.4f} -> last_q={last_q_avg:.4f})")
 
-    # 2. Reconstruction error MUST be < 1e-8
-    if any(e > 1e-8 for e in recon_errors):
-        print(f"FAIL: reconstruction error > 1e-8 (got {max(recon_errors):.2e})")
+    # 2. Reconstruction error MUST be < 1e-8 (RevDEQ diagnostics only).
+    if any(e is None for e in recon_errors):
+        print("FAIL: reconstruction error missing in RevDEQ mode")
         ok = False
+    else:
+        if any(e > 1e-8 for e in recon_errors):
+            print(f"FAIL: reconstruction error > 1e-8 (got {max(recon_errors):.2e})")
+            ok = False
 
-    # 3. Reconstruction error should not increase
-    if len(recon_errors) >= 2 and recon_errors[-1] > max(recon_errors[0] * 5, 1e-10):
-        print(f"FAIL: reconstruction error diverging ({recon_errors[0]:.2e} -> {recon_errors[-1]:.2e})")
-        ok = False
+        # 3. Reconstruction error should not increase
+        if len(recon_errors) >= 2 and recon_errors[-1] > max(recon_errors[0] * 5, 1e-10):
+            print(f"FAIL: reconstruction error diverging ({recon_errors[0]:.2e} -> {recon_errors[-1]:.2e})")
+            ok = False
 
     # 4. Convergence MUST decrease: DEQ model must be trained to find a fixed point.
     # Uses RELATIVE convergence (||z_T - z_{T-1}|| / ||z_T||) which is scale-invariant.
