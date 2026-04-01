@@ -1,0 +1,386 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  rulecolor=\color{black!20},
+}
+
+\title{OPG Parameter Golf: Architecture and Training Setup (Code Review)}
+\author{Autoresearch Notes (generated from \texttt{train\_gpt.py})}
+\date{2026-04-01}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes the current ``OPG'' (parameter-golf) training script and model architecture as implemented in
+\texttt{train\_gpt.py}. It is intended as a faithful, code-driven description: the model graph, DEQ solver, routing and
+diagnostics, the loss function, optimization setup (optimizers and schedules), and the post-training quantization and
+evaluation pipeline that produces the scored \texttt{val\_bpb}.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Project goal and constraints (as enforced by the training harness)}
+\paragraph{Optimization target.}
+The primary objective is to minimize the post-quantization validation metric \texttt{val\_bpb} on the FineWeb validation
+split. The script logs both an in-training validation curve (NTP-only) and a final, scored post-quant evaluation after
+INT6 mixed quantization and roundtrip load.
+
+\paragraph{Operational constraints.}
+The project imposes strict constraints (artifact size budget, training wall-clock, DDP correctness). While these are
+documented externally (e.g., \texttt{AGENTS.md}), the script explicitly supports:
+\begin{itemize}
+  \item DDP execution via \texttt{torchrun} (any GPU count).
+  \item Mixed precision training (BF16 autocast) with selected parameters kept in FP32 for optimizer precision.
+  \item A self-contained serialization/quantization routine producing a compressed artifact.
+\end{itemize}
+
+\section{Data, tokenization, and metrics}
+\subsection{Dataset and tokenizer}
+\texttt{train\_gpt.py} loads a pre-tokenized binary dataset from:
+\begin{itemize}
+  \item \texttt{data\_path = ./data/datasets/fineweb10B\_sp1024}
+  \item Training shards: \texttt{fineweb\_train\_*.bin}
+  \item Validation shards: \texttt{fineweb\_val\_*.bin}
+\end{itemize}
+
+Tokenization uses a SentencePiece model:
+\begin{itemize}
+  \item \texttt{tokenizer\_path = ./data/tokenizers/fineweb\_1024\_bpe.model}
+  \item \texttt{vocab\_size = 1024}
+\end{itemize}
+
+\subsection{Bits-per-byte (BPB)}
+Validation and final evaluation compute \texttt{val\_bpb} from NLL loss and a byte-count estimate. The pipeline tracks:
+\begin{align}
+  \text{val\_loss} &= \frac{\sum_t \ell_t}{\#\text{tokens}}, \\
+  \text{bits per token} &= \frac{\text{val\_loss}}{\log 2}, \\
+  \text{tokens per byte} &= \frac{\#\text{tokens}}{\#\text{bytes}}, \\
+  \text{val\_bpb} &= (\text{bits per token}) \cdot (\text{tokens per byte}).
+\end{align}
+The byte count uses precomputed lookup tensors derived from tokenizer metadata (bytes per token, leading-space handling,
+and boundary token behavior).
+
+\section{High-level model graph}
+\subsection{Forward path overview}
+For an input token id tensor $x \in \mathbb{Z}^{B\times T}$ and targets $y \in \mathbb{Z}^{B\times T}$:
+\begin{enumerate}
+  \item Embed tokens with \textbf{tied} embedding matrix $E$ (optional bigram hash embedding is added).
+  \item Normalize and apply a \textbf{SmearGate} (mix current and previous token embeddings).
+  \item Run the \textbf{RevDEQ backbone} to produce hidden states $h$.
+  \item Apply final normalization.
+  \item Produce two distributions with a dual \textbf{MoSHead}:
+    \begin{itemize}
+      \item CTP head: predicts the \emph{current} token $x_i$ from context $x_{\le i}$.
+      \item NTP head: predicts the \emph{next} token $y_i = x_{i+1}$ from context $x_{\le i}$.
+    \end{itemize}
+  \item Compute losses and regularizers (Section~\ref{sec:loss}).
+\end{enumerate}
+
+\subsection{Default architecture hyperparameters}
+The default configuration is defined in the \texttt{Hyperparameters} class. Selected defaults:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Setting & Default \\
+\midrule
+\texttt{model\_dim} & 640 \\
+\texttt{num\_heads} & 8 \\
+\texttt{num\_kv\_heads} & 4 (GQA) \\
+\texttt{mlp\_mult} & 2.5 \\
+\texttt{num\_layers} & 4 (DEQ solver iterations $K$) \\
+\texttt{num\_refinements} & 1 (Diffusion-AR cycles) \\
+\texttt{rope\_base} & 1000 \\
+\texttt{logit\_softcap} & 20 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Core modules}
+\subsection{Embedding and feature augmentation}
+\paragraph{Token embedding.}
+\texttt{tok\_emb} is an \texttt{nn.Embedding} of size $(V=1024, d=640)$, optionally tied to the output head.
+When tied, it is initialized with a small normal distribution (\texttt{tied\_embed\_init\_std}).
+
+\paragraph{SmearGate.}
+SmearGate blends each token embedding with the previous token embedding:
+\begin{align}
+  g &= \sigma(\theta) \in (0,1)^d,\\
+  x'_{t} &= g \odot x_t + (1-g)\odot x_{t-1},
+\end{align}
+where $x_{t-1}$ is zero for $t=0$. The gate is initialized near identity (\texttt{sigmoid(3)=0.95}).
+
+\paragraph{BigramHashEmbedding (optional).}
+The script can add a hashed bigram embedding with a learned scale. Hashing uses a simple XOR-based function over adjacent
+token ids. The embedding table and projection are initialized to zeros; the scale defaults to 0.05.
+
+\subsection{Soft Dense Routing}
+\paragraph{Router weights.}
+\texttt{SoftDenseRouter} produces dense per-expert weights:
+\begin{align}
+  \alpha &= \text{softmax}(W x), \\
+  g &= \sigma(\gamma) \quad \text{(learned per-expert scalars)}, \\
+  w &= \alpha \odot g.
+\end{align}
+Unlike a pure softmax mixture, the post-softmax sigmoid $g$ breaks the convex constraint (total mass $\sum_e w_e$ can be
+$<1$), enabling ``skipping'' experts by reducing effective routed mass.
+
+\paragraph{Balance and sparsity regularizers.}
+During training, diagnostics and balance are computed on the \emph{effective} weights $w$:
+\begin{align}
+  \tilde{w} &= \frac{w}{\sum_e w_e + \epsilon},\\
+  L_\text{bal} &= \text{MSE}(\mathbb{E}[\tilde{w}], \text{Uniform}),\\
+  L_\text{spar} &= \mathbb{E}[|w|].
+\end{align}
+These are accumulated across attention and MLP routers and later scaled (Section~\ref{sec:loss}).
+
+\subsection{MLA + Gated Attention + dense expert output}
+\paragraph{MLA-style KV compression and decoupled RoPE.}
+Attention implements:
+\begin{itemize}
+  \item KV down-projection to a latent dimension.
+  \item Separate key RoPE path (``decoupled RoPE'') and non-positional component.
+  \item GQA with \texttt{num\_kv\_heads} key/value heads expanded to \texttt{num\_heads} when needed.
+\end{itemize}
+
+\paragraph{Head-wise gated attention.}
+The query projection emits both query vectors and per-head gate logits. The SDPA output is modulated:
+\[
+  y \leftarrow y \odot \sigma(\text{gate\_logits} + \text{gate\_bias}).
+\]
+
+\paragraph{Dense experts on attention output.}
+Attention has $E$ low-rank experts, each applying a $(d\rightarrow r\rightarrow d)$ transform to the post-attention output,
+and the router mixes the expert outputs densely:
+\[
+  \text{out} = \sum_{e=1}^E w_e \cdot \text{Expert}_e(y).
+\]
+
+\subsection{MLP experts with dense routing}
+The MLP module similarly implements dense experts:
+\begin{itemize}
+  \item Expert parameters for the gated MLP components (\texttt{expert\_gate}, \texttt{expert\_fc}, \texttt{expert\_down}).
+  \item A dense router computes weights $w$ and mixes expert outputs.
+\end{itemize}
+
+\subsection{MoSHead: dual head (CTP + NTP) with FSQ}
+\paragraph{Mixture-of-Softmaxes.}
+The output head is a dual MoS head:
+\begin{itemize}
+  \item A shared set of experts used by both heads.
+  \item A specialized expert per head.
+  \item Each expert projects $d\rightarrow r$ via an $A$ matrix; logits are produced by multiplying with a head-specific
+  $B$ matrix ($r\rightarrow V$).
+\end{itemize}
+
+\paragraph{FSQ in the intermediate space.}
+Expert latents are bounded with \texttt{tanh} and quantized to a small number of levels with a straight-through estimator
+(training-time only).
+
+\paragraph{No sigmoid gates in MoS routing.}
+MoS uses pure softmax routing (convex combination). The code comment notes that the mixture itself breaks the softmax
+bottleneck, so post-softmax sigmoid gating is not used here.
+
+\section{RevDEQ backbone}
+\subsection{Block structure}
+The DEQ function $f_\theta(z, x_0)$ is implemented by \texttt{Block.forward(z, x0)}:
+\begin{enumerate}
+  \item Inject $x_0$ via a per-dimension convex mixture:
+  \[
+    z \leftarrow m_0 \odot z + m_1 \odot x_0, \quad [m_0, m_1] = \text{softmax}(\texttt{resid\_mix}).
+  \]
+  \item Attention residual update:
+  \[
+    z \leftarrow z + s_a \odot \text{Attn}(\text{RMSNorm}(z)),
+  \]
+  where $s_a$ is a learned per-dimension scale bounded by \texttt{tanh} to $\pm \texttt{attn\_scale\_max}$.
+  \item MLP residual update:
+  \[
+    z \leftarrow z + s_m \odot \text{MLP}(\text{RMSNorm}(z)),
+  \]
+  where $s_m$ is similarly bounded by \texttt{mlp\_scale\_max}.
+\end{enumerate}
+
+\subsection{Coupled-state solver (explicit unroll)}
+The explicit solver iterates a coupled state $(y, z)$ for $K$ steps with relaxation parameter $\beta$:
+\begin{align}
+  y_{k+1} &= (1-\beta) y_k + \beta f_\theta(z_k, x_0), \\
+  z_{k+1} &= (1-\beta) z_k + \beta f_\theta(y_{k+1}, x_0).
+\end{align}
+The script uses $K=\texttt{num\_layers}$ by default, and logs a terminal-step proxy for:
+\begin{itemize}
+  \item Iteration convergence: $\lVert z_T - z_{T-1}\rVert$
+  \item Relative convergence: $\lVert z_T - z_{T-1}\rVert / \max(\lVert z_T\rVert, 1)$
+  \item Residual (when diagnostics enabled): $\lVert z_T - f_\theta(z_T, x_0)\rVert$
+\end{itemize}
+
+\subsection{RevDEQFunction (memory-efficient backward)}
+When \texttt{deq\_backward=revdeq}, forward runs under \texttt{no\_grad} and saves only terminal states. Backward
+reconstructs intermediate states in reverse (using FP64 accumulators for add/sub stability) and computes VJPs per step.
+
+\subsection{Diffusion-AR refinement (predict $\rightarrow$ soft-embed $\rightarrow$ re-solve)}
+The model can run multiple refinement cycles (\texttt{num\_refinements}). After a solve, it builds a sparse soft embedding:
+\begin{itemize}
+  \item Compute head log-probs on normalized terminal state $z$.
+  \item Shift NTP by one position to align with CTP at the same token index.
+  \item Mix probabilities $p_\text{mix} = 0.5(p_\text{ctp} + p_\text{ntp-shift})$.
+  \item Take top-$k$ and form a weighted embedding sum using the token embedding table.
+  \item Scale by \texttt{diffar\_scale} and add to $x_0$ as a refined input, then re-run the DEQ solver.
+\end{itemize}
+The script also uses an EMA-style average over refinement steps (0.5 new + 0.5 previous) for stability.
+
+\section{Loss function and regularization}
+\label{sec:loss}
+For each batch, the script computes:
+\begin{itemize}
+  \item \textbf{NTP loss} (primary): NLL of the NTP head on targets $y$.
+  \item \textbf{CTP loss} (auxiliary): NLL of the CTP head predicting the current token $x$.
+  \item \textbf{Convergence loss} (computed and logged): relative squared update magnitude at the terminal solver step.
+  \item \textbf{Router regularizers}: balance and sparsity from attention/MLP routers, plus MoS balance loss.
+  \item \textbf{Output-space orthogonality penalties}: per-component penalties based on cosine similarity between expert
+  mean outputs/latents (when enabled).
+\end{itemize}
+
+The total loss is:
+\begin{align}
+  L &= L_\text{ntp} + \lambda_\text{ctp} L_\text{ctp} + \lambda_\text{conv} L_\text{conv}
+  + \lambda_\text{bal} L_\text{bal} + \lambda_\text{spar} L_\text{spar}
+  + \lambda_\text{ortho} L_\text{ortho}.
+\end{align}
+
+Default coefficients (from \texttt{Hyperparameters}):
+\begin{itemize}
+  \item $\lambda_\text{ctp} = 0.1 \cdot \texttt{num\_refinements}$ (0 when no refinements).
+  \item $\lambda_\text{conv} = \texttt{conv\_loss\_coef}$ (currently 0.0; convergence is monitored, not optimized).
+  \item Balance multiplier: \texttt{bal\_loss\_coef} times per-component weights (\texttt{attn\_balance\_mult},
+  \texttt{mlp\_balance\_mult}).
+  \item Sparsity coefficient is hard-coded as 0.001 in the loss assembly.
+  \item Output-space orth coefficients: \texttt{mos\_ortho\_out\_coef}, \texttt{attn\_ortho\_out\_coef},
+  \texttt{mlp\_ortho\_out\_coef} (each default 0.05).
+\end{itemize}
+
+\section{Training setup}
+\subsection{DDP, microbatches, and precision}
+\paragraph{DDP.}
+If \texttt{WORLD\_SIZE} is set, the script initializes NCCL and wraps the model in
+\texttt{DistributedDataParallel(broadcast\_buffers=False)}.
+
+\paragraph{Gradient accumulation.}
+The script chooses \texttt{grad\_accum\_steps} automatically as $\lceil 8/\texttt{world\_size}\rceil$ and then adjusts to
+ensure at least one sequence per rank per micro-step.
+
+\paragraph{Mixed precision.}
+Training uses BF16 autocast for forward passes. Many linear layers are implemented via a custom \texttt{CastedLinear};
+after model creation, these are set to FP32 weights for stability (\texttt{module.float()}), and additional low-dimensional
+parameters are restored to FP32.
+
+\subsection{Optimizers}
+The script uses three optimizers:
+\begin{itemize}
+  \item \textbf{Token optimizer}: \texttt{AdamW} on token embeddings (and bigram embedding table), fused, with
+  \texttt{weight\_decay}.
+  \item \textbf{Matrix optimizer}: a custom \textbf{Muon} optimizer on 2D+ matrices in the DEQ block (excluding control
+  tensors). Muon uses momentum and a Newton-Schulz-based orthogonalization backend compiled with \texttt{torch.compile}.
+  \item \textbf{Scalar optimizer}: \texttt{AdamW} on scalar/control tensors, including MoS parameters (3D tensors are not
+  routed to Muon).
+\end{itemize}
+
+\subsection{Learning-rate schedule, warmup, warmdown, and SWA}
+\paragraph{Warmup.}
+\texttt{warmup\_steps} performs a short training run and then restores the initial model and optimizer state. This is a
+system warmup (kernel/cache/timing), not a true optimization phase.
+
+\paragraph{Warmdown.}
+The learning-rate multiplier \texttt{lr\_mul(step, elapsed)} decreases linearly in the last \texttt{warmdown\_iters} steps
+(or based on remaining wall-clock if a cap is set).
+
+\paragraph{Late QAT.}
+During the last $\approx 10\%$ of warmdown (when \texttt{lr\_mul < 0.10}), a global flag enables fake quantization noise
+in selected large 2D tensors to improve robustness to the final INT6 quantization.
+
+\paragraph{SWA.}
+If enabled, stochastic weight averaging collects checkpoints during warmdown and applies the averaged weights before
+serialization and post-quant evaluation.
+
+\section{Logging, diagnostics, and plotting}
+\subsection{Run logs}
+Rank 0 writes a log file at \texttt{logs/\{run\_id\}.txt} and prints the path to stdout. Training lines include:
+\begin{itemize}
+  \item Losses: \texttt{train\_loss}, \texttt{ntp\_loss}, \texttt{ctp\_loss}, \texttt{conv\_loss}.
+  \item Gradient norms.
+  \item DEQ diagnostics (residual proxies, iter convergence, optional reconstruction error for RevDEQ backward).
+  \item Router diagnostics: per-component usage, entropy, CV, and gates (when enabled).
+  \item Output-space orthogonality metrics per component (when logged).
+\end{itemize}
+
+\subsection{Diagnostics cadence}
+Router diagnostics are expensive; the script enables them only around selected forward passes (via a context manager) so
+that plots have curves without requiring very frequent full validation.
+
+\subsection{Comparison plot}
+\texttt{experiments/plot\_metrics.py} parses \texttt{experiments/training\_logs/baseline.log} and \texttt{current.log} and
+generates a single figure \texttt{experiments/metrics\_comparison.png}.
+
+\section{Post-training quantization and final evaluation}
+\subsection{INT6 mixed quantization}
+After training (and optional SWA), the script:
+\begin{itemize}
+  \item Saves FP weights to \texttt{experiments/weights/current/final\_model.pt}.
+  \item Applies mixed INT6 quantization to selected categories (e.g., attention/MLP/bigram) and stores scales.
+  \item Compresses the quantized blob with Zstd (if available) or zlib and writes
+  \texttt{experiments/weights/current/final\_model.int6.ptz}.
+  \item Logs the total artifact size (quant bytes + code bytes).
+\end{itemize}
+
+\subsection{Roundtrip load and scored evaluation}
+The quantized artifact is decompressed, dequantized back to FP tensors, loaded into the model, and evaluated on the full
+validation set (\texttt{full\_eval=True}) to produce the final scored \texttt{val\_bpb}. The script logs both rounded and
+exact values and writes a metadata JSON file for tracking.
+
+\section{Notes on contraction and fixed-point behavior}
+The current design contains mechanisms that \emph{encourage} near-identity updates at initialization (bounded residual
+scales, convex mixing with $x_0$), but contraction is not guaranteed. Contraction depends on the operator norm of the
+Jacobian $\|\partial f/\partial z\|$, which can exceed 1 even with multiplicative gates in $(0,1)$.
+
+Practical diagnostics in this codebase are:
+\begin{itemize}
+  \item Relative iter convergence: $\|z_T-z_{T-1}\|/\|z_T\|$.
+  \item Terminal residual (when diagnostic mode is enabled): $\|z_T - f(z_T)\|$.
+  \item Output-space orthogonality and router health metrics, which act as hard guardrails for expressiveness.
+\end{itemize}
+
+\section{Reference links}
+\begin{thebibliography}{9}
+\bibitem{revdeq}
+RevDEQ: Reversible Deep Equilibrium Models.
+\newblock arXiv:2509.12917.
+\newblock \url{https://arxiv.org/abs/2509.12917v1}
+
+\bibitem{softdense}
+Soft Dense Routing inspiration.
+\newblock arXiv:2308.00951.
+
+\bibitem{gatedattn}
+Gated attention inspiration.
+\newblock arXiv:2505.06708.
+\end{thebibliography}
+
+\end{document}
+
