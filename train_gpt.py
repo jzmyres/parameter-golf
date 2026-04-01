@@ -2249,13 +2249,13 @@ def main() -> None:
             val_loss, val_bpb = eval_val(
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                full_eval=last_step,
+                full_eval=False,
             )
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, include_gates=True, step=step) if master_process else ""
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"val_mode:{'full' if last_step else 'fast'} "
+                f"val_mode:fast "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
                 f"{deq_info}{expert_info}"
             )
@@ -2433,7 +2433,7 @@ def main() -> None:
         q_val_loss, q_val_bpb = eval_val(
             args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            full_eval=True,
+            full_eval=(args.eval_batch_seqs <= 0),
         )
     torch.cuda.synchronize()
     log0(

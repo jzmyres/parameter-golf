@@ -17,6 +17,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 ## Validation Curves
 - If you want plots with curves, make sure the run actually logs multiple validation points (set a non-zero validation interval).
 - For in-training curves, validate on a fixed small subset; reserve full validation for final-only checkpoints.
+- Make full-validation opt-in when iterating locally; it can dominate wall-clock and mask training issues.
 
 ## Plot Robustness
 - Don’t treat missing metrics as zeros; represent “not logged” explicitly.
