@@ -53,13 +53,13 @@ def parse_log(logpath: str) -> dict:
            for s in ("usage", "entropy", "cv")},
         # Per-component orthogonality
         "mlp_ortho": [], "attn_ortho": [], "mos_ctp_ortho": [], "mos_ntp_ortho": [], "mos_ortho": [],
-        "mlp_ortho_w": [], "attn_ortho_w": [],
+        "mlp_ortho_w": [], "attn_ortho_w": [], "mos_ctp_ortho_w": [], "mos_ntp_ortho_w": [],
         # Train-time diagnostics (dense, logged alongside train_loss when enabled)
         "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
         **{f"{p}_{s}_train": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
            for s in ("usage", "entropy", "cv")},
         "mlp_ortho_train": [], "attn_ortho_train": [], "mos_ctp_ortho_train": [], "mos_ntp_ortho_train": [],
-        "mlp_ortho_w_train": [], "attn_ortho_w_train": [],
+        "mlp_ortho_w_train": [], "attn_ortho_w_train": [], "mos_ctp_ortho_w_train": [], "mos_ntp_ortho_w_train": [],
         # Final post-quant scoring metric (what the submission is scored on)
         "final_postquant_val_loss": None,
         "final_postquant_val_bpb": None,
@@ -106,6 +106,8 @@ def parse_log(logpath: str) -> dict:
                 ("attn_ortho_train", rf"attn_ortho:{_FLOAT}"),
                 ("mlp_ortho_w_train", rf"mlp_ortho_w:{_FLOAT}"),
                 ("attn_ortho_w_train", rf"attn_ortho_w:{_FLOAT}"),
+                ("mos_ctp_ortho_w_train", rf"mos_ctp_ortho_w:{_FLOAT}"),
+                ("mos_ntp_ortho_w_train", rf"mos_ntp_ortho_w:{_FLOAT}"),
                 ("mos_ctp_ortho_train", rf"mos_ctp_ortho:{_FLOAT}"),
                 ("mos_ntp_ortho_train", rf"mos_ntp_ortho:{_FLOAT}"),
             ]:
@@ -162,7 +164,7 @@ def parse_log(logpath: str) -> dict:
             for comp in ("mlp", "attn", "mos", "mos_ctp", "mos_ntp"):
                 m_o = re.search(rf"{comp}_ortho:{_FLOAT}", line)
                 data[f"{comp}_ortho"].append(float(m_o.group(1)) if m_o else math.nan)
-            for comp in ("mlp", "attn"):
+            for comp in ("mlp", "attn", "mos_ctp", "mos_ntp"):
                 m_o = re.search(rf"{comp}_ortho_w:{_FLOAT}", line)
                 data[f"{comp}_ortho_w"].append(float(m_o.group(1)) if m_o else math.nan)
             # No balance-loss keys are logged; use *_cv fields for balance diagnostics.
@@ -510,8 +512,38 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         "Convergence Loss (from train)",
     )
 
+    # Weight-space orthogonality subplot (proxy; sanity-check alignment with output-space).
+    ax_ortho_w = axes[4, 2]
+    steps_key, _ = _prefer_train("mlp_ortho_w_train", "mlp_ortho_w")
+    w_series = []
+    for comp_label, key in [
+        ("mlp", "mlp_ortho_w_train" if steps_key == "train_steps" else "mlp_ortho_w"),
+        ("attn", "attn_ortho_w_train" if steps_key == "train_steps" else "attn_ortho_w"),
+        ("mos_ctp", "mos_ctp_ortho_w_train" if steps_key == "train_steps" else "mos_ctp_ortho_w"),
+        ("mos_ntp", "mos_ntp_ortho_w_train" if steps_key == "train_steps" else "mos_ntp_ortho_w"),
+    ]:
+        w_series.append((comp_label, b.get(key, []), c.get(key, [])))
+    _plot_components(
+        ax_ortho_w,
+        b,
+        c,
+        steps_key,
+        w_series,
+        "Weight-Space Orthogonality (per Component)",
+        ylabel="Mean |cos|",
+    )
+    all_w = []
+    for _, bv, cv in w_series:
+        all_w.extend([v for v in (bv or []) if _is_finite(v)])
+        all_w.extend([v for v in (cv or []) if _is_finite(v)])
+    hi = max(all_w) if all_w else 0.01
+    ax_ortho_w.set_ylim(0.0, max(0.01, hi * 1.2))
+
+    # Row 6: Val BPB bars + summary text
+    axes[5, 2].axis("off")
+
     # Pre vs post-quant val_bpb (post-quant is the scored metric)
-    ax_postq = axes[4, 2]
+    ax_postq = axes[5, 0]
     ax_postq.set_title("Val BPB (Pre vs Post-Quant)", fontsize=11)
     b_pre = b["val_bpb"][-1] if b.get("val_bpb") else None
     c_pre = c["val_bpb"][-1] if c.get("val_bpb") else None
@@ -564,27 +596,6 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         )
         ax_postq.set_xticks([])
         ax_postq.set_yticks([])
-
-    # Row 6: left plot + summary text
-    axes[5, 1].axis("off")
-    axes[5, 2].axis("off")
-
-    # Weight-space orthogonality subplot (alignment check; proxy for output-space).
-    ax_ortho_w = axes[5, 0]
-    steps_key, _ = _prefer_train("mlp_ortho_w_train", "mlp_ortho_w")
-    w_series = []
-    for comp_label, key in [
-        ("mlp", "mlp_ortho_w_train" if steps_key == "train_steps" else "mlp_ortho_w"),
-        ("attn", "attn_ortho_w_train" if steps_key == "train_steps" else "attn_ortho_w"),
-    ]:
-        w_series.append((comp_label, b.get(key, []), c.get(key, [])))
-    _plot_components(ax_ortho_w, b, c, steps_key, w_series, "Weight-Space Orthogonality (MLP/Attn)", ylabel="Mean |cos|")
-    all_w = []
-    for _, bv, cv in w_series:
-        all_w.extend([v for v in (bv or []) if _is_finite(v)])
-        all_w.extend([v for v in (cv or []) if _is_finite(v)])
-    hi = max(all_w) if all_w else 0.01
-    ax_ortho_w.set_ylim(0.0, max(0.01, hi * 1.2))
 
     summary_lines = []
     if b["val_bpb"] and c["val_bpb"]:
