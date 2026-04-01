@@ -2499,7 +2499,7 @@ def main() -> None:
         q_val_loss, q_val_bpb = eval_val(
             args, model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            full_eval=(args.eval_batch_seqs <= 0),
+            full_eval=True,
         )
     torch.cuda.synchronize()
     log0(
