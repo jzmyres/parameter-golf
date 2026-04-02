@@ -244,9 +244,12 @@ reconstructs intermediate states in reverse (using FP64 accumulators for add/sub
 \subsection{Diffusion-AR refinement (predict $\rightarrow$ soft-embed $\rightarrow$ re-solve)}
 The model can run multiple refinement cycles (\texttt{num\_refinements}). After a solve, it builds a sparse soft embedding:
 \begin{itemize}
-  \item Compute head log-probs on normalized terminal state $z$, then convert to a valid probability distribution via softmax (exp + renormalize).
-  \item Shift NTP by one position so position $i$ uses the previous-token prediction NTP[$i{-}1$].
-  \item Take top-$k$ and form a weighted embedding sum using the token embedding table.
+  \item Compute head log-probs (CTP and NTP) on normalized terminal state $z$, then convert each to a valid probability distribution
+  (exp + renormalize).
+  \item Shift NTP by one position so position $i$ uses the previous-token prediction NTP[$i{-}1$] (which predicts token $i$).
+  \item Form the refinement distribution as an average of the two valid distributions:
+  $p_\text{mix} \leftarrow 0.5\,p_\text{ctp} + 0.5\,p_\text{ntp-shift}$, with position $0$ using CTP only (no previous token).
+  \item Take top-$k$ (default $k{=}128$) and form a weighted embedding sum using the token embedding table.
   \item Project the expected embedding into the backbone input space (RMSNorm).
   \item Define the refined input as an EMA: $x_0^\text{refined} \leftarrow 0.5\,x_0^\text{new} + 0.5\,x_0^\text{prev}$,
   with $x_0^\text{prev}$ initialized to the original $x_0$ (so refinement step $r{=}0$ is the standard token embedding path).
@@ -255,8 +258,8 @@ The model can run multiple refinement cycles (\texttt{num\_refinements}). After 
 The EMA coupling makes refinement stable without introducing an extra trained ``convergence loss'' term.
 \paragraph{One-hot as a special case.}
 The $r{=}0$ input embedding path corresponds to a delta distribution over tokens (all probability mass on the observed token),
-so the expected embedding is exactly the token's embedding. Position $0$ in refinement steps remains on this path because there is
-no previous-token NTP prediction available.
+so the expected embedding is exactly the token's embedding. For refinement steps ($r{>}0$), position $0$ uses the CTP distribution
+because there is no meaningful previous-token NTP prediction for it.
 
 \section{Loss function and regularization}
 \label{sec:loss}

@@ -39,6 +39,9 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Prefer simple, explicit parameterizations over hidden stability clamps; diagnose fixed-point behavior directly via residual/convergence metrics.
 - When you need contraction, add a single block-level gate and log it; don’t hide stability in many per-path scale knobs.
 
+## Refinement
+- When mixing token distributions, normalize each input distribution first and renormalize after mixing.
+
 ## Configuration
 - Keep experiment hyperparameters in code defaults (or CLI), not hidden environment variables.
 - Remove dead/unreachable configuration paths; they silently rot and confuse debugging.

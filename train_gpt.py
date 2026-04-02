@@ -116,7 +116,7 @@ class Hyperparameters:
     weight_decay = 0.03
 
     # Routing regularization weights
-    attn_balance_mult = 10.0
+    attn_balance_mult = 5.0
     mlp_balance_mult = 1.0
     bal_loss_coef = 1.0
     # Loss-free load balancing (bias controller). Keeps expert utilization healthy without
@@ -125,8 +125,8 @@ class Hyperparameters:
     router_bias_lr = 0.05
     router_bias_clip = 5.0
     mos_ortho_out_coef = 0.05
-    attn_ortho_out_coef = 0.05
-    mlp_ortho_out_coef = 0.05
+    attn_ortho_out_coef = 0.02
+    mlp_ortho_out_coef = 0.02
     deq_backward = "autograd"  # {autograd, revdeq}
     deq_k_jitter = False
     deq_k_min = 4
@@ -1586,35 +1586,50 @@ class GPT(nn.Module):
         # Initialize MoS head from embedding weights
         self.mos_head.init_from_embedding(self.tok_emb.weight.data)
 
-    def _get_soft_embedding(self, z: Tensor, topk: int = 32) -> Tensor:
-        """Diffusion-AR refinement: build a *full* refined embedding from shifted NTP predictions only.
+    def _get_soft_embedding(self, z: Tensor, topk: int = 128) -> Tensor:
+        """Diffusion-AR refinement: build a *full* refined embedding from CTP + shifted NTP predictions.
 
-        For each position i, uses NTP[i-1] from MoSHead: predicts next token after i-1 (= token i).
-        Shift NTP by one position to align predictions with the token index, then
-        take top-k, build sparse expected embedding, then project it into the same
-        backbone-input space as x0 (RMSNorm).
+        For each position i, combines two signals:
+        - CTP[i] from MoSHead: predicts token at position i (from context 0..i)
+        - NTP[i-1] from MoSHead: predicts next token after i-1 (= token i)
+        Shift NTP by one position to align predictions with the token index.
+        For position 0 (no previous token), use CTP only.
+
+        Convert log-probs to valid probability distributions, mix, take top-k,
+        build sparse expected embedding, then project it into the same backbone-input
+        space as x0 (RMSNorm).
         """
         def _logp_to_prob(log_p: Tensor) -> Tensor:
             # MoSHead returns normalized log-probabilities; convert to a numerically-stable
             # probability distribution (sum≈1) in fp32, then renormalize to guarantee validity.
             p = log_p.float().exp()
+            p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
             return p / p.sum(dim=-1, keepdim=True).clamp_min(1e-8)
 
         with torch.no_grad():
             h = self.final_norm(z)
             was_training = self.mos_head.training
             self.mos_head.train(False)
-            _, log_p_ntp = self.mos_head(h)  # [B,T,V] log-probs
+            log_p_ctp, log_p_ntp = self.mos_head(h)  # [B,T,V] log-probs
             self.mos_head.train(was_training)
             # Clear autocast cache to prevent stale weight caching from poisoning
             # subsequent calls with gradients enabled (PyTorch autocast bug).
             torch.clear_autocast_cache()
 
             log_p_ntp_shifted = torch.cat([log_p_ntp[:, :1], log_p_ntp[:, :-1]], dim=1)
-            # Use a valid probability distribution for refinement updates.
-            # (If we ever re-enable CTP mixing, apply the same conversion to CTP as well.)
+            p_ctp = _logp_to_prob(log_p_ctp)
             p_ntp = _logp_to_prob(log_p_ntp_shifted)
-            topk_probs, topk_idx = p_ntp.topk(topk, dim=-1)  # [B,T,K]
+            p_mix = 0.5 * (p_ctp + p_ntp)
+            # Position 0 has no previous token; ignore NTP[0] (which predicts token 1).
+            p_mix[:, 0] = p_ctp[:, 0]
+            p_mix = torch.nan_to_num(p_mix, nan=0.0, posinf=0.0, neginf=0.0)
+            # p_ctp and p_ntp are each normalized probability distributions (sum=1); their convex
+            # combination is therefore already normalized in exact arithmetic. We intentionally
+            # skip a full-vocab renormalization here for speed; the subsequent top-k renorm
+            # ensures the sparse mixture is a valid distribution over its retained support.
+
+            k = min(int(topk), int(p_mix.shape[-1]))
+            topk_probs, topk_idx = p_mix.topk(k, dim=-1)  # [B,T,K]
             topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             W = self.tok_emb.weight.data  # [V, d]
             topk_embeds = F.embedding(topk_idx, W)  # [B,T,K,d]
@@ -1700,8 +1715,6 @@ class GPT(nn.Module):
         for r in range(1 + self.num_refinements):
             if r > 0:
                 new_soft_embed = self._get_soft_embedding(z)
-                # Position 0 has no previous token; keep it stable (one-hot token embedding path).
-                new_soft_embed[:, 0] = prev_soft_embed[:, 0]
                 x0_refined = 0.5 * new_soft_embed + 0.5 * prev_soft_embed
                 prev_soft_embed = x0_refined.detach()
                 z = x0_refined  # warm start from refined input (not old fixed point)
