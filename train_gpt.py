@@ -1587,27 +1587,26 @@ class GPT(nn.Module):
         self.mos_head.init_from_embedding(self.tok_emb.weight.data)
 
     def _get_soft_embedding(self, z: Tensor, topk: int = 32) -> Tensor:
-        """Diffusion-AR refinement: build a *full* refined embedding from CTP + NTP predictions.
+        """Diffusion-AR refinement: build a *full* refined embedding from shifted NTP predictions only.
 
-        For each position i, combines two signals via frozen expert:
-        - CTP[i] from MoSHead: predicts token at position i (from context 0..i)
-        - NTP[i-1] from MoSHead: predicts next token after i-1 (= token i)
-        Mix probabilities, take top-k, build sparse expected embedding, then
-        project it into the same backbone-input space as x0 (RMSNorm).
+        For each position i, uses NTP[i-1] from MoSHead: predicts next token after i-1 (= token i).
+        Shift NTP by one position to align predictions with the token index, then
+        take top-k, build sparse expected embedding, then project it into the same
+        backbone-input space as x0 (RMSNorm).
         """
         with torch.no_grad():
             h = self.final_norm(z)
             was_training = self.mos_head.training
             self.mos_head.train(False)
-            log_p_ctp, log_p_ntp = self.mos_head(h)  # [B,T,V] log-probs
+            _, log_p_ntp = self.mos_head(h)  # [B,T,V] log-probs
             self.mos_head.train(was_training)
             # Clear autocast cache to prevent stale weight caching from poisoning
             # subsequent calls with gradients enabled (PyTorch autocast bug).
             torch.clear_autocast_cache()
 
             log_p_ntp_shifted = torch.cat([log_p_ntp[:, :1], log_p_ntp[:, :-1]], dim=1)
-            p_mix = 0.5 * (log_p_ctp.float().exp() + log_p_ntp_shifted.float().exp())
-            topk_probs, topk_idx = p_mix.topk(topk, dim=-1)  # [B,T,K]
+            p_ntp = log_p_ntp_shifted.float().exp()
+            topk_probs, topk_idx = p_ntp.topk(topk, dim=-1)  # [B,T,K]
             topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             W = self.tok_emb.weight.data  # [V, d]
             topk_embeds = F.embedding(topk_idx, W)  # [B,T,K,d]
@@ -1693,6 +1692,8 @@ class GPT(nn.Module):
         for r in range(1 + self.num_refinements):
             if r > 0:
                 new_soft_embed = self._get_soft_embedding(z)
+                # Position 0 has no previous token; keep it stable (one-hot token embedding path).
+                new_soft_embed[:, 0] = prev_soft_embed[:, 0]
                 x0_refined = 0.5 * new_soft_embed + 0.5 * prev_soft_embed
                 prev_soft_embed = x0_refined.detach()
                 z = x0_refined  # warm start from refined input (not old fixed point)

@@ -245,8 +245,7 @@ reconstructs intermediate states in reverse (using FP64 accumulators for add/sub
 The model can run multiple refinement cycles (\texttt{num\_refinements}). After a solve, it builds a sparse soft embedding:
 \begin{itemize}
   \item Compute head log-probs on normalized terminal state $z$.
-  \item Shift NTP by one position to align with CTP at the same token index.
-  \item Mix probabilities $p_\text{mix} = 0.5(p_\text{ctp} + p_\text{ntp-shift})$.
+  \item Shift NTP by one position so position $i$ uses the previous-token prediction NTP[$i{-}1$].
   \item Take top-$k$ and form a weighted embedding sum using the token embedding table.
   \item Project the expected embedding into the backbone input space (RMSNorm).
   \item Define the refined input as an EMA: $x_0^\text{refined} \leftarrow 0.5\,x_0^\text{new} + 0.5\,x_0^\text{prev}$,
