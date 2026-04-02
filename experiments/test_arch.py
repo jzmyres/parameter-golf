@@ -4,6 +4,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 
+def _get_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def _make_model(**overrides):
     from train_gpt import GPT
     defaults = dict(
@@ -11,16 +15,21 @@ def _make_model(**overrides):
         num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
         tied_embed_init_std=0.005, logit_softcap=30.0, rope_base=10000.0,
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
-        kv_latent_dim=0, num_refinements=1, router_sigmoid_gate=True,
+        kv_latent_dim=0, num_refinements=1, router_sigmoid_gate=False,
     )
     defaults.update(overrides)
-    return GPT(**defaults).cuda().bfloat16()
+    dev = _get_device()
+    m = GPT(**defaults).to(dev)
+    # Keep dtype stable across CPU/GPU: bfloat16 on CUDA, float32 on CPU.
+    if dev.type == "cuda":
+        m = m.bfloat16()
+    return m
 
 
 def test_all_constraints():
     """Test that all 5 constraints are satisfied."""
     model = _make_model()
-    assert getattr(model, "router_sigmoid_gate", True) is True
+    assert getattr(model, "router_sigmoid_gate", False) is False
 
     # Check constraint #1: RevDEQ
     assert model.shared_block is not None, "Must have shared_block (RevDEQ)"
@@ -53,7 +62,9 @@ def test_all_constraints():
     # Check constraint #5: Diffusion-AR (refinement)
     assert model.num_refinements >= 1, "Must have at least 1 refinement step"
     assert hasattr(model, "_get_soft_embedding"), "Must implement refinement soft-embedding builder"
-    z = torch.zeros((2, 32, model.tok_emb.embedding_dim), device="cuda", dtype=torch.bfloat16)
+    dev = _get_device()
+    z_dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
+    z = torch.zeros((2, 32, model.tok_emb.embedding_dim), device=dev, dtype=z_dtype)
     soft = model._get_soft_embedding(z)
     assert soft.shape == z.shape, f"soft embedding must match z shape, got {tuple(soft.shape)}"
 
@@ -74,12 +85,14 @@ def test_all_constraints():
 
 
 def test_router_sigmoid_gate_ablation():
-    """Ablation: disabling router sigmoid gates should yield convex-mixture routing."""
+    """Mode toggle: disabling router sigmoid gates yields convex-mixture routing."""
     model = _make_model(router_sigmoid_gate=False)
     model.eval()
 
     dim = model.tok_emb.embedding_dim
-    x = torch.randn(2, 8, dim, device="cuda", dtype=torch.bfloat16)
+    dev = _get_device()
+    x_dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
+    x = torch.randn(2, 8, dim, device=dev, dtype=x_dtype)
     r = model.shared_block.mlp.mlp_router
     _ = r(x)
 
@@ -94,16 +107,31 @@ def test_router_sigmoid_gate_ablation():
         err = (w.sum(dim=-1) - 1.0).abs().max().item()
     assert err < 1e-3, f"route_weights should sum to 1 when gates disabled; max_err={err:.6f}"
 
+    # Enabling sigmoid gates should reintroduce post-softmax gating.
+    model2 = _make_model(router_sigmoid_gate=True)
+    model2.eval()
+    x2 = torch.randn(2, 8, dim, device=dev, dtype=x_dtype)
+    r2 = model2.shared_block.mlp.mlp_router
+    with torch.no_grad():
+        w2 = r2(x2)
+        s2 = w2.sum(dim=-1).mean().item()
+    assert r2.use_sigmoid_gate is True
+    assert s2 < 0.99, f"expected gated routing sum < 1 when enabled; got mean_sum={s2:.4f}"
+
 
 def test_revdeq_convergence():
     """Test RevDEQ coupled-state iteration converges."""
     model = _make_model(num_layers=8)
 
-    x = torch.randint(0, 1024, (2, 32), device="cuda")
-    y = torch.randint(0, 1024, (2, 32), device="cuda")
+    dev = _get_device()
+    x = torch.randint(0, 1024, (2, 32), device=dev)
+    y = torch.randint(0, 1024, (2, 32), device=dev)
 
     # Forward + backward
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    if dev.type == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            loss = model(x, y)
+    else:
         loss = model(x, y)
     loss.backward()
 
@@ -119,13 +147,17 @@ def test_revdeq_reversibility():
     """Test RevDEQ backward reconstruction quality."""
     model = _make_model(bigram_vocab_size=0, deq_backward="revdeq")
 
-    x = torch.randint(0, 1024, (1, 16), device="cuda")
-    y = torch.randint(0, 1024, (1, 16), device="cuda")
+    dev = _get_device()
+    x = torch.randint(0, 1024, (1, 16), device=dev)
+    y = torch.randint(0, 1024, (1, 16), device=dev)
 
     # Use model in inference mode to trigger reconstruction verification
     model.train(False)
     with torch.inference_mode():
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        if dev.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+        else:
             loss = model(x, y)
 
     assert hasattr(model, '_deq_recon_error'), "Must track reconstruction error"

@@ -13,7 +13,7 @@ You MUST incorporate these three architectural innovations into the transformer 
 
 1. **RevDEQ** (arxiv:2509.12917) — Reversible Deep Equilibrium Model for the main backbone. Output defined as fixed point of a learned function. Exact gradients, no regularization needed.
 
-2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Per-expert **sigmoid gating AFTER softmax** routing to break convex constraint (allows skipping experts). Learned gate scalars per expert. Fully differentiable, no top-k, no token dropping.
+2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Routing is fully differentiable (softmax over experts), no top-k, no token dropping. Post-softmax per-expert sigmoid gating is **optional** (kept only as an ablation knob).
 
 3. **MLA with Gated Attention** (DeepSeek MLA + arxiv:2505.06708) — Low-rank KV compression with decoupled RoPE, plus head-specific sigmoid gates after SDPA for query-dependent sparse modulation of attention outputs.
 
@@ -23,8 +23,8 @@ You MUST incorporate these three architectural innovations into the transformer 
 - Code must work with DDP (torchrun, any GPU count)
 - Evaluation metric: val_bpb on FineWeb validation set
 - **Expert health MUST be satisfied by end of training** (final-only hard constraints):
-  - Per-component min usage ≥ 0.15
-  - Per-component balance CV ≤ 0.20
+  - Per-component min share ≥ 0.6 / num_experts (share is normalized across experts; sum=1)
+  - Per-component balance CV ≤ 0.20 (computed on the same normalized share distribution)
   - MLP/Attn orthogonality (mean |cos|) ≤ 0.20
   - These are guardrails for expressiveness/optimization; do not accept runs that violate them.
 - **Fixed-point behavior is a desired goal**, not a hard constraint: monitor relative convergence/residuals and improve if it does not harm expert health or val_bpb.

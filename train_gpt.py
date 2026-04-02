@@ -134,7 +134,7 @@ class Hyperparameters:
     kv_latent_dim = 0  # 0 = auto (dim//2)
     attn_expert_rank = 0  # 0 = auto (dim//2)
     mlp_expert_rank = 0  # 0 = auto (hidden//2)
-    router_sigmoid_gate = True  # ablation: disable post-softmax sigmoid expert gates
+    router_sigmoid_gate = False  # ablation: optional post-softmax sigmoid expert gates
 
     # SWA knobs (defaults only; override via CLI, not env)
     swa_enabled = True
@@ -1509,7 +1509,7 @@ class GPT(nn.Module):
         attn_ortho_out_coef: float = 0.05,
         mlp_ortho_out_coef: float = 0.05,
         deq_backward: str = "autograd",
-        router_sigmoid_gate: bool = True,
+        router_sigmoid_gate: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
