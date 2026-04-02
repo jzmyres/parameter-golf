@@ -14,6 +14,7 @@ import argparse
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -2434,6 +2435,23 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # Auto-update comparison plots at the end of a run (rank0 only).
+    # Keeps the experiment loop tight: finishing training immediately refreshes
+    # `experiments/metrics_comparison.png` and `experiments/metrics_eval_comparison.png`.
+    if master_process:
+        try:
+            exp_logdir = Path("experiments/training_logs")
+            exp_logdir.mkdir(parents=True, exist_ok=True)
+            if logfile is not None and Path(logfile).exists():
+                # Copy rather than rename so `logs/<run_id>.txt` remains the canonical run log.
+                shutil.copyfile(logfile, exp_logdir / "current.log")
+            # Only run plots if a baseline exists (comparison window protocol).
+            if (exp_logdir / "baseline.log").exists() and (exp_logdir / "current.log").exists():
+                subprocess.run([sys.executable, "experiments/plot_metrics.py"], check=False)
+                subprocess.run([sys.executable, "experiments/plot_eval_metrics.py"], check=False)
+        except Exception as e:
+            log0(f"auto_plot_failed:{type(e).__name__}:{e}")
 
     # Apply SWA if collected
     if args.swa_enabled and swa_state is not None and swa_count > 1:

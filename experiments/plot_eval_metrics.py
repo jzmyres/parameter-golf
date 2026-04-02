@@ -9,11 +9,15 @@ Outputs: experiments/metrics_eval_comparison.png
 
 from __future__ import annotations
 
-import math
+import os
 import sys
 from pathlib import Path
 
-from experiments.plot_metrics import (
+# When executed as `python experiments/plot_eval_metrics.py`, ensure repo root is on sys.path
+# so `experiments.*` namespace imports work (implicit namespace package).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from experiments.plot_metrics import (  # noqa: E402
     COLOR_BASELINE,
     COLOR_CURRENT,
     COMP_LINESTYLES,
@@ -147,4 +151,3 @@ if __name__ == "__main__":
     ok = plot_eval_comparison(str(baseline), str(current), str(expdir))
     if not ok:
         sys.exit(1)
-
