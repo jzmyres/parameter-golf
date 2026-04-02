@@ -1594,6 +1594,12 @@ class GPT(nn.Module):
         take top-k, build sparse expected embedding, then project it into the same
         backbone-input space as x0 (RMSNorm).
         """
+        def _logp_to_prob(log_p: Tensor) -> Tensor:
+            # MoSHead returns normalized log-probabilities; convert to a numerically-stable
+            # probability distribution (sum≈1) in fp32, then renormalize to guarantee validity.
+            p = log_p.float().exp()
+            return p / p.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
         with torch.no_grad():
             h = self.final_norm(z)
             was_training = self.mos_head.training
@@ -1605,7 +1611,9 @@ class GPT(nn.Module):
             torch.clear_autocast_cache()
 
             log_p_ntp_shifted = torch.cat([log_p_ntp[:, :1], log_p_ntp[:, :-1]], dim=1)
-            p_ntp = log_p_ntp_shifted.float().exp()
+            # Use a valid probability distribution for refinement updates.
+            # (If we ever re-enable CTP mixing, apply the same conversion to CTP as well.)
+            p_ntp = _logp_to_prob(log_p_ntp_shifted)
             topk_probs, topk_idx = p_ntp.topk(topk, dim=-1)  # [B,T,K]
             topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             W = self.tok_emb.weight.data  # [V, d]
