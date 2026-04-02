@@ -14,6 +14,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Treat the primary run log as the source of truth; don’t rely on wrapper tools capturing stdout/stderr.
 - For progress monitoring, tail the run log directly.
 - Avoid logging stale diagnostics outside their natural cadence (train-step vs val-step).
+- Make ablations an explicit, logged flag so runs remain comparable and reproducible.
 
 ## Validation Curves
 - If you want plots with curves, make sure the run actually logs multiple validation points (set a non-zero validation interval).
