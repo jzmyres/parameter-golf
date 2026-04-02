@@ -83,7 +83,7 @@ and boundary token behavior).
 For an input token id tensor $x \in \mathbb{Z}^{B\times T}$ and targets $y \in \mathbb{Z}^{B\times T}$:
 \begin{enumerate}
   \item Embed tokens with \textbf{tied} embedding matrix $E$ (optional bigram hash embedding is added).
-  \item Normalize and apply a \textbf{SmearGate} (mix current and previous token embeddings).
+  \item Normalize embeddings (RMSNorm). (SmearGate is disabled / identity in the current code.)
   \item Run the \textbf{RevDEQ backbone} to produce hidden states $h$.
   \item Apply final normalization.
   \item Produce two distributions with a dual \textbf{MoSHead}:
@@ -119,13 +119,10 @@ Setting & Default \\
 \texttt{tok\_emb} is an \texttt{nn.Embedding} of size $(V=1024, d=640)$, optionally tied to the output head.
 When tied, it is initialized with a small normal distribution (\texttt{tied\_embed\_init\_std}).
 
-\paragraph{SmearGate.}
-SmearGate blends each token embedding with the previous token embedding:
-\begin{align}
-  g &= \sigma(\theta) \in (0,1)^d,\\
-  x'_{t} &= g \odot x_t + (1-g)\odot x_{t-1},
-\end{align}
-where $x_{t-1}$ is zero for $t=0$. The gate is initialized near identity (\texttt{sigmoid(6)=0.9975}).
+\paragraph{SmearGate (disabled).}
+The codebase contains a SmearGate module for mixing the current token embedding with the previous token embedding, but the
+current model sets it to \texttt{nn.Identity()} (no effect). This keeps the input path simple and avoids injecting a
+previous-token mixture into the DEQ backbone input.
 
 \paragraph{BigramHashEmbedding (optional).}
 The script can add a hashed bigram embedding with a learned scale. Hashing uses a simple XOR-based function over adjacent
@@ -250,7 +247,7 @@ The model can run multiple refinement cycles (\texttt{num\_refinements}). After 
   \item Shift NTP by one position to align with CTP at the same token index.
   \item Mix probabilities $p_\text{mix} = 0.5(p_\text{ctp} + p_\text{ntp-shift})$.
   \item Take top-$k$ and form a weighted embedding sum using the token embedding table.
-  \item Project the expected embedding into the backbone input space (RMSNorm + SmearGate).
+  \item Project the expected embedding into the backbone input space (RMSNorm).
   \item Define the refined input as an EMA: $x_0^\text{refined} \leftarrow 0.5\,x_0^\text{new} + 0.5\,x_0^\text{prev}$,
   with $x_0^\text{prev}$ initialized to the original $x_0$ (so refinement step $r{=}0$ is the standard token embedding path).
   \item Re-run the DEQ solver using $x_0^\text{refined}$.
@@ -335,6 +332,7 @@ Rank 0 writes a log file at \texttt{logs/\{run\_id\}.txt} and prints the path to
   \item Losses: \texttt{train\_loss}, \texttt{ntp\_loss}, \texttt{ctp\_loss}.
   \item Gradient norms.
   \item DEQ diagnostics (residual proxies, iter convergence, optional reconstruction error for RevDEQ backward).
+  \item Global gate diagnostics: \texttt{gg}, \texttt{gg\_mean}, and \texttt{gg\_iter:[...]}. (The latter reports one value per DEQ iteration.)
   \item Router diagnostics: per-component usage, entropy, CV, and gates (when enabled).
   \item Output-space orthogonality metrics per component (when logged).
 \end{itemize}

@@ -421,7 +421,6 @@ CONTROL_TENSOR_NAME_PATTERNS = (
     "q_gain",
     "skip_weight",
     "skip_weights",
-    "smear.gate",
     "bigram.scale",
     "gate_bias",
     "expert_gate_logits",
@@ -1288,6 +1287,9 @@ class Block(nn.Module):
         self._gg_sum = 0.0
         self._gg_count = 0
         self._gg_last: float | None = None
+        # Fine-grained gg tracking: per Block.forward call (used to derive gg by DEQ iteration).
+        self._gg_call_track_enabled = False
+        self._gg_call_track: list[float] = []
 
         # Constrain mixing weights via softmax (convex combination) but initialize
         # near the historical behavior: mix ≈ [1, 0] (no x0 injection at init).
@@ -1306,6 +1308,8 @@ class Block(nn.Module):
         if self._gg_track_enabled:
             self._gg_sum += gg_val
             self._gg_count += 1
+        if self._gg_call_track_enabled:
+            self._gg_call_track.append(gg_val)
 
         mix = torch.softmax(self.resid_mix.float(), dim=0).to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
@@ -1527,7 +1531,8 @@ class GPT(nn.Module):
         self.blocks = None
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.smear = SmearGate(model_dim)
+        # SmearGate removed: keep the embedding path simple and avoid injecting previous-token mixing.
+        self.smear = nn.Identity()
         # RevDEQ (Constraint #1): single shared block with coupled-state fixed-point iteration
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
@@ -1604,7 +1609,6 @@ class GPT(nn.Module):
 
             # Match the input embedding path as closely as possible (no bigram available for soft tokens).
             soft_embed = _rms_norm(soft_embed.to(dtype=z.dtype))
-            soft_embed = self.smear(soft_embed)
         return soft_embed
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
@@ -1623,6 +1627,9 @@ class GPT(nn.Module):
         self.shared_block._gg_sum = 0.0
         self.shared_block._gg_count = 0
         self.shared_block._gg_track_enabled = True
+        # Also track gg per Block.forward call so we can compute gg by DEQ iteration.
+        self.shared_block._gg_call_track = []
+        self.shared_block._gg_call_track_enabled = True
         try:
             if self.training and self.deq_backward == "revdeq":
                 params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
@@ -1648,10 +1655,16 @@ class GPT(nn.Module):
             return z, z_prev, y_acc, z_acc
         finally:
             self.shared_block._gg_track_enabled = False
+            self.shared_block._gg_call_track_enabled = False
             if self.shared_block._gg_count > 0:
                 self._gg_mean_last_solve = float(self.shared_block._gg_sum / self.shared_block._gg_count)
             else:
                 self._gg_mean_last_solve = None
+            calls = list(getattr(self.shared_block, "_gg_call_track", []) or [])
+            if len(calls) == 2 * K:
+                self._gg_iter_last_solve = [0.5 * (calls[2 * i] + calls[2 * i + 1]) for i in range(K)]
+            else:
+                self._gg_iter_last_solve = []
 
     def _run_backbone(self, x: Tensor) -> Tensor:
         """Decoupled DEQ solver + Diffusion-AR refinement.
@@ -1664,11 +1677,13 @@ class GPT(nn.Module):
         z = x  # warm start
         dtype = x.dtype
         self._deq_residuals: list[float] = []
+        self._gg_iter: list[float] | None = None
         # Avoid leaking stale eval-only diagnostics into train-step logs.
         self._deq_recon_error = None
         prev_soft_embed = x0
         x0_refined = x0  # track for reconstruction
 
+        gg_iters_by_refinement: list[list[float]] = []
         for r in range(1 + self.num_refinements):
             if r > 0:
                 new_soft_embed = self._get_soft_embedding(z)
@@ -1680,6 +1695,22 @@ class GPT(nn.Module):
 
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
             z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
+            gg_iters_by_refinement.append(list(getattr(self, "_gg_iter_last_solve", []) or []))
+
+        # Aggregate gg by DEQ iteration across all refinement solves (r0 one-hot + r>0 soft-embed).
+        # This produces one vector per forward pass: gg_iter[k] = mean over refinements of gg_iter_r[k].
+        if gg_iters_by_refinement:
+            k_max = max((len(v) for v in gg_iters_by_refinement), default=0)
+            if k_max > 0:
+                agg: list[float] = []
+                for k in range(k_max):
+                    vals = [v[k] for v in gg_iters_by_refinement if len(v) > k]
+                    agg.append(float(sum(vals) / max(len(vals), 1)))
+                self._gg_iter = agg
+            else:
+                self._gg_iter = []
+        else:
+            self._gg_iter = None
 
         # Fixed-point diagnostics (desired goal, not a trained loss).
         if self.training:
@@ -1741,7 +1772,6 @@ class GPT(nn.Module):
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = _rms_norm(x)
-        x = self.smear(x)
         x = self._run_backbone(x)
         return self.final_norm(x)
 
@@ -2039,7 +2069,6 @@ def main() -> None:
         p for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
 
@@ -2137,6 +2166,10 @@ def main() -> None:
         gg_mean = getattr(m, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             parts.append(f"gg_mean:{float(gg_mean):.4f}")
+        gg_iter = getattr(m, "_gg_iter", None)
+        if isinstance(gg_iter, list) and gg_iter:
+            gg_str = ",".join(f"{float(v):.4f}" for v in gg_iter)
+            parts.append(f"gg_iter:[{gg_str}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(

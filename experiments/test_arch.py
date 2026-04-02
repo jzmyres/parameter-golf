@@ -73,7 +73,9 @@ def test_all_constraints():
 
     # Gate initialization: all sigmoid gates should start at midpoint 0.5 (logit/bias = 0).
     # Gate initialization: all sigmoid gates should start near-1 (logit ~ 6; sigmoid ~ 0.9975).
-    assert _sigmoid(model.smear.gate.float()).min().item() > 0.99
+    # SmearGate removed; keep the token embedding path unmodified by previous-token mixing.
+    import torch.nn as nn
+    assert isinstance(model.smear, nn.Identity)
     assert torch.allclose(model.shared_block.gg_w.float(), torch.zeros_like(model.shared_block.gg_w.float()))
     assert _sigmoid(model.shared_block.gg_b.float()).item() > 0.99
     assert _sigmoid(attn.gate_bias.float()).min().item() > 0.99

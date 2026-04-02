@@ -3,10 +3,10 @@
 Shows full training curves for ALL diagnostic metrics:
 - Row 1: Train Loss, Val BPB, Step Avg (ms)
 - Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
-- Row 3: DEQ Residual, DEQ Recon Error, DEQ Iter Convergence
+- Row 3: DEQ Residual, Summary, DEQ Iter Convergence
 - Row 4: Expert Usage (min per component), Expert Entropy, Expert Orthogonality
 - Row 5: Expert Balance CV (per component), DEQ Iter Conv (absolute), Final Post-Quant Val BPB
-- Row 6: Summary text with final values comparison
+- Row 6: GG by DEQ iter, DEQ Recon Error, (spare)
 
 All subplots use consistent colors: blue for Baseline, orange for Current.
 Components (mlp/attn/mos_ctp/mos_ntp) are encoded with line styles.
@@ -44,6 +44,7 @@ def parse_log(logpath: str) -> dict:
         "val_steps": [], "val_loss": [], "val_bpb": [],
         # Validation-time diagnostics (sparse unless VAL_LOSS_EVERY is small)
         "deq_residual": [], "deq_recon": [], "deq_iter_conv": [], "deq_iter_conv_rel": [],
+        "gg_iter": [],
         # Combined expert metrics (backward compat)
         "expert_usage": [], "expert_entropy": [], "expert_ortho": [],
         # Per-component: usage (list of lists), entropy, cv
@@ -53,6 +54,7 @@ def parse_log(logpath: str) -> dict:
         "mlp_ortho": [], "attn_ortho": [], "mos_ctp_ortho": [], "mos_ntp_ortho": [], "mos_ortho": [],
         # Train-time diagnostics (dense, logged alongside train_loss when enabled)
         "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
+        "gg_iter_train": [],
         **{f"{p}_{s}_train": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
            for s in ("usage", "entropy", "cv")},
         "mlp_ortho_train": [], "attn_ortho_train": [], "mos_ctp_ortho_train": [], "mos_ntp_ortho_train": [],
@@ -109,6 +111,10 @@ def parse_log(logpath: str) -> dict:
                 data[f"{prefix}_usage_train"].append(
                     [float(v.strip()) for v in m_u.group(1).split(",") if v.strip()] if m_u else []
                 )
+            m_gg = re.search(r"gg_iter:\[([\d.,\s]+)\]", line)
+            data["gg_iter_train"].append(
+                [float(v.strip()) for v in m_gg.group(1).split(",") if v.strip()] if m_gg else []
+            )
 
         # Final post-quant metric (exact, if available)
         # Example:
@@ -156,6 +162,10 @@ def parse_log(logpath: str) -> dict:
                 m_o = re.search(rf"{comp}_ortho:{_FLOAT}", line)
                 data[f"{comp}_ortho"].append(float(m_o.group(1)) if m_o else math.nan)
             # No balance-loss keys are logged; use *_cv fields for balance diagnostics.
+            m_gg = re.search(r"gg_iter:\[([\d.,\s]+)\]", line)
+            data["gg_iter"].append(
+                [float(v.strip()) for v in m_gg.group(1).split(",") if v.strip()] if m_gg else []
+            )
 
     return data
 
@@ -389,8 +399,6 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     # Row 3: DEQ diagnostics (prefer train-logged diagnostics for dense curves)
     steps_key, key = _prefer_train("deq_residual_train", "deq_residual")
     _plot_line(axes[2, 0], b, c, key, key, steps_key, steps_key, "DEQ Residual ||z - f(z)||")
-    steps_key, key = _prefer_train("deq_recon_train", "deq_recon")
-    _plot_line(axes[2, 1], b, c, key, key, steps_key, steps_key, "DEQ Reconstruction Error")
     steps_key, key = _prefer_train("deq_iter_conv_rel_train", "deq_iter_conv_rel")
     _plot_line(axes[2, 2], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv (relative)")
 
@@ -547,8 +555,50 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_postq.set_xticks([])
         ax_postq.set_yticks([])
 
-    # Row 6: summary text only
-    axes[5, 0].axis("off")
+    # Row 6: GG by DEQ iteration + DEQ reconstruction error (swapped) + spare
+    def _prefer_train_listlist(train_key: str, val_key: str) -> tuple[str, str]:
+        if any(len(v) for v in b.get(train_key, [])) or any(len(v) for v in c.get(train_key, [])):
+            return "train_steps", train_key
+        return "val_steps", val_key
+
+    ax_gg = axes[5, 0]
+    steps_key, key = _prefer_train_listlist("gg_iter_train", "gg_iter")
+    b_iters = b.get(key, []) or []
+    c_iters = c.get(key, []) or []
+    k_plot = 0
+    if b_iters:
+        k_plot = max(k_plot, max((len(v) for v in b_iters), default=0))
+    if c_iters:
+        k_plot = max(k_plot, max((len(v) for v in c_iters), default=0))
+    ax_gg.set_title("GG by DEQ Iter (avg across refinements)", fontsize=11)
+    ax_gg.set_xlabel("Step")
+    ax_gg.set_ylabel("gg")
+    ax_gg.grid(True, alpha=0.3)
+    if k_plot <= 0:
+        ax_gg.text(0.5, 0.5, "Not logged", ha="center", va="center", fontsize=10, transform=ax_gg.transAxes)
+        ax_gg.set_xticks([])
+        ax_gg.set_yticks([])
+    else:
+        iter_linestyles = ["-", "--", ":", "-."]
+        from matplotlib.lines import Line2D
+        style_handles = []
+        for ki in range(k_plot):
+            style = iter_linestyles[ki % len(iter_linestyles)]
+            b_vals = [v[ki] if len(v) > ki else math.nan for v in b_iters]
+            c_vals = [v[ki] if len(v) > ki else math.nan for v in c_iters]
+            bx, by = _filter_finite(b.get(steps_key, []), b_vals)
+            cx, cy = _filter_finite(c.get(steps_key, []), c_vals)
+            if bx and by:
+                ax_gg.plot(bx, by, color=COLOR_BASELINE, linestyle=style, alpha=0.75, linewidth=2.0)
+            if cx and cy:
+                ax_gg.plot(cx, cy, color=COLOR_CURRENT, linestyle=style, alpha=0.75, linewidth=2.0)
+            style_handles.append(Line2D([0], [0], color="#333333", lw=2.2, linestyle=style, label=f"k={ki+1}"))
+        ax_gg.set_ylim(0.0, 1.0)
+        ax_gg.legend(handles=style_handles, loc="upper right", fontsize=8, frameon=False)
+
+    steps_key, key = _prefer_train("deq_recon_train", "deq_recon")
+    _plot_line(axes[5, 1], b, c, key, key, steps_key, steps_key, "DEQ Reconstruction Error")
+
     axes[5, 2].axis("off")
 
     summary_lines = []
@@ -585,8 +635,17 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     if b.get("attn_ortho") and c.get("attn_ortho"):
         summary_lines.append(f"Attn ortho: {b['attn_ortho'][-1]:.4f} vs {c['attn_ortho'][-1]:.4f}")
     summary = "\n".join(summary_lines)
-    axes[5, 1].text(0.0, 0.5, summary, fontsize=11, family="monospace",
-                   verticalalignment="center", transform=axes[5, 1].transAxes)
+    # Put summary text into Row 3 middle (swap with reconstruction error).
+    axes[2, 1].axis("off")
+    axes[2, 1].text(
+        0.0,
+        0.5,
+        summary,
+        fontsize=11,
+        family="monospace",
+        verticalalignment="center",
+        transform=axes[2, 1].transAxes,
+    )
 
     plt.tight_layout()
     plt.savefig(str(Path(outdir) / "metrics_comparison.png"), dpi=150)
