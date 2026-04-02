@@ -38,6 +38,7 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 ### Loop (run indefinitely)
 0. Read `EXPERIENCE.md` — apply accumulated guardrails
 0b. After each fix, add **one short, general** lesson to `EXPERIENCE.md` (wisdom, not run-specific details)
+0c. **Shift comparison window**: before starting a new iteration `i`, set the baseline to the *last* iteration `i-1` by copying `experiments/training_logs/current.log` → `experiments/training_logs/baseline.log` (archive the old `baseline.log` if needed). Then run iteration `i` and write its log to `current.log`. This keeps plots as “previous vs current” (i-1 vs i).
 1. `git log --oneline -20` + read `results.tsv` — understand history
 2. Plan ONE focused change (architecture, hyperparameters, or training)
 3. Write tests first (TDD)
