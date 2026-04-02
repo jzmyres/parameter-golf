@@ -18,7 +18,7 @@ def _make_model(**overrides):
         num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
         tied_embed_init_std=0.005, logit_softcap=30.0, rope_base=10000.0,
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
-        kv_latent_dim=0, num_refinements=1, router_sigmoid_gate=False,
+        kv_latent_dim=0, num_refinements=1,
     )
     defaults.update(overrides)
     dev = _get_device()
@@ -32,7 +32,6 @@ def _make_model(**overrides):
 def test_all_constraints():
     """Test that all 5 constraints are satisfied."""
     model = _make_model()
-    assert getattr(model, "router_sigmoid_gate", False) is False
 
     # Check constraint #1: RevDEQ
     assert model.shared_block is not None, "Must have shared_block (RevDEQ)"
@@ -83,48 +82,15 @@ def test_all_constraints():
     dim = model.tok_emb.embedding_dim
     assert attn.c_q.weight.shape[0] == dim + attn.num_heads
     assert torch.allclose(attn.c_q.weight[dim:, :].float(), torch.zeros_like(attn.c_q.weight[dim:, :].float()))
-    # Router expert gates
-    assert _sigmoid(mlp.mlp_router.expert_gate_logits.float()).min().item() > 0.99
-    assert _sigmoid(attn.attn_router.expert_gate_logits.float()).min().item() > 0.99
-
-    print("PASS: All 5 constraints satisfied")
-
-
-def test_router_sigmoid_gate_ablation():
-    """Mode toggle: disabling router sigmoid gates yields convex-mixture routing."""
-    model = _make_model(router_sigmoid_gate=False)
-    model.eval()
-
-    dim = model.tok_emb.embedding_dim
-    dev = _get_device()
-    x_dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
-    x = torch.randn(2, 8, dim, device=dev, dtype=x_dtype)
-    r = model.shared_block.mlp.mlp_router
-    _ = r(x)
-
-    assert r.use_sigmoid_gate is False
-    assert r._expert_gates is not None
-    assert len(r._expert_gates) == r.num_experts
-    assert all(abs(float(g) - 1.0) < 1e-6 for g in r._expert_gates), "disabled sigmoid gate must report gates=1"
-
-    # With gates=1, route_weights should sum to 1 across experts (convex mixture).
+    # Router is pure softmax (dense): weights sum to 1.
+    r = mlp.mlp_router
+    x = torch.randn(2, 8, dim, device=dev, dtype=z_dtype)
     with torch.no_grad():
         w = r(x)
         err = (w.sum(dim=-1) - 1.0).abs().max().item()
-    assert err < 1e-3, f"route_weights should sum to 1 when gates disabled; max_err={err:.6f}"
+    assert err < 1e-3, f"route_weights should sum to 1; max_err={err:.6f}"
 
-    # Enabling sigmoid gates should reintroduce post-softmax gating.
-    model2 = _make_model(router_sigmoid_gate=True)
-    model2.eval()
-    x2 = torch.randn(2, 8, dim, device=dev, dtype=x_dtype)
-    r2 = model2.shared_block.mlp.mlp_router
-    with torch.no_grad():
-        w2 = r2(x2)
-        s2 = w2.sum(dim=-1).mean().item()
-    assert r2.use_sigmoid_gate is True
-    # With per-expert gates initialized near-1, sum across experts should be close to sigmoid(init_logit).
-    expected = float(_sigmoid(r2.expert_gate_logits.float()).mean().item())
-    assert abs(s2 - expected) < 5e-3, f"expected mean_sum≈{expected:.4f} when enabled; got mean_sum={s2:.4f}"
+    print("PASS: All 5 constraints satisfied")
 
 
 def test_revdeq_convergence():
@@ -175,7 +141,6 @@ def test_revdeq_reversibility():
 
 if __name__ == "__main__":
     test_all_constraints()
-    test_router_sigmoid_gate_ablation()
     test_revdeq_convergence()
     test_revdeq_reversibility()
     print("\nAll tests passed!")

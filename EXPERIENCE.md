@@ -8,6 +8,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Name metrics by what they actually measure; don’t reuse a proxy metric under a different label.
 - Prefer enforcing hard constraints in the space you diagnose; remove proxy regularizers if they don’t transfer.
 - Treat expert health metrics as non-negotiable guardrails; optimize everything else inside that envelope.
+- Validate hard constraints in eval-mode; train-mode “healthy routing” can be misleading.
 - Don’t train on a diagnostic unless it consistently improves the scored metric; keep “convergence” as a monitored signal, not a loss.
 
 ## Logging

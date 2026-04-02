@@ -198,7 +198,7 @@ When proposing architecture improvements:
 - **Full-dim low-rank experts**: every expert operates on the FULL model hidden dimension.
   Use low-rank matrices (dim→rank→dim) to control parameter count.
   Do NOT partition dimensions across experts (no `expert_size = dim // num_experts`).
-- **Attn/MLP routing**: softmax + per-expert sigmoid gate (SoftDenseRouter)
+- **Attn/MLP routing**: pure softmax (SoftDenseRouter)
 - **MoS routing (exception)**: pure softmax only (convex combination summing to 1), NO sigmoid gates.
   Per Mixtape paper ("Breaking the Softmax Bottleneck Efficiently", NeurIPS 2019).
   The softmax bottleneck is broken by the mixture of softmaxes itself, not by gating.

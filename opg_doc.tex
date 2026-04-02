@@ -132,24 +132,25 @@ token ids. The embedding table and projection are initialized to zeros; the scal
 \paragraph{Router weights.}
 \texttt{SoftDenseRouter} produces dense per-expert weights:
 \begin{align}
-  \alpha &= \text{softmax}(W x), \\
-  g &= \sigma(\gamma) \quad \text{(learned per-expert scalars)}, \\
-  w &= \alpha \odot g.
+  \alpha &= \text{softmax}(W x + b),
 \end{align}
-In the current setup, the post-softmax sigmoid gate $g$ is an \emph{optional} ablation knob rather than a hard
-requirement (softmax-only / sigmoid-off improved post-quant BPB in an ablation). The default configuration disables this
-gate (\texttt{router\_sigmoid\_gate=0}), in which case $g\equiv 1$ and routing reduces to a convex mixture ($w=\alpha$).
-When enabled, $g$ breaks
-the convex constraint (total mass $\sum_e w_e$ can be $<1$), enabling ``skipping'' experts by reducing effective routed mass.
+where $b$ is a learned per-expert bias updated with a \emph{loss-free} controller during training (see below). Post-softmax
+sigmoid gating is removed from the default architecture because an ablation showed it degrades performance.
 
 \paragraph{Balance and sparsity regularizers.}
-During training, diagnostics and balance are computed on the \emph{effective} weights $w$:
+During training, diagnostics and balance are computed on the routing weights $\alpha$:
 \begin{align}
-  \tilde{w} &= \frac{w}{\sum_e w_e + \epsilon},\\
-  L_\text{bal} &= \text{MSE}(\mathbb{E}[\tilde{w}], \text{Uniform}),\\
-  L_\text{spar} &= \mathbb{E}[|w|].
+  L_\text{bal} &= \text{MSE}(\mathbb{E}[\alpha], \text{Uniform}).
 \end{align}
 These are accumulated across attention and MLP routers and later scaled (Section~\ref{sec:loss}).
+
+\paragraph{Loss-free load balancing (expert bias controller).}
+To prevent dead experts without introducing strong auxiliary-loss gradients, the router maintains a bias vector $b$ that is
+updated once per optimizer step from terminal-state routing statistics:
+\[
+  b \leftarrow \text{clip}\Big(b + \eta\big(\text{Uniform} - \mathbb{E}[\alpha]\big)\Big),
+\]
+with a small learning rate $\eta$ and bounded magnitude. This keeps utilization healthy on eval without crowding the main loss.
 
 \subsection{MLA + Gated Attention + dense expert output}
 \paragraph{MLA-style KV compression and decoupled RoPE.}
