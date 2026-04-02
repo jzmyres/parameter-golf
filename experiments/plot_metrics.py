@@ -5,7 +5,7 @@ Shows full training curves for ALL diagnostic metrics:
 - Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
 - Row 3: DEQ Residual, DEQ Recon Error, DEQ Iter Convergence
 - Row 4: Expert Usage (min per component), Expert Entropy, Expert Orthogonality
-- Row 5: Expert Balance CV (per component), Convergence Loss, Final Post-Quant Val BPB
+- Row 5: Expert Balance CV (per component), DEQ Iter Conv (absolute), Final Post-Quant Val BPB
 - Row 6: Summary text with final values comparison
 
 All subplots use consistent colors: blue for Baseline, orange for Current.
@@ -39,7 +39,6 @@ def parse_log(logpath: str) -> dict:
     data = {
         "train_batch_tokens": None,
         "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
-        "conv_loss": [],
         "grad_norm": [],
         "step_avg_ms": [], "train_time_ms": [],
         "val_steps": [], "val_loss": [], "val_bpb": [],
@@ -80,8 +79,6 @@ def parse_log(logpath: str) -> dict:
             data["ntp_loss"].append(float(m_ntp.group(1)) if m_ntp else math.nan)
             m_ctp = re.search(rf"ctp_loss:{_FLOAT}", line)
             data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else math.nan)
-            m_conv = re.search(rf"conv_loss:{_FLOAT}", line)
-            data["conv_loss"].append(float(m_conv.group(1)) if m_conv else math.nan)
             # Parse pre-clip gradient norm
             m_gn = re.search(rf"grad_norm:{_FLOAT}", line)
             data["grad_norm"].append(float(m_gn.group(1)) if m_gn else math.nan)
@@ -478,7 +475,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     hi = max(all_vals) if all_vals else 1.0
     ax_ortho.set_ylim(0.0, max(1.0, hi * 1.05))
 
-    # Row 5: Balance diagnostics (CV), conv_loss, spare
+    # Row 5: Balance diagnostics (CV), DEQ iter convergence (absolute), scored metric
     ax_bal = axes[4, 0]
     steps_key, _ = _prefer_train("mlp_cv_train", "mlp_cv")
     bal_series = []
@@ -491,17 +488,9 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         bal_series.append((comp_label, b.get(key, []), c.get(key, [])))
     _plot_components(ax_bal, b, c, steps_key, bal_series, "Expert Balance CV (per Component)", ylabel="CV")
 
-    # Convergence loss (from train)
-    _plot_line(
-        axes[4, 1],
-        b,
-        c,
-        "conv_loss",
-        "conv_loss",
-        "train_steps",
-        "train_steps",
-        "Convergence Loss (from train)",
-    )
+    # DEQ iteration convergence (absolute; prefer dense train-logged series when available)
+    steps_key, key = _prefer_train("deq_iter_conv_train", "deq_iter_conv")
+    _plot_line(axes[4, 1], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv (absolute)")
 
     # Pre vs post-quant val_bpb (post-quant is the scored metric)
     ax_postq = axes[4, 2]

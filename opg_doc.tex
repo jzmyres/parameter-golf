@@ -208,14 +208,18 @@ The DEQ function $f_\theta(z, x_0)$ is implemented by \texttt{Block.forward(z, x
   \]
   \item Attention residual update:
   \[
-    z \leftarrow z + s_a \odot \text{Attn}(\text{RMSNorm}(z)),
+    z \leftarrow z + \text{Attn}(\text{RMSNorm}(z)),
   \]
-  where $s_a$ is a learned per-dimension scale bounded by \texttt{tanh} to $\pm \texttt{attn\_scale\_max}$.
   \item MLP residual update:
   \[
-    z \leftarrow z + s_m \odot \text{MLP}(\text{RMSNorm}(z)),
+    z \leftarrow z + \text{MLP}(\text{RMSNorm}(z)).
   \]
-  where $s_m$ is similarly bounded by \texttt{mlp\_scale\_max}.
+  \item Global block gate (scalar):
+  \[
+    f_\theta(z, x_0) = g_g \cdot z_{\text{body}} + (1-g_g)\cdot z_{\text{in}}, \quad g_g=\sigma(\langle \bar z_{\text{in}}, w_{gg}\rangle + b_{gg}),
+  \]
+  where $\bar z_{\text{in}}$ is mean-pooled over batch and sequence, and $(w_{gg}, b_{gg})$ are learned parameters. All
+  sigmoid-based gates are initialized at midpoint ($g{=}0.5$; logit/bias $=0$).
 \end{enumerate}
 
 \subsection{Coupled-state solver (explicit unroll)}
@@ -242,9 +246,12 @@ The model can run multiple refinement cycles (\texttt{num\_refinements}). After 
   \item Shift NTP by one position to align with CTP at the same token index.
   \item Mix probabilities $p_\text{mix} = 0.5(p_\text{ctp} + p_\text{ntp-shift})$.
   \item Take top-$k$ and form a weighted embedding sum using the token embedding table.
-  \item Scale by \texttt{diffar\_scale} and add to $x_0$ as a refined input, then re-run the DEQ solver.
+  \item Project the expected embedding into the backbone input space (RMSNorm + SmearGate).
+  \item Define the refined input as an EMA: $x_0^\text{refined} \leftarrow 0.5\,x_0^\text{new} + 0.5\,x_0^\text{prev}$,
+  with $x_0^\text{prev}$ initialized to the original $x_0$ (so refinement step $r{=}0$ is the standard token embedding path).
+  \item Re-run the DEQ solver using $x_0^\text{refined}$.
 \end{itemize}
-The script also uses an EMA-style average over refinement steps (0.5 new + 0.5 previous) for stability.
+The EMA coupling makes refinement stable without introducing an extra trained ``convergence loss'' term.
 
 \section{Loss function and regularization}
 \label{sec:loss}
@@ -252,7 +259,6 @@ For each batch, the script computes:
 \begin{itemize}
   \item \textbf{NTP loss} (primary): NLL of the NTP head on targets $y$.
   \item \textbf{CTP loss} (auxiliary): NLL of the CTP head predicting the current token $x$.
-  \item \textbf{Convergence loss} (computed and logged): relative squared update magnitude at the terminal solver step.
   \item \textbf{Router regularizers}: balance and sparsity from attention/MLP routers, plus MoS balance loss.
   \item \textbf{Output-space orthogonality penalties}: per-component penalties based on cosine similarity between expert
   mean outputs/latents (when enabled).
@@ -260,7 +266,7 @@ For each batch, the script computes:
 
 The total loss is:
 \begin{align}
-  L &= L_\text{ntp} + \lambda_\text{ctp} L_\text{ctp} + \lambda_\text{conv} L_\text{conv}
+  L &= L_\text{ntp} + \lambda_\text{ctp} L_\text{ctp}
   + \lambda_\text{bal} L_\text{bal} + \lambda_\text{spar} L_\text{spar}
   + \lambda_\text{ortho} L_\text{ortho}.
 \end{align}
@@ -268,7 +274,6 @@ The total loss is:
 Default coefficients (from \texttt{Hyperparameters}):
 \begin{itemize}
   \item $\lambda_\text{ctp} = 0.1 \cdot \texttt{num\_refinements}$ (0 when no refinements).
-  \item $\lambda_\text{conv} = \texttt{conv\_loss\_coef}$ (currently 0.0; convergence is monitored, not optimized).
   \item Balance multiplier: \texttt{bal\_loss\_coef} times per-component weights (\texttt{attn\_balance\_mult},
   \texttt{mlp\_balance\_mult}).
   \item Sparsity coefficient is hard-coded as 0.001 in the loss assembly.
@@ -383,4 +388,3 @@ Gated attention inspiration.
 \end{thebibliography}
 
 \end{document}
-

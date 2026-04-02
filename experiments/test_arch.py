@@ -28,6 +28,7 @@ def test_all_constraints():
 
     # Check constraint #3: MLA with Gated Attention
     attn = model.shared_block.attn
+    assert attn.num_experts == 4, f"Attention must use 4 experts, got {attn.num_experts}"
     assert hasattr(attn, 'c_kv_down'), "Must have KV compression (MLA)"
     assert hasattr(attn, 'c_k_nope'), "Must have non-RoPE key decompress"
     assert hasattr(attn, 'c_k_rope'), "Must have decoupled RoPE key"
@@ -35,6 +36,7 @@ def test_all_constraints():
 
     # Check constraint #2: Soft Dense Routing (Dense MoE)
     mlp = model.shared_block.mlp
+    assert mlp.num_experts == 4, f"MLP must use 4 experts, got {mlp.num_experts}"
     assert hasattr(mlp, 'expert_gate'), "Must have expert_gate (3D per-expert params)"
     assert hasattr(mlp, 'expert_fc'), "Must have expert_fc (3D per-expert params)"
     assert hasattr(mlp, 'expert_down'), "Must have expert_down (3D per-expert params)"
@@ -49,7 +51,23 @@ def test_all_constraints():
 
     # Check constraint #5: Diffusion-AR (refinement)
     assert model.num_refinements >= 1, "Must have at least 1 refinement step"
-    assert hasattr(model, 'diffar_scale'), "Must have diffar_scale"
+    assert hasattr(model, "_get_soft_embedding"), "Must implement refinement soft-embedding builder"
+    z = torch.zeros((2, 32, model.tok_emb.embedding_dim), device="cuda", dtype=torch.bfloat16)
+    soft = model._get_soft_embedding(z)
+    assert soft.shape == z.shape, f"soft embedding must match z shape, got {tuple(soft.shape)}"
+
+    # Gate initialization: all sigmoid gates should start at midpoint 0.5 (logit/bias = 0).
+    assert torch.allclose(model.smear.gate.float(), torch.zeros_like(model.smear.gate.float()))
+    assert torch.allclose(model.shared_block.gg_w.float(), torch.zeros_like(model.shared_block.gg_w.float()))
+    assert float(model.shared_block.gg_b.float().item()) == 0.0
+    assert torch.allclose(attn.gate_bias.float(), torch.zeros_like(attn.gate_bias.float()))
+    # Gate-logit slice of c_q should be zero-initialized.
+    dim = model.tok_emb.embedding_dim
+    assert attn.c_q.weight.shape[0] == dim + attn.num_heads
+    assert torch.allclose(attn.c_q.weight[dim:, :].float(), torch.zeros_like(attn.c_q.weight[dim:, :].float()))
+    # Router expert gates
+    assert torch.allclose(mlp.mlp_router.expert_gate_logits.float(), torch.zeros_like(mlp.mlp_router.expert_gate_logits.float()))
+    assert torch.allclose(attn.attn_router.expert_gate_logits.float(), torch.zeros_like(attn.attn_router.expert_gate_logits.float()))
 
     print("PASS: All 5 constraints satisfied")
 

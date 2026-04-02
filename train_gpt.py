@@ -84,8 +84,6 @@ class Hyperparameters:
     qk_gain_init = 1.5
     deq_beta = 0.2
     resid_mix_init_logit = 5.0
-    attn_scale_max = 0.2
-    mlp_scale_max = 0.2
 
     vocab_size = 1024
     num_layers = 4  # DEQ solver iters per refinement step (fixed K by default)
@@ -121,8 +119,6 @@ class Hyperparameters:
     mos_ortho_out_coef = 0.05
     attn_ortho_out_coef = 0.05
     mlp_ortho_out_coef = 0.05
-    conv_loss_coef = 0.0
-
     deq_backward = "autograd"  # {autograd, revdeq}
     deq_k_jitter = False
     deq_k_min = 4
@@ -165,7 +161,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--mos-ortho-out-coef", type=float, default=None)
     p.add_argument("--attn-ortho-out-coef", type=float, default=None)
     p.add_argument("--mlp-ortho-out-coef", type=float, default=None)
-    p.add_argument("--conv-loss-coef", type=float, default=None)
     p.add_argument("--bigram-vocab-size", type=int, default=None)
     p.add_argument("--bigram-dim", type=int, default=None)
     p.add_argument("--kv-latent-dim", type=int, default=None)
@@ -378,7 +373,7 @@ def eval_val(
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 _ = model(x, y)
-            # Use NTP-only loss for val (exclude CTP and convergence terms)
+            # Use NTP-only loss for val (exclude CTP term)
             batch_loss = torch.tensor(base_m._ntp_loss, device=device)
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -413,18 +408,15 @@ def eval_val(
 CONTROL_TENSOR_NAME_PATTERNS = (
     # Keep only small control tensors in fp32. Avoid broad substrings like "expert_gate"
     # which can match large expert weight tensors (e.g., shared_block.mlp.expert_gate).
-    "attn_scale",
-    "attn_scales",
-    "mlp_scale",
-    "mlp_scales",
     "resid_mix",
     "resid_mixes",
+    "gg_w",
+    "gg_b",
     "q_gain",
     "skip_weight",
     "skip_weights",
     "smear.gate",
     "bigram.scale",
-    "diffar_scale",
     "gate_bias",
     "expert_gate_logits",
     "expert_gate_ctp_logits",
@@ -734,8 +726,8 @@ class SoftDenseRouter(nn.Module):
         self.router = CastedLinear(dim, num_experts, bias=False)
         # Small router init → near-uniform routing at start
         nn.init.normal_(self.router.weight, std=0.01)
-        # Learned per-expert gate scalars (post-softmax); init open (sigmoid(1)=0.73)
-        self.expert_gate_logits = nn.Parameter(torch.ones(num_experts, dtype=torch.float32))
+        # Learned per-expert gate scalars (post-softmax); init midpoint (sigmoid(0)=0.5)
+        self.expert_gate_logits = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
         # Diagnostics (set during forward)
         self._balance_loss = None
         self._sparsity_loss = None
@@ -823,7 +815,7 @@ class CausalSelfAttention(nn.Module):
     - Soft dense routing on output projection (MoE for attention)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
-                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 2,
+                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 4,
                  expert_rank: int = 0):
         super().__init__()
         if dim % num_heads != 0:
@@ -834,7 +826,7 @@ class CausalSelfAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
         self.num_experts = num_experts
-        self.expert_rank = expert_rank if expert_rank > 0 else dim // 2
+        self.expert_rank = expert_rank if expert_rank > 0 else max(dim // max(self.num_experts, 1), 1)
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
 
@@ -845,6 +837,9 @@ class CausalSelfAttention(nn.Module):
 
         # Q projection outputs query + scalar per-head gate logits.
         self.c_q = CastedLinear(dim, dim + num_heads, bias=False)
+        # Initialize the gate-logit slice to 0 so the attention gate starts at 0.5.
+        with torch.no_grad():
+            self.c_q.weight[dim:, :].zero_()
         # KV compression path
         self.c_kv_down = CastedLinear(dim, self.kv_latent_dim, bias=False)
         self.c_k_nope = CastedLinear(self.kv_latent_dim, num_kv_heads * self.nope_dim, bias=False)
@@ -860,7 +855,7 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
         # Gated attention bias (per-head scalar)
-        self.gate_bias = nn.Parameter(torch.ones(num_heads, dtype=torch.float32))
+        self.gate_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
         # Soft dense routing on attention output (MoE for attention)
         self.attn_router = SoftDenseRouter(dim, num_experts)
         self.out_ortho_coef = 0.0
@@ -954,11 +949,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     """SiLU-gated MLP with true expert parameters + Soft Dense Routing (Constraint #2)."""
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2, expert_rank: int = 0):
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 4, expert_rank: int = 0):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
-        self.expert_rank = expert_rank if expert_rank > 0 else hidden // 2
+        self.expert_rank = expert_rank if expert_rank > 0 else max(hidden // max(self.num_experts, 1), 1)
         self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
@@ -1020,8 +1015,8 @@ class SmearGate(nn.Module):
     """Blend each token's embedding with the previous token's embedding."""
     def __init__(self, dim: int):
         super().__init__()
-        # Initialize near-identity: mostly current token, slight previous-token injection.
-        self.gate = nn.Parameter(torch.full((dim,), 3.0, dtype=torch.float32))  # sigmoid(3)=0.95
+        # Initialize at midpoint: equal blend of current token and previous token.
+        self.gate = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))  # sigmoid(0)=0.5
 
     def forward(self, x: Tensor) -> Tensor:
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
@@ -1251,25 +1246,24 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 resid_mix_init_logit: float = 5.0, attn_scale_max: float = 0.2,
-                 mlp_scale_max: float = 0.2):
+                 resid_mix_init_logit: float = 5.0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, expert_rank=attn_expert_rank)
         self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank)
-        # Small init for DEQ stability — block starts as near-identity
-        self.attn_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.full((dim,), 0.01, dtype=torch.float32))
-        if attn_scale_max <= 0.0:
-            raise ValueError(f"attn_scale_max must be > 0, got {attn_scale_max}")
-        if mlp_scale_max <= 0.0:
-            raise ValueError(f"mlp_scale_max must be > 0, got {mlp_scale_max}")
         if resid_mix_init_logit <= 0.0:
             raise ValueError(f"resid_mix_init_logit must be > 0, got {resid_mix_init_logit}")
-        self.attn_scale_max = float(attn_scale_max)
-        self.mlp_scale_max = float(mlp_scale_max)
+
+        # Global gate scalar for the entire transformer block (midpoint init = 0.5).
+        # Computed from pooled block input so gg can vary across DEQ iterations.
+        self.gg_w = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
+        self.gg_b = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self._gg_track_enabled = False
+        self._gg_sum = 0.0
+        self._gg_count = 0
+        self._gg_last: float | None = None
 
         # Constrain mixing weights via softmax (convex combination) but initialize
         # near the historical behavior: mix ≈ [1, 0] (no x0 injection at init).
@@ -1279,17 +1273,24 @@ class Block(nn.Module):
             self.resid_mix[1].fill_(-resid_mix_init_logit)
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        z_in = x
+        pooled = z_in.float().mean(dim=(0, 1))
+        gg_logit = (pooled * self.gg_w).sum() + self.gg_b
+        gg = torch.sigmoid(gg_logit).to(dtype=x.dtype)
+        gg_val = float(gg.detach().item())
+        self._gg_last = gg_val
+        if self._gg_track_enabled:
+            self._gg_sum += gg_val
+            self._gg_count += 1
+
         mix = torch.softmax(self.resid_mix.float(), dim=0).to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_scale = self.attn_scale.float()
-        attn_scale = (attn_scale / self.attn_scale_max).tanh() * self.attn_scale_max
         attn_out = self.attn(self.attn_norm(x))
-        x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        mlp_scale = self.mlp_scale.float()
-        mlp_scale = (mlp_scale / self.mlp_scale_max).tanh() * self.mlp_scale_max
+        x = x + attn_out
         mlp_out = self.mlp(self.mlp_norm(x))
-        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
-        return x
+        x = x + mlp_out
+        # Global residual blend: f(z, x0) = gg * transformer(z, x0) + (1 - gg) * z
+        return gg * x + (1 - gg) * z_in
 
 
 class RevDEQFunction(torch.autograd.Function):
@@ -1481,15 +1482,12 @@ class GPT(nn.Module):
         mlp_expert_rank: int = 0,
         deq_beta: float = 0.5,
         resid_mix_init_logit: float = 5.0,
-        attn_scale_max: float = 0.2,
-        mlp_scale_max: float = 0.2,
         attn_balance_mult: float = 3.0,
         mlp_balance_mult: float = 1.0,
         bal_loss_coef: float = 0.5,
         mos_ortho_out_coef: float = 0.05,
         attn_ortho_out_coef: float = 0.05,
         mlp_ortho_out_coef: float = 0.05,
-        conv_loss_coef: float = 0.0,
         deq_backward: str = "autograd",
     ):
         super().__init__()
@@ -1509,9 +1507,7 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                   attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                  resid_mix_init_logit=resid_mix_init_logit,
-                                  attn_scale_max=attn_scale_max,
-                                  mlp_scale_max=mlp_scale_max)
+                                  resid_mix_init_logit=resid_mix_init_logit)
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -1519,7 +1515,6 @@ class GPT(nn.Module):
         self.mos_ortho_out_coef = float(mos_ortho_out_coef)
         self.attn_ortho_out_coef = float(attn_ortho_out_coef)
         self.mlp_ortho_out_coef = float(mlp_ortho_out_coef)
-        self.conv_loss_coef = float(conv_loss_coef)
         if deq_backward not in ("autograd", "revdeq"):
             raise ValueError(f"deq_backward must be autograd|revdeq, got {deq_backward!r}")
         self.deq_backward = deq_backward
@@ -1527,8 +1522,6 @@ class GPT(nn.Module):
         # can materialize differentiable losses when using autograd-unrolled DEQ.
         self.shared_block.attn.out_ortho_coef = self.attn_ortho_out_coef
         self.shared_block.mlp.out_ortho_coef = self.mlp_ortho_out_coef
-        # Diffusion-AR scale: controls strength of prediction-feedback (init small for DEQ stability)
-        self.diffar_scale = nn.Parameter(torch.tensor(0.01, dtype=torch.float32))
         # MoS output head (Constraints #4+#5): shared experts, dual B for CTP/NTP
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm()
@@ -1546,16 +1539,23 @@ class GPT(nn.Module):
                     if ".proj." in name or name.endswith(".proj"):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * self.num_layers))
+        # Ensure sigmoid gate logits start at midpoint 0.5 by forcing their logit-producing
+        # weights to 0 after generic init passes.
+        with torch.no_grad():
+            attn = self.shared_block.attn
+            dim = self.tok_emb.embedding_dim
+            attn.c_q.weight[dim:, :].zero_()
         # Initialize MoS head from embedding weights
         self.mos_head.init_from_embedding(self.tok_emb.weight.data)
 
     def _get_soft_embedding(self, z: Tensor, topk: int = 32) -> Tensor:
-        """Diffusion-AR: build soft embedding from CTP + NTP predictions.
+        """Diffusion-AR refinement: build a *full* refined embedding from CTP + NTP predictions.
 
         For each position i, combines two signals via frozen expert:
         - CTP[i] from MoSHead: predicts token at position i (from context 0..i)
         - NTP[i-1] from MoSHead: predicts next token after i-1 (= token i)
-        Mix probabilities, take top-k, build sparse soft embedding.
+        Mix probabilities, take top-k, build sparse expected embedding, then
+        project it into the same backbone-input space as x0 (RMSNorm + SmearGate).
         """
         with torch.no_grad():
             h = self.final_norm(z)
@@ -1574,7 +1574,11 @@ class GPT(nn.Module):
             W = self.tok_emb.weight.data  # [V, d]
             topk_embeds = F.embedding(topk_idx, W)  # [B,T,K,d]
             soft_embed = (topk_probs.unsqueeze(-1) * topk_embeds).sum(-2)  # [B,T,d]
-        return self.diffar_scale.to(dtype=z.dtype) * soft_embed.to(z.dtype)
+
+            # Match the input embedding path as closely as possible (no bigram available for soft tokens).
+            soft_embed = _rms_norm(soft_embed.to(dtype=z.dtype))
+            soft_embed = self.smear(soft_embed)
+        return soft_embed
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
         """Run DEQ coupled-state solver.
@@ -1588,28 +1592,39 @@ class GPT(nn.Module):
         dtype = x0.dtype
         K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
 
-        if self.training and self.deq_backward == "revdeq":
-            params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
-            z, z_prev = RevDEQFunction.apply(
-                self.shared_block, x0, z_init, beta, K, *params
-            )
-            return z, z_prev, None, None
+        # Track global gate gg across the entire DEQ solve (avg over all block calls).
+        self.shared_block._gg_sum = 0.0
+        self.shared_block._gg_count = 0
+        self.shared_block._gg_track_enabled = True
+        try:
+            if self.training and self.deq_backward == "revdeq":
+                params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
+                z, z_prev = RevDEQFunction.apply(
+                    self.shared_block, x0, z_init, beta, K, *params
+                )
+                return z, z_prev, None, None
 
-        # Explicit coupled-state unroll (autograd-enabled in training).
-        acc_dtype = torch.float64 if (not self.training and self.deq_backward == "revdeq") else torch.float32
-        y_acc = z_init.to(acc_dtype)
-        z_acc = z_init.to(acc_dtype)
-        z = z_init
-        z_prev = z
-        for _ in range(K):
+            # Explicit coupled-state unroll (autograd-enabled in training).
+            acc_dtype = torch.float64 if (not self.training and self.deq_backward == "revdeq") else torch.float32
+            y_acc = z_init.to(acc_dtype)
+            z_acc = z_init.to(acc_dtype)
+            z = z_init
             z_prev = z
-            f_z = self.shared_block(z, x0)
-            y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
-            y = y_acc.to(dtype)
-            f_y = self.shared_block(y, x0)
-            z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
-            z = z_acc.to(dtype)
-        return z, z_prev, y_acc, z_acc
+            for _ in range(K):
+                z_prev = z
+                f_z = self.shared_block(z, x0)
+                y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
+                y = y_acc.to(dtype)
+                f_y = self.shared_block(y, x0)
+                z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
+                z = z_acc.to(dtype)
+            return z, z_prev, y_acc, z_acc
+        finally:
+            self.shared_block._gg_track_enabled = False
+            if self.shared_block._gg_count > 0:
+                self._gg_mean_last_solve = float(self.shared_block._gg_sum / self.shared_block._gg_count)
+            else:
+                self._gg_mean_last_solve = None
 
     def _run_backbone(self, x: Tensor) -> Tensor:
         """Decoupled DEQ solver + Diffusion-AR refinement.
@@ -1624,18 +1639,14 @@ class GPT(nn.Module):
         self._deq_residuals: list[float] = []
         # Avoid leaking stale eval-only diagnostics into train-step logs.
         self._deq_recon_error = None
-        prev_soft_embed = None
+        prev_soft_embed = x0
         x0_refined = x0  # track for reconstruction
 
         for r in range(1 + self.num_refinements):
             if r > 0:
                 new_soft_embed = self._get_soft_embedding(z)
-                if prev_soft_embed is not None:
-                    soft_embed = 0.5 * new_soft_embed + 0.5 * prev_soft_embed
-                else:
-                    soft_embed = new_soft_embed
-                prev_soft_embed = soft_embed.detach()
-                x0_refined = x0 + soft_embed
+                x0_refined = 0.5 * new_soft_embed + 0.5 * prev_soft_embed
+                prev_soft_embed = x0_refined.detach()
                 z = x0_refined  # warm start from refined input (not old fixed point)
             else:
                 x0_refined = x0
@@ -1643,18 +1654,8 @@ class GPT(nn.Module):
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
             z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        # Convergence loss: ||z_T - z_{T-1}||² / ||z_T||² (relative, scale-invariant)
-        # This produced the best val_bpb (1.4291). Absolute MSE consistently worse.
+        # Fixed-point diagnostics (desired goal, not a trained loss).
         if self.training:
-            z_norm_sq = z.detach().float().pow(2).sum().clamp_min(1.0)
-            if z_prev is not None:
-                self._convergence_loss = (z - z_prev).float().pow(2).sum() / z_norm_sq
-            elif y_acc is not None:
-                self._convergence_loss = (y_acc - z).float().pow(2).sum() / z_norm_sq
-            else:
-                f_z = self.shared_block(z, x0_refined)
-                self._convergence_loss = (z - f_z).float().pow(2).sum() / z_norm_sq
-            # Track BOTH absolute and relative convergence
             if z_prev is not None:
                 abs_conv = (z - z_prev).float().norm().item()
                 z_norm_diag = z.detach().float().norm().clamp_min(1.0).item()
@@ -1741,11 +1742,9 @@ class GPT(nn.Module):
         V = self.tok_emb.num_embeddings
         ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
         ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
-        conv_loss = getattr(self, '_convergence_loss', torch.tensor(0.0, device=ntp_loss.device))
         bal_loss, spar_loss, _ = self._collect_routing_losses(ntp_loss.device)
         self._ntp_loss = ntp_loss.detach().item()
         self._ctp_loss = ctp_loss.detach().item()
-        self._conv_loss = conv_loss.detach().item() if isinstance(conv_loss, torch.Tensor) else 0.0
         # CTP weight scales with refinement steps: at step 0 input is clean one-hot,
         # CTP becomes meaningful only after soft embedding refinement
         ctp_weight = 0.1 * self.num_refinements
@@ -1767,7 +1766,6 @@ class GPT(nn.Module):
         return (
             ntp_loss
             + ctp_weight * ctp_loss
-            + self.conv_loss_coef * conv_loss
             + self.bal_loss_coef * bal_loss
             + 0.001 * spar_loss
             + self.mos_ortho_out_coef * mos_ortho_loss
@@ -1987,15 +1985,12 @@ def main() -> None:
         mlp_expert_rank=args.mlp_expert_rank,
         deq_beta=args.deq_beta,
         resid_mix_init_logit=args.resid_mix_init_logit,
-        attn_scale_max=args.attn_scale_max,
-        mlp_scale_max=args.mlp_scale_max,
         attn_balance_mult=args.attn_balance_mult,
         mlp_balance_mult=args.mlp_balance_mult,
         bal_loss_coef=args.bal_loss_coef,
         mos_ortho_out_coef=args.mos_ortho_out_coef,
         attn_ortho_out_coef=args.attn_ortho_out_coef,
         mlp_ortho_out_coef=args.mlp_ortho_out_coef,
-        conv_loss_coef=args.conv_loss_coef,
         deq_backward=args.deq_backward,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -2108,6 +2103,11 @@ def main() -> None:
             parts.append(f"deq_iter_conv:{m._deq_iter_convergence:.6f}")
         if hasattr(m, "_deq_iter_convergence_rel"):
             parts.append(f"deq_iter_conv_rel:{m._deq_iter_convergence_rel:.6f}")
+        if hasattr(m, "shared_block") and getattr(m.shared_block, "_gg_last", None) is not None:
+            parts.append(f"gg:{float(m.shared_block._gg_last):.4f}")
+        gg_mean = getattr(m, "_gg_mean_last_solve", None)
+        if gg_mean is not None:
+            parts.append(f"gg_mean:{float(gg_mean):.4f}")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(
@@ -2318,12 +2318,11 @@ def main() -> None:
         if should_log_train:
             ntp = getattr(base_model, '_ntp_loss', 0.0)
             ctp = getattr(base_model, '_ctp_loss', 0.0)
-            conv = getattr(base_model, '_conv_loss', 0.0)
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step, require_step_match=True) if master_process else ""
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} conv_loss:{conv:.6f} "
+                f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} "
                 f"grad_norm:{_preclip_grad_norm:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 f"{deq_info}{expert_info}"

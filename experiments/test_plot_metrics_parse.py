@@ -16,7 +16,7 @@ class TestPlotMetricsParse(unittest.TestCase):
         log = "\n".join(
             [
                 # Train log line includes diagnostics we want plotted densely.
-                "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 conv_loss:0.123456 grad_norm:0.9 "
+                "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
                 "train_time:10.0ms step_avg:10.0ms "
                 "deq_residual:1.0 deq_recon_err:0.0 deq_iter_conv:0.1 "
                 "mlp_ortho:0.25 attn_ortho:0.50 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "

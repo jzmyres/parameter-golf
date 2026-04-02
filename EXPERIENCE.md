@@ -8,6 +8,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Name metrics by what they actually measure; don’t reuse a proxy metric under a different label.
 - Prefer enforcing hard constraints in the space you diagnose; remove proxy regularizers if they don’t transfer.
 - Treat expert health metrics as non-negotiable guardrails; optimize everything else inside that envelope.
+- Don’t train on a diagnostic unless it consistently improves the scored metric; keep “convergence” as a monitored signal, not a loss.
 
 ## Logging
 - Treat the primary run log as the source of truth; don’t rely on wrapper tools capturing stdout/stderr.
@@ -33,6 +34,8 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - FP64 add/sub is a *reversibility* tool (reconstruction accuracy), not a default training requirement.
 - Use autograd-unroll when you need output-space regularizers; use RevDEQ backward when you need constant-memory exact gradients.
 - Only compute/log reconstruction error when using the RevDEQ backward path (otherwise it’s not an actionable signal).
+- Prefer simple, explicit parameterizations over hidden stability clamps; diagnose fixed-point behavior directly via residual/convergence metrics.
+- When you need contraction, add a single block-level gate and log it; don’t hide stability in many per-path scale knobs.
 
 ## Configuration
 - Keep experiment hyperparameters in code defaults (or CLI), not hidden environment variables.
