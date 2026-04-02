@@ -140,7 +140,8 @@ token ids. The embedding table and projection are initialized to zeros; the scal
   w &= \alpha \odot g.
 \end{align}
 In the current setup, the post-softmax sigmoid gate $g$ is treated as an \emph{optional} ablation knob rather than a hard
-requirement. When disabled, $g\equiv 1$ and routing reduces to a convex mixture ($w=\alpha$). When enabled, $g$ breaks
+requirement (sigmoid-off improved post-quant BPB in an ablation). When disabled, $g\equiv 1$ and routing reduces to a
+convex mixture ($w=\alpha$). When enabled, $g$ breaks
 the convex constraint (total mass $\sum_e w_e$ can be $<1$), enabling ``skipping'' experts by reducing effective routed mass.
 
 \paragraph{Balance and sparsity regularizers.}

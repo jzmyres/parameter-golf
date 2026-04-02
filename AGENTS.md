@@ -13,7 +13,7 @@ You MUST incorporate these three architectural innovations into the transformer 
 
 1. **RevDEQ** (arxiv:2509.12917) — Reversible Deep Equilibrium Model for the main backbone. Output defined as fixed point of a learned function. Exact gradients, no regularization needed.
 
-2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Routing is fully differentiable (softmax over experts), no top-k, no token dropping. Post-softmax per-expert sigmoid gating is **optional** (kept only as an ablation knob).
+2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Routing is fully differentiable (softmax over experts), no top-k, no token dropping. Post-softmax per-expert sigmoid gating is **optional** (kept only as an ablation knob; sigmoid-off improved post-quant val\_bpb in an ablation).
 
 3. **MLA with Gated Attention** (DeepSeek MLA + arxiv:2505.06708) — Low-rank KV compression with decoupled RoPE, plus head-specific sigmoid gates after SDPA for query-dependent sparse modulation of attention outputs.
 
