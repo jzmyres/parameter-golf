@@ -11,7 +11,7 @@ def _make_model(**overrides):
         num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
         tied_embed_init_std=0.005, logit_softcap=30.0, rope_base=10000.0,
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
-        kv_latent_dim=0, num_refinements=1,
+        kv_latent_dim=0, num_refinements=1, router_sigmoid_gate=True,
     )
     defaults.update(overrides)
     return GPT(**defaults).cuda().bfloat16()
@@ -20,6 +20,7 @@ def _make_model(**overrides):
 def test_all_constraints():
     """Test that all 5 constraints are satisfied."""
     model = _make_model()
+    assert getattr(model, "router_sigmoid_gate", True) is True
 
     # Check constraint #1: RevDEQ
     assert model.shared_block is not None, "Must have shared_block (RevDEQ)"
@@ -72,6 +73,28 @@ def test_all_constraints():
     print("PASS: All 5 constraints satisfied")
 
 
+def test_router_sigmoid_gate_ablation():
+    """Ablation: disabling router sigmoid gates should yield convex-mixture routing."""
+    model = _make_model(router_sigmoid_gate=False)
+    model.eval()
+
+    dim = model.tok_emb.embedding_dim
+    x = torch.randn(2, 8, dim, device="cuda", dtype=torch.bfloat16)
+    r = model.shared_block.mlp.mlp_router
+    _ = r(x)
+
+    assert r.use_sigmoid_gate is False
+    assert r._expert_gates is not None
+    assert len(r._expert_gates) == r.num_experts
+    assert all(abs(float(g) - 1.0) < 1e-6 for g in r._expert_gates), "disabled sigmoid gate must report gates=1"
+
+    # With gates=1, route_weights should sum to 1 across experts (convex mixture).
+    with torch.no_grad():
+        w = r(x)
+        err = (w.sum(dim=-1) - 1.0).abs().max().item()
+    assert err < 1e-3, f"route_weights should sum to 1 when gates disabled; max_err={err:.6f}"
+
+
 def test_revdeq_convergence():
     """Test RevDEQ coupled-state iteration converges."""
     model = _make_model(num_layers=8)
@@ -112,6 +135,7 @@ def test_revdeq_reversibility():
 
 if __name__ == "__main__":
     test_all_constraints()
+    test_router_sigmoid_gate_ablation()
     test_revdeq_convergence()
     test_revdeq_reversibility()
     print("\nAll tests passed!")

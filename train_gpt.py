@@ -134,6 +134,7 @@ class Hyperparameters:
     kv_latent_dim = 0  # 0 = auto (dim//2)
     attn_expert_rank = 0  # 0 = auto (dim//2)
     mlp_expert_rank = 0  # 0 = auto (hidden//2)
+    router_sigmoid_gate = True  # ablation: disable post-softmax sigmoid expert gates
 
     # SWA knobs (defaults only; override via CLI, not env)
     swa_enabled = True
@@ -166,6 +167,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--kv-latent-dim", type=int, default=None)
     p.add_argument("--attn-expert-rank", type=int, default=None)
     p.add_argument("--mlp-expert-rank", type=int, default=None)
+    p.add_argument("--router-sigmoid-gate", type=int, default=None, help="1/0; disable to ablate post-softmax sigmoid expert gates")
     p.add_argument("--swa-enabled", type=int, default=None, help="1/0")
     p.add_argument("--swa-start-frac", type=float, default=None)
     p.add_argument("--swa-every", type=int, default=None)
@@ -184,6 +186,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             if key == "swa_enabled":
                 out[key] = bool(int(v))
             elif key == "deq_k_jitter":
+                out[key] = bool(int(v))
+            elif key == "router_sigmoid_gate":
                 out[key] = bool(int(v))
             else:
                 out[key] = v
@@ -720,9 +724,10 @@ class SoftDenseRouter(nn.Module):
     remaining fully differentiable.
     Provides sparsity (L1) + balance (MSE) regularization and diagnostics.
     """
-    def __init__(self, dim: int, num_experts: int):
+    def __init__(self, dim: int, num_experts: int, *, use_sigmoid_gate: bool = True):
         super().__init__()
         self.num_experts = num_experts
+        self.use_sigmoid_gate = bool(use_sigmoid_gate)
         self.router = CastedLinear(dim, num_experts, bias=False)
         # Small router init → near-uniform routing at start
         nn.init.normal_(self.router.weight, std=0.01)
@@ -741,7 +746,13 @@ class SoftDenseRouter(nn.Module):
         """Returns routing weights [*, num_experts]."""
         route_logits = self.router(x)
         alpha = torch.softmax(route_logits, dim=-1)
-        gates = torch.sigmoid(self.expert_gate_logits.to(dtype=alpha.dtype))
+        raw_gates = torch.sigmoid(self.expert_gate_logits.to(dtype=alpha.dtype))
+        if self.use_sigmoid_gate:
+            gates = raw_gates
+        else:
+            # Ablation: enforce convex-mixture routing by making gates effectively 1.0.
+            # Still reference the parameter so DDP never sees it as unused.
+            gates = torch.ones_like(raw_gates) + raw_gates * 0.0
         route_weights = alpha * gates
         if self.training:
             # Balance on *effective* routing (post-gate), not raw softmax alpha.
@@ -816,7 +827,7 @@ class CausalSelfAttention(nn.Module):
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 6,
-                 expert_rank: int = 0):
+                 expert_rank: int = 0, *, router_sigmoid_gate: bool = True):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -857,7 +868,7 @@ class CausalSelfAttention(nn.Module):
         # Gated attention bias (per-head scalar)
         self.gate_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
         # Soft dense routing on attention output (MoE for attention)
-        self.attn_router = SoftDenseRouter(dim, num_experts)
+        self.attn_router = SoftDenseRouter(dim, num_experts, use_sigmoid_gate=router_sigmoid_gate)
         self.out_ortho_coef = 0.0
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
@@ -949,7 +960,15 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     """SiLU-gated MLP with true expert parameters + Soft Dense Routing (Constraint #2)."""
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 6, expert_rank: int = 0):
+    def __init__(
+        self,
+        dim: int,
+        mlp_mult: float,
+        num_experts: int = 6,
+        expert_rank: int = 0,
+        *,
+        router_sigmoid_gate: bool = True,
+    ):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
@@ -961,7 +980,7 @@ class MLP(nn.Module):
             nn.init.xavier_uniform_(self.expert_gate.data[e])
             nn.init.xavier_uniform_(self.expert_fc.data[e])
             nn.init.xavier_uniform_(self.expert_down.data[e])
-        self.mlp_router = SoftDenseRouter(dim, num_experts)
+        self.mlp_router = SoftDenseRouter(dim, num_experts, use_sigmoid_gate=router_sigmoid_gate)
         self.out_ortho_coef = 0.0
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
@@ -1246,13 +1265,14 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 resid_mix_init_logit: float = 5.0):
+                 resid_mix_init_logit: float = 5.0, *, router_sigmoid_gate: bool = True):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                         kv_latent_dim=kv_latent_dim, expert_rank=attn_expert_rank)
-        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank)
+                                         kv_latent_dim=kv_latent_dim, expert_rank=attn_expert_rank,
+                                         router_sigmoid_gate=router_sigmoid_gate)
+        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router_sigmoid_gate=router_sigmoid_gate)
         if resid_mix_init_logit <= 0.0:
             raise ValueError(f"resid_mix_init_logit must be > 0, got {resid_mix_init_logit}")
 
@@ -1489,6 +1509,7 @@ class GPT(nn.Module):
         attn_ortho_out_coef: float = 0.05,
         mlp_ortho_out_coef: float = 0.05,
         deq_backward: str = "autograd",
+        router_sigmoid_gate: bool = True,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1507,7 +1528,8 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                   attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                  resid_mix_init_logit=resid_mix_init_logit)
+                                  resid_mix_init_logit=resid_mix_init_logit,
+                                  router_sigmoid_gate=router_sigmoid_gate)
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -1518,6 +1540,7 @@ class GPT(nn.Module):
         if deq_backward not in ("autograd", "revdeq"):
             raise ValueError(f"deq_backward must be autograd|revdeq, got {deq_backward!r}")
         self.deq_backward = deq_backward
+        self.router_sigmoid_gate = bool(router_sigmoid_gate)
         # Route the output-space orthogonality coefficients into the expert modules so they
         # can materialize differentiable losses when using autograd-unrolled DEQ.
         self.shared_block.attn.out_ortho_coef = self.attn_ortho_out_coef
@@ -1961,6 +1984,7 @@ def main() -> None:
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"router_sigmoid_gate:{int(bool(args.router_sigmoid_gate))}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -1992,6 +2016,7 @@ def main() -> None:
         attn_ortho_out_coef=args.attn_ortho_out_coef,
         mlp_ortho_out_coef=args.mlp_ortho_out_coef,
         deq_backward=args.deq_backward,
+        router_sigmoid_gate=args.router_sigmoid_gate,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
