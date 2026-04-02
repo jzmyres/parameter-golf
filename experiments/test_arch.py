@@ -28,7 +28,7 @@ def test_all_constraints():
 
     # Check constraint #3: MLA with Gated Attention
     attn = model.shared_block.attn
-    assert attn.num_experts == 4, f"Attention must use 4 experts, got {attn.num_experts}"
+    assert attn.num_experts == 6, f"Attention must use 6 experts, got {attn.num_experts}"
     assert hasattr(attn, 'c_kv_down'), "Must have KV compression (MLA)"
     assert hasattr(attn, 'c_k_nope'), "Must have non-RoPE key decompress"
     assert hasattr(attn, 'c_k_rope'), "Must have decoupled RoPE key"
@@ -36,7 +36,7 @@ def test_all_constraints():
 
     # Check constraint #2: Soft Dense Routing (Dense MoE)
     mlp = model.shared_block.mlp
-    assert mlp.num_experts == 4, f"MLP must use 4 experts, got {mlp.num_experts}"
+    assert mlp.num_experts == 6, f"MLP must use 6 experts, got {mlp.num_experts}"
     assert hasattr(mlp, 'expert_gate'), "Must have expert_gate (3D per-expert params)"
     assert hasattr(mlp, 'expert_fc'), "Must have expert_fc (3D per-expert params)"
     assert hasattr(mlp, 'expert_down'), "Must have expert_down (3D per-expert params)"
