@@ -22,7 +22,7 @@
 
 \title{OPG Parameter Golf: Architecture and Training Setup (Code Review)}
 \author{Autoresearch Notes (generated from \texttt{train\_gpt.py})}
-\date{2026-04-01}
+\date{2026-04-02}
 
 \begin{document}
 \maketitle
@@ -125,7 +125,7 @@ SmearGate blends each token embedding with the previous token embedding:
   g &= \sigma(\theta) \in (0,1)^d,\\
   x'_{t} &= g \odot x_t + (1-g)\odot x_{t-1},
 \end{align}
-where $x_{t-1}$ is zero for $t=0$. The gate is initialized near identity (\texttt{sigmoid(3)=0.95}).
+where $x_{t-1}$ is zero for $t=0$. The gate is initialized near identity (\texttt{sigmoid(6)=0.9975}).
 
 \paragraph{BigramHashEmbedding (optional).}
 The script can add a hashed bigram embedding with a learned scale. Hashing uses a simple XOR-based function over adjacent
@@ -139,9 +139,10 @@ token ids. The embedding table and projection are initialized to zeros; the scal
   g &= \sigma(\gamma) \quad \text{(learned per-expert scalars)}, \\
   w &= \alpha \odot g.
 \end{align}
-In the current setup, the post-softmax sigmoid gate $g$ is treated as an \emph{optional} ablation knob rather than a hard
-requirement (sigmoid-off improved post-quant BPB in an ablation). When disabled, $g\equiv 1$ and routing reduces to a
-convex mixture ($w=\alpha$). When enabled, $g$ breaks
+In the current setup, the post-softmax sigmoid gate $g$ is an \emph{optional} ablation knob rather than a hard
+requirement (softmax-only / sigmoid-off improved post-quant BPB in an ablation). The default configuration disables this
+gate (\texttt{router\_sigmoid\_gate=0}), in which case $g\equiv 1$ and routing reduces to a convex mixture ($w=\alpha$).
+When enabled, $g$ breaks
 the convex constraint (total mass $\sum_e w_e$ can be $<1$), enabling ``skipping'' experts by reducing effective routed mass.
 
 \paragraph{Balance and sparsity regularizers.}
@@ -221,7 +222,8 @@ The DEQ function $f_\theta(z, x_0)$ is implemented by \texttt{Block.forward(z, x
     f_\theta(z, x_0) = g_g \cdot z_{\text{body}} + (1-g_g)\cdot z_{\text{in}}, \quad g_g=\sigma(\langle \bar z_{\text{in}}, w_{gg}\rangle + b_{gg}),
   \]
   where $\bar z_{\text{in}}$ is mean-pooled over batch and sequence, and $(w_{gg}, b_{gg})$ are learned parameters. All
-  sigmoid-based gates are initialized at midpoint ($g{=}0.5$; logit/bias $=0$).
+  sigmoid-based gates are initialized near 1 (\texttt{sigmoid(6)=0.9975}). For attention head gating, the per-token
+  gate logits are initialized to 0 and combined with a learned bias initialized near 1.
 \end{enumerate}
 
 \subsection{Coupled-state solver (explicit unroll)}
@@ -330,7 +332,7 @@ serialization and post-quant evaluation.
 \subsection{Run logs}
 Rank 0 writes a log file at \texttt{logs/\{run\_id\}.txt} and prints the path to stdout. Training lines include:
 \begin{itemize}
-  \item Losses: \texttt{train\_loss}, \texttt{ntp\_loss}, \texttt{ctp\_loss}, \texttt{conv\_loss}.
+  \item Losses: \texttt{train\_loss}, \texttt{ntp\_loss}, \texttt{ctp\_loss}.
   \item Gradient norms.
   \item DEQ diagnostics (residual proxies, iter convergence, optional reconstruction error for RevDEQ backward).
   \item Router diagnostics: per-component usage, entropy, CV, and gates (when enabled).
@@ -362,8 +364,8 @@ validation set (\texttt{full\_eval=True}) to produce the final scored \texttt{va
 exact values and writes a metadata JSON file for tracking.
 
 \section{Notes on contraction and fixed-point behavior}
-The current design contains mechanisms that \emph{encourage} near-identity updates at initialization (bounded residual
-scales, convex mixing with $x_0$), but contraction is not guaranteed. Contraction depends on the operator norm of the
+The current design contains mechanisms that \emph{encourage} stable updates at initialization (convex mixing with $x_0$
+and a learned global block gate $g_g$), but contraction is not guaranteed. Contraction depends on the operator norm of the
 Jacobian $\|\partial f/\partial z\|$, which can exceed 1 even with multiplicative gates in $(0,1)$.
 
 Practical diagnostics in this codebase are:

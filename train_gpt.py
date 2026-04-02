@@ -45,6 +45,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 _ROUTER_DIAGNOSTICS_ACTIVE = False
 _ROUTER_DIAGNOSTICS_STEP: int | None = None
 
+SIGMOID_ONE_INIT_LOGIT = 6.0  # sigmoid(6)=0.9975; "initialized to 1" without full saturation
+
 
 @contextlib.contextmanager
 def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
@@ -731,8 +733,9 @@ class SoftDenseRouter(nn.Module):
         self.router = CastedLinear(dim, num_experts, bias=False)
         # Small router init → near-uniform routing at start
         nn.init.normal_(self.router.weight, std=0.01)
-        # Learned per-expert gate scalars (post-softmax); init midpoint (sigmoid(0)=0.5)
-        self.expert_gate_logits = nn.Parameter(torch.zeros(num_experts, dtype=torch.float32))
+        # Learned per-expert gate scalars (post-softmax); init near-1 (sigmoid(6)=0.9975).
+        # Note: gates are optional (router_sigmoid_gate flag); when disabled, gates are forced to 1.0.
+        self.expert_gate_logits = nn.Parameter(torch.full((num_experts,), SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
         # Diagnostics (set during forward)
         self._balance_loss = None
         self._sparsity_loss = None
@@ -865,8 +868,8 @@ class CausalSelfAttention(nn.Module):
             nn.init.xavier_uniform_(self.expert_out.data[e])
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
-        # Gated attention bias (per-head scalar)
-        self.gate_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+        # Gated attention bias (per-head scalar); init near-1 (combined with zeroed per-token logits).
+        self.gate_bias = nn.Parameter(torch.full((num_heads,), SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
         # Soft dense routing on attention output (MoE for attention)
         self.attn_router = SoftDenseRouter(dim, num_experts, use_sigmoid_gate=router_sigmoid_gate)
         self.out_ortho_coef = 0.0
@@ -1034,8 +1037,8 @@ class SmearGate(nn.Module):
     """Blend each token's embedding with the previous token's embedding."""
     def __init__(self, dim: int):
         super().__init__()
-        # Initialize at midpoint: equal blend of current token and previous token.
-        self.gate = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))  # sigmoid(0)=0.5
+        # Initialize near-1: mostly current token embedding, minimal previous-token injection.
+        self.gate = nn.Parameter(torch.full((dim,), SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))  # sigmoid(6)=0.9975
 
     def forward(self, x: Tensor) -> Tensor:
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
@@ -1279,7 +1282,8 @@ class Block(nn.Module):
         # Global gate scalar for the entire transformer block (midpoint init = 0.5).
         # Computed from pooled block input so gg can vary across DEQ iterations.
         self.gg_w = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
-        self.gg_b = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        # Initialize gg near-1 so the block starts as "fully on" (global gate is a contraction knob, not a hard constraint).
+        self.gg_b = nn.Parameter(torch.tensor(SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
         self._gg_track_enabled = False
         self._gg_sum = 0.0
         self._gg_count = 0

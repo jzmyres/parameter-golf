@@ -7,6 +7,9 @@ import torch
 def _get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+def _sigmoid(x: torch.Tensor) -> torch.Tensor:
+    return 1 / (1 + (-x).exp())
+
 
 def _make_model(**overrides):
     from train_gpt import GPT
@@ -69,17 +72,18 @@ def test_all_constraints():
     assert soft.shape == z.shape, f"soft embedding must match z shape, got {tuple(soft.shape)}"
 
     # Gate initialization: all sigmoid gates should start at midpoint 0.5 (logit/bias = 0).
-    assert torch.allclose(model.smear.gate.float(), torch.zeros_like(model.smear.gate.float()))
+    # Gate initialization: all sigmoid gates should start near-1 (logit ~ 6; sigmoid ~ 0.9975).
+    assert _sigmoid(model.smear.gate.float()).min().item() > 0.99
     assert torch.allclose(model.shared_block.gg_w.float(), torch.zeros_like(model.shared_block.gg_w.float()))
-    assert float(model.shared_block.gg_b.float().item()) == 0.0
-    assert torch.allclose(attn.gate_bias.float(), torch.zeros_like(attn.gate_bias.float()))
+    assert _sigmoid(model.shared_block.gg_b.float()).item() > 0.99
+    assert _sigmoid(attn.gate_bias.float()).min().item() > 0.99
     # Gate-logit slice of c_q should be zero-initialized.
     dim = model.tok_emb.embedding_dim
     assert attn.c_q.weight.shape[0] == dim + attn.num_heads
     assert torch.allclose(attn.c_q.weight[dim:, :].float(), torch.zeros_like(attn.c_q.weight[dim:, :].float()))
     # Router expert gates
-    assert torch.allclose(mlp.mlp_router.expert_gate_logits.float(), torch.zeros_like(mlp.mlp_router.expert_gate_logits.float()))
-    assert torch.allclose(attn.attn_router.expert_gate_logits.float(), torch.zeros_like(attn.attn_router.expert_gate_logits.float()))
+    assert _sigmoid(mlp.mlp_router.expert_gate_logits.float()).min().item() > 0.99
+    assert _sigmoid(attn.attn_router.expert_gate_logits.float()).min().item() > 0.99
 
     print("PASS: All 5 constraints satisfied")
 
@@ -116,7 +120,9 @@ def test_router_sigmoid_gate_ablation():
         w2 = r2(x2)
         s2 = w2.sum(dim=-1).mean().item()
     assert r2.use_sigmoid_gate is True
-    assert s2 < 0.99, f"expected gated routing sum < 1 when enabled; got mean_sum={s2:.4f}"
+    # With per-expert gates initialized near-1, sum across experts should be close to sigmoid(init_logit).
+    expected = float(_sigmoid(r2.expert_gate_logits.float()).mean().item())
+    assert abs(s2 - expected) < 5e-3, f"expected mean_sum≈{expected:.4f} when enabled; got mean_sum={s2:.4f}"
 
 
 def test_revdeq_convergence():
