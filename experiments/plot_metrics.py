@@ -2,10 +2,10 @@
 
 Shows full training curves for ALL diagnostic metrics:
 - Row 1: Train Loss, Val BPB, Step Avg (ms)
-- Row 2: NTP Loss, DEQ Recon Error, Pre-clip Grad Norm
-- Row 3: DEQ Residual, CTP Loss, DEQ Iter Convergence (relative)
+- Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
+- Row 3: DEQ Residual, DEQ Iter Conv (absolute), DEQ Iter Convergence (relative)
 - Row 4: Expert Usage (min per component), Expert Entropy, Expert Orthogonality
-- Row 5: Expert Balance CV (per component), DEQ Iter Conv (absolute), Final Post-Quant Val BPB
+- Row 5: Expert Balance CV (per component), DEQ Recon Error, Final Post-Quant Val BPB
 - Row 6: GG by DEQ iter, Summary, (spare)
 
 All subplots use consistent colors: blue for Baseline, orange for Current.
@@ -392,16 +392,16 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
 
     # Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
     _plot_line(axes[1, 0], b, c, "ntp_loss", "ntp_loss", "train_steps", "train_steps", "NTP Loss")
-    steps_key, key = _prefer_train("deq_recon_train", "deq_recon")
-    _plot_line(axes[1, 1], b, c, key, key, steps_key, steps_key, "DEQ Reconstruction Error")
+    _plot_line(axes[1, 1], b, c, "ctp_loss", "ctp_loss", "train_steps", "train_steps", "CTP Loss")
     _plot_line(axes[1, 2], b, c, "grad_norm", "grad_norm", "train_steps", "train_steps",
                "Pre-clip Grad Norm")
 
     # Row 3: DEQ diagnostics (prefer train-logged diagnostics for dense curves)
     steps_key, key = _prefer_train("deq_residual_train", "deq_residual")
     _plot_line(axes[2, 0], b, c, key, key, steps_key, steps_key, "DEQ Residual ||z - f(z)||")
-    # (Requested swap) Put CTP loss in Row 3 middle for easier scan vs DEQ diagnostics.
-    _plot_line(axes[2, 1], b, c, "ctp_loss", "ctp_loss", "train_steps", "train_steps", "CTP Loss")
+    # (Requested swap sequence) DEQ iteration convergence (absolute) into Row 3 middle.
+    steps_key, key = _prefer_train("deq_iter_conv_train", "deq_iter_conv")
+    _plot_line(axes[2, 1], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv (absolute)")
     steps_key, key = _prefer_train("deq_iter_conv_rel_train", "deq_iter_conv_rel")
     _plot_line(axes[2, 2], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv (relative)")
 
@@ -486,7 +486,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     hi = max(all_vals) if all_vals else 1.0
     ax_ortho.set_ylim(0.0, max(1.0, hi * 1.05))
 
-    # Row 5: Balance diagnostics (CV), DEQ iter convergence (absolute), scored metric
+    # Row 5: Balance diagnostics (CV), DEQ reconstruction error, scored metric
     ax_bal = axes[4, 0]
     steps_key, _ = _prefer_train("mlp_cv_train", "mlp_cv")
     bal_series = []
@@ -499,9 +499,9 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         bal_series.append((comp_label, b.get(key, []), c.get(key, [])))
     _plot_components(ax_bal, b, c, steps_key, bal_series, "Expert Balance CV (per Component)", ylabel="CV")
 
-    # DEQ iteration convergence (absolute; prefer dense train-logged series when available)
-    steps_key, key = _prefer_train("deq_iter_conv_train", "deq_iter_conv")
-    _plot_line(axes[4, 1], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv (absolute)")
+    # DEQ reconstruction error (prefer dense train-logged series when available)
+    steps_key, key = _prefer_train("deq_recon_train", "deq_recon")
+    _plot_line(axes[4, 1], b, c, key, key, steps_key, steps_key, "DEQ Reconstruction Error")
 
     # Pre vs post-quant val_bpb (post-quant is the scored metric)
     ax_postq = axes[4, 2]
