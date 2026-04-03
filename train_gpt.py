@@ -1355,6 +1355,11 @@ class Block(nn.Module):
         self.gg_w = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
         # Initialize gg near-1 so the block starts as "fully on" (global gate is a contraction knob, not a hard constraint).
         self.gg_b = nn.Parameter(torch.tensor(SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
+        if self.moe_level == "block":
+            # Block-level MoE uses router gate-mass as gg; disable learned gg params to avoid
+            # unused-parameter issues under DDP and to match the intended design.
+            self.gg_w.requires_grad_(False)
+            self.gg_b.requires_grad_(False)
         self._gg_track_enabled = False
         self._gg_sum = 0.0
         self._gg_count = 0
