@@ -106,9 +106,29 @@ def _bar_pre_post_quant(ax, b: dict, c: dict):
         hi = max(vals) if vals else 1.0
         pad = max((hi - lo) * 0.5, 0.002)
         ax.set_ylim(lo - pad, hi + pad)
+        for xi, v in zip([x[0] - width / 2, x[1] - width / 2], pre_vals, strict=False):
+            if _is_finite(v):
+                ax.annotate(
+                    f"{v:.4f}",
+                    xy=(xi, v),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
         for xi, v in zip([x[0] + width / 2, x[1] + width / 2], post_vals, strict=False):
             if _is_finite(v):
-                ax.text(xi, v, f"{v:.4f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+                ax.annotate(
+                    f"{v:.4f}",
+                    xy=(xi, v),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    fontweight="bold",
+                )
     else:
         ax.text(0.5, 0.5, "Not logged", ha="center", va="center", transform=ax.transAxes)
         ax.set_xticks([])

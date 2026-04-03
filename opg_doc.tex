@@ -210,11 +210,11 @@ The DEQ function $f_\theta(z, x_0)$ is implemented by \texttt{Block.forward(z, x
   \]
   \item Attention residual update:
   \[
-    z \leftarrow z + \text{Attn}(\text{RMSNorm}(z)),
+    z \leftarrow z + g_a(z)\cdot \text{Attn}(\text{RMSNorm}(z)), \quad g_a(z)=\sigma(\langle \bar z, w_a\rangle + b_a),
   \]
   \item MLP residual update:
   \[
-    z \leftarrow z + \text{MLP}(\text{RMSNorm}(z)).
+    z \leftarrow z + g_m(z)\cdot \text{MLP}(\text{RMSNorm}(z)), \quad g_m(z)=\sigma(\langle \bar z, w_m\rangle + b_m).
   \]
   \item Global block gate (scalar):
   \[
@@ -346,6 +346,7 @@ Rank 0 writes a log file at \texttt{logs/\{run\_id\}.txt} and prints the path to
   \item Gradient norms.
   \item DEQ diagnostics (residual proxies, iter convergence, optional reconstruction error for RevDEQ backward).
   \item Global gate diagnostics: \texttt{gg}, \texttt{gg\_mean}, and \texttt{gg\_iter:[...]}. (The latter reports one value per DEQ iteration.)
+  \item Residual gate diagnostics: \texttt{attn\_rg}, \texttt{mlp\_rg}, plus \texttt{attn\_rg\_iter:[...]}/\texttt{mlp\_rg\_iter:[...]} (one value per DEQ iteration).
   \item Router diagnostics: per-component usage, entropy, CV, and gates (when enabled).
   \item Output-space orthogonality metrics per component (when logged).
 \end{itemize}

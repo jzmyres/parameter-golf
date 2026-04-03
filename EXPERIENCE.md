@@ -42,6 +42,9 @@ Short, reusable guardrails to avoid common experiment mistakes.
 ## Refinement
 - When mixing token distributions, normalize each input distribution first and renormalize after mixing.
 
+## Gating
+- Initialize new stability knobs to preserve baseline behavior (bias-only “on”), then learn deviations from data.
+
 ## Configuration
 - Keep experiment hyperparameters in code defaults (or CLI), not hidden environment variables.
 - Remove dead/unreachable configuration paths; they silently rot and confuse debugging.

@@ -82,6 +82,16 @@ def test_all_constraints():
     dim = model.tok_emb.embedding_dim
     assert attn.c_q.weight.shape[0] == dim + attn.num_heads
     assert torch.allclose(attn.c_q.weight[dim:, :].float(), torch.zeros_like(attn.c_q.weight[dim:, :].float()))
+    # Residual gates: input-dependent sigmoid scalars; start near-1 with zero weights.
+    blk = model.shared_block
+    assert hasattr(blk, "attn_resid_gate_w") and hasattr(blk, "attn_resid_gate_b")
+    assert hasattr(blk, "mlp_resid_gate_w") and hasattr(blk, "mlp_resid_gate_b")
+    assert blk.attn_resid_gate_w.shape == (dim,)
+    assert blk.mlp_resid_gate_w.shape == (dim,)
+    assert torch.allclose(blk.attn_resid_gate_w.float(), torch.zeros_like(blk.attn_resid_gate_w.float()))
+    assert torch.allclose(blk.mlp_resid_gate_w.float(), torch.zeros_like(blk.mlp_resid_gate_w.float()))
+    assert _sigmoid(blk.attn_resid_gate_b.float()).item() > 0.99
+    assert _sigmoid(blk.mlp_resid_gate_b.float()).item() > 0.99
     # Router is pure softmax (dense): weights sum to 1.
     r = mlp.mlp_router
     x = torch.randn(2, 8, dim, device=dev, dtype=z_dtype)

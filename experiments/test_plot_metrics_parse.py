@@ -19,6 +19,7 @@ class TestPlotMetricsParse(unittest.TestCase):
                 "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
                 "train_time:10.0ms step_avg:10.0ms "
                 "deq_residual:1.0 deq_recon_err:0.0 deq_iter_conv:0.1 gg_iter:[0.9,0.8,0.7,0.6] "
+                "attn_rg_iter:[0.99,0.98,0.97,0.96] mlp_rg_iter:[0.88,0.87,0.86,0.85] "
                 "mlp_ortho:0.25 attn_ortho:0.50 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
                 "mlp_entropy:0.7 attn_entropy:0.6 mos_ctp_entropy:0.8 mos_ntp_entropy:0.9 "
                 "mlp_cv:0.01 attn_cv:0.02 mos_ctp_cv:0.03 mos_ntp_cv:0.04 "
@@ -36,6 +37,8 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["deq_recon_train"], [0.0])
         self.assertEqual(d["deq_iter_conv_train"], [0.1])
         self.assertEqual(d["gg_iter_train"], [[0.9, 0.8, 0.7, 0.6]])
+        self.assertEqual(d["attn_rg_iter_train"], [[0.99, 0.98, 0.97, 0.96]])
+        self.assertEqual(d["mlp_rg_iter_train"], [[0.88, 0.87, 0.86, 0.85]])
         self.assertEqual(d["mlp_ortho_train"], [0.25])
         self.assertEqual(d["attn_ortho_train"], [0.50])
         self.assertEqual(d["mos_ctp_ortho_train"], [0.10])

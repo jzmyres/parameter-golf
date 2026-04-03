@@ -6,7 +6,7 @@ Shows full training curves for ALL diagnostic metrics:
 - Row 3: DEQ Residual, DEQ Iter Conv (absolute), DEQ Iter Convergence (relative)
 - Row 4: Expert Usage (min per component), Expert Entropy, Expert Orthogonality
 - Row 5: Expert Balance CV (per component), DEQ Recon Error, Final Post-Quant Val BPB
-- Row 6: GG by DEQ iter, Summary, (spare)
+- Row 6: GG by DEQ iter, Summary, Residual Gates by DEQ iter
 
 All subplots use consistent colors: blue for Baseline, orange for Current.
 Components (mlp/attn/mos_ctp/mos_ntp) are encoded with line styles.
@@ -45,6 +45,8 @@ def parse_log(logpath: str) -> dict:
         # Validation-time diagnostics (sparse unless VAL_LOSS_EVERY is small)
         "deq_residual": [], "deq_recon": [], "deq_iter_conv": [], "deq_iter_conv_rel": [],
         "gg_iter": [],
+        "attn_rg_iter": [],
+        "mlp_rg_iter": [],
         # Combined expert metrics (backward compat)
         "expert_usage": [], "expert_entropy": [], "expert_ortho": [],
         # Per-component: usage (list of lists), entropy, cv
@@ -55,6 +57,8 @@ def parse_log(logpath: str) -> dict:
         # Train-time diagnostics (dense, logged alongside train_loss when enabled)
         "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
         "gg_iter_train": [],
+        "attn_rg_iter_train": [],
+        "mlp_rg_iter_train": [],
         **{f"{p}_{s}_train": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
            for s in ("usage", "entropy", "cv")},
         "mlp_ortho_train": [], "attn_ortho_train": [], "mos_ctp_ortho_train": [], "mos_ntp_ortho_train": [],
@@ -115,6 +119,14 @@ def parse_log(logpath: str) -> dict:
             data["gg_iter_train"].append(
                 [float(v.strip()) for v in m_gg.group(1).split(",") if v.strip()] if m_gg else []
             )
+            m_arg = re.search(r"attn_rg_iter:\[([\d.,\s]+)\]", line)
+            data["attn_rg_iter_train"].append(
+                [float(v.strip()) for v in m_arg.group(1).split(",") if v.strip()] if m_arg else []
+            )
+            m_mrg = re.search(r"mlp_rg_iter:\[([\d.,\s]+)\]", line)
+            data["mlp_rg_iter_train"].append(
+                [float(v.strip()) for v in m_mrg.group(1).split(",") if v.strip()] if m_mrg else []
+            )
 
         # Final post-quant metric (exact, if available)
         # Example:
@@ -165,6 +177,14 @@ def parse_log(logpath: str) -> dict:
             m_gg = re.search(r"gg_iter:\[([\d.,\s]+)\]", line)
             data["gg_iter"].append(
                 [float(v.strip()) for v in m_gg.group(1).split(",") if v.strip()] if m_gg else []
+            )
+            m_arg = re.search(r"attn_rg_iter:\[([\d.,\s]+)\]", line)
+            data["attn_rg_iter"].append(
+                [float(v.strip()) for v in m_arg.group(1).split(",") if v.strip()] if m_arg else []
+            )
+            m_mrg = re.search(r"mlp_rg_iter:\[([\d.,\s]+)\]", line)
+            data["mlp_rg_iter"].append(
+                [float(v.strip()) for v in m_mrg.group(1).split(",") if v.strip()] if m_mrg else []
             )
 
     return data
@@ -530,10 +550,27 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     if plotted_any:
         for xi, v in zip([x[0] - width / 2, x[1] - width / 2], pre_vals, strict=False):
             if _is_finite(v):
-                ax_postq.text(xi, v, f"{v:.4f}", ha="center", va="bottom", fontsize=9)
+                ax_postq.annotate(
+                    f"{v:.4f}",
+                    xy=(xi, v),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
         for xi, v in zip([x[0] + width / 2, x[1] + width / 2], post_vals, strict=False):
             if _is_finite(v):
-                ax_postq.text(xi, v, f"{v:.4f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+                ax_postq.annotate(
+                    f"{v:.4f}",
+                    xy=(xi, v),
+                    xytext=(0, 3),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                    fontweight="bold",
+                )
         ax_postq.set_xticks(x)
         ax_postq.set_xticklabels(["Baseline", "Current"])
         ax_postq.set_ylabel("val_bpb")
@@ -558,7 +595,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_postq.set_xticks([])
         ax_postq.set_yticks([])
 
-    # Row 6: GG by DEQ iteration + Summary + spare
+    # Row 6: GG by DEQ iteration + Summary + Residual gates by DEQ iteration
     def _prefer_train_listlist(train_key: str, val_key: str) -> tuple[str, str]:
         if any(len(v) for v in b.get(train_key, [])) or any(len(v) for v in c.get(train_key, [])):
             return "train_steps", train_key
@@ -600,7 +637,56 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_gg.legend(handles=style_handles, loc="upper right", fontsize=8, frameon=False)
 
     axes[5, 1].axis("off")
-    axes[5, 2].axis("off")
+    # Residual gates (attn/MLP) by DEQ iteration (avg across refinements).
+    ax_rg = axes[5, 2]
+    ax_rg.set_title("Residual Gates by DEQ Iter (avg across refinements)", fontsize=11)
+    ax_rg.set_xlabel("Step")
+    ax_rg.set_ylabel("gate")
+    ax_rg.grid(True, alpha=0.3)
+
+    steps_key, a_key = _prefer_train_listlist("attn_rg_iter_train", "attn_rg_iter")
+    _, m_key = _prefer_train_listlist("mlp_rg_iter_train", "mlp_rg_iter")
+    b_a = b.get(a_key, []) or []
+    c_a = c.get(a_key, []) or []
+    b_m = b.get(m_key, []) or []
+    c_m = c.get(m_key, []) or []
+    k_plot = 0
+    for series in (b_a, c_a, b_m, c_m):
+        if series:
+            k_plot = max(k_plot, max((len(v) for v in series), default=0))
+    if k_plot <= 0:
+        ax_rg.text(0.5, 0.5, "Not logged", ha="center", va="center", fontsize=10, transform=ax_rg.transAxes)
+        ax_rg.set_xticks([])
+        ax_rg.set_yticks([])
+    else:
+        iter_linestyles = ["-", "--", ":", "-."]
+        from matplotlib.lines import Line2D
+        style_handles = []
+        comp_handles = [
+            Line2D([0], [0], color="#333333", lw=2.2, linestyle="-", label="Attn (thick)"),
+            Line2D([0], [0], color="#333333", lw=1.2, linestyle="-", label="MLP (thin)"),
+        ]
+        for ki in range(k_plot):
+            style = iter_linestyles[ki % len(iter_linestyles)]
+            b_vals_a = [v[ki] if len(v) > ki else math.nan for v in b_a]
+            c_vals_a = [v[ki] if len(v) > ki else math.nan for v in c_a]
+            b_vals_m = [v[ki] if len(v) > ki else math.nan for v in b_m]
+            c_vals_m = [v[ki] if len(v) > ki else math.nan for v in c_m]
+            bx_a, by_a = _filter_finite(b.get(steps_key, []), b_vals_a)
+            cx_a, cy_a = _filter_finite(c.get(steps_key, []), c_vals_a)
+            bx_m, by_m = _filter_finite(b.get(steps_key, []), b_vals_m)
+            cx_m, cy_m = _filter_finite(c.get(steps_key, []), c_vals_m)
+            if bx_a and by_a:
+                ax_rg.plot(bx_a, by_a, color=COLOR_BASELINE, linestyle=style, alpha=0.85, linewidth=2.2)
+            if cx_a and cy_a:
+                ax_rg.plot(cx_a, cy_a, color=COLOR_CURRENT, linestyle=style, alpha=0.85, linewidth=2.2)
+            if bx_m and by_m:
+                ax_rg.plot(bx_m, by_m, color=COLOR_BASELINE, linestyle=style, alpha=0.55, linewidth=1.2)
+            if cx_m and cy_m:
+                ax_rg.plot(cx_m, cy_m, color=COLOR_CURRENT, linestyle=style, alpha=0.55, linewidth=1.2)
+            style_handles.append(Line2D([0], [0], color="#333333", lw=2.2, linestyle=style, label=f"k={ki+1}"))
+        ax_rg.set_ylim(0.0, 1.0)
+        ax_rg.legend(handles=style_handles + comp_handles, loc="upper right", fontsize=8, frameon=False)
 
     summary_lines = []
     if b["val_bpb"] and c["val_bpb"]:
