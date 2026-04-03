@@ -1632,8 +1632,21 @@ class GPT(nn.Module):
             topk_probs, topk_idx = p_mix.topk(k, dim=-1)  # [B,T,K]
             topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             W = self.tok_emb.weight.data  # [V, d]
-            topk_embeds = F.embedding(topk_idx, W)  # [B,T,K,d]
-            soft_embed = (topk_probs.unsqueeze(-1) * topk_embeds).sum(-2)  # [B,T,d]
+            # Memory note: materializing `[B,T,K,d]` can be very large at `K=128`.
+            # Compute the expected embedding in chunks to keep peak memory bounded.
+            B, T, K = topk_idx.shape
+            d = W.shape[1]
+            flat_idx = topk_idx.reshape(B * T, K)
+            flat_p = topk_probs.reshape(B * T, K)
+            flat_out = W.new_empty((B * T, d))
+            chunk = 512  # trades a small loop for much lower peak VRAM
+            for s in range(0, B * T, chunk):
+                e = min(s + chunk, B * T)
+                idx_chunk = flat_idx[s:e]  # [N,K]
+                p_chunk = flat_p[s:e]      # [N,K]
+                emb = F.embedding(idx_chunk, W)  # [N,K,d]
+                flat_out[s:e] = (p_chunk.unsqueeze(-1) * emb).sum(dim=1)
+            soft_embed = flat_out.reshape(B, T, d)
 
             # Match the input embedding path as closely as possible (no bigram available for soft tokens).
             soft_embed = _rms_norm(soft_embed.to(dtype=z.dtype))
