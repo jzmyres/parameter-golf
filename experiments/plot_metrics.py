@@ -220,6 +220,24 @@ def _filter_finite(steps: list[int], values: list[float]) -> tuple[list[int], li
 def _has_any_finite(values: list[float]) -> bool:
     return any(_is_finite(v) for v in values or [])
 
+def _series_equal(a: list[float] | None, b: list[float] | None, *, eps: float = 1e-12) -> bool:
+    """Approx equality for two numeric series, ignoring NaNs."""
+    if a is None or b is None:
+        return False
+    n = min(len(a), len(b))
+    if n == 0:
+        return False
+    any_compared = False
+    for i in range(n):
+        av = a[i]
+        bv = b[i]
+        if not (_is_finite(av) and _is_finite(bv)):
+            continue
+        any_compared = True
+        if abs(float(av) - float(bv)) > eps:
+            return False
+    return any_compared
+
 
 def _plot_line(ax, b, c, b_key, c_key, b_steps, c_steps, title, ylabel=None):
     """Plot two line series on the same axis with consistent colors."""
@@ -450,6 +468,16 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     if not any(_has_any_finite(s[1]) or _has_any_finite(s[2]) for s in usage_series):
         # Fallback: combined expert_usage (older logs)
         usage_series = [("expert", usage_min_series(b, "expert_usage"), usage_min_series(c, "expert_usage"))]
+    else:
+        # If block-level MoE ties attn+mlp routing, their usage curves may be identical.
+        # Avoid drawing two styles on top of each other (can look "misaligned" due to dashes).
+        mlp = next((s for s in usage_series if s[0] == "mlp"), None)
+        attn = next((s for s in usage_series if s[0] == "attn"), None)
+        if mlp is not None and attn is not None and _series_equal(attn[2], mlp[2]):
+            usage_series = [
+                (lab, bv, (None if lab == "attn" else cv))
+                for (lab, bv, cv) in usage_series
+            ]
     _plot_components(
         ax_usage,
         b,
@@ -474,6 +502,14 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     if not any(_has_any_finite(s[1]) or _has_any_finite(s[2]) for s in entropy_series):
         # Fallback: combined expert_entropy (older logs)
         entropy_series = [("expert", b.get("expert_entropy", []), c.get("expert_entropy", []))]
+    else:
+        mlp = next((s for s in entropy_series if s[0] == "mlp"), None)
+        attn = next((s for s in entropy_series if s[0] == "attn"), None)
+        if mlp is not None and attn is not None and _series_equal(attn[2], mlp[2]):
+            entropy_series = [
+                (lab, bv, (None if lab == "attn" else cv))
+                for (lab, bv, cv) in entropy_series
+            ]
     _plot_components(ax_ent, b, c, steps_key, entropy_series, "Expert Entropy (per Component)", ylabel="Entropy")
 
     # Expert Orthogonality: per-component lines (formatted like entropy plot)
@@ -518,6 +554,13 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ("mos_ntp", "mos_ntp_cv_train" if steps_key == "train_steps" else "mos_ntp_cv"),
     ]:
         bal_series.append((comp_label, b.get(key, []), c.get(key, [])))
+    mlp = next((s for s in bal_series if s[0] == "mlp"), None)
+    attn = next((s for s in bal_series if s[0] == "attn"), None)
+    if mlp is not None and attn is not None and _series_equal(attn[2], mlp[2]):
+        bal_series = [
+            (lab, bv, (None if lab == "attn" else cv))
+            for (lab, bv, cv) in bal_series
+        ]
     _plot_components(ax_bal, b, c, steps_key, bal_series, "Expert Balance CV (per Component)", ylabel="CV")
 
     # DEQ reconstruction error (prefer dense train-logged series when available)

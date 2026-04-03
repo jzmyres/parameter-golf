@@ -31,6 +31,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - For near-zero diagnostics, log/plot with enough precision (e.g. scientific notation + log scale).
 - Diagnostics should run in consistent precision; mixed-precision drift can look like “instability”.
 - Prefer line styles (not point clouds) for multi-component time series, and always include a legend for the encoding.
+- When two series are intentionally identical (tied components), deduplicate the plot so style overlays don’t look like mismatches.
 - When adding new logged keys, update the parser and add a small unit test so plots don’t silently degrade.
 
 ## RevDEQ
