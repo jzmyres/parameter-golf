@@ -431,8 +431,6 @@ CONTROL_TENSOR_NAME_PATTERNS = (
     "skip_weights",
     "bigram.scale",
     "gate_bias",
-    "attn_resid_gate",
-    "mlp_resid_gate",
 )
 FP16_KEEP_NAME_PATTERNS = ("tok_emb",)
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -1302,26 +1300,6 @@ class Block(nn.Module):
         self._gg_call_track_enabled = False
         self._gg_call_track: list[float] = []
 
-        # Learnable residual sigmoid gates for attention and MLP residual adds.
-        # These are scalar gates, input-dependent via pooled activations (like gg),
-        # and initialized near-1 so residuals start fully active.
-        self.attn_resid_gate_w = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
-        self.attn_resid_gate_b = nn.Parameter(torch.tensor(SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
-        self.mlp_resid_gate_w = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
-        self.mlp_resid_gate_b = nn.Parameter(torch.tensor(SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
-        self._attn_rg_track_enabled = False
-        self._attn_rg_sum = 0.0
-        self._attn_rg_count = 0
-        self._attn_rg_last: float | None = None
-        self._attn_rg_call_track_enabled = False
-        self._attn_rg_call_track: list[float] = []
-        self._mlp_rg_track_enabled = False
-        self._mlp_rg_sum = 0.0
-        self._mlp_rg_count = 0
-        self._mlp_rg_last: float | None = None
-        self._mlp_rg_call_track_enabled = False
-        self._mlp_rg_call_track: list[float] = []
-
         # Constrain mixing weights via softmax (convex combination) but initialize
         # near the historical behavior: mix ≈ [1, 0] (no x0 injection at init).
         self.resid_mix = nn.Parameter(torch.empty(2, dim, dtype=torch.float32))
@@ -1345,29 +1323,9 @@ class Block(nn.Module):
         mix = torch.softmax(self.resid_mix.float(), dim=0).to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        pooled_attn = x.float().mean(dim=(0, 1))
-        attn_rg_logit = (pooled_attn * self.attn_resid_gate_w).sum() + self.attn_resid_gate_b
-        attn_rg = torch.sigmoid(attn_rg_logit).to(dtype=x.dtype)
-        attn_rg_val = float(attn_rg.detach().item())
-        self._attn_rg_last = attn_rg_val
-        if self._attn_rg_track_enabled:
-            self._attn_rg_sum += attn_rg_val
-            self._attn_rg_count += 1
-        if self._attn_rg_call_track_enabled:
-            self._attn_rg_call_track.append(attn_rg_val)
-        x = x + attn_rg * attn_out
+        x = x + attn_out
         mlp_out = self.mlp(self.mlp_norm(x))
-        pooled_mlp = x.float().mean(dim=(0, 1))
-        mlp_rg_logit = (pooled_mlp * self.mlp_resid_gate_w).sum() + self.mlp_resid_gate_b
-        mlp_rg = torch.sigmoid(mlp_rg_logit).to(dtype=x.dtype)
-        mlp_rg_val = float(mlp_rg.detach().item())
-        self._mlp_rg_last = mlp_rg_val
-        if self._mlp_rg_track_enabled:
-            self._mlp_rg_sum += mlp_rg_val
-            self._mlp_rg_count += 1
-        if self._mlp_rg_call_track_enabled:
-            self._mlp_rg_call_track.append(mlp_rg_val)
-        x = x + mlp_rg * mlp_out
+        x = x + mlp_out
         # Global residual blend: f(z, x0) = gg * transformer(z, x0) + (1 - gg) * z
         return gg * x + (1 - gg) * z_in
 
@@ -1713,17 +1671,6 @@ class GPT(nn.Module):
         # Also track gg per Block.forward call so we can compute gg by DEQ iteration.
         self.shared_block._gg_call_track = []
         self.shared_block._gg_call_track_enabled = True
-        # Track residual gates (attn/MLP) analogously to gg.
-        self.shared_block._attn_rg_sum = 0.0
-        self.shared_block._attn_rg_count = 0
-        self.shared_block._attn_rg_track_enabled = True
-        self.shared_block._attn_rg_call_track = []
-        self.shared_block._attn_rg_call_track_enabled = True
-        self.shared_block._mlp_rg_sum = 0.0
-        self.shared_block._mlp_rg_count = 0
-        self.shared_block._mlp_rg_track_enabled = True
-        self.shared_block._mlp_rg_call_track = []
-        self.shared_block._mlp_rg_call_track_enabled = True
         try:
             if self.training and self.deq_backward == "revdeq":
                 params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
@@ -1750,10 +1697,6 @@ class GPT(nn.Module):
         finally:
             self.shared_block._gg_track_enabled = False
             self.shared_block._gg_call_track_enabled = False
-            self.shared_block._attn_rg_track_enabled = False
-            self.shared_block._attn_rg_call_track_enabled = False
-            self.shared_block._mlp_rg_track_enabled = False
-            self.shared_block._mlp_rg_call_track_enabled = False
             if self.shared_block._gg_count > 0:
                 self._gg_mean_last_solve = float(self.shared_block._gg_sum / self.shared_block._gg_count)
             else:
@@ -1763,26 +1706,6 @@ class GPT(nn.Module):
                 self._gg_iter_last_solve = [0.5 * (calls[2 * i] + calls[2 * i + 1]) for i in range(K)]
             else:
                 self._gg_iter_last_solve = []
-
-            if self.shared_block._attn_rg_count > 0:
-                self._attn_rg_mean_last_solve = float(self.shared_block._attn_rg_sum / self.shared_block._attn_rg_count)
-            else:
-                self._attn_rg_mean_last_solve = None
-            a_calls = list(getattr(self.shared_block, "_attn_rg_call_track", []) or [])
-            if len(a_calls) == 2 * K:
-                self._attn_rg_iter_last_solve = [0.5 * (a_calls[2 * i] + a_calls[2 * i + 1]) for i in range(K)]
-            else:
-                self._attn_rg_iter_last_solve = []
-
-            if self.shared_block._mlp_rg_count > 0:
-                self._mlp_rg_mean_last_solve = float(self.shared_block._mlp_rg_sum / self.shared_block._mlp_rg_count)
-            else:
-                self._mlp_rg_mean_last_solve = None
-            m_calls = list(getattr(self.shared_block, "_mlp_rg_call_track", []) or [])
-            if len(m_calls) == 2 * K:
-                self._mlp_rg_iter_last_solve = [0.5 * (m_calls[2 * i] + m_calls[2 * i + 1]) for i in range(K)]
-            else:
-                self._mlp_rg_iter_last_solve = []
 
     def _run_backbone(self, x: Tensor) -> Tensor:
         """Decoupled DEQ solver + Diffusion-AR refinement.
@@ -1796,16 +1719,12 @@ class GPT(nn.Module):
         dtype = x.dtype
         self._deq_residuals: list[float] = []
         self._gg_iter: list[float] | None = None
-        self._attn_rg_iter: list[float] | None = None
-        self._mlp_rg_iter: list[float] | None = None
         # Avoid leaking stale eval-only diagnostics into train-step logs.
         self._deq_recon_error = None
         prev_soft_embed = x0
         x0_refined = x0  # track for reconstruction
 
         gg_iters_by_refinement: list[list[float]] = []
-        attn_rg_iters_by_refinement: list[list[float]] = []
-        mlp_rg_iters_by_refinement: list[list[float]] = []
         for r in range(1 + self.num_refinements):
             if r > 0:
                 new_soft_embed = self._get_soft_embedding(z)
@@ -1818,25 +1737,20 @@ class GPT(nn.Module):
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
             z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
             gg_iters_by_refinement.append(list(getattr(self, "_gg_iter_last_solve", []) or []))
-            attn_rg_iters_by_refinement.append(list(getattr(self, "_attn_rg_iter_last_solve", []) or []))
-            mlp_rg_iters_by_refinement.append(list(getattr(self, "_mlp_rg_iter_last_solve", []) or []))
-
-        def _agg_iters(iters_by_ref: list[list[float]]) -> list[float] | None:
-            if not iters_by_ref:
-                return None
-            k_max = max((len(v) for v in iters_by_ref), default=0)
-            if k_max <= 0:
-                return []
-            agg: list[float] = []
-            for k in range(k_max):
-                vals = [v[k] for v in iters_by_ref if len(v) > k]
-                agg.append(float(sum(vals) / max(len(vals), 1)))
-            return agg
 
         # Aggregate per-DEQ-iteration gates across all refinement solves (r0 one-hot + r>0 soft-embed).
-        self._gg_iter = _agg_iters(gg_iters_by_refinement)
-        self._attn_rg_iter = _agg_iters(attn_rg_iters_by_refinement)
-        self._mlp_rg_iter = _agg_iters(mlp_rg_iters_by_refinement)
+        if gg_iters_by_refinement:
+            k_max = max((len(v) for v in gg_iters_by_refinement), default=0)
+            if k_max > 0:
+                agg: list[float] = []
+                for k in range(k_max):
+                    vals = [v[k] for v in gg_iters_by_refinement if len(v) > k]
+                    agg.append(float(sum(vals) / max(len(vals), 1)))
+                self._gg_iter = agg
+            else:
+                self._gg_iter = []
+        else:
+            self._gg_iter = None
 
         # Fixed-point diagnostics (desired goal, not a trained loss).
         if self.training:
@@ -2294,10 +2208,6 @@ def main() -> None:
             parts.append(f"deq_iter_conv_rel:{m._deq_iter_convergence_rel:.6f}")
         if hasattr(m, "shared_block") and getattr(m.shared_block, "_gg_last", None) is not None:
             parts.append(f"gg:{float(m.shared_block._gg_last):.4f}")
-        if hasattr(m, "shared_block") and getattr(m.shared_block, "_attn_rg_last", None) is not None:
-            parts.append(f"attn_rg:{float(m.shared_block._attn_rg_last):.4f}")
-        if hasattr(m, "shared_block") and getattr(m.shared_block, "_mlp_rg_last", None) is not None:
-            parts.append(f"mlp_rg:{float(m.shared_block._mlp_rg_last):.4f}")
         gg_mean = getattr(m, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             parts.append(f"gg_mean:{float(gg_mean):.4f}")
@@ -2305,14 +2215,6 @@ def main() -> None:
         if isinstance(gg_iter, list) and gg_iter:
             gg_str = ",".join(f"{float(v):.4f}" for v in gg_iter)
             parts.append(f"gg_iter:[{gg_str}]")
-        attn_rg_iter = getattr(m, "_attn_rg_iter", None)
-        if isinstance(attn_rg_iter, list) and attn_rg_iter:
-            s = ",".join(f"{float(v):.4f}" for v in attn_rg_iter)
-            parts.append(f"attn_rg_iter:[{s}]")
-        mlp_rg_iter = getattr(m, "_mlp_rg_iter", None)
-        if isinstance(mlp_rg_iter, list) and mlp_rg_iter:
-            s = ",".join(f"{float(v):.4f}" for v in mlp_rg_iter)
-            parts.append(f"mlp_rg_iter:[{s}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(
