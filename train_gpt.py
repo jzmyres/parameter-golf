@@ -733,12 +733,20 @@ class SoftDenseRouter(nn.Module):
     optional loss-free load-balancing bias controller (expert_bias) updated once
     per optimizer step from terminal-state routing statistics.
     """
-    def __init__(self, dim: int, num_experts: int):
+    def __init__(self, dim: int, num_experts: int, *, enable_gate: bool = False):
         super().__init__()
         self.num_experts = num_experts
+        self.enable_gate = bool(enable_gate)
         self.router = CastedLinear(dim, num_experts, bias=False)
         # Small router init → near-uniform routing at start
         nn.init.normal_(self.router.weight, std=0.01)
+        # Optional gating head for block-level MoE: w = softmax(logits) * sigmoid(gate_logits),
+        # so sum(w) is in (0,1] and can serve as a per-token global residual gate.
+        self.gate = CastedLinear(dim, num_experts, bias=True) if self.enable_gate else None
+        if self.gate is not None:
+            with torch.no_grad():
+                self.gate.weight.zero_()
+                self.gate.bias.fill_(SIGMOID_ONE_INIT_LOGIT)
         # Loss-free load-balancing bias (added to routing logits before softmax).
         # Updated outside autograd to avoid gradient interference from strong aux losses.
         self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32), persistent=True)
@@ -751,6 +759,7 @@ class SoftDenseRouter(nn.Module):
         self._expert_gates = None
         self._expert_entropy = None
         self._expert_balance_cv = None
+        self._gate_mass_mean = None
         self._diag_step: int | None = None
 
     def set_bias_stats_enabled(self, enabled: bool) -> None:
@@ -775,11 +784,20 @@ class SoftDenseRouter(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         """Returns routing weights [*, num_experts]."""
         route_logits = self.router(x) + self.expert_bias.to(dtype=x.dtype)
-        route_weights = torch.softmax(route_logits, dim=-1)
+        p = torch.softmax(route_logits, dim=-1)
+        if self.gate is not None:
+            g = torch.sigmoid(self.gate(x))
+            route_weights = p * g
+            gate_mass = route_weights.sum(dim=-1, keepdim=True)  # [*,1] in (0,1]
+            share = route_weights / gate_mass.clamp_min(1e-8)    # normalized share (sum=1)
+        else:
+            route_weights = p
+            share = p
         if self.training:
-            # Balance on routing weights (dense softmax distribution).
-            reduce_dims = tuple(range(route_weights.ndim - 1))
-            mean_share = route_weights.mean(dim=reduce_dims)
+            # Balance on normalized share distribution (sum=1), even when route_weights
+            # is gated and does not sum to 1.
+            reduce_dims = tuple(range(share.ndim - 1))
+            mean_share = share.mean(dim=reduce_dims)
             target = torch.ones_like(mean_share) / self.num_experts
             self._balance_loss = F.mse_loss(mean_share, target)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
@@ -792,15 +810,19 @@ class SoftDenseRouter(nn.Module):
                     do_diag = dist.get_rank() == 0
                 if do_diag:
                     # Compute diagnostics from detached tensors to avoid autograd overhead.
-                    rw = route_weights.detach()
-                    mean_mass = rw.mean(dim=reduce_dims)
-                    self._expert_usage = mean_mass.float().cpu().tolist()
+                    s = share.detach()
+                    mean_mass = s.mean(dim=reduce_dims)
+                    self._expert_usage = mean_mass.float().cpu().tolist()  # normalized share
                     self._expert_gates = None
 
-                    per_token_ent = -(rw * (rw + 1e-8).log()).sum(-1)
+                    per_token_ent = -(s * (s + 1e-8).log()).sum(-1)
                     self._expert_entropy = per_token_ent.mean().item()
-                    mean_share_d = mean_mass
-                    self._expert_balance_cv = (mean_share_d.std() / mean_share_d.mean().clamp_min(1e-8)).item()
+                    self._expert_balance_cv = (mean_mass.std() / mean_mass.mean().clamp_min(1e-8)).item()
+                    if self.gate is not None:
+                        gm = gate_mass.detach()
+                        self._gate_mass_mean = float(gm.mean().item())
+                    else:
+                        self._gate_mass_mean = None
                     self._diag_step = _ROUTER_DIAGNOSTICS_STEP
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
@@ -814,21 +836,25 @@ class SoftDenseRouter(nn.Module):
                 if dist.is_available() and dist.is_initialized():
                     do_diag = dist.get_rank() == 0
                 if do_diag:
-                    reduce_dims = tuple(range(route_weights.ndim - 1))
-                    mean_mass = route_weights.mean(dim=reduce_dims)
-                    self._expert_usage = mean_mass.float().cpu().tolist()
+                    reduce_dims = tuple(range(share.ndim - 1))
+                    mean_mass = share.mean(dim=reduce_dims)
+                    self._expert_usage = mean_mass.float().cpu().tolist()  # normalized share
                     self._expert_gates = None
 
-                    per_token_ent = -(route_weights * (route_weights + 1e-8).log()).sum(-1)
+                    per_token_ent = -(share * (share + 1e-8).log()).sum(-1)
                     self._expert_entropy = per_token_ent.mean().item()
-                    mean_share = mean_mass
-                    self._expert_balance_cv = (mean_share.std() / mean_share.mean().clamp_min(1e-8)).item()
+                    self._expert_balance_cv = (mean_mass.std() / mean_mass.mean().clamp_min(1e-8)).item()
+                    if self.gate is not None:
+                        self._gate_mass_mean = float(gate_mass.detach().mean().item())
+                    else:
+                        self._gate_mass_mean = None
                     self._diag_step = _ROUTER_DIAGNOSTICS_STEP
                 else:
                     self._expert_usage = None
                     self._expert_gates = None
                     self._expert_entropy = None
                     self._expert_balance_cv = None
+                    self._gate_mass_mean = None
                     self._diag_step = None
         return route_weights
 
@@ -1309,7 +1335,7 @@ class Block(nn.Module):
         self.moe_level = moe_level
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        shared_router = SoftDenseRouter(dim, 6) if self.moe_level == "block" else None
+        shared_router = SoftDenseRouter(dim, 6, enable_gate=True) if self.moe_level == "block" else None
         self.attn = CausalSelfAttention(
             dim,
             num_heads,
@@ -1346,34 +1372,46 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         z_in = x
-        pooled = z_in.float().mean(dim=(0, 1))
-        gg_logit = (pooled * self.gg_w).sum() + self.gg_b
-        gg = torch.sigmoid(gg_logit).to(dtype=x.dtype)
-        gg_val = float(gg.detach().item())
-        self._gg_last = gg_val
-        if self._gg_track_enabled:
-            self._gg_sum += gg_val
-            self._gg_count += 1
-        if self._gg_call_track_enabled:
-            self._gg_call_track.append(gg_val)
 
         mix = torch.softmax(self.resid_mix.float(), dim=0).to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         if self.moe_level == "block":
             x_attn = self.attn_norm(x)
             # One router for the whole block (paired expert blocks): compute weights once.
-            w = self.attn.attn_router(x_attn)  # shared router instance
+            w = self.attn.attn_router(x_attn)  # shared router instance; sum(w) in (0,1]
+            gg_tok = w.sum(dim=-1)             # [B,T] global residual gate per token
+            gg_val = float(gg_tok.detach().float().mean().item())
+            self._gg_last = gg_val
+            if self._gg_track_enabled:
+                self._gg_sum += gg_val
+                self._gg_count += 1
+            if self._gg_call_track_enabled:
+                self._gg_call_track.append(gg_val)
             attn_out_e = self.attn.forward_experts(x_attn)  # [B,T,E,D]
             z1_e = x[:, :, None, :] + attn_out_e
             mlp_out_e = self.mlp.forward_experts(self.mlp_norm(z1_e))
             z2_e = z1_e + mlp_out_e
-            x = (z2_e * w.unsqueeze(-1)).sum(dim=2)
+            x_mix = (z2_e * w.unsqueeze(-1)).sum(dim=2)
+            # Use leftover routing mass as the residual weight (no separate learned global gate).
+            x = x_mix + (1.0 - gg_tok).to(dtype=x.dtype).unsqueeze(-1) * z_in
         else:
+            pooled = z_in.float().mean(dim=(0, 1))
+            gg_logit = (pooled * self.gg_w).sum() + self.gg_b
+            gg = torch.sigmoid(gg_logit).to(dtype=x.dtype)
+            gg_val = float(gg.detach().item())
+            self._gg_last = gg_val
+            if self._gg_track_enabled:
+                self._gg_sum += gg_val
+                self._gg_count += 1
+            if self._gg_call_track_enabled:
+                self._gg_call_track.append(gg_val)
             attn_out = self.attn(self.attn_norm(x))
             x = x + attn_out
             mlp_out = self.mlp(self.mlp_norm(x))
             x = x + mlp_out
-        # Global residual blend: f(z, x0) = gg * transformer(z, x0) + (1 - gg) * z
+        if self.moe_level == "block":
+            return x
+        # Global residual blend (component MoE): f(z, x0) = gg * transformer(z, x0) + (1 - gg) * z
         return gg * x + (1 - gg) * z_in
 
 

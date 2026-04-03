@@ -47,6 +47,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 ## Configuration
 - Keep experiment hyperparameters in code defaults (or CLI), not hidden environment variables.
 - Remove dead/unreachable configuration paths; they silently rot and confuse debugging.
+- If you add gating that changes a probability simplex into sub-mass, define health metrics on the renormalized share and treat leftover mass explicitly.
 
 ## Environment Sanity Checks
 - Before long runs, verify the environment can see CUDA and the dataset/tokenizer paths resolve.
