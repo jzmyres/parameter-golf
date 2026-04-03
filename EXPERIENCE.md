@@ -16,6 +16,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - For progress monitoring, tail the run log directly.
 - Avoid logging stale diagnostics outside their natural cadence (train-step vs val-step).
 - Make ablations an explicit, logged flag so runs remain comparable and reproducible.
+- Never append multiple runs into a single comparison log; truncate logs per run or make parsers select the last run.
 
 ## Validation Curves
 - If you want plots with curves, make sure the run actually logs multiple validation points (set a non-zero validation interval).

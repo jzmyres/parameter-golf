@@ -132,6 +132,7 @@ class Hyperparameters:
     deq_k_min = 4
     deq_k_max = 4
     deq_k_eval = 4
+    moe_level = "component"  # {"component","block"}; component=Attn+MLP mix, block=paired expert block mix once
 
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = 32
@@ -186,6 +187,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--deq-k-min", type=int, default=None)
     p.add_argument("--deq-k-max", type=int, default=None)
     p.add_argument("--deq-k-eval", type=int, default=None)
+    p.add_argument("--moe-level", type=str, default=None, choices=["component", "block"])
     ns, unknown = p.parse_known_args(argv)
     if unknown:
         raise SystemExit(f"Unknown args: {unknown}")
@@ -841,7 +843,7 @@ class CausalSelfAttention(nn.Module):
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 6,
-                 expert_rank: int = 0):
+                 expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -881,13 +883,15 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.rope_dim, base=rope_base)
         # Gated attention bias (per-head scalar); init near-1 (combined with zeroed per-token logits).
         self.gate_bias = nn.Parameter(torch.full((num_heads,), SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
-        # Soft dense routing on attention output (MoE for attention)
-        self.attn_router = SoftDenseRouter(dim, num_experts)
+        # Soft dense routing on attention output (MoE for attention). In block-level MoE
+        # mode we pass in a shared router from the parent block.
+        self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self.out_ortho_coef = 0.0
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward_experts(self, x: Tensor) -> Tensor:
+        """Return per-expert attention outputs [B, T, E, D] (no routing mix)."""
         bsz, seqlen, dim = x.shape
         # Q projection outputs query vectors + per-head gate logits
         q_and_gate = self.c_q(x)  # [B, T, dim + num_heads]
@@ -928,8 +932,6 @@ class CausalSelfAttention(nn.Module):
         # Gated attention: query-dependent per-head gate (arxiv:2505.06708)
         y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        # Soft dense routing on attention output (dense mixture-of-experts)
-        route_weights = self.attn_router(x)  # [B, T, E]
         # einsum requires matching dtypes; keep compute in activation dtype under autocast.
         expert_proj = self.expert_proj.to(dtype=y.dtype)
         expert_out = self.expert_out.to(dtype=y.dtype)
@@ -952,6 +954,11 @@ class CausalSelfAttention(nn.Module):
             with torch.no_grad():
                 mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
                 self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu).item())
+        return out_e
+
+    def forward(self, x: Tensor) -> Tensor:
+        out_e = self.forward_experts(x)
+        route_weights = self.attn_router(x)  # [B, T, E]
         return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
 
     @property
@@ -980,6 +987,7 @@ class MLP(nn.Module):
         mlp_mult: float,
         num_experts: int = 6,
         expert_rank: int = 0,
+        router: SoftDenseRouter | None = None,
     ):
         super().__init__()
         hidden = int(mlp_mult * dim)
@@ -992,19 +1000,31 @@ class MLP(nn.Module):
             nn.init.xavier_uniform_(self.expert_gate.data[e])
             nn.init.xavier_uniform_(self.expert_fc.data[e])
             nn.init.xavier_uniform_(self.expert_down.data[e])
-        self.mlp_router = SoftDenseRouter(dim, num_experts)
+        # Soft dense routing. In block-level MoE we pass in a shared router from the parent block.
+        self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self.out_ortho_coef = 0.0
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
 
-    def forward(self, x: Tensor) -> Tensor:
-        route_weights = self.mlp_router(x)  # [B, T, E]
+    def forward_experts(self, x: Tensor) -> Tensor:
+        """Return per-expert MLP outputs [B, T, E, D] (no routing mix).
+
+        Supports both:
+        - x: [B, T, D]   (component MoE; all experts see same x)
+        - x: [B, T, E, D] (block MoE; expert e sees its own stream x[...,e,:])
+        """
+        if x.ndim not in (3, 4):
+            raise ValueError(f"MLP expects x rank 3 or 4, got shape {tuple(x.shape)}")
         # einsum requires matching dtypes; keep compute in activation dtype under autocast.
         expert_gate = self.expert_gate.to(dtype=x.dtype)
         expert_fc = self.expert_fc.to(dtype=x.dtype)
         expert_down = self.expert_down.to(dtype=x.dtype)
-        gate_h = torch.einsum('btd,esd->btes', x, expert_gate)
-        fc_h = torch.einsum('btd,esd->btes', x, expert_fc)
+        if x.ndim == 3:
+            gate_h = torch.einsum('btd,esd->btes', x, expert_gate)
+            fc_h = torch.einsum('btd,esd->btes', x, expert_fc)
+        else:
+            gate_h = torch.einsum('bted,esd->btes', x, expert_gate)
+            fc_h = torch.einsum('bted,esd->btes', x, expert_fc)
         h = F.silu(gate_h) * fc_h  # [B, T, E, expert_rank]
         out_e = torch.einsum('btes,eds->bted', h, expert_down)
         self._out_ortho_loss = None
@@ -1022,6 +1042,11 @@ class MLP(nn.Module):
             with torch.no_grad():
                 mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
                 self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu).item())
+        return out_e
+
+    def forward(self, x: Tensor) -> Tensor:
+        out_e = self.forward_experts(x)
+        route_weights = self.mlp_router(x)  # [B, T, E]
         return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
 
     @property
@@ -1277,13 +1302,25 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 resid_mix_init_logit: float = 5.0):
+                 resid_mix_init_logit: float = 5.0, moe_level: str = "component"):
         super().__init__()
+        if moe_level not in ("component", "block"):
+            raise ValueError(f"moe_level must be component|block, got {moe_level!r}")
+        self.moe_level = moe_level
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                         kv_latent_dim=kv_latent_dim, expert_rank=attn_expert_rank)
-        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank)
+        shared_router = SoftDenseRouter(dim, 6) if self.moe_level == "block" else None
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            kv_latent_dim=kv_latent_dim,
+            expert_rank=attn_expert_rank,
+            router=shared_router,
+        )
+        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=shared_router)
         if resid_mix_init_logit <= 0.0:
             raise ValueError(f"resid_mix_init_logit must be > 0, got {resid_mix_init_logit}")
 
@@ -1322,10 +1359,20 @@ class Block(nn.Module):
 
         mix = torch.softmax(self.resid_mix.float(), dim=0).to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + attn_out
-        mlp_out = self.mlp(self.mlp_norm(x))
-        x = x + mlp_out
+        if self.moe_level == "block":
+            x_attn = self.attn_norm(x)
+            # One router for the whole block (paired expert blocks): compute weights once.
+            w = self.attn.attn_router(x_attn)  # shared router instance
+            attn_out_e = self.attn.forward_experts(x_attn)  # [B,T,E,D]
+            z1_e = x[:, :, None, :] + attn_out_e
+            mlp_out_e = self.mlp.forward_experts(self.mlp_norm(z1_e))
+            z2_e = z1_e + mlp_out_e
+            x = (z2_e * w.unsqueeze(-1)).sum(dim=2)
+        else:
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + attn_out
+            mlp_out = self.mlp(self.mlp_norm(x))
+            x = x + mlp_out
         # Global residual blend: f(z, x0) = gg * transformer(z, x0) + (1 - gg) * z
         return gg * x + (1 - gg) * z_in
 
@@ -1526,6 +1573,7 @@ class GPT(nn.Module):
         attn_ortho_out_coef: float = 0.05,
         mlp_ortho_out_coef: float = 0.05,
         deq_backward: str = "autograd",
+        moe_level: str = "component",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1545,7 +1593,7 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                   attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                  resid_mix_init_logit=resid_mix_init_logit)
+                                  resid_mix_init_logit=resid_mix_init_logit, moe_level=moe_level)
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -1780,12 +1828,18 @@ class GPT(nn.Module):
             # - dense train-step router diagnostics are consistent (rank0 only)
             attn_router = self.shared_block.attn.attn_router
             mlp_router = self.shared_block.mlp.mlp_router
-            attn_router.set_bias_stats_enabled(True)
-            mlp_router.set_bias_stats_enabled(True)
-            _ = attn_router(self.shared_block.attn_norm(z))
-            _ = mlp_router(self.shared_block.mlp_norm(z))
-            attn_router.set_bias_stats_enabled(False)
-            mlp_router.set_bias_stats_enabled(False)
+            seen: set[int] = set()
+            for r, inp in [
+                (attn_router, self.shared_block.attn_norm(z)),
+                (mlp_router, self.shared_block.mlp_norm(z)),
+            ]:
+                rid = id(r)
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                r.set_bias_stats_enabled(True)
+                _ = r(inp)
+                r.set_bias_stats_enabled(False)
 
         # Diagnostics (eval only)
         if not self.training:
@@ -1825,14 +1879,21 @@ class GPT(nn.Module):
         """Collect balance, sparsity, and orthogonality losses from all routers."""
         zero = torch.tensor(0.0, device=device)
         bal, spar, ortho = zero, zero, zero
-        # Per-component routing losses with stronger weight for attention (prevents collapse)
-        for name, r, bal_weight in [
-            ("attn", self.shared_block.attn.attn_router, self.attn_balance_mult),
-            ("mlp", self.shared_block.mlp.mlp_router, self.mlp_balance_mult),
+        # Per-component routing losses with stronger weight for attention (prevents collapse).
+        # Deduplicate if routers are tied/shared (block-level MoE).
+        router_weights: dict[int, float] = {}
+        routers: dict[int, SoftDenseRouter] = {}
+        for r, w in [
+            (self.shared_block.attn.attn_router, self.attn_balance_mult),
+            (self.shared_block.mlp.mlp_router, self.mlp_balance_mult),
         ]:
-            r_bal = getattr(r, '_balance_loss', zero)
-            r_spar = getattr(r, '_sparsity_loss', zero)
-            bal = bal + bal_weight * r_bal
+            rid = id(r)
+            routers[rid] = r
+            router_weights[rid] = router_weights.get(rid, 0.0) + float(w)
+        for rid, r in routers.items():
+            r_bal = getattr(r, "_balance_loss", zero)
+            r_spar = getattr(r, "_sparsity_loss", zero)
+            bal = bal + float(router_weights.get(rid, 0.0)) * r_bal
             spar = spar + r_spar
         # MoS head routing
         bal = bal + getattr(self.mos_head, '_balance_loss', zero)
@@ -2023,6 +2084,9 @@ def main() -> None:
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
+        # Truncate run log at the start of each run (prevents multi-run concatenation).
+        with open(logfile, "w", encoding="utf-8") as f:
+            f.write("")
         print(logfile, flush=True)
 
     def log0(msg: str, console: bool = True) -> None:
@@ -2064,6 +2128,7 @@ def main() -> None:
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"moe_level:{args.moe_level}")
     log0(f"router_bias_update:{int(bool(args.router_bias_update))} lr:{float(args.router_bias_lr):.4f} clip:{float(args.router_bias_clip):.2f}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -2096,6 +2161,7 @@ def main() -> None:
         attn_ortho_out_coef=args.attn_ortho_out_coef,
         mlp_ortho_out_coef=args.mlp_ortho_out_coef,
         deq_backward=args.deq_backward,
+        moe_level=args.moe_level,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -2306,16 +2372,20 @@ def main() -> None:
             for opt in optimizers:
                 opt.step()
             if args.router_bias_update:
-                base_model.shared_block.attn.attn_router.bias_update(
-                    lr=float(args.router_bias_lr),
-                    clip=float(args.router_bias_clip),
-                    distributed=distributed,
-                )
-                base_model.shared_block.mlp.mlp_router.bias_update(
-                    lr=float(args.router_bias_lr),
-                    clip=float(args.router_bias_clip),
-                    distributed=distributed,
-                )
+                seen: set[int] = set()
+                for r in [
+                    base_model.shared_block.attn.attn_router,
+                    base_model.shared_block.mlp.mlp_router,
+                ]:
+                    rid = id(r)
+                    if rid in seen:
+                        continue
+                    seen.add(rid)
+                    r.bias_update(
+                        lr=float(args.router_bias_lr),
+                        clip=float(args.router_bias_clip),
+                        distributed=distributed,
+                    )
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
@@ -2414,16 +2484,20 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         if args.router_bias_update:
-            base_model.shared_block.attn.attn_router.bias_update(
-                lr=float(args.router_bias_lr),
-                clip=float(args.router_bias_clip),
-                distributed=distributed,
-            )
-            base_model.shared_block.mlp.mlp_router.bias_update(
-                lr=float(args.router_bias_lr),
-                clip=float(args.router_bias_clip),
-                distributed=distributed,
-            )
+            seen: set[int] = set()
+            for r in [
+                base_model.shared_block.attn.attn_router,
+                base_model.shared_block.mlp.mlp_router,
+            ]:
+                rid = id(r)
+                if rid in seen:
+                    continue
+                seen.add(rid)
+                r.bias_update(
+                    lr=float(args.router_bias_lr),
+                    clip=float(args.router_bias_clip),
+                    distributed=distributed,
+                )
         zero_grad_all()
 
         step += 1

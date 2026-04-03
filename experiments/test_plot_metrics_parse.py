@@ -12,6 +12,34 @@ from experiments.plot_metrics import parse_log, usage_min_series
 
 
 class TestPlotMetricsParse(unittest.TestCase):
+    def test_parse_log_concatenated_runs_keep_last(self):
+        log = "\n".join(
+            [
+                # Run 1
+                "train_batch_tokens:8 train_seq_len:4 iterations:2 warmup_steps:0 max_wallclock_seconds:0.000",
+                "step:1/2 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 train_time:10.0ms step_avg:10.0ms",
+                "step:1/2 val_loss:3.1 val_bpb:1.50 deq_residual:1.0 mlp_entropy:0.7",
+                "final_int6_zstd_roundtrip_exact val_loss:2.00000000 val_bpb:1.40000000",
+                # Run 2 (concatenated into same file)
+                "train_batch_tokens:8 train_seq_len:4 iterations:2 warmup_steps:0 max_wallclock_seconds:0.000",
+                "step:1/2 train_loss:2.2 ntp_loss:1.1 ctp_loss:0.1 grad_norm:0.1 train_time:5.0ms step_avg:5.0ms",
+                "step:1/2 val_loss:2.1 val_bpb:1.25 deq_residual:2.0 mlp_entropy:0.8",
+                "final_int6_zstd_roundtrip_exact val_loss:1.90000000 val_bpb:1.35000000",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        # Only the second run should remain.
+        self.assertEqual(d["train_steps"], [1])
+        self.assertEqual(d["train_loss"], [2.2])
+        self.assertEqual(d["val_steps"], [1])
+        self.assertEqual(d["val_bpb"], [1.25])
+        self.assertEqual(d["final_postquant_val_bpb"], 1.35)
+
     def test_parse_log_train_diagnostics_fields(self):
         log = "\n".join(
             [

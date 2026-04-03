@@ -36,7 +36,8 @@ _FLOAT = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
 def parse_log(logpath: str) -> dict:
     """Parse training log for all metrics."""
     lines = Path(logpath).read_text().split("\n")
-    data = {
+    def _new_data() -> dict:
+        return {
         "train_batch_tokens": None,
         "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
         "grad_norm": [],
@@ -62,17 +63,32 @@ def parse_log(logpath: str) -> dict:
         # Final post-quant scoring metric (what the submission is scored on)
         "final_postquant_val_loss": None,
         "final_postquant_val_bpb": None,
-    }
+        }
+
+    # NOTE: logs may accidentally contain multiple runs concatenated together (e.g. reused run_id).
+    # Plotting must be run-session aware; keep only the most recent run.
+    data = _new_data()
+    last_step_seen: int | None = None
 
     for line in lines:
-        m = re.search(r"train_batch_tokens:(\d+)", line)
-        if m and data["train_batch_tokens"] is None:
-            data["train_batch_tokens"] = int(m.group(1))
+        m = re.search(r"^train_batch_tokens:(\d+)", line)
+        if m:
+            # Start of a new run: reset if we already parsed any steps/metrics.
+            if data["train_steps"] or data["val_steps"] or data.get("final_postquant_val_bpb") is not None:
+                data = _new_data()
+                last_step_seen = None
+            if data["train_batch_tokens"] is None:
+                data["train_batch_tokens"] = int(m.group(1))
 
         # Training steps
         m = re.search(rf"^step:(\d+)/\d+ train_loss:{_FLOAT}.*train_time:{_FLOAT}ms step_avg:{_FLOAT}ms", line)
         if m:
-            data["train_steps"].append(int(m.group(1)))
+            step_i = int(m.group(1))
+            if last_step_seen is not None and step_i < last_step_seen:
+                data = _new_data()
+                last_step_seen = None
+            last_step_seen = step_i
+            data["train_steps"].append(step_i)
             data["train_loss"].append(float(m.group(2)))
             data["train_time_ms"].append(float(m.group(3)))
             data["step_avg_ms"].append(float(m.group(4)))
@@ -127,7 +143,12 @@ def parse_log(logpath: str) -> dict:
         # Validation steps
         m = re.search(rf"^step:(\d+)/\d+ val_loss:{_FLOAT} val_bpb:{_FLOAT}", line)
         if m:
-            data["val_steps"].append(int(m.group(1)))
+            step_i = int(m.group(1))
+            if last_step_seen is not None and step_i < last_step_seen:
+                data = _new_data()
+                last_step_seen = None
+            last_step_seen = step_i
+            data["val_steps"].append(step_i)
             data["val_loss"].append(float(m.group(2)))
             data["val_bpb"].append(float(m.group(3)))
             # Parse individual DEQ/expert metrics
