@@ -22,7 +22,7 @@
 
 \title{OPG Parameter Golf: Architecture and Training Setup (Code Review)}
 \author{Autoresearch Notes (generated from \texttt{train\_gpt.py})}
-\date{2026-04-02}
+\date{2026-04-03}
 
 \begin{document}
 \maketitle
@@ -130,20 +130,36 @@ token ids. The embedding table and projection are initialized to zeros; the scal
 
 \subsection{Soft Dense Routing}
 \paragraph{Router weights.}
-\texttt{SoftDenseRouter} produces dense per-expert weights:
+\texttt{SoftDenseRouter} produces dense per-expert weights. The code supports two closely-related modes:
+\begin{itemize}
+  \item \textbf{Component MoE (default; \texttt{moe\_level=component}).} Pure softmax routing (convex weights that sum to 1).
+  \item \textbf{Block MoE (\texttt{moe\_level=block}).} The \emph{single shared block router} uses a gated variant:
+  \[
+    w = \text{softmax}(\ell)\odot \sigma(g), \quad \sum_e w_e \in (0,1],
+  \]
+  where the leftover mass $1-\sum_e w_e$ is used as a per-token residual/global-gate weight.
+\end{itemize}
+
+For component MoE, routing is:
 \begin{align}
   \alpha &= \text{softmax}(W x + b),
 \end{align}
 where $b$ is a learned per-expert bias updated with a \emph{loss-free} controller during training (see below). Post-softmax
-sigmoid gating is removed from the default architecture because an ablation showed it degrades performance.
+sigmoid gating is not used in the default component MoE (the block router gate is an explicit residual-blend mechanism).
 
 \paragraph{Balance and sparsity regularizers.}
-During training, diagnostics and balance are computed on the routing weights $\alpha$:
+During training, diagnostics and balance are computed on a \emph{normalized share distribution} (which sums to 1):
+\begin{itemize}
+  \item Component MoE: share $=\alpha$.
+  \item Block MoE (gated router): share $= w / \sum_e w_e$ (per token).
+\end{itemize}
+Balance is:
 \begin{align}
   L_\text{bal} &= \text{MSE}(\mathbb{E}[\alpha], \text{Uniform}).
 \end{align}
 These are accumulated across attention and MLP routers and later scaled (Section~\ref{sec:loss}).
 Defaults set attention balancing stronger than MLP (\texttt{attn\_balance\_mult}=5.0, \texttt{mlp\_balance\_mult}=1.0).
+The router exposes a \texttt{\_sparsity\_loss} hook, but in the current code it is set to 0 (no sparsity loss is applied).
 
 \paragraph{Loss-free load balancing (expert bias controller).}
 To prevent dead experts without introducing strong auxiliary-loss gradients, the router maintains a bias vector $b$ that is
@@ -208,21 +224,30 @@ The DEQ function $f_\theta(z, x_0)$ is implemented by \texttt{Block.forward(z, x
   \[
     z \leftarrow m_0 \odot z + m_1 \odot x_0, \quad [m_0, m_1] = \text{softmax}(\texttt{resid\_mix}).
   \]
-  \item Attention residual update:
-  \[
-    z \leftarrow z + \text{Attn}(\text{RMSNorm}(z)),
-  \]
-  \item MLP residual update:
-  \[
-    z \leftarrow z + \text{MLP}(\text{RMSNorm}(z)).
-  \]
-  \item Global block gate (scalar):
-  \[
-    f_\theta(z, x_0) = g_g \cdot z_{\text{body}} + (1-g_g)\cdot z_{\text{in}}, \quad g_g=\sigma(\langle \bar z_{\text{in}}, w_{gg}\rangle + b_{gg}),
-  \]
-  where $\bar z_{\text{in}}$ is mean-pooled over batch and sequence, and $(w_{gg}, b_{gg})$ are learned parameters. All
-  sigmoid-based gates are initialized near 1 (\texttt{sigmoid(6)=0.9975}). For attention head gating, the per-token
-  gate logits are initialized to 0 and combined with a learned bias initialized near 1.
+  \item Apply either component-level MoE or block-level MoE:
+  \begin{itemize}
+    \item \textbf{Component MoE (\texttt{moe\_level=component}).} Standard sequencing:
+    \[
+      z \leftarrow z + \text{Attn}(\text{RMSNorm}(z)),\qquad
+      z \leftarrow z + \text{MLP}(\text{RMSNorm}(z)).
+    \]
+    Then apply a learned global block gate (scalar):
+    \[
+      f_\theta(z, x_0) = g_g \cdot z_{\text{body}} + (1-g_g)\cdot z_{\text{in}}, \quad
+      g_g=\sigma(\langle \bar z_{\text{in}}, w_{gg}\rangle + b_{gg}),
+    \]
+    where $\bar z_{\text{in}}$ is mean-pooled over batch and sequence.
+
+    \item \textbf{Block MoE (\texttt{moe\_level=block}).} ``Paired expert blocks'' with a single shared router. The router emits
+    gated weights $w$ where $\sum_e w_e \in (0,1]$ and this \emph{gate mass} acts as a per-token global gate:
+    \[
+      g_g(x) \equiv \sum_{e=1}^E w_e(x), \qquad
+      f_\theta(z, x_0) = \sum_{e=1}^E w_e \cdot z^{(e)}_{\text{body}} + (1-g_g)\cdot z_{\text{in}}.
+    \]
+    In this mode there is no separate learned global gate; the router gate-mass plays that role.
+  \end{itemize}
+  All sigmoid-based gates are initialized near 1 (\texttt{sigmoid(6)=0.9975}) unless otherwise noted. For attention head gating,
+  the per-token gate-logit slice is initialized to 0 and combined with a learned bias initialized near 1.
 \end{enumerate}
 
 \subsection{Coupled-state solver (explicit unroll)}
@@ -290,7 +315,8 @@ Default coefficients (from \texttt{Hyperparameters}):
   \item $\lambda_\text{ctp} = 0.1 \cdot \texttt{num\_refinements}$ (0 when no refinements).
   \item Balance multiplier: \texttt{bal\_loss\_coef} times per-component weights (\texttt{attn\_balance\_mult},
   \texttt{mlp\_balance\_mult}).
-  \item Sparsity coefficient is hard-coded as 0.001 in the loss assembly.
+  \item Sparsity coefficient is hard-coded as 0.001 in the loss assembly, but router \texttt{\_sparsity\_loss} is currently 0
+  (no active sparsity penalty).
   \item Output-space orth coefficients: \texttt{mos\_ortho\_out\_coef}, \texttt{attn\_ortho\_out\_coef},
   \texttt{mlp\_ortho\_out\_coef} (defaults: MoS=0.05, Attn/MLP=0.02).
 \end{itemize}
@@ -340,12 +366,15 @@ serialization and post-quant evaluation.
 
 \section{Logging, diagnostics, and plotting}
 \subsection{Run logs}
-Rank 0 writes a log file at \texttt{logs/\{run\_id\}.txt} and prints the path to stdout. Training lines include:
+Rank 0 writes a log file at \texttt{logs/\{run\_id\}.txt} and prints the path to stdout. The file is truncated at the start
+of each run (prevents multi-run concatenation under a reused \texttt{run\_id}). Training lines include:
 \begin{itemize}
   \item Losses: \texttt{train\_loss}, \texttt{ntp\_loss}, \texttt{ctp\_loss}.
   \item Gradient norms.
   \item DEQ diagnostics (residual proxies, iter convergence, optional reconstruction error for RevDEQ backward).
-  \item Global gate diagnostics: \texttt{gg}, \texttt{gg\_mean}, and \texttt{gg\_iter:[...]}. (The latter reports one value per DEQ iteration.)
+  \item Global gate diagnostics: \texttt{gg}, \texttt{gg\_mean}, and \texttt{gg\_iter:[...]}. In component MoE these come
+  from the learned block gate; in block MoE they come from the router gate-mass (mean of $\sum_e w_e$).
+  \item \texttt{moe\_level:\{component|block\}} to disambiguate runs.
   \item Router diagnostics: per-component usage, entropy, CV, and gates (when enabled).
   \item Output-space orthogonality metrics per component (when logged).
 \end{itemize}
@@ -357,6 +386,7 @@ that plots have curves without requiring very frequent full validation.
 \subsection{Comparison plot}
 \texttt{experiments/plot\_metrics.py} parses \texttt{experiments/training\_logs/baseline.log} and \texttt{current.log} and
 generates a single figure \texttt{experiments/metrics\_comparison.png}.
+The parser is run-session aware: if a log file contains multiple runs concatenated together, it keeps only the last run.
 
 \section{Post-training quantization and final evaluation}
 \subsection{INT6 mixed quantization}
@@ -376,8 +406,9 @@ exact values and writes a metadata JSON file for tracking.
 
 \section{Notes on contraction and fixed-point behavior}
 The current design contains mechanisms that \emph{encourage} stable updates at initialization (convex mixing with $x_0$
-and a learned global block gate $g_g$), but contraction is not guaranteed. Contraction depends on the operator norm of the
-Jacobian $\|\partial f/\partial z\|$, which can exceed 1 even with multiplicative gates in $(0,1)$.
+and either a learned global block gate $g_g$ in component MoE or a router gate-mass in block MoE), but contraction is not
+guaranteed. Contraction depends on the operator norm of the Jacobian $\|\partial f/\partial z\|$, which can exceed 1 even
+with multiplicative gates in $(0,1)$.
 
 Practical diagnostics in this codebase are:
 \begin{itemize}
