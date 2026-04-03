@@ -143,6 +143,7 @@ During training, diagnostics and balance are computed on the routing weights $\a
   L_\text{bal} &= \text{MSE}(\mathbb{E}[\alpha], \text{Uniform}).
 \end{align}
 These are accumulated across attention and MLP routers and later scaled (Section~\ref{sec:loss}).
+Defaults set attention balancing stronger than MLP (\texttt{attn\_balance\_mult}=5.0, \texttt{mlp\_balance\_mult}=1.0).
 
 \paragraph{Loss-free load balancing (expert bias controller).}
 To prevent dead experts without introducing strong auxiliary-loss gradients, the router maintains a bias vector $b$ that is
@@ -256,6 +257,11 @@ The model can run multiple refinement cycles (\texttt{num\_refinements}). After 
   \item Re-run the DEQ solver using $x_0^\text{refined}$.
 \end{itemize}
 The EMA coupling makes refinement stable without introducing an extra trained ``convergence loss'' term.
+\paragraph{Implementation notes.}
+Because $p_\text{ctp}$ and $p_\text{ntp-shift}$ are individually normalized distributions, their convex combination is already
+normalized in exact arithmetic; the code skips a full-vocab renormalization for speed and instead renormalizes on the retained
+top-$k$ support. To keep peak VRAM bounded at $k{=}128$, the expected embedding is computed in chunks (avoids materializing a
+full $[B,T,k,d]$ tensor).
 \paragraph{One-hot as a special case.}
 The $r{=}0$ input embedding path corresponds to a delta distribution over tokens (all probability mass on the observed token),
 so the expected embedding is exactly the token's embedding. For refinement steps ($r{>}0$), position $0$ uses the CTP distribution
@@ -286,7 +292,7 @@ Default coefficients (from \texttt{Hyperparameters}):
   \texttt{mlp\_balance\_mult}).
   \item Sparsity coefficient is hard-coded as 0.001 in the loss assembly.
   \item Output-space orth coefficients: \texttt{mos\_ortho\_out\_coef}, \texttt{attn\_ortho\_out\_coef},
-  \texttt{mlp\_ortho\_out\_coef} (each default 0.05).
+  \texttt{mlp\_ortho\_out\_coef} (defaults: MoS=0.05, Attn/MLP=0.02).
 \end{itemize}
 
 \section{Training setup}
