@@ -127,9 +127,9 @@ class Hyperparameters:
     attn_ortho_out_coef = 0.02
     mlp_ortho_out_coef = 0.02
     deq_backward = "autograd"  # {autograd, revdeq}
-    deq_k_jitter = False
-    deq_k_min = 4
-    deq_k_max = 4
+    deq_k_jitter = True
+    deq_k_min = 2
+    deq_k_max = 8
     deq_k_eval = 4
     moe_level = "component"  # {"component","block"}; component=Attn+MLP mix, block=paired expert block mix once
 
