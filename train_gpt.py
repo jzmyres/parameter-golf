@@ -86,7 +86,6 @@ class Hyperparameters:
     max_wallclock_seconds = 0.0  # 0 disables wallclock early-stop
     qk_gain_init = 1.5
     deq_beta = 0.2
-    resid_mix_init_logit = 5.0
 
     vocab_size = 1024
     num_layers = 4  # DEQ solver iters per refinement step (fixed K by default)
@@ -1328,7 +1327,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 resid_mix_init_logit: float = 5.0, moe_level: str = "component"):
+                 moe_level: str = "component"):
         super().__init__()
         if moe_level not in ("component", "block"):
             raise ValueError(f"moe_level must be component|block, got {moe_level!r}")
@@ -1347,8 +1346,6 @@ class Block(nn.Module):
             router=shared_router,
         )
         self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=shared_router)
-        if resid_mix_init_logit <= 0.0:
-            raise ValueError(f"resid_mix_init_logit must be > 0, got {resid_mix_init_logit}")
 
         # Global gate scalar for the entire transformer block (midpoint init = 0.5).
         # Computed from pooled block input so gg can vary across DEQ iterations.
@@ -1368,18 +1365,33 @@ class Block(nn.Module):
         self._gg_call_track_enabled = False
         self._gg_call_track: list[float] = []
 
-        # Constrain mixing weights via softmax (convex combination) but initialize
-        # near the historical behavior: mix ≈ [1, 0] (no x0 injection at init).
-        self.resid_mix = nn.Parameter(torch.empty(2, dim, dtype=torch.float32))
+        # Input-conditioned injection gate (hypernet).
+        # Gate uses pooled pre-injection state u=mean_{b,t}(z_in) to keep the cost small and
+        # stable under DEQ iteration. The gate is per-dimension:
+        #   g = sigmoid(u ⊙ w_inj + b_inj) ∈ (0,1)^d
+        # Injection is convex:
+        #   z_inj = (1-g)⊙z_in + g⊙x0
+        self.inj_w = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
+        self.inj_b = nn.Parameter(torch.empty((dim,), dtype=torch.float32))
+        # Diagnostics: mean gate value on the last forward call.
+        self._inj_gate_last_mean: float | None = None
         with torch.no_grad():
-            self.resid_mix[0].fill_(resid_mix_init_logit)
-            self.resid_mix[1].fill_(-resid_mix_init_logit)
+            # Conservative init: injection almost-off at start to preserve near-identity behavior.
+            self.inj_b.fill_(-6.0)
+
+    def _inj_gate_from(self, z_in: Tensor) -> Tensor:
+        """Return per-dimension injection gate g ∈ (0,1)^d computed from pooled z_in."""
+        u = z_in.float().mean(dim=(0, 1))  # [d]
+        logits = u * self.inj_w + self.inj_b
+        g = torch.sigmoid(logits)  # [d]
+        self._inj_gate_last_mean = float(g.detach().mean().item())
+        return g
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         z_in = x
 
-        mix = torch.softmax(self.resid_mix.float(), dim=0).to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        g = self._inj_gate_from(z_in).to(dtype=x.dtype)  # [d]
+        x = (1.0 - g)[None, None, :] * z_in + g[None, None, :] * x0
         if self.moe_level == "block":
             x_attn = self.attn_norm(x)
             # One router for the whole block (paired expert blocks): compute weights once.
@@ -1608,7 +1620,6 @@ class GPT(nn.Module):
         attn_expert_rank: int = 0,
         mlp_expert_rank: int = 0,
         deq_beta: float = 0.5,
-        resid_mix_init_logit: float = 5.0,
         attn_balance_mult: float = 3.0,
         mlp_balance_mult: float = 1.0,
         bal_loss_coef: float = 0.5,
@@ -1636,7 +1647,7 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                   attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                  resid_mix_init_logit=resid_mix_init_logit, moe_level=moe_level)
+                                  moe_level=moe_level)
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2196,7 +2207,6 @@ def main() -> None:
         attn_expert_rank=args.attn_expert_rank,
         mlp_expert_rank=args.mlp_expert_rank,
         deq_beta=args.deq_beta,
-        resid_mix_init_logit=args.resid_mix_init_logit,
         attn_balance_mult=args.attn_balance_mult,
         mlp_balance_mult=args.mlp_balance_mult,
         bal_loss_coef=args.bal_loss_coef,

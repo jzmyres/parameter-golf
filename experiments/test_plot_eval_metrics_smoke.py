@@ -8,6 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class TestPlotEvalMetricsSmoke(unittest.TestCase):
     def test_plot_eval_metrics_generates_png(self):
+        try:
+            import matplotlib  # noqa: F401
+        except Exception:
+            self.skipTest("matplotlib not available in this environment")
         from experiments.plot_eval_metrics import plot_eval_comparison
 
         log = "\n".join(
@@ -34,4 +38,3 @@ class TestPlotEvalMetricsSmoke(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
