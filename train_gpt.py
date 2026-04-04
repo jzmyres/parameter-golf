@@ -113,7 +113,7 @@ class Hyperparameters:
 
     vocab_size = 1024
     num_layers = 4  # DEQ solver iters per refinement step (fixed K by default)
-    num_refinements = 1  # predict→soft_embed→re-encode cycles
+    num_refinements = 2  # predict→soft_embed→re-encode cycles
     num_kv_heads = 4
     model_dim = 640
     num_heads = 8
@@ -153,8 +153,8 @@ class Hyperparameters:
     deq_backward = "autograd"  # {autograd, revdeq}
     deq_k_jitter = True
     deq_k_min = 2
-    deq_k_max = 8
-    deq_k_eval = 4
+    deq_k_max = 12
+    deq_k_eval = 8
     moe_level = "component"  # {"component","block"}; component=Attn+MLP mix, block=paired expert block mix once
 
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)

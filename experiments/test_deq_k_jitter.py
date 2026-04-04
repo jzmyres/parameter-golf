@@ -18,8 +18,8 @@ class TestDeqKJitter(unittest.TestCase):
         # Defaults (experiment protocol): jitter enabled, K sampled in [2,8], eval fixed.
         self.assertEqual(Hyperparameters.deq_k_jitter, True)
         self.assertEqual(Hyperparameters.deq_k_min, 2)
-        self.assertEqual(Hyperparameters.deq_k_max, 8)
-        self.assertEqual(Hyperparameters.deq_k_eval, 4)
+        self.assertEqual(Hyperparameters.deq_k_max, 12)
+        self.assertEqual(Hyperparameters.deq_k_eval, 8)
 
     def test_cli_override_parses_bool(self):
         ov = _parse_cli_overrides(["--deq-k-jitter", "0"])
@@ -30,11 +30,11 @@ class TestDeqKJitter(unittest.TestCase):
     def test_shuffle_bag_covers_all_k_each_cycle(self):
         import random
         rng = random.Random(123)
-        s = KShuffleBagSampler(2, 8, rng)
-        got1 = [s.sample() for _ in range(7)]
-        self.assertEqual(set(got1), set(range(2, 9)))
-        got2 = [s.sample() for _ in range(7)]
-        self.assertEqual(set(got2), set(range(2, 9)))
+        s = KShuffleBagSampler(2, 12, rng)
+        got1 = [s.sample() for _ in range(11)]
+        self.assertEqual(set(got1), set(range(2, 13)))
+        got2 = [s.sample() for _ in range(11)]
+        self.assertEqual(set(got2), set(range(2, 13)))
 
 
 if __name__ == "__main__":

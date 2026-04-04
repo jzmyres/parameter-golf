@@ -652,15 +652,19 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         """
         if ki <= 0:
             return "-"
-        # k=2..8: increasingly "dashy" styles (shorter dashes / more frequent gaps).
+        # k=2..12: increasingly "dashy" styles (shorter dashes / more frequent gaps).
         dash_table = [
             (0, (10, 3)),  # k=2
-            (0, (8, 3)),   # k=3
-            (0, (6, 3)),   # k=4
-            (0, (4, 3)),   # k=5
-            (0, (3, 2)),   # k=6
-            (0, (2, 2)),   # k=7
-            (0, (1, 1)),   # k=8
+            (0, (9, 3)),   # k=3
+            (0, (8, 3)),   # k=4
+            (0, (7, 3)),   # k=5
+            (0, (6, 3)),   # k=6
+            (0, (5, 2)),   # k=7
+            (0, (4, 2)),   # k=8
+            (0, (3, 2)),   # k=9
+            (0, (2, 2)),   # k=10
+            (0, (2, 1)),   # k=11
+            (0, (1, 1)),   # k=12
         ]
         idx = min(ki - 1, len(dash_table) - 1)
         return dash_table[idx]
