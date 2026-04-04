@@ -53,3 +53,6 @@ Short, reusable guardrails to avoid common experiment mistakes.
 ## Environment Sanity Checks
 - Before long runs, verify the environment can see CUDA and the dataset/tokenizer paths resolve.
 - Generate plots using an environment that has the plotting dependencies installed.
+
+## Randomness
+- When you need randomness *and* coverage, use a shuffle-bag sampler instead of i.i.d. draws.

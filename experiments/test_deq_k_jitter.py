@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-from train_gpt import Hyperparameters, _parse_cli_overrides
+from train_gpt import Hyperparameters, KShuffleBagSampler, _parse_cli_overrides
 
 
 class TestDeqKJitter(unittest.TestCase):
@@ -26,6 +26,15 @@ class TestDeqKJitter(unittest.TestCase):
         self.assertEqual(ov["deq_k_jitter"], False)
         ov = _parse_cli_overrides(["--deq-k-jitter", "1"])
         self.assertEqual(ov["deq_k_jitter"], True)
+
+    def test_shuffle_bag_covers_all_k_each_cycle(self):
+        import random
+        rng = random.Random(123)
+        s = KShuffleBagSampler(2, 8, rng)
+        got1 = [s.sample() for _ in range(7)]
+        self.assertEqual(set(got1), set(range(2, 9)))
+        got2 = [s.sample() for _ in range(7)]
+        self.assertEqual(set(got2), set(range(2, 9)))
 
 
 if __name__ == "__main__":

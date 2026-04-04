@@ -64,6 +64,29 @@ def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
         _ROUTER_DIAGNOSTICS_ACTIVE = prev
         _ROUTER_DIAGNOSTICS_STEP = prev_step
 
+
+class KShuffleBagSampler:
+    """Shuffle-bag sampler over an integer range [k_min, k_max] (inclusive).
+
+    Guarantees exact coverage: each K appears exactly once per bag cycle, with random order.
+    """
+    def __init__(self, k_min: int, k_max: int, rng: random.Random):
+        if k_min > k_max:
+            raise ValueError(f"k_min must be <= k_max, got {k_min} > {k_max}")
+        self.k_min = int(k_min)
+        self.k_max = int(k_max)
+        self.rng = rng
+        self._bag: list[int] = []
+
+    def reset(self) -> None:
+        self._bag.clear()
+
+    def sample(self) -> int:
+        if not self._bag:
+            self._bag = list(range(self.k_min, self.k_max + 1))
+            self.rng.shuffle(self._bag)
+        return int(self._bag.pop())
+
 class Hyperparameters:
     # Do not override experiment configuration via environment variables.
     # (Exception: CUDA/DDP runtime env like CUDA_VISIBLE_DEVICES/RANK/WORLD_SIZE.)
@@ -2194,6 +2217,16 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     k_rng = random.Random(args.seed + 12345)
+    k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max, k_rng)
+
+    def sample_deq_k() -> int:
+        """Sample one DEQ iteration count K for the next optimizer step (rank0-decided, broadcast)."""
+        k = k_sampler.sample() if rank == 0 else 0
+        if distributed:
+            k_t = torch.tensor([k], device=device, dtype=torch.int64)
+            dist.broadcast(k_t, src=0)
+            k = int(k_t.item())
+        return int(k)
 
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
@@ -2437,12 +2470,7 @@ def main() -> None:
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             if args.deq_k_jitter:
-                k = k_rng.randint(args.deq_k_min, args.deq_k_max)
-                if distributed:
-                    k_t = torch.tensor([k], device=device, dtype=torch.int64)
-                    dist.broadcast(k_t, src=0)
-                    k = int(k_t.item())
-                base_model._deq_k_override = int(k)
+                base_model._deq_k_override = sample_deq_k()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -2477,6 +2505,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        # Reset the shuffle-bag after warmup so main training begins with fresh coverage cycles.
+        k_sampler.reset()
 
     # MAIN TRAINING LOOP
     training_time_ms = 0.0
@@ -2531,12 +2561,7 @@ def main() -> None:
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if args.deq_k_jitter:
-            k = k_rng.randint(args.deq_k_min, args.deq_k_max) if rank == 0 else 0
-            if distributed:
-                k_t = torch.tensor([k], device=device, dtype=torch.int64)
-                dist.broadcast(k_t, src=0)
-                k = int(k_t.item())
-            base_model._deq_k_override = int(k)
+            base_model._deq_k_override = sample_deq_k()
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
