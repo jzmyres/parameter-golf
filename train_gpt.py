@@ -126,7 +126,9 @@ class Hyperparameters:
     mos_ortho_out_coef = 0.05
     attn_ortho_out_coef = 0.02
     mlp_ortho_out_coef = 0.02
-    deq_backward = "autograd"  # {autograd, revdeq}
+    # NOTE: When K-jitter spans larger K, autograd-unroll can OOM due to storing 2*K block activations.
+    # RevDEQ backward is the intended constant-memory path for variable-K experiments.
+    deq_backward = "revdeq"  # {autograd, revdeq}
     deq_k_jitter = True
     deq_k_min = 2
     deq_k_max = 8
