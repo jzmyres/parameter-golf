@@ -49,6 +49,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Remove dead/unreachable configuration paths; they silently rot and confuse debugging.
 - If you add gating that changes a probability simplex into sub-mass, define health metrics on the renormalized share and treat leftover mass explicitly.
 - In iterative solvers, prefer pooled convex gates with conservative initialization to preserve a stable identity path.
+- If you change normalization strategy, apply it consistently at every weight input so comparisons remain meaningful.
 
 ## Environment Sanity Checks
 - Before long runs, verify the environment can see CUDA and the dataset/tokenizer paths resolve.

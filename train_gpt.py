@@ -782,10 +782,12 @@ class SoftDenseRouter(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """Returns routing weights [*, num_experts]."""
-        route_logits = self.router(x) + self.expert_bias.to(dtype=x.dtype)
+        # Pre-RMSNorm: ensure all weight inputs are normalized immediately before use.
+        x_n = _rms_norm(x)
+        route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
         p = torch.softmax(route_logits, dim=-1)
         if self.gate is not None:
-            g = torch.sigmoid(self.gate(x))
+            g = torch.sigmoid(self.gate(x_n))
             route_weights = p * g
             gate_mass = route_weights.sum(dim=-1, keepdim=True)  # [*,1] in (0,1]
             share = route_weights / gate_mass.clamp_min(1e-8)    # normalized share (sum=1)
@@ -918,16 +920,18 @@ class CausalSelfAttention(nn.Module):
     def forward_experts(self, x: Tensor) -> Tensor:
         """Return per-expert attention outputs [B, T, E, D] (no routing mix)."""
         bsz, seqlen, dim = x.shape
+        # Pre-RMSNorm: normalize input before feeding it to any weight multiplication.
+        x_n = _rms_norm(x)
         # Q projection outputs query vectors + per-head gate logits
-        q_and_gate = self.c_q(x)  # [B, T, dim + num_heads]
+        q_and_gate = self.c_q(x_n)  # [B, T, dim + num_heads]
         q_raw = q_and_gate[..., :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         gate_logits = q_and_gate[..., dim:].reshape(bsz, seqlen, self.num_heads, 1).transpose(1, 2)
         q_rope, q_nope = q_raw[..., :self.rope_dim], q_raw[..., self.rope_dim:]
 
-        kv_latent = self.c_kv_down(x)
+        kv_latent = self.c_kv_down(x_n)
         k_nope = self.c_k_nope(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
         v = self.c_v(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        k_rope = self.c_k_rope(x).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
+        k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
 
         q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
         k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
@@ -983,7 +987,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         out_e = self.forward_experts(x)
-        route_weights = self.attn_router(x)  # [B, T, E]
+        # Router does its own pre-RMSNorm, but keep the callsite consistent with the
+        # "pre-RMSNorm before weight input" convention.
+        route_weights = self.attn_router(_rms_norm(x))  # [B, T, E]
         return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
 
     @property
@@ -1040,6 +1046,8 @@ class MLP(nn.Module):
         """
         if x.ndim not in (3, 4):
             raise ValueError(f"MLP expects x rank 3 or 4, got shape {tuple(x.shape)}")
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x = _rms_norm(x)
         # einsum requires matching dtypes; keep compute in activation dtype under autocast.
         expert_gate = self.expert_gate.to(dtype=x.dtype)
         expert_fc = self.expert_fc.to(dtype=x.dtype)
@@ -1128,7 +1136,8 @@ class BigramHashEmbedding(nn.Module):
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(self.bigram_hash(token_ids))
         if self.proj is not None:
-            h = self.proj(h)
+            # Pre-RMSNorm: normalize before weight multiplication.
+            h = self.proj(_rms_norm(h))
         return h * self.scale.to(dtype=h.dtype)
 
 
@@ -1234,6 +1243,8 @@ class MoSHead(nn.Module):
         between per-expert mean pre-FSQ latents (x @ A_e).
         """
         N = x.shape[0]
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x = _rms_norm(x)
         alpha = F.softmax(gate(x).float(), dim=-1)  # [N, num_shared+num_spec] — convex combination
         log_w = alpha.clamp(min=1e-8).log()
         log_p_unnorm = x.new_full((N, self.vocab_size), -torch.inf, dtype=torch.float32)
@@ -1381,7 +1392,9 @@ class Block(nn.Module):
 
     def _inj_gate_from(self, z_in: Tensor) -> Tensor:
         """Return per-dimension injection gate g ∈ (0,1)^d computed from pooled z_in."""
-        u = z_in.float().mean(dim=(0, 1))  # [d]
+        # Pre-RMSNorm: normalize before weight input to the hypernet.
+        z_n = _rms_norm(z_in)
+        u = z_n.float().mean(dim=(0, 1))  # [d]
         logits = u * self.inj_w + self.inj_b
         g = torch.sigmoid(logits)  # [d]
         self._inj_gate_last_mean = float(g.detach().mean().item())
@@ -1412,7 +1425,8 @@ class Block(nn.Module):
             # Use leftover routing mass as the residual weight (no separate learned global gate).
             x = x_mix + (1.0 - gg_tok).to(dtype=x.dtype).unsqueeze(-1) * z_in
         else:
-            pooled = z_in.float().mean(dim=(0, 1))
+            # Pre-RMSNorm: normalize before weight input to the global gate.
+            pooled = _rms_norm(z_in).float().mean(dim=(0, 1))
             gg_logit = (pooled * self.gg_w).sum() + self.gg_b
             gg = torch.sigmoid(gg_logit).to(dtype=x.dtype)
             gg_val = float(gg.detach().item())
