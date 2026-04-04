@@ -2182,6 +2182,7 @@ def main() -> None:
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"run_id:{args.run_id}")
     log0(f"moe_level:{args.moe_level}")
     log0(f"router_bias_update:{int(bool(args.router_bias_update))} lr:{float(args.router_bias_lr):.4f} clip:{float(args.router_bias_clip):.2f}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
@@ -2706,7 +2707,10 @@ def main() -> None:
             if logfile is not None and Path(logfile).exists():
                 # Copy rather than rename so `logs/<run_id>.txt` remains the canonical run log.
                 shutil.copyfile(logfile, exp_logdir / "current.log")
-            # Only run plots if a baseline exists (comparison window protocol).
+            # Always keep plots up to date with the most recent run. If this is the first
+            # run in a fresh workspace, initialize baseline from current so plots render.
+            if (exp_logdir / "current.log").exists() and not (exp_logdir / "baseline.log").exists():
+                shutil.copyfile(exp_logdir / "current.log", exp_logdir / "baseline.log")
             if (exp_logdir / "baseline.log").exists() and (exp_logdir / "current.log").exists():
                 subprocess.run([sys.executable, "experiments/plot_metrics.py"], check=False)
                 subprocess.run([sys.executable, "experiments/plot_eval_metrics.py"], check=False)
