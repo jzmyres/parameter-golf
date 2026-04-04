@@ -153,11 +153,29 @@ def _plot_gg_iter(ax, b: dict, c: dict):
         ax.set_yticks([])
         return
 
-    iter_linestyles = ["-", "--", ":", "-."]
+    def _k_linestyle(ki: int):
+        """Line style for GG-by-DEQ-iter curves.
+
+        ki is 0-based; k=1 should be solid, and larger k should become progressively more dashed.
+        """
+        if ki <= 0:
+            return "-"
+        dash_table = [
+            (0, (10, 3)),  # k=2
+            (0, (8, 3)),   # k=3
+            (0, (6, 3)),   # k=4
+            (0, (4, 3)),   # k=5
+            (0, (3, 2)),   # k=6
+            (0, (2, 2)),   # k=7
+            (0, (1, 1)),   # k=8
+        ]
+        idx = min(ki - 1, len(dash_table) - 1)
+        return dash_table[idx]
+
     from matplotlib.lines import Line2D
     style_handles = []
     for ki in range(k_plot):
-        style = iter_linestyles[ki % len(iter_linestyles)]
+        style = _k_linestyle(ki)
         b_vals = [v[ki] if len(v) > ki else math.nan for v in b_iters]
         c_vals = [v[ki] if len(v) > ki else math.nan for v in c_iters]
         bx, by = _filter_finite(b.get("val_steps", []), b_vals)

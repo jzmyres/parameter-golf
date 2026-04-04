@@ -645,6 +645,26 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
             return "train_steps", train_key
         return "val_steps", val_key
 
+    def _k_linestyle(ki: int):
+        """Line style for GG-by-DEQ-iter curves.
+
+        ki is 0-based; k=1 should be solid, and larger k should become progressively more dashed.
+        """
+        if ki <= 0:
+            return "-"
+        # k=2..8: increasingly "dashy" styles (shorter dashes / more frequent gaps).
+        dash_table = [
+            (0, (10, 3)),  # k=2
+            (0, (8, 3)),   # k=3
+            (0, (6, 3)),   # k=4
+            (0, (4, 3)),   # k=5
+            (0, (3, 2)),   # k=6
+            (0, (2, 2)),   # k=7
+            (0, (1, 1)),   # k=8
+        ]
+        idx = min(ki - 1, len(dash_table) - 1)
+        return dash_table[idx]
+
     ax_gg = axes[5, 0]
     steps_key, key = _prefer_train_listlist("gg_iter_train", "gg_iter")
     b_iters = b.get(key, []) or []
@@ -663,11 +683,10 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_gg.set_xticks([])
         ax_gg.set_yticks([])
     else:
-        iter_linestyles = ["-", "--", ":", "-."]
         from matplotlib.lines import Line2D
         style_handles = []
         for ki in range(k_plot):
-            style = iter_linestyles[ki % len(iter_linestyles)]
+            style = _k_linestyle(ki)
             b_vals = [v[ki] if len(v) > ki else math.nan for v in b_iters]
             c_vals = [v[ki] if len(v) > ki else math.nan for v in c_iters]
             bx, by = _filter_finite(b.get(steps_key, []), b_vals)
