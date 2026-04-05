@@ -15,11 +15,11 @@ class TestDeqKJitter(unittest.TestCase):
         self.assertTrue(hasattr(Hyperparameters, "deq_k_min"))
         self.assertTrue(hasattr(Hyperparameters, "deq_k_max"))
         self.assertTrue(hasattr(Hyperparameters, "deq_k_eval"))
-        # Defaults (experiment protocol): jitter enabled, K sampled in [2,8], eval fixed.
-        self.assertEqual(Hyperparameters.deq_k_jitter, True)
-        self.assertEqual(Hyperparameters.deq_k_min, 2)
+        # Defaults: fixed K=12 for all training/eval steps (no jitter).
+        self.assertEqual(Hyperparameters.deq_k_jitter, False)
+        self.assertEqual(Hyperparameters.deq_k_min, 12)
         self.assertEqual(Hyperparameters.deq_k_max, 12)
-        self.assertEqual(Hyperparameters.deq_k_eval, 8)
+        self.assertEqual(Hyperparameters.deq_k_eval, 12)
 
     def test_cli_override_parses_bool(self):
         ov = _parse_cli_overrides(["--deq-k-jitter", "0"])

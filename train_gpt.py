@@ -112,7 +112,7 @@ class Hyperparameters:
     deq_beta = 0.2
 
     vocab_size = 1024
-    num_layers = 4  # DEQ solver iters per refinement step (fixed K by default)
+    num_layers = 12  # DEQ solver iters per refinement step (fixed K by default)
     num_refinements = 2  # predict→soft_embed→re-encode cycles
     num_kv_heads = 4
     model_dim = 640
@@ -151,10 +151,16 @@ class Hyperparameters:
     attn_ortho_out_coef = 0.02
     mlp_ortho_out_coef = 0.02
     deq_backward = "autograd"  # {autograd, revdeq}
-    deq_k_jitter = True
-    deq_k_min = 2
+    deq_k_jitter = False
+    deq_k_min = 12
     deq_k_max = 12
-    deq_k_eval = 8
+    deq_k_eval = 12
+
+    # Sparse intermediate DEQ supervision (encourages useful early iterates)
+    deq_sup_enabled = True
+    deq_sup_ks = "2,6,12"
+    deq_sup_weights = "0.2,0.3,0.5"
+    deq_sup_coef = 0.25
 
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = 32
@@ -210,6 +216,10 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--deq-k-min", type=int, default=None)
     p.add_argument("--deq-k-max", type=int, default=None)
     p.add_argument("--deq-k-eval", type=int, default=None)
+    p.add_argument("--deq-sup-enabled", type=int, default=None, help="1/0; sparse intermediate DEQ supervision")
+    p.add_argument("--deq-sup-ks", type=str, default=None, help="comma-separated iteration indices, e.g. 2,6,12")
+    p.add_argument("--deq-sup-weights", type=str, default=None, help="comma-separated weights for ks (optional)")
+    p.add_argument("--deq-sup-coef", type=float, default=None, help="overall multiplier for intermediate supervision")
     ns, unknown = p.parse_known_args(argv)
     if unknown:
         raise SystemExit(f"Unknown args: {unknown}")
@@ -744,6 +754,16 @@ def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
     cos = g @ g.T
     mask = ~torch.eye(e, dtype=torch.bool, device=cos.device)
     return cos[mask].abs().mean()
+
+
+def _parse_int_list(csv: str) -> list[int]:
+    parts = [p.strip() for p in str(csv).split(",") if p.strip()]
+    return [int(p) for p in parts]
+
+
+def _parse_float_list(csv: str) -> list[float]:
+    parts = [p.strip() for p in str(csv).split(",") if p.strip()]
+    return [float(p) for p in parts]
 
 
 class SoftDenseRouter(nn.Module):
@@ -1663,6 +1683,13 @@ class GPT(nn.Module):
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm()
         self._init_weights()
+        # Intermediate DEQ supervision config (populated in main from args)
+        self.deq_sup_enabled = False
+        self.deq_sup_ks: list[int] = []
+        self.deq_sup_weights: list[float] = []
+        self.deq_sup_coef: float = 0.0
+        self._deq_sup_snaps: list[Tensor] | None = None
+        self._deq_sup_target: Tensor | None = None
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -1751,7 +1778,7 @@ class GPT(nn.Module):
             soft_embed = _rms_norm(soft_embed.to(dtype=z.dtype))
         return soft_embed
 
-    def _deq_solve(self, x0: Tensor, z_init: Tensor):
+    def _deq_solve(self, x0: Tensor, z_init: Tensor, *, collect_ks: set[int] | None = None):
         """Run DEQ coupled-state solver.
 
         - Training:
@@ -1762,6 +1789,8 @@ class GPT(nn.Module):
         beta = self.deq_beta
         dtype = x0.dtype
         K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
+        collect_ks = set(collect_ks or [])
+        z_snaps: list[Tensor] = []
 
         # Track global gate gg across the entire DEQ solve (avg over all block calls).
         self.shared_block._gg_sum = 0.0
@@ -1772,11 +1801,13 @@ class GPT(nn.Module):
         self.shared_block._gg_call_track_enabled = True
         try:
             if self.training and self.deq_backward == "revdeq":
+                if collect_ks:
+                    raise RuntimeError("Intermediate DEQ supervision requires deq_backward=autograd")
                 params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
                 z, z_prev = RevDEQFunction.apply(
                     self.shared_block, x0, z_init, beta, K, *params
                 )
-                return z, z_prev, None, None
+                return z, z_prev, None, None, []
 
             # Explicit coupled-state unroll (autograd-enabled in training).
             # For variable-K training (K-jitter) large K can OOM under autograd-unroll due to
@@ -1790,7 +1821,7 @@ class GPT(nn.Module):
             z_acc = z_init.to(acc_dtype)
             z = z_init
             z_prev = z
-            for _ in range(K):
+            for i in range(K):
                 z_prev = z
                 if use_ckpt:
                     f_z = checkpoint.checkpoint(_f_theta, z, x0, use_reentrant=False)
@@ -1804,7 +1835,10 @@ class GPT(nn.Module):
                     f_y = self.shared_block(y, x0)
                 z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
                 z = z_acc.to(dtype)
-            return z, z_prev, y_acc, z_acc
+                k = i + 1
+                if k in collect_ks:
+                    z_snaps.append(z)
+            return z, z_prev, y_acc, z_acc, z_snaps
         finally:
             self.shared_block._gg_track_enabled = False
             self.shared_block._gg_call_track_enabled = False
@@ -1830,6 +1864,7 @@ class GPT(nn.Module):
         dtype = x.dtype
         self._deq_residuals: list[float] = []
         self._gg_iter: list[float] | None = None
+        self._deq_sup_snaps = None
         # Avoid leaking stale eval-only diagnostics into train-step logs.
         self._deq_recon_error = None
         prev_soft_embed = x0
@@ -1846,7 +1881,13 @@ class GPT(nn.Module):
                 x0_refined = x0
 
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
-            z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
+            # Sparse intermediate supervision snapshots: collect only for the final refinement solve.
+            collect = None
+            if self.training and self.deq_sup_enabled and r == self.num_refinements:
+                collect = set(self.deq_sup_ks)
+            z, z_prev, y_acc, z_acc, z_snaps = self._deq_solve(x0_refined, z, collect_ks=collect)
+            if self.training and self.deq_sup_enabled and r == self.num_refinements:
+                self._deq_sup_snaps = z_snaps
             gg_iters_by_refinement.append(list(getattr(self, "_gg_iter_last_solve", []) or []))
 
         # Aggregate per-DEQ-iteration gates across all refinement solves (r0 one-hot + r>0 soft-embed).
@@ -1990,6 +2031,17 @@ class GPT(nn.Module):
                 attn_ortho_loss = a.to(device=ntp_loss.device)
             if isinstance(m, torch.Tensor):
                 mlp_ortho_loss = m.to(device=ntp_loss.device)
+
+        # Sparse intermediate DEQ supervision (final refinement solve only).
+        sup_loss = torch.tensor(0.0, device=ntp_loss.device)
+        if self.training and self.deq_sup_enabled and self.deq_backward == "autograd":
+            snaps = list(self._deq_sup_snaps or [])
+            if snaps and self.deq_sup_weights:
+                # Snaps are collected in increasing k order.
+                for w, z_k in zip(self.deq_sup_weights, snaps, strict=False):
+                    h_k = self.final_norm(z_k)
+                    _, log_p_ntp_k = self.mos_head(h_k)
+                    sup_loss = sup_loss + float(w) * F.nll_loss(log_p_ntp_k.reshape(-1, V), target_ids.reshape(-1))
         return (
             ntp_loss
             + ctp_weight * ctp_loss
@@ -1998,6 +2050,7 @@ class GPT(nn.Module):
             + self.mos_ortho_out_coef * mos_ortho_loss
             + self.attn_ortho_out_coef * attn_ortho_loss
             + self.mlp_ortho_out_coef * mlp_ortho_loss
+            + self.deq_sup_coef * sup_loss
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -2104,6 +2157,37 @@ def main() -> None:
     args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
     if not getattr(args, "run_id", ""):
         args.run_id = str(uuid.uuid4())
+
+    # Parse DEQ supervision schedule (decision-complete at runtime).
+    deq_sup_enabled = bool(getattr(args, "deq_sup_enabled", False))
+    ks: list[int] = []
+    ws: list[float] = []
+    if deq_sup_enabled:
+        if str(getattr(args, "deq_backward", "autograd")) != "autograd":
+            raise ValueError("deq_sup_enabled requires deq_backward=autograd")
+        ks = _parse_int_list(getattr(args, "deq_sup_ks", ""))
+        if not ks:
+            raise ValueError("deq_sup_ks must be non-empty when deq_sup_enabled=1")
+        if max(ks) > int(args.num_layers):
+            raise ValueError(f"deq_sup_ks must be <= num_layers={int(args.num_layers)}, got {ks}")
+        w_csv = getattr(args, "deq_sup_weights", "")
+        if w_csv:
+            ws = _parse_float_list(w_csv)
+            if len(ws) != len(ks):
+                raise ValueError(f"deq_sup_weights length must match deq_sup_ks: {len(ws)} vs {len(ks)}")
+        else:
+            ws = [1.0] * len(ks)
+        s = float(sum(ws))
+        if not math.isfinite(s) or s <= 0:
+            raise ValueError(f"deq_sup_weights must sum to >0, got {ws}")
+        ws = [float(w) / s for w in ws]
+        pairs = sorted(zip(ks, ws, strict=True), key=lambda t: t[0])
+        ks = [k for k, _ in pairs]
+        ws = [w for _, w in pairs]
+        # Store back for logging/plotting (stable, sorted).
+        args.deq_sup_ks = ",".join(str(k) for k in ks)
+        args.deq_sup_weights = ",".join(f"{w:.4f}" for w in ws)
+        args.deq_sup_coef = float(getattr(args, "deq_sup_coef", 0.0))
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -2208,6 +2292,10 @@ def main() -> None:
         f" deq_k_jitter={int(bool(args.deq_k_jitter))}"
         f" deq_k_range={int(args.deq_k_min)}-{int(args.deq_k_max)}"
         f" deq_k_eval={int(args.deq_k_eval)}"
+        f" deq_sup={int(bool(getattr(args, 'deq_sup_enabled', False)))}"
+        f" deq_sup_ks={getattr(args, 'deq_sup_ks', '')}"
+        f" deq_sup_w={getattr(args, 'deq_sup_weights', '')}"
+        f" deq_sup_coef={float(getattr(args, 'deq_sup_coef', 0.0)):.4f}"
         " soft_topk=128"
         " moe=block"
         " router=softmax*sigmoid"
@@ -2244,6 +2332,12 @@ def main() -> None:
         mlp_ortho_out_coef=args.mlp_ortho_out_coef,
         deq_backward=args.deq_backward,
     ).to(device).bfloat16()
+
+    # Configure intermediate DEQ supervision (model-side; uses parsed/sorted values from args).
+    base_model.deq_sup_enabled = bool(deq_sup_enabled)
+    base_model.deq_sup_ks = list(ks)
+    base_model.deq_sup_weights = list(ws)
+    base_model.deq_sup_coef = float(getattr(args, "deq_sup_coef", 0.0)) if deq_sup_enabled else 0.0
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()

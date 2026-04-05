@@ -296,6 +296,16 @@ The model returns:
 \]
 where $L_{\text{spar}}$ is currently a zero placeholder in code (hook for sparsity losses, not actively used).
 
+\paragraph{Sparse intermediate DEQ supervision (training only).}
+When enabled, the code also adds an auxiliary NTP loss on a small set of intermediate DEQ iterates
+for the \emph{final refinement solve only} (to encourage useful early iterates without per-step K-jitter).
+Let $\mathcal{K}_{\text{sup}}\subseteq\{1,\dots,K\}$ (e.g. $\{2,6,12\}$) and weights $\omega_k$ summing to $1$.
+Then:
+\[
+  L_{\text{sup}} \;=\; \sum_{k\in\mathcal{K}_{\text{sup}}} \omega_k\ \mathrm{NLL}(\log p_{\text{NTP}}(z_k), y),
+\]
+and the returned loss includes $+\lambda_{\text{sup}}L_{\text{sup}}$.
+
 \section{Symbol mapping (doc $\leftrightarrow$ code)}
 \begin{center}
 \begin{tabular}{ll}

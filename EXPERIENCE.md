@@ -40,6 +40,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Only compute/log reconstruction error when using the RevDEQ backward path (otherwise it’s not an actionable signal).
 - Prefer simple, explicit parameterizations over hidden stability clamps; diagnose fixed-point behavior directly via residual/convergence metrics.
 - When you need contraction, add a single block-level gate and log it; don’t hide stability in many per-path scale knobs.
+- Intermediate DEQ supervision shapes early iterates, but it’s compute-heavy; keep it sparse and aligned with the scored output.
 
 ## Refinement
 - When mixing token distributions, normalize each input distribution first and renormalize after mixing.
