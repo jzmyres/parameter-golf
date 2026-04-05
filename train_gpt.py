@@ -162,6 +162,13 @@ class Hyperparameters:
     deq_sup_weights = "0.2,0.3,0.5"
     deq_sup_coef = 0.25
 
+    # Efficiency knobs
+    compile_train = False
+    deq_k_ramp_enabled = True
+    deq_k_ramp_start = 4
+    deq_k_ramp_end = 12
+    deq_k_ramp_steps = 800
+
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = 32
 
@@ -220,6 +227,11 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--deq-sup-ks", type=str, default=None, help="comma-separated iteration indices, e.g. 2,6,12")
     p.add_argument("--deq-sup-weights", type=str, default=None, help="comma-separated weights for ks (optional)")
     p.add_argument("--deq-sup-coef", type=float, default=None, help="overall multiplier for intermediate supervision")
+    p.add_argument("--compile-train", type=int, default=None, help="1/0; torch.compile shared_block for training")
+    p.add_argument("--deq-k-ramp-enabled", type=int, default=None, help="1/0; deterministic K ramp schedule")
+    p.add_argument("--deq-k-ramp-start", type=int, default=None)
+    p.add_argument("--deq-k-ramp-end", type=int, default=None)
+    p.add_argument("--deq-k-ramp-steps", type=int, default=None)
     ns, unknown = p.parse_known_args(argv)
     if unknown:
         raise SystemExit(f"Unknown args: {unknown}")
@@ -764,6 +776,20 @@ def _parse_int_list(csv: str) -> list[int]:
 def _parse_float_list(csv: str) -> list[float]:
     parts = [p.strip() for p in str(csv).split(",") if p.strip()]
     return [float(p) for p in parts]
+
+
+def deq_k_ramp(step: int, *, start: int, end: int, ramp_steps: int) -> int:
+    """Deterministic linear ramp: step=1..ramp_steps maps start..end; after ramp_steps -> end."""
+    s = int(step)
+    if s <= 1:
+        return int(start)
+    if ramp_steps <= 1:
+        return int(end)
+    if s >= int(ramp_steps):
+        return int(end)
+    frac = float(s - 1) / float(int(ramp_steps) - 1)
+    k = int(round(float(start) + (float(end) - float(start)) * frac))
+    return int(max(min(k, int(end)), int(start)))
 
 
 class SoftDenseRouter(nn.Module):
@@ -1755,6 +1781,7 @@ class GPT(nn.Module):
         self.deq_sup_weights: list[float] = []
         self.deq_sup_coef: float = 0.0
         self._deq_sup_snaps: list[Tensor] | None = None
+        self._deq_sup_weights_eff: list[float] = []
         self._deq_sup_target: Tensor | None = None
 
     def _init_weights(self) -> None:
@@ -1931,6 +1958,7 @@ class GPT(nn.Module):
         self._deq_residuals: list[float] = []
         self._gg_iter: list[float] | None = None
         self._deq_sup_snaps = None
+        self._deq_sup_weights_eff = []
         # Avoid leaking stale eval-only diagnostics into train-step logs.
         self._deq_recon_error = None
         prev_soft_embed = x0
@@ -1950,7 +1978,16 @@ class GPT(nn.Module):
             # Sparse intermediate supervision snapshots: collect only for the final refinement solve.
             collect = None
             if self.training and self.deq_sup_enabled and r == self.num_refinements:
-                collect = set(self.deq_sup_ks)
+                K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
+                eff = [(k, w) for k, w in zip(self.deq_sup_ks, self.deq_sup_weights, strict=True) if k <= K]
+                if eff:
+                    ws = [w for _, w in eff]
+                    s = float(sum(ws))
+                    ws = [float(w) / max(s, 1e-8) for w in ws]
+                    self._deq_sup_weights_eff = ws
+                    collect = {k for k, _ in eff}
+                else:
+                    self._deq_sup_weights_eff = []
             z, z_prev, y_acc, z_acc, z_snaps = self._deq_solve(x0_refined, z, collect_ks=collect)
             if self.training and self.deq_sup_enabled and r == self.num_refinements:
                 self._deq_sup_snaps = z_snaps
@@ -2102,9 +2139,10 @@ class GPT(nn.Module):
         sup_loss = torch.tensor(0.0, device=ntp_loss.device)
         if self.training and self.deq_sup_enabled and self.deq_backward == "autograd":
             snaps = list(self._deq_sup_snaps or [])
-            if snaps and self.deq_sup_weights:
+            ws = list(self._deq_sup_weights_eff or [])
+            if snaps and ws:
                 # Snaps are collected in increasing k order.
-                for w, z_k in zip(self.deq_sup_weights, snaps, strict=False):
+                for w, z_k in zip(ws, snaps, strict=False):
                     h_k = self.final_norm(z_k)
                     _, log_p_ntp_k = self.mos_head(h_k)
                     sup_loss = sup_loss + float(w) * F.nll_loss(log_p_ntp_k.reshape(-1, V), target_ids.reshape(-1))
@@ -2254,6 +2292,21 @@ def main() -> None:
         args.deq_sup_ks = ",".join(str(k) for k in ks)
         args.deq_sup_weights = ",".join(f"{w:.4f}" for w in ws)
         args.deq_sup_coef = float(getattr(args, "deq_sup_coef", 0.0))
+
+    # Parse/validate K-ramp schedule.
+    deq_k_ramp_enabled = bool(getattr(args, "deq_k_ramp_enabled", False))
+    deq_k_ramp_start = int(getattr(args, "deq_k_ramp_start", args.deq_k_min))
+    deq_k_ramp_end = int(getattr(args, "deq_k_ramp_end", args.deq_k_max))
+    deq_k_ramp_steps = int(getattr(args, "deq_k_ramp_steps", 0))
+    if deq_k_ramp_enabled:
+        if deq_k_ramp_start <= 0 or deq_k_ramp_end <= 0:
+            raise ValueError("deq_k_ramp_start/end must be positive")
+        if deq_k_ramp_start > deq_k_ramp_end:
+            raise ValueError("deq_k_ramp_start must be <= deq_k_ramp_end")
+        if deq_k_ramp_end > int(args.num_layers):
+            raise ValueError(f"deq_k_ramp_end must be <= num_layers={int(args.num_layers)}")
+        if deq_k_ramp_steps <= 0:
+            raise ValueError("deq_k_ramp_steps must be positive when ramp enabled")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -2337,6 +2390,22 @@ def main() -> None:
             k = int(k_t.item())
         return int(k)
 
+    def deq_k_for_step(step_i: int) -> int:
+        """Choose K for this optimizer step (rank0-decided, broadcast)."""
+        k = 0
+        if rank == 0:
+            if deq_k_ramp_enabled:
+                k = deq_k_ramp(step_i, start=deq_k_ramp_start, end=deq_k_ramp_end, ramp_steps=deq_k_ramp_steps)
+            elif args.deq_k_jitter:
+                k = sample_deq_k()
+            else:
+                k = int(getattr(args, "deq_k_max", args.num_layers))
+        if distributed:
+            k_t = torch.tensor([k], device=device, dtype=torch.int64)
+            dist.broadcast(k_t, src=0)
+            k = int(k_t.item())
+        return int(k)
+
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -2362,6 +2431,11 @@ def main() -> None:
         f" deq_sup_ks={getattr(args, 'deq_sup_ks', '')}"
         f" deq_sup_w={getattr(args, 'deq_sup_weights', '')}"
         f" deq_sup_coef={float(getattr(args, 'deq_sup_coef', 0.0)):.4f}"
+        f" compile_train={int(bool(getattr(args, 'compile_train', False)))}"
+        f" deq_k_ramp={int(bool(getattr(args, 'deq_k_ramp_enabled', False)))}"
+        f" deq_k_ramp_start={int(getattr(args, 'deq_k_ramp_start', 0))}"
+        f" deq_k_ramp_end={int(getattr(args, 'deq_k_ramp_end', 0))}"
+        f" deq_k_ramp_steps={int(getattr(args, 'deq_k_ramp_steps', 0))}"
         " soft_topk=128"
         " moe=block"
         " router=softmax*sigmoid"
@@ -2408,6 +2482,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    # Optional training compile: compile only the shared block to avoid compiling the whole training step.
+    if bool(getattr(args, "compile_train", False)):
+        base_model.shared_block = torch.compile(base_model.shared_block, mode="reduce-overhead", fullgraph=False)
     compiled_model = base_model  # skip compile for training; use compiled forward_logits for eval
     model: nn.Module = (
         DDP(
@@ -2696,8 +2774,10 @@ def main() -> None:
             args.train_log_every > 0
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
-        if args.deq_k_jitter:
-            base_model._deq_k_override = sample_deq_k()
+        if deq_k_ramp_enabled or args.deq_k_jitter:
+            base_model._deq_k_override = deq_k_for_step(next_step)
+        else:
+            base_model._deq_k_override = 0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
