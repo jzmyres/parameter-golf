@@ -1038,6 +1038,10 @@ class CausalSelfAttention(nn.Module):
         # Pre-RMSNorm: normalize immediately before weight multiplication.
         x_n = _rms_norm(x)
         y = self._attn_shared_from_normed(x_n)  # [B,T,D]
+        return self.project_expert_from_shared(y, expert_idx)
+
+    def project_expert_from_shared(self, y: Tensor, expert_idx: int) -> Tensor:
+        """Apply expert low-rank projections to a shared attention output y [B,T,D]."""
         e = int(expert_idx)
         proj = self.expert_proj[e].to(dtype=y.dtype)  # [R,D]
         out = self.expert_out[e].to(dtype=y.dtype)    # [D,R]
@@ -1462,6 +1466,7 @@ class Block(nn.Module):
         g = self._inj_gate_from(z_in).to(dtype=x.dtype)  # [d]
         x = (1.0 - g)[None, None, :] * z_in + g[None, None, :] * x0
         x_attn = self.attn_norm(x)
+        x_attn_n = _rms_norm(x_attn)
         # One router for the whole block (paired expert blocks): compute weights once.
         w = self.attn.attn_router(x_attn)  # shared router instance; sum(w) in (0,1]
         gg_tok = w.sum(dim=-1)             # [B,T] residual gate per token
@@ -1482,8 +1487,10 @@ class Block(nn.Module):
 
         attn_mu: list[Tensor] = []
         mlp_mu: list[Tensor] = []
+        # Compute shared attention output once, then project per expert.
+        y_shared = self.attn._attn_shared_from_normed(x_attn_n)  # [B,T,D]
         for e in range(self.attn.num_experts):
-            attn_out = self.attn.forward_expert(x_attn, e)  # [B,T,D]
+            attn_out = self.attn.project_expert_from_shared(y_shared, e)  # [B,T,D]
             z1 = x + attn_out
             mlp_out = self.mlp.forward_expert(self.mlp_norm(z1), e)  # [B,T,D]
             z2 = z1 + mlp_out
