@@ -965,45 +965,7 @@ class CausalSelfAttention(nn.Module):
         bsz, seqlen, dim = x.shape
         # Pre-RMSNorm: normalize immediately before weight multiplication.
         x_n = _rms_norm(x)
-        # Q projection outputs query vectors + per-head gate logits
-        q_and_gate = self.c_q(x_n)  # [B, T, dim + num_heads]
-        q_raw = q_and_gate[..., :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        gate_logits = q_and_gate[..., dim:].reshape(bsz, seqlen, self.num_heads, 1).transpose(1, 2)
-        q_rope, q_nope = q_raw[..., :self.rope_dim], q_raw[..., self.rope_dim:]
-
-        kv_latent = self.c_kv_down(x_n)
-        k_nope = self.c_k_nope(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
-        v = self.c_v(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
-
-        q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
-        k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
-
-        cos, sin = self.rotary(seqlen, x.device, q_rope.dtype)
-        q_rope = apply_rotary_emb(q_rope, cos, sin)
-        k_rope = apply_rotary_emb(k_rope, cos, sin)
-
-        q_full = torch.cat([q_rope, q_nope], dim=-1)
-        k_full = torch.cat([k_rope, k_nope], dim=-1)
-        q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
-
-        # PyTorch versions differ on whether SDPA supports the `enable_gqa` flag.
-        # Fall back to explicit KV head expansion for older versions.
-        try:
-            y = F.scaled_dot_product_attention(
-                q_full, k_full, v, attn_mask=None, is_causal=True,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            )
-        except TypeError:
-            k_use, v_use = k_full, v
-            if self.num_kv_heads != self.num_heads:
-                rep = self.num_heads // self.num_kv_heads
-                k_use = k_full.repeat_interleave(rep, dim=1)
-                v_use = v.repeat_interleave(rep, dim=1)
-            y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
-        # Gated attention: query-dependent per-head gate (arxiv:2505.06708)
-        y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = self._attn_shared_from_normed(x_n)  # [B,T,D]
         # einsum requires matching dtypes; keep compute in activation dtype under autocast.
         expert_proj = self.expert_proj.to(dtype=y.dtype)
         expert_out = self.expert_out.to(dtype=y.dtype)
@@ -1027,6 +989,60 @@ class CausalSelfAttention(nn.Module):
                 mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
                 self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu).item())
         return out_e
+
+    def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
+        """Shared attention path: returns y [B,T,D] after SDPA and per-head gating.
+
+        Expects x_n already pre-RMSNorm'd.
+        """
+        bsz, seqlen, dim = x_n.shape
+        q_and_gate = self.c_q(x_n)  # [B, T, dim + num_heads]
+        q_raw = q_and_gate[..., :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        gate_logits = q_and_gate[..., dim:].reshape(bsz, seqlen, self.num_heads, 1).transpose(1, 2)
+        q_rope, q_nope = q_raw[..., :self.rope_dim], q_raw[..., self.rope_dim:]
+
+        kv_latent = self.c_kv_down(x_n)
+        k_nope = self.c_k_nope(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
+        v = self.c_v(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
+
+        q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
+        k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
+
+        cos, sin = self.rotary(seqlen, x_n.device, q_rope.dtype)
+        q_rope = apply_rotary_emb(q_rope, cos, sin)
+        k_rope = apply_rotary_emb(k_rope, cos, sin)
+
+        q_full = torch.cat([q_rope, q_nope], dim=-1)
+        k_full = torch.cat([k_rope, k_nope], dim=-1)
+        q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
+
+        try:
+            y = F.scaled_dot_product_attention(
+                q_full, k_full, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        except TypeError:
+            k_use, v_use = k_full, v
+            if self.num_kv_heads != self.num_heads:
+                rep = self.num_heads // self.num_kv_heads
+                k_use = k_full.repeat_interleave(rep, dim=1)
+                v_use = v.repeat_interleave(rep, dim=1)
+            y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
+
+        y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
+        return y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+
+    def forward_expert(self, x: Tensor, expert_idx: int) -> Tensor:
+        """Return a single expert attention output [B, T, D] without materializing [B,T,E,D]."""
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x_n = _rms_norm(x)
+        y = self._attn_shared_from_normed(x_n)  # [B,T,D]
+        e = int(expert_idx)
+        proj = self.expert_proj[e].to(dtype=y.dtype)  # [R,D]
+        out = self.expert_out[e].to(dtype=y.dtype)    # [D,R]
+        h = torch.einsum('btd,rd->btr', y, proj)
+        return torch.einsum('btr,dr->btd', h, out)
 
     def forward(self, x: Tensor) -> Tensor:
         raise RuntimeError("CausalSelfAttention routing is handled at the Block level; use forward_experts().")
@@ -1115,6 +1131,21 @@ class MLP(nn.Module):
                 mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
                 self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu).item())
         return out_e
+
+    def forward_expert(self, x: Tensor, expert_idx: int) -> Tensor:
+        """Return a single expert MLP output [B, T, D] without materializing [B,T,E,D]."""
+        if x.ndim != 3:
+            raise ValueError(f"forward_expert expects x rank 3 [B,T,D], got shape {tuple(x.shape)}")
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x = _rms_norm(x)
+        e = int(expert_idx)
+        expert_gate = self.expert_gate[e].to(dtype=x.dtype)  # [R,D]
+        expert_fc = self.expert_fc[e].to(dtype=x.dtype)      # [R,D]
+        expert_down = self.expert_down[e].to(dtype=x.dtype)  # [D,R]
+        gate_h = torch.einsum('btd,sd->bts', x, expert_gate)
+        fc_h = torch.einsum('btd,sd->bts', x, expert_fc)
+        h = F.silu(gate_h) * fc_h
+        return torch.einsum('bts,ds->btd', h, expert_down)
 
     def forward(self, x: Tensor) -> Tensor:
         raise RuntimeError("MLP routing is handled at the Block level; use forward_experts().")
@@ -1442,13 +1473,41 @@ class Block(nn.Module):
         if self._gg_call_track_enabled:
             self._gg_call_track.append(gg_val)
 
-        attn_out_e = self.attn.forward_experts(x_attn)  # [B,T,E,D]
-        z1_e = x[:, :, None, :] + attn_out_e
-        mlp_out_e = self.mlp.forward_experts(self.mlp_norm(z1_e))
-        z2_e = z1_e + mlp_out_e
-        x_mix = (z2_e * w.unsqueeze(-1)).sum(dim=2)
-        # Use leftover routing mass as the residual weight (no separate learned global gate).
-        return x_mix + (1.0 - gg_tok).to(dtype=x.dtype).unsqueeze(-1) * z_in
+        # Memory-safe expert mixing: stream experts without materializing [B,T,E,D].
+        x_mix = (1.0 - gg_tok).to(dtype=x.dtype).unsqueeze(-1) * z_in
+        need_loss = bool(self.training and torch.is_grad_enabled())
+        do_diag = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+        if do_diag and dist.is_available() and dist.is_initialized():
+            do_diag = dist.get_rank() == 0
+
+        attn_mu: list[Tensor] = []
+        mlp_mu: list[Tensor] = []
+        for e in range(self.attn.num_experts):
+            attn_out = self.attn.forward_expert(x_attn, e)  # [B,T,D]
+            z1 = x + attn_out
+            mlp_out = self.mlp.forward_expert(self.mlp_norm(z1), e)  # [B,T,D]
+            z2 = z1 + mlp_out
+            x_mix = x_mix + w[..., e:e+1] * z2
+            if need_loss or do_diag:
+                attn_mu.append(attn_out.mean(dim=(0, 1)).float())
+                mlp_mu.append(mlp_out.mean(dim=(0, 1)).float())
+
+        # Output-space orthogonality tracking/losses without storing per-expert streams.
+        self.attn._out_ortho_loss = None
+        self.mlp._out_ortho_loss = None
+        if attn_mu:
+            mu_a = torch.stack(attn_mu, dim=0)  # [E,D]
+            mu_m = torch.stack(mlp_mu, dim=0)   # [E,D]
+            if need_loss and self.attn.out_ortho_coef > 0.0:
+                self.attn._out_ortho_loss = mean_abs_offdiag_cosine(mu_a)
+            if need_loss and self.mlp.out_ortho_coef > 0.0:
+                self.mlp._out_ortho_loss = mean_abs_offdiag_cosine(mu_m)
+            if do_diag:
+                with torch.no_grad():
+                    self.attn._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu_a).item())
+                    self.mlp._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu_m).item())
+
+        return x_mix
 
 
 class RevDEQFunction(torch.autograd.Function):
