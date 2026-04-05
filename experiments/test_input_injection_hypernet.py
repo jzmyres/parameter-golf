@@ -25,7 +25,6 @@ class TestInputInjectionHypernet(unittest.TestCase):
             kv_latent_dim=0,
             attn_expert_rank=0,
             mlp_expert_rank=0,
-            moe_level="component",
         )
         z_in = torch.randn(2, 3, d)
         x0 = torch.randn(2, 3, d)
@@ -45,4 +44,3 @@ class TestInputInjectionHypernet(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

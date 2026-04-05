@@ -38,6 +38,9 @@ def parse_log(logpath: str) -> dict:
     lines = Path(logpath).read_text().split("\n")
     def _new_data() -> dict:
         return {
+        "run_id": None,
+        "config": {},
+        "config_line": None,
         "train_batch_tokens": None,
         "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
         "grad_norm": [],
@@ -71,6 +74,21 @@ def parse_log(logpath: str) -> dict:
     last_step_seen: int | None = None
 
     for line in lines:
+        m = re.search(r"^run_id:([\\w\\-\\.]+)", line)
+        if m:
+            data["run_id"] = m.group(1)
+
+        m = re.search(r"^config:\\s*(.*)$", line)
+        if m:
+            data["config_line"] = m.group(1).strip()
+            cfg: dict[str, str] = {}
+            for part in data["config_line"].split():
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                cfg[k.strip()] = v.strip()
+            data["config"] = cfg
+
         m = re.search(r"^train_batch_tokens:(\d+)", line)
         if m:
             # Start of a new run: reset if we already parsed any steps/metrics.
@@ -707,6 +725,20 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     axes[5, 2].axis("off")
 
     summary_lines = []
+    # Run metadata + config deltas (if logged)
+    if b.get("run_id") or c.get("run_id"):
+        summary_lines.append(f"Run ID:     {b.get('run_id') or '??'} -> {c.get('run_id') or '??'}")
+    b_cfg = b.get("config") or {}
+    c_cfg = c.get("config") or {}
+    if b_cfg and c_cfg:
+        shared = {k: b_cfg[k] for k in b_cfg.keys() & c_cfg.keys() if b_cfg.get(k) == c_cfg.get(k)}
+        changed = {k: (b_cfg.get(k), c_cfg.get(k)) for k in (b_cfg.keys() | c_cfg.keys()) if b_cfg.get(k) != c_cfg.get(k)}
+        if shared:
+            items = " ".join(f"{k}={v}" for k, v in sorted(shared.items()))
+            summary_lines.append(f"Shared:     {items}")
+        if changed:
+            items = " ".join(f"{k}:{bv}->{cv}" for k, (bv, cv) in sorted(changed.items()))
+            summary_lines.append(f"Diff:       {items}")
     if b["val_bpb"] and c["val_bpb"]:
         delta = c["val_bpb"][-1] - b["val_bpb"][-1]
         summary_lines.append(f"Val BPB:    {b['val_bpb'][-1]:.4f} -> {c['val_bpb'][-1]:.4f} (d={delta:+.4f})")

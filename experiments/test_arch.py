@@ -75,20 +75,24 @@ def test_all_constraints():
     # SmearGate removed; keep the token embedding path unmodified by previous-token mixing.
     import torch.nn as nn
     assert isinstance(model.smear, nn.Identity)
-    assert torch.allclose(model.shared_block.gg_w.float(), torch.zeros_like(model.shared_block.gg_w.float()))
-    assert _sigmoid(model.shared_block.gg_b.float()).item() > 0.99
     assert _sigmoid(attn.gate_bias.float()).min().item() > 0.99
     # Gate-logit slice of c_q should be zero-initialized.
     dim = model.tok_emb.embedding_dim
     assert attn.c_q.weight.shape[0] == dim + attn.num_heads
     assert torch.allclose(attn.c_q.weight[dim:, :].float(), torch.zeros_like(attn.c_q.weight[dim:, :].float()))
-    # Router is pure softmax (dense): weights sum to 1.
+    # Block-level router uses dense softmax, modulated by a per-expert sigmoid gate:
+    #   w = softmax(logits) * sigmoid(gate_logits), so sum(w) ∈ (0, 1].
     r = mlp.mlp_router
+    assert r.gate is not None, "Block-level router must have sigmoid gates enabled"
     x = torch.randn(2, 8, dim, device=dev, dtype=z_dtype)
     with torch.no_grad():
         w = r(x)
-        err = (w.sum(dim=-1) - 1.0).abs().max().item()
-    assert err < 1e-3, f"route_weights should sum to 1; max_err={err:.6f}"
+        s = w.sum(dim=-1)
+        assert (s <= 1.0 + 1e-4).all().item()
+        assert (s >= 0.0).all().item()
+        # Near-1 init for gate bias => sum close to 1 at initialization.
+        err = (s - 1.0).abs().max().item()
+    assert err < 0.02, f"route_weights sum should be close to 1 at init; max_err={err:.6f}"
 
     print("PASS: All 5 constraints satisfied")
 

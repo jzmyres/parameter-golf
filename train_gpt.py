@@ -155,7 +155,6 @@ class Hyperparameters:
     deq_k_min = 2
     deq_k_max = 12
     deq_k_eval = 8
-    moe_level = "component"  # {"component","block"}; component=Attn+MLP mix, block=paired expert block mix once
 
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = 32
@@ -166,7 +165,8 @@ class Hyperparameters:
     kv_latent_dim = 0  # 0 = auto (dim//2)
     attn_expert_rank = 0  # 0 = auto (dim//2)
     mlp_expert_rank = 0  # 0 = auto (hidden//2)
-    # Routing uses pure softmax (dense) by default; no post-softmax sigmoid gating.
+    # Routing is dense softmax over experts, optionally modulated by a per-expert sigmoid
+    # gate so the total routing mass is in (0,1] and can be used as a residual gate.
 
     # SWA knobs (defaults only; override via CLI, not env)
     swa_enabled = True
@@ -210,7 +210,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--deq-k-min", type=int, default=None)
     p.add_argument("--deq-k-max", type=int, default=None)
     p.add_argument("--deq-k-eval", type=int, default=None)
-    p.add_argument("--moe-level", type=str, default=None, choices=["component", "block"])
     ns, unknown = p.parse_known_args(argv)
     if unknown:
         raise SystemExit(f"Unknown args: {unknown}")
@@ -885,12 +884,12 @@ class SoftDenseRouter(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    """MLA with Gated Attention + Soft Dense Routing (Constraints #2, #3).
+    """MLA with Gated Attention + expert bank (Constraints #2, #3).
 
     - Low-rank KV compression via shared latent
     - Decoupled RoPE: half of head_dim for positional encoding
     - Query-dependent per-head sigmoid gate after SDPA (scalar gate per head)
-    - Soft dense routing on output projection (MoE for attention)
+    - Routing is performed at the Block level (shared router for the whole block)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 6,
@@ -1010,11 +1009,7 @@ class CausalSelfAttention(nn.Module):
         return out_e
 
     def forward(self, x: Tensor) -> Tensor:
-        out_e = self.forward_experts(x)
-        # Router does its own pre-RMSNorm, but keep the callsite consistent with the
-        # "pre-RMSNorm before weight input" convention.
-        route_weights = self.attn_router(_rms_norm(x))  # [B, T, E]
-        return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
+        raise RuntimeError("CausalSelfAttention routing is handled at the Block level; use forward_experts().")
 
     @property
     def attn_gate(self) -> Tensor:
@@ -1035,7 +1030,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """SiLU-gated MLP with true expert parameters + Soft Dense Routing (Constraint #2)."""
+    """SiLU-gated MLP expert bank (routing performed at Block level)."""
     def __init__(
         self,
         dim: int,
@@ -1102,9 +1097,7 @@ class MLP(nn.Module):
         return out_e
 
     def forward(self, x: Tensor) -> Tensor:
-        out_e = self.forward_experts(x)
-        route_weights = self.mlp_router(x)  # [B, T, E]
-        return (out_e * route_weights.unsqueeze(-1)).sum(dim=2)
+        raise RuntimeError("MLP routing is handled at the Block level; use forward_experts().")
 
     @property
     def router(self) -> SoftDenseRouter:
@@ -1361,15 +1354,14 @@ class MoSHead(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
-                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 moe_level: str = "component"):
+                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0):
         super().__init__()
-        if moe_level not in ("component", "block"):
-            raise ValueError(f"moe_level must be component|block, got {moe_level!r}")
-        self.moe_level = moe_level
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        shared_router = SoftDenseRouter(dim, 6, enable_gate=True) if self.moe_level == "block" else None
+        # Block-level Soft Dense Routing: one router for the whole block (paired experts).
+        # Routing weights are softmax(logits) * sigmoid(gate_logits); sum(weights) ∈ (0,1]
+        # serves as a per-token residual gate for the DEQ iteration update.
+        shared_router = SoftDenseRouter(dim, 6, enable_gate=True)
         self.attn = CausalSelfAttention(
             dim,
             num_heads,
@@ -1381,17 +1373,6 @@ class Block(nn.Module):
             router=shared_router,
         )
         self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=shared_router)
-
-        # Global gate scalar for the entire transformer block (midpoint init = 0.5).
-        # Computed from pooled block input so gg can vary across DEQ iterations.
-        self.gg_w = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
-        # Initialize gg near-1 so the block starts as "fully on" (global gate is a contraction knob, not a hard constraint).
-        self.gg_b = nn.Parameter(torch.tensor(SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
-        if self.moe_level == "block":
-            # Block-level MoE uses router gate-mass as gg; disable learned gg params to avoid
-            # unused-parameter issues under DDP and to match the intended design.
-            self.gg_w.requires_grad_(False)
-            self.gg_b.requires_grad_(False)
         self._gg_track_enabled = False
         self._gg_sum = 0.0
         self._gg_count = 0
@@ -1429,45 +1410,25 @@ class Block(nn.Module):
 
         g = self._inj_gate_from(z_in).to(dtype=x.dtype)  # [d]
         x = (1.0 - g)[None, None, :] * z_in + g[None, None, :] * x0
-        if self.moe_level == "block":
-            x_attn = self.attn_norm(x)
-            # One router for the whole block (paired expert blocks): compute weights once.
-            w = self.attn.attn_router(x_attn)  # shared router instance; sum(w) in (0,1]
-            gg_tok = w.sum(dim=-1)             # [B,T] global residual gate per token
-            gg_val = float(gg_tok.detach().float().mean().item())
-            self._gg_last = gg_val
-            if self._gg_track_enabled:
-                self._gg_sum += gg_val
-                self._gg_count += 1
-            if self._gg_call_track_enabled:
-                self._gg_call_track.append(gg_val)
-            attn_out_e = self.attn.forward_experts(x_attn)  # [B,T,E,D]
-            z1_e = x[:, :, None, :] + attn_out_e
-            mlp_out_e = self.mlp.forward_experts(self.mlp_norm(z1_e))
-            z2_e = z1_e + mlp_out_e
-            x_mix = (z2_e * w.unsqueeze(-1)).sum(dim=2)
-            # Use leftover routing mass as the residual weight (no separate learned global gate).
-            x = x_mix + (1.0 - gg_tok).to(dtype=x.dtype).unsqueeze(-1) * z_in
-        else:
-            # Pre-RMSNorm: normalize immediately before weight multiplication.
-            pooled = _rms_norm(z_in).float().mean(dim=(0, 1))
-            gg_logit = (pooled * self.gg_w).sum() + self.gg_b
-            gg = torch.sigmoid(gg_logit).to(dtype=x.dtype)
-            gg_val = float(gg.detach().item())
-            self._gg_last = gg_val
-            if self._gg_track_enabled:
-                self._gg_sum += gg_val
-                self._gg_count += 1
-            if self._gg_call_track_enabled:
-                self._gg_call_track.append(gg_val)
-            attn_out = self.attn(self.attn_norm(x))
-            x = x + attn_out
-            mlp_out = self.mlp(self.mlp_norm(x))
-            x = x + mlp_out
-        if self.moe_level == "block":
-            return x
-        # Global residual blend (component MoE): f(z, x0) = gg * transformer(z, x0) + (1 - gg) * z
-        return gg * x + (1 - gg) * z_in
+        x_attn = self.attn_norm(x)
+        # One router for the whole block (paired expert blocks): compute weights once.
+        w = self.attn.attn_router(x_attn)  # shared router instance; sum(w) in (0,1]
+        gg_tok = w.sum(dim=-1)             # [B,T] residual gate per token
+        gg_val = float(gg_tok.detach().float().mean().item())
+        self._gg_last = gg_val
+        if self._gg_track_enabled:
+            self._gg_sum += gg_val
+            self._gg_count += 1
+        if self._gg_call_track_enabled:
+            self._gg_call_track.append(gg_val)
+
+        attn_out_e = self.attn.forward_experts(x_attn)  # [B,T,E,D]
+        z1_e = x[:, :, None, :] + attn_out_e
+        mlp_out_e = self.mlp.forward_experts(self.mlp_norm(z1_e))
+        z2_e = z1_e + mlp_out_e
+        x_mix = (z2_e * w.unsqueeze(-1)).sum(dim=2)
+        # Use leftover routing mass as the residual weight (no separate learned global gate).
+        return x_mix + (1.0 - gg_tok).to(dtype=x.dtype).unsqueeze(-1) * z_in
 
 
 class RevDEQFunction(torch.autograd.Function):
@@ -1665,7 +1626,6 @@ class GPT(nn.Module):
         attn_ortho_out_coef: float = 0.05,
         mlp_ortho_out_coef: float = 0.05,
         deq_backward: str = "autograd",
-        moe_level: str = "component",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1684,8 +1644,7 @@ class GPT(nn.Module):
         # RevDEQ (Constraint #1): single shared block with coupled-state fixed-point iteration
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
-                                  attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                  moe_level=moe_level)
+                                  attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank)
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2243,7 +2202,16 @@ def main() -> None:
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"run_id:{args.run_id}")
-    log0(f"moe_level:{args.moe_level}")
+    log0(
+        "config:"
+        f" refinements={int(args.num_refinements)}"
+        f" deq_k_jitter={int(bool(args.deq_k_jitter))}"
+        f" deq_k_range={int(args.deq_k_min)}-{int(args.deq_k_max)}"
+        f" deq_k_eval={int(args.deq_k_eval)}"
+        " soft_topk=128"
+        " moe=block"
+        " router=softmax*sigmoid"
+    )
     log0(f"router_bias_update:{int(bool(args.router_bias_update))} lr:{float(args.router_bias_lr):.4f} clip:{float(args.router_bias_clip):.2f}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -2275,7 +2243,6 @@ def main() -> None:
         attn_ortho_out_coef=args.attn_ortho_out_coef,
         mlp_ortho_out_coef=args.mlp_ortho_out_coef,
         deq_backward=args.deq_backward,
-        moe_level=args.moe_level,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):

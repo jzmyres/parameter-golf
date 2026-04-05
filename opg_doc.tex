@@ -228,22 +228,8 @@ Injection is a convex per-dimension interpolation:
   z \leftarrow (1-g)\odot z_{\text{in}} + g \odot x_0.
 \]
 
-\subsection{Two routing levels (\texttt{moe\_level} switch)}
-The block supports two dense MoE organizations:
-
-\paragraph{(A) Component-level MoE: \texttt{moe\_level=component}.}
-Attention and MLP are applied sequentially with standard residual connections:
-\[
-  z_1 = z + \mathrm{Attn}\!\left(\mathrm{RMSNorm}(z)\right),\qquad
-  z_2 = z_1 + \mathrm{MLP}\!\left(\mathrm{RMSNorm}(z_1)\right).
-\]
-Then a learned \emph{global gate} $g_g\in(0,1)$ (computed from pooled block input) blends the update with the identity map:
-\[
-  f_\theta(z,x_0) \;=\; g_g\, z_2 + (1-g_g)\, z_{\text{in}}.
-\]
-
-\paragraph{(B) Block-level MoE: \texttt{moe\_level=block}.}
-In this mode, attention and MLP are paired into expert blocks and mixed by a single shared router.
+\subsection{Block-level dense routing (paired expert blocks)}
+Attention and MLP are paired into expert blocks and mixed by a single shared router.
 Per token, the router produces:
 \[
   p(x)=\mathrm{softmax}(\ell(x)),\qquad g(x)=\sigma(\gamma(x)),\qquad w(x)=p(x)\odot g(x).
@@ -284,14 +270,13 @@ The CTP weight scales with refinement steps:
 \subsection{Router balance loss (defined on normalized share)}
 Each router defines a per-token \emph{normalized share} distribution $\alpha$ over experts:
 \begin{itemize}
-  \item component routing: $\alpha=\mathrm{softmax}(\cdot)$ (already sums to $1$),
-  \item gated routing: $\alpha=w/\sum_e w_e$ (renormalized to sum to $1$).
+  \item $\alpha=w/\sum_e w_e$ (renormalized to sum to $1$), even though $w$ itself may be sub-mass.
 \end{itemize}
 Let $\bar\alpha = \mathbb{E}_{b,t}[\alpha_{b,t}]$ be mean share. The balance loss is:
 \[
   L_{\text{bal}} = \left\|\bar\alpha - \tfrac{1}{E}\mathbf{1}\right\|_2^2,
 \]
-aggregated across routers with per-component multipliers (attention typically weighted more strongly than MLP).
+aggregated across routers with per-component multipliers (attention typically weighted more strongly than MLP), even when routers are tied/shared.
 
 \subsection{Output-space orthogonality penalties (autograd-unroll only)}
 When \texttt{deq\_backward=autograd}, the model may add differentiable output-space orthogonality penalties for expert outputs.
