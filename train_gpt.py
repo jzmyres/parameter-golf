@@ -766,6 +766,11 @@ class Rotary(nn.Module):
             # Important: mutating module attributes inside torch.compile can break
             # CUDA graphs (cached outputs overwritten across invocations).
             self._refresh_cache(seq_len, device)
+        # PyTorch inference_mode can produce "inference tensors" that cannot be saved for backward.
+        # If eval ran first and populated the cache under inference_mode, ensure training refreshes
+        # the cache with normal tensors before any autograd-tracked computation uses it.
+        if torch.is_grad_enabled() and self._cos_cached is not None and self._cos_cached.is_inference():
+            self._refresh_cache(seq_len, device)
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
