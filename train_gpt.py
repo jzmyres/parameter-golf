@@ -170,7 +170,7 @@ class Hyperparameters:
     router_bias_update = True
     router_bias_lr = 0.05
     router_bias_clip = 5.0
-    mos_ortho_out_coef = 0.01
+    mos_ortho_out_coef = 1e-3
     attn_ortho_out_coef = 0.0
     mlp_ortho_out_coef = 0.0
     deq_backward = "revdeq"  # {autograd, revdeq}
@@ -2445,6 +2445,13 @@ def main() -> None:
         f" deq_k_range={int(args.deq_k_min)}-{int(args.deq_k_max)}"
         f" deq_k_eval={int(args.deq_k_eval)}"
         f" compile_train={int(bool(getattr(args, 'compile_train', False)))}"
+        f" batch_tokens={int(args.train_batch_tokens)}"
+        f" seq_len={int(args.train_seq_len)}"
+        f" beta={float(args.deq_beta):.3f}"
+        f" mos_ortho_coef={float(args.mos_ortho_out_coef):.4g}"
+        f" model_dim={int(args.model_dim)}"
+        f" heads={int(args.num_heads)}"
+        f" kv_heads={int(args.num_kv_heads)}"
         " soft_topk=128"
         " moe=block"
         " router=softmax"

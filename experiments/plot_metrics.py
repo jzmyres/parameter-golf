@@ -45,6 +45,7 @@ def parse_log(logpath: str) -> dict:
         "grad_norm": [],
         "step_avg_ms": [], "train_time_ms": [],
         "val_steps": [], "val_loss": [], "val_bpb": [],
+        "val_train_time_ms": [], "val_step_avg_ms": [],
         # Validation-time diagnostics (sparse unless VAL_LOSS_EVERY is small)
         "deq_residual": [], "deq_recon": [], "deq_iter_conv": [], "deq_iter_conv_rel": [],
         "gg_iter": [],
@@ -181,6 +182,11 @@ def parse_log(logpath: str) -> dict:
             data["val_steps"].append(step_i)
             data["val_loss"].append(float(m.group(2)))
             data["val_bpb"].append(float(m.group(3)))
+            # Total training time is printed on val lines; use it as authoritative for summary.
+            m_tt = re.search(rf"train_time:{_FLOAT}ms", line)
+            data["val_train_time_ms"].append(float(m_tt.group(1)) if m_tt else math.nan)
+            m_sa = re.search(rf"step_avg:{_FLOAT}ms", line)
+            data["val_step_avg_ms"].append(float(m_sa.group(1)) if m_sa else math.nan)
             # Parse individual DEQ/expert metrics
             for key, pat in [
                 ("deq_residual", rf"deq_residual:{_FLOAT}"),
@@ -594,7 +600,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     _plot_line(axes[4, 1], b, c, key, key, steps_key, steps_key, "DEQ Reconstruction Error")
 
     # Pre vs post-quant val_bpb (post-quant is the scored metric)
-    ax_postq = axes[4, 2]
+    # (Requested swap) Put this bar chart in Row 6 left.
+    ax_postq = axes[5, 0]
     ax_postq.set_title("Val BPB (Pre vs Post-Quant)", fontsize=11)
     b_pre = b["val_bpb"][-1] if b.get("val_bpb") else None
     c_pre = c["val_bpb"][-1] if c.get("val_bpb") else None
@@ -665,7 +672,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_postq.set_xticks([])
         ax_postq.set_yticks([])
 
-    # Row 6: GG by DEQ iteration + Summary + spare
+    # Row 6: Summary + spare
     def _prefer_train_listlist(train_key: str, val_key: str) -> tuple[str, str]:
         if any(len(v) for v in b.get(train_key, [])) or any(len(v) for v in c.get(train_key, [])):
             return "train_steps", train_key
@@ -695,7 +702,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         idx = min(ki - 1, len(dash_table) - 1)
         return dash_table[idx]
 
-    ax_gg = axes[5, 0]
+    # (Requested swap) Put GG plot in Row 5 right.
+    ax_gg = axes[4, 2]
     steps_key, key = _prefer_train_listlist("gg_iter_train", "gg_iter")
     b_iters = b.get(key, []) or []
     c_iters = c.get(key, []) or []
@@ -757,6 +765,21 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         )
     if b["train_steps"] and c["train_steps"]:
         summary_lines.append(f"Steps:      {b['train_steps'][-1]} vs {c['train_steps'][-1]}")
+    # Prefer total training time from val lines (available even when train logs are sparse).
+    def _last_finite(vals: list[float] | None) -> float:
+        for v in reversed(vals or []):
+            if _is_finite(v):
+                return float(v)
+        return math.nan
+
+    b_time_ms = _last_finite(b.get("val_train_time_ms", []))
+    c_time_ms = _last_finite(c.get("val_train_time_ms", []))
+    if not _is_finite(b_time_ms):
+        b_time_ms = _last_finite(b.get("train_time_ms", []))
+    if not _is_finite(c_time_ms):
+        c_time_ms = _last_finite(c.get("train_time_ms", []))
+    if _is_finite(b_time_ms) and _is_finite(c_time_ms):
+        summary_lines.append(f"Time (s):   {b_time_ms/1000.0:.1f} -> {c_time_ms/1000.0:.1f} (d={(c_time_ms-b_time_ms)/1000.0:+.1f})")
     if b["train_loss"] and c["train_loss"]:
         summary_lines.append(f"Train Loss: {b['train_loss'][-1]:.4f} vs {c['train_loss'][-1]:.4f}")
     if b["ntp_loss"] and c["ntp_loss"] and any(v > 0 for v in b["ntp_loss"]):
