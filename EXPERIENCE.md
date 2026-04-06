@@ -41,6 +41,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Use autograd-unroll when you need output-space regularizers; use RevDEQ backward when you need constant-memory exact gradients.
 - Only compute/log reconstruction error when using the RevDEQ backward path (otherwise it’s not an actionable signal).
 - Reconstruction error is bounded by state rounding; interpret it as a trend/guardrail, not a “should be zero” assertion.
+- Avoid caching inference-mode tensors into modules that are reused for training; refresh caches when switching modes.
 - Prefer simple, explicit parameterizations over hidden stability clamps; diagnose fixed-point behavior directly via residual/convergence metrics.
 - When you need contraction, add a single block-level gate and log it; don’t hide stability in many per-path scale knobs.
 - Intermediate DEQ supervision shapes early iterates, but it’s compute-heavy; keep it sparse and aligned with the scored output.

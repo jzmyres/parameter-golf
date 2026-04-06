@@ -767,9 +767,11 @@ class Rotary(nn.Module):
             # CUDA graphs (cached outputs overwritten across invocations).
             self._refresh_cache(seq_len, device)
         # PyTorch inference_mode can produce "inference tensors" that cannot be saved for backward.
-        # If eval ran first and populated the cache under inference_mode, ensure training refreshes
-        # the cache with normal tensors before any autograd-tracked computation uses it.
-        if torch.is_grad_enabled() and self._cos_cached is not None and self._cos_cached.is_inference():
+        # If eval ran first and populated the cache under inference_mode, ensure any subsequent
+        # non-inference computation refreshes the cache with normal tensors. This matters both for
+        # standard autograd (needs to save tensors for backward) and RevDEQ (needs forward/backward
+        # function evaluations to match for reversible reconstruction).
+        if (not torch.is_inference_mode_enabled()) and self._cos_cached is not None and self._cos_cached.is_inference():
             self._refresh_cache(seq_len, device)
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
