@@ -127,7 +127,7 @@ class Hyperparameters:
     warmup_steps = 20
     # Throughput-tuned default for this dev box (2×A100 DDP): maximize tokens/sec without torch.compile.
     # NOTE: larger batches can change DEQ stability; keep this conservative unless retuned.
-    train_batch_tokens = 65_536
+    train_batch_tokens = 262_144
     train_seq_len = 2048
     max_wallclock_seconds = 0.0  # 0 disables wallclock early-stop
     qk_gain_init = 1.5
@@ -1692,20 +1692,22 @@ class RevDEQFunction(torch.autograd.Function):
         cur_param_grads_req: list[torch.Tensor | None] = [None] * len(params_req)
         cur_x_grad = torch.zeros_like(x0, dtype=torch.float32)
 
-        y_next = y_terminal
-        z_next = z_terminal
+        # Keep the reversible reconstruction in FP64 to reduce the error amplification from
+        # repeated division by (1-beta). The VJP computations still run in compute_dtype.
+        y_next64 = y_terminal.to(acc_dtype)
+        z_next64 = z_terminal.to(acc_dtype)
 
         for _ in range(K):
             # VJP 1: f(y_{n+1}, x0) — used to reconstruct z_n
-            y_local = y_next.detach().to(compute_dtype).requires_grad_()
+            y_local = y_next64.detach().to(compute_dtype).requires_grad_()
             x_local = x0.detach().to(x0.dtype).requires_grad_()
             with torch.enable_grad():
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
                     out_y = f_theta(y_local, x_local)
 
             # Reconstruct z_n: z_n = (z_{n+1} - beta*f(y_{n+1})) / (1-beta)
-            z_n = (z_next.to(acc_dtype) - out_y.detach().to(acc_dtype) * beta) / beta_inv
-            z_n = z_n.to(state_dtype)
+            z_n64 = (z_next64 - out_y.detach().to(acc_dtype) * beta) / beta_inv
+            z_n = z_n64.to(state_dtype)
 
             grad_seed_y = (beta * bar_z).to(out_y.dtype)
             grads_y = torch.autograd.grad(
@@ -1716,15 +1718,15 @@ class RevDEQFunction(torch.autograd.Function):
             bar_y_acc = bar_y + vjp_y
 
             # VJP 2: f(z_n, x0) — used to reconstruct y_n
-            z_local = z_n.detach().to(compute_dtype).requires_grad_()
+            z_local = z_n64.detach().to(compute_dtype).requires_grad_()
             x_local2 = x0.detach().to(x0.dtype).requires_grad_()
             with torch.enable_grad():
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
                     out_z = f_theta(z_local, x_local2)
 
             # Reconstruct y_n: y_n = (y_{n+1} - beta*f(z_n)) / (1-beta)
-            y_n = (y_next.to(acc_dtype) - out_z.detach().to(acc_dtype) * beta) / beta_inv
-            y_n = y_n.to(state_dtype)
+            y_n64 = (y_next64 - out_z.detach().to(acc_dtype) * beta) / beta_inv
+            y_n = y_n64.to(state_dtype)
 
             grad_seed_z = (beta * bar_y_acc).to(out_z.dtype)
             grads_z = torch.autograd.grad(
@@ -1751,7 +1753,7 @@ class RevDEQFunction(torch.autograd.Function):
             if grads_z[1] is not None:
                 cur_x_grad += grads_z[1].detach().float()
 
-            y_next, z_next = y_n, z_n
+            y_next64, z_next64 = y_n64, z_n64
 
         # Reconstruction diagnostic: should be near 0 when fp64 add/sub reconstruction is consistent.
         # Only meaningful for the RevDEQ backward path. We store the scalar on the module so the
@@ -1760,7 +1762,9 @@ class RevDEQFunction(torch.autograd.Function):
             try:
                 z0 = z_init_state.to(dtype=state_dtype)
                 denom = max(float(z0.norm().item()), 1.0)
-                recon_err = float(((z_next - z0).norm().item() + (y_next - z0).norm().item()) / denom)
+                z_rec = z_next64.to(dtype=state_dtype)
+                y_rec = y_next64.to(dtype=state_dtype)
+                recon_err = float(((z_rec - z0).norm().item() + (y_rec - z0).norm().item()) / denom)
                 setattr(f_theta, "_deq_recon_error_last_bwd", recon_err)
             except Exception:
                 pass
