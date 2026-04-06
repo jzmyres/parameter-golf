@@ -13,7 +13,7 @@ You MUST incorporate these three architectural innovations into the transformer 
 
 1. **RevDEQ** (arxiv:2509.12917) — Reversible Deep Equilibrium Model for the main backbone. Output defined as fixed point of a learned function. Exact gradients, no regularization needed.
 
-2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Routing is fully differentiable (softmax over experts, no top-k, no token dropping). For the block-level MoE, routing weights are modulated by a per-expert sigmoid gate so total routing mass is in $(0,1]$ and its sum can serve as the DEQ residual gate.
+2. **Soft Dense Routing** (inspired by arxiv:2308.00951) — Dense MoE with NO sparsity. ALL experts process ALL tokens. Routing is fully differentiable (**pure softmax over experts**), no top-k, no token dropping, **no post-softmax sigmoid gating**.
 
 3. **MLA with Gated Attention** (DeepSeek MLA + arxiv:2505.06708) — Low-rank KV compression with decoupled RoPE, plus head-specific sigmoid gates after SDPA for query-dependent sparse modulation of attention outputs.
 
@@ -25,7 +25,7 @@ You MUST incorporate these three architectural innovations into the transformer 
 - **Expert health MUST be satisfied by end of training** (final-only hard constraints):
   - Per-component min share ≥ 0.6 / num_experts (share is normalized across experts; sum=1)
   - Per-component balance CV ≤ 0.20 (computed on the same normalized share distribution)
-  - MLP/Attn orthogonality (mean |cos|) ≤ 0.20
+  - Expert-group orthogonality (max-pair |cos|) ≤ 0.20 for `transformer_block`, `mos_ctp`, and `mos_ntp`
   - These are guardrails for expressiveness/optimization; do not accept runs that violate them.
 - **Fixed-point behavior is a desired goal**, not a hard constraint: monitor relative convergence/residuals and improve if it does not harm expert health or val_bpb.
 - RevDEQ precision reminder: use FP64 add/sub + reconstruction diagnostics only when using the RevDEQ backward path; autograd-unroll is the right tool when you need output-space regularizers (see `EXPERIENCE.md`).

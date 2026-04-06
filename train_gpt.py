@@ -50,6 +50,16 @@ _ROUTER_DIAGNOSTICS_STEP: int | None = None
 SIGMOID_ONE_INIT_LOGIT = 6.0  # sigmoid(6)=0.9975; "initialized to 1" without full saturation
 
 
+def dynamo_disable(fn):
+    """Run a function outside `torch.compile` graphs when possible."""
+    try:
+        import torch._dynamo as dynamo  # type: ignore
+
+        return dynamo.disable(fn)
+    except Exception:
+        return fn
+
+
 @contextlib.contextmanager
 def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
     global _ROUTER_DIAGNOSTICS_ACTIVE
@@ -87,6 +97,16 @@ class KShuffleBagSampler:
             self.rng.shuffle(self._bag)
         return int(self._bag.pop())
 
+    def set_range(self, k_min: int, k_max: int) -> None:
+        k_min_i = int(k_min)
+        k_max_i = int(k_max)
+        if k_min_i > k_max_i:
+            raise ValueError(f"k_min must be <= k_max, got {k_min_i} > {k_max_i}")
+        if k_min_i != self.k_min or k_max_i != self.k_max:
+            self.k_min = k_min_i
+            self.k_max = k_max_i
+            self.reset()
+
 class Hyperparameters:
     # Do not override experiment configuration via environment variables.
     # (Exception: CUDA/DDP runtime env like CUDA_VISIBLE_DEVICES/RANK/WORLD_SIZE.)
@@ -105,14 +125,16 @@ class Hyperparameters:
     iterations = 1000
     warmdown_iters = 1000
     warmup_steps = 20
-    train_batch_tokens = 524_288  # default: keep prior stable batch size
+    # Throughput-tuned default for this dev box (2×A100 DDP): maximize tokens/sec without torch.compile.
+    # NOTE: larger batches can change DEQ stability; keep this conservative unless retuned.
+    train_batch_tokens = 65_536
     train_seq_len = 2048
     max_wallclock_seconds = 0.0  # 0 disables wallclock early-stop
     qk_gain_init = 1.5
     deq_beta = 0.2
 
     vocab_size = 1024
-    num_layers = 12  # DEQ solver iters per refinement step (fixed K by default)
+    num_layers = 38  # DEQ solver iteration budget (max K)
     num_refinements = 2  # predict→soft_embed→re-encode cycles
     num_kv_heads = 4
     model_dim = 640
@@ -147,27 +169,20 @@ class Hyperparameters:
     router_bias_update = True
     router_bias_lr = 0.05
     router_bias_clip = 5.0
-    mos_ortho_out_coef = 0.05
-    attn_ortho_out_coef = 0.02
-    mlp_ortho_out_coef = 0.02
-    deq_backward = "autograd"  # {autograd, revdeq}
-    deq_k_jitter = False
-    deq_k_min = 12
-    deq_k_max = 12
-    deq_k_eval = 12
-
-    # Sparse intermediate DEQ supervision (encourages useful early iterates)
-    deq_sup_enabled = True
-    deq_sup_ks = "2,6,12"
-    deq_sup_weights = "0.2,0.3,0.5"
-    deq_sup_coef = 0.25
-
-    # Efficiency knobs
-    compile_train = False
-    deq_k_ramp_enabled = True
-    deq_k_ramp_start = 4
-    deq_k_ramp_end = 12
-    deq_k_ramp_steps = 800
+    mos_ortho_out_coef = 0.02
+    attn_ortho_out_coef = 0.0
+    mlp_ortho_out_coef = 0.0
+    deq_backward = "revdeq"  # {autograd, revdeq}
+    deq_k_jitter = True
+    deq_k_min = 2
+    deq_k_max = 30
+    deq_k_eval = 30
+    # Shuffle-bag K-jitter range ramp: maxK linearly increases from deq_k_max_start -> deq_k_max.
+    # Default: no ramp (stable range from step 1).
+    deq_k_max_start = deq_k_max
+    deq_k_max_ramp_steps = 1
+    compile_train = False  # torch.compile(shared_block) for training speed
+    benchmark_mode = False  # skip post-quant eval/serialization for speed microbenchmarks
 
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = 32
@@ -178,8 +193,7 @@ class Hyperparameters:
     kv_latent_dim = 0  # 0 = auto (dim//2)
     attn_expert_rank = 0  # 0 = auto (dim//2)
     mlp_expert_rank = 0  # 0 = auto (hidden//2)
-    # Routing is dense softmax over experts, optionally modulated by a per-expert sigmoid
-    # gate so the total routing mass is in (0,1] and can be used as a residual gate.
+    # Routing is dense softmax over experts (no post-softmax gating).
 
     # SWA knobs (defaults only; override via CLI, not env)
     swa_enabled = True
@@ -195,6 +209,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--run-id", type=str, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--iterations", type=int, default=None)
+    p.add_argument("--warmup-steps", type=int, default=None)
     p.add_argument("--train-batch-tokens", type=int, default=None)
     p.add_argument("--train-seq-len", type=int, default=None)
     p.add_argument("--val-batch-size", type=int, default=None)
@@ -223,15 +238,10 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--deq-k-min", type=int, default=None)
     p.add_argument("--deq-k-max", type=int, default=None)
     p.add_argument("--deq-k-eval", type=int, default=None)
-    p.add_argument("--deq-sup-enabled", type=int, default=None, help="1/0; sparse intermediate DEQ supervision")
-    p.add_argument("--deq-sup-ks", type=str, default=None, help="comma-separated iteration indices, e.g. 2,6,12")
-    p.add_argument("--deq-sup-weights", type=str, default=None, help="comma-separated weights for ks (optional)")
-    p.add_argument("--deq-sup-coef", type=float, default=None, help="overall multiplier for intermediate supervision")
-    p.add_argument("--compile-train", type=int, default=None, help="1/0; torch.compile shared_block for training")
-    p.add_argument("--deq-k-ramp-enabled", type=int, default=None, help="1/0; deterministic K ramp schedule")
-    p.add_argument("--deq-k-ramp-start", type=int, default=None)
-    p.add_argument("--deq-k-ramp-end", type=int, default=None)
-    p.add_argument("--deq-k-ramp-steps", type=int, default=None)
+    p.add_argument("--deq-k-max-start", type=int, default=None, help="starting maxK for range ramp (train only)")
+    p.add_argument("--deq-k-max-ramp-steps", type=int, default=None, help="steps to ramp maxK to deq_k_max")
+    p.add_argument("--compile-train", type=int, default=None, help="1/0; torch.compile(shared_block) during training")
+    p.add_argument("--benchmark-mode", type=int, default=None, help="1/0; skip final eval/quant/plots (speed bench)")
     ns, unknown = p.parse_known_args(argv)
     if unknown:
         raise SystemExit(f"Unknown args: {unknown}")
@@ -244,6 +254,10 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             elif key == "deq_k_jitter":
                 out[key] = bool(int(v))
             elif key == "router_bias_update":
+                out[key] = bool(int(v))
+            elif key == "compile_train":
+                out[key] = bool(int(v))
+            elif key == "benchmark_mode":
                 out[key] = bool(int(v))
             else:
                 out[key] = v
@@ -734,6 +748,14 @@ class Rotary(nn.Module):
         self._cos_cached: Tensor | None = None
         self._sin_cached: Tensor | None = None
 
+    @dynamo_disable
+    def _refresh_cache(self, seq_len: int, device: torch.device) -> None:
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq.to(device))
+        self._cos_cached = freqs.cos()[None, None, :, :].contiguous()
+        self._sin_cached = freqs.sin()[None, None, :, :].contiguous()
+        self._seq_len_cached = seq_len
+
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
         if (
             self._cos_cached is None
@@ -741,11 +763,9 @@ class Rotary(nn.Module):
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
         ):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
-            self._seq_len_cached = seq_len
+            # Important: mutating module attributes inside torch.compile can break
+            # CUDA graphs (cached outputs overwritten across invocations).
+            self._refresh_cache(seq_len, device)
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
@@ -768,18 +788,24 @@ def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
     return cos[mask].abs().mean()
 
 
-def _parse_int_list(csv: str) -> list[int]:
-    parts = [p.strip() for p in str(csv).split(",") if p.strip()]
-    return [int(p) for p in parts]
+def max_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
+    """Max off-diagonal |cosine similarity| for a [E, D] tensor.
+
+    Worst-case statistic: if this is <= thr, then *all* expert pairs satisfy |cos| <= thr.
+    """
+    if groups.ndim != 2:
+        raise ValueError(f"groups must be rank-2 [E,D], got shape {tuple(groups.shape)}")
+    e = groups.shape[0]
+    if e < 2:
+        return groups.new_zeros(())
+    g = groups / (groups.norm(dim=-1, keepdim=True) + eps)
+    cos = g @ g.T
+    mask = ~torch.eye(e, dtype=torch.bool, device=cos.device)
+    return cos[mask].abs().max()
 
 
-def _parse_float_list(csv: str) -> list[float]:
-    parts = [p.strip() for p in str(csv).split(",") if p.strip()]
-    return [float(p) for p in parts]
-
-
-def deq_k_ramp(step: int, *, start: int, end: int, ramp_steps: int) -> int:
-    """Deterministic linear ramp: step=1..ramp_steps maps start..end; after ramp_steps -> end."""
+def deq_maxk_ramp(step: int, *, start: int, end: int, ramp_steps: int) -> int:
+    """Linear ramp for the *max K* of shuffle-bag sampling."""
     s = int(step)
     if s <= 1:
         return int(start)
@@ -826,6 +852,7 @@ class SoftDenseRouter(nn.Module):
         self._expert_usage = None
         self._expert_gates = None
         self._expert_entropy = None
+        self._expert_sparsity = None
         self._expert_balance_cv = None
         self._gate_mass_mean = None
         self._diag_step: int | None = None
@@ -879,21 +906,7 @@ class SoftDenseRouter(nn.Module):
                 if do_diag and dist.is_available() and dist.is_initialized():
                     do_diag = dist.get_rank() == 0
                 if do_diag:
-                    # Compute diagnostics from detached tensors to avoid autograd overhead.
-                    s = share.detach()
-                    mean_mass = s.mean(dim=reduce_dims)
-                    self._expert_usage = mean_mass.float().cpu().tolist()  # normalized share
-                    self._expert_gates = None
-
-                    per_token_ent = -(s * (s + 1e-8).log()).sum(-1)
-                    self._expert_entropy = per_token_ent.mean().item()
-                    self._expert_balance_cv = (mean_mass.std() / mean_mass.mean().clamp_min(1e-8)).item()
-                    if self.gate is not None:
-                        gm = gate_mass.detach()
-                        self._gate_mass_mean = float(gm.mean().item())
-                    else:
-                        self._gate_mass_mean = None
-                    self._diag_step = _ROUTER_DIAGNOSTICS_STEP
+                    self._record_diagnostics(share.detach(), gate_mass.detach() if self.gate is not None else None, reduce_dims)
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
@@ -906,27 +919,35 @@ class SoftDenseRouter(nn.Module):
                 if dist.is_available() and dist.is_initialized():
                     do_diag = dist.get_rank() == 0
                 if do_diag:
-                    reduce_dims = tuple(range(share.ndim - 1))
-                    mean_mass = share.mean(dim=reduce_dims)
-                    self._expert_usage = mean_mass.float().cpu().tolist()  # normalized share
-                    self._expert_gates = None
-
-                    per_token_ent = -(share * (share + 1e-8).log()).sum(-1)
-                    self._expert_entropy = per_token_ent.mean().item()
-                    self._expert_balance_cv = (mean_mass.std() / mean_mass.mean().clamp_min(1e-8)).item()
-                    if self.gate is not None:
-                        self._gate_mass_mean = float(gate_mass.detach().mean().item())
-                    else:
-                        self._gate_mass_mean = None
-                    self._diag_step = _ROUTER_DIAGNOSTICS_STEP
+                    self._record_diagnostics(share.detach(), gate_mass.detach() if self.gate is not None else None, tuple(range(share.ndim - 1)))
                 else:
                     self._expert_usage = None
                     self._expert_gates = None
                     self._expert_entropy = None
+                    self._expert_sparsity = None
                     self._expert_balance_cv = None
                     self._gate_mass_mean = None
                     self._diag_step = None
         return route_weights
+
+    @dynamo_disable
+    def _record_diagnostics(self, share_detached: Tensor, gate_mass_detached: Tensor | None, reduce_dims: tuple[int, ...]) -> None:
+        # Compute diagnostics from detached tensors to avoid autograd overhead, and
+        # keep all Python-side state mutation out of torch.compile graphs.
+        mean_mass = share_detached.mean(dim=reduce_dims)
+        self._expert_usage = mean_mass.float().cpu().tolist()  # normalized share (sum=1)
+        self._expert_gates = None
+
+        per_token_ent = -(share_detached * (share_detached + 1e-8).log()).sum(-1)
+        ent = float(per_token_ent.mean().item())
+        self._expert_entropy = ent
+        self._expert_sparsity = 1.0 - (ent / max(math.log(float(self.num_experts)), 1e-8))
+        self._expert_balance_cv = float((mean_mass.std() / mean_mass.mean().clamp_min(1e-8)).item())
+        if gate_mass_detached is not None:
+            self._gate_mass_mean = float(gate_mass_detached.mean().item())
+        else:
+            self._gate_mass_mean = None
+        self._diag_step = _ROUTER_DIAGNOSTICS_STEP
 
 
 class CausalSelfAttention(nn.Module):
@@ -1325,10 +1346,7 @@ class MoSHead(nn.Module):
                 .float()
                 .reshape(self.num_shared + self.num_specialized, -1)
             )
-            groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
-            cos = groups @ groups.T
-            mask = ~torch.eye(groups.shape[0], dtype=torch.bool, device=cos.device)
-            return cos[mask].abs().mean().item()
+            return float(max_abs_offdiag_cosine(groups).item())
 
     def _fsq(self, x: Tensor) -> Tensor:
         return _fsq_ste(x, self.fsq_levels, self.training)
@@ -1337,7 +1355,7 @@ class MoSHead(nn.Module):
                       A_spec: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Compute (log_probs, alpha_softmax, ortho_out) for one head.
 
-        `ortho_out` is output/latent-space orthogonality: mean off-diagonal |cos|
+        `ortho_out` is output/latent-space orthogonality: max off-diagonal |cos|
         between per-expert mean pre-FSQ latents (x @ A_e).
         """
         N = x.shape[0]
@@ -1363,7 +1381,7 @@ class MoSHead(nn.Module):
             idx = self.num_shared + e
             log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
         log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
-        ortho_out = mean_abs_offdiag_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
+        ortho_out = max_abs_offdiag_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
         return log_p, alpha, ortho_out
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
@@ -1440,9 +1458,9 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         # Block-level Soft Dense Routing: one router for the whole block (paired experts).
-        # Routing weights are softmax(logits) * sigmoid(gate_logits); sum(weights) ∈ (0,1]
-        # serves as a per-token residual gate for the DEQ iteration update.
-        shared_router = SoftDenseRouter(dim, 6, enable_gate=True)
+        # Routing weights are pure softmax over experts (sum=1). A separate per-token
+        # residual gate gg is used for DEQ stability (not a post-softmax gate).
+        shared_router = SoftDenseRouter(dim, 6, enable_gate=False)
         self.attn = CausalSelfAttention(
             dim,
             num_heads,
@@ -1454,10 +1472,17 @@ class Block(nn.Module):
             router=shared_router,
         )
         self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=shared_router)
+        # Global residual gate for the DEQ iteration update: gg(x) ∈ (0,1) per token.
+        self.gg_gate = CastedLinear(dim, 1, bias=True)
+        with torch.no_grad():
+            self.gg_gate.weight.zero_()
+            # Start unsaturated (sigmoid(0)=0.5) so gg can quickly adapt to contraction needs.
+            self.gg_gate.bias.zero_()
         self._gg_track_enabled = False
         self._gg_sum = 0.0
         self._gg_count = 0
         self._gg_last: float | None = None
+        self._block_ortho_cos_sim: float | None = None
         # Fine-grained gg tracking: per Block.forward call (used to derive gg by DEQ iteration).
         self._gg_call_track_enabled = False
         self._gg_call_track: list[float] = []
@@ -1483,8 +1508,35 @@ class Block(nn.Module):
         u = z_n.float().mean(dim=(0, 1))  # [d]
         logits = u * self.inj_w + self.inj_b
         g = torch.sigmoid(logits)  # [d]
-        self._inj_gate_last_mean = float(g.detach().mean().item())
+        # Avoid Python-side scalar extraction in the hot path (torch.compile friendly).
+        if (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE):
+            self._record_inj_diag(g.detach())
         return g
+
+    @dynamo_disable
+    def _record_inj_diag(self, g_detached: Tensor) -> None:
+        self._inj_gate_last_mean = float(g_detached.mean().item())
+
+    @dynamo_disable
+    def _record_gg_diag(self, gg_tok_detached: Tensor) -> None:
+        gg_val = float(gg_tok_detached.float().mean().item())
+        self._gg_last = gg_val
+        if self._gg_track_enabled:
+            self._gg_sum += gg_val
+            self._gg_count += 1
+        if self._gg_call_track_enabled:
+            self._gg_call_track.append(gg_val)
+
+    @dynamo_disable
+    def _record_block_ortho(self, block_mu: list[Tensor]) -> None:
+        self._block_ortho_cos_sim = None
+        if len(block_mu) < 2:
+            return
+        try:
+            mu_b = torch.stack(block_mu, dim=0)
+            self._block_ortho_cos_sim = float(max_abs_offdiag_cosine(mu_b).item())
+        except Exception:
+            self._block_ortho_cos_sim = None
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         z_in = x
@@ -1494,25 +1546,20 @@ class Block(nn.Module):
         x_attn = self.attn_norm(x)
         x_attn_n = _rms_norm(x_attn)
         # One router for the whole block (paired expert blocks): compute weights once.
-        w = self.attn.attn_router(x_attn)  # shared router instance; sum(w) in (0,1]
-        gg_tok = w.sum(dim=-1)             # [B,T] residual gate per token
-        gg_val = float(gg_tok.detach().float().mean().item())
-        self._gg_last = gg_val
-        if self._gg_track_enabled:
-            self._gg_sum += gg_val
-            self._gg_count += 1
-        if self._gg_call_track_enabled:
-            self._gg_call_track.append(gg_val)
+        w = self.attn.attn_router(x_attn)  # shared router instance; sum(w)=1
+        gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)  # [B,T]
+        if self._gg_track_enabled or self._gg_call_track_enabled:
+            self._record_gg_diag(gg_tok.detach())
 
         # Memory-safe expert mixing: stream experts without materializing [B,T,E,D].
+        # Update: z_out = (1-gg)*z_in + gg*Σ_e w_e * expert_e(z_in, x0)
         x_mix = (1.0 - gg_tok).to(dtype=x.dtype).unsqueeze(-1) * z_in
         need_loss = bool(self.training and torch.is_grad_enabled())
         do_diag = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE)
         if do_diag and dist.is_available() and dist.is_initialized():
             do_diag = dist.get_rank() == 0
 
-        attn_mu: list[Tensor] = []
-        mlp_mu: list[Tensor] = []
+        block_mu: list[Tensor] = []
         # Compute shared attention output once, then project per expert.
         y_shared = self.attn._attn_shared_from_normed(x_attn_n)  # [B,T,D]
         for e in range(self.attn.num_experts):
@@ -1520,25 +1567,18 @@ class Block(nn.Module):
             z1 = x + attn_out
             mlp_out = self.mlp.forward_expert(self.mlp_norm(z1), e)  # [B,T,D]
             z2 = z1 + mlp_out
-            x_mix = x_mix + w[..., e:e+1] * z2
-            if need_loss or do_diag:
-                attn_mu.append(attn_out.mean(dim=(0, 1)).float())
-                mlp_mu.append(mlp_out.mean(dim=(0, 1)).float())
-
-        # Output-space orthogonality tracking/losses without storing per-expert streams.
-        self.attn._out_ortho_loss = None
-        self.mlp._out_ortho_loss = None
-        if attn_mu:
-            mu_a = torch.stack(attn_mu, dim=0)  # [E,D]
-            mu_m = torch.stack(mlp_mu, dim=0)   # [E,D]
-            if need_loss and self.attn.out_ortho_coef > 0.0:
-                self.attn._out_ortho_loss = mean_abs_offdiag_cosine(mu_a)
-            if need_loss and self.mlp.out_ortho_coef > 0.0:
-                self.mlp._out_ortho_loss = mean_abs_offdiag_cosine(mu_m)
+            x_mix = x_mix + (gg_tok.to(dtype=x.dtype).unsqueeze(-1) * w[..., e:e+1]) * z2
             if do_diag:
-                with torch.no_grad():
-                    self.attn._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu_a).item())
-                    self.mlp._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu_m).item())
+                # Track the *weighted* per-expert block contribution, since this is what
+                # actually gets mixed into the DEQ update: contrib_e = (gg*w_e) * z2_e.
+                contrib = (gg_tok.to(dtype=z2.dtype).unsqueeze(-1) * w[..., e:e+1]) * z2
+                block_mu.append(contrib.mean(dim=(0, 1)).float())
+
+        if do_diag:
+            # Block expert output-space orthogonality (metric-only): mean |cos| across per-expert
+            # mean *weighted* block outputs (gg*w_e*z2). This captures redundancy/collapse at the
+            # actual mixed expert contribution level.
+            self._record_block_ortho(block_mu)
 
         return x_mix
 
@@ -1575,10 +1615,14 @@ class RevDEQFunction(torch.autograd.Function):
         compute_dtype = z_init.dtype
         device_type = x0.device.type
         beta_inv = 1.0 - beta
+        # Snapshot diagnostic intent: the surrounding `router_diagnostics(...)` context
+        # exits before backward runs, so backward must not consult global flags.
+        ctx.do_recon_diag = bool(_ROUTER_DIAGNOSTICS_ACTIVE)
 
         y_state = z_init.to(state_dtype)
         z_state = z_init.to(state_dtype)
         z_prev_state = z_state
+        z_init_state = z_state.detach()
 
         with torch.no_grad():
             out_y = None
@@ -1600,11 +1644,16 @@ class RevDEQFunction(torch.autograd.Function):
             # Uses the last computed f(y) from the final forward iteration.
             if out_y is not None:
                 try:
-                    f_theta._deq_residual_proxy = float((z_state - out_y.to(state_dtype)).norm().item())
+                    # f_theta may be a compiled callable; only attach if attribute assignment works.
+                    setattr(f_theta, "_deq_residual_proxy", float((z_state - out_y.to(state_dtype)).norm().item()))
                 except Exception:
-                    f_theta._deq_residual_proxy = None
+                    try:
+                        setattr(f_theta, "_deq_residual_proxy", None)
+                    except Exception:
+                        pass
 
         ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(), z_prev_state.detach())
+        ctx.z_init_state = z_init_state
         ctx.f_theta = f_theta
         ctx.beta = beta
         ctx.beta_inv = beta_inv
@@ -1617,6 +1666,7 @@ class RevDEQFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_z, _grad_z_prev_ignored):
         x0, y_terminal, z_terminal, _z_prev_terminal = (t.detach() for t in ctx.saved_tensors)
+        z_init_state = getattr(ctx, "z_init_state", None)
         f_theta = ctx.f_theta
         beta = ctx.beta
         beta_inv = ctx.beta_inv
@@ -1696,6 +1746,18 @@ class RevDEQFunction(torch.autograd.Function):
 
             y_next, z_next = y_n, z_n
 
+        # Reconstruction diagnostic: should be near 0 when fp64 add/sub reconstruction is consistent.
+        # Only meaningful for the RevDEQ backward path. We store the scalar on the module so the
+        # training loop can log it without re-running extra compute.
+        if bool(getattr(ctx, "do_recon_diag", False)) and isinstance(z_init_state, torch.Tensor):
+            try:
+                z0 = z_init_state.to(dtype=state_dtype)
+                denom = max(float(z0.norm().item()), 1.0)
+                recon_err = float(((z_next - z0).norm().item() + (y_next - z0).norm().item()) / denom)
+                setattr(f_theta, "_deq_recon_error_last_bwd", recon_err)
+            except Exception:
+                pass
+
         # z_init gradient = bar_y + bar_z (both adjoint states at step 0)
         z_init_grad = (bar_y + bar_z).to(x0.dtype)
         # Map required grads back to full *params list for autograd/DDP.
@@ -1734,9 +1796,9 @@ class GPT(nn.Module):
         attn_balance_mult: float = 3.0,
         mlp_balance_mult: float = 1.0,
         bal_loss_coef: float = 0.5,
-        mos_ortho_out_coef: float = 0.05,
-        attn_ortho_out_coef: float = 0.05,
-        mlp_ortho_out_coef: float = 0.05,
+        mos_ortho_out_coef: float = 0.0,
+        attn_ortho_out_coef: float = 0.0,
+        mlp_ortho_out_coef: float = 0.0,
         deq_backward: str = "autograd",
     ):
         super().__init__()
@@ -1775,14 +1837,6 @@ class GPT(nn.Module):
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm()
         self._init_weights()
-        # Intermediate DEQ supervision config (populated in main from args)
-        self.deq_sup_enabled = False
-        self.deq_sup_ks: list[int] = []
-        self.deq_sup_weights: list[float] = []
-        self.deq_sup_coef: float = 0.0
-        self._deq_sup_snaps: list[Tensor] | None = None
-        self._deq_sup_weights_eff: list[float] = []
-        self._deq_sup_target: Tensor | None = None
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -1871,7 +1925,7 @@ class GPT(nn.Module):
             soft_embed = _rms_norm(soft_embed.to(dtype=z.dtype))
         return soft_embed
 
-    def _deq_solve(self, x0: Tensor, z_init: Tensor, *, collect_ks: set[int] | None = None):
+    def _deq_solve(self, x0: Tensor, z_init: Tensor):
         """Run DEQ coupled-state solver.
 
         - Training:
@@ -1882,25 +1936,25 @@ class GPT(nn.Module):
         beta = self.deq_beta
         dtype = x0.dtype
         K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
-        collect_ks = set(collect_ks or [])
-        z_snaps: list[Tensor] = []
-
-        # Track global gate gg across the entire DEQ solve (avg over all block calls).
+        # Track gates only when diagnostics are enabled (keeps torch.compile graphs stable and fast).
+        track_gg = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE)
         self.shared_block._gg_sum = 0.0
         self.shared_block._gg_count = 0
-        self.shared_block._gg_track_enabled = True
+        self.shared_block._gg_track_enabled = bool(track_gg)
         # Also track gg per Block.forward call so we can compute gg by DEQ iteration.
         self.shared_block._gg_call_track = []
-        self.shared_block._gg_call_track_enabled = True
+        self.shared_block._gg_call_track_enabled = bool(track_gg)
         try:
+            # Optional compile path (training only): use eager block for diagnostic steps.
+            f_theta = self.shared_block
+            if self.training and bool(getattr(self, "compile_train", False)) and not bool(_ROUTER_DIAGNOSTICS_ACTIVE):
+                f_theta = getattr(self, "_shared_block_compiled", self.shared_block)
             if self.training and self.deq_backward == "revdeq":
-                if collect_ks:
-                    raise RuntimeError("Intermediate DEQ supervision requires deq_backward=autograd")
                 params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
                 z, z_prev = RevDEQFunction.apply(
-                    self.shared_block, x0, z_init, beta, K, *params
+                    f_theta, x0, z_init, beta, K, *params
                 )
-                return z, z_prev, None, None, []
+                return z, z_prev, None, None
 
             # Explicit coupled-state unroll (autograd-enabled in training).
             # For variable-K training (K-jitter) large K can OOM under autograd-unroll due to
@@ -1908,30 +1962,27 @@ class GPT(nn.Module):
             # for much lower memory usage.
             use_ckpt = bool(self.training and self.deq_backward == "autograd" and K >= 5)
             def _f_theta(a: Tensor, b: Tensor) -> Tensor:
-                return self.shared_block(a, b)
+                return f_theta(a, b)
             acc_dtype = torch.float64 if (not self.training and self.deq_backward == "revdeq") else torch.float32
             y_acc = z_init.to(acc_dtype)
             z_acc = z_init.to(acc_dtype)
             z = z_init
             z_prev = z
-            for i in range(K):
+            for _ in range(K):
                 z_prev = z
                 if use_ckpt:
                     f_z = checkpoint.checkpoint(_f_theta, z, x0, use_reentrant=False)
                 else:
-                    f_z = self.shared_block(z, x0)
+                    f_z = f_theta(z, x0)
                 y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
                 y = y_acc.to(dtype)
                 if use_ckpt:
                     f_y = checkpoint.checkpoint(_f_theta, y, x0, use_reentrant=False)
                 else:
-                    f_y = self.shared_block(y, x0)
+                    f_y = f_theta(y, x0)
                 z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
                 z = z_acc.to(dtype)
-                k = i + 1
-                if k in collect_ks:
-                    z_snaps.append(z)
-            return z, z_prev, y_acc, z_acc, z_snaps
+            return z, z_prev, y_acc, z_acc
         finally:
             self.shared_block._gg_track_enabled = False
             self.shared_block._gg_call_track_enabled = False
@@ -1957,10 +2008,10 @@ class GPT(nn.Module):
         dtype = x.dtype
         self._deq_residuals: list[float] = []
         self._gg_iter: list[float] | None = None
-        self._deq_sup_snaps = None
-        self._deq_sup_weights_eff = []
         # Avoid leaking stale eval-only diagnostics into train-step logs.
         self._deq_recon_error = None
+        self._deq_z_init_last: Tensor | None = None
+        self._deq_k_last = None
         prev_soft_embed = x0
         x0_refined = x0  # track for reconstruction
 
@@ -1975,22 +2026,8 @@ class GPT(nn.Module):
                 x0_refined = x0
 
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
-            # Sparse intermediate supervision snapshots: collect only for the final refinement solve.
-            collect = None
-            if self.training and self.deq_sup_enabled and r == self.num_refinements:
-                K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
-                eff = [(k, w) for k, w in zip(self.deq_sup_ks, self.deq_sup_weights, strict=True) if k <= K]
-                if eff:
-                    ws = [w for _, w in eff]
-                    s = float(sum(ws))
-                    ws = [float(w) / max(s, 1e-8) for w in ws]
-                    self._deq_sup_weights_eff = ws
-                    collect = {k for k, _ in eff}
-                else:
-                    self._deq_sup_weights_eff = []
-            z, z_prev, y_acc, z_acc, z_snaps = self._deq_solve(x0_refined, z, collect_ks=collect)
-            if self.training and self.deq_sup_enabled and r == self.num_refinements:
-                self._deq_sup_snaps = z_snaps
+            self._deq_z_init_last = z.detach()
+            z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
             gg_iters_by_refinement.append(list(getattr(self, "_gg_iter_last_solve", []) or []))
 
         # Aggregate per-DEQ-iteration gates across all refinement solves (r0 one-hot + r>0 soft-embed).
@@ -2030,23 +2067,12 @@ class GPT(nn.Module):
                 self._deq_yz_gap = (y_acc - z).float().norm().item()
 
             # Define router regularizers/diagnostics on the terminal equilibrium state.
-            # This unifies behavior across DEQ backward modes and ensures:
-            # - balance/sparsity losses target the actual terminal state
-            # - dense train-step router diagnostics are consistent (rank0 only)
-            attn_router = self.shared_block.attn.attn_router
-            mlp_router = self.shared_block.mlp.mlp_router
-            seen: set[int] = set()
-            for r, inp in [
-                (attn_router, self.shared_block.attn_norm(z)),
-                (mlp_router, self.shared_block.mlp_norm(z)),
-            ]:
-                rid = id(r)
-                if rid in seen:
-                    continue
-                seen.add(rid)
-                r.set_bias_stats_enabled(True)
-                _ = r(inp)
-                r.set_bias_stats_enabled(False)
+            # Use the same router input as in Block.forward (attn_norm) to avoid component
+            # mismatches when routers are tied/shared (block-level MoE).
+            router = self.shared_block.attn.attn_router
+            router.set_bias_stats_enabled(True)
+            _ = router(self.shared_block.attn_norm(z))
+            router.set_bias_stats_enabled(False)
 
         # Diagnostics (eval only)
         if not self.training:
@@ -2057,19 +2083,9 @@ class GPT(nn.Module):
                 self._deq_residuals = [(z - f_z_final).float().norm().item()]
                 self._deq_iter_convergence = abs_conv  # absolute
                 self._deq_iter_convergence_rel = abs_conv / z_norm_diag  # relative
-                if self.deq_backward == "revdeq" and y_acc is not None and z_acc is not None:
-                    # fp64 backward reconstruction of last DEQ solve (RevDEQ diagnostics only).
-                    z_init_64 = (x0_refined if self.num_refinements > 0 else x0).to(torch.float64)
-                    yr_acc, zr_acc = y_acc.to(torch.float64).clone(), z_acc.to(torch.float64).clone()
-                    beta = self.deq_beta
-                    for _ in range(self.num_layers):
-                        f_yr = self.shared_block(yr_acc.to(dtype), x0_refined)
-                        zr_acc = (zr_acc - beta * f_yr.to(torch.float64)) / (1 - beta)
-                        f_zr = self.shared_block(zr_acc.to(dtype), x0_refined)
-                        yr_acc = (yr_acc - beta * f_zr.to(torch.float64)) / (1 - beta)
-                    state_norm = max(z_init_64.norm().item(), 1.0)
-                    recon_error = ((zr_acc - z_init_64).norm().item() + (yr_acc - z_init_64).norm().item()) / state_norm
-                    self._deq_recon_error = recon_error
+                # RevDEQ reconstruction diagnostics are produced in the RevDEQ backward path,
+                # not during eval-only explicit unroll (which can spuriously diverge due to
+                # backend/kernel differences and is not representative of the actual backward).
 
         return z
 
@@ -2135,17 +2151,6 @@ class GPT(nn.Module):
             if isinstance(m, torch.Tensor):
                 mlp_ortho_loss = m.to(device=ntp_loss.device)
 
-        # Sparse intermediate DEQ supervision (final refinement solve only).
-        sup_loss = torch.tensor(0.0, device=ntp_loss.device)
-        if self.training and self.deq_sup_enabled and self.deq_backward == "autograd":
-            snaps = list(self._deq_sup_snaps or [])
-            ws = list(self._deq_sup_weights_eff or [])
-            if snaps and ws:
-                # Snaps are collected in increasing k order.
-                for w, z_k in zip(ws, snaps, strict=False):
-                    h_k = self.final_norm(z_k)
-                    _, log_p_ntp_k = self.mos_head(h_k)
-                    sup_loss = sup_loss + float(w) * F.nll_loss(log_p_ntp_k.reshape(-1, V), target_ids.reshape(-1))
         return (
             ntp_loss
             + ctp_weight * ctp_loss
@@ -2154,7 +2159,6 @@ class GPT(nn.Module):
             + self.mos_ortho_out_coef * mos_ortho_loss
             + self.attn_ortho_out_coef * attn_ortho_loss
             + self.mlp_ortho_out_coef * mlp_ortho_loss
-            + self.deq_sup_coef * sup_loss
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -2262,51 +2266,17 @@ def main() -> None:
     if not getattr(args, "run_id", ""):
         args.run_id = str(uuid.uuid4())
 
-    # Parse DEQ supervision schedule (decision-complete at runtime).
-    deq_sup_enabled = bool(getattr(args, "deq_sup_enabled", False))
-    ks: list[int] = []
-    ws: list[float] = []
-    if deq_sup_enabled:
-        if str(getattr(args, "deq_backward", "autograd")) != "autograd":
-            raise ValueError("deq_sup_enabled requires deq_backward=autograd")
-        ks = _parse_int_list(getattr(args, "deq_sup_ks", ""))
-        if not ks:
-            raise ValueError("deq_sup_ks must be non-empty when deq_sup_enabled=1")
-        if max(ks) > int(args.num_layers):
-            raise ValueError(f"deq_sup_ks must be <= num_layers={int(args.num_layers)}, got {ks}")
-        w_csv = getattr(args, "deq_sup_weights", "")
-        if w_csv:
-            ws = _parse_float_list(w_csv)
-            if len(ws) != len(ks):
-                raise ValueError(f"deq_sup_weights length must match deq_sup_ks: {len(ws)} vs {len(ks)}")
-        else:
-            ws = [1.0] * len(ks)
-        s = float(sum(ws))
-        if not math.isfinite(s) or s <= 0:
-            raise ValueError(f"deq_sup_weights must sum to >0, got {ws}")
-        ws = [float(w) / s for w in ws]
-        pairs = sorted(zip(ks, ws, strict=True), key=lambda t: t[0])
-        ks = [k for k, _ in pairs]
-        ws = [w for _, w in pairs]
-        # Store back for logging/plotting (stable, sorted).
-        args.deq_sup_ks = ",".join(str(k) for k in ks)
-        args.deq_sup_weights = ",".join(f"{w:.4f}" for w in ws)
-        args.deq_sup_coef = float(getattr(args, "deq_sup_coef", 0.0))
-
-    # Parse/validate K-ramp schedule.
-    deq_k_ramp_enabled = bool(getattr(args, "deq_k_ramp_enabled", False))
-    deq_k_ramp_start = int(getattr(args, "deq_k_ramp_start", args.deq_k_min))
-    deq_k_ramp_end = int(getattr(args, "deq_k_ramp_end", args.deq_k_max))
-    deq_k_ramp_steps = int(getattr(args, "deq_k_ramp_steps", 0))
-    if deq_k_ramp_enabled:
-        if deq_k_ramp_start <= 0 or deq_k_ramp_end <= 0:
-            raise ValueError("deq_k_ramp_start/end must be positive")
-        if deq_k_ramp_start > deq_k_ramp_end:
-            raise ValueError("deq_k_ramp_start must be <= deq_k_ramp_end")
-        if deq_k_ramp_end > int(args.num_layers):
-            raise ValueError(f"deq_k_ramp_end must be <= num_layers={int(args.num_layers)}")
-        if deq_k_ramp_steps <= 0:
-            raise ValueError("deq_k_ramp_steps must be positive when ramp enabled")
+    # Shuffle-bag K-jitter range ramp validation (maxK ramps from deq_k_max_start -> deq_k_max).
+    if int(args.deq_k_min) <= 0:
+        raise ValueError("deq_k_min must be positive")
+    if int(args.deq_k_max_start) < int(args.deq_k_min):
+        raise ValueError("deq_k_max_start must be >= deq_k_min")
+    if int(args.deq_k_max) < int(args.deq_k_max_start):
+        raise ValueError("deq_k_max must be >= deq_k_max_start")
+    if int(args.deq_k_max) > int(args.num_layers):
+        raise ValueError(f"deq_k_max must be <= num_layers={int(args.num_layers)}")
+    if int(args.deq_k_max_ramp_steps) <= 0:
+        raise ValueError("deq_k_max_ramp_steps must be positive")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -2344,7 +2314,9 @@ def main() -> None:
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    # Keep a safe fallback backend enabled so eval never fails with "Invalid backend" when
+    # FlashAttention is temporarily unsupported for a given shape/dtype.
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -2379,7 +2351,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     k_rng = random.Random(args.seed + 12345)
-    k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max, k_rng)
+    k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max_start, k_rng)
 
     def sample_deq_k() -> int:
         """Sample one DEQ iteration count K for the next optimizer step (rank0-decided, broadcast)."""
@@ -2394,9 +2366,14 @@ def main() -> None:
         """Choose K for this optimizer step (rank0-decided, broadcast)."""
         k = 0
         if rank == 0:
-            if deq_k_ramp_enabled:
-                k = deq_k_ramp(step_i, start=deq_k_ramp_start, end=deq_k_ramp_end, ramp_steps=deq_k_ramp_steps)
-            elif args.deq_k_jitter:
+            if args.deq_k_jitter:
+                cur_max = deq_maxk_ramp(
+                    step_i,
+                    start=int(args.deq_k_max_start),
+                    end=int(args.deq_k_max),
+                    ramp_steps=int(args.deq_k_max_ramp_steps),
+                )
+                k_sampler.set_range(int(args.deq_k_min), int(cur_max))
                 k = sample_deq_k()
             else:
                 k = int(getattr(args, "deq_k_max", args.num_layers))
@@ -2427,18 +2404,10 @@ def main() -> None:
         f" deq_k_jitter={int(bool(args.deq_k_jitter))}"
         f" deq_k_range={int(args.deq_k_min)}-{int(args.deq_k_max)}"
         f" deq_k_eval={int(args.deq_k_eval)}"
-        f" deq_sup={int(bool(getattr(args, 'deq_sup_enabled', False)))}"
-        f" deq_sup_ks={getattr(args, 'deq_sup_ks', '')}"
-        f" deq_sup_w={getattr(args, 'deq_sup_weights', '')}"
-        f" deq_sup_coef={float(getattr(args, 'deq_sup_coef', 0.0)):.4f}"
         f" compile_train={int(bool(getattr(args, 'compile_train', False)))}"
-        f" deq_k_ramp={int(bool(getattr(args, 'deq_k_ramp_enabled', False)))}"
-        f" deq_k_ramp_start={int(getattr(args, 'deq_k_ramp_start', 0))}"
-        f" deq_k_ramp_end={int(getattr(args, 'deq_k_ramp_end', 0))}"
-        f" deq_k_ramp_steps={int(getattr(args, 'deq_k_ramp_steps', 0))}"
         " soft_topk=128"
         " moe=block"
-        " router=softmax*sigmoid"
+        " router=softmax"
     )
     log0(f"router_bias_update:{int(bool(args.router_bias_update))} lr:{float(args.router_bias_lr):.4f} clip:{float(args.router_bias_clip):.2f}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
@@ -2473,11 +2442,6 @@ def main() -> None:
         deq_backward=args.deq_backward,
     ).to(device).bfloat16()
 
-    # Configure intermediate DEQ supervision (model-side; uses parsed/sorted values from args).
-    base_model.deq_sup_enabled = bool(deq_sup_enabled)
-    base_model.deq_sup_ks = list(ks)
-    base_model.deq_sup_weights = list(ws)
-    base_model.deq_sup_coef = float(getattr(args, "deq_sup_coef", 0.0)) if deq_sup_enabled else 0.0
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -2485,7 +2449,12 @@ def main() -> None:
 
     # Optional training compile: compile only the shared block to avoid compiling the whole training step.
     if bool(getattr(args, "compile_train", False)):
-        base_model.shared_block = torch.compile(base_model.shared_block, mode="reduce-overhead", fullgraph=False)
+        # Keep the eager module for diagnostics + attribute access; use compiled callable
+        # only on non-diagnostic training steps.
+        base_model._shared_block_compiled = torch.compile(base_model.shared_block, mode="reduce-overhead", fullgraph=False)
+        base_model.compile_train = True
+    else:
+        base_model.compile_train = False
     compiled_model = base_model  # skip compile for training; use compiled forward_logits for eval
     model: nn.Module = (
         DDP(
@@ -2572,6 +2541,17 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+    def compiler_step_begin() -> None:
+        # When `--compile-train 1` is enabled, Inductor may use CUDA graphs.
+        # Marking step boundaries prevents stale graph outputs from being overwritten
+        # across invocations (common when modules keep small diagnostic tensors).
+        if not bool(getattr(args, "compile_train", False)):
+            return
+        try:
+            torch.compiler.cudagraph_mark_step_begin()
+        except Exception:
+            pass
+
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -2621,42 +2601,46 @@ def main() -> None:
         parts: list[str] = []
 
         if hasattr(m, "shared_block"):
-            for comp_name, comp in [("mlp", m.shared_block.mlp), ("attn", m.shared_block.attn)]:
-                router = getattr(comp, f"{comp_name}_router", None)
-                if router is None:
-                    router = getattr(comp, "attn_router", None)
-                diag_ok = (
-                    router is not None
-                    and getattr(router, "_expert_usage", None) is not None
-                    and (not require_step_match or getattr(router, "_diag_step", None) == step)
-                )
-                if diag_ok:
-                    usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
-                    parts.append(f"{comp_name}_usage:[{usage_str}]")
-                    ent = getattr(router, "_expert_entropy", None)
-                    if ent is not None:
-                        parts.append(f"{comp_name}_entropy:{ent:.4f}")
-                    cv = getattr(router, "_expert_balance_cv", None)
-                    if cv is not None:
-                        parts.append(f"{comp_name}_cv:{cv:.4f}")
-                    if include_gates:
-                        gates = getattr(router, "_expert_gates", None)
-                        if gates is not None:
-                            gates_str = ",".join(f"{g:.3f}" for g in gates)
-                            parts.append(f"{comp_name}_gates:[{gates_str}]")
+            # Block-level router stats (shared across attention + MLP expert banks).
+            router = getattr(m.shared_block.attn, "attn_router", None)
+            diag_ok = (
+                router is not None
+                and getattr(router, "_expert_usage", None) is not None
+                and (not require_step_match or getattr(router, "_diag_step", None) == step)
+            )
+            if diag_ok:
+                usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
+                parts.append(f"expert_usage:[{usage_str}]")
+                # Backward-compat with existing plotting code: expose the shared block-router
+                # stats under both `mlp_*` and `attn_*` keys. Plotting will automatically
+                # de-duplicate identical series for block-level MoE.
+                parts.append(f"block_usage:[{usage_str}]")
+                parts.append(f"mlp_usage:[{usage_str}]")
+                parts.append(f"attn_usage:[{usage_str}]")
+                ent = getattr(router, "_expert_entropy", None)
+                if ent is not None:
+                    parts.append(f"expert_entropy:{ent:.4f}")
+                    parts.append(f"block_entropy:{ent:.4f}")
+                    parts.append(f"mlp_entropy:{ent:.4f}")
+                    parts.append(f"attn_entropy:{ent:.4f}")
+                    spar = getattr(router, "_expert_sparsity", None)
+                    if spar is not None:
+                        parts.append(f"expert_sparsity:{float(spar):.4f}")
+                cv = getattr(router, "_expert_balance_cv", None)
+                if cv is not None:
+                    parts.append(f"block_cv:{cv:.4f}")
+                    parts.append(f"mlp_cv:{cv:.4f}")
+                    parts.append(f"attn_cv:{cv:.4f}")
+                if include_gates:
+                    gm = getattr(router, "_gate_mass_mean", None)
+                    if gm is not None:
+                        parts.append(f"expert_gate_mass:{float(gm):.4f}")
 
-            mlp = m.shared_block.mlp
-            if hasattr(mlp, "get_expert_diagnostics"):
-                diag = mlp.get_expert_diagnostics()
-                if "ortho_cos_sim" in diag:
-                    parts.append(f"mlp_ortho:{diag['ortho_cos_sim']:.4f}")
-                    parts.append(f"expert_ortho:{diag['ortho_cos_sim']:.4f}")
-            # Weight-space orthogonality proxy (alignment check with output-space).
-            attn = m.shared_block.attn
-            if hasattr(attn, "get_expert_diagnostics"):
-                diag = attn.get_expert_diagnostics()
-                if "ortho_cos_sim" in diag:
-                    parts.append(f"attn_ortho:{diag['ortho_cos_sim']:.4f}")
+            # Block-level expert output orthogonality (used by plotting code as expert_ortho).
+            block_ortho = getattr(m.shared_block, "_block_ortho_cos_sim", None)
+            if block_ortho is not None:
+                parts.append(f"block_ortho:{float(block_ortho):.4f}")
+                parts.append(f"expert_ortho:{float(block_ortho):.4f}")
         if hasattr(m, "mos_head"):
             mos = m.mos_head
             if hasattr(mos, "get_head_orthogonality"):
@@ -2684,11 +2668,14 @@ def main() -> None:
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             if args.deq_k_jitter:
-                base_model._deq_k_override = sample_deq_k()
+                base_model._deq_k_override = deq_k_for_step(warmup_step + 1)
+            else:
+                base_model._deq_k_override = int(getattr(args, "deq_k_max", args.num_layers))
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                compiler_step_begin()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -2768,20 +2755,28 @@ def main() -> None:
         global _QAT_ACTIVE
         _QAT_ACTIVE = scale < 0.10
         zero_grad_all()
+        # Clear stale RevDEQ backward reconstruction diagnostic; it is only meaningful for
+        # the *current* optimizer step when computed by RevDEQFunction.backward.
+        if hasattr(base_model, "shared_block") and hasattr(base_model.shared_block, "_deq_recon_error_last_bwd"):
+            try:
+                base_model.shared_block._deq_recon_error_last_bwd = None
+            except Exception:
+                pass
         train_loss = torch.zeros((), device=device)
         next_step = step + 1
         will_log_train = (
             args.train_log_every > 0
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
-        if deq_k_ramp_enabled or args.deq_k_jitter:
+        if args.deq_k_jitter:
             base_model._deq_k_override = deq_k_for_step(next_step)
         else:
-            base_model._deq_k_override = 0
+            base_model._deq_k_override = int(getattr(args, "deq_k_max", args.num_layers))
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            compiler_step_begin()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 diag_enabled = master_process and will_log_train and micro_step == grad_accum_steps - 1
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
@@ -2843,6 +2838,9 @@ def main() -> None:
         if should_log_train:
             ntp = getattr(base_model, '_ntp_loss', 0.0)
             ctp = getattr(base_model, '_ctp_loss', 0.0)
+            # Pull RevDEQ backward reconstruction diagnostic (if computed) onto the model so
+            # the logging/plotting path stays uniform.
+            base_model._deq_recon_error = getattr(base_model.shared_block, "_deq_recon_error_last_bwd", None)
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step, require_step_match=True) if master_process else ""
             log0(
@@ -2875,6 +2873,12 @@ def main() -> None:
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
+
+    if bool(getattr(args, "benchmark_mode", False)):
+        log0("benchmark_mode:1 skipping_final_eval_and_serialization")
+        if distributed:
+            dist.destroy_process_group()
+        return
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # Weights go to experiments/weights/current/ (rotated by update_results.sh)

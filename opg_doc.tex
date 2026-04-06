@@ -38,6 +38,22 @@ function. The specification below is intended to be self-contained and auditable
 \tableofcontents
 \newpage
 
+\section{Practical defaults (throughput on 2$\times$A100 DDP)}
+\label{sec:throughput}
+\paragraph{Goal.}
+For local iteration on this dev box (2$\times$A100 with DDP), the code defaults are chosen to maximize
+\emph{tokens/second} while keeping behavior identical to the training/eval pipeline.
+
+\paragraph{Defaults (as of 2026-04-06).}
+\begin{itemize}
+  \item \texttt{train\_batch\_tokens = 65536} (conservative throughput default on 2$\times$A100; larger batches require stability retuning).
+  \item \texttt{compile\_train = 0} by default: \texttt{torch.compile} was empirically much slower for the shared RevDEQ block on 2$\times$A100.
+  \item K-jitter uses a shuffle-bag over \texttt{[deq\_k\_min, deq\_k\_max]} with \textbf{no ramp} by default (stable from step 1).
+\end{itemize}
+
+\paragraph{Optional compile path.}
+\texttt{compile\_train=1} remains supported for experimentation, but is not the throughput default on 2$\times$A100.
+
 \section{Notation (shapes and conventions)}
 \paragraph{Discrete inputs and targets.}
 Let $V$ be the vocabulary size, $B$ the batch size, and $T$ the sequence length.
@@ -232,16 +248,17 @@ Injection is a convex per-dimension interpolation:
 Attention and MLP are paired into expert blocks and mixed by a single shared router.
 Per token, the router produces:
 \[
-  p(x)=\mathrm{softmax}(\ell(x)),\qquad g(x)=\sigma(\gamma(x)),\qquad w(x)=p(x)\odot g(x).
+  w(x)=\mathrm{softmax}(\ell(x))\in\Delta^{E-1},
 \]
-Here $w\in\mathbb{R}_{\ge 0}^{E}$ and $\sum_{e=1}^{E} w_e \in (0,1]$.
-The \emph{gate mass} serves as the per-token global residual gate:
+so $w\in\mathbb{R}_{\ge 0}^{E}$ and $\sum_{e=1}^{E} w_e = 1$ (pure softmax; no post-softmax sigmoid gating).
+The block also computes a separate per-token global residual gate:
 \[
-  g_g(x) \;=\; \sum_{e=1}^{E} w_e(x).
+  g_g(x) \;=\; \sigma(\mathrm{gg}(x))\in(0,1),
 \]
+where $\mathrm{gg}(\cdot)$ is a learned scalar projection of the normalized block input.
 Each expert produces a full block update $z_{\text{body}}^{(e)}$, and the output is:
 \[
-  f_\theta(z,x_0) \;=\; \sum_{e=1}^{E} w_e(x)\ z_{\text{body}}^{(e)} + (1-g_g(x))\, z_{\text{in}}.
+  f_\theta(z,x_0) \;=\; (1-g_g(x))\, z_{\text{in}} \;+\; g_g(x)\sum_{e=1}^{E} w_e(x)\ z_{\text{body}}^{(e)}.
 \]
 In code, routing inputs $x$ are the normalized block input (\texttt{attn\_norm} output) and $w$ is computed once per block call.
 

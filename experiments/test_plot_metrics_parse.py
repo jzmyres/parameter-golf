@@ -47,7 +47,8 @@ class TestPlotMetricsParse(unittest.TestCase):
                 "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
                 "train_time:10.0ms step_avg:10.0ms "
                 "deq_residual:1.0 deq_recon_err:0.0 deq_iter_conv:0.1 gg_iter:[0.9,0.8,0.7,0.6] "
-                "mlp_ortho:0.25 attn_ortho:0.50 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
+                "expert_ortho:0.25 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
+                "block_entropy:0.65 block_cv:0.015 block_usage:[0.45,0.55] "
                 "mlp_entropy:0.7 attn_entropy:0.6 mos_ctp_entropy:0.8 mos_ntp_entropy:0.9 "
                 "mlp_cv:0.01 attn_cv:0.02 mos_ctp_cv:0.03 mos_ntp_cv:0.04 "
                 "mlp_usage:[0.5,0.5] attn_usage:[0.4,0.6] mos_ctp_usage:[0.1,0.9,0.0] mos_ntp_usage:[0.2,0.8,0.0]",
@@ -64,10 +65,11 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["deq_recon_train"], [0.0])
         self.assertEqual(d["deq_iter_conv_train"], [0.1])
         self.assertEqual(d["gg_iter_train"], [[0.9, 0.8, 0.7, 0.6]])
-        self.assertEqual(d["mlp_ortho_train"], [0.25])
-        self.assertEqual(d["attn_ortho_train"], [0.50])
         self.assertEqual(d["mos_ctp_ortho_train"], [0.10])
         self.assertEqual(d["mos_ntp_ortho_train"], [0.20])
+        self.assertEqual(d["block_entropy_train"], [0.65])
+        self.assertEqual(d["block_cv_train"], [0.015])
+        self.assertEqual(usage_min_series(d, "block_usage_train"), [0.45])
         self.assertEqual(usage_min_series(d, "mlp_usage_train"), [0.5])
         self.assertEqual(usage_min_series(d, "mos_ctp_usage_train"), [0.0])
 
@@ -94,7 +96,8 @@ class TestPlotMetricsParse(unittest.TestCase):
                 "step:1/10 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 train_time:10.0ms step_avg:10.0ms",
                 "step:1/10 val_loss:3.1 val_bpb:1.50 train_time:10ms step_avg:10.0ms "
                 "deq_residual:1.0 deq_recon_err:0.0 deq_iter_conv:0.1 gg_iter:[0.1,0.2] "
-                "mlp_ortho:0.25 attn_ortho:0.50 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 expert_ortho:0.25 "
+                "block_ortho:0.27 expert_ortho:0.25 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
+                "block_entropy:0.65 block_cv:0.015 block_usage:[0.45,0.55] "
                 "mlp_entropy:0.7 attn_entropy:0.6 mos_ctp_entropy:0.8 mos_ntp_entropy:0.9 "
                 "mlp_usage:[0.5,0.5] attn_usage:[0.4,0.6] mos_ctp_usage:[0.1,0.9,0.0] mos_ntp_usage:[0.2,0.8,0.0]",
             ]
@@ -106,12 +109,14 @@ class TestPlotMetricsParse(unittest.TestCase):
             d = parse_log(p)
 
         self.assertEqual(d["val_steps"], [1])
-        self.assertEqual(d["mlp_ortho"][-1], 0.25)
-        self.assertEqual(d["attn_ortho"][-1], 0.50)
         self.assertEqual(d["mos_ctp_ortho"][-1], 0.10)
         self.assertEqual(d["mos_ntp_ortho"][-1], 0.20)
+        self.assertEqual(d["block_ortho"][-1], 0.27)
         self.assertEqual(d["expert_ortho"][-1], 0.25)
         self.assertEqual(d["gg_iter"][-1], [0.1, 0.2])
+        self.assertEqual(d["block_entropy"][-1], 0.65)
+        self.assertEqual(d["block_cv"][-1], 0.015)
+        self.assertEqual(usage_min_series(d, "block_usage"), [0.45])
 
         self.assertEqual(usage_min_series(d, "mlp_usage"), [0.5])
         self.assertEqual(usage_min_series(d, "mos_ctp_usage"), [0.0])

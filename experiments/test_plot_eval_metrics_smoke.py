@@ -17,9 +17,10 @@ class TestPlotEvalMetricsSmoke(unittest.TestCase):
         log = "\n".join(
             [
                 "step:200/1000 val_loss:3.1 val_bpb:1.50 deq_residual:1.0 deq_iter_conv:0.1 "
-                "mlp_ortho:0.25 attn_ortho:0.50 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
-                "mlp_cv:0.10 attn_cv:0.10 mos_ctp_cv:0.10 mos_ntp_cv:0.10 "
-                "mlp_usage:[0.5,0.5] attn_usage:[0.4,0.6] mos_ctp_usage:[0.33,0.33,0.34] mos_ntp_usage:[0.33,0.33,0.34]",
+                "block_ortho:0.15 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
+                "block_cv:0.10 mos_ctp_cv:0.10 mos_ntp_cv:0.10 "
+                "block_entropy:0.90 mos_ctp_entropy:1.00 mos_ntp_entropy:1.10 "
+                "block_usage:[0.2,0.2,0.2,0.2,0.1,0.1] mos_ctp_usage:[0.33,0.33,0.34] mos_ntp_usage:[0.33,0.33,0.34]",
             ]
         )
         with tempfile.TemporaryDirectory() as td:

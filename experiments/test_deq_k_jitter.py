@@ -15,11 +15,15 @@ class TestDeqKJitter(unittest.TestCase):
         self.assertTrue(hasattr(Hyperparameters, "deq_k_min"))
         self.assertTrue(hasattr(Hyperparameters, "deq_k_max"))
         self.assertTrue(hasattr(Hyperparameters, "deq_k_eval"))
-        # Defaults: fixed K=12 for all training/eval steps (no jitter).
-        self.assertEqual(Hyperparameters.deq_k_jitter, False)
-        self.assertEqual(Hyperparameters.deq_k_min, 12)
-        self.assertEqual(Hyperparameters.deq_k_max, 12)
-        self.assertEqual(Hyperparameters.deq_k_eval, 12)
+        self.assertTrue(hasattr(Hyperparameters, "deq_k_max_start"))
+        self.assertTrue(hasattr(Hyperparameters, "deq_k_max_ramp_steps"))
+        # Defaults: shuffle-bag K-jitter with a maxK range ramp.
+        self.assertEqual(Hyperparameters.deq_k_jitter, True)
+        self.assertGreaterEqual(Hyperparameters.deq_k_min, 2)
+        self.assertGreaterEqual(Hyperparameters.deq_k_max_start, Hyperparameters.deq_k_min)
+        self.assertGreaterEqual(Hyperparameters.deq_k_max, Hyperparameters.deq_k_max_start)
+        self.assertEqual(Hyperparameters.deq_k_max, 30)
+        self.assertEqual(Hyperparameters.deq_k_eval, 30)
 
     def test_cli_override_parses_bool(self):
         ov = _parse_cli_overrides(["--deq-k-jitter", "0"])
@@ -35,6 +39,15 @@ class TestDeqKJitter(unittest.TestCase):
         self.assertEqual(set(got1), set(range(2, 13)))
         got2 = [s.sample() for _ in range(11)]
         self.assertEqual(set(got2), set(range(2, 13)))
+
+    def test_shuffle_bag_set_range_resets(self):
+        import random
+        rng = random.Random(123)
+        s = KShuffleBagSampler(2, 4, rng)
+        _ = [s.sample() for _ in range(3)]
+        s.set_range(2, 6)
+        got = [s.sample() for _ in range(5)]
+        self.assertEqual(set(got), set(range(2, 7)))
 
 
 if __name__ == "__main__":

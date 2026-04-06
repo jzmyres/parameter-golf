@@ -216,19 +216,30 @@ def _summary_text(ax, b: dict, c: dict):
     if _is_finite(base_post) and _is_finite(cur_post):
         lines.append(f"Post-Quant: {base_post:.4f} -> {cur_post:.4f} (d={cur_post-base_post:+.4f})")
 
-    thr_usage = 0.15
     thr_cv = 0.20
     thr_ortho = 0.20
     for comp, usage_key, cv_key, ortho_key in [
-        ("MLP", "mlp_usage", "mlp_cv", "mlp_ortho"),
-        ("Attn", "attn_usage", "attn_cv", "attn_ortho"),
+        ("transformer_block", "block_usage", "block_cv", "block_ortho"),
+        ("mos_ctp", "mos_ctp_usage", "mos_ctp_cv", "mos_ctp_ortho"),
+        ("mos_ntp", "mos_ntp_usage", "mos_ntp_cv", "mos_ntp_ortho"),
     ]:
+        usage_last = None
+        for u in reversed(c.get(usage_key, []) or []):
+            if u:
+                usage_last = u
+                break
+        e = len(usage_last) if usage_last is not None else 0
+        thr_usage = (0.6 / float(e)) if e > 0 else math.nan
         mu = _min_usage(c, usage_key)
         cv = _last_finite(c.get(cv_key, []))
         ortho = _last_finite(c.get(ortho_key, []))
-        ok = (_is_finite(mu) and mu >= thr_usage) and (_is_finite(cv) and cv <= thr_cv) and (_is_finite(ortho) and ortho <= thr_ortho)
+        ok = (
+            (_is_finite(mu) and _is_finite(thr_usage) and mu >= thr_usage)
+            and (_is_finite(cv) and cv <= thr_cv)
+            and (_is_finite(ortho) and ortho <= thr_ortho)
+        )
         status = "PASS" if ok else "FAIL"
-        lines.append(f"{comp}: min_usage={mu:.3f} cv={cv:.3f} ortho={ortho:.3f} => {status}")
+        lines.append(f"{comp}: min_usage={mu:.3f} (thr={thr_usage:.3f}) cv={cv:.3f} ortho={ortho:.3f} => {status}")
 
     s = "\n".join(lines) if lines else "Not logged"
     ax.text(0.0, 0.5, s, fontsize=11, family="monospace", va="center", transform=ax.transAxes)
@@ -252,7 +263,7 @@ def plot_eval_comparison(baseline_log: str, current_log: str, outdir: str) -> bo
         Line2D([0], [0], color=COLOR_BASELINE, lw=2.2, label="Baseline"),
         Line2D([0], [0], color=COLOR_CURRENT, lw=2.2, label="Current"),
     ]
-    for comp in ("mlp", "attn", "mos_ctp", "mos_ntp"):
+    for comp in ("transformer_block", "mos_ctp", "mos_ntp"):
         handles.append(Line2D([0], [0], color="black", lw=2.0, linestyle=COMP_LINESTYLES.get(comp, "-"), label=comp))
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=3, frameon=False, fontsize=9)
     fig.subplots_adjust(top=0.90)
@@ -264,35 +275,29 @@ def plot_eval_comparison(baseline_log: str, current_log: str, outdir: str) -> bo
 
     # Row 2: expert-health constraints (val)
     usage_series = [
-        ("mlp", usage_min_series(b, "mlp_usage"), usage_min_series(c, "mlp_usage")),
-        ("attn", usage_min_series(b, "attn_usage"), usage_min_series(c, "attn_usage")),
+        ("transformer_block", usage_min_series(b, "block_usage"), usage_min_series(c, "block_usage")),
         ("mos_ctp", usage_min_series(b, "mos_ctp_usage"), usage_min_series(c, "mos_ctp_usage")),
         ("mos_ntp", usage_min_series(b, "mos_ntp_usage"), usage_min_series(c, "mos_ntp_usage")),
     ]
     if not any(_has_any_finite(s[1]) or _has_any_finite(s[2]) for s in usage_series):
         usage_series = [("expert", usage_min_series(b, "expert_usage"), usage_min_series(c, "expert_usage"))]
     _plot_components(axes[1, 0], b, c, usage_series, "Min Usage (val)", ylabel="min usage")
-    axes[1, 0].axhline(0.15, color="#666666", linewidth=1.2, linestyle=":", alpha=0.8)
 
     cv_series = [
-        ("mlp", b.get("mlp_cv", []), c.get("mlp_cv", [])),
-        ("attn", b.get("attn_cv", []), c.get("attn_cv", [])),
+        ("transformer_block", b.get("block_cv", []), c.get("block_cv", [])),
         ("mos_ctp", b.get("mos_ctp_cv", []), c.get("mos_ctp_cv", [])),
         ("mos_ntp", b.get("mos_ntp_cv", []), c.get("mos_ntp_cv", [])),
     ]
     _plot_components(axes[1, 1], b, c, cv_series, "Balance CV (val)", ylabel="CV")
-    axes[1, 1].axhline(0.20, color="#666666", linewidth=1.2, linestyle=":", alpha=0.8)
 
     ortho_series = [
-        ("mlp", b.get("mlp_ortho", []), c.get("mlp_ortho", [])),
-        ("attn", b.get("attn_ortho", []), c.get("attn_ortho", [])),
+        ("transformer_block", b.get("block_ortho", b.get("expert_ortho", [])), c.get("block_ortho", c.get("expert_ortho", []))),
         ("mos_ctp", b.get("mos_ctp_ortho", []), c.get("mos_ctp_ortho", [])),
         ("mos_ntp", b.get("mos_ntp_ortho", []), c.get("mos_ntp_ortho", [])),
     ]
     if not any(_has_any_finite(s[1]) or _has_any_finite(s[2]) for s in ortho_series):
         ortho_series = [("mlp", b.get("expert_ortho", []), c.get("expert_ortho", []))]
-    _plot_components(axes[1, 2], b, c, ortho_series, "Orthogonality (val)", ylabel="mean |cos|")
-    axes[1, 2].axhline(0.20, color="#666666", linewidth=1.2, linestyle=":", alpha=0.8)
+    _plot_components(axes[1, 2], b, c, ortho_series, "Orthogonality (val)", ylabel="max |cos|")
 
     # Keep orthogonality linear and bounded.
     all_vals = []

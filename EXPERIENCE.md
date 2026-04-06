@@ -6,6 +6,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Track and compare the *scored* metric (post-quant) separately from any in-training validation.
 - Always report both the final in-training validation and the final post-quant result.
 - Name metrics by what they actually measure; don’t reuse a proxy metric under a different label.
+- For hard constraints, track the worst-case statistic you need to guarantee (max), not an average.
 - Prefer enforcing hard constraints in the space you diagnose; remove proxy regularizers if they don’t transfer.
 - Treat expert health metrics as non-negotiable guardrails; optimize everything else inside that envelope.
 - Validate hard constraints in eval-mode; train-mode “healthy routing” can be misleading.
@@ -33,11 +34,13 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Prefer line styles (not point clouds) for multi-component time series, and always include a legend for the encoding.
 - When two series are intentionally identical (tied components), deduplicate the plot so style overlays don’t look like mismatches.
 - When adding new logged keys, update the parser and add a small unit test so plots don’t silently degrade.
+- When a metric is renamed for clarity, keep a compatibility alias until all plots/tests have been updated.
 
 ## RevDEQ
 - FP64 add/sub is a *reversibility* tool (reconstruction accuracy), not a default training requirement.
 - Use autograd-unroll when you need output-space regularizers; use RevDEQ backward when you need constant-memory exact gradients.
 - Only compute/log reconstruction error when using the RevDEQ backward path (otherwise it’s not an actionable signal).
+- Reconstruction error is bounded by state rounding; interpret it as a trend/guardrail, not a “should be zero” assertion.
 - Prefer simple, explicit parameterizations over hidden stability clamps; diagnose fixed-point behavior directly via residual/convergence metrics.
 - When you need contraction, add a single block-level gate and log it; don’t hide stability in many per-path scale knobs.
 - Intermediate DEQ supervision shapes early iterates, but it’s compute-heavy; keep it sparse and aligned with the scored output.
@@ -51,6 +54,8 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - If you add gating that changes a probability simplex into sub-mass, define health metrics on the renormalized share and treat leftover mass explicitly.
 - In iterative solvers, prefer pooled convex gates with conservative initialization to preserve a stable identity path.
 - When an ablation is complete, delete the deprecated mode so logging, plots, and constraints can’t silently drift.
+- Throughput tuning must be validated against stability signals; “faster” configs that break DEQ behavior are not viable defaults.
+- Avoid saturated sigmoid gate inits; mid-point initialization keeps gradients alive and improves solver stability.
 
 ## Environment Sanity Checks
 - Before long runs, verify the environment can see CUDA and the dataset/tokenizer paths resolve.
