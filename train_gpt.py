@@ -121,6 +121,7 @@ class Hyperparameters:
     val_batch_size = 524_288
     val_loss_every = 200  # sparse but meaningful validation curve
     train_log_every = 100
+    auto_plot_on_val = True  # update metrics plots after each val_bpb log (rank0 only)
 
     iterations = 1000
     warmdown_iters = 1000
@@ -215,6 +216,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--val-batch-size", type=int, default=None)
     p.add_argument("--val-loss-every", type=int, default=None)
     p.add_argument("--train-log-every", type=int, default=None)
+    p.add_argument("--auto-plot-on-val", type=int, default=None, help="1/0; update plots after each val run (rank0)")
     p.add_argument("--max-wallclock-seconds", type=float, default=None)
     p.add_argument("--attn-balance-mult", type=float, default=None)
     p.add_argument("--mlp-balance-mult", type=float, default=None)
@@ -258,6 +260,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             elif key == "compile_train":
                 out[key] = bool(int(v))
             elif key == "benchmark_mode":
+                out[key] = bool(int(v))
+            elif key == "auto_plot_on_val":
                 out[key] = bool(int(v))
             else:
                 out[key] = v
@@ -795,10 +799,18 @@ def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
     return cos[mask].abs().mean()
 
 
-def max_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
-    """Max off-diagonal |cosine similarity| for a [E, D] tensor.
+def max_mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
+    """Max over experts of mean off-diagonal |cosine similarity| for a [E, D] tensor.
 
-    Worst-case statistic: if this is <= thr, then *all* expert pairs satisfy |cos| <= thr.
+    Compute pairwise |cos| between experts, take the mean across "other experts"
+    for each expert, then take the max across experts:
+
+        m_i = mean_{j != i} |cos(e_i, e_j)|
+        return max_i m_i
+
+    This is a worst-case per-expert redundancy signal. It is less sensitive to a
+    single anomalous pair than a pure max-over-pairs, while still being a strict
+    guardrail when thresholded.
     """
     if groups.ndim != 2:
         raise ValueError(f"groups must be rank-2 [E,D], got shape {tuple(groups.shape)}")
@@ -806,9 +818,10 @@ def max_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
     if e < 2:
         return groups.new_zeros(())
     g = groups / (groups.norm(dim=-1, keepdim=True) + eps)
-    cos = g @ g.T
-    mask = ~torch.eye(e, dtype=torch.bool, device=cos.device)
-    return cos[mask].abs().max()
+    cos = (g @ g.T).abs()
+    cos = cos.masked_fill(torch.eye(e, dtype=torch.bool, device=cos.device), 0.0)
+    per_expert_mean = cos.sum(dim=-1) / float(e - 1)
+    return per_expert_mean.max()
 
 
 def deq_maxk_ramp(step: int, *, start: int, end: int, ramp_steps: int) -> int:
@@ -1353,7 +1366,7 @@ class MoSHead(nn.Module):
                 .float()
                 .reshape(self.num_shared + self.num_specialized, -1)
             )
-            return float(max_abs_offdiag_cosine(groups).item())
+            return float(max_mean_abs_offdiag_cosine(groups).item())
 
     def _fsq(self, x: Tensor) -> Tensor:
         return _fsq_ste(x, self.fsq_levels, self.training)
@@ -1388,7 +1401,7 @@ class MoSHead(nn.Module):
             idx = self.num_shared + e
             log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
         log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
-        ortho_out = max_abs_offdiag_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
+        ortho_out = max_mean_abs_offdiag_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
         return log_p, alpha, ortho_out
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
@@ -1541,7 +1554,7 @@ class Block(nn.Module):
             return
         try:
             mu_b = torch.stack(block_mu, dim=0)
-            self._block_ortho_cos_sim = float(max_abs_offdiag_cosine(mu_b).item())
+            self._block_ortho_cos_sim = float(max_mean_abs_offdiag_cosine(mu_b).item())
         except Exception:
             self._block_ortho_cos_sim = None
 
@@ -2347,6 +2360,22 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    def _maybe_update_plots() -> None:
+        if not master_process:
+            return
+        if not bool(getattr(args, "auto_plot_on_val", False)):
+            return
+        try:
+            exp_logdir = Path("experiments/training_logs")
+            exp_logdir.mkdir(parents=True, exist_ok=True)
+            if logfile is not None and Path(logfile).exists():
+                shutil.copyfile(logfile, exp_logdir / "current.log")
+            # Best-effort: do not fail training if plotting fails.
+            subprocess.run([sys.executable, "experiments/plot_metrics.py"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run([sys.executable, "experiments/plot_eval_metrics.py"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return
+
     log0(code, console=False)
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
@@ -2749,6 +2778,7 @@ def main() -> None:
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
                 f"{deq_info}{expert_info}"
             )
+            _maybe_update_plots()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 

@@ -297,7 +297,7 @@ def plot_eval_comparison(baseline_log: str, current_log: str, outdir: str) -> bo
     ]
     if not any(_has_any_finite(s[1]) or _has_any_finite(s[2]) for s in ortho_series):
         ortho_series = [("mlp", b.get("expert_ortho", []), c.get("expert_ortho", []))]
-    _plot_components(axes[1, 2], b, c, ortho_series, "Orthogonality (val)", ylabel="max |cos|")
+    _plot_components(axes[1, 2], b, c, ortho_series, "Orthogonality (val)", ylabel="max mean |cos|")
 
     # Keep orthogonality linear and bounded.
     all_vals = []

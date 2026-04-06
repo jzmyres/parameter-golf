@@ -564,8 +564,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         c,
         steps_key,
         ortho_series,
-        "Orthogonality (max |cos| by Group)",
-        ylabel="Max |cos| (worst pair)",
+        "Orthogonality (max mean |cos| by Group)",
+        ylabel="Max mean |cos|",
     )
     # Orthogonality is naturally bounded in [0, 1]; keep linear for interpretability.
     all_vals = []

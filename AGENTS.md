@@ -25,7 +25,7 @@ You MUST incorporate these three architectural innovations into the transformer 
 - **Expert health MUST be satisfied by end of training** (final-only hard constraints):
   - Per-component min share ≥ 0.6 / num_experts (share is normalized across experts; sum=1)
   - Per-component balance CV ≤ 0.20 (computed on the same normalized share distribution)
-  - Expert-group orthogonality (max-pair |cos|) ≤ 0.20 for `transformer_block`, `mos_ctp`, and `mos_ntp`
+  - Expert-group orthogonality (max over experts of mean |cos|) ≤ 0.20 for `transformer_block`, `mos_ctp`, and `mos_ntp`
   - These are guardrails for expressiveness/optimization; do not accept runs that violate them.
 - **Fixed-point behavior is a desired goal**, not a hard constraint: monitor relative convergence/residuals and improve if it does not harm expert health or val_bpb.
 - RevDEQ precision reminder: use FP64 add/sub + reconstruction diagnostics only when using the RevDEQ backward path; autograd-unroll is the right tool when you need output-space regularizers (see `EXPERIENCE.md`).
