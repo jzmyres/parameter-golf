@@ -169,7 +169,7 @@ class Hyperparameters:
     router_bias_update = True
     router_bias_lr = 0.05
     router_bias_clip = 5.0
-    mos_ortho_out_coef = 0.02
+    mos_ortho_out_coef = 0.01
     attn_ortho_out_coef = 0.0
     mlp_ortho_out_coef = 0.0
     deq_backward = "revdeq"  # {autograd, revdeq}
