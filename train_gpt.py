@@ -6,6 +6,7 @@ Note: For this autoresearch workspace, `train_gpt.py` may grow beyond a small tu
 
 from __future__ import annotations
 
+import atexit
 import copy
 import contextlib
 import glob
@@ -14,6 +15,7 @@ import argparse
 import math
 import os
 import random
+import signal
 import shutil
 import subprocess
 import sys
@@ -76,15 +78,22 @@ def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
 
 
 class KShuffleBagSampler:
-    """Shuffle-bag sampler over an integer range [k_min, k_max] (inclusive).
+    """Shuffle-bag sampler over an integer grid in [k_min, k_max] (inclusive).
+
+    Values are sampled from:
+        {k_min, k_min + step, k_min + 2*step, ..., <= k_max}
 
     Guarantees exact coverage: each K appears exactly once per bag cycle, with random order.
     """
-    def __init__(self, k_min: int, k_max: int, rng: random.Random):
+    def __init__(self, k_min: int, k_max: int, rng: random.Random, *, step: int = 1):
         if k_min > k_max:
             raise ValueError(f"k_min must be <= k_max, got {k_min} > {k_max}")
+        step_i = int(step)
+        if step_i <= 0:
+            raise ValueError(f"step must be positive, got {step_i}")
         self.k_min = int(k_min)
         self.k_max = int(k_max)
+        self.step = step_i
         self.rng = rng
         self._bag: list[int] = []
 
@@ -93,18 +102,22 @@ class KShuffleBagSampler:
 
     def sample(self) -> int:
         if not self._bag:
-            self._bag = list(range(self.k_min, self.k_max + 1))
+            self._bag = list(range(self.k_min, self.k_max + 1, self.step))
             self.rng.shuffle(self._bag)
         return int(self._bag.pop())
 
-    def set_range(self, k_min: int, k_max: int) -> None:
+    def set_range(self, k_min: int, k_max: int, *, step: int | None = None) -> None:
         k_min_i = int(k_min)
         k_max_i = int(k_max)
         if k_min_i > k_max_i:
             raise ValueError(f"k_min must be <= k_max, got {k_min_i} > {k_max_i}")
-        if k_min_i != self.k_min or k_max_i != self.k_max:
+        step_i = self.step if step is None else int(step)
+        if step_i <= 0:
+            raise ValueError(f"step must be positive, got {step_i}")
+        if k_min_i != self.k_min or k_max_i != self.k_max or step_i != self.step:
             self.k_min = k_min_i
             self.k_max = k_max_i
+            self.step = step_i
             self.reset()
 
 class Hyperparameters:
@@ -126,8 +139,7 @@ class Hyperparameters:
     iterations = 1000
     warmdown_iters = 1000
     warmup_steps = 20
-    # Throughput-tuned default for this dev box (2×A100 DDP): maximize tokens/sec without torch.compile.
-    # NOTE: larger batches can change DEQ stability; keep this conservative unless retuned.
+    # Throughput-tuned default for this dev box (2×A100 DDP).
     train_batch_tokens = 262_144
     train_seq_len = 2048
     max_wallclock_seconds = 0.0  # 0 disables wallclock early-stop
@@ -136,7 +148,9 @@ class Hyperparameters:
 
     vocab_size = 1024
     num_layers = 38  # DEQ solver iteration budget (max K)
-    num_refinements = 2  # predict→soft_embed→re-encode cycles
+    # Refinements are expensive; ramp them in after early optimization stabilizes.
+    num_refinements = 1  # target (max) refinement count
+    num_refinements_ramp_steps = 200  # 0 refinements for steps < this, then 1
     num_kv_heads = 4
     model_dim = 640
     num_heads = 8
@@ -164,7 +178,12 @@ class Hyperparameters:
     # Routing regularization weights
     attn_balance_mult = 5.0
     mlp_balance_mult = 1.0
-    bal_loss_coef = 1.0
+    bal_loss_coef = 1e-3
+    # Periodic auxiliary loss on the *block-level* router-weighted expert contributions at z*.
+    # This is the most direct way to enforce output-space expert diversity under RevDEQ.
+    block_ortho_aux_coef = 0.01
+    block_ortho_aux_every = 100
+    block_ortho_aux_tokens = 256
     # Loss-free load balancing (bias controller). Keeps expert utilization healthy without
     # interfering gradients from strong auxiliary losses.
     router_bias_update = True
@@ -175,9 +194,10 @@ class Hyperparameters:
     mlp_ortho_out_coef = 0.0
     deq_backward = "revdeq"  # {autograd, revdeq}
     deq_k_jitter = True
-    deq_k_min = 2
-    deq_k_max = 30
-    deq_k_eval = 30
+    deq_k_min = 4
+    deq_k_max = 32
+    deq_k_step = 4  # sample K on a grid: {4,8,12,...,32}
+    deq_k_eval = 32
     # Shuffle-bag K-jitter range ramp: maxK linearly increases from deq_k_max_start -> deq_k_max.
     # Default: no ramp (stable range from step 1).
     deq_k_max_start = deq_k_max
@@ -227,11 +247,15 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--mos-ortho-out-coef", type=float, default=None)
     p.add_argument("--attn-ortho-out-coef", type=float, default=None)
     p.add_argument("--mlp-ortho-out-coef", type=float, default=None)
+    p.add_argument("--block-ortho-aux-coef", type=float, default=None)
+    p.add_argument("--block-ortho-aux-every", type=int, default=None)
+    p.add_argument("--block-ortho-aux-tokens", type=int, default=None)
     p.add_argument("--bigram-vocab-size", type=int, default=None)
     p.add_argument("--bigram-dim", type=int, default=None)
     p.add_argument("--kv-latent-dim", type=int, default=None)
     p.add_argument("--attn-expert-rank", type=int, default=None)
     p.add_argument("--mlp-expert-rank", type=int, default=None)
+    p.add_argument("--num-refinements-ramp-steps", type=int, default=None, help="steps with 0 refinements before enabling num_refinements")
     p.add_argument("--swa-enabled", type=int, default=None, help="1/0")
     p.add_argument("--swa-start-frac", type=float, default=None)
     p.add_argument("--swa-every", type=int, default=None)
@@ -239,6 +263,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--deq-k-jitter", type=int, default=None, help="1/0; sample K per optimizer step")
     p.add_argument("--deq-k-min", type=int, default=None)
     p.add_argument("--deq-k-max", type=int, default=None)
+    p.add_argument("--deq-k-step", type=int, default=None, help="grid step for K jitter (e.g. 4 => {4,8,12,...})")
     p.add_argument("--deq-k-eval", type=int, default=None)
     p.add_argument("--deq-k-max-start", type=int, default=None, help="starting maxK for range ramp (train only)")
     p.add_argument("--deq-k-max-ramp-steps", type=int, default=None, help="steps to ramp maxK to deq_k_max")
@@ -1558,6 +1583,40 @@ class Block(nn.Module):
         except Exception:
             self._block_ortho_cos_sim = None
 
+    def block_contrib_mu(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> Tensor:
+        """Return per-expert mean router-weighted block contributions μ_e ∈ R^D as [E,D].
+
+        Contribution is the exact tensor mixed into the DEQ update:
+            contrib_e = (gg(z,x0) * w_e(z,x0)) * block_out_e(z,x0)
+
+        This is used for a periodic auxiliary orthogonality loss to enforce expert diversity
+        under RevDEQ's memory-efficient backward (where forward runs without saved activations).
+        """
+        if z_in.ndim != 3 or x0.ndim != 3:
+            raise ValueError(f"expected z_in and x0 as [B,T,D], got {tuple(z_in.shape)} and {tuple(x0.shape)}")
+        bsz, seqlen, _ = z_in.shape
+        t = int(min(max(1, int(max_tokens)), seqlen))
+        z_in = z_in[:, :t]
+        x0 = x0[:, :t]
+
+        g = self._inj_gate_from(z_in).to(dtype=z_in.dtype)  # [d]
+        x = (1.0 - g)[None, None, :] * z_in + g[None, None, :] * x0
+        x_attn = self.attn_norm(x)
+        x_attn_n = _rms_norm(x_attn)
+        w = self.attn.attn_router(x_attn)  # shared router; sum(w)=1
+        gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)  # [B,T]
+
+        y_shared = self.attn._attn_shared_from_normed(x_attn_n)  # [B,T,D]
+        mus: list[Tensor] = []
+        for e in range(self.attn.num_experts):
+            attn_out = self.attn.project_expert_from_shared(y_shared, e)  # [B,T,D]
+            z1 = x + attn_out
+            mlp_out = self.mlp.forward_expert(self.mlp_norm(z1), e)  # [B,T,D]
+            z2 = z1 + mlp_out
+            contrib = (gg_tok.to(dtype=z2.dtype).unsqueeze(-1) * w[..., e:e + 1]) * z2
+            mus.append(contrib.mean(dim=(0, 1)).float())
+        return torch.stack(mus, dim=0)  # [E,D] fp32
+
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         z_in = x
 
@@ -1824,6 +1883,9 @@ class GPT(nn.Module):
         attn_ortho_out_coef: float = 0.0,
         mlp_ortho_out_coef: float = 0.0,
         deq_backward: str = "autograd",
+        block_ortho_aux_coef: float = 0.0,
+        block_ortho_aux_every: int = 0,
+        block_ortho_aux_tokens: int = 256,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1853,6 +1915,11 @@ class GPT(nn.Module):
         if deq_backward not in ("autograd", "revdeq"):
             raise ValueError(f"deq_backward must be autograd|revdeq, got {deq_backward!r}")
         self.deq_backward = deq_backward
+        self.block_ortho_aux_coef = float(block_ortho_aux_coef)
+        self.block_ortho_aux_every = int(block_ortho_aux_every)
+        self.block_ortho_aux_tokens = int(block_ortho_aux_tokens)
+        self._block_ortho_aux_enabled = False
+        self._block_ortho_aux_loss: Tensor | None = None
         # Route the output-space orthogonality coefficients into the expert modules so they
         # can materialize differentiable losses when using autograd-unrolled DEQ.
         self.shared_block.attn.out_ortho_coef = self.attn_ortho_out_coef
@@ -2038,6 +2105,7 @@ class GPT(nn.Module):
         self._deq_k_last = None
         prev_soft_embed = x0
         x0_refined = x0  # track for reconstruction
+        self._block_ortho_aux_loss = None
 
         gg_iters_by_refinement: list[list[float]] = []
         for r in range(1 + self.num_refinements):
@@ -2097,6 +2165,14 @@ class GPT(nn.Module):
             router.set_bias_stats_enabled(True)
             _ = router(self.shared_block.attn_norm(z))
             router.set_bias_stats_enabled(False)
+
+            # Periodic auxiliary loss: enforce block-level expert output diversity on z*.
+            if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
+                mu = self.shared_block.block_contrib_mu(z, x0_refined, max_tokens=self.block_ortho_aux_tokens)  # [E,D] fp32
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(mu, op=dist.ReduceOp.SUM)
+                    mu = mu / float(dist.get_world_size())
+                self._block_ortho_aux_loss = max_mean_abs_offdiag_cosine(mu)
 
         # Diagnostics (eval only)
         if not self.training:
@@ -2175,6 +2251,10 @@ class GPT(nn.Module):
             if isinstance(m, torch.Tensor):
                 mlp_ortho_loss = m.to(device=ntp_loss.device)
 
+        block_ortho_aux = torch.tensor(0.0, device=ntp_loss.device)
+        if self.training and self._block_ortho_aux_enabled and isinstance(self._block_ortho_aux_loss, torch.Tensor):
+            block_ortho_aux = self._block_ortho_aux_loss.to(device=ntp_loss.device)
+
         return (
             ntp_loss
             + ctp_weight * ctp_loss
@@ -2183,6 +2263,7 @@ class GPT(nn.Module):
             + self.mos_ortho_out_coef * mos_ortho_loss
             + self.attn_ortho_out_coef * attn_ortho_loss
             + self.mlp_ortho_out_coef * mlp_ortho_loss
+            + self.block_ortho_aux_coef * block_ortho_aux
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -2343,6 +2424,7 @@ def main() -> None:
     enable_math_sdp(True)
 
     logfile = None
+    live_current_log = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
@@ -2350,6 +2432,13 @@ def main() -> None:
         with open(logfile, "w", encoding="utf-8") as f:
             f.write("")
         print(logfile, flush=True)
+        # Keep a continuously-updated copy of the current run log for plotting/debugging even
+        # when the run is interrupted before the next validation step.
+        exp_logdir = Path("experiments/training_logs")
+        exp_logdir.mkdir(parents=True, exist_ok=True)
+        live_current_log = str(exp_logdir / "current.log")
+        with open(live_current_log, "w", encoding="utf-8") as f:
+            f.write("")
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -2359,8 +2448,14 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+        if live_current_log is not None:
+            try:
+                with open(live_current_log, "a", encoding="utf-8") as f:
+                    print(msg, file=f)
+            except Exception:
+                pass
 
-    def _maybe_update_plots() -> None:
+    def _best_effort_update_plots(reason: str) -> None:
         if not master_process:
             return
         if not bool(getattr(args, "auto_plot_on_val", False)):
@@ -2368,13 +2463,42 @@ def main() -> None:
         try:
             exp_logdir = Path("experiments/training_logs")
             exp_logdir.mkdir(parents=True, exist_ok=True)
+            # Copy rather than rename so `logs/<run_id>.txt` remains the canonical run log.
             if logfile is not None and Path(logfile).exists():
                 shutil.copyfile(logfile, exp_logdir / "current.log")
-            # Best-effort: do not fail training if plotting fails.
-            subprocess.run([sys.executable, "experiments/plot_metrics.py"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run([sys.executable, "experiments/plot_eval_metrics.py"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
+            # If this is the first run in a fresh workspace, initialize baseline from current
+            # so comparison plots render.
+            if (exp_logdir / "current.log").exists() and not (exp_logdir / "baseline.log").exists():
+                shutil.copyfile(exp_logdir / "current.log", exp_logdir / "baseline.log")
+            for script in ("experiments/plot_metrics.py", "experiments/plot_eval_metrics.py"):
+                proc = subprocess.run([sys.executable, script], capture_output=True, text=True, check=False)
+                if proc.returncode != 0:
+                    stderr = (proc.stderr or "").strip().replace("\n", " ")
+                    stderr = stderr[:500] + ("…" if len(stderr) > 500 else "")
+                    log0(f"auto_plot_failed:{reason}:{Path(script).name}:rc={proc.returncode}:stderr={stderr}")
+        except Exception as e:
+            log0(f"auto_plot_failed:{reason}:{type(e).__name__}:{e}")
+
+    def _maybe_update_plots() -> None:
+        if not master_process:
             return
+        if not bool(getattr(args, "auto_plot_on_val", False)):
+            return
+        _best_effort_update_plots("val")
+
+    if master_process:
+        # Attempt to update plots on clean exit and on common interrupts (best-effort).
+        atexit.register(lambda: _best_effort_update_plots("atexit"))
+
+        def _sig_handler(signum: int, _frame: object | None) -> None:
+            _best_effort_update_plots(f"signal:{signum}")
+            raise SystemExit(128 + int(signum))
+
+        for _sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(_sig, _sig_handler)
+            except Exception:
+                pass
 
     log0(code, console=False)
     log0("=" * 100, console=False)
@@ -2391,16 +2515,15 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     k_rng = random.Random(args.seed + 12345)
-    k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max_start, k_rng)
+    k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max_start, k_rng, step=int(getattr(args, "deq_k_step", 1)))
 
     def sample_deq_k() -> int:
-        """Sample one DEQ iteration count K for the next optimizer step (rank0-decided, broadcast)."""
-        k = k_sampler.sample() if rank == 0 else 0
-        if distributed:
-            k_t = torch.tensor([k], device=device, dtype=torch.int64)
-            dist.broadcast(k_t, src=0)
-            k = int(k_t.item())
-        return int(k)
+        """Sample one DEQ iteration count K for the next optimizer step (rank0-only).
+
+        Broadcasting must be handled by the caller to ensure all ranks execute collectives
+        in the same order (a common source of NCCL watchdog timeouts).
+        """
+        return int(k_sampler.sample())
 
     def deq_k_for_step(step_i: int) -> int:
         """Choose K for this optimizer step (rank0-decided, broadcast)."""
@@ -2413,7 +2536,7 @@ def main() -> None:
                     end=int(args.deq_k_max),
                     ramp_steps=int(args.deq_k_max_ramp_steps),
                 )
-                k_sampler.set_range(int(args.deq_k_min), int(cur_max))
+                k_sampler.set_range(int(args.deq_k_min), int(cur_max), step=int(getattr(args, "deq_k_step", 1)))
                 k = sample_deq_k()
             else:
                 k = int(getattr(args, "deq_k_max", args.num_layers))
@@ -2441,14 +2564,19 @@ def main() -> None:
     log0(
         "config:"
         f" refinements={int(args.num_refinements)}"
+        f" refinements_ramp={int(getattr(args, 'num_refinements_ramp_steps', 0))}"
         f" deq_k_jitter={int(bool(args.deq_k_jitter))}"
         f" deq_k_range={int(args.deq_k_min)}-{int(args.deq_k_max)}"
+        f" deq_k_step={int(getattr(args, 'deq_k_step', 1))}"
         f" deq_k_eval={int(args.deq_k_eval)}"
         f" compile_train={int(bool(getattr(args, 'compile_train', False)))}"
         f" batch_tokens={int(args.train_batch_tokens)}"
         f" seq_len={int(args.train_seq_len)}"
         f" beta={float(args.deq_beta):.3f}"
         f" mos_ortho_coef={float(args.mos_ortho_out_coef):.4g}"
+        f" block_ortho_aux_coef={float(args.block_ortho_aux_coef):.4g}"
+        f" block_ortho_aux_every={int(args.block_ortho_aux_every)}"
+        f" block_ortho_aux_tokens={int(args.block_ortho_aux_tokens)}"
         f" model_dim={int(args.model_dim)}"
         f" heads={int(args.num_heads)}"
         f" kv_heads={int(args.num_kv_heads)}"
@@ -2487,6 +2615,9 @@ def main() -> None:
         attn_ortho_out_coef=args.attn_ortho_out_coef,
         mlp_ortho_out_coef=args.mlp_ortho_out_coef,
         deq_backward=args.deq_backward,
+        block_ortho_aux_coef=args.block_ortho_aux_coef,
+        block_ortho_aux_every=args.block_ortho_aux_every,
+        block_ortho_aux_tokens=args.block_ortho_aux_tokens,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -2508,7 +2639,7 @@ def main() -> None:
             compiled_model,
             device_ids=[local_rank],
             broadcast_buffers=False,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
         if distributed
         else compiled_model
@@ -2718,12 +2849,16 @@ def main() -> None:
                 base_model._deq_k_override = deq_k_for_step(warmup_step + 1)
             else:
                 base_model._deq_k_override = int(getattr(args, "deq_k_max", args.num_layers))
+            # Keep warmup simple (no refinements).
+            base_model.num_refinements = 0
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 compiler_step_begin()
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    # Keep warmup cheap and stable: disable periodic auxiliary losses.
+                    base_model._block_ortho_aux_enabled = False
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -2820,6 +2955,9 @@ def main() -> None:
             base_model._deq_k_override = deq_k_for_step(next_step)
         else:
             base_model._deq_k_override = int(getattr(args, "deq_k_max", args.num_layers))
+        # Ramp refinements from 0 -> args.num_refinements.
+        ramp_steps = int(getattr(args, "num_refinements_ramp_steps", 0) or 0)
+        base_model.num_refinements = 0 if ramp_steps > 0 and next_step < ramp_steps else int(args.num_refinements)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -2827,6 +2965,14 @@ def main() -> None:
             compiler_step_begin()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 diag_enabled = master_process and will_log_train and micro_step == grad_accum_steps - 1
+                # Periodic auxiliary block-orthogonality loss: enable only on the final micro-step
+                # so we pay the overhead once per optimizer step.
+                base_model._block_ortho_aux_enabled = bool(
+                    args.block_ortho_aux_every > 0
+                    and args.block_ortho_aux_coef > 0.0
+                    and (next_step % int(args.block_ortho_aux_every) == 0)
+                    and micro_step == grad_accum_steps - 1
+                )
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
             train_loss += loss.detach()
@@ -3021,21 +3167,8 @@ def main() -> None:
     # IMPORTANT: run this only after post-quant eval is logged so the plot can
     # show the scored metric (final_int6_*_roundtrip_exact).
     if master_process:
-        try:
-            exp_logdir = Path("experiments/training_logs")
-            exp_logdir.mkdir(parents=True, exist_ok=True)
-            if logfile is not None and Path(logfile).exists():
-                # Copy rather than rename so `logs/<run_id>.txt` remains the canonical run log.
-                shutil.copyfile(logfile, exp_logdir / "current.log")
-            # Always keep plots up to date with the most recent run. If this is the first
-            # run in a fresh workspace, initialize baseline from current so plots render.
-            if (exp_logdir / "current.log").exists() and not (exp_logdir / "baseline.log").exists():
-                shutil.copyfile(exp_logdir / "current.log", exp_logdir / "baseline.log")
-            if (exp_logdir / "baseline.log").exists() and (exp_logdir / "current.log").exists():
-                subprocess.run([sys.executable, "experiments/plot_metrics.py"], check=False)
-                subprocess.run([sys.executable, "experiments/plot_eval_metrics.py"], check=False)
-        except Exception as e:
-            log0(f"auto_plot_failed:{type(e).__name__}:{e}")
+        # Ensure the final plot reflects the scored post-quant metric.
+        _best_effort_update_plots("final")
 
     if distributed:
         dist.destroy_process_group()

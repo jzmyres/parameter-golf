@@ -49,6 +49,7 @@ def parse_log(logpath: str) -> dict:
         # Validation-time diagnostics (sparse unless VAL_LOSS_EVERY is small)
         "deq_residual": [], "deq_recon": [], "deq_iter_conv": [], "deq_iter_conv_rel": [],
         "gg_iter": [],
+        "gg_mean": [],
         # Combined expert metrics (backward compat)
         "expert_usage": [], "expert_entropy": [], "expert_sparsity": [], "expert_ortho": [],
         # Block-level expert orthogonality (explicit key; `expert_ortho` is kept for compat)
@@ -63,6 +64,7 @@ def parse_log(logpath: str) -> dict:
         # Train-time diagnostics (dense, logged alongside train_loss when enabled)
         "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
         "gg_iter_train": [],
+        "gg_mean_train": [],
         **{f"{p}_{s}_train": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
            for s in ("usage", "entropy", "cv")},
         "block_usage_train": [], "block_entropy_train": [], "block_cv_train": [],
@@ -125,6 +127,8 @@ def parse_log(logpath: str) -> dict:
             # Parse pre-clip gradient norm
             m_gn = re.search(rf"grad_norm:{_FLOAT}", line)
             data["grad_norm"].append(float(m_gn.group(1)) if m_gn else math.nan)
+            m_ggm = re.search(rf"\\bgg_mean:{_FLOAT}\\b", line)
+            data["gg_mean_train"].append(float(m_ggm.group(1)) if m_ggm else math.nan)
 
             # Train-time DEQ + expert diagnostics (optional). Missing values become NaN.
             for key, pat in [
@@ -182,6 +186,8 @@ def parse_log(logpath: str) -> dict:
             data["val_steps"].append(step_i)
             data["val_loss"].append(float(m.group(2)))
             data["val_bpb"].append(float(m.group(3)))
+            m_ggm = re.search(rf"\\bgg_mean:{_FLOAT}\\b", line)
+            data["gg_mean"].append(float(m_ggm.group(1)) if m_ggm else math.nan)
             # Total training time is printed on val lines; use it as authoritative for summary.
             m_tt = re.search(rf"train_time:{_FLOAT}ms", line)
             data["val_train_time_ms"].append(float(m_tt.group(1)) if m_tt else math.nan)
@@ -430,7 +436,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
             return "train_steps", train_key
         return "val_steps", val_key
 
-    fig, axes = plt.subplots(6, 3, figsize=(18, 26))
+    # Wide landscape aspect so the 6×3 grid is readable in typical image viewers.
+    fig, axes = plt.subplots(6, 3, figsize=(26, 16))
     fig.suptitle("Baseline vs Current Experiment — Full Diagnostics", fontsize=16, fontweight="bold")
 
     # Global legend (colors = run, line style = component)
@@ -450,7 +457,9 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
                 label=comp,
             )
         )
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.965), ncol=3, frameon=False, fontsize=9)
+    legend = fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.965), ncol=3, frameon=False, fontsize=9)
+    # Prevent legend bbox from distorting subplot layout (tight_layout can over-shrink axes).
+    legend.set_in_layout(False)
     fig.subplots_adjust(top=0.93)
 
     # Row 1: Training metrics (total loss, val bpb, step avg)
@@ -491,6 +500,26 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     steps_key, key = _prefer_train("deq_iter_conv_rel_train", "deq_iter_conv_rel")
     _plot_line(axes[2, 2], b, c, key, key, steps_key, steps_key, "DEQ Iter Conv (relative)")
 
+    # Requested: log-scale the absolute DEQ residual and absolute iter-convergence plots.
+    def _set_log_scale_safe(ax, *series_lists: list[float]) -> None:
+        vals: list[float] = []
+        for s in series_lists:
+            for v in s:
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if math.isfinite(fv) and fv > 0:
+                    vals.append(fv)
+        ax.set_yscale("log")
+        ax.set_ylim(bottom=(min(vals) * 0.8) if vals else 1e-6)
+
+    # Use whichever series was plotted (train-logged preferred).
+    steps_key, key = _prefer_train("deq_residual_train", "deq_residual")
+    _set_log_scale_safe(axes[2, 0], b.get(key, []), c.get(key, []))
+    steps_key, key = _prefer_train("deq_iter_conv_train", "deq_iter_conv")
+    _set_log_scale_safe(axes[2, 1], b.get(key, []), c.get(key, []))
+
     # Row 4: Expert diagnostics (usage, entropy, orthogonality). Prefer train-logged series for dense curves.
     # Usage: min share per expert group (Transformer block, MoS CTP, MoS NTP)
     ax_usage = axes[3, 0]
@@ -522,6 +551,23 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         "Expert Usage (min share by Group)",
         ylabel="Min usage fraction",
     )
+    # Hard-constraint reference lines: min share >= 0.6 / num_experts (final-only constraint).
+    def _last_list_len(d: dict, k: str) -> int | None:
+        vals = d.get(k, None)
+        if not isinstance(vals, list) or not vals:
+            return None
+        for v in reversed(vals):
+            if isinstance(v, (list, tuple)) and len(v) > 0:
+                return int(len(v))
+        return None
+
+    e_block = _last_list_len(b, "block_usage_train" if use_train else "block_usage") or _last_list_len(c, "block_usage_train" if use_train else "block_usage")
+    e_ctp = _last_list_len(b, "mos_ctp_usage_train" if use_train else "mos_ctp_usage") or _last_list_len(c, "mos_ctp_usage_train" if use_train else "mos_ctp_usage")
+    e_ntp = _last_list_len(b, "mos_ntp_usage_train" if use_train else "mos_ntp_usage") or _last_list_len(c, "mos_ntp_usage_train" if use_train else "mos_ntp_usage")
+    for e in (e_block, e_ctp, e_ntp):
+        if e and e > 0:
+            ax_usage.axhline(0.6 / float(e), color="#666666", linestyle=":", linewidth=1.2, alpha=0.6)
+    ax_usage.set_ylim(bottom=0.0)
 
     # Expert Entropy: per-group lines (Transformer block, MoS CTP, MoS NTP)
     ax_ent = axes[3, 1]
@@ -573,6 +619,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         "Orthogonality (max mean |cos| by Group)",
         ylabel="Max mean |cos|",
     )
+    ax_ortho.axhline(0.20, color="#666666", linestyle=":", linewidth=1.2, alpha=0.6)
     # Orthogonality is naturally bounded in [0, 1]; keep linear for interpretability.
     all_vals = []
     for _, bv, cv in ortho_series:
@@ -594,10 +641,22 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ("mos_ntp", b.get("mos_ntp_cv_train" if use_train else "mos_ntp_cv", []), c.get("mos_ntp_cv_train" if use_train else "mos_ntp_cv", [])),
     ]
     _plot_components(ax_bal, b, c, steps_key, bal_series, "Expert Balance CV (by Group)", ylabel="CV")
+    ax_bal.axhline(0.20, color="#666666", linestyle=":", linewidth=1.2, alpha=0.6)
 
     # DEQ reconstruction error (prefer dense train-logged series when available)
     steps_key, key = _prefer_train("deq_recon_train", "deq_recon")
     _plot_line(axes[4, 1], b, c, key, key, steps_key, steps_key, "DEQ Reconstruction Error")
+    ax_recon = axes[4, 1]
+    vals = []
+    for d in (b, c):
+        for v in d.get(key, []):
+            if _is_finite(v) and float(v) > 0:
+                vals.append(float(v))
+    if vals:
+        ax_recon.set_yscale("log")
+        lo = min(vals)
+        hi = max(vals)
+        ax_recon.set_ylim(max(lo * 0.3, 1e-16), max(hi * 3.0, 1e-15))
 
     # Pre vs post-quant val_bpb (post-quant is the scored metric)
     # (Requested swap) Put this bar chart in Row 6 left.
@@ -722,20 +781,31 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_gg.set_yticks([])
     else:
         from matplotlib.lines import Line2D
+        # Summary view: plot gg_mean plus representative k curves to keep readability for large K_max.
+        gg_steps_key, gg_key = ("train_steps", "gg_mean_train") if any(_is_finite(v) for v in b.get("gg_mean_train", []) + c.get("gg_mean_train", [])) else ("val_steps", "gg_mean")
+        bx, by = _filter_finite(b.get(gg_steps_key, []), b.get(gg_key, []))
+        cx, cy = _filter_finite(c.get(gg_steps_key, []), c.get(gg_key, []))
+        if bx and by:
+            ax_gg.plot(bx, by, color=COLOR_BASELINE, linestyle="-", alpha=0.9, linewidth=3.0, label="baseline gg_mean")
+        if cx and cy:
+            ax_gg.plot(cx, cy, color=COLOR_CURRENT, linestyle="-", alpha=0.9, linewidth=3.0, label="current gg_mean")
+
+        rep = [0, 1, 3, 7, 15, k_plot - 1]
+        rep = sorted({i for i in rep if 0 <= i < k_plot})
         style_handles = []
-        for ki in range(k_plot):
+        for ki in rep:
             style = _k_linestyle(ki)
             b_vals = [v[ki] if len(v) > ki else math.nan for v in b_iters]
             c_vals = [v[ki] if len(v) > ki else math.nan for v in c_iters]
             bx, by = _filter_finite(b.get(steps_key, []), b_vals)
             cx, cy = _filter_finite(c.get(steps_key, []), c_vals)
             if bx and by:
-                ax_gg.plot(bx, by, color=COLOR_BASELINE, linestyle=style, alpha=0.75, linewidth=2.0)
+                ax_gg.plot(bx, by, color=COLOR_BASELINE, linestyle=style, alpha=0.5, linewidth=1.8)
             if cx and cy:
-                ax_gg.plot(cx, cy, color=COLOR_CURRENT, linestyle=style, alpha=0.75, linewidth=2.0)
-            style_handles.append(Line2D([0], [0], color="#333333", lw=2.2, linestyle=style, label=f"k={ki+1}"))
+                ax_gg.plot(cx, cy, color=COLOR_CURRENT, linestyle=style, alpha=0.5, linewidth=1.8)
+            style_handles.append(Line2D([0], [0], color="#333333", lw=2.0, linestyle=style, label=f"k={ki+1}"))
         ax_gg.set_ylim(0.0, 1.0)
-        ax_gg.legend(handles=style_handles, loc="upper right", fontsize=8, frameon=False)
+        ax_gg.legend(handles=style_handles, loc="upper right", fontsize=8, frameon=False, title="Representative k")
 
     axes[5, 1].axis("off")
     axes[5, 2].axis("off")
@@ -804,9 +874,63 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         summary_lines.append(f"MoS CTP O:  {b['mos_ctp_ortho'][-1]:.4f} vs {c['mos_ctp_ortho'][-1]:.4f}")
     if b.get("mos_ntp_ortho") and c.get("mos_ntp_ortho") and b["mos_ntp_ortho"] and c["mos_ntp_ortho"]:
         summary_lines.append(f"MoS NTP O:  {b['mos_ntp_ortho'][-1]:.4f} vs {c['mos_ntp_ortho'][-1]:.4f}")
+
+    # Final-only hard constraints: min share >= 0.6/E, CV <= 0.20, block orthogonality <= 0.20.
+    def _last_nonempty_list(d: dict, k: str) -> list[float] | None:
+        vals = d.get(k, None)
+        if not isinstance(vals, list) or not vals:
+            return None
+        for v in reversed(vals):
+            if isinstance(v, (list, tuple)) and len(v) > 0:
+                return [float(x) for x in v]
+        return None
+
+    def _min_share_ok(u: list[float] | None) -> tuple[bool | None, float | None]:
+        if not u:
+            return None, None
+        e = len(u)
+        thr = 0.6 / float(e)
+        return (min(u) >= thr), thr
+
+    def _last_metric(d: dict, k: str) -> float | None:
+        for v in reversed(d.get(k, []) or []):
+            if _is_finite(v):
+                return float(v)
+        return None
+
+    def _ok_str(ok: bool | None) -> str:
+        return "OK" if ok is True else ("FAIL" if ok is False else "N/A")
+
+    for name, d in [("Baseline", b), ("Current", c)]:
+        u_block = _last_nonempty_list(d, "block_usage")
+        u_ctp = _last_nonempty_list(d, "mos_ctp_usage")
+        u_ntp = _last_nonempty_list(d, "mos_ntp_usage")
+        ok_b, thr_b = _min_share_ok(u_block)
+        ok_c, thr_c = _min_share_ok(u_ctp)
+        ok_n, thr_n = _min_share_ok(u_ntp)
+        cv_b = _last_metric(d, "block_cv")
+        cv_c = _last_metric(d, "mos_ctp_cv")
+        cv_n = _last_metric(d, "mos_ntp_cv")
+        ortho = _last_metric(d, "block_ortho") or _last_metric(d, "expert_ortho")
+        cv_ok = (cv_b is not None and cv_b <= 0.20)
+        ortho_ok = (ortho is not None and ortho <= 0.20)
+        # Only print thresholds when we can infer expert counts.
+        tparts = []
+        if thr_b is not None:
+            tparts.append(f"minshare(block)≥{thr_b:.3f}:{_ok_str(ok_b)}")
+        if thr_c is not None:
+            tparts.append(f"minshare(mos_ctp)≥{thr_c:.3f}:{_ok_str(ok_c)}")
+        if thr_n is not None:
+            tparts.append(f"minshare(mos_ntp)≥{thr_n:.3f}:{_ok_str(ok_n)}")
+        if cv_b is not None:
+            tparts.append(f"cv(block)≤0.20:{_ok_str(cv_ok)}")
+        if ortho is not None:
+            tparts.append(f"ortho(block)≤0.20:{_ok_str(ortho_ok)}")
+        if tparts:
+            summary_lines.append(f"{name} HC:  " + " ".join(tparts))
     summary = "\n".join(summary_lines)
     # (Requested swap) Put summary text into Row 6 middle.
-    axes[5, 1].text(
+    summary_text = axes[5, 1].text(
         0.0,
         0.5,
         summary,
@@ -815,8 +939,12 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         verticalalignment="center",
         transform=axes[5, 1].transAxes,
     )
+    # Exclude summary panel from tight_layout geometry calculation.
+    summary_text.set_in_layout(False)
+    axes[5, 1].set_in_layout(False)
 
-    plt.tight_layout()
+    # Reserve top margin for suptitle/legend without squeezing columns.
+    fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.93])
     plt.savefig(str(Path(outdir) / "metrics_comparison.png"), dpi=150)
     plt.close()
     print(f"Saved metrics_comparison.png")

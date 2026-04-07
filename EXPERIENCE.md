@@ -64,3 +64,12 @@ Short, reusable guardrails to avoid common experiment mistakes.
 
 ## Randomness
 - When you need randomness *and* coverage, use a shuffle-bag sampler instead of i.i.d. draws.
+
+## Diagnostics
+- Match plotting scale and summaries to the metric’s dynamic range and sampling scheme so you don’t mistake artifacts for behavior.
+
+## Efficiency
+- In DEQ-style models, cost scales with batch × iterations × refinements; tune these jointly to avoid runaway wall time.
+
+## Distributed
+- Any rank-conditional control flow around collectives is a correctness bug; all ranks must execute collectives in the same order.
