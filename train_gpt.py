@@ -2111,7 +2111,11 @@ class GPT(nn.Module):
         for r in range(1 + self.num_refinements):
             if r > 0:
                 new_soft_embed = self._get_soft_embedding(z)
-                x0_refined = 0.5 * new_soft_embed + 0.5 * prev_soft_embed
+                # Smooth refinement injection to avoid a discrete optimization shock when refinements
+                # turn on (e.g. at step == num_refinements_ramp_steps).
+                alpha = float(getattr(self, "_refine_mix_alpha", 0.5))
+                alpha = float(min(max(alpha, 0.0), 1.0))
+                x0_refined = alpha * new_soft_embed + (1.0 - alpha) * prev_soft_embed
                 prev_soft_embed = x0_refined.detach()
                 z = x0_refined  # warm start from refined input (not old fixed point)
             else:
@@ -2168,7 +2172,8 @@ class GPT(nn.Module):
 
             # Periodic auxiliary loss: enforce block-level expert output diversity on z*.
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
-                mu = self.shared_block.block_contrib_mu(z, x0_refined, max_tokens=self.block_ortho_aux_tokens)  # [E,D] fp32
+                max_tokens = int(getattr(self, "_block_ortho_aux_tokens_override", self.block_ortho_aux_tokens))
+                mu = self.shared_block.block_contrib_mu(z, x0_refined, max_tokens=max_tokens)  # [E,D] fp32
                 if dist.is_available() and dist.is_initialized():
                     dist.all_reduce(mu, op=dist.ReduceOp.SUM)
                     mu = mu / float(dist.get_world_size())
@@ -2234,7 +2239,9 @@ class GPT(nn.Module):
         self._ctp_loss = ctp_loss.detach().item()
         # CTP weight scales with refinement steps: at step 0 input is clean one-hot,
         # CTP becomes meaningful only after soft embedding refinement
-        ctp_weight = 0.1 * self.num_refinements
+        refine_alpha = float(getattr(self, "_refine_mix_alpha", 0.5))
+        refine_strength = min(max(refine_alpha / 0.5, 0.0), 1.0)  # 0..1
+        ctp_weight = 0.1 * self.num_refinements * refine_strength
         mos_ortho_loss = torch.tensor(0.0, device=ntp_loss.device)
         if getattr(self.mos_head, "_ctp_ortho_out", None) is not None and getattr(self.mos_head, "_ntp_ortho_out", None) is not None:
             mos_ortho_loss = self.mos_head._ctp_ortho_out + self.mos_head._ntp_ortho_out
@@ -2255,6 +2262,8 @@ class GPT(nn.Module):
         if self.training and self._block_ortho_aux_enabled and isinstance(self._block_ortho_aux_loss, torch.Tensor):
             block_ortho_aux = self._block_ortho_aux_loss.to(device=ntp_loss.device)
 
+        eff_block_ortho_coef = float(self.block_ortho_aux_coef) * float(getattr(self, "_block_ortho_aux_coef_scale", 1.0))
+
         return (
             ntp_loss
             + ctp_weight * ctp_loss
@@ -2263,7 +2272,7 @@ class GPT(nn.Module):
             + self.mos_ortho_out_coef * mos_ortho_loss
             + self.attn_ortho_out_coef * attn_ortho_loss
             + self.mlp_ortho_out_coef * mlp_ortho_loss
-            + self.block_ortho_aux_coef * block_ortho_aux
+            + eff_block_ortho_coef * block_ortho_aux
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -2933,6 +2942,13 @@ def main() -> None:
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        # Wallclock fraction for schedules: prefer max_wallclock when enabled (time-capped runs),
+        # otherwise fall back to step/iters.
+        if max_wallclock_ms is not None and max_wallclock_ms > 0:
+            time_frac = min(max(elapsed_ms / max_wallclock_ms, 0.0), 1.0)
+        else:
+            time_frac = min(max(step / max(int(args.iterations), 1), 0.0), 1.0)
+        late_frac = min(max((time_frac - 0.70) / 0.30, 0.0), 1.0)
         scale = lr_mul(step, elapsed_ms)
         # Late QAT: enable fake quantization during last 15% of warmdown
         global _QAT_ACTIVE
@@ -2958,6 +2974,17 @@ def main() -> None:
         # Ramp refinements from 0 -> args.num_refinements.
         ramp_steps = int(getattr(args, "num_refinements_ramp_steps", 0) or 0)
         base_model.num_refinements = 0 if ramp_steps > 0 and next_step < ramp_steps else int(args.num_refinements)
+        # Also ramp the refinement injection strength (mix alpha) smoothly from 0 -> 0.5
+        # over an additional window to avoid a discrete training shock.
+        if base_model.num_refinements > 0 and ramp_steps > 0:
+            mix_ramp = ramp_steps
+            if next_step <= ramp_steps:
+                base_model._refine_mix_alpha = 0.0
+            else:
+                prog = min(max((next_step - ramp_steps) / max(mix_ramp, 1), 0.0), 1.0)
+                base_model._refine_mix_alpha = 0.5 * float(prog)
+        else:
+            base_model._refine_mix_alpha = 0.5 if base_model.num_refinements > 0 else 0.0
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
@@ -2967,12 +2994,22 @@ def main() -> None:
                 diag_enabled = master_process and will_log_train and micro_step == grad_accum_steps - 1
                 # Periodic auxiliary block-orthogonality loss: enable only on the final micro-step
                 # so we pay the overhead once per optimizer step.
-                base_model._block_ortho_aux_enabled = bool(
-                    args.block_ortho_aux_every > 0
-                    and args.block_ortho_aux_coef > 0.0
-                    and (next_step % int(args.block_ortho_aux_every) == 0)
-                    and micro_step == grad_accum_steps - 1
-                )
+                base_model._block_ortho_aux_enabled = False
+                base_model._block_ortho_aux_coef_scale = 1.0
+                base_model._block_ortho_aux_tokens_override = int(args.block_ortho_aux_tokens)
+                if args.block_ortho_aux_coef > 0.0 and micro_step == grad_accum_steps - 1:
+                    # Late-phase: increase frequency + strength while reducing token cost.
+                    if late_frac > 0.0:
+                        base_model._block_ortho_aux_enabled = True
+                        base_model._block_ortho_aux_coef_scale = 1.0 + 9.0 * float(late_frac)  # 0.01 -> 0.10
+                        base_model._block_ortho_aux_tokens_override = max(
+                            64, int(args.block_ortho_aux_tokens * (1.0 - 0.5 * float(late_frac)))
+                        )
+                    else:
+                        base_model._block_ortho_aux_enabled = bool(
+                            args.block_ortho_aux_every > 0
+                            and (next_step % int(args.block_ortho_aux_every) == 0)
+                        )
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
             train_loss += loss.detach()
@@ -2996,6 +3033,9 @@ def main() -> None:
             opt.step()
         if args.router_bias_update:
             seen: set[int] = set()
+            # Late-phase scheduling: increase the loss-free bias controller strength.
+            bias_lr = float(args.router_bias_lr) * (1.0 + 3.0 * float(late_frac))  # 0.05 -> 0.20
+            bias_updates = 1 + int(round(3.0 * float(late_frac)))  # 1..4 updates/step
             for r in [
                 base_model.shared_block.attn.attn_router,
                 base_model.shared_block.mlp.mlp_router,
@@ -3004,11 +3044,12 @@ def main() -> None:
                 if rid in seen:
                     continue
                 seen.add(rid)
-                r.bias_update(
-                    lr=float(args.router_bias_lr),
-                    clip=float(args.router_bias_clip),
-                    distributed=distributed,
-                )
+                for _ in range(bias_updates):
+                    r.bias_update(
+                        lr=bias_lr,
+                        clip=float(args.router_bias_clip),
+                        distributed=distributed,
+                    )
         zero_grad_all()
 
         step += 1

@@ -73,3 +73,6 @@ Short, reusable guardrails to avoid common experiment mistakes.
 
 ## Distributed
 - Any rank-conditional control flow around collectives is a correctness bug; all ranks must execute collectives in the same order.
+
+## Logging
+- Avoid multiple processes writing to the same log file concurrently; keep a single canonical log and derive copies from it.
