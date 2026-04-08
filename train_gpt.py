@@ -2433,7 +2433,6 @@ def main() -> None:
     enable_math_sdp(True)
 
     logfile = None
-    live_current_log = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{args.run_id}.txt"
@@ -2441,13 +2440,6 @@ def main() -> None:
         with open(logfile, "w", encoding="utf-8") as f:
             f.write("")
         print(logfile, flush=True)
-        # Keep a continuously-updated copy of the current run log for plotting/debugging even
-        # when the run is interrupted before the next validation step.
-        exp_logdir = Path("experiments/training_logs")
-        exp_logdir.mkdir(parents=True, exist_ok=True)
-        live_current_log = str(exp_logdir / "current.log")
-        with open(live_current_log, "w", encoding="utf-8") as f:
-            f.write("")
 
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
@@ -2457,12 +2449,6 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
-        if live_current_log is not None:
-            try:
-                with open(live_current_log, "a", encoding="utf-8") as f:
-                    print(msg, file=f)
-            except Exception:
-                pass
 
     def _best_effort_update_plots(reason: str) -> None:
         if not master_process:
@@ -2509,7 +2495,8 @@ def main() -> None:
             except Exception:
                 pass
 
-    log0(code, console=False)
+    # Avoid dumping the entire source file into logs (huge, noisy, and makes parsing fragile).
+    # We still track `Code size` and git hash later for artifact accounting.
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
@@ -2798,26 +2785,17 @@ def main() -> None:
             if diag_ok:
                 usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
                 parts.append(f"expert_usage:[{usage_str}]")
-                # Backward-compat with existing plotting code: expose the shared block-router
-                # stats under both `mlp_*` and `attn_*` keys. Plotting will automatically
-                # de-duplicate identical series for block-level MoE.
                 parts.append(f"block_usage:[{usage_str}]")
-                parts.append(f"mlp_usage:[{usage_str}]")
-                parts.append(f"attn_usage:[{usage_str}]")
                 ent = getattr(router, "_expert_entropy", None)
                 if ent is not None:
                     parts.append(f"expert_entropy:{ent:.4f}")
                     parts.append(f"block_entropy:{ent:.4f}")
-                    parts.append(f"mlp_entropy:{ent:.4f}")
-                    parts.append(f"attn_entropy:{ent:.4f}")
                     spar = getattr(router, "_expert_sparsity", None)
                     if spar is not None:
                         parts.append(f"expert_sparsity:{float(spar):.4f}")
                 cv = getattr(router, "_expert_balance_cv", None)
                 if cv is not None:
                     parts.append(f"block_cv:{cv:.4f}")
-                    parts.append(f"mlp_cv:{cv:.4f}")
-                    parts.append(f"attn_cv:{cv:.4f}")
                 if include_gates:
                     gm = getattr(router, "_gate_mass_mean", None)
                     if gm is not None:

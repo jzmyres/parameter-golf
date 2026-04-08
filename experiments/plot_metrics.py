@@ -54,9 +54,8 @@ def parse_log(logpath: str) -> dict:
         "expert_usage": [], "expert_entropy": [], "expert_sparsity": [], "expert_ortho": [],
         # Block-level expert orthogonality (explicit key; `expert_ortho` is kept for compat)
         "block_ortho": [],
-        # Per-component: usage (list of lists), entropy, cv
-        **{f"{p}_{s}": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
-           for s in ("usage", "entropy", "cv")},
+        # Per-group: usage (list of lists), entropy, cv
+        **{f"{p}_{s}": [] for p in ("mos_ctp", "mos_ntp") for s in ("usage", "entropy", "cv")},
         # Block-level routing metrics (preferred for block-level MoE plotting).
         "block_usage": [], "block_entropy": [], "block_cv": [],
         # Orthogonality (expert_ortho is block-level weighted expert contribution orthogonality)
@@ -65,8 +64,7 @@ def parse_log(logpath: str) -> dict:
         "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
         "gg_iter_train": [],
         "gg_mean_train": [],
-        **{f"{p}_{s}_train": [] for p in ("mlp", "attn", "mos_ctp", "mos_ntp")
-           for s in ("usage", "entropy", "cv")},
+        **{f"{p}_{s}_train": [] for p in ("mos_ctp", "mos_ntp") for s in ("usage", "entropy", "cv")},
         "block_usage_train": [], "block_entropy_train": [], "block_cv_train": [],
         "expert_ortho_train": [],
         "block_ortho_train": [],
@@ -136,15 +134,11 @@ def parse_log(logpath: str) -> dict:
                 ("deq_recon_train", rf"deq_recon_err:{_FLOAT}"),
                 ("deq_iter_conv_train", rf"deq_iter_conv:{_FLOAT}"),
                 ("deq_iter_conv_rel_train", rf"deq_iter_conv_rel:{_FLOAT}"),
-                ("mlp_entropy_train", rf"mlp_entropy:{_FLOAT}"),
-                ("attn_entropy_train", rf"attn_entropy:{_FLOAT}"),
                 ("block_ortho_train", rf"block_ortho:{_FLOAT}"),
                 ("expert_ortho_train", rf"expert_ortho:{_FLOAT}"),
                 ("mos_ctp_entropy_train", rf"mos_ctp_entropy:{_FLOAT}"),
                 ("mos_ntp_entropy_train", rf"mos_ntp_entropy:{_FLOAT}"),
                 ("block_entropy_train", rf"block_entropy:{_FLOAT}"),
-                ("mlp_cv_train", rf"mlp_cv:{_FLOAT}"),
-                ("attn_cv_train", rf"attn_cv:{_FLOAT}"),
                 ("mos_ctp_cv_train", rf"mos_ctp_cv:{_FLOAT}"),
                 ("mos_ntp_cv_train", rf"mos_ntp_cv:{_FLOAT}"),
                 ("block_cv_train", rf"block_cv:{_FLOAT}"),
@@ -153,7 +147,7 @@ def parse_log(logpath: str) -> dict:
             ]:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else math.nan)
-            for prefix in ("mlp", "attn", "mos_ctp", "mos_ntp"):
+            for prefix in ("mos_ctp", "mos_ntp"):
                 m_u = re.search(rf"{prefix}_usage:\[([\d.,\s]+)\]", line)
                 data[f"{prefix}_usage_train"].append(
                     [float(v.strip()) for v in m_u.group(1).split(",") if v.strip()] if m_u else []
@@ -213,8 +207,8 @@ def parse_log(logpath: str) -> dict:
                 data["expert_usage"].append(usage)
             else:
                 data["expert_usage"].append([])
-            # Per-component expert usage + entropy + cv
-            for prefix in ("mlp", "attn", "mos_ctp", "mos_ntp"):
+            # Per-group expert usage + entropy + cv
+            for prefix in ("mos_ctp", "mos_ntp"):
                 m_u = re.search(rf"{prefix}_usage:\[([\d.,\s]+)\]", line)
                 data[f"{prefix}_usage"].append(
                     [float(v.strip()) for v in m_u.group(1).split(",") if v.strip()] if m_u else [])
