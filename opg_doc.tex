@@ -226,41 +226,42 @@ The forward dynamics above are the same for both backward modes:
 \section{Update function \texorpdfstring{$f_\theta(z,x_0)$}{f(z,x0)} (Block)}
 \label{sec:f_theta}
 
-\subsection{Input injection via an input-conditioned hypernet gate}
-The block injects $x_0$ into the current state using an \emph{input-conditioned} per-dimension convex gate.
-Let $z_{\text{in}}$ denote the pre-injection state (the identity anchor for the block's residual blending).
-Define a pooled summary vector:
+\subsection{Input injection via a pooled scalar gate}
+The block injects $x_0$ into the current state using a \emph{pooled scalar} convex gate.
+Let $z_{\text{in}}$ denote the pre-injection state (identity anchor for the DEQ update).
+Define a pooled summary vector from normalized state:
 \[
-  u \;=\; \mathbb{E}_{b,t}[z_{\text{in}}[b,t,:]] \in \mathbb{R}^d.
+  u \;=\; \mathbb{E}_{b,t}[\mathrm{RMSNorm}(z_{\text{in}})[b,t,:]] \in \mathbb{R}^d.
 \]
-The hypernet is a lightweight diagonal-affine map producing gate logits:
+The injection gate is a learned scalar:
 \[
-  \ell \;=\; u \odot w_{\text{inj}} + b_{\text{inj}},\qquad
-  g \;=\; \sigma(\ell)\in (0,1)^d,
+  g_{\text{inj}} \;=\; \sigma(w_{\text{inj}}^\top u + b_{\text{inj}})\in(0,1),
 \]
-where $w_{\text{inj}},b_{\text{inj}}\in\mathbb{R}^d$ are learned parameters.
-Injection is a convex per-dimension interpolation:
+and injection is a convex update written additively:
 \[
-  z \leftarrow (1-g)\odot z_{\text{in}} + g \odot x_0.
+  x \;=\; z_{\text{in}} + g_{\text{inj}}(x_0 - z_{\text{in}}).
 \]
+This keeps the injection cost small and stable under DEQ iteration while anchoring the solve to the token embedding.
 
-\subsection{Block-level dense routing (paired expert blocks)}
-Attention and MLP are paired into expert blocks and mixed by a single shared router.
-Per token, the router produces:
+\subsection{Component-level dense routing (Soft Dense Routing)}
+The block contains two dense MoE components: attention and MLP. Each has its own router.
+For a router input $h\in\mathbb{R}^d$, routing weights are:
 \[
-  w(x)=\mathrm{softmax}(\ell(x))\in\Delta^{E-1},
+  w(h) \;=\; \mathrm{softmax}(\ell(h))\in\Delta^{E-1},
 \]
 so $w\in\mathbb{R}_{\ge 0}^{E}$ and $\sum_{e=1}^{E} w_e = 1$ (pure softmax; no post-softmax sigmoid gating).
-The block also computes a separate per-token global residual gate:
+All experts process all tokens; the routed update is the convex mixture of expert outputs.
+
+\subsection{Global residual gate for contraction}
+The block computes a per-token global gate $g_g(x)\in(0,1)$ from the normalized attention input:
 \[
-  g_g(x) \;=\; \sigma(\mathrm{gg}(x))\in(0,1),
+  g_g(x)\;=\;\sigma(\mathrm{gg}(\mathrm{RMSNorm}(x)))\in(0,1).
 \]
-where $\mathrm{gg}(\cdot)$ is a learned scalar projection of the normalized block input.
-Each expert produces a full block update $z_{\text{body}}^{(e)}$, and the output is:
+Let $z_2$ be the post-attention+MLP residual result. The block update is:
 \[
-  f_\theta(z,x_0) \;=\; (1-g_g(x))\, z_{\text{in}} \;+\; g_g(x)\sum_{e=1}^{E} w_e(x)\ z_{\text{body}}^{(e)}.
+  f_\theta(z_{\text{in}},x_0)\;=\;(1-g_g)\,z_{\text{in}} + g_g\,z_2.
 \]
-In code, routing inputs $x$ are the normalized block input (\texttt{attn\_norm} output) and $w$ is computed once per block call.
+This provides an explicit, logged knob for fixed-point behavior; convergence is monitored but not a hard constraint.
 
 \section{Heads and losses (training objective)}
 \label{sec:loss}
@@ -284,16 +285,17 @@ The CTP weight scales with refinement steps:
   \lambda_{\text{CTP}} = 0.1\,R.
 \]
 
-\subsection{Router balance loss (defined on normalized share)}
-Each router defines a per-token \emph{normalized share} distribution $\alpha$ over experts:
-\begin{itemize}
-  \item $\alpha=w/\sum_e w_e$ (renormalized to sum to $1$), even though $w$ itself may be sub-mass.
-\end{itemize}
-Let $\bar\alpha = \mathbb{E}_{b,t}[\alpha_{b,t}]$ be mean share. The balance loss is:
+\subsection{Router health loss (hard-constraint shaped)}
+Each router defines a per-token share distribution $w\in\Delta^{E-1}$. Let $\bar w=\mathbb{E}_{b,t}[w_{b,t}]$.
+The training-time router loss is a constraint-shaped combination:
 \[
-  L_{\text{bal}} = \left\|\bar\alpha - \tfrac{1}{E}\mathbf{1}\right\|_2^2,
+  L_{\text{bal}}=\left\|\bar w-\tfrac{1}{E}\mathbf{1}\right\|_2^2
+  \;+\; \lambda_{\min}\,\mathbb{E}_{e}\big[\max(0, \tfrac{0.6}{E}-\bar w_e)^2\big]
+  \;+\; \lambda_{\mathrm{cv}}\,\max(0, \mathrm{CV}(\bar w)-0.20)^2,
 \]
-aggregated across routers with per-component multipliers (attention typically weighted more strongly than MLP), even when routers are tied/shared.
+where $\mathrm{CV}(\bar w)=\mathrm{std}(\bar w)/\mathrm{mean}(\bar w)$. These soft barriers target the final-only hard constraints
+(min-share and CV) without over-regularizing already-healthy routing.
+Additionally, a loss-free bias controller updates router logits outside autograd to counteract collapse.
 
 \subsection{Output-space orthogonality penalties (autograd-unroll only)}
 When \texttt{deq\_backward=autograd}, the model may add differentiable output-space orthogonality penalties for expert outputs.
@@ -313,11 +315,7 @@ The model returns:
 \]
 where $L_{\text{spar}}$ is currently a zero placeholder in code (hook for sparsity losses, not actively used).
 
-\paragraph{Sparse intermediate DEQ supervision (training only).}
-When enabled, the code also adds an auxiliary NTP loss on a small set of intermediate DEQ iterates
-for the \emph{final refinement solve only} (to encourage useful early iterates without per-step K-jitter).
-Let $\mathcal{K}_{\text{sup}}\subseteq\{1,\dots,K\}$ (e.g. $\{2,6,12\}$) and weights $\omega_k$ summing to $1$.
-Then:
+% Intermediate DEQ supervision is not used in the current training pipeline.
 \[
   L_{\text{sup}} \;=\; \sum_{k\in\mathcal{K}_{\text{sup}}} \omega_k\ \mathrm{NLL}(\log p_{\text{NTP}}(z_k), y),
 \]

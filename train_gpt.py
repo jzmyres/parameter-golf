@@ -178,11 +178,11 @@ class Hyperparameters:
     # Routing regularization weights
     attn_balance_mult = 5.0
     mlp_balance_mult = 1.0
-    bal_loss_coef = 1e-3
-    # Periodic auxiliary loss on the *block-level* router-weighted expert contributions at z*.
-    # This is the most direct way to enforce output-space expert diversity under RevDEQ.
-    block_ortho_aux_coef = 0.01
-    block_ortho_aux_every = 100
+    bal_loss_coef = 5e-3
+    # Periodic auxiliary loss on per-expert output-space means at z* (prefix-only for cost control).
+    # This directly regularizes expert diversity without materializing [B,T,E,D].
+    block_ortho_aux_coef = 0.05
+    block_ortho_aux_every = 50
     block_ortho_aux_tokens = 256
     # Loss-free load balancing (bias controller). Keeps expert utilization healthy without
     # interfering gradients from strong auxiliary losses.
@@ -447,12 +447,14 @@ def eval_val(
     *,
     full_eval: bool,
 ) -> tuple[float, float]:
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    # Eval does not accumulate gradients; dividing by `grad_accum_steps` would artificially
+    # shrink the effective eval batch and make full validation extremely slow.
+    local_batch_tokens = args.val_batch_size // world_size
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
@@ -872,34 +874,40 @@ class SoftDenseRouter(nn.Module):
     optional loss-free load-balancing bias controller (expert_bias) updated once
     per optimizer step from terminal-state routing statistics.
     """
-    def __init__(self, dim: int, num_experts: int, *, enable_gate: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        num_experts: int,
+        *,
+        min_share_frac: float = 0.6,
+        cv_target: float = 0.20,
+        min_share_loss_weight: float = 1.0,
+        cv_loss_weight: float = 0.10,
+    ):
         super().__init__()
         self.num_experts = num_experts
-        self.enable_gate = bool(enable_gate)
+        # Hard-constraint targets (used for training-time regularization + bias controller).
+        self.min_share_frac = float(min_share_frac)
+        self.cv_target = float(cv_target)
+        self.min_share_loss_weight = float(min_share_loss_weight)
+        self.cv_loss_weight = float(cv_loss_weight)
         self.router = CastedLinear(dim, num_experts, bias=False)
         # Small router init → near-uniform routing at start
         nn.init.normal_(self.router.weight, std=0.01)
-        # Optional gating head for block-level MoE: w = softmax(logits) * sigmoid(gate_logits),
-        # so sum(w) is in (0,1] and can serve as a per-token global residual gate.
-        self.gate = CastedLinear(dim, num_experts, bias=True) if self.enable_gate else None
-        if self.gate is not None:
-            with torch.no_grad():
-                self.gate.weight.zero_()
-                self.gate.bias.fill_(SIGMOID_ONE_INIT_LOGIT)
         # Loss-free load-balancing bias (added to routing logits before softmax).
         # Updated outside autograd to avoid gradient interference from strong aux losses.
         self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32), persistent=True)
-        self._bias_stats_enabled = False
+        # Always track mean-share statistics so the loss-free bias controller can update
+        # without requiring an extra router forward pass (which would overwrite diagnostics).
+        self._bias_stats_enabled = True
         self._mean_share_last: Tensor | None = None
         # Diagnostics (set during forward)
         self._balance_loss = None
         self._sparsity_loss = None
         self._expert_usage = None
-        self._expert_gates = None
         self._expert_entropy = None
         self._expert_sparsity = None
         self._expert_balance_cv = None
-        self._gate_mass_mean = None
         self._diag_step: int | None = None
 
     def set_bias_stats_enabled(self, enabled: bool) -> None:
@@ -916,7 +924,15 @@ class SoftDenseRouter(nn.Module):
             ms = ms.clone()
             dist.all_reduce(ms, op=dist.ReduceOp.SUM)
             ms /= float(dist.get_world_size())
+        # Bias controller target: mostly uniform, with extra mass assigned to underused experts
+        # so the min-share constraint is met more reliably.
         target = torch.full_like(ms, 1.0 / float(self.num_experts))
+        lb = float(self.min_share_frac) / float(self.num_experts)
+        if lb > 0.0:
+            boost = (lb - ms).clamp_min(0.0)
+            if float(boost.sum().item()) > 0.0:
+                target = (target + boost).clamp_min(1e-8)
+                target = target / target.sum()
         self.expert_bias.add_(lr * (target - ms))
         if clip > 0:
             self.expert_bias.clamp_(min=-clip, max=clip)
@@ -927,21 +943,21 @@ class SoftDenseRouter(nn.Module):
         x_n = _rms_norm(x)
         route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
         p = torch.softmax(route_logits, dim=-1)
-        if self.gate is not None:
-            g = torch.sigmoid(self.gate(x_n))
-            route_weights = p * g
-            gate_mass = route_weights.sum(dim=-1, keepdim=True)  # [*,1] in (0,1]
-            share = route_weights / gate_mass.clamp_min(1e-8)    # normalized share (sum=1)
-        else:
-            route_weights = p
-            share = p
+        route_weights = p
+        share = p
         if self.training:
-            # Balance on normalized share distribution (sum=1), even when route_weights
-            # is gated and does not sum to 1.
             reduce_dims = tuple(range(share.ndim - 1))
             mean_share = share.mean(dim=reduce_dims)
             target = torch.ones_like(mean_share) / self.num_experts
-            self._balance_loss = F.mse_loss(mean_share, target)
+            mse = F.mse_loss(mean_share, target)
+            lb = float(self.min_share_frac) / float(self.num_experts)
+            min_share = mean_share.min()
+            min_share_loss = torch.relu(mean_share.new_tensor(lb) - mean_share).pow(2).mean() if lb > 0.0 else mean_share.new_zeros(())
+            cv = (mean_share.std() / mean_share.mean().clamp_min(1e-8))
+            cv_loss = torch.relu(cv - mean_share.new_tensor(self.cv_target)).pow(2) if self.cv_target > 0.0 else mean_share.new_zeros(())
+            # Keep the base term always present; other terms are soft barriers for the end-of-run
+            # expert-health constraints (min-share and CV).
+            self._balance_loss = mse + self.min_share_loss_weight * min_share_loss + self.cv_loss_weight * cv_loss
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
             if self._bias_stats_enabled:
                 # Store terminal-state routing stats for the loss-free bias controller update.
@@ -951,7 +967,7 @@ class SoftDenseRouter(nn.Module):
                 if do_diag and dist.is_available() and dist.is_initialized():
                     do_diag = dist.get_rank() == 0
                 if do_diag:
-                    self._record_diagnostics(share.detach(), gate_mass.detach() if self.gate is not None else None, reduce_dims)
+                    self._record_diagnostics(share.detach(), reduce_dims)
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
@@ -964,34 +980,27 @@ class SoftDenseRouter(nn.Module):
                 if dist.is_available() and dist.is_initialized():
                     do_diag = dist.get_rank() == 0
                 if do_diag:
-                    self._record_diagnostics(share.detach(), gate_mass.detach() if self.gate is not None else None, tuple(range(share.ndim - 1)))
+                    self._record_diagnostics(share.detach(), tuple(range(share.ndim - 1)))
                 else:
                     self._expert_usage = None
-                    self._expert_gates = None
                     self._expert_entropy = None
                     self._expert_sparsity = None
                     self._expert_balance_cv = None
-                    self._gate_mass_mean = None
                     self._diag_step = None
         return route_weights
 
     @dynamo_disable
-    def _record_diagnostics(self, share_detached: Tensor, gate_mass_detached: Tensor | None, reduce_dims: tuple[int, ...]) -> None:
+    def _record_diagnostics(self, share_detached: Tensor, reduce_dims: tuple[int, ...]) -> None:
         # Compute diagnostics from detached tensors to avoid autograd overhead, and
         # keep all Python-side state mutation out of torch.compile graphs.
         mean_mass = share_detached.mean(dim=reduce_dims)
         self._expert_usage = mean_mass.float().cpu().tolist()  # normalized share (sum=1)
-        self._expert_gates = None
 
         per_token_ent = -(share_detached * (share_detached + 1e-8).log()).sum(-1)
         ent = float(per_token_ent.mean().item())
         self._expert_entropy = ent
         self._expert_sparsity = 1.0 - (ent / max(math.log(float(self.num_experts)), 1e-8))
         self._expert_balance_cv = float((mean_mass.std() / mean_mass.mean().clamp_min(1e-8)).item())
-        if gate_mass_detached is not None:
-            self._gate_mass_mean = float(gate_mass_detached.mean().item())
-        else:
-            self._gate_mass_mean = None
         self._diag_step = _ROUTER_DIAGNOSTICS_STEP
 
 
@@ -1001,7 +1010,7 @@ class CausalSelfAttention(nn.Module):
     - Low-rank KV compression via shared latent
     - Decoupled RoPE: half of head_dim for positional encoding
     - Query-dependent per-head sigmoid gate after SDPA (scalar gate per head)
-    - Routing is performed at the Block level (shared router for the whole block)
+    - Component-level dense MoE (router mixes attention expert deltas)
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 6,
@@ -1045,8 +1054,8 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.rope_dim, base=rope_base)
         # Gated attention bias (per-head scalar); init near-1 (combined with zeroed per-token logits).
         self.gate_bias = nn.Parameter(torch.full((num_heads,), SIGMOID_ONE_INIT_LOGIT, dtype=torch.float32))
-        # Soft dense routing on attention output (MoE for attention). In block-level MoE
-        # mode we pass in a shared router from the parent block.
+        # Soft dense routing on attention output (MoE for attention). A shared router can be
+        # injected by the parent block if tying is desired.
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self.out_ortho_coef = 0.0
         self._out_ortho_cos_sim: float | None = None
@@ -1081,6 +1090,48 @@ class CausalSelfAttention(nn.Module):
                 mu = out_e.mean(dim=(0, 1)).float()  # [E, D]
                 self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu).item())
         return out_e
+
+    def mix_experts_from_shared(self, y: Tensor, w: Tensor) -> Tensor:
+        """Return routed attention output [B, T, D] from shared attention output y [B,T,D].
+
+        Vectorized fused form (no [B,T,E,D] materialization):
+          h = y @ P^T            where P is expert_proj packed as [E*R, D]
+          h *= repeat(w, R)      per-expert weight broadcast across rank channels
+          out = h @ O            where O is expert_out^T packed as [E*R, D]
+        """
+        if y.ndim != 3 or w.ndim != 3:
+            raise ValueError(f"Expected y,w rank-3 [B,T,*], got {tuple(y.shape)} and {tuple(w.shape)}")
+        B, T, D = y.shape
+        if w.shape[0] != B or w.shape[1] != T or w.shape[2] != self.num_experts:
+            raise ValueError(f"w must be [B,T,E={self.num_experts}], got {tuple(w.shape)}")
+        E = self.num_experts
+        R = self.expert_rank
+        y_flat = y.reshape(B * T, D)
+        w_flat = w.reshape(B * T, E).to(dtype=y_flat.dtype)
+
+        P = self.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, D)                # [E*R, D]
+        O = self.expert_out.to(dtype=y_flat.dtype).permute(0, 2, 1).reshape(E * R, D)  # [E*R, D] == out^T packed
+        h = y_flat @ P.t()  # [N, E*R]
+        h = h * w_flat.repeat_interleave(R, dim=1)
+        out = h @ O  # [N, D]
+
+        # Output-space orthogonality diagnostics/loss: compute on mean expert outputs.
+        self._out_ortho_loss = None
+        need_loss = bool(self.training and torch.is_grad_enabled() and self.out_ortho_coef > 0.0)
+        do_diag = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE) or need_loss
+        if do_diag and dist.is_available() and dist.is_initialized():
+            do_diag = dist.get_rank() == 0
+        if do_diag:
+            mu_h = h.reshape(B * T, E, R).mean(dim=0).to(dtype=torch.float32)  # [E, R]
+            out_T = self.expert_out.to(dtype=mu_h.dtype).permute(0, 2, 1)      # [E, R, D]
+            mu_out = torch.einsum("er,erd->ed", mu_h, out_T)                   # [E, D]
+            ortho = mean_abs_offdiag_cosine(mu_out)
+            if need_loss:
+                self._out_ortho_loss = ortho
+            if do_diag:
+                self._out_ortho_cos_sim = float(ortho.detach().item())
+
+        return out.reshape(B, T, D)
 
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         """Shared attention path: returns y [B,T,D] after SDPA and per-head gating.
@@ -1141,7 +1192,7 @@ class CausalSelfAttention(nn.Module):
         return torch.einsum('btr,dr->btd', h, out)
 
     def forward(self, x: Tensor) -> Tensor:
-        raise RuntimeError("CausalSelfAttention routing is handled at the Block level; use forward_experts().")
+        raise RuntimeError("CausalSelfAttention routing is handled by Block; call Block.forward() (or mix_experts_from_shared).")
 
     @property
     def attn_gate(self) -> Tensor:
@@ -1162,7 +1213,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """SiLU-gated MLP expert bank (routing performed at Block level)."""
+    """SiLU-gated MLP expert bank (component-level dense MoE)."""
     def __init__(
         self,
         dim: int,
@@ -1182,7 +1233,7 @@ class MLP(nn.Module):
             nn.init.xavier_uniform_(self.expert_gate.data[e])
             nn.init.xavier_uniform_(self.expert_fc.data[e])
             nn.init.xavier_uniform_(self.expert_down.data[e])
-        # Soft dense routing. In block-level MoE we pass in a shared router from the parent block.
+        # Soft dense routing. A shared router can be injected by the parent block if tying is desired.
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self.out_ortho_coef = 0.0
         self._out_ortho_cos_sim: float | None = None
@@ -1243,8 +1294,50 @@ class MLP(nn.Module):
         h = F.silu(gate_h) * fc_h
         return torch.einsum('bts,ds->btd', h, expert_down)
 
+    def mix_experts(self, x: Tensor, w: Tensor) -> Tensor:
+        """Return routed MLP output [B, T, D] from input x [B,T,D] and router weights w [B,T,E]."""
+        if x.ndim != 3 or w.ndim != 3:
+            raise ValueError(f"Expected x,w rank-3 [B,T,*], got {tuple(x.shape)} and {tuple(w.shape)}")
+        B, T, D = x.shape
+        E = self.num_experts
+        if w.shape[0] != B or w.shape[1] != T or w.shape[2] != E:
+            raise ValueError(f"w must be [B,T,E={E}], got {tuple(w.shape)}")
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x_n = _rms_norm(x)
+        N = B * T
+        x_flat = x_n.reshape(N, D)
+        w_flat = w.reshape(N, E).to(dtype=x_flat.dtype)
+        R = self.expert_rank
+
+        G = self.expert_gate.to(dtype=x_flat.dtype).reshape(E * R, D)  # [E*R, D]
+        Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)   # [E*R, D]
+        Dwn = self.expert_down.to(dtype=x_flat.dtype).permute(0, 2, 1).reshape(E * R, D)  # [E*R, D] == down^T packed
+
+        gate = x_flat @ G.t()   # [N, E*R]
+        fc = x_flat @ Fm.t()    # [N, E*R]
+        h = F.silu(gate) * fc   # [N, E*R]
+        h = h * w_flat.repeat_interleave(R, dim=1)
+        out = h @ Dwn  # [N, D]
+
+        self._out_ortho_loss = None
+        need_loss = bool(self.training and torch.is_grad_enabled() and self.out_ortho_coef > 0.0)
+        do_diag = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE) or need_loss
+        if do_diag and dist.is_available() and dist.is_initialized():
+            do_diag = dist.get_rank() == 0
+        if do_diag:
+            mu_h = h.reshape(N, E, R).mean(dim=0).to(dtype=torch.float32)  # [E, R]
+            down_T = self.expert_down.to(dtype=mu_h.dtype).permute(0, 2, 1)  # [E, R, D]
+            mu_out = torch.einsum("er,erd->ed", mu_h, down_T)  # [E, D]
+            ortho = mean_abs_offdiag_cosine(mu_out)
+            if need_loss:
+                self._out_ortho_loss = ortho
+            if do_diag:
+                self._out_ortho_cos_sim = float(ortho.detach().item())
+
+        return out.reshape(B, T, D)
+
     def forward(self, x: Tensor) -> Tensor:
-        raise RuntimeError("MLP routing is handled at the Block level; use forward_experts().")
+        raise RuntimeError("MLP routing is handled by Block; call Block.forward() (or mix_experts).")
 
     @property
     def router(self) -> SoftDenseRouter:
@@ -1502,10 +1595,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        # Block-level Soft Dense Routing: one router for the whole block (paired experts).
-        # Routing weights are pure softmax over experts (sum=1). A separate per-token
-        # residual gate gg is used for DEQ stability (not a post-softmax gate).
-        shared_router = SoftDenseRouter(dim, 6, enable_gate=False)
+        # Component-level Soft Dense Routing: separate routers for attention and MLP experts.
+        # Routing weights are pure softmax over experts (sum=1); no post-softmax gating.
+        self.attn_router = SoftDenseRouter(dim, 6)
+        self.mlp_router = SoftDenseRouter(dim, 6)
         self.attn = CausalSelfAttention(
             dim,
             num_heads,
@@ -1514,9 +1607,9 @@ class Block(nn.Module):
             qk_gain_init,
             kv_latent_dim=kv_latent_dim,
             expert_rank=attn_expert_rank,
-            router=shared_router,
+            router=self.attn_router,
         )
-        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=shared_router)
+        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=self.mlp_router)
         # Global residual gate for the DEQ iteration update: gg(x) ∈ (0,1) per token.
         self.gg_gate = CastedLinear(dim, 1, bias=True)
         with torch.no_grad():
@@ -1527,40 +1620,36 @@ class Block(nn.Module):
         self._gg_sum = 0.0
         self._gg_count = 0
         self._gg_last: float | None = None
-        self._block_ortho_cos_sim: float | None = None
         # Fine-grained gg tracking: per Block.forward call (used to derive gg by DEQ iteration).
         self._gg_call_track_enabled = False
         self._gg_call_track: list[float] = []
 
-        # Input-conditioned injection gate (hypernet).
-        # Gate uses pooled pre-injection state u=mean_{b,t}(z_in) to keep the cost small and
-        # stable under DEQ iteration. The gate is per-dimension:
-        #   g = sigmoid(u ⊙ w_inj + b_inj) ∈ (0,1)^d
-        # Injection is convex:
-        #   z_inj = (1-g)⊙z_in + g⊙x0
-        self.inj_w = nn.Parameter(torch.zeros((dim,), dtype=torch.float32))
-        self.inj_b = nn.Parameter(torch.empty((dim,), dtype=torch.float32))
-        # Diagnostics: mean gate value on the last forward call.
+        # Input injection gate (scalar). Uses pooled pre-injection state to keep the cost small
+        # and stable under DEQ iteration:
+        #   g = sigmoid(MLP(mean(rmsnorm(z_in)))) ∈ (0,1)
+        #   x = z_in + g * (x0 - z_in)   (convex mixing, written as an additive update)
+        self.inj_gate = CastedLinear(dim, 1, bias=True)
+        # Diagnostics: gate value on the last forward call.
         self._inj_gate_last_mean: float | None = None
         with torch.no_grad():
-            # Conservative init: injection almost-off at start to preserve near-identity behavior.
-            self.inj_b.fill_(-6.0)
+            self.inj_gate.weight.zero_()
+            # Conservative init (val_bpb priority): small but non-trivial injection so the DEQ
+            # dynamics stay anchored to the token embedding without destabilizing the solve.
+            # sigmoid(logit(0.1)) = 0.1
+            self.inj_gate.bias.fill_(-2.1972246)
 
     def _inj_gate_from(self, z_in: Tensor) -> Tensor:
-        """Return per-dimension injection gate g ∈ (0,1)^d computed from pooled z_in."""
-        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        """Return scalar injection gate g ∈ (0,1) computed from pooled z_in."""
         z_n = _rms_norm(z_in)
-        u = z_n.float().mean(dim=(0, 1))  # [d]
-        logits = u * self.inj_w + self.inj_b
-        g = torch.sigmoid(logits)  # [d]
-        # Avoid Python-side scalar extraction in the hot path (torch.compile friendly).
+        u = z_n.mean(dim=(0, 1), keepdim=True)  # [1,1,d]
+        g = torch.sigmoid(self.inj_gate(u)).squeeze(-1)  # [1,1]
         if (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE):
             self._record_inj_diag(g.detach())
-        return g
+        return g  # [1,1]
 
     @dynamo_disable
     def _record_inj_diag(self, g_detached: Tensor) -> None:
-        self._inj_gate_last_mean = float(g_detached.mean().item())
+        self._inj_gate_last_mean = float(g_detached.float().mean().item())
 
     @dynamo_disable
     def _record_gg_diag(self, gg_tok_detached: Tensor) -> None:
@@ -1572,94 +1661,82 @@ class Block(nn.Module):
         if self._gg_call_track_enabled:
             self._gg_call_track.append(gg_val)
 
-    @dynamo_disable
-    def _record_block_ortho(self, block_mu: list[Tensor]) -> None:
-        self._block_ortho_cos_sim = None
-        if len(block_mu) < 2:
-            return
-        try:
-            mu_b = torch.stack(block_mu, dim=0)
-            self._block_ortho_cos_sim = float(max_mean_abs_offdiag_cosine(mu_b).item())
-        except Exception:
-            self._block_ortho_cos_sim = None
+    def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> tuple[Tensor, Tensor]:
+        """Return (attn_ortho, mlp_ortho) on a prefix for cost control.
 
-    def block_contrib_mu(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> Tensor:
-        """Return per-expert mean router-weighted block contributions μ_e ∈ R^D as [E,D].
-
-        Contribution is the exact tensor mixed into the DEQ update:
-            contrib_e = (gg(z,x0) * w_e(z,x0)) * block_out_e(z,x0)
-
-        This is used for a periodic auxiliary orthogonality loss to enforce expert diversity
-        under RevDEQ's memory-efficient backward (where forward runs without saved activations).
+        Output-space orthogonality is computed on per-expert mean outputs (mean |cos| across experts).
+        This can be used as a periodic auxiliary loss under RevDEQ.
         """
         if z_in.ndim != 3 or x0.ndim != 3:
             raise ValueError(f"expected z_in and x0 as [B,T,D], got {tuple(z_in.shape)} and {tuple(x0.shape)}")
-        bsz, seqlen, _ = z_in.shape
+        bsz, seqlen, dim = z_in.shape
         t = int(min(max(1, int(max_tokens)), seqlen))
-        z_in = z_in[:, :t]
-        x0 = x0[:, :t]
+        z_sub = z_in[:, :t]
+        x0_sub = x0[:, :t]
 
-        g = self._inj_gate_from(z_in).to(dtype=z_in.dtype)  # [d]
-        x = (1.0 - g)[None, None, :] * z_in + g[None, None, :] * x0
+        g_inj = self._inj_gate_from(z_sub).to(dtype=z_sub.dtype)  # [1,1]
+        x = z_sub + g_inj * (x0_sub - z_sub)
+
+        # Attention expert mean outputs
         x_attn = self.attn_norm(x)
         x_attn_n = _rms_norm(x_attn)
-        w = self.attn.attn_router(x_attn)  # shared router; sum(w)=1
-        gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)  # [B,T]
+        w_attn = self.attn_router(x_attn)  # [B,t,E]
+        y_shared = self.attn._attn_shared_from_normed(x_attn_n)  # [B,t,D]
+        E = self.attn.num_experts
+        R = self.attn.expert_rank
+        y_flat = y_shared.reshape(bsz * t, dim)
+        P = self.attn.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, dim)
+        h = y_flat @ P.t()  # [N, E*R]
+        mu_h = h.reshape(bsz * t, E, R).mean(dim=0).to(dtype=torch.float32)  # [E,R]
+        out_T = self.attn.expert_out.to(dtype=mu_h.dtype).permute(0, 2, 1)  # [E,R,D]
+        mu_attn = torch.einsum("er,erd->ed", mu_h, out_T)  # [E,D]
+        attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
+        # MLP expert mean outputs (MLP input uses mixed attention output)
+        attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
+        z1 = x + attn_mix
+        x_mlp = self.mlp_norm(z1)
+        w_mlp = self.mlp_router(x_mlp)
+        x_mlp_n = _rms_norm(x_mlp)
+        N = bsz * t
+        x_flat = x_mlp_n.reshape(N, dim)
+        E2 = self.mlp.num_experts
+        R2 = self.mlp.expert_rank
+        G = self.mlp.expert_gate.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
+        Fm = self.mlp.expert_fc.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
+        gate = x_flat @ G.t()
+        fc = x_flat @ Fm.t()
+        h_mlp = F.silu(gate) * fc  # [N,E*R]
+        mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)  # [E,R]
+        down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).permute(0, 2, 1)  # [E,R,D]
+        mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)  # [E,D]
+        mlp_ortho = mean_abs_offdiag_cosine(mu_mlp)
+
+        return attn_ortho, mlp_ortho
+
+    def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
+        # Inject x0 into the DEQ state with a contraction-friendly convex update.
+        g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)  # [1,1]
+        x = z_in + g_inj * (x0 - z_in)
+
+        # Attention (component-level MoE)
+        x_attn = self.attn_norm(x)
+        x_attn_n = _rms_norm(x_attn)
+        w_attn = self.attn_router(x_attn)  # [B,T,E]
         y_shared = self.attn._attn_shared_from_normed(x_attn_n)  # [B,T,D]
-        mus: list[Tensor] = []
-        for e in range(self.attn.num_experts):
-            attn_out = self.attn.project_expert_from_shared(y_shared, e)  # [B,T,D]
-            z1 = x + attn_out
-            mlp_out = self.mlp.forward_expert(self.mlp_norm(z1), e)  # [B,T,D]
-            z2 = z1 + mlp_out
-            contrib = (gg_tok.to(dtype=z2.dtype).unsqueeze(-1) * w[..., e:e + 1]) * z2
-            mus.append(contrib.mean(dim=(0, 1)).float())
-        return torch.stack(mus, dim=0)  # [E,D] fp32
+        attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)  # [B,T,D]
+        z1 = x + attn_mix
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        z_in = x
+        # MLP (component-level MoE)
+        x_mlp = self.mlp_norm(z1)
+        w_mlp = self.mlp_router(x_mlp)  # [B,T,E]
+        mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp)  # [B,T,D]
+        z2 = z1 + mlp_mix
 
-        g = self._inj_gate_from(z_in).to(dtype=x.dtype)  # [d]
-        x = (1.0 - g)[None, None, :] * z_in + g[None, None, :] * x0
-        x_attn = self.attn_norm(x)
-        x_attn_n = _rms_norm(x_attn)
-        # One router for the whole block (paired expert blocks): compute weights once.
-        w = self.attn.attn_router(x_attn)  # shared router instance; sum(w)=1
         gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)  # [B,T]
         if self._gg_track_enabled or self._gg_call_track_enabled:
             self._record_gg_diag(gg_tok.detach())
-
-        # Memory-safe expert mixing: stream experts without materializing [B,T,E,D].
-        # Update: z_out = (1-gg)*z_in + gg*Σ_e w_e * expert_e(z_in, x0)
-        x_mix = (1.0 - gg_tok).to(dtype=x.dtype).unsqueeze(-1) * z_in
-        need_loss = bool(self.training and torch.is_grad_enabled())
-        do_diag = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE)
-        if do_diag and dist.is_available() and dist.is_initialized():
-            do_diag = dist.get_rank() == 0
-
-        block_mu: list[Tensor] = []
-        # Compute shared attention output once, then project per expert.
-        y_shared = self.attn._attn_shared_from_normed(x_attn_n)  # [B,T,D]
-        for e in range(self.attn.num_experts):
-            attn_out = self.attn.project_expert_from_shared(y_shared, e)  # [B,T,D]
-            z1 = x + attn_out
-            mlp_out = self.mlp.forward_expert(self.mlp_norm(z1), e)  # [B,T,D]
-            z2 = z1 + mlp_out
-            x_mix = x_mix + (gg_tok.to(dtype=x.dtype).unsqueeze(-1) * w[..., e:e+1]) * z2
-            if do_diag:
-                # Track the *weighted* per-expert block contribution, since this is what
-                # actually gets mixed into the DEQ update: contrib_e = (gg*w_e) * z2_e.
-                contrib = (gg_tok.to(dtype=z2.dtype).unsqueeze(-1) * w[..., e:e+1]) * z2
-                block_mu.append(contrib.mean(dim=(0, 1)).float())
-
-        if do_diag:
-            # Block expert output-space orthogonality (metric-only): mean |cos| across per-expert
-            # mean *weighted* block outputs (gg*w_e*z2). This captures redundancy/collapse at the
-            # actual mixed expert contribution level.
-            self._record_block_ortho(block_mu)
-
-        return x_mix
+        return (1.0 - gg_tok).to(dtype=z_in.dtype).unsqueeze(-1) * z_in + gg_tok.to(dtype=z_in.dtype).unsqueeze(-1) * z2
 
 
 class RevDEQFunction(torch.autograd.Function):
@@ -2162,22 +2239,17 @@ class GPT(nn.Module):
             if y_acc is not None:
                 self._deq_yz_gap = (y_acc - z).float().norm().item()
 
-            # Define router regularizers/diagnostics on the terminal equilibrium state.
-            # Use the same router input as in Block.forward (attn_norm) to avoid component
-            # mismatches when routers are tied/shared (block-level MoE).
-            router = self.shared_block.attn.attn_router
-            router.set_bias_stats_enabled(True)
-            _ = router(self.shared_block.attn_norm(z))
-            router.set_bias_stats_enabled(False)
-
-            # Periodic auxiliary loss: enforce block-level expert output diversity on z*.
+            # Periodic auxiliary loss: enforce expert output diversity at z* (prefix-only).
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
                 max_tokens = int(getattr(self, "_block_ortho_aux_tokens_override", self.block_ortho_aux_tokens))
-                mu = self.shared_block.block_contrib_mu(z, x0_refined, max_tokens=max_tokens)  # [E,D] fp32
-                if dist.is_available() and dist.is_initialized():
-                    dist.all_reduce(mu, op=dist.ReduceOp.SUM)
-                    mu = mu / float(dist.get_world_size())
-                self._block_ortho_aux_loss = max_mean_abs_offdiag_cosine(mu)
+                attn_o, mlp_o = self.shared_block.ortho_aux(z, x0_refined, max_tokens=max_tokens)
+                # Barrier-shape the hard constraint (mean |cos| <= 0.20). If already healthy,
+                # do not penalize; otherwise apply a quadratic barrier.
+                thr = float(0.20)
+                attn_b = F.relu(attn_o - thr).pow(2)
+                mlp_b = F.relu(mlp_o - thr).pow(2)
+                # Encourage both components to diversify; average keeps coefficient meaning stable.
+                self._block_ortho_aux_loss = 0.5 * (attn_b + mlp_b)
 
         # Diagnostics (eval only)
         if not self.training:
@@ -2208,7 +2280,7 @@ class GPT(nn.Module):
         zero = torch.tensor(0.0, device=device)
         bal, spar, ortho = zero, zero, zero
         # Per-component routing losses with stronger weight for attention (prevents collapse).
-        # Deduplicate if routers are tied/shared (block-level MoE).
+        # Deduplicate if routers are tied/shared.
         router_weights: dict[int, float] = {}
         routers: dict[int, SoftDenseRouter] = {}
         for r, w in [
@@ -2374,6 +2446,11 @@ def main() -> None:
     args = Hyperparameters()
     for k, v in cli_overrides.items():
         setattr(args, k, v)
+    # If a wall-clock budget is provided, treat it as the primary stop condition.
+    # Unless the user explicitly overrides `--iterations`, set a very large iteration cap
+    # so runs are governed by time rather than a fixed step count.
+    if float(getattr(args, "max_wallclock_seconds", 0.0)) > 0.0 and "iterations" not in cli_overrides:
+        args.iterations = int(1_000_000_000)
     # Resolve derived paths after CLI overrides.
     args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
     args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
@@ -2577,7 +2654,7 @@ def main() -> None:
         f" heads={int(args.num_heads)}"
         f" kv_heads={int(args.num_kv_heads)}"
         " soft_topk=128"
-        " moe=block"
+        " moe=component"
         " router=softmax"
     )
     log0(f"router_bias_update:{int(bool(args.router_bias_update))} lr:{float(args.router_bias_lr):.4f} clip:{float(args.router_bias_clip):.2f}")
@@ -2775,37 +2852,38 @@ def main() -> None:
         parts: list[str] = []
 
         if hasattr(m, "shared_block"):
-            # Block-level router stats (shared across attention + MLP expert banks).
-            router = getattr(m.shared_block.attn, "attn_router", None)
-            diag_ok = (
-                router is not None
-                and getattr(router, "_expert_usage", None) is not None
-                and (not require_step_match or getattr(router, "_diag_step", None) == step)
-            )
-            if diag_ok:
+            # Component-level expert health metrics (Hard Constraints).
+            attn_router = getattr(getattr(m.shared_block, "attn", None), "attn_router", None)
+            mlp_router = getattr(getattr(m.shared_block, "mlp", None), "mlp_router", None)
+
+            for prefix, router in (("attn", attn_router), ("mlp", mlp_router)):
+                diag_ok = (
+                    router is not None
+                    and getattr(router, "_expert_usage", None) is not None
+                    and (not require_step_match or getattr(router, "_diag_step", None) == step)
+                )
+                if not diag_ok:
+                    continue
                 usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
-                parts.append(f"expert_usage:[{usage_str}]")
-                parts.append(f"block_usage:[{usage_str}]")
+                parts.append(f"{prefix}_usage:[{usage_str}]")
                 ent = getattr(router, "_expert_entropy", None)
                 if ent is not None:
-                    parts.append(f"expert_entropy:{ent:.4f}")
-                    parts.append(f"block_entropy:{ent:.4f}")
+                    parts.append(f"{prefix}_entropy:{ent:.4f}")
                     spar = getattr(router, "_expert_sparsity", None)
                     if spar is not None:
-                        parts.append(f"expert_sparsity:{float(spar):.4f}")
+                        parts.append(f"{prefix}_sparsity:{float(spar):.4f}")
                 cv = getattr(router, "_expert_balance_cv", None)
                 if cv is not None:
-                    parts.append(f"block_cv:{cv:.4f}")
-                if include_gates:
-                    gm = getattr(router, "_gate_mass_mean", None)
-                    if gm is not None:
-                        parts.append(f"expert_gate_mass:{float(gm):.4f}")
+                    parts.append(f"{prefix}_cv:{cv:.4f}")
+                # No routing mass gate in softmax-only routing (hard constraint).
 
-            # Block-level expert output orthogonality (used by plotting code as expert_ortho).
-            block_ortho = getattr(m.shared_block, "_block_ortho_cos_sim", None)
-            if block_ortho is not None:
-                parts.append(f"block_ortho:{float(block_ortho):.4f}")
-                parts.append(f"expert_ortho:{float(block_ortho):.4f}")
+            # Output-space orthogonality (mean |cos| across experts).
+            attn_ortho = getattr(getattr(m.shared_block, "attn", None), "_out_ortho_cos_sim", None)
+            mlp_ortho = getattr(getattr(m.shared_block, "mlp", None), "_out_ortho_cos_sim", None)
+            if attn_ortho is not None:
+                parts.append(f"attn_ortho:{float(attn_ortho):.4f}")
+            if mlp_ortho is not None:
+                parts.append(f"mlp_ortho:{float(mlp_ortho):.4f}")
         if hasattr(m, "mos_head"):
             mos = m.mos_head
             if hasattr(mos, "get_head_orthogonality"):
@@ -2976,18 +3054,10 @@ def main() -> None:
                 base_model._block_ortho_aux_coef_scale = 1.0
                 base_model._block_ortho_aux_tokens_override = int(args.block_ortho_aux_tokens)
                 if args.block_ortho_aux_coef > 0.0 and micro_step == grad_accum_steps - 1:
-                    # Late-phase: increase frequency + strength while reducing token cost.
-                    if late_frac > 0.0:
-                        base_model._block_ortho_aux_enabled = True
-                        base_model._block_ortho_aux_coef_scale = 1.0 + 9.0 * float(late_frac)  # 0.01 -> 0.10
-                        base_model._block_ortho_aux_tokens_override = max(
-                            64, int(args.block_ortho_aux_tokens * (1.0 - 0.5 * float(late_frac)))
-                        )
-                    else:
-                        base_model._block_ortho_aux_enabled = bool(
-                            args.block_ortho_aux_every > 0
-                            and (next_step % int(args.block_ortho_aux_every) == 0)
-                        )
+                    base_model._block_ortho_aux_enabled = bool(
+                        args.block_ortho_aux_every > 0
+                        and (next_step % int(args.block_ortho_aux_every) == 0)
+                    )
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
             train_loss += loss.detach()

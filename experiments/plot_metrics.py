@@ -22,9 +22,12 @@ COLOR_CURRENT = "#ff7f0e"   # matplotlib default orange
 
 # Component line styles (primary encoding)
 COMP_LINESTYLES = {
-    "transformer_block": "-",
-    "mos_ctp": "--",
-    "mos_ntp": ":",
+    "attn": "-",
+    "mlp": "--",
+    # Backward compat: older logs used a single block-level router.
+    "transformer_block": "-.",
+    "mos_ctp": ":",
+    "mos_ntp": (0, (3, 1, 1, 1)),  # dash-dot-dot
 }
 
 COMP_SCATTER_SIZE = 72
@@ -54,6 +57,9 @@ def parse_log(logpath: str) -> dict:
         "expert_usage": [], "expert_entropy": [], "expert_sparsity": [], "expert_ortho": [],
         # Block-level expert orthogonality (explicit key; `expert_ortho` is kept for compat)
         "block_ortho": [],
+        # Component-level routing metrics (preferred for component-level MoE plotting).
+        **{f"{p}_{s}": [] for p in ("attn", "mlp") for s in ("usage", "entropy", "cv", "sparsity")},
+        **{f"{p}_ortho": [] for p in ("attn", "mlp")},
         # Per-group: usage (list of lists), entropy, cv
         **{f"{p}_{s}": [] for p in ("mos_ctp", "mos_ntp") for s in ("usage", "entropy", "cv")},
         # Block-level routing metrics (preferred for block-level MoE plotting).
@@ -66,6 +72,8 @@ def parse_log(logpath: str) -> dict:
         "gg_mean_train": [],
         **{f"{p}_{s}_train": [] for p in ("mos_ctp", "mos_ntp") for s in ("usage", "entropy", "cv")},
         "block_usage_train": [], "block_entropy_train": [], "block_cv_train": [],
+        **{f"{p}_{s}_train": [] for p in ("attn", "mlp") for s in ("usage", "entropy", "cv", "sparsity")},
+        **{f"{p}_ortho_train": [] for p in ("attn", "mlp")},
         "expert_ortho_train": [],
         "block_ortho_train": [],
         "mos_ctp_ortho_train": [], "mos_ntp_ortho_train": [],
@@ -136,26 +144,32 @@ def parse_log(logpath: str) -> dict:
                 ("deq_iter_conv_rel_train", rf"deq_iter_conv_rel:{_FLOAT}"),
                 ("block_ortho_train", rf"block_ortho:{_FLOAT}"),
                 ("expert_ortho_train", rf"expert_ortho:{_FLOAT}"),
+                ("attn_ortho_train", rf"attn_ortho:{_FLOAT}"),
+                ("mlp_ortho_train", rf"mlp_ortho:{_FLOAT}"),
                 ("mos_ctp_entropy_train", rf"mos_ctp_entropy:{_FLOAT}"),
                 ("mos_ntp_entropy_train", rf"mos_ntp_entropy:{_FLOAT}"),
                 ("block_entropy_train", rf"block_entropy:{_FLOAT}"),
+                ("attn_entropy_train", rf"attn_entropy:{_FLOAT}"),
+                ("mlp_entropy_train", rf"mlp_entropy:{_FLOAT}"),
                 ("mos_ctp_cv_train", rf"mos_ctp_cv:{_FLOAT}"),
                 ("mos_ntp_cv_train", rf"mos_ntp_cv:{_FLOAT}"),
                 ("block_cv_train", rf"block_cv:{_FLOAT}"),
+                ("attn_cv_train", rf"attn_cv:{_FLOAT}"),
+                ("mlp_cv_train", rf"mlp_cv:{_FLOAT}"),
+                ("attn_sparsity_train", rf"attn_sparsity:{_FLOAT}"),
+                ("mlp_sparsity_train", rf"mlp_sparsity:{_FLOAT}"),
                 ("mos_ctp_ortho_train", rf"mos_ctp_ortho:{_FLOAT}"),
                 ("mos_ntp_ortho_train", rf"mos_ntp_ortho:{_FLOAT}"),
             ]:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else math.nan)
-            for prefix in ("mos_ctp", "mos_ntp"):
+            for prefix in ("attn", "mlp", "mos_ctp", "mos_ntp"):
                 m_u = re.search(rf"{prefix}_usage:\[([\d.,\s]+)\]", line)
                 data[f"{prefix}_usage_train"].append(
                     [float(v.strip()) for v in m_u.group(1).split(",") if v.strip()] if m_u else []
                 )
             m_bu = re.search(r"block_usage:\[([\d.,\s]+)\]", line)
-            data["block_usage_train"].append(
-                [float(v.strip()) for v in m_bu.group(1).split(",") if v.strip()] if m_bu else []
-            )
+            data["block_usage_train"].append([float(v.strip()) for v in m_bu.group(1).split(",") if v.strip()] if m_bu else [])
             m_gg = re.search(r"gg_iter:\[([\d.,\s]+)\]", line)
             data["gg_iter_train"].append(
                 [float(v.strip()) for v in m_gg.group(1).split(",") if v.strip()] if m_gg else []
@@ -197,6 +211,8 @@ def parse_log(logpath: str) -> dict:
                 ("expert_sparsity", rf"(?<!\w_)expert_sparsity:{_FLOAT}"),
                 ("block_ortho", rf"block_ortho:{_FLOAT}"),
                 ("expert_ortho", rf"expert_ortho:{_FLOAT}"),
+                ("attn_ortho", rf"attn_ortho:{_FLOAT}"),
+                ("mlp_ortho", rf"mlp_ortho:{_FLOAT}"),
             ]:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else math.nan)
@@ -208,7 +224,7 @@ def parse_log(logpath: str) -> dict:
             else:
                 data["expert_usage"].append([])
             # Per-group expert usage + entropy + cv
-            for prefix in ("mos_ctp", "mos_ntp"):
+            for prefix in ("attn", "mlp", "mos_ctp", "mos_ntp"):
                 m_u = re.search(rf"{prefix}_usage:\[([\d.,\s]+)\]", line)
                 data[f"{prefix}_usage"].append(
                     [float(v.strip()) for v in m_u.group(1).split(",") if v.strip()] if m_u else [])
@@ -216,6 +232,9 @@ def parse_log(logpath: str) -> dict:
                 data[f"{prefix}_entropy"].append(float(m_e.group(1)) if m_e else math.nan)
                 m_cv = re.search(rf"{prefix}_cv:{_FLOAT}", line)
                 data[f"{prefix}_cv"].append(float(m_cv.group(1)) if m_cv else math.nan)
+                m_sp = re.search(rf"{prefix}_sparsity:{_FLOAT}", line)
+                if f"{prefix}_sparsity" in data:
+                    data[f"{prefix}_sparsity"].append(float(m_sp.group(1)) if m_sp else math.nan)
             # Block-level router stats
             m_bu = re.search(r"block_usage:\[([\d.,\s]+)\]", line)
             data["block_usage"].append(
@@ -518,24 +537,33 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     # Usage: min share per expert group (Transformer block, MoS CTP, MoS NTP)
     ax_usage = axes[3, 0]
     use_train = any(
-        _has_any_finite(usage_min_series(d, "block_usage_train"))
+        _has_any_finite(usage_min_series(d, "attn_usage_train"))
+        or _has_any_finite(usage_min_series(d, "mlp_usage_train"))
+        or _has_any_finite(usage_min_series(d, "block_usage_train"))
         or _has_any_finite(usage_min_series(d, "mos_ctp_usage_train"))
         or _has_any_finite(usage_min_series(d, "mos_ntp_usage_train"))
         for d in (b, c)
     )
     steps_key = "train_steps" if use_train else "val_steps"
-    if use_train:
-        usage_series = [
-            ("transformer_block", usage_min_series(b, "block_usage_train"), usage_min_series(c, "block_usage_train")),
-            ("mos_ctp", usage_min_series(b, "mos_ctp_usage_train"), usage_min_series(c, "mos_ctp_usage_train")),
-            ("mos_ntp", usage_min_series(b, "mos_ntp_usage_train"), usage_min_series(c, "mos_ntp_usage_train")),
-        ]
-    else:
-        usage_series = [
-            ("transformer_block", usage_min_series(b, "block_usage"), usage_min_series(c, "block_usage")),
-            ("mos_ctp", usage_min_series(b, "mos_ctp_usage"), usage_min_series(c, "mos_ctp_usage")),
-            ("mos_ntp", usage_min_series(b, "mos_ntp_usage"), usage_min_series(c, "mos_ntp_usage")),
-        ]
+    def _series_for(group: str, train_key: str, val_key: str) -> tuple[str, list[float], list[float]]:
+        return (group, usage_min_series(b, train_key if use_train else val_key), usage_min_series(c, train_key if use_train else val_key))
+
+    usage_series: list[tuple[str, list[float], list[float]]] = []
+    # Prefer component-level (attn/mlp) when present; otherwise fall back to block-level.
+    any_attn = any(any(v) for v in b.get("attn_usage_train" if use_train else "attn_usage", [])) or any(
+        any(v) for v in c.get("attn_usage_train" if use_train else "attn_usage", [])
+    )
+    any_mlp = any(any(v) for v in b.get("mlp_usage_train" if use_train else "mlp_usage", [])) or any(
+        any(v) for v in c.get("mlp_usage_train" if use_train else "mlp_usage", [])
+    )
+    if any_attn:
+        usage_series.append(_series_for("attn", "attn_usage_train", "attn_usage"))
+    if any_mlp:
+        usage_series.append(_series_for("mlp", "mlp_usage_train", "mlp_usage"))
+    if not usage_series:
+        usage_series.append(_series_for("transformer_block", "block_usage_train", "block_usage"))
+    usage_series.append(_series_for("mos_ctp", "mos_ctp_usage_train", "mos_ctp_usage"))
+    usage_series.append(_series_for("mos_ntp", "mos_ntp_usage_train", "mos_ntp_usage"))
     _plot_components(
         ax_usage,
         b,
@@ -555,10 +583,12 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
                 return int(len(v))
         return None
 
+    e_attn = _last_list_len(b, "attn_usage_train" if use_train else "attn_usage") or _last_list_len(c, "attn_usage_train" if use_train else "attn_usage")
+    e_mlp = _last_list_len(b, "mlp_usage_train" if use_train else "mlp_usage") or _last_list_len(c, "mlp_usage_train" if use_train else "mlp_usage")
     e_block = _last_list_len(b, "block_usage_train" if use_train else "block_usage") or _last_list_len(c, "block_usage_train" if use_train else "block_usage")
     e_ctp = _last_list_len(b, "mos_ctp_usage_train" if use_train else "mos_ctp_usage") or _last_list_len(c, "mos_ctp_usage_train" if use_train else "mos_ctp_usage")
     e_ntp = _last_list_len(b, "mos_ntp_usage_train" if use_train else "mos_ntp_usage") or _last_list_len(c, "mos_ntp_usage_train" if use_train else "mos_ntp_usage")
-    for e in (e_block, e_ctp, e_ntp):
+    for e in (e_attn, e_mlp, e_block, e_ctp, e_ntp):
         if e and e > 0:
             ax_usage.axhline(0.6 / float(e), color="#666666", linestyle=":", linewidth=1.2, alpha=0.6)
     ax_usage.set_ylim(bottom=0.0)
@@ -566,34 +596,51 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     # Expert Entropy: per-group lines (Transformer block, MoS CTP, MoS NTP)
     ax_ent = axes[3, 1]
     use_train = any(
-        _has_any_finite(d.get("block_entropy_train", [])) or _has_any_finite(d.get("mos_ctp_entropy_train", [])) or _has_any_finite(d.get("mos_ntp_entropy_train", []))
+        _has_any_finite(d.get("attn_entropy_train", []))
+        or _has_any_finite(d.get("mlp_entropy_train", []))
+        or _has_any_finite(d.get("block_entropy_train", []))
+        or _has_any_finite(d.get("mos_ctp_entropy_train", []))
+        or _has_any_finite(d.get("mos_ntp_entropy_train", []))
         for d in (b, c)
     )
     steps_key = "train_steps" if use_train else "val_steps"
-    entropy_series = [
-        ("transformer_block", b.get("block_entropy_train" if use_train else "block_entropy", []), c.get("block_entropy_train" if use_train else "block_entropy", [])),
-        ("mos_ctp", b.get("mos_ctp_entropy_train" if use_train else "mos_ctp_entropy", []), c.get("mos_ctp_entropy_train" if use_train else "mos_ctp_entropy", [])),
-        ("mos_ntp", b.get("mos_ntp_entropy_train" if use_train else "mos_ntp_entropy", []), c.get("mos_ntp_entropy_train" if use_train else "mos_ntp_entropy", [])),
-    ]
+    entropy_series: list[tuple[str, list[float], list[float]]] = []
+    if _has_any_finite(b.get("attn_entropy_train" if use_train else "attn_entropy", [])) or _has_any_finite(c.get("attn_entropy_train" if use_train else "attn_entropy", [])):
+        entropy_series.append(("attn", b.get("attn_entropy_train" if use_train else "attn_entropy", []), c.get("attn_entropy_train" if use_train else "attn_entropy", [])))
+    if _has_any_finite(b.get("mlp_entropy_train" if use_train else "mlp_entropy", [])) or _has_any_finite(c.get("mlp_entropy_train" if use_train else "mlp_entropy", [])):
+        entropy_series.append(("mlp", b.get("mlp_entropy_train" if use_train else "mlp_entropy", []), c.get("mlp_entropy_train" if use_train else "mlp_entropy", [])))
+    if not entropy_series:
+        entropy_series.append(("transformer_block", b.get("block_entropy_train" if use_train else "block_entropy", []), c.get("block_entropy_train" if use_train else "block_entropy", [])))
+    entropy_series.append(("mos_ctp", b.get("mos_ctp_entropy_train" if use_train else "mos_ctp_entropy", []), c.get("mos_ctp_entropy_train" if use_train else "mos_ctp_entropy", [])))
+    entropy_series.append(("mos_ntp", b.get("mos_ntp_entropy_train" if use_train else "mos_ntp_entropy", []), c.get("mos_ntp_entropy_train" if use_train else "mos_ntp_entropy", [])))
     _plot_components(ax_ent, b, c, steps_key, entropy_series, "Expert Entropy (by Group)", ylabel="Entropy")
 
     # Orthogonality: block-level weighted experts + MoS head orthogonality
     ax_ortho = axes[3, 2]
     # Prefer train-logged series when any of the orthogonality metrics are present there.
     use_train = False
-    for k in ("block_ortho_train", "expert_ortho_train", "mos_ctp_ortho_train", "mos_ntp_ortho_train"):
+    for k in ("attn_ortho_train", "mlp_ortho_train", "block_ortho_train", "expert_ortho_train", "mos_ctp_ortho_train", "mos_ntp_ortho_train"):
         if _has_any_finite(b.get(k, [])) or _has_any_finite(c.get(k, [])):
             use_train = True
             break
     steps_key = "train_steps" if use_train else "val_steps"
-    expert_ortho_key = "block_ortho_train" if steps_key == "train_steps" else "block_ortho"
     ortho_series = []
-    # Transformer block expert orthogonality (preferred explicit key; fall back to legacy `expert_ortho`).
-    ortho_series.append((
-        "transformer_block",
-        b.get(expert_ortho_key, b.get("expert_ortho_train" if steps_key == "train_steps" else "expert_ortho", [])),
-        c.get(expert_ortho_key, c.get("expert_ortho_train" if steps_key == "train_steps" else "expert_ortho", [])),
-    ))
+    # Prefer component-level (attn/mlp). Fall back to legacy block-level keys.
+    b_attn_o = b.get("attn_ortho_train" if steps_key == "train_steps" else "attn_ortho", [])
+    c_attn_o = c.get("attn_ortho_train" if steps_key == "train_steps" else "attn_ortho", [])
+    b_mlp_o = b.get("mlp_ortho_train" if steps_key == "train_steps" else "mlp_ortho", [])
+    c_mlp_o = c.get("mlp_ortho_train" if steps_key == "train_steps" else "mlp_ortho", [])
+    if _has_any_finite(b_attn_o) or _has_any_finite(c_attn_o):
+        ortho_series.append(("attn", b_attn_o, c_attn_o))
+    if _has_any_finite(b_mlp_o) or _has_any_finite(c_mlp_o):
+        ortho_series.append(("mlp", b_mlp_o, c_mlp_o))
+    if not ortho_series:
+        expert_ortho_key = "block_ortho_train" if steps_key == "train_steps" else "block_ortho"
+        ortho_series.append((
+            "transformer_block",
+            b.get(expert_ortho_key, b.get("expert_ortho_train" if steps_key == "train_steps" else "expert_ortho", [])),
+            c.get(expert_ortho_key, c.get("expert_ortho_train" if steps_key == "train_steps" else "expert_ortho", [])),
+        ))
     ortho_series.append((
         "mos_ctp",
         b.get("mos_ctp_ortho_train" if steps_key == "train_steps" else "mos_ctp_ortho", []),
@@ -625,15 +672,23 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     # Row 5: Balance diagnostics (CV), DEQ reconstruction error, scored metric
     ax_bal = axes[4, 0]
     use_train = any(
-        _has_any_finite(d.get("block_cv_train", [])) or _has_any_finite(d.get("mos_ctp_cv_train", [])) or _has_any_finite(d.get("mos_ntp_cv_train", []))
+        _has_any_finite(d.get("attn_cv_train", []))
+        or _has_any_finite(d.get("mlp_cv_train", []))
+        or _has_any_finite(d.get("block_cv_train", []))
+        or _has_any_finite(d.get("mos_ctp_cv_train", []))
+        or _has_any_finite(d.get("mos_ntp_cv_train", []))
         for d in (b, c)
     )
     steps_key = "train_steps" if use_train else "val_steps"
-    bal_series = [
-        ("transformer_block", b.get("block_cv_train" if use_train else "block_cv", []), c.get("block_cv_train" if use_train else "block_cv", [])),
-        ("mos_ctp", b.get("mos_ctp_cv_train" if use_train else "mos_ctp_cv", []), c.get("mos_ctp_cv_train" if use_train else "mos_ctp_cv", [])),
-        ("mos_ntp", b.get("mos_ntp_cv_train" if use_train else "mos_ntp_cv", []), c.get("mos_ntp_cv_train" if use_train else "mos_ntp_cv", [])),
-    ]
+    bal_series: list[tuple[str, list[float], list[float]]] = []
+    if _has_any_finite(b.get("attn_cv_train" if use_train else "attn_cv", [])) or _has_any_finite(c.get("attn_cv_train" if use_train else "attn_cv", [])):
+        bal_series.append(("attn", b.get("attn_cv_train" if use_train else "attn_cv", []), c.get("attn_cv_train" if use_train else "attn_cv", [])))
+    if _has_any_finite(b.get("mlp_cv_train" if use_train else "mlp_cv", [])) or _has_any_finite(c.get("mlp_cv_train" if use_train else "mlp_cv", [])):
+        bal_series.append(("mlp", b.get("mlp_cv_train" if use_train else "mlp_cv", []), c.get("mlp_cv_train" if use_train else "mlp_cv", [])))
+    if not bal_series:
+        bal_series.append(("transformer_block", b.get("block_cv_train" if use_train else "block_cv", []), c.get("block_cv_train" if use_train else "block_cv", [])))
+    bal_series.append(("mos_ctp", b.get("mos_ctp_cv_train" if use_train else "mos_ctp_cv", []), c.get("mos_ctp_cv_train" if use_train else "mos_ctp_cv", [])))
+    bal_series.append(("mos_ntp", b.get("mos_ntp_cv_train" if use_train else "mos_ntp_cv", []), c.get("mos_ntp_cv_train" if use_train else "mos_ntp_cv", [])))
     _plot_components(ax_bal, b, c, steps_key, bal_series, "Expert Balance CV (by Group)", ylabel="CV")
     ax_bal.axhline(0.20, color="#666666", linestyle=":", linewidth=1.2, alpha=0.6)
 

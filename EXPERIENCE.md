@@ -9,6 +9,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - For hard constraints, use a worst-case aggregation that matches the guarantee you want (e.g. max over per-expert means).
 - Prefer enforcing hard constraints in the space you diagnose; remove proxy regularizers if they don’t transfer.
 - Treat expert health metrics as non-negotiable guardrails; optimize everything else inside that envelope.
+- When a metric is a hard end constraint, add a direct soft barrier loss for it instead of hoping a proxy will transfer.
 - Validate hard constraints in eval-mode; train-mode “healthy routing” can be misleading.
 - Don’t train on a diagnostic unless it consistently improves the scored metric; keep “convergence” as a monitored signal, not a loss.
 
@@ -45,6 +46,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Prefer simple, explicit parameterizations over hidden stability clamps; diagnose fixed-point behavior directly via residual/convergence metrics.
 - When you need contraction, add a single block-level gate and log it; don’t hide stability in many per-path scale knobs.
 - Intermediate DEQ supervision shapes early iterates, but it’s compute-heavy; keep it sparse and aligned with the scored output.
+- When enforcing a hard constraint, prefer a barrier loss (penalize violations only) over always-on regularization.
 
 ## Refinement
 - When mixing token distributions, normalize each input distribution first and renormalize after mixing.
@@ -76,3 +78,5 @@ Short, reusable guardrails to avoid common experiment mistakes.
 
 ## Logging
 - Avoid multiple processes writing to the same log file concurrently; keep a single canonical log and derive copies from it.
+- Initialize gates to meaningful mid-range values; extreme gate biases can hide capacity or destabilize dynamics.
+- Keep evaluation batching independent from training gradient-accumulation; eval should reflect the true throughput target.
