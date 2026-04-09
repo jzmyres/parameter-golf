@@ -26,15 +26,14 @@ class TestRouterHealthScale(unittest.TestCase):
 
         r.health_scale = 1.0
         _ = r(x)
-        loss1 = float(r._balance_loss.detach().cpu().item())
+        loss1 = float(r._health_loss.detach().cpu().item())
 
         r.health_scale = 5.0
         _ = r(x)
-        loss5 = float(r._balance_loss.detach().cpu().item())
+        loss5 = float(r._health_loss.detach().cpu().item())
 
         self.assertGreater(loss5, loss1 + 1e-6)
 
 
 if __name__ == "__main__":
     unittest.main()
-

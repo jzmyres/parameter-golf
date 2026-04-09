@@ -182,7 +182,10 @@ class Hyperparameters:
     # Routing regularization weights
     attn_balance_mult = 5.0
     mlp_balance_mult = 1.0
+    # Balance MSE is a gentle shaping term; hard-constraint barriers (min share, CV) are
+    # applied separately via `router_health_coef` so they are not accidentally suppressed.
     bal_loss_coef = 5e-3
+    router_health_coef = 0.25
     # Periodic auxiliary loss on per-expert output-space means at z* (prefix-only for cost control).
     # Default off for throughput; enable only when expert orthogonality needs extra shaping.
     block_ortho_aux_coef = 0.0
@@ -247,6 +250,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--attn-balance-mult", type=float, default=None)
     p.add_argument("--mlp-balance-mult", type=float, default=None)
     p.add_argument("--bal-loss-coef", type=float, default=None)
+    p.add_argument("--router-health-coef", type=float, default=None)
     p.add_argument("--router-lr", type=float, default=None)
     p.add_argument("--router-bias-update", type=int, default=None, help="1/0; loss-free expert-bias load balancing")
     p.add_argument("--router-bias-lr", type=float, default=None)
@@ -915,6 +919,7 @@ class SoftDenseRouter(nn.Module):
         self._mean_share_last: Tensor | None = None
         # Diagnostics (set during forward)
         self._balance_loss = None
+        self._health_loss = None
         self._sparsity_loss = None
         self._expert_usage = None
         self._expert_entropy = None
@@ -972,7 +977,8 @@ class SoftDenseRouter(nn.Module):
             hs = float(getattr(self, "health_scale", 1.0))
             w_min = float(self.min_share_loss_weight) * hs
             w_cv = float(self.cv_loss_weight) * hs
-            self._balance_loss = mse + w_min * min_share_loss + w_cv * cv_loss
+            self._balance_loss = mse
+            self._health_loss = w_min * min_share_loss + w_cv * cv_loss
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
             if self._bias_stats_enabled:
                 # Store terminal-state routing stats for the loss-free bias controller update.
@@ -985,6 +991,7 @@ class SoftDenseRouter(nn.Module):
                     self._record_diagnostics(share.detach(), reduce_dims)
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
+            self._health_loss = torch.tensor(0.0, device=x.device)
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
             # Do not update bias controller from eval passes.
             self._mean_share_last = None
@@ -1979,6 +1986,7 @@ class GPT(nn.Module):
         attn_balance_mult: float = 3.0,
         mlp_balance_mult: float = 1.0,
         bal_loss_coef: float = 0.5,
+        router_health_coef: float = 0.25,
         mos_ortho_out_coef: float = 0.0,
         attn_ortho_out_coef: float = 0.0,
         mlp_ortho_out_coef: float = 0.0,
@@ -2011,6 +2019,7 @@ class GPT(nn.Module):
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
         self.bal_loss_coef = float(bal_loss_coef)
+        self.router_health_coef = float(router_health_coef)
         self.mos_ortho_out_coef = float(mos_ortho_out_coef)
         self.attn_ortho_out_coef = float(attn_ortho_out_coef)
         self.mlp_ortho_out_coef = float(mlp_ortho_out_coef)
@@ -2316,9 +2325,9 @@ class GPT(nn.Module):
         return self.final_norm(x)
 
     def _collect_routing_losses(self, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
-        """Collect balance, sparsity, and orthogonality losses from all routers."""
+        """Collect routing MSE, hard-constraint health, and sparsity losses."""
         zero = torch.tensor(0.0, device=device)
-        bal, spar, ortho = zero, zero, zero
+        bal, health, spar = zero, zero, zero
         # Per-component routing losses with stronger weight for attention (prevents collapse).
         # Deduplicate if routers are tied/shared.
         router_weights: dict[int, float] = {}
@@ -2332,13 +2341,15 @@ class GPT(nn.Module):
             router_weights[rid] = router_weights.get(rid, 0.0) + float(w)
         for rid, r in routers.items():
             r_bal = getattr(r, "_balance_loss", zero)
+            r_health = getattr(r, "_health_loss", zero)
             r_spar = getattr(r, "_sparsity_loss", zero)
             bal = bal + float(router_weights.get(rid, 0.0)) * r_bal
+            health = health + float(router_weights.get(rid, 0.0)) * r_health
             spar = spar + r_spar
         # MoS head routing
         bal = bal + getattr(self.mos_head, '_balance_loss', zero)
         spar = spar + getattr(self.mos_head, '_sparsity_loss', zero)
-        return bal, spar, ortho
+        return bal, health, spar
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
@@ -2346,7 +2357,7 @@ class GPT(nn.Module):
         V = self.tok_emb.num_embeddings
         ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
         ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
-        bal_loss, spar_loss, _ = self._collect_routing_losses(ntp_loss.device)
+        bal_loss, health_loss, spar_loss = self._collect_routing_losses(ntp_loss.device)
         self._ntp_loss = ntp_loss.detach().item()
         self._ctp_loss = ctp_loss.detach().item()
         # CTP weight scales with refinement steps: at step 0 input is clean one-hot,
@@ -2380,6 +2391,7 @@ class GPT(nn.Module):
             ntp_loss
             + ctp_weight * ctp_loss
             + self.bal_loss_coef * bal_loss
+            + self.router_health_coef * health_loss
             + 0.001 * spar_loss
             + self.mos_ortho_out_coef * mos_ortho_loss
             + self.attn_ortho_out_coef * attn_ortho_loss
@@ -2686,6 +2698,7 @@ def main() -> None:
         f" batch_tokens={int(args.train_batch_tokens)}"
         f" seq_len={int(args.train_seq_len)}"
         f" beta={float(args.deq_beta):.3f}"
+        f" router_health_coef={float(getattr(args, 'router_health_coef', 0.0)):.4g}"
         f" mos_ortho_coef={float(args.mos_ortho_out_coef):.4g}"
         f" block_ortho_aux_coef={float(args.block_ortho_aux_coef):.4g}"
         f" block_ortho_aux_every={int(args.block_ortho_aux_every)}"
@@ -2726,6 +2739,7 @@ def main() -> None:
         attn_balance_mult=args.attn_balance_mult,
         mlp_balance_mult=args.mlp_balance_mult,
         bal_loss_coef=args.bal_loss_coef,
+        router_health_coef=float(getattr(args, "router_health_coef", 0.0)),
         mos_ortho_out_coef=args.mos_ortho_out_coef,
         attn_ortho_out_coef=args.attn_ortho_out_coef,
         mlp_ortho_out_coef=args.mlp_ortho_out_coef,

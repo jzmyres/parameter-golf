@@ -24,7 +24,7 @@ class TestRouterHealthLoss(unittest.TestCase):
             router.router.weight.zero_()
             router.expert_bias.zero_()
         _ = router(x)
-        loss_uniform = float(router._balance_loss.detach().cpu().item())
+        loss_uniform = float(router._health_loss.detach().cpu().item())
 
         # Collapsed routing: push almost all mass to expert 0
         with torch.no_grad():
@@ -32,7 +32,7 @@ class TestRouterHealthLoss(unittest.TestCase):
             router.router.weight[0].fill_(+10.0)
             router.expert_bias.zero_()
         _ = router(x)
-        loss_collapse = float(router._balance_loss.detach().cpu().item())
+        loss_collapse = float(router._health_loss.detach().cpu().item())
 
         self.assertGreater(loss_collapse, loss_uniform + 1e-6)
 
