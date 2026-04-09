@@ -185,12 +185,11 @@ class Hyperparameters:
     # Balance MSE is a gentle shaping term; hard-constraint barriers (min share, CV) are
     # applied separately via `router_health_coef` so they are not accidentally suppressed.
     bal_loss_coef = 5e-3
-    # Stronger by default: expert health is a hard constraint at end of training.
-    router_health_coef = 1.0
+    router_health_coef = 0.25
     # Periodic auxiliary loss on per-expert output-space means at z* (prefix-only for cost control).
-    # Enabled to enforce the hard orthogonality constraint under RevDEQ backward.
-    block_ortho_aux_coef = 0.5
-    block_ortho_aux_every = 50
+    # Default off for throughput; enable only when expert orthogonality needs extra shaping.
+    block_ortho_aux_coef = 0.0
+    block_ortho_aux_every = 0
     block_ortho_aux_tokens = 128
     # Loss-free load balancing (bias controller). Keeps expert utilization healthy without
     # interfering gradients from strong auxiliary losses.
