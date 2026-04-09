@@ -142,7 +142,8 @@ class Hyperparameters:
     # Throughput-tuned default for this dev box (2×A100 DDP).
     train_batch_tokens = 262_144
     train_seq_len = 2048
-    max_wallclock_seconds = 0.0  # 0 disables wallclock early-stop
+    # Default training budget: 1 hour wall-clock (evaluation/plotting not counted).
+    max_wallclock_seconds = 3600.0  # 0 disables wallclock early-stop
     qk_gain_init = 1.5
     deq_beta = 0.2
 
@@ -196,13 +197,15 @@ class Hyperparameters:
     deq_backward = "revdeq"  # {autograd, revdeq}
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 32
-    deq_k_step = 4  # sample K on a grid: {4,8,12,...,32}
-    deq_k_eval = 32
+    deq_k_max = 20
+    deq_k_step = 4  # sample K on a grid: {4,8,12,...,20}
+    deq_k_eval = 20
     # Shuffle-bag K-jitter range ramp: maxK linearly increases from deq_k_max_start -> deq_k_max.
     # Default: no ramp (stable range from step 1).
     deq_k_max_start = deq_k_max
     deq_k_max_ramp_steps = 1
+    # Shared router is cheaper and stabilizes expert health; keep on by default.
+    tie_attn_mlp_router = True
     compile_train = False  # torch.compile(shared_block) for training speed
     benchmark_mode = False  # skip post-quant eval/serialization for speed microbenchmarks
 
@@ -269,6 +272,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--deq-k-eval", type=int, default=None)
     p.add_argument("--deq-k-max-start", type=int, default=None, help="starting maxK for range ramp (train only)")
     p.add_argument("--deq-k-max-ramp-steps", type=int, default=None, help="steps to ramp maxK to deq_k_max")
+    p.add_argument("--tie-attn-mlp-router", type=int, default=None, help="1/0; share a single router between attn+mlp")
     p.add_argument("--compile-train", type=int, default=None, help="1/0; torch.compile(shared_block) during training")
     p.add_argument("--benchmark-mode", type=int, default=None, help="1/0; skip final eval/quant/plots (speed bench)")
     ns, unknown = p.parse_known_args(argv)
@@ -289,6 +293,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             elif key == "benchmark_mode":
                 out[key] = bool(int(v))
             elif key == "auto_plot_on_val":
+                out[key] = bool(int(v))
+            elif key == "tie_attn_mlp_router":
                 out[key] = bool(int(v))
             else:
                 out[key] = v
@@ -1598,7 +1604,8 @@ class MoSHead(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
-                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0):
+                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
+                 tie_attn_mlp_router: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -1606,8 +1613,13 @@ class Block(nn.Module):
         # Routing weights are pure softmax over experts (sum=1); no post-softmax gating.
         # Hard-constraint-aware barriers: attention is the typical collapse mode, so it
         # gets stronger min-share/CV barrier weights by default.
-        self.attn_router = SoftDenseRouter(dim, 6, min_share_loss_weight=10.0, cv_loss_weight=2.0)
-        self.mlp_router = SoftDenseRouter(dim, 6, min_share_loss_weight=5.0, cv_loss_weight=1.0)
+        if bool(tie_attn_mlp_router):
+            shared = SoftDenseRouter(dim, 6, min_share_loss_weight=10.0, cv_loss_weight=2.0)
+            self.attn_router = shared
+            self.mlp_router = shared
+        else:
+            self.attn_router = SoftDenseRouter(dim, 6, min_share_loss_weight=10.0, cv_loss_weight=2.0)
+            self.mlp_router = SoftDenseRouter(dim, 6, min_share_loss_weight=5.0, cv_loss_weight=1.0)
         self.attn = CausalSelfAttention(
             dim,
             num_heads,
@@ -1972,6 +1984,7 @@ class GPT(nn.Module):
         block_ortho_aux_coef: float = 0.0,
         block_ortho_aux_every: int = 0,
         block_ortho_aux_tokens: int = 256,
+        tie_attn_mlp_router: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1990,7 +2003,8 @@ class GPT(nn.Module):
         # RevDEQ (Constraint #1): single shared block with coupled-state fixed-point iteration
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
-                                  attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank)
+                                  attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
+                                  tie_attn_mlp_router=bool(tie_attn_mlp_router))
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2680,6 +2694,7 @@ def main() -> None:
         " soft_topk=128"
         " moe=component"
         " router=softmax"
+        f" tie_router={int(bool(getattr(args, 'tie_attn_mlp_router', False)))}"
     )
     log0(f"router_bias_update:{int(bool(args.router_bias_update))} lr:{float(args.router_bias_lr):.4f} clip:{float(args.router_bias_clip):.2f}")
     log0(f"router_lr:{float(getattr(args, 'router_lr', 0.0)):.6f}")
@@ -2716,6 +2731,7 @@ def main() -> None:
         block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every,
         block_ortho_aux_tokens=args.block_ortho_aux_tokens,
+        tie_attn_mlp_router=bool(getattr(args, "tie_attn_mlp_router", False)),
     ).to(device).bfloat16()
 
     for module in base_model.modules():
