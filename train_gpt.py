@@ -138,7 +138,9 @@ class Hyperparameters:
 
     iterations = 1000
     warmdown_iters = 1000
-    warmup_steps = 20
+    # Warmup is intentionally expensive (it runs optimizer steps then resets model+optim state).
+    # For time-budgeted iteration runs, default to 0 to avoid wasting wall-clock.
+    warmup_steps = 0
     # Throughput-tuned default for this dev box (2×A100 DDP).
     train_batch_tokens = 262_144
     train_seq_len = 2048
@@ -182,9 +184,9 @@ class Hyperparameters:
     mlp_balance_mult = 1.0
     bal_loss_coef = 5e-3
     # Periodic auxiliary loss on per-expert output-space means at z* (prefix-only for cost control).
-    # This directly regularizes expert diversity without materializing [B,T,E,D].
-    block_ortho_aux_coef = 0.10
-    block_ortho_aux_every = 20
+    # Default off for throughput; enable only when expert orthogonality needs extra shaping.
+    block_ortho_aux_coef = 0.0
+    block_ortho_aux_every = 0
     block_ortho_aux_tokens = 128
     # Loss-free load balancing (bias controller). Keeps expert utilization healthy without
     # interfering gradients from strong auxiliary losses.
@@ -197,9 +199,9 @@ class Hyperparameters:
     deq_backward = "revdeq"  # {autograd, revdeq}
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 20
-    deq_k_step = 4  # sample K on a grid: {4,8,12,...,20}
-    deq_k_eval = 20
+    deq_k_max = 12
+    deq_k_step = 4  # sample K on a grid: {4,8,12}
+    deq_k_eval = 12
     # Shuffle-bag K-jitter range ramp: maxK linearly increases from deq_k_max_start -> deq_k_max.
     # Default: no ramp (stable range from step 1).
     deq_k_max_start = deq_k_max

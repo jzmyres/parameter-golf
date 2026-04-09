@@ -22,8 +22,8 @@ class TestDeqKJitter(unittest.TestCase):
         self.assertGreaterEqual(Hyperparameters.deq_k_min, 2)
         self.assertGreaterEqual(Hyperparameters.deq_k_max_start, Hyperparameters.deq_k_min)
         self.assertGreaterEqual(Hyperparameters.deq_k_max, Hyperparameters.deq_k_max_start)
-        self.assertEqual(Hyperparameters.deq_k_max, 20)
-        self.assertEqual(Hyperparameters.deq_k_eval, 20)
+        self.assertEqual(Hyperparameters.deq_k_max, 12)
+        self.assertEqual(Hyperparameters.deq_k_eval, 12)
 
     def test_cli_override_parses_bool(self):
         ov = _parse_cli_overrides(["--deq-k-jitter", "0"])
