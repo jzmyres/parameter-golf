@@ -296,6 +296,11 @@ The training-time router loss is a constraint-shaped combination:
 where $\mathrm{CV}(\bar w)=\mathrm{std}(\bar w)/\mathrm{mean}(\bar w)$. These soft barriers target the final-only hard constraints
 (min-share and CV) without over-regularizing already-healthy routing.
 Additionally, a loss-free bias controller updates router logits outside autograd to counteract collapse.
+In code, the barrier weights are multiplied by a late-phase scalar \texttt{health\_scale} to emphasize end-of-run constraint satisfaction.
+
+\paragraph{Router optimizer.}
+Router weight matrices are optimized with a separate AdamW group (\texttt{router\_lr}) instead of Muon, because routers are
+control modules whose sharpness strongly affects both expert health and DEQ stability.
 
 \subsection{Output-space orthogonality penalties (autograd-unroll only)}
 When \texttt{deq\_backward=autograd}, the model may add differentiable output-space orthogonality penalties for expert outputs.

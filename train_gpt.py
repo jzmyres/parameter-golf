@@ -165,6 +165,7 @@ class Hyperparameters:
     tied_embed_init_std = 0.005
     matrix_lr = 0.02
     scalar_lr = 0.02
+    router_lr = 0.005
     muon_momentum = 0.99
     muon_backend_steps = 5
     muon_momentum_warmup_start = 0.92
@@ -181,14 +182,14 @@ class Hyperparameters:
     bal_loss_coef = 5e-3
     # Periodic auxiliary loss on per-expert output-space means at z* (prefix-only for cost control).
     # This directly regularizes expert diversity without materializing [B,T,E,D].
-    block_ortho_aux_coef = 0.05
-    block_ortho_aux_every = 50
-    block_ortho_aux_tokens = 256
+    block_ortho_aux_coef = 0.10
+    block_ortho_aux_every = 20
+    block_ortho_aux_tokens = 128
     # Loss-free load balancing (bias controller). Keeps expert utilization healthy without
     # interfering gradients from strong auxiliary losses.
     router_bias_update = True
-    router_bias_lr = 0.05
-    router_bias_clip = 5.0
+    router_bias_lr = 0.10
+    router_bias_clip = 10.0
     mos_ortho_out_coef = 1e-3
     attn_ortho_out_coef = 0.0
     mlp_ortho_out_coef = 0.0
@@ -210,7 +211,7 @@ class Hyperparameters:
 
     # Architecture knobs (defaults only; override via CLI, not env)
     bigram_vocab_size = 65536
-    bigram_dim = 224
+    bigram_dim = 208
     kv_latent_dim = 0  # 0 = auto (dim//2)
     attn_expert_rank = 0  # 0 = auto (dim//2)
     mlp_expert_rank = 0  # 0 = auto (hidden//2)
@@ -241,6 +242,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--attn-balance-mult", type=float, default=None)
     p.add_argument("--mlp-balance-mult", type=float, default=None)
     p.add_argument("--bal-loss-coef", type=float, default=None)
+    p.add_argument("--router-lr", type=float, default=None)
     p.add_argument("--router-bias-update", type=int, default=None, help="1/0; loss-free expert-bias load balancing")
     p.add_argument("--router-bias-lr", type=float, default=None)
     p.add_argument("--router-bias-clip", type=float, default=None)
@@ -889,8 +891,10 @@ class SoftDenseRouter(nn.Module):
         # Hard-constraint targets (used for training-time regularization + bias controller).
         self.min_share_frac = float(min_share_frac)
         self.cv_target = float(cv_target)
+        # Base weights (can be scaled in the training loop to emphasize end-of-run constraints).
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
+        self.health_scale = 1.0
         self.router = CastedLinear(dim, num_experts, bias=False)
         # Small router init → near-uniform routing at start
         nn.init.normal_(self.router.weight, std=0.01)
@@ -957,7 +961,10 @@ class SoftDenseRouter(nn.Module):
             cv_loss = torch.relu(cv - mean_share.new_tensor(self.cv_target)).pow(2) if self.cv_target > 0.0 else mean_share.new_zeros(())
             # Keep the base term always present; other terms are soft barriers for the end-of-run
             # expert-health constraints (min-share and CV).
-            self._balance_loss = mse + self.min_share_loss_weight * min_share_loss + self.cv_loss_weight * cv_loss
+            hs = float(getattr(self, "health_scale", 1.0))
+            w_min = float(self.min_share_loss_weight) * hs
+            w_cv = float(self.cv_loss_weight) * hs
+            self._balance_loss = mse + w_min * min_share_loss + w_cv * cv_loss
             self._sparsity_loss = torch.tensor(0.0, device=x.device)
             if self._bias_stats_enabled:
                 # Store terminal-state routing stats for the loss-free bias controller update.
@@ -1597,8 +1604,10 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         # Component-level Soft Dense Routing: separate routers for attention and MLP experts.
         # Routing weights are pure softmax over experts (sum=1); no post-softmax gating.
-        self.attn_router = SoftDenseRouter(dim, 6)
-        self.mlp_router = SoftDenseRouter(dim, 6)
+        # Hard-constraint-aware barriers: attention is the typical collapse mode, so it
+        # gets stronger min-share/CV barrier weights by default.
+        self.attn_router = SoftDenseRouter(dim, 6, min_share_loss_weight=10.0, cv_loss_weight=2.0)
+        self.mlp_router = SoftDenseRouter(dim, 6, min_share_loss_weight=5.0, cv_loss_weight=1.0)
         self.attn = CausalSelfAttention(
             dim,
             num_heads,
@@ -2243,6 +2252,12 @@ class GPT(nn.Module):
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
                 max_tokens = int(getattr(self, "_block_ortho_aux_tokens_override", self.block_ortho_aux_tokens))
                 attn_o, mlp_o = self.shared_block.ortho_aux(z, x0_refined, max_tokens=max_tokens)
+                # Update logged output-space orthogonality diagnostics (pre-barrier).
+                try:
+                    self.shared_block.attn._out_ortho_cos_sim = float(attn_o.detach().float().item())
+                    self.shared_block.mlp._out_ortho_cos_sim = float(mlp_o.detach().float().item())
+                except Exception:
+                    pass
                 # Barrier-shape the hard constraint (mean |cos| <= 0.20). If already healthy,
                 # do not penalize; otherwise apply a quadratic barrier.
                 thr = float(0.20)
@@ -2260,6 +2275,15 @@ class GPT(nn.Module):
                 self._deq_residuals = [(z - f_z_final).float().norm().item()]
                 self._deq_iter_convergence = abs_conv  # absolute
                 self._deq_iter_convergence_rel = abs_conv / z_norm_diag  # relative
+                # Keep eval-mode expert-health diagnostics accurate (output-space orthogonality
+                # must be computed from expert outputs, not weights, and should reflect the
+                # current model state).
+                try:
+                    attn_o, mlp_o = self.shared_block.ortho_aux(z, x0_refined, max_tokens=128)
+                    self.shared_block.attn._out_ortho_cos_sim = float(attn_o.float().item())
+                    self.shared_block.mlp._out_ortho_cos_sim = float(mlp_o.float().item())
+                except Exception:
+                    pass
                 # RevDEQ reconstruction diagnostics are produced in the RevDEQ backward path,
                 # not during eval-only explicit unroll (which can spuriously diverge due to
                 # backend/kernel differences and is not representative of the actual backward).
@@ -2658,6 +2682,7 @@ def main() -> None:
         " router=softmax"
     )
     log0(f"router_bias_update:{int(bool(args.router_bias_update))} lr:{float(args.router_bias_lr):.4f} clip:{float(args.router_bias_clip):.2f}")
+    log0(f"router_lr:{float(getattr(args, 'router_lr', 0.0)):.6f}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -2720,6 +2745,11 @@ def main() -> None:
 
     # RevDEQ: params come from shared_block
     block_named_params = list(base_model.shared_block.named_parameters())
+    router_params = [
+        p
+        for name, p in block_named_params
+        if name.endswith("attn_router.router.weight") or name.endswith("mlp_router.router.weight")
+    ]
     matrix_params = [
         p for name, p in block_named_params
         if p.ndim >= 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
@@ -2728,6 +2758,10 @@ def main() -> None:
         p for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    if router_params:
+        router_set = {id(p) for p in router_params}
+        matrix_params = [p for p in matrix_params if id(p) not in router_set]
+        scalar_params = [p for p in scalar_params if id(p) not in router_set]
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
 
@@ -2768,7 +2802,18 @@ def main() -> None:
         weight_decay=args.weight_decay,
         fused=True,
     )
+    optimizer_router = None
+    if router_params:
+        optimizer_router = torch.optim.AdamW(
+            [{"params": router_params, "lr": float(args.router_lr), "base_lr": float(args.router_lr)}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=0.0,
+            fused=True,
+        )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if optimizer_router is not None:
+        optimizers.append(optimizer_router)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -3005,6 +3050,13 @@ def main() -> None:
         else:
             time_frac = min(max(step / max(int(args.iterations), 1), 0.0), 1.0)
         late_frac = min(max((time_frac - 0.70) / 0.30, 0.0), 1.0)
+        # Strengthen hard-constraint barriers late in training so end-of-run expert health is satisfied.
+        health_scale = 1.0 + 4.0 * float(late_frac)
+        try:
+            base_model.shared_block.attn_router.health_scale = health_scale
+            base_model.shared_block.mlp_router.health_scale = health_scale
+        except Exception:
+            pass
         scale = lr_mul(step, elapsed_ms)
         # Late QAT: enable fake quantization during last 15% of warmdown
         global _QAT_ACTIVE
@@ -3082,8 +3134,8 @@ def main() -> None:
         if args.router_bias_update:
             seen: set[int] = set()
             # Late-phase scheduling: increase the loss-free bias controller strength.
-            bias_lr = float(args.router_bias_lr) * (1.0 + 3.0 * float(late_frac))  # 0.05 -> 0.20
-            bias_updates = 1 + int(round(3.0 * float(late_frac)))  # 1..4 updates/step
+            bias_lr = float(args.router_bias_lr) * (1.0 + 4.0 * float(late_frac))
+            bias_updates = 2 + int(round(6.0 * float(late_frac)))  # 2..8 updates/step
             for r in [
                 base_model.shared_block.attn.attn_router,
                 base_model.shared_block.mlp.mlp_router,
@@ -3156,6 +3208,51 @@ def main() -> None:
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
+
+    # Final expert-health check (eval-mode, small prefix). This provides a definitive
+    # "OK/FAIL" signal for the hard constraints independent of training-mode noise.
+    if master_process:
+        try:
+            seq_len = int(args.train_seq_len)
+            seqs = int(min(max(1, int(args.eval_batch_seqs)), 32))
+            raw = val_tokens[: seqs * seq_len + 1].to(device=device, dtype=torch.int64, non_blocking=True)
+            x_chk = raw[:-1].reshape(seqs, seq_len)
+            y_chk = raw[1:].reshape(seqs, seq_len)
+            base_model.eval()
+            with torch.inference_mode():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    _ = base_model(x_chk, y_chk)
+
+            def _router_stats(r: SoftDenseRouter) -> tuple[float, float]:
+                usage = getattr(r, "_expert_usage", None)
+                if not usage:
+                    return float("nan"), float("nan")
+                ms = float(min(usage))
+                cv = float(getattr(r, "_expert_balance_cv", float("nan")))
+                return ms, cv
+
+            attn_ms, attn_cv = _router_stats(base_model.shared_block.attn_router)
+            mlp_ms, mlp_cv = _router_stats(base_model.shared_block.mlp_router)
+            attn_o = float(getattr(base_model.shared_block.attn, "_out_ortho_cos_sim", float("nan")))
+            mlp_o = float(getattr(base_model.shared_block.mlp, "_out_ortho_cos_sim", float("nan")))
+            thr_share = 0.6 / float(base_model.shared_block.attn_router.num_experts)
+            ok = (
+                attn_ms >= thr_share
+                and mlp_ms >= thr_share
+                and attn_cv <= 0.20
+                and mlp_cv <= 0.20
+                and attn_o <= 0.20
+                and mlp_o <= 0.20
+            )
+            log0(
+                "final_hard_constraints:"
+                f"{'OK' if ok else 'FAIL'} "
+                f"attn_minshare:{attn_ms:.4f} attn_cv:{attn_cv:.4f} attn_ortho:{attn_o:.4f} "
+                f"mlp_minshare:{mlp_ms:.4f} mlp_cv:{mlp_cv:.4f} mlp_ortho:{mlp_o:.4f}"
+            )
+            base_model.train()
+        except Exception as e:
+            log0(f"final_hard_constraints:ERROR:{type(e).__name__}:{e}")
 
     if bool(getattr(args, "benchmark_mode", False)):
         log0("benchmark_mode:1 skipping_final_eval_and_serialization")

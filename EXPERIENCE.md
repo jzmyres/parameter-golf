@@ -59,6 +59,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - When an ablation is complete, delete the deprecated mode so logging, plots, and constraints can’t silently drift.
 - Throughput tuning must be validated against stability signals; “faster” configs that break DEQ behavior are not viable defaults.
 - Avoid saturated sigmoid gate inits; mid-point initialization keeps gradients alive and improves solver stability.
+- Routers are control modules; give them a gentle optimizer/separate LR so they don’t destabilize late training.
 
 ## Environment Sanity Checks
 - Before long runs, verify the environment can see CUDA and the dataset/tokenizer paths resolve.
