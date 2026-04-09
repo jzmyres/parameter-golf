@@ -187,10 +187,11 @@ class Hyperparameters:
     bal_loss_coef = 5e-3
     router_health_coef = 0.25
     # Periodic auxiliary loss on per-expert output-space means at z* (prefix-only for cost control).
-    # Default off for throughput; enable only when expert orthogonality needs extra shaping.
-    block_ortho_aux_coef = 0.0
-    block_ortho_aux_every = 0
-    block_ortho_aux_tokens = 128
+    # Enabled: orthogonality is a hard constraint and needs explicit enforcement under RevDEQ.
+    # Run on a small prefix every step for a dense, stable gradient signal.
+    block_ortho_aux_coef = 1.0
+    block_ortho_aux_every = 1
+    block_ortho_aux_tokens = 64
     # Loss-free load balancing (bias controller). Keeps expert utilization healthy without
     # interfering gradients from strong auxiliary losses.
     router_bias_update = True
