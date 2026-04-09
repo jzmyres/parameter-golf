@@ -47,7 +47,6 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - When you need contraction, add a single block-level gate and log it; don’t hide stability in many per-path scale knobs.
 - Intermediate DEQ supervision shapes early iterates, but it’s compute-heavy; keep it sparse and aligned with the scored output.
 - When enforcing a hard constraint, prefer a barrier loss (penalize violations only) over always-on regularization.
-- For hard constraints under expensive solvers, use frequent small-prefix barriers rather than rare full-prefix penalties.
 
 ## Refinement
 - When mixing token distributions, normalize each input distribution first and renormalize after mixing.
