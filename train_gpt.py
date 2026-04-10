@@ -219,10 +219,6 @@ class Hyperparameters:
     eval_batch_seqs = 32
 
     # Architecture knobs (defaults only; override via CLI, not env)
-    # Expert weight normalization strategy:
-    # - "pre": apply an extra RMS-normalization immediately before expert/router weight matmuls
-    # - "post": rely on block RMSNorms and normalize only expert deltas (after mixing)
-    expert_weight_norm = "post"
     bigram_vocab_size = 65536
     bigram_dim = 208
     kv_latent_dim = 0  # 0 = auto (dim//2)
@@ -269,7 +265,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--bigram-vocab-size", type=int, default=None)
     p.add_argument("--bigram-dim", type=int, default=None)
     p.add_argument("--kv-latent-dim", type=int, default=None)
-    p.add_argument("--expert-weight-norm", type=str, default=None, choices=["pre", "post"])
     p.add_argument("--attn-expert-rank", type=int, default=None)
     p.add_argument("--mlp-expert-rank", type=int, default=None)
     p.add_argument("--num-refinements-ramp-steps", type=int, default=None, help="steps with 0 refinements before enabling num_refinements")
@@ -899,7 +894,6 @@ class SoftDenseRouter(nn.Module):
         dim: int,
         num_experts: int,
         *,
-        use_prenorm_weights: bool = True,
         min_share_frac: float = 0.6,
         cv_target: float = 0.20,
         min_share_loss_weight: float = 1.0,
@@ -907,7 +901,6 @@ class SoftDenseRouter(nn.Module):
     ):
         super().__init__()
         self.num_experts = num_experts
-        self.use_prenorm_weights = bool(use_prenorm_weights)
         # Hard-constraint targets (used for training-time regularization + bias controller).
         self.min_share_frac = float(min_share_frac)
         self.cv_target = float(cv_target)
@@ -964,8 +957,9 @@ class SoftDenseRouter(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         """Returns routing weights [*, num_experts]."""
-        x_w = _rms_norm(x) if self.use_prenorm_weights else x
-        route_logits = self.router(x_w) + self.expert_bias.to(dtype=x.dtype)
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x_n = _rms_norm(x)
+        route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
         p = torch.softmax(route_logits, dim=-1)
         route_weights = p
         share = p
@@ -1043,8 +1037,7 @@ class CausalSelfAttention(nn.Module):
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 6,
-                 expert_rank: int = 0, router: SoftDenseRouter | None = None,
-                 use_prenorm_weights: bool = True):
+                 expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -1087,7 +1080,6 @@ class CausalSelfAttention(nn.Module):
         # Soft dense routing on attention output (MoE for attention). A shared router can be
         # injected by the parent block if tying is desired.
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
-        self.use_prenorm_weights = bool(use_prenorm_weights)
         self.out_ortho_coef = 0.0
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
@@ -1095,7 +1087,8 @@ class CausalSelfAttention(nn.Module):
     def forward_experts(self, x: Tensor) -> Tensor:
         """Return per-expert attention outputs [B, T, E, D] (no routing mix)."""
         bsz, seqlen, dim = x.shape
-        x_n = _rms_norm(x) if self.use_prenorm_weights else x
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x_n = _rms_norm(x)
         y = self._attn_shared_from_normed(x_n)  # [B,T,D]
         # einsum requires matching dtypes; keep compute in activation dtype under autocast.
         expert_proj = self.expert_proj.to(dtype=y.dtype)
@@ -1208,7 +1201,8 @@ class CausalSelfAttention(nn.Module):
 
     def forward_expert(self, x: Tensor, expert_idx: int) -> Tensor:
         """Return a single expert attention output [B, T, D] without materializing [B,T,E,D]."""
-        x_n = _rms_norm(x) if self.use_prenorm_weights else x
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x_n = _rms_norm(x)
         y = self._attn_shared_from_normed(x_n)  # [B,T,D]
         return self.project_expert_from_shared(y, expert_idx)
 
@@ -1250,7 +1244,6 @@ class MLP(nn.Module):
         num_experts: int = 6,
         expert_rank: int = 0,
         router: SoftDenseRouter | None = None,
-        use_prenorm_weights: bool = True,
     ):
         super().__init__()
         hidden = int(mlp_mult * dim)
@@ -1265,7 +1258,6 @@ class MLP(nn.Module):
             nn.init.xavier_uniform_(self.expert_down.data[e])
         # Soft dense routing. A shared router can be injected by the parent block if tying is desired.
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
-        self.use_prenorm_weights = bool(use_prenorm_weights)
         self.out_ortho_coef = 0.0
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
@@ -1279,7 +1271,8 @@ class MLP(nn.Module):
         """
         if x.ndim not in (3, 4):
             raise ValueError(f"MLP expects x rank 3 or 4, got shape {tuple(x.shape)}")
-        x = _rms_norm(x) if self.use_prenorm_weights else x
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x = _rms_norm(x)
         # einsum requires matching dtypes; keep compute in activation dtype under autocast.
         expert_gate = self.expert_gate.to(dtype=x.dtype)
         expert_fc = self.expert_fc.to(dtype=x.dtype)
@@ -1313,7 +1306,8 @@ class MLP(nn.Module):
         """Return a single expert MLP output [B, T, D] without materializing [B,T,E,D]."""
         if x.ndim != 3:
             raise ValueError(f"forward_expert expects x rank 3 [B,T,D], got shape {tuple(x.shape)}")
-        x = _rms_norm(x) if self.use_prenorm_weights else x
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x = _rms_norm(x)
         e = int(expert_idx)
         expert_gate = self.expert_gate[e].to(dtype=x.dtype)  # [R,D]
         expert_fc = self.expert_fc[e].to(dtype=x.dtype)      # [R,D]
@@ -1331,7 +1325,8 @@ class MLP(nn.Module):
         E = self.num_experts
         if w.shape[0] != B or w.shape[1] != T or w.shape[2] != E:
             raise ValueError(f"w must be [B,T,E={E}], got {tuple(w.shape)}")
-        x_n = _rms_norm(x) if self.use_prenorm_weights else x
+        # Pre-RMSNorm: normalize immediately before weight multiplication.
+        x_n = _rms_norm(x)
         N = B * T
         x_flat = x_n.reshape(N, D)
         w_flat = w.reshape(N, E).to(dtype=x_flat.dtype)
@@ -1620,13 +1615,8 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False,
-                 expert_weight_norm: str = "pre"):
+                 tie_attn_mlp_router: bool = False):
         super().__init__()
-        if expert_weight_norm not in ("pre", "post"):
-            raise ValueError(f"expert_weight_norm must be 'pre'|'post', got {expert_weight_norm!r}")
-        self.expert_weight_norm = str(expert_weight_norm)
-        self._use_prenorm_weights = self.expert_weight_norm == "pre"
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         # Component-level Soft Dense Routing: separate routers for attention and MLP experts.
@@ -1640,9 +1630,6 @@ class Block(nn.Module):
         else:
             self.attn_router = SoftDenseRouter(dim, 6, min_share_loss_weight=10.0, cv_loss_weight=2.0)
             self.mlp_router = SoftDenseRouter(dim, 6, min_share_loss_weight=5.0, cv_loss_weight=1.0)
-        # Apply expert/router pre-normalization consistently across tied and untied routers.
-        for r in {id(self.attn_router): self.attn_router, id(self.mlp_router): self.mlp_router}.values():
-            r.use_prenorm_weights = bool(self._use_prenorm_weights)
         self.attn = CausalSelfAttention(
             dim,
             num_heads,
@@ -1652,9 +1639,8 @@ class Block(nn.Module):
             kv_latent_dim=kv_latent_dim,
             expert_rank=attn_expert_rank,
             router=self.attn_router,
-            use_prenorm_weights=bool(self._use_prenorm_weights),
         )
-        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=self.mlp_router, use_prenorm_weights=bool(self._use_prenorm_weights))
+        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=self.mlp_router)
         # Global residual gate for the DEQ iteration update: gg(x) ∈ (0,1) per token.
         self.gg_gate = CastedLinear(dim, 1, bias=True)
         with torch.no_grad():
@@ -1724,7 +1710,7 @@ class Block(nn.Module):
 
         # Attention expert mean outputs
         x_attn = self.attn_norm(x)
-        x_attn_n = _rms_norm(x_attn) if self._use_prenorm_weights else x_attn
+        x_attn_n = _rms_norm(x_attn)
         w_attn = self.attn_router(x_attn)  # [B,t,E]
         y_shared = self.attn._attn_shared_from_normed(x_attn_n)  # [B,t,D]
         E = self.attn.num_experts
@@ -1742,7 +1728,7 @@ class Block(nn.Module):
         z1 = x + attn_mix
         x_mlp = self.mlp_norm(z1)
         w_mlp = self.mlp_router(x_mlp)
-        x_mlp_n = _rms_norm(x_mlp) if self._use_prenorm_weights else x_mlp
+        x_mlp_n = _rms_norm(x_mlp)
         N = bsz * t
         x_flat = x_mlp_n.reshape(N, dim)
         E2 = self.mlp.num_experts
@@ -1767,20 +1753,15 @@ class Block(nn.Module):
         # Attention (component-level MoE)
         x_attn = self.attn_norm(x)
         x_attn_n = _rms_norm(x_attn)
-        x_attn_w = x_attn_n if self._use_prenorm_weights else x_attn
         w_attn = self.attn_router(x_attn)  # [B,T,E]
-        y_shared = self.attn._attn_shared_from_normed(x_attn_w)  # [B,T,D]
+        y_shared = self.attn._attn_shared_from_normed(x_attn_n)  # [B,T,D]
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)  # [B,T,D]
-        if not self._use_prenorm_weights:
-            attn_mix = _rms_norm(attn_mix)
         z1 = x + attn_mix
 
         # MLP (component-level MoE)
         x_mlp = self.mlp_norm(z1)
         w_mlp = self.mlp_router(x_mlp)  # [B,T,E]
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp)  # [B,T,D]
-        if not self._use_prenorm_weights:
-            mlp_mix = _rms_norm(mlp_mix)
         z2 = z1 + mlp_mix
 
         gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)  # [B,T]
@@ -2015,7 +1996,6 @@ class GPT(nn.Module):
         block_ortho_aux_every: int = 0,
         block_ortho_aux_tokens: int = 256,
         tie_attn_mlp_router: bool = False,
-        expert_weight_norm: str = "pre",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2035,8 +2015,7 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                   attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                  tie_attn_mlp_router=bool(tie_attn_mlp_router),
-                                  expert_weight_norm=str(expert_weight_norm))
+                                  tie_attn_mlp_router=bool(tie_attn_mlp_router))
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2728,7 +2707,6 @@ def main() -> None:
         f" model_dim={int(args.model_dim)}"
         f" heads={int(args.num_heads)}"
         f" kv_heads={int(args.num_kv_heads)}"
-        f" expert_weight_norm={str(getattr(args, 'expert_weight_norm', 'pre'))}"
         " soft_topk=128"
         " moe=component"
         " router=softmax"
@@ -2771,7 +2749,6 @@ def main() -> None:
         block_ortho_aux_every=args.block_ortho_aux_every,
         block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         tie_attn_mlp_router=bool(getattr(args, "tie_attn_mlp_router", False)),
-        expert_weight_norm=str(getattr(args, "expert_weight_norm", "pre")),
     ).to(device).bfloat16()
 
     for module in base_model.modules():
