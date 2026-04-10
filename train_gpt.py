@@ -214,6 +214,8 @@ class Hyperparameters:
     tie_attn_mlp_router = True
     compile_train = False  # torch.compile(shared_block) for training speed
     benchmark_mode = False  # skip post-quant eval/serialization for speed microbenchmarks
+    # Throughput/stability ablation: compute Attn(x) and MLP(x) from the same injected state.
+    parallel_attn_mlp = False
 
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
     eval_batch_seqs = 32
@@ -289,6 +291,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--tie-attn-mlp-router", type=int, default=None, help="1/0; share a single router between attn+mlp")
     p.add_argument("--compile-train", type=int, default=None, help="1/0; torch.compile(shared_block) during training")
     p.add_argument("--benchmark-mode", type=int, default=None, help="1/0; skip final eval/quant/plots (speed bench)")
+    p.add_argument("--parallel-attn-mlp", type=int, default=None, help="1/0; MLP reads x (not attn-updated state)")
     ns, unknown = p.parse_known_args(argv)
     if unknown:
         raise SystemExit(f"Unknown args: {unknown}")
@@ -311,6 +314,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             elif key == "tie_attn_mlp_router":
                 out[key] = bool(int(v))
             elif key == "ema_enabled":
+                out[key] = bool(int(v))
+            elif key == "parallel_attn_mlp":
                 out[key] = bool(int(v))
             else:
                 out[key] = v
@@ -1638,7 +1643,8 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False):
+                 tie_attn_mlp_router: bool = False,
+                 parallel_attn_mlp: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -1664,6 +1670,9 @@ class Block(nn.Module):
             router=self.attn_router,
         )
         self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=self.mlp_router)
+        # If enabled, both attention and MLP read the same injected state x and their outputs
+        # are summed. This removes the sequential dependency (MLP(z1)) and is a throughput/stability ablation.
+        self.parallel_attn_mlp = bool(parallel_attn_mlp)
         # Global residual gate for the DEQ iteration update: gg(x) ∈ (0,1) per token.
         self.gg_gate = CastedLinear(dim, 1, bias=True)
         with torch.no_grad():
@@ -1746,10 +1755,11 @@ class Block(nn.Module):
         mu_attn = torch.einsum("er,erd->ed", mu_h, out_T)  # [E,D]
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
-        # MLP expert mean outputs (MLP input uses mixed attention output)
+        # MLP expert mean outputs.
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
         z1 = x + attn_mix
-        x_mlp = self.mlp_norm(z1)
+        x_mlp_in = x if self.parallel_attn_mlp else z1
+        x_mlp = self.mlp_norm(x_mlp_in)
         w_mlp = self.mlp_router(x_mlp)
         x_mlp_n = _rms_norm(x_mlp)
         N = bsz * t
@@ -1781,11 +1791,12 @@ class Block(nn.Module):
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)  # [B,T,D]
         z1 = x + attn_mix
 
-        # MLP (component-level MoE)
-        x_mlp = self.mlp_norm(z1)
+        # MLP (component-level MoE). Optionally read the same injected state x (parallel ablation).
+        x_mlp_in = x if self.parallel_attn_mlp else z1
+        x_mlp = self.mlp_norm(x_mlp_in)
         w_mlp = self.mlp_router(x_mlp)  # [B,T,E]
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp)  # [B,T,D]
-        z2 = z1 + mlp_mix
+        z2 = (z1 + mlp_mix) if not self.parallel_attn_mlp else (x + attn_mix + mlp_mix)
 
         gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)  # [B,T]
         if self._gg_track_enabled or self._gg_call_track_enabled:
@@ -2019,6 +2030,7 @@ class GPT(nn.Module):
         block_ortho_aux_every: int = 0,
         block_ortho_aux_tokens: int = 256,
         tie_attn_mlp_router: bool = False,
+        parallel_attn_mlp: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2038,7 +2050,8 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                   attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                  tie_attn_mlp_router=bool(tie_attn_mlp_router))
+                                  tie_attn_mlp_router=bool(tie_attn_mlp_router),
+                                  parallel_attn_mlp=bool(parallel_attn_mlp))
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2719,6 +2732,7 @@ def main() -> None:
         f" deq_k_step={int(getattr(args, 'deq_k_step', 1))}"
         f" deq_k_eval={int(args.deq_k_eval)}"
         f" compile_train={int(bool(getattr(args, 'compile_train', False)))}"
+        f" parallel_attn_mlp={int(bool(getattr(args, 'parallel_attn_mlp', False)))}"
         f" batch_tokens={int(args.train_batch_tokens)}"
         f" seq_len={int(args.train_seq_len)}"
         f" beta={float(args.deq_beta):.3f}"
@@ -2774,6 +2788,7 @@ def main() -> None:
         block_ortho_aux_every=args.block_ortho_aux_every,
         block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         tie_attn_mlp_router=bool(getattr(args, "tie_attn_mlp_router", False)),
+        parallel_attn_mlp=bool(getattr(args, "parallel_attn_mlp", False)),
     ).to(device).bfloat16()
 
     for module in base_model.modules():
