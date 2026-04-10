@@ -230,6 +230,10 @@ class Hyperparameters:
     swa_enabled = True
     swa_start_frac = 0.3
     swa_every = 25
+    # EMA knobs (record-inspired). Keep CPU-fp32 to avoid VRAM pressure.
+    ema_enabled = False
+    ema_decay = 0.997
+    ema_update_every = 1
 
 
 def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
@@ -271,6 +275,9 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--swa-enabled", type=int, default=None, help="1/0")
     p.add_argument("--swa-start-frac", type=float, default=None)
     p.add_argument("--swa-every", type=int, default=None)
+    p.add_argument("--ema-enabled", type=int, default=None, help="1/0; EMA weight averaging (CPU fp32)")
+    p.add_argument("--ema-decay", type=float, default=None)
+    p.add_argument("--ema-update-every", type=int, default=None)
     p.add_argument("--deq-backward", type=str, default=None, choices=["autograd", "revdeq"])
     p.add_argument("--deq-k-jitter", type=int, default=None, help="1/0; sample K per optimizer step")
     p.add_argument("--deq-k-min", type=int, default=None)
@@ -303,9 +310,25 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
                 out[key] = bool(int(v))
             elif key == "tie_attn_mlp_router":
                 out[key] = bool(int(v))
+            elif key == "ema_enabled":
+                out[key] = bool(int(v))
             else:
                 out[key] = v
     return out
+
+
+def update_ema_state_(
+    ema_state: dict[str, Tensor],
+    model_state: dict[str, Tensor],
+    *,
+    decay: float,
+) -> None:
+    """In-place EMA update: ema <- decay*ema + (1-decay)*model (CPU fp32)."""
+    d = float(decay)
+    alpha = 1.0 - d
+    with torch.no_grad():
+        for name, t in model_state.items():
+            ema_state[name].mul_(d).add_(t.detach().float().cpu(), alpha=alpha)
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -2711,6 +2734,8 @@ def main() -> None:
         " moe=component"
         " router=softmax"
         f" tie_router={int(bool(getattr(args, 'tie_attn_mlp_router', False)))}"
+        f" ema={int(bool(getattr(args, 'ema_enabled', False)))}"
+        f" ema_decay={float(getattr(args, 'ema_decay', 0.0)):.4f}"
     )
     log0(f"router_bias_update:{int(bool(args.router_bias_update))} lr:{float(args.router_bias_lr):.4f} clip:{float(args.router_bias_clip):.2f}")
     log0(f"router_lr:{float(getattr(args, 'router_lr', 0.0)):.6f}")
@@ -3039,6 +3064,12 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    ema_state: dict[str, Tensor] | None = None
+    ema_decay = float(getattr(args, "ema_decay", 0.0))
+    ema_every = int(getattr(args, "ema_update_every", 1))
+    if bool(getattr(args, "ema_enabled", False)):
+        ema_state = {name: t.detach().float().cpu().clone() for name, t in base_model.state_dict().items()}
+        log0(f"ema:enabled decay:{ema_decay:.4f} update_every:{ema_every}")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -3185,6 +3216,9 @@ def main() -> None:
                     )
         zero_grad_all()
 
+        if ema_state is not None and ema_every > 0 and (step % ema_every == 0):
+            update_ema_state_(ema_state, base_model.state_dict(), decay=ema_decay)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
@@ -3241,6 +3275,13 @@ def main() -> None:
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
+
+    # Apply EMA weights (record-inspired). Applied after SWA so EMA is the final averaged state.
+    if ema_state is not None:
+        log0("ema:applying EMA weights")
+        current_state = base_model.state_dict()
+        ema_cast = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+        base_model.load_state_dict(ema_cast, strict=True)
 
     # Final expert-health check (eval-mode, small prefix). This provides a definitive
     # "OK/FAIL" signal for the hard constraints independent of training-mode noise.
