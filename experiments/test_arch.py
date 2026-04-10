@@ -70,29 +70,21 @@ def test_all_constraints():
     soft = model._get_soft_embedding(z)
     assert soft.shape == z.shape, f"soft embedding must match z shape, got {tuple(soft.shape)}"
 
-    # Gate initialization: all sigmoid gates should start at midpoint 0.5 (logit/bias = 0).
-    # Gate initialization: all sigmoid gates should start near-1 (logit ~ 6; sigmoid ~ 0.9975).
     # SmearGate removed; keep the token embedding path unmodified by previous-token mixing.
     import torch.nn as nn
     assert isinstance(model.smear, nn.Identity)
-    assert _sigmoid(attn.gate_bias.float()).min().item() > 0.99
-    # Gate-logit slice of c_q should be zero-initialized.
     dim = model.tok_emb.embedding_dim
-    assert attn.c_q.weight.shape[0] == dim + attn.num_heads
-    assert torch.allclose(attn.c_q.weight[dim:, :].float(), torch.zeros_like(attn.c_q.weight[dim:, :].float()))
-    # Block-level router uses dense softmax, modulated by a per-expert sigmoid gate:
-    #   w = softmax(logits) * sigmoid(gate_logits), so sum(w) ∈ (0, 1].
+
+    # Soft Dense Routing must be pure softmax (no post-softmax sigmoid gating).
     r = mlp.mlp_router
-    assert r.gate is not None, "Block-level router must have sigmoid gates enabled"
     x = torch.randn(2, 8, dim, device=dev, dtype=z_dtype)
     with torch.no_grad():
         w = r(x)
         s = w.sum(dim=-1)
-        assert (s <= 1.0 + 1e-4).all().item()
-        assert (s >= 0.0).all().item()
-        # Near-1 init for gate bias => sum close to 1 at initialization.
+        assert (w >= 0.0).all().item()
+        assert (w <= 1.0).all().item()
         err = (s - 1.0).abs().max().item()
-    assert err < 0.02, f"route_weights sum should be close to 1 at init; max_err={err:.6f}"
+    assert err < 1e-3, f"route_weights must sum to 1 for pure softmax routing; max_err={err:.6f}"
 
     print("PASS: All 5 constraints satisfied")
 
@@ -129,17 +121,22 @@ def test_revdeq_reversibility():
     x = torch.randint(0, 1024, (1, 16), device=dev)
     y = torch.randint(0, 1024, (1, 16), device=dev)
 
-    # Use model in inference mode to trigger reconstruction verification
-    model.train(False)
-    with torch.inference_mode():
+    # Reconstruction diagnostic is produced during the RevDEQ backward path.
+    from train_gpt import router_diagnostics
+    with router_diagnostics(True, step_tag=0):
         if dev.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = model(x, y)
         else:
             loss = model(x, y)
+    loss.backward()
 
-    assert hasattr(model, '_deq_recon_error'), "Must track reconstruction error"
-    print(f"Reconstruction error: {model._deq_recon_error:.6f}")
+    assert hasattr(model, "shared_block")
+    recon = getattr(model.shared_block, "_deq_recon_error_last_bwd", None)
+    assert recon is not None, "Must produce reconstruction diagnostic under RevDEQ backward"
+    assert float(recon) >= 0.0
+    assert float(recon) < 1.0
+    print(f"Reconstruction error: {float(recon):.6f}")
     print("PASS: RevDEQ reversibility verification works")
 
 
