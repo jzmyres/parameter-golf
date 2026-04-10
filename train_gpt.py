@@ -212,7 +212,7 @@ class Hyperparameters:
     deq_k_max_ramp_steps = 1
     # Shared router is cheaper and stabilizes expert health; keep on by default.
     tie_attn_mlp_router = True
-    compile_train = True  # torch.compile(shared_block) for training speed
+    compile_train = False  # torch.compile(shared_block) for training speed
     benchmark_mode = False  # skip post-quant eval/serialization for speed microbenchmarks
 
     eval_stride = 0  # 0=standard eval; set >0 for sliding window (final only)
