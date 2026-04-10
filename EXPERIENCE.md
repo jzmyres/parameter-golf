@@ -77,7 +77,6 @@ Short, reusable guardrails to avoid common experiment mistakes.
 ## Efficiency
 - In DEQ-style models, cost scales with batch × iterations × refinements; tune these jointly to avoid runaway wall time.
 - Treat `torch.compile` as an experiment: guard it behind a flag and verify peak VRAM, since recompiles/capture can unexpectedly OOM.
-- To improve post-quant performance, try low-overhead training-time gap reducers (EMA, earlier QAT) before adding heavier quantization passes.
 
 ## Distributed
 - Any rank-conditional control flow around collectives is a correctness bug; all ranks must execute collectives in the same order.

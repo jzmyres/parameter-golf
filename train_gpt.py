@@ -138,9 +138,6 @@ class Hyperparameters:
 
     iterations = 1000
     warmdown_iters = 1000
-    # When training under a wall-clock budget, start warmdown based on time remaining.
-    # Example: warmdown_frac=0.5 => the last 50% of the wall-clock budget is warmdown.
-    warmdown_frac = 0.50
     # Warmup is intentionally expensive (it runs optimizer steps then resets model+optim state).
     # For time-budgeted iteration runs, default to 0 to avoid wasting wall-clock.
     warmup_steps = 0
@@ -233,12 +230,6 @@ class Hyperparameters:
     swa_enabled = True
     swa_start_frac = 0.3
     swa_every = 25
-    # EMA knobs (record-inspired). Keep CPU-fp32 to avoid VRAM pressure.
-    ema_enabled = True
-    ema_decay = 0.997
-    ema_update_every = 1
-    # Late QAT: enable fake quant earlier during warmdown to reduce the quant gap.
-    late_qat_threshold = 0.15
 
 
 def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
@@ -257,7 +248,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--train-log-every", type=int, default=None)
     p.add_argument("--auto-plot-on-val", type=int, default=None, help="1/0; update plots after each val run (rank0)")
     p.add_argument("--max-wallclock-seconds", type=float, default=None)
-    p.add_argument("--warmdown-frac", type=float, default=None, help="(wallclock only) fraction of time budget used for warmdown")
     p.add_argument("--attn-balance-mult", type=float, default=None)
     p.add_argument("--mlp-balance-mult", type=float, default=None)
     p.add_argument("--bal-loss-coef", type=float, default=None)
@@ -281,10 +271,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p.add_argument("--swa-enabled", type=int, default=None, help="1/0")
     p.add_argument("--swa-start-frac", type=float, default=None)
     p.add_argument("--swa-every", type=int, default=None)
-    p.add_argument("--ema-enabled", type=int, default=None, help="1/0; EMA weight averaging (CPU fp32)")
-    p.add_argument("--ema-decay", type=float, default=None)
-    p.add_argument("--ema-update-every", type=int, default=None)
-    p.add_argument("--late-qat-threshold", type=float, default=None, help="enable fake-quant when lr scale < threshold")
     p.add_argument("--deq-backward", type=str, default=None, choices=["autograd", "revdeq"])
     p.add_argument("--deq-k-jitter", type=int, default=None, help="1/0; sample K per optimizer step")
     p.add_argument("--deq-k-min", type=int, default=None)
@@ -317,58 +303,9 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
                 out[key] = bool(int(v))
             elif key == "tie_attn_mlp_router":
                 out[key] = bool(int(v))
-            elif key == "ema_enabled":
-                out[key] = bool(int(v))
             else:
                 out[key] = v
     return out
-
-
-def compute_lr_mul(
-    *,
-    step: int,
-    elapsed_ms: float,
-    iterations: int,
-    warmdown_iters: int,
-    max_wallclock_seconds: float,
-    warmdown_frac: float,
-) -> float:
-    """Compute the learning-rate multiplier for warmdown scheduling.
-
-    - If max_wallclock_seconds > 0: warmdown begins when remaining time <= warmdown_frac * budget.
-    - Else: warmdown begins at step >= iterations - warmdown_iters.
-    """
-    if warmdown_iters <= 0:
-        return 1.0
-    max_wallclock_ms = 1000.0 * max_wallclock_seconds if max_wallclock_seconds > 0 else None
-    if max_wallclock_ms is None:
-        warmdown_start = max(iterations - warmdown_iters, 0)
-        if warmdown_start <= step < iterations:
-            return max((iterations - step) / max(warmdown_iters, 1), 0.0)
-        return 1.0
-    wd_frac = float(warmdown_frac)
-    wd_frac = min(max(wd_frac, 0.0), 1.0)
-    warmdown_ms = max(wd_frac * max_wallclock_ms, 1e-9)
-    remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-    return remaining_ms / warmdown_ms if remaining_ms <= warmdown_ms else 1.0
-
-
-def update_ema_state_(
-    ema_state: dict[str, Tensor],
-    model_state: dict[str, Tensor],
-    *,
-    decay: float,
-) -> None:
-    """In-place EMA update: ema <- decay*ema + (1-decay)*model (CPU fp32)."""
-    d = float(decay)
-    alpha = 1.0 - d
-    with torch.no_grad():
-        for name, t in model_state.items():
-            ema_state[name].mul_(d).add_(t.detach().float().cpu(), alpha=alpha)
-
-
-def late_qat_active(*, scale: float, threshold: float) -> bool:
-    return float(scale) < float(threshold)
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -2762,10 +2699,6 @@ def main() -> None:
         f" batch_tokens={int(args.train_batch_tokens)}"
         f" seq_len={int(args.train_seq_len)}"
         f" beta={float(args.deq_beta):.3f}"
-        f" warmdown_frac={float(getattr(args, 'warmdown_frac', 0.5)):.2f}"
-        f" late_qat_thr={float(getattr(args, 'late_qat_threshold', 0.10)):.2f}"
-        f" ema={int(bool(getattr(args, 'ema_enabled', False)))}"
-        f" ema_decay={float(getattr(args, 'ema_decay', 0.0)):.4f}"
         f" router_health_coef={float(getattr(args, 'router_health_coef', 0.0)):.4g}"
         f" mos_ortho_coef={float(args.mos_ortho_out_coef):.4g}"
         f" block_ortho_aux_coef={float(args.block_ortho_aux_coef):.4g}"
@@ -2951,14 +2884,15 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        return compute_lr_mul(
-            step=int(step),
-            elapsed_ms=float(elapsed_ms),
-            iterations=int(args.iterations),
-            warmdown_iters=int(args.warmdown_iters),
-            max_wallclock_seconds=float(args.max_wallclock_seconds),
-            warmdown_frac=float(getattr(args, "warmdown_frac", 0.5)),
-        )
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wallclock_ms is None:
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     def format_deq_info(m: nn.Module) -> str:
         parts: list[str] = []
@@ -3105,13 +3039,6 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
-    ema_state: dict[str, Tensor] | None = None
-    ema_decay = float(getattr(args, "ema_decay", 0.0))
-    ema_every = int(getattr(args, "ema_update_every", 1))
-    if bool(getattr(args, "ema_enabled", False)):
-        # Keep EMA on CPU fp32 for stability and to avoid VRAM pressure.
-        ema_state = {name: t.detach().float().cpu().clone() for name, t in base_model.state_dict().items()}
-        log0(f"ema:enabled decay:{ema_decay:.4f} update_every:{ema_every}")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -3166,7 +3093,7 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         # Late QAT: enable fake quantization during last 15% of warmdown
         global _QAT_ACTIVE
-        _QAT_ACTIVE = late_qat_active(scale=float(scale), threshold=float(getattr(args, "late_qat_threshold", 0.10)))
+        _QAT_ACTIVE = scale < 0.10
         zero_grad_all()
         # Clear stale RevDEQ backward reconstruction diagnostic; it is only meaningful for
         # the *current* optimizer step when computed by RevDEQFunction.backward.
@@ -3258,28 +3185,18 @@ def main() -> None:
                     )
         zero_grad_all()
 
-        if ema_state is not None and ema_every > 0 and (step % ema_every == 0):
-            update_ema_state_(ema_state, base_model.state_dict(), decay=ema_decay)
-
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
         # SWA: collect checkpoints during warmdown
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
             if swa_state is None:
-                if ema_state is not None:
-                    swa_state = {name: t.detach().cpu().clone() for name, t in ema_state.items()}
-                else:
-                    swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
                 log0(f"swa:start step:{step}")
             else:
-                if ema_state is not None:
-                    for name, t in ema_state.items():
-                        swa_state[name] += t.detach().cpu()
-                else:
-                    for name, t in base_model.state_dict().items():
-                        swa_state[name] += t.detach().cpu()
+                for name, t in base_model.state_dict().items():
+                    swa_state[name] += t.detach().cpu()
                 swa_count += 1
 
         should_log_train = (
@@ -3314,13 +3231,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-
-    # Apply EMA if enabled and SWA not collected (or too few checkpoints).
-    if ema_state is not None and not (args.swa_enabled and swa_state is not None and swa_count > 1):
-        log0("ema:applying EMA weights")
-        current_state = base_model.state_dict()
-        ema_cast = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
-        base_model.load_state_dict(ema_cast, strict=True)
 
     # Apply SWA if collected
     if args.swa_enabled and swa_state is not None and swa_count > 1:
