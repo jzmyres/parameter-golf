@@ -62,6 +62,7 @@ Short, reusable guardrails to avoid common experiment mistakes.
 - Avoid saturated sigmoid gate inits; mid-point initialization keeps gradients alive and improves solver stability.
 - Routers are control modules; give them a gentle optimizer/separate LR so they don’t destabilize late training.
 - Don’t bury hard-constraint barriers behind tiny global coefficients; separate “health” losses so violations remain enforceable.
+- Treat norm placement as an ablation knob; revert quickly if it worsens stability or the scored metric.
 
 ## Environment Sanity Checks
 - Before long runs, verify the environment can see CUDA and the dataset/tokenizer paths resolve.
