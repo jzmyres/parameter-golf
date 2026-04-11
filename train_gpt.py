@@ -98,7 +98,7 @@ class Hyperparameters:
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 7200.0  # 2xL40S dev (2h autoresearch budget); set 600 for 8xH100
+    max_wallclock_seconds = 3600.0  # 2xL40S dev (1h autoresearch budget); set 600 for 8xH100
 
     # Model architecture
     vocab_size = 1024
@@ -1209,8 +1209,10 @@ class Block(nn.Module):
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        z1 = x + attn_mix
-        x_mlp = self.mlp_norm(z1)
+        # Parallel residuals without inner residual (matches forward()): the
+        # MLP reads x, not x + attn_mix.  Ortho diagnostic stays aligned with
+        # the z2 = attn + mlp form in forward().
+        x_mlp = self.mlp_norm(x)
         w_mlp = self.mlp_router(x_mlp)
         x_mlp_n = _rms_norm(x_mlp)
         N = bsz * t
@@ -1232,17 +1234,28 @@ class Block(nn.Module):
         g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
         x = z_in + g_inj * (x0 - z_in)
 
+        # Parallel residuals with the inner residual REMOVED.  Attention and
+        # MLP both read the same pre-residual input x and their outputs sum
+        # directly, without the `x +` add that the sequential and earlier
+        # parallel-residual attempts used.  The residual path is supplied
+        # entirely by the outer gg_gate below:
+        #   out = (1 - gg_tok) * z_in + gg_tok * (attn + mlp)
+        # Early training gg_tok is small so the transformation contribution
+        # is automatically gate-scaled, giving the solver a wide contraction
+        # margin; the optimizer can learn the gate to increase transformation
+        # weight as training progresses, without the ~2x update-magnitude
+        # blow-up that broke attempts 1 and 2.
         x_attn = self.attn_norm(x)
         x_attn_n = _rms_norm(x_attn)
         w_attn = self.attn_router(x_attn)
         y_shared = self.attn._attn_shared_from_normed(x_attn_n)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        z1 = x + attn_mix
 
-        x_mlp = self.mlp_norm(z1)
+        x_mlp = self.mlp_norm(x)
         w_mlp = self.mlp_router(x_mlp)
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp)
-        z2 = z1 + mlp_mix
+
+        z2 = attn_mix + mlp_mix
 
         gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)
         if self._gg_track_enabled or self._gg_call_track_enabled:
