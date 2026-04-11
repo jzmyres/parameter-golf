@@ -162,10 +162,15 @@ class Hyperparameters:
     mlp_expert_rank = 192
 
     # Weight averaging
-    swa_enabled = True
+    # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
+    # ~8.6% of random init in the EMA average (0.997^822); SWA averages 4
+    # checkpoints from a still-improving region.  Both dragged iter 0's gates
+    # toward identity and added 0.83 BPB to the post-quant val.  Test whether
+    # the DEQ fixed-point survives without weight averaging.
+    swa_enabled = False
     swa_start_frac = 0.4
     swa_every = 50
-    ema_enabled = True
+    ema_enabled = False
     ema_decay = 0.997
     ema_update_every = 1
 
@@ -2306,7 +2311,7 @@ def main() -> None:
     # is exploiting a specific iteration count rather than a true fixed point.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
     log0("k_sweep:start")
-    k_sweep_values = [4, 6, 8, 12, 16]
+    k_sweep_values = [4, 8, 16]
     k_sweep_results: dict[int, float] = {}
     for k_eval in k_sweep_values:
         base_m_for_roundtrip._deq_k_override = int(k_eval)
