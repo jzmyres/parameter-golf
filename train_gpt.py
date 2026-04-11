@@ -1209,10 +1209,8 @@ class Block(nn.Module):
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        # Parallel residuals (matches forward()): MLP reads x (same pre-residual
-        # input as attention), not x + attn_mix.  Keeps the ortho diagnostic
-        # aligned with the 0.5x-averaged forward pass.
-        x_mlp = self.mlp_norm(x)
+        z1 = x + attn_mix
+        x_mlp = self.mlp_norm(z1)
         w_mlp = self.mlp_router(x_mlp)
         x_mlp_n = _rms_norm(x_mlp)
         N = bsz * t
@@ -1234,25 +1232,17 @@ class Block(nn.Module):
         g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
         x = z_in + g_inj * (x0 - z_in)
 
-        # Parallel residuals with 0.5x lane averaging (GPT-J style, PR #1412
-        # @Robby955, #1204 @msisovic).  The raw sum form f(z) = attn(z) + mlp(z)
-        # doubles the update magnitude vs the sequential form and blows up the
-        # DEQ solver (commit 926cf63 attempt: deq_residual 976 -> 7.2e8 at
-        # step 600).  Averaging keeps the update magnitude comparable to the
-        # sequential f(z) = attn(z) + mlp(attn(z) + z), so the contraction
-        # constant stays <= 1, while still giving attn and MLP the same
-        # pre-residual input (which makes the Jacobian isotropic).
         x_attn = self.attn_norm(x)
         x_attn_n = _rms_norm(x_attn)
         w_attn = self.attn_router(x_attn)
         y_shared = self.attn._attn_shared_from_normed(x_attn_n)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
+        z1 = x + attn_mix
 
-        x_mlp = self.mlp_norm(x)
+        x_mlp = self.mlp_norm(z1)
         w_mlp = self.mlp_router(x_mlp)
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp)
-
-        z2 = x + 0.5 * (attn_mix + mlp_mix)
+        z2 = z1 + mlp_mix
 
         gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)
         if self._gg_track_enabled or self._gg_call_track_enabled:
