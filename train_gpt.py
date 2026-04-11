@@ -2226,17 +2226,18 @@ def main() -> None:
         ema_cast = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
         base_model.load_state_dict(ema_cast, strict=True)
 
-    # Tear down DDP before master-only roundtrip (run_validation uses
-    # dist.all_reduce guarded by dist.is_initialized(); destroying first
-    # makes it a clean single-GPU eval on master).
+    # Keep DDP alive through post-training validation so run_validation and
+    # sliding_window_validation can shard the val set across both ranks.
     if distributed:
         dist.barrier()
-        dist.destroy_process_group()
 
-    # Post-training quantization + roundtrip verification
+    # Master-only: quantization, compression, artifact save, decompression,
+    # and reload of dequantized weights.  These steps are inherently serial.
+    base_model.train(False)
+    meta_path: Path | None = None
+    val_bpb_q = 0.0
     if master_process:
         log0(f"Code size: {len(code.encode('utf-8'))} bytes")
-        base_model.eval()
         sd = base_model.state_dict()
         int6_cats = {"matrix", "embed", "bigram"}
         qsd, meta = mixed_quantize_int6(sd, int6_cats)
@@ -2278,53 +2279,72 @@ def main() -> None:
         deq_sd = dequantize_mixed_int6(loaded["state_dict"], loaded["meta"], sd)
         base_model.load_state_dict(deq_sd, strict=True)
 
-        base_m_for_roundtrip = base_model
-        base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
-        val_loss_q, val_bpb_q = run_validation(
+    # Broadcast the dequantized weights from master to all ranks so every
+    # rank runs eval on the same int6-roundtripped model.  Parameters and
+    # buffers iterate in deterministic registration order, so we can pair
+    # broadcasts without extra synchronization.
+    if distributed:
+        for p in base_model.parameters():
+            dist.broadcast(p.data, src=0)
+        for b in base_model.buffers():
+            dist.broadcast(b.data, src=0)
+        dist.barrier()
+
+    # All ranks: roundtrip validation sharded across the val set via DDP.
+    base_m_for_roundtrip = base_model
+    base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
+    val_loss_q, val_bpb_q = run_validation(
+        args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
+        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        full_validation=True,
+    )
+    log0(f"roundtrip_verification:done val_loss:{val_loss_q:.4f} val_bpb:{val_bpb_q:.6f}")
+
+    # DEQ fixed-point K-sweep: verify val_bpb improves (or plateaus) as K grows.
+    # A valid DEQ should converge to a fixed point — more solver iterations = better
+    # or equal quality, never worse.  Non-monotone behaviour indicates the model
+    # is exploiting a specific iteration count rather than a true fixed point.
+    # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
+    log0("k_sweep:start")
+    k_sweep_values = [4, 6, 8, 12, 16]
+    k_sweep_results: dict[int, float] = {}
+    for k_eval in k_sweep_values:
+        base_m_for_roundtrip._deq_k_override = int(k_eval)
+        _, bpb_k = run_validation(
             args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             full_validation=True,
         )
-        log0(f"roundtrip_verification:done val_loss:{val_loss_q:.4f} val_bpb:{val_bpb_q:.6f}")
+        k_sweep_results[k_eval] = float(bpb_k)
+        log0(f"k_sweep:k={k_eval} val_bpb:{bpb_k:.6f}")
+    k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
+    log0(f"k_sweep:done {k_parts}")
+    # Restore eval K for any downstream sliding-window eval.
+    base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
 
-        # DEQ fixed-point K-sweep: verify val_bpb improves (or plateaus) as K grows.
-        # A valid DEQ should converge to a fixed point — more solver iterations = better
-        # or equal quality, never worse. Non-monotone behaviour indicates the model
-        # is exploiting a specific iteration count rather than a true fixed point.
-        log0("k_sweep:start")
-        k_sweep_values = [4, 6, 8, 12, 16]
-        k_sweep_results: dict[int, float] = {}
-        for k_eval in k_sweep_values:
-            base_m_for_roundtrip._deq_k_override = int(k_eval)
-            _, bpb_k = run_validation(
-                args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                full_validation=True,
-            )
-            k_sweep_results[k_eval] = float(bpb_k)
-            log0(f"k_sweep:k={k_eval} val_bpb:{bpb_k:.6f}")
-        k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
-        log0(f"k_sweep:done {k_parts}")
-        # Restore eval K for any downstream sliding-window eval.
-        base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
+    val_stride = int(getattr(args, "eval_stride", 0))
+    if val_stride > 0:
+        log0(f"sliding_validation:start stride={val_stride}")
+        _, sliding_bpb = sliding_window_validation(
+            args, base_m_for_roundtrip, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=val_stride,
+        )
+        log0(f"sliding_validation:done val_bpb:{sliding_bpb:.6f}")
 
-        val_stride = int(getattr(args, "eval_stride", 0))
-        if val_stride > 0:
-            log0(f"sliding_validation:start stride={val_stride}")
-            _, sliding_bpb = sliding_window_validation(
-                args, base_m_for_roundtrip, rank, world_size, device,
-                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                stride=val_stride,
-            )
-            log0(f"sliding_validation:done val_bpb:{sliding_bpb:.6f}")
-
+    # Master-only: update meta.json with the final val_bpb.
+    if master_process and meta_path is not None:
+        import json
         with open(meta_path, "r") as f:
             meta_json = json.load(f)
         meta_json["val_bpb"] = val_bpb_q
         with open(meta_path, "w") as f:
             json.dump(meta_json, f)
 
-    # DDP already torn down above
+    # Tear down DDP after all eval completes.
+    if distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
