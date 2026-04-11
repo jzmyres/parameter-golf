@@ -98,7 +98,7 @@ class Hyperparameters:
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 1200.0  # 2xL40S dev; set 600 for 8xH100
+    max_wallclock_seconds = 7200.0  # 2xL40S dev (2h autoresearch budget); set 600 for 8xH100
 
     # Model architecture
     vocab_size = 1024
@@ -2273,6 +2273,27 @@ def main() -> None:
             full_validation=True,
         )
         log0(f"roundtrip_verification:done val_loss:{val_loss_q:.4f} val_bpb:{val_bpb_q:.6f}")
+
+        # DEQ fixed-point K-sweep: verify val_bpb improves (or plateaus) as K grows.
+        # A valid DEQ should converge to a fixed point — more solver iterations = better
+        # or equal quality, never worse. Non-monotone behaviour indicates the model
+        # is exploiting a specific iteration count rather than a true fixed point.
+        log0("k_sweep:start")
+        k_sweep_values = [4, 6, 8, 12, 16]
+        k_sweep_results: dict[int, float] = {}
+        for k_eval in k_sweep_values:
+            base_m_for_roundtrip._deq_k_override = int(k_eval)
+            _, bpb_k = run_validation(
+                args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                full_validation=True,
+            )
+            k_sweep_results[k_eval] = float(bpb_k)
+            log0(f"k_sweep:k={k_eval} val_bpb:{bpb_k:.6f}")
+        k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
+        log0(f"k_sweep:done {k_parts}")
+        # Restore eval K for any downstream sliding-window eval.
+        base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
 
         val_stride = int(getattr(args, "eval_stride", 0))
         if val_stride > 0:
