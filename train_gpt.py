@@ -1209,8 +1209,9 @@ class Block(nn.Module):
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        z1 = x + attn_mix
-        x_mlp = self.mlp_norm(z1)
+        # Parallel residuals: MLP reads x (same pre-residual input as attention),
+        # not x + attn_mix.  Keeps the ortho diagnostic aligned with forward().
+        x_mlp = self.mlp_norm(x)
         w_mlp = self.mlp_router(x_mlp)
         x_mlp_n = _rms_norm(x_mlp)
         N = bsz * t
@@ -1232,17 +1233,23 @@ class Block(nn.Module):
         g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
         x = z_in + g_inj * (x0 - z_in)
 
+        # Parallel residuals (GPT-J style, PR #1412 @Robby955, #1204 @msisovic):
+        # attention and MLP both read the same pre-residual input x, and their
+        # outputs sum into one residual update.  In DEQ terms this changes the
+        # iteration map from f(z) = attn(z) + mlp(attn(z) + z) to
+        # f(z) = attn(z) + mlp(z), which has a more isotropic Jacobian and is
+        # typically a tighter contraction for the solver.
         x_attn = self.attn_norm(x)
         x_attn_n = _rms_norm(x_attn)
         w_attn = self.attn_router(x_attn)
         y_shared = self.attn._attn_shared_from_normed(x_attn_n)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        z1 = x + attn_mix
 
-        x_mlp = self.mlp_norm(z1)
+        x_mlp = self.mlp_norm(x)
         w_mlp = self.mlp_router(x_mlp)
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp)
-        z2 = z1 + mlp_mix
+
+        z2 = x + attn_mix + mlp_mix
 
         gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)
         if self._gg_track_enabled or self._gg_call_track_enabled:
