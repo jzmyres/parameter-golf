@@ -97,6 +97,7 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
     losses, ntp_losses, ctp_losses = [], [], []
     recon_errors, iter_convs, residuals = [], [], []
     expert_snapshots = []
+    has_bad_grad = False  # accumulate across ALL steps (not just last)
 
     # Load a buffer of real data; sample fresh batches each step
     token_buf = _load_real_data(args.vocab_size, total_tokens=65536, seq=128)
@@ -108,7 +109,6 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
             loss = model(x, y)
         loss.backward()
 
-        has_bad_grad = False
         for name, p in model.named_parameters():
             if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
                 has_bad_grad = True
@@ -128,12 +128,17 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
                     model.forward_logits(ex)
             r = model._deq_residuals[0] if model._deq_residuals else 0.0
             residuals.append(r)
-            recon_errors.append(model._deq_recon_error)
+            recon_err = model._deq_recon_error
+            # RevDEQ backward sets recon on shared_block; transfer if available
+            if recon_err is None:
+                recon_err = getattr(model.shared_block, "_deq_recon_error_last_bwd", None)
+            recon_errors.append(recon_err)
             iter_convs.append(model._deq_iter_convergence)
             diag = _get_expert_diagnostics(model)
             expert_snapshots.append(diag)
+            recon_str = f"{recon_err:.2e}" if recon_err is not None else "N/A"
             print(f"  step {i+1}: loss={losses[-1]:.4f} ntp={ntp_losses[-1]:.4f} ctp={ctp_losses[-1]:.4f} "
-                  f"recon={model._deq_recon_error:.2e} iter_conv={model._deq_iter_convergence:.1f} residual={r:.1f}")
+                  f"recon={recon_str} iter_conv={model._deq_iter_convergence:.1f} residual={r:.1f}")
             if "mlp_usage" in diag:
                 print(f"    mlp: usage={diag['mlp_usage']} entropy={diag['mlp_entropy']:.4f} "
                       f"balance_cv={diag['mlp_balance_cv']:.4f} ortho={diag.get('mlp_ortho', 0):.4f}")
