@@ -98,7 +98,7 @@ class Hyperparameters:
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 3600.0  # 2xL40S dev (1h autoresearch budget); set 600 for 8xH100
+    max_wallclock_seconds = 7200.0  # 1xL40S dev (2h budget for single-GPU); set 600 for 8xH100
 
     # Model architecture
     vocab_size = 1024
@@ -106,7 +106,7 @@ class Hyperparameters:
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
-    model_dim = 512
+    model_dim = 768  # iter 6: up from 512, funded by bigram reduction (65536×208 → 4096×128)
     num_heads = 8
     mlp_mult = 3.0
     tie_embeddings = True
@@ -155,16 +155,21 @@ class Hyperparameters:
     deq_k_eval = 8
 
     # Architecture knobs
-    bigram_vocab_size = 65536
-    bigram_dim = 208
+    # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
+    # to 4096×128 (~590K params) to match records (2026-03-25 uses 2048×128,
+    # 2026-03-20 SmearGate uses 4096×128).  Frees ~13.1M params for the
+    # transformer body.  The freed capacity enables model_dim increase in
+    # iter 7 and mlp_mult increase in iter 8.
+    bigram_vocab_size = 4096
+    bigram_dim = 128
     kv_latent_dim = 0  # auto: dim//2
-    # iter 4: halved expert_rank to keep total rank-units constant when
-    # doubling num_experts from 8 -> 16 in Block.  Test whether more-but-
-    # smaller experts beats fewer-but-larger experts at constant compute.
-    #   8 x 128 = 1024 attn rank-units -> 16 x 64 = 1024  (identical)
-    #   8 x 192 = 1536 mlp rank-units  -> 16 x 96 = 1536  (identical)
-    attn_expert_rank = 64
-    mlp_expert_rank = 96
+    # iter 6: restored full expert_rank (128/192) at 16 experts.  The bigram
+    # reduction (65536×208 → 4096×128) freed ~13M params, which we reinvest
+    # into both model_dim (512→768) and expert capacity (rank 64/96 → 128/192).
+    # Total rank-units: 16×128=2048 attn, 16×192=3072 mlp — the highest
+    # expert capacity we've tested.
+    attn_expert_rank = 128
+    mlp_expert_rank = 192
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
