@@ -113,7 +113,7 @@ class Hyperparameters:
     rope_base = 10000.0
     logit_softcap = 30.0
     qk_gain_init = 5.0
-    deq_beta = 0.20  # iter 0: tighter solver contraction (was 0.35, but baseline's iter_conv_rel drifted 0.002->0.5 over 3k steps)
+    deq_beta = 0.10  # iter 7: beta sweep — testing most conservative value first (was 0.20, original 0.35)
 
     # Optimizer
     tied_embed_lr = 0.03
