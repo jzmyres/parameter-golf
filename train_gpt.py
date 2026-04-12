@@ -98,7 +98,7 @@ class Hyperparameters:
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 7200.0  # 1xL40S dev (2h budget for single-GPU); set 600 for 8xH100
+    max_wallclock_seconds = 3600.0  # 2xL40S dev (1h budget); set 600 for 8xH100
 
     # Model architecture
     vocab_size = 1024
@@ -1149,16 +1149,15 @@ class MoSHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    # iter 4: doubled num_experts again (8 -> 16) at constant rank-units.
-    # The Hyperparameters defaults halve attn_expert_rank (128 -> 64) and
-    # mlp_expert_rank (192 -> 96), so total rank-units (16 x 64 = 1024;
-    # 16 x 96 = 1536) and step throughput stay identical to iter 3 a3.
-    # Tests whether more-but-smaller experts beats fewer-but-larger at
-    # the same total compute.
+    # iter 6 attempt 2: 8 experts at dim=768.  16 experts at full rank
+    # (128/192) collapsed at step 400 (iter 6 a1, same failure as iter 3 a1).
+    # Scaling law: collapse risk ~ num_experts * expert_rank^2.  8 experts
+    # at rank 128 was proven stable for 743 steps in iter 3 a3.  Combined
+    # with dim=768 + reduced bigram gives a stable, high-capacity config.
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False, num_experts: int = 16):
+                 tie_attn_mlp_router: bool = False, num_experts: int = 8):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
