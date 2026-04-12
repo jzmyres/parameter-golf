@@ -106,7 +106,7 @@ class Hyperparameters:
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
-    model_dim = 768  # iter 6: up from 512, funded by bigram reduction (65536×208 → 4096×128)
+    model_dim = 896  # iter 11: dim scaling — 1024 failed smoke (rank too small), try 896
     num_heads = 8
     mlp_mult = 3.0
     tie_embeddings = True
@@ -129,7 +129,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.36  # iter 10: WD sweep continues — 0.09→0.18 gave -0.042, testing 0.36
+    weight_decay = 0.18  # optimal: sweep tested {0.09, 0.18, 0.36} — 0.18 is Pareto best (1.7539 post-int6)
     tied_embed_init_std = 0.005
 
     # Routing
@@ -163,10 +163,9 @@ class Hyperparameters:
     bigram_vocab_size = 4096
     bigram_dim = 128
     kv_latent_dim = 0  # auto: dim//2
-    # iter 7 optimum: rank 128/192 at dim=768 is Pareto best for 1h budget.
-    # iter 8 showed doubling rank to 256/384 hurts (throughput penalty > per-step gain).
-    attn_expert_rank = 128
-    mlp_expert_rank = 192
+    # iter 11: dim scaling at constant throughput — reduce rank to compensate for dim 768→896
+    attn_expert_rank = 96
+    mlp_expert_rank = 144
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
@@ -2342,17 +2341,33 @@ def main() -> None:
     # is exploiting a specific iteration count rather than a true fixed point.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
     log0("k_sweep:start")
-    k_sweep_values = [4, 8, 16]
+    k_sweep_values = [4, 8, 16, 32, 64]  # extrapolate beyond training K to test true convergence
     k_sweep_results: dict[int, float] = {}
     for k_eval in k_sweep_values:
         base_m_for_roundtrip._deq_k_override = int(k_eval)
-        _, bpb_k = run_validation(
-            args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            full_validation=True,
-        )
+        # Enable router diagnostics so gg_iter + DEQ convergence are captured per K.
+        with router_diagnostics(enabled=True, step_tag=k_eval):
+            _, bpb_k = run_validation(
+                args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                full_validation=True,
+            )
         k_sweep_results[k_eval] = float(bpb_k)
-        log0(f"k_sweep:k={k_eval} val_bpb:{bpb_k:.6f}")
+        # Log val_bpb + per-iteration gg trajectory + DEQ diagnostics for this K.
+        diag_parts = [f"val_bpb:{bpb_k:.6f}"]
+        gg_iter = getattr(base_m_for_roundtrip, "_gg_iter_last_solve", None)
+        if gg_iter and len(gg_iter) > 0:
+            diag_parts.append(f"gg_iter:[{','.join(f'{v:.3f}' for v in gg_iter)}]")
+        gg_mean = getattr(base_m_for_roundtrip, "_gg_mean_last_solve", None)
+        if gg_mean is not None:
+            diag_parts.append(f"gg_mean:{gg_mean:.4f}")
+        conv_rel = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel", None)
+        if conv_rel is not None:
+            diag_parts.append(f"iter_conv_rel:{conv_rel:.6f}")
+        residual_list = getattr(base_m_for_roundtrip, "_deq_residuals", None)
+        if residual_list and len(residual_list) > 0:
+            diag_parts.append(f"residual:{residual_list[-1]:.2f}")
+        log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
     k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
     log0(f"k_sweep:done {k_parts}")
     # Restore eval K for any downstream sliding-window eval.
