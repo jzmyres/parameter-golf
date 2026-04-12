@@ -158,8 +158,13 @@ class Hyperparameters:
     bigram_vocab_size = 65536
     bigram_dim = 208
     kv_latent_dim = 0  # auto: dim//2
-    attn_expert_rank = 128
-    mlp_expert_rank = 192
+    # iter 4: halved expert_rank to keep total rank-units constant when
+    # doubling num_experts from 8 -> 16 in Block.  Test whether more-but-
+    # smaller experts beats fewer-but-larger experts at constant compute.
+    #   8 x 128 = 1024 attn rank-units -> 16 x 64 = 1024  (identical)
+    #   8 x 192 = 1536 mlp rank-units  -> 16 x 96 = 1536  (identical)
+    attn_expert_rank = 64
+    mlp_expert_rank = 96
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
@@ -1139,18 +1144,16 @@ class MoSHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    # iter 3 attempt 3: num_experts bumped from 6 to 8 in attn + mlp.  Attempt 1
-    # tried 12 experts and routing collapsed at step 400 (one expert taking
-    # 51% of routing) -- the existing routing regularization was tuned for 6
-    # experts and didn't scale to 12.  Attempt 2 tried 12 experts + 2x routing
-    # regularization and the smoke test failed (the strong regularization
-    # broke DEQ reversibility, recon_err 1.95e-3 -> 3.74).  Pivot to a smaller
-    # capacity bump: 8 experts (+33%) which adds ~0.85M params and should be
-    # within the existing routing regularization's stable region.
+    # iter 4: doubled num_experts again (8 -> 16) at constant rank-units.
+    # The Hyperparameters defaults halve attn_expert_rank (128 -> 64) and
+    # mlp_expert_rank (192 -> 96), so total rank-units (16 x 64 = 1024;
+    # 16 x 96 = 1536) and step throughput stay identical to iter 3 a3.
+    # Tests whether more-but-smaller experts beats fewer-but-larger at
+    # the same total compute.
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False, num_experts: int = 8):
+                 tie_attn_mlp_router: bool = False, num_experts: int = 16):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
