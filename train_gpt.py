@@ -113,7 +113,7 @@ class Hyperparameters:
     rope_base = 10000.0
     logit_softcap = 30.0
     qk_gain_init = 5.0
-    deq_beta = 0.10  # iter 7: beta sweep — testing most conservative value first (was 0.20, original 0.35)
+    deq_beta = 0.05  # iter 7b: beta sweep continues — β=0.10 beat β=0.20 by 0.022 BPB, testing even lower
 
     # Optimizer
     tied_embed_lr = 0.03
