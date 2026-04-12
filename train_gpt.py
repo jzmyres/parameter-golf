@@ -129,7 +129,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.06
+    weight_decay = 0.09  # iter 5: records consistently use 0.085-0.095; higher WD shrinks weights → better int6 compression
     tied_embed_init_std = 0.005
 
     # Routing
@@ -1987,7 +1987,7 @@ def main() -> None:
     optimizer_tok = torch.optim.AdamW(tok_params, betas=(args.beta1, args.beta2),
                                        eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
     optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum,
-                          backend_steps=args.muon_backend_steps, weight_decay=0.04)
+                          backend_steps=args.muon_backend_steps, weight_decay=args.weight_decay)
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.AdamW(
