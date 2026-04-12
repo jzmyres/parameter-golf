@@ -129,7 +129,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.09  # iter 5: records consistently use 0.085-0.095; higher WD shrinks weights → better int6 compression
+    weight_decay = 0.18  # iter 9: WD scaling test — 0.06→0.09 gave -0.25 BPB, test if doubling again helps
     tied_embed_init_std = 0.005
 
     # Routing
@@ -163,12 +163,10 @@ class Hyperparameters:
     bigram_vocab_size = 4096
     bigram_dim = 128
     kv_latent_dim = 0  # auto: dim//2
-    # iter 8: double expert_rank to fill artifact budget.  Current config
-    # (dim=768, 8exp, rank 128/192) only uses 5 MB of 16 MB budget = 11 MB
-    # headroom.  Doubling rank: 9.1M → 14.2M params, artifact ~10.7 MB.
-    # Expert capacity: 8×256=2048 attn, 8×384=3072 mlp rank-units.
-    attn_expert_rank = 256
-    mlp_expert_rank = 384
+    # iter 7 optimum: rank 128/192 at dim=768 is Pareto best for 1h budget.
+    # iter 8 showed doubling rank to 256/384 hurts (throughput penalty > per-step gain).
+    attn_expert_rank = 128
+    mlp_expert_rank = 192
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
