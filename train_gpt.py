@@ -1160,7 +1160,17 @@ class Block(nn.Module):
         self.gg_gate = CastedLinear(dim, 1, bias=True)
         with torch.no_grad():
             self.gg_gate.weight.zero_()
-            self.gg_gate.bias.zero_()
+            # iter 2: initialize gg_gate.bias = 1.5 so init gg_tok = sigmoid(1.5)
+            # ~ 0.82.  Combined with deq_beta=0.20, the per-iteration update at
+            # init is 0.20 * 0.82 = 0.164 (~3.7x larger than iter 1's converged
+            # 0.044), so K matters: K=4 reaches ~49% of the fixed point, K=8
+            # reaches ~76%, K=16 reaches ~94%.  In iter 1 the model learned
+            # gg_tok ~ 0.22 and the K-sweep was flat (k4=k8=k16=1.6209) because
+            # the solver converged in <4 iters and the iterative depth was
+            # wasted.  Starting high lets the optimizer choose whether to use
+            # the depth -- if it lowers gg_tok again, we know the model is
+            # actively choosing shallow; if it stays high, we get real depth.
+            self.gg_gate.bias.fill_(1.5)
         self._gg_last: float | None = None
         self._gg_track_enabled = False
         self._gg_sum = 0.0
