@@ -1139,24 +1139,30 @@ class MoSHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
+    # iter 3: num_experts doubled from 6 to 12 in attn + mlp.  Iter 2 showed
+    # the model actively prefers shallow DEQ (lowers gg_tok back to ~0.11 from
+    # init 0.82) regardless of initialization, so we add capacity in the
+    # regime the model actually likes instead of fighting it.  Adds ~2.55M
+    # params (14% growth) and ~1.9 MB to the int6 artifact (8.87 MB -> ~10.8
+    # MB, well under the 16 MB budget).
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False):
+                 tie_attn_mlp_router: bool = False, num_experts: int = 12):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         if bool(tie_attn_mlp_router):
-            shared = SoftDenseRouter(dim, 6, min_share_loss_weight=10.0, cv_loss_weight=2.0)
+            shared = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0)
             self.attn_router = shared
             self.mlp_router = shared
         else:
-            self.attn_router = SoftDenseRouter(dim, 6, min_share_loss_weight=10.0, cv_loss_weight=2.0)
-            self.mlp_router = SoftDenseRouter(dim, 6, min_share_loss_weight=5.0, cv_loss_weight=1.0)
+            self.attn_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0)
+            self.mlp_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=5.0, cv_loss_weight=1.0)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                         kv_latent_dim=kv_latent_dim, expert_rank=attn_expert_rank,
-                                         router=self.attn_router)
-        self.mlp = MLP(dim, mlp_mult, expert_rank=mlp_expert_rank, router=self.mlp_router)
+                                         kv_latent_dim=kv_latent_dim, num_experts=num_experts,
+                                         expert_rank=attn_expert_rank, router=self.attn_router)
+        self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.mlp_router)
         self.gg_gate = CastedLinear(dim, 1, bias=True)
         with torch.no_grad():
             self.gg_gate.weight.zero_()
