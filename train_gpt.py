@@ -1139,16 +1139,18 @@ class MoSHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    # iter 3: num_experts doubled from 6 to 12 in attn + mlp.  Iter 2 showed
-    # the model actively prefers shallow DEQ (lowers gg_tok back to ~0.11 from
-    # init 0.82) regardless of initialization, so we add capacity in the
-    # regime the model actually likes instead of fighting it.  Adds ~2.55M
-    # params (14% growth) and ~1.9 MB to the int6 artifact (8.87 MB -> ~10.8
-    # MB, well under the 16 MB budget).
+    # iter 3 attempt 3: num_experts bumped from 6 to 8 in attn + mlp.  Attempt 1
+    # tried 12 experts and routing collapsed at step 400 (one expert taking
+    # 51% of routing) -- the existing routing regularization was tuned for 6
+    # experts and didn't scale to 12.  Attempt 2 tried 12 experts + 2x routing
+    # regularization and the smoke test failed (the strong regularization
+    # broke DEQ reversibility, recon_err 1.95e-3 -> 3.74).  Pivot to a smaller
+    # capacity bump: 8 experts (+33%) which adds ~0.85M params and should be
+    # within the existing routing regularization's stable region.
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False, num_experts: int = 12):
+                 tie_attn_mlp_router: bool = False, num_experts: int = 8):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
