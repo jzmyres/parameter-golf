@@ -106,7 +106,7 @@ class Hyperparameters:
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
-    model_dim = 896  # iter 11: dim scaling — 1024 failed smoke (rank too small), try 896
+    model_dim = 768  # optimal: dim sweep showed 768 > 896 > 1024 (expert rank more valuable than shared attn width)
     num_heads = 8
     mlp_mult = 3.0
     tie_embeddings = True
@@ -129,7 +129,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.18  # optimal: sweep tested {0.09, 0.18, 0.36} — 0.18 is Pareto best (1.7539 post-int6)
+    weight_decay = 0.36  # iter 12: high-WD rerun with K={4,8,16,32,64} sweep to test DEQ extrapolation
     tied_embed_init_std = 0.005
 
     # Routing
@@ -163,9 +163,9 @@ class Hyperparameters:
     bigram_vocab_size = 4096
     bigram_dim = 128
     kv_latent_dim = 0  # auto: dim//2
-    # iter 11: dim scaling at constant throughput — reduce rank to compensate for dim 768→896
-    attn_expert_rank = 96
-    mlp_expert_rank = 144
+    # optimal: rank 128/192 at dim=768, 8 experts
+    attn_expert_rank = 128
+    mlp_expert_rank = 192
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
