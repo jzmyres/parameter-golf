@@ -2032,6 +2032,15 @@ def main() -> None:
         gg_mean = getattr(m, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             parts.append(f"gg_mean:{float(gg_mean):.4f}")
+        # Per-DEQ-iteration gg trajectory: each entry is the average gg_tok
+        # over the (y, z) sub-call pair at iteration index i.  A *decreasing*
+        # trend across iterations means the model is making smaller updates
+        # as it approaches the fixed point -- desirable.  A flat trend means
+        # the iterative depth is wasted.
+        gg_iter = getattr(m, "_gg_iter_last_solve", None)
+        if gg_iter is not None and len(gg_iter) > 0:
+            iter_str = ",".join(f"{float(v):.3f}" for v in gg_iter)
+            parts.append(f"gg_iter:[{iter_str}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
