@@ -129,7 +129,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.18  # iter 9: WD scaling test — 0.06→0.09 gave -0.25 BPB, test if doubling again helps
+    weight_decay = 0.36  # iter 10: WD sweep continues — 0.09→0.18 gave -0.042, testing 0.36
     tied_embed_init_std = 0.005
 
     # Routing
