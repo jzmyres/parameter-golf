@@ -113,7 +113,7 @@ class Hyperparameters:
     rope_base = 10000.0
     logit_softcap = 30.0
     qk_gain_init = 5.0
-    deq_beta = 0.05  # iter 7b: beta sweep continues — β=0.10 beat β=0.20 by 0.022 BPB, testing even lower
+    deq_beta = 0.10  # optimal: sweep tested {0.05, 0.10, 0.20} — U-shaped, 0.10 is Pareto best (1.796 post-int6)
 
     # Optimizer
     tied_embed_lr = 0.03
@@ -163,13 +163,12 @@ class Hyperparameters:
     bigram_vocab_size = 4096
     bigram_dim = 128
     kv_latent_dim = 0  # auto: dim//2
-    # iter 6: restored full expert_rank (128/192) at 16 experts.  The bigram
-    # reduction (65536×208 → 4096×128) freed ~13M params, which we reinvest
-    # into both model_dim (512→768) and expert capacity (rank 64/96 → 128/192).
-    # Total rank-units: 16×128=2048 attn, 16×192=3072 mlp — the highest
-    # expert capacity we've tested.
-    attn_expert_rank = 128
-    mlp_expert_rank = 192
+    # iter 8: double expert_rank to fill artifact budget.  Current config
+    # (dim=768, 8exp, rank 128/192) only uses 5 MB of 16 MB budget = 11 MB
+    # headroom.  Doubling rank: 9.1M → 14.2M params, artifact ~10.7 MB.
+    # Expert capacity: 8×256=2048 attn, 8×384=3072 mlp rank-units.
+    attn_expert_rank = 256
+    mlp_expert_rank = 384
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
