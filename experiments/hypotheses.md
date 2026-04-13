@@ -272,26 +272,26 @@ The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ req
 | **27** | Single-step diffusion CTP (noisy soft-embed + denoise) | H16 — enriches embedding gradients | Phase 5 best |
 | **28** | LeakyReLU(0.5)² in MLP experts | Records evidence — consistent wins | Phase 5 best |
 
-### Phase 7: Scaling law grid (at locked config)
-
-Locked config: WD=0.72, β=0.20, K jitter {4,8,12,16}, 8exp, dim=768, post-norm, untied router sigmoid gates, best injection mechanism from Phase 5, batched Muon NS, compiled shared_block.
-
-| Iter | Config change | Variable | Depends on |
-|---|---|---|---|
-| 29 | dim=512, rank=128/192, 8exp | dim↓ (baseline comparison) | Phase 6 |
-| 30 | dim=1024, rank=96/144, 8exp | dim↑ (test if post-norm enables larger dim) | Phase 6 |
-| 31 | dim=768, rank=192/288, 4exp | fewer experts, higher rank | Phase 6 |
-| 32 | dim=768, rank=96/144, 12exp | more experts, lower rank (H5 confirmed stable at WD=0.72) | Phase 6 |
-| 33 | dim=768, rank=128/192, 8exp, mlp_mult=4 | wider MLP | Phase 6 |
-
-### Phase 8: Advanced techniques (if gap to record > 0.3 BPB)
+### Phase 7: Advanced techniques (if gap to record > 0.3 BPB)
 
 | Iter | Config change | Hypothesis | Depends on |
 |---|---|---|---|
-| 34 | OrthoInit on all large weight matrices | Records evidence — better gradient propagation through DEQ | Phase 7 |
-| 35 | Skip gates between DEQ iterations (U-Net style) | Adapted from records 2026-04-09 | Phase 7 |
-| 36 | Gated attention gate position (before SDPA vs after) | Records + paper arXiv 2505.06708 | Phase 7 |
-| 37 | MoS head rework (FSQ levels + rank sweep) | Output head capacity tuning | Phase 7 |
+| 29 | OrthoInit on all large weight matrices | Records evidence — better gradient propagation through DEQ | Phase 6 |
+| 30 | Skip gates between DEQ iterations (U-Net style) | Adapted from records 2026-04-09 | Phase 6 |
+| 31 | Gated attention gate position (before SDPA vs after) | Records + paper arXiv 2505.06708 | Phase 6 |
+| 32 | MoS head rework (FSQ levels + rank sweep) | Output head capacity tuning | Phase 6 |
+
+### Phase 8: Scaling law grid (FINAL — locked config)
+
+Locked config: WD=0.72, β=0.20, K jitter {4,8,12,16}, 8exp, dim=768, post-norm, untied router sigmoid gates, best injection mechanism from Phase 5, batched Muon NS, compiled shared_block, best techniques from Phase 7.
+
+| Iter | Config change | Variable | Depends on |
+|---|---|---|---|
+| 33 | dim=512, rank=128/192, 8exp | dim↓ (baseline comparison) | Phase 7 |
+| 34 | dim=1024, rank=96/144, 8exp | dim↑ (test if post-norm enables larger dim) | Phase 7 |
+| 35 | dim=768, rank=192/288, 4exp | fewer experts, higher rank | Phase 7 |
+| 36 | dim=768, rank=96/144, 12exp | more experts, lower rank (H5 confirmed stable at WD=0.72) | Phase 7 |
+| 37 | dim=768, rank=128/192, 8exp, mlp_mult=4 | wider MLP | Phase 7 |
 
 ### Permanent protocol for all iterations
 - K jitter: {4, 8, 12, 16} (train at varying K to force good FP — H12 VERIFIED)
@@ -303,5 +303,13 @@ Locked config: WD=0.72, β=0.20, K jitter {4,8,12,16}, 8exp, dim=768, post-norm,
 - Locked (WD, β) = (0.72, 0.20) unless explicitly testing a WD/β hypothesis
 - Post-norm on Block output is load-bearing — do not remove (H20)
 - Muon NS must operate at correct tensor granularity — verify shape for any new param groups (H21)
-- Post-int6 hard assertions: expert health (CV<0.5, entropy>70%), gate trend (active gg), FP convergence (K-sweep monotone within 0.005, conv_rel<0.1)
+- **Post-int6 HARD assertions** (run fails if any violated, DDP-global aggregation):
+  - Per-component min_share ≥ 0.6/E (weakest expert ≥60% of fair share)
+  - Per-component balance_cv ≤ 0.20 (routing balance)
+  - Per-component ortho ≤ 0.20 (max-mean |cos|, not mean-|cos|)
+  - gg_max ≥ 0.3 AND gg_min ≤ 0.95 (gate active, not collapsed/saturated)
+  - inj_max ≥ 0.05 AND inj_mean ≥ 0.01 (x0 injection non-zero — H23 DEQ input-dependence)
+  - K-sweep monotone from K=8 (Δ ≤ 0.005), worst K≥16 within 0.03 of best
+  - iter_conv_rel ≤ 0.1 at highest K
+- **Artifact budget HARD cap**: code + compressed model ≤ 16,000,000 bytes (fails early)
 - Untied attn/mlp routers (separate sigmoid gates and routing weights per component)

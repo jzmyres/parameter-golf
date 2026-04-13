@@ -655,11 +655,13 @@ class DistributedTokenLoader:
         # materializes its own per_rank_span slice.  Avoids the old O(world_size)
         # read-then-slice pattern where every rank read all ranks' data.
         self.stream.skip(self.rank * per_rank_span)
-        local = self.stream.take(per_rank_span).to(dtype=torch.int64)
+        local_u16 = self.stream.take(per_rank_span)  # CPU uint16 (memmap-backed)
         self.stream.skip((self.world_size - 1 - self.rank) * per_rank_span)
+        # Single fused op: CPU uint16 → GPU int64 (skips intermediate CPU int64 copy).
+        local = local_u16.to(self.device, dtype=torch.int64, non_blocking=True)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
-        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+        return x, y
 
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1010,10 @@ class CausalSelfAttention(nn.Module):
                 mu_h = h.reshape(B * T, E, R).mean(dim=0).to(dtype=torch.float32)
                 out_T = self.expert_out.to(dtype=mu_h.dtype)
                 mu_out = torch.einsum("er,erd->ed", mu_h, out_T)
-                self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu_out).item())
+                # Max-mean |cos| — stricter than mean-|cos|: flags the WORST
+                # expert's mean similarity to the others.  Required for the
+                # post-int6 hard assertion on expert diversity.
+                self._out_ortho_cos_sim = float(max_mean_abs_offdiag_cosine(mu_out).item())
 
         return out.reshape(B, T, D)
 
@@ -1074,7 +1079,8 @@ class MLP(nn.Module):
             with torch.no_grad():
                 mu_h = h.reshape(N, E, R).mean(dim=0).to(dtype=torch.float32)
                 mu_out = torch.einsum("er,erd->ed", mu_h, self.expert_down.to(dtype=mu_h.dtype))
-                self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu_out).item())
+                # Max-mean |cos| (worst expert's mean similarity to others).
+                self._out_ortho_cos_sim = float(max_mean_abs_offdiag_cosine(mu_out).item())
 
         return out.reshape(B, T, D)
 
@@ -2471,7 +2477,8 @@ def main() -> None:
     meta_path: Path | None = None
     val_bpb_q = 0.0
     if master_process:
-        log0(f"Code size: {len(code.encode('utf-8'))} bytes")
+        code_bytes = len(code.encode('utf-8'))
+        log0(f"Code size: {code_bytes} bytes")
         sd = base_model.state_dict()
         # Save full-precision (bf16) weights before quantization for diagnostic
         # re-evaluation (K-sweep at new K values, gate analysis) without retraining.
@@ -2491,6 +2498,18 @@ def main() -> None:
             compressed = zlib.compress(raw_bytes, 9)
         artifact_bytes = len(compressed)
         log0(f"artifact_bytes:{artifact_bytes} compressor:{_COMPRESSOR}")
+
+        # Parameter Golf HARD budget: total = code + compressed model ≤ 16,000,000 bytes.
+        # Failing this means the artifact violates the competition constraint; we
+        # fail early (before the expensive roundtrip eval) so a bad run doesn't
+        # waste compute pretending to succeed.
+        total_bytes = code_bytes + artifact_bytes
+        log0(f"total_bytes:{total_bytes} (code:{code_bytes} + artifact:{artifact_bytes}) budget:16000000")
+        if total_bytes > 16_000_000:
+            raise RuntimeError(
+                f"Artifact budget violated: total_bytes={total_bytes} > 16,000,000 "
+                f"(code={code_bytes} + artifact={artifact_bytes})"
+            )
 
         weights_dir = Path("experiments/weights/current")
         weights_dir.mkdir(parents=True, exist_ok=True)
@@ -2597,73 +2616,141 @@ def main() -> None:
     k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
     log0(f"k_sweep:done {k_parts}")
 
-    # ── Final hard assertions on post-int6 model health ──────────────────
-    # These run after the K-sweep so all diagnostics are populated from the
-    # K=128 (or highest K) eval pass.  Failures are logged as warnings, not
-    # crashes, so the run still produces usable data — but they flag issues
-    # that should be investigated before promoting to baseline.
-    _assert_warnings: list[str] = []
+    # ── Final HARD assertions on post-int6 model health ──────────────────
+    # Run after the K-sweep so all diagnostics are populated from the highest
+    # K eval pass.  These are HARD failures — they raise RuntimeError if the
+    # trained model violates the architectural invariants (expert health,
+    # DEQ input-dependence, FP convergence).  The run cannot be promoted to
+    # baseline unless every assertion passes.
+    #
+    # Expert usage + CV are rank-local per-router state (from the fast K-sweep
+    # eval which only batched a subset), so we DDP-all-reduce them here to get
+    # the global view that actually matters.
+    _failures: list[str] = []
 
-    # 1. Expert health: balanced usage + orthogonality
-    for prefix, router in (("attn", getattr(base_m_for_roundtrip.shared_block.attn, "attn_router", None)),
-                           ("mlp", getattr(base_m_for_roundtrip.shared_block.mlp, "mlp_router", None))):
+    # Helper: DDP-global mean of a scalar float (None→None pass-through).
+    def _ddp_mean_scalar(x: float | None) -> float | None:
+        if x is None:
+            return None
+        if distributed:
+            t = torch.tensor([float(x)], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            return float(t.item()) / float(world_size)
+        return float(x)
+
+    # Helper: DDP-global mean of a 1D usage vector (None→None pass-through).
+    def _ddp_mean_vec(v: list[float] | None) -> list[float] | None:
+        if v is None:
+            return None
+        t = torch.tensor([float(x) for x in v], device=device)
+        if distributed:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            t = t / float(world_size)
+        return t.detach().cpu().tolist()
+
+    # 1. Expert health per component (DDP-global).  Hard requirements:
+    #      min_share ≥ 0.6 / E   (weakest expert gets ≥60% of its fair share)
+    #      balance_cv ≤ 0.20     (mean-share dispersion across experts)
+    #      ortho     ≤ 0.20     (max-mean |cos| — worst expert's similarity)
+    for prefix, router, ortho_host in (
+        ("attn", getattr(base_m_for_roundtrip.shared_block.attn, "attn_router", None),
+                 getattr(base_m_for_roundtrip.shared_block, "attn", None)),
+        ("mlp",  getattr(base_m_for_roundtrip.shared_block.mlp, "mlp_router", None),
+                 getattr(base_m_for_roundtrip.shared_block, "mlp", None)),
+    ):
         if router is None:
             continue
-        cv = getattr(router, "_expert_balance_cv", None)
-        if cv is not None and float(cv) > 0.5:
-            _assert_warnings.append(f"{prefix}_balance_cv={cv:.3f} > 0.5 (routing imbalance)")
-        ent = getattr(router, "_expert_entropy", None)
-        n_exp = getattr(router, "num_experts", 8)
-        max_ent = math.log(n_exp)
-        if ent is not None and max_ent > 0 and float(ent) / max_ent < 0.7:
-            _assert_warnings.append(f"{prefix}_entropy={ent:.3f} < 70% of max ({max_ent:.3f}) (expert collapse)")
-    for attr_name in ("attn", "mlp"):
-        ortho = getattr(getattr(base_m_for_roundtrip.shared_block, attr_name, None), "_out_ortho_cos_sim", None)
-        if ortho is not None and float(ortho) > 0.3:
-            _assert_warnings.append(f"{attr_name}_ortho={ortho:.3f} > 0.3 (experts not diverse)")
+        n_exp = int(getattr(router, "num_experts", 8))
+        usage = _ddp_mean_vec(getattr(router, "_expert_usage", None))
+        if usage is not None and len(usage) > 0:
+            min_share = float(min(usage))
+            min_share_thresh = 0.6 / float(n_exp)
+            if min_share < min_share_thresh:
+                _failures.append(
+                    f"{prefix}_min_share={min_share:.4f} < {min_share_thresh:.4f} "
+                    f"(=0.6/{n_exp} — weakest expert below 60% of fair share)"
+                )
+            # Recompute CV from the global-mean usage vector so it's not
+            # rank-local: CV = std / mean of the DDP-averaged per-expert shares.
+            m = sum(usage) / float(len(usage))
+            var = sum((u - m) ** 2 for u in usage) / float(len(usage))
+            cv = (var ** 0.5) / max(m, 1e-8)
+            if cv > 0.20:
+                _failures.append(f"{prefix}_balance_cv={cv:.4f} > 0.20 (routing imbalance)")
+        ortho = _ddp_mean_scalar(getattr(ortho_host, "_out_ortho_cos_sim", None))
+        if ortho is not None and ortho > 0.20:
+            _failures.append(
+                f"{prefix}_ortho={ortho:.4f} > 0.20 (max-mean |cos| — experts not diverse)"
+            )
 
-    # 2. Global gate trend: gg should be active (not collapsed to 0 or 1)
+    # 2. Global gate trend: gg must be active (not collapsed to 0 or 1).
     gg_iter_final = getattr(base_m_for_roundtrip, "_gg_iter_last_solve", None)
     if gg_iter_final and len(gg_iter_final) >= 4:
         gg_min = min(gg_iter_final)
         gg_max = max(gg_iter_final)
         if gg_max < 0.3:
-            _assert_warnings.append(f"gg_max={gg_max:.3f} < 0.3 (gate collapsed — model not using DEQ iterations)")
+            _failures.append(f"gg_max={gg_max:.3f} < 0.3 (gate collapsed — DEQ iterations unused)")
         if gg_min > 0.95:
-            _assert_warnings.append(f"gg_min={gg_min:.3f} > 0.95 (gate saturated — no convergence signal)")
+            _failures.append(f"gg_min={gg_min:.3f} > 0.95 (gate saturated — no convergence signal)")
 
-    # 3. FP convergence: K-sweep should be monotone-improving or plateauing
+    # 3. Injection gate: x0 must be injected sometimes so the fixed point
+    #    remains input-specific (H23).  Hard requirement: max inj_iter ≥ 0.05
+    #    AND mean inj_iter ≥ 0.01.  A vanishing injection means `f(z, x0) ≈ f(z)`
+    #    at late iterations, so different inputs can converge to the same z*.
+    inj_iter_final = getattr(base_m_for_roundtrip, "_inj_iter_last_solve", None)
+    if inj_iter_final and len(inj_iter_final) > 0:
+        inj_max = max(inj_iter_final)
+        inj_mean = sum(inj_iter_final) / len(inj_iter_final)
+        if inj_max < 0.05:
+            _failures.append(
+                f"inj_max={inj_max:.4f} < 0.05 (injection collapsed — DEQ fixed point "
+                f"no longer input-specific, violates z* = f(z*, x0), see H23)"
+            )
+        if inj_mean < 0.01:
+            _failures.append(
+                f"inj_mean={inj_mean:.4f} < 0.01 (avg injection near zero — "
+                f"x0 dependence lost across solver)"
+            )
+
+    # 4. FP convergence: K-sweep should be monotone-improving or plateauing.
     if len(k_sweep_results) >= 2:
         ks_sorted = sorted(k_sweep_results.items())
         best_bpb = min(v for _, v in ks_sorted)
         worst_high_k = max(v for k, v in ks_sorted if k >= 16) if any(k >= 16 for k, _ in ks_sorted) else None
         if worst_high_k is not None and worst_high_k - best_bpb > 0.03:
-            _assert_warnings.append(
+            _failures.append(
                 f"K-sweep degradation: best={best_bpb:.4f} worst_k>=16={worst_high_k:.4f} "
-                f"(Δ={worst_high_k - best_bpb:.4f} > 0.03 — input-dependence may be lost at high K, see H23)"
+                f"(Δ={worst_high_k - best_bpb:.4f} > 0.03 — FP quality lost at deep K, see H23)"
             )
-        # Check monotonicity from K=8 onward (K=4 may be legitimately worse due to under-iteration)
+        # Check monotonicity from K=8 onward (K=4 may be legitimately worse due to under-iteration).
         ks_from_8 = [(k, v) for k, v in ks_sorted if k >= 8]
         for i in range(1, len(ks_from_8)):
             if ks_from_8[i][1] > ks_from_8[i-1][1] + 0.005:
-                _assert_warnings.append(
+                _failures.append(
                     f"K-sweep non-monotone: k={ks_from_8[i-1][0]} bpb={ks_from_8[i-1][1]:.4f} → "
                     f"k={ks_from_8[i][0]} bpb={ks_from_8[i][1]:.4f} (Δ=+{ks_from_8[i][1]-ks_from_8[i-1][1]:.4f})"
                 )
-                break  # only flag first non-monotone step
+                break
 
-    # 4. Iter convergence: relative convergence should be small at highest K
+    # 5. Iter convergence: relative convergence must be small at highest K.
     conv_rel = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel", None)
     if conv_rel is not None and float(conv_rel) > 0.1:
-        _assert_warnings.append(f"iter_conv_rel={conv_rel:.4f} > 0.1 (solver not converging at eval K)")
+        _failures.append(f"iter_conv_rel={conv_rel:.4f} > 0.1 (solver not converging at eval K)")
 
-    if _assert_warnings:
-        log0("⚠ POST-INT6 HEALTH WARNINGS:")
-        for w in _assert_warnings:
-            log0(f"  ⚠ {w}")
-        log0(f"({len(_assert_warnings)} warning(s) — review before promoting to baseline)")
-    else:
-        log0("✓ POST-INT6 HEALTH: all assertions passed (expert balance, gate trend, FP convergence)")
+    if _failures:
+        log0("✗ POST-INT6 HARD ASSERTION FAILURES:")
+        for w in _failures:
+            log0(f"  ✗ {w}")
+        log0(f"({len(_failures)} failure(s) — run is INVALID and cannot be promoted to baseline)")
+        # Tear down DDP cleanly before raising so other ranks don't deadlock.
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        raise RuntimeError(
+            f"Post-int6 health assertions failed ({len(_failures)}): "
+            + "; ".join(_failures)
+        )
+    log0("✓ POST-INT6 HEALTH: all hard assertions passed (expert balance, ortho, gate trend, injection, FP convergence)")
 
     # Restore eval K for any downstream sliding-window eval.
     base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
