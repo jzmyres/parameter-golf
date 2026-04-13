@@ -113,7 +113,7 @@ class Hyperparameters:
     rope_base = 10000.0
     logit_softcap = 30.0
     qk_gain_init = 5.0
-    deq_beta = 0.30  # iter 14a: H18 test — does higher β give faster DEQ convergence at WD=0.72? (single variable change from iter 13's β=0.20)
+    deq_beta = 0.20  # locked: Phase 1 concluded β=0.20 optimal (lower β = better FP quality, H18 tested)
 
     # Optimizer
     tied_embed_lr = 0.03
@@ -129,7 +129,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 1.44  # iter 14b: test if higher WD restores dome gate faster at β=0.30 (H19)
+    weight_decay = 0.72  # locked: Phase 1 concluded WD=0.72 optimal (WD=1.44 too high, WD=0.36 too low for β=0.20)
     tied_embed_init_std = 0.005
 
     # Routing
@@ -1148,15 +1148,14 @@ class MoSHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    # iter 6 attempt 2: 8 experts at dim=768.  16 experts at full rank
-    # (128/192) collapsed at step 400 (iter 6 a1, same failure as iter 3 a1).
-    # Scaling law: collapse risk ~ num_experts * expert_rank^2.  8 experts
-    # at rank 128 was proven stable for 743 steps in iter 3 a3.  Combined
-    # with dim=768 + reduced bigram gives a stable, high-capacity config.
+    # iter 15: test 12 experts at locked WD=0.72 (H5 revisited).
+    # Previous 12-expert attempts collapsed at WD=0.06 (iter 3a1) and WD=0.18
+    # (iter 6a1).  H9 (verified) showed higher WD expands stability.  If
+    # 12 experts works at WD=0.72, the earlier collapse was WD-addressable.
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False, num_experts: int = 8):
+                 tie_attn_mlp_router: bool = False, num_experts: int = 12):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()

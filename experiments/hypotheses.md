@@ -129,8 +129,9 @@ designed to test it with a single controlled variable change.
 
 Suggests WD_min ∝ β² (or some power law). Each β increment needs proportionally MORE WD.
 **Update from iter 14a:** The flat gate at step 200 was TRANSIENT — by step 356, the dome shape formed even at WD=0.72/β=0.30. The "defense mechanism" is a training-phase phenomenon, not a permanent state. H19 may not need WD=1.44; the dome just forms slower at higher β.
-**Status:** OBSERVED but initial interpretation was premature. The dome-formation delay may be β-dependent, not WD-dependent.
-**Revised test:** Compare dome formation SPEED at (WD=0.72/β=0.30) vs (WD=1.44/β=0.30) — does higher WD make the dome form earlier in training?
+**Status:** OBSERVED — initial "flat gate = defense" interpretation was premature (dome formed by step 356 at both WD levels).
+**Iter 14b result:** WD=1.44/β=0.30 produced dome at step 356 (same timing as WD=0.72). But WD=1.44 had WORSE convergence (gg[15]=0.104 vs 0.067) and WORSE FP quality (K=8→K=64 Δ=+0.027 vs +0.020). Higher WD weakens per-iteration effectiveness without accelerating dome formation.
+**Conclusion:** WD has a U-shaped optimum per β. WD=0.72 is near-optimal for β=0.20-0.30. WD=1.44 is too high.
 
 ### H12: Wider K jitter fixes FP quality degradation
 **Claim:** Training at K∈{4,8,12,16} forces the model to optimize FP quality at all K, making K-sweep monotone.
