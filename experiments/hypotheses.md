@@ -86,6 +86,28 @@ designed to test it with a single controlled variable change.
 
 ## PROPOSED (untested)
 
+### H17: WD controls training stability (prevents collapse) — PRIORITY
+**Claim:** Higher WD → smaller weight magnitudes → smaller Jacobian → prevents training degeneracy (routing collapse, gradient explosion, loss divergence). WD is the lever for STABILITY, independent of convergence speed.
+**Mechanism:** WD shrinks ||W|| → shrinks spectral_norm(∂f/∂z) → contraction condition β×||∂f/∂z|| < 1 is easier to satisfy → training stays in the stable basin.
+**Prediction:** A config that collapses at WD=X should become stable at WD=2X without changing β.
+**Partial evidence:** H9 verified (WD=0.36/β=0.20 FAILED → WD=0.72/β=0.20 PASSED). But H9 only tested one β value.
+**To verify:** Test a config that collapsed (e.g., 12exp rank128) at progressively higher WD {0.36, 0.72, 1.44} with β held constant. If it stabilizes, WD→stability is confirmed.
+**Isolation:** β must be held constant. If β also changes, the effect is confounded.
+
+### H18: β controls DEQ convergence speed — PRIORITY
+**Claim:** Higher β → larger per-iteration solver step → DEQ converges in fewer iterations → gg_iter reaches ~0 earlier → better FP quality within fixed K. β is the lever for CONVERGENCE SPEED, independent of training stability.
+**Mechanism:** β is the relaxation coefficient: z_{n+1} = (1-β)z_n + β·f(z_n). Larger β → faster approach to fixed point → fewer wasted iterations.
+**Prediction:** At fixed WD (stability guaranteed), increasing β should: (a) reduce the K at which gg_iter reaches ~0, (b) improve K-sweep monotonicity (less K=8→K=16 degradation), (c) NOT cause training collapse (because WD handles stability).
+**Partial evidence:** β=0.10 vs β=0.20 at WD=0.18 showed β=0.20 was slightly worse (H6). But WD=0.18 may not have been high enough to stabilize β=0.20.
+**To verify:** At WD=0.72 (verified stable for β=0.20), test β={0.10, 0.20, 0.30} and compare: (a) gg_iter[K-1] at each β, (b) K-sweep monotonicity, (c) training stability. If higher β gives faster convergence without collapse, H18 is verified.
+**Isolation:** WD must be held constant. Only β changes.
+
+**Relationship between H17 and H18:**
+- WD and β address DIFFERENT failure modes: WD→stability, β→convergence speed
+- They are orthogonal in principle but coupled through the Jacobian norm
+- Recipe: first set WD high enough for stability (H17), then tune β for convergence speed (H18)
+- This gives a principled 2-step optimization instead of a 2D grid search
+
 ### H12: Wider K jitter fixes FP quality degradation
 **Claim:** Training at K∈{4,8,12,16} forces the model to optimize FP quality at all K, making K-sweep monotone.
 **Test:** Iter 13 (running) — WD=0.72/β=0.20 + K jitter {4,8,12,16}
@@ -134,22 +156,48 @@ designed to test it with a single controlled variable change.
 
 ## Iteration Schedule (upcoming)
 
-| Iter | Config change | Tests hypothesis | Depends on |
+**Phase 1: Verify WD→stability and β→convergence (H17, H18) — PRIORITY**
+
+| Iter | Config change | Tests | Depends on |
 |---|---|---|---|
-| **13** | WD=0.72, β=0.20, K jitter {4,8,12,16}, fast eval | H9 (WD→stable β), H12 (K jitter→FP quality) | — |
-| 14 | WD=0.72, β=0.30 (if 13 stable) OR WD=1.44, β=0.20 (if 13 fails) | H9 (push further), H13 (WD-β diagonal) | iter 13 |
-| 15 | Lock (WD, β). Test 12exp rank128 at high WD | H5 (expert collapse addressable by WD?) | iter 14 |
-| | **— Gate statistics infrastructure —** | | |
-| 16 | Track all gates per-iter (router, injection, gg, attn gate) | Observability for H14 | iter 15 |
-| | **— Architecture exploration —** | | |
-| 17 | Router sigmoid gate (input-dependent, init open) | H14 | iter 16 |
-| 18 | Injection mechanism exploration | New hypothesis | iter 17 |
-| 19 | Post-norm vs pre-norm | New hypothesis | iter 18 |
-| | **— Advanced training objectives —** | | |
-| 20 | Quant-noise injection in DEQ iterations | H15 | iter 19 |
-| 21 | Single-step diffusion CTP | H16 | iter 20 |
-| | **— Scaling law experiments —** | | |
-| 22-26 | Grid: vary (dim, rank, experts) at locked (WD, β) | Scaling law | iter 21 |
+| **13** | WD=0.72, β=0.20, K jitter {4,8,12,16} | H17 (stable?), H12 (K jitter→FP) | — |
+| 14a | WD=0.72, **β=0.30** (hold WD, increase β only) | **H18** (faster convergence at same stability?) | iter 13 stable |
+| 14b | WD=0.72, **β=0.10** (hold WD, decrease β only) | **H18** (control: slower convergence?) | iter 13 stable |
+| 15 | **WD=1.44**, β=0.20 (hold β, increase WD only) | **H17** (even more stable? diminishing returns?) | iter 13 stable |
+| 15b | If 13 fails: **WD=1.44**, β=0.20 | **H17** (WD=0.72 wasn't enough → double again) | iter 13 fails |
+
+**Decision point after Phase 1:**
+- H17 verified → WD is the stability lever, set to minimum stable value
+- H18 verified → β is the convergence lever, set to max that doesn't hurt val_bpb
+- Lock (WD, β) pair for all subsequent experiments
+
+**Phase 2: Stability-enabled scaling (test H5 revisited)**
+
+| Iter | Config change | Tests | Depends on |
+|---|---|---|---|
+| 16 | 12exp rank128 at locked high WD | H5 revisited (collapse addressable by WD?) | Phase 1 |
+| 17 | Gate statistics infrastructure | Observability for arch exploration | iter 16 |
+
+**Phase 3: Architecture exploration**
+
+| Iter | Config change | Tests | Depends on |
+|---|---|---|---|
+| 18 | Router sigmoid gate (input-dependent, init open) | H14 | iter 17 |
+| 19 | Injection mechanism exploration | New hypothesis | iter 18 |
+| 20 | Post-norm vs pre-norm | New hypothesis | iter 19 |
+
+**Phase 4: Advanced training objectives**
+
+| Iter | Config change | Tests | Depends on |
+|---|---|---|---|
+| 21 | Quant-noise injection in DEQ iterations | H15 | iter 20 |
+| 22 | Single-step diffusion CTP | H16 | iter 21 |
+
+**Phase 5: Scaling law experiments**
+
+| Iter | Config change | Tests | Depends on |
+|---|---|---|---|
+| 23-27 | Grid: vary (dim, rank, experts) at locked config | Scaling law | iter 22 |
 
 ### Permanent protocol for all iterations
 - K jitter: {4, 8, 12, 16} (train at varying K to force good FP)
