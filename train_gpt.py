@@ -736,6 +736,14 @@ class SoftDenseRouter(nn.Module):
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
         self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32), persistent=True)
+        # Input-dependent sigmoid gate on routing weights (iter 17, H14).
+        # Init fully open: weight=0, bias=5.0 → sigmoid(5)≈0.993.
+        # The model can learn to suppress specific experts per-token.
+        self.router_gate = CastedLinear(dim, num_experts, bias=True)
+        with torch.no_grad():
+            self.router_gate.weight.zero_()
+            self.router_gate.bias.fill_(5.0)
+        self._router_gate_last_mean: float | None = None
         self._mean_share_last: Tensor | None = None
         self._balance_loss = None
         self._health_loss = None
@@ -770,6 +778,16 @@ class SoftDenseRouter(nn.Module):
         x_n = _rms_norm(x)
         route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
         p = torch.softmax(route_logits, dim=-1)
+        # Apply input-dependent sigmoid gate (iter 17, H14).
+        # Re-normalize after gating to preserve soft-dense property: all experts
+        # get nonzero weight summing to 1.  Without re-normalization, softmax ×
+        # sigmoid doesn't sum to 1, breaking the routing contract and causing
+        # DEQ instability (smoke test failed with residual explosion).
+        router_gate_act = torch.sigmoid(self.router_gate(x_n))
+        p = p * router_gate_act
+        p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        if _should_diag(self.training):
+            self._router_gate_last_mean = float(router_gate_act.detach().float().mean().item())
         if self.training:
             reduce_dims = tuple(range(p.ndim - 1))
             mean_share = p.mean(dim=reduce_dims)
@@ -1195,6 +1213,7 @@ class Block(nn.Module):
         # Per-call tracking for all gates (iter 16: gate statistics infra)
         self._inj_call_track: list[float] = []
         self._attn_gate_call_track: list[float] = []
+        self._router_gate_call_track: list[float] = []
 
         self.inj_gate = CastedLinear(dim, 1, bias=True)
         self._inj_gate_last_mean: float | None = None
@@ -1300,6 +1319,10 @@ class Block(nn.Module):
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
             if ag is not None:
                 self._attn_gate_call_track.append(ag)
+            # Capture router gate for per-iteration tracking (uses attn_router since tied)
+            rg = getattr(self.attn_router, "_router_gate_last_mean", None)
+            if rg is not None:
+                self._router_gate_call_track.append(rg)
         return (1.0 - gg_tok).to(dtype=z_in.dtype).unsqueeze(-1) * z_in + gg_tok.to(dtype=z_in.dtype).unsqueeze(-1) * z2
 
 
@@ -1575,6 +1598,7 @@ class GPT(nn.Module):
         self.shared_block._gg_call_track_enabled = bool(track_gg)
         self.shared_block._inj_call_track = []
         self.shared_block._attn_gate_call_track = []
+        self.shared_block._router_gate_call_track = []
         try:
             f_theta = self.shared_block
             if self.training and self.deq_backward == "revdeq":
@@ -1620,6 +1644,12 @@ class GPT(nn.Module):
                 self._attn_gate_iter_last_solve = [0.5 * (ag_calls[2*i] + ag_calls[2*i+1]) for i in range(K)]
             else:
                 self._attn_gate_iter_last_solve = []
+            # Aggregate router_gate per-iteration
+            rg_calls = list(getattr(self.shared_block, "_router_gate_call_track", []) or [])
+            if len(rg_calls) == 2 * K:
+                self._router_gate_iter_last_solve = [0.5 * (rg_calls[2*i] + rg_calls[2*i+1]) for i in range(K)]
+            else:
+                self._router_gate_iter_last_solve = []
 
     def _run_backbone(self, x: Tensor) -> Tensor:
         x0 = x
@@ -2088,6 +2118,10 @@ def main() -> None:
         ag_iter = getattr(m, "_attn_gate_iter_last_solve", None)
         if ag_iter is not None and len(ag_iter) > 0:
             parts.append(f"attn_gate_iter:[{','.join(f'{v:.3f}' for v in ag_iter)}]")
+        # Per-iteration router gate trajectory
+        rg_iter = getattr(m, "_router_gate_iter_last_solve", None)
+        if rg_iter is not None and len(rg_iter) > 0:
+            parts.append(f"router_gate_iter:[{','.join(f'{v:.3f}' for v in rg_iter)}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
@@ -2412,6 +2446,9 @@ def main() -> None:
         ag_iter = getattr(base_m_for_roundtrip, "_attn_gate_iter_last_solve", None)
         if ag_iter and len(ag_iter) > 0:
             diag_parts.append(f"attn_gate_iter:[{','.join(f'{v:.3f}' for v in ag_iter)}]")
+        rg_iter = getattr(base_m_for_roundtrip, "_router_gate_iter_last_solve", None)
+        if rg_iter and len(rg_iter) > 0:
+            diag_parts.append(f"router_gate_iter:[{','.join(f'{v:.3f}' for v in rg_iter)}]")
         gg_mean = getattr(base_m_for_roundtrip, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             diag_parts.append(f"gg_mean:{gg_mean:.4f}")
