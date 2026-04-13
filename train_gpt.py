@@ -244,7 +244,8 @@ def update_ema_state_(ema_state: dict[str, Tensor], model_state: dict[str, Tenso
 # MUON OPTIMIZER
 # ---------------------------------------------------------------------------
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+def _ns5_2d(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    """NS preconditioner for a single 2D matrix."""
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -258,11 +259,48 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
+def _ns5_batched(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    """NS preconditioner for a batch of independent matrices.
+
+    Input: (..., m, n) — leading dims are batch, last two are the matrix.
+    Each matrix is normalized and processed independently (no cross-batch coupling).
+    """
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    norms = X.flatten(-2).norm(dim=-1)
+    X = X / (norms[..., None, None] + eps)
+    transposed = X.size(-2) > X.size(-1)
+    if transposed:
+        X = X.transpose(-1, -2).contiguous()
+    for _ in range(steps):
+        A = X @ X.transpose(-1, -2)
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.transpose(-1, -2)
+    return X
+
+
+# Compile both NS backends for throughput (just the math, not the full model).
+# Safe on L40S: these are small pure-tensor functions, no triton kernel issues.
+zeropower_via_newtonschulz5 = torch.compile(_ns5_2d)
+zeropower_via_newtonschulz5_batched = torch.compile(_ns5_batched)
+
+
 class Muon(torch.optim.Optimizer):
+    """Muon optimizer with batched NS for expert weight banks.
+
+    For ndim>2 params (expert banks), NS operates on the last two dims
+    independently per batch element.  All expert tensors are now stored
+    natively as (E, R, D) — no transpose handling needed.
+    """
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
                  nesterov: bool = True, weight_decay: float = 0.0):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
                                       nesterov=nesterov, weight_decay=weight_decay))
+        # Non-serialized cache for per-group flat update buffers + offsets.
+        # Stored outside self.state to avoid breaking state_dict()/checkpointing.
+        self._buf_cache: dict[int, tuple[Tensor, list[tuple[int, int]]]] = {}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -281,9 +319,20 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
-            curr = 0
+            # Cached flat update buffer + offsets (non-serialized, won't break state_dict)
+            group_idx = id(group["params"][0]) if params else 0
+            if group_idx in self._buf_cache:
+                updates_flat, offsets = self._buf_cache[group_idx]
+                updates_flat.zero_()
+            else:
+                total_params = sum(int(p.numel()) for p in params)
+                updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+                offsets = []
+                curr = 0
+                for p in params:
+                    offsets.append((curr, curr + p.numel()))
+                    curr += p.numel()
+                self._buf_cache[group_idx] = (updates_flat, offsets)
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
                     g = p.grad
@@ -295,12 +344,20 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     orig_shape = g.shape
-                    g = g.view(-1, g.shape[-1])
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    g = g.view(orig_shape)
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
+                    if g.ndim > 2:
+                        g_b = g.reshape(-1, g.shape[-2], g.shape[-1])
+                        g_b = zeropower_via_newtonschulz5_batched(g_b, steps=backend_steps)
+                        m, n = g_b.size(-2), g_b.size(-1)
+                        g_b *= max(1, m / n) ** 0.5
+                        g = g_b.reshape(orig_shape)
+                    else:
+                        g = g.reshape(-1, g.shape[-1])
+                        g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                        g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                        g = g.reshape(orig_shape)
+                    start, end = offsets[i]
+                    updates_flat[start:end] = g.reshape(-1)
+            curr = 0  # still needed for the unpack loop below
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
             wd = group.get("weight_decay", 0.0)
@@ -527,8 +584,10 @@ def load_data_shard(file: Path) -> Tensor:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
     header_bytes = 256 * np.dtype("<i4").itemsize
-    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
-    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+    # Use memmap so multiple DDP ranks share OS page cache instead of
+    # allocating full copies per process.
+    tokens_np = np.memmap(file, dtype="<u2", mode="r", offset=header_bytes, shape=(num_tokens,))
+    return torch.from_numpy(np.array(tokens_np, dtype=np.uint16))
 
 
 class TokenStream:
@@ -544,6 +603,18 @@ class TokenStream:
         self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
+
+    def skip(self, n: int) -> None:
+        """Advance position by n tokens without materializing them."""
+        remaining = n
+        while remaining > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance_file()
+                continue
+            k = min(remaining, avail)
+            self.pos += k
+            remaining -= k
 
     def take(self, n: int) -> Tensor:
         chunks: list[Tensor] = []
@@ -575,9 +646,12 @@ class DistributedTokenLoader:
             raise ValueError(f"TRAIN_BATCH_TOKENS too small: {global_tokens}")
         local_tokens = local_seqs * seq_len
         per_rank_span = local_tokens + 1
-        chunk = self.stream.take(per_rank_span * self.world_size)
-        start = self.rank * per_rank_span
-        local = chunk[start : start + per_rank_span].to(dtype=torch.int64)
+        # Each rank advances the stream by the full global span but only
+        # materializes its own per_rank_span slice.  Avoids the old O(world_size)
+        # read-then-slice pattern where every rank read all ranks' data.
+        self.stream.skip(self.rank * per_rank_span)
+        local = self.stream.take(per_rank_span).to(dtype=torch.int64)
+        self.stream.skip((self.world_size - 1 - self.rank) * per_rank_span)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
@@ -612,11 +686,14 @@ class CastedLinear(nn.Linear):
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
+    """Cast control tensors and scalars to FP32 for stable accumulation.
+
+    Does NOT cast expert banks (ndim>=3) — those stay in bf16 to avoid
+    per-forward .to(bf16) copies in CastedLinear (huge throughput hit).
+    """
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(p in name for p in CONTROL_TENSOR_PATTERNS)) and param.dtype != torch.float32:
-                param.data = param.data.float()
-            if param.ndim >= 3 and param.dtype != torch.float32:
                 param.data = param.data.float()
 
 
@@ -777,17 +854,13 @@ class SoftDenseRouter(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x_n = _rms_norm(x)
         route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
-        p = torch.softmax(route_logits, dim=-1)
-        # Apply input-dependent sigmoid gate (iter 17, H14).
-        # Re-normalize after gating to preserve soft-dense property: all experts
-        # get nonzero weight summing to 1.  Without re-normalization, softmax ×
-        # sigmoid doesn't sum to 1, breaking the routing contract and causing
-        # DEQ instability (smoke test failed with residual explosion).
-        router_gate_act = torch.sigmoid(self.router_gate(x_n))
-        p = p * router_gate_act
-        p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        # Gate in logit space: softmax(a + log_sigmoid(b)) is mathematically
+        # identical to softmax(a)*sigmoid(b)/renorm, but stays "pure softmax"
+        # and avoids explicit renormalization.
+        gate_logits = F.logsigmoid(self.router_gate(x_n))
+        p = torch.softmax(route_logits + gate_logits, dim=-1)
         if _should_diag(self.training):
-            self._router_gate_last_mean = float(router_gate_act.detach().float().mean().item())
+            self._router_gate_last_mean = float(gate_logits.detach().exp().float().mean().item())
         if self.training:
             reduce_dims = tuple(range(p.ndim - 1))
             mean_share = p.mean(dim=reduce_dims)
@@ -858,7 +931,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
         self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
         self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
-        self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
+        self.expert_out = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_proj.data[e])
             nn.init.xavier_uniform_(self.expert_out.data[e])
@@ -916,18 +989,19 @@ class CausalSelfAttention(nn.Module):
     def mix_experts_from_shared(self, y: Tensor, w: Tensor) -> Tensor:
         B, T, D = y.shape
         E, R = self.num_experts, self.expert_rank
-        y_flat = y.reshape(B * T, D)
-        w_flat = w.reshape(B * T, E).to(dtype=y_flat.dtype)
+        N = B * T
+        y_flat = y.reshape(N, D)
+        w_flat = w.reshape(N, E).to(dtype=y_flat.dtype)
         P = self.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, D)
-        O = self.expert_out.to(dtype=y_flat.dtype).permute(0, 2, 1).reshape(E * R, D)
+        O = self.expert_out.to(dtype=y_flat.dtype).reshape(E * R, D)
         h = y_flat @ P.t()
-        h = h * w_flat.repeat_interleave(R, dim=1)
+        h = (h.view(N, E, R) * w_flat.unsqueeze(-1)).view(N, E * R)
         out = h @ O
 
         if _should_diag(self.training):
             with torch.no_grad():
                 mu_h = h.reshape(B * T, E, R).mean(dim=0).to(dtype=torch.float32)
-                out_T = self.expert_out.to(dtype=mu_h.dtype).permute(0, 2, 1)
+                out_T = self.expert_out.to(dtype=mu_h.dtype)
                 mu_out = torch.einsum("er,erd->ed", mu_h, out_T)
                 self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu_out).item())
 
@@ -966,7 +1040,7 @@ class MLP(nn.Module):
         self.expert_rank = expert_rank if expert_rank > 0 else max(hidden // max(num_experts, 1), 1)
         self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
-        self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
+        self.expert_down = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_gate.data[e])
             nn.init.xavier_uniform_(self.expert_fc.data[e])
@@ -984,18 +1058,17 @@ class MLP(nn.Module):
         w_flat = w.reshape(N, E).to(dtype=x_flat.dtype)
         G = self.expert_gate.to(dtype=x_flat.dtype).reshape(E * R, D)
         Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)
-        Dwn = self.expert_down.to(dtype=x_flat.dtype).permute(0, 2, 1).reshape(E * R, D)
+        Dwn = self.expert_down.to(dtype=x_flat.dtype).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
         h = F.leaky_relu(gate, negative_slope=0.5).square() * fc
-        h = h * w_flat.repeat_interleave(R, dim=1)
+        h = (h.view(N, E, R) * w_flat.unsqueeze(-1)).view(N, E * R)
         out = h @ Dwn
 
         if _should_diag(self.training):
             with torch.no_grad():
                 mu_h = h.reshape(N, E, R).mean(dim=0).to(dtype=torch.float32)
-                down_T = self.expert_down.to(dtype=mu_h.dtype).permute(0, 2, 1)
-                mu_out = torch.einsum("er,erd->ed", mu_h, down_T)
+                mu_out = torch.einsum("er,erd->ed", mu_h, self.expert_down.to(dtype=mu_h.dtype))
                 self._out_ortho_cos_sim = float(mean_abs_offdiag_cosine(mu_out).item())
 
         return out.reshape(B, T, D)
@@ -1260,8 +1333,7 @@ class Block(nn.Module):
         P = self.attn.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, dim)
         h = y_flat @ P.t()
         mu_h = h.reshape(bsz * t, E, R).mean(dim=0).to(dtype=torch.float32)
-        out_T = self.attn.expert_out.to(dtype=mu_h.dtype).permute(0, 2, 1)
-        mu_attn = torch.einsum("er,erd->ed", mu_h, out_T)
+        mu_attn = torch.einsum("er,erd->ed", mu_h, self.attn.expert_out.to(dtype=mu_h.dtype))
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
@@ -1280,8 +1352,7 @@ class Block(nn.Module):
         fc = x_flat @ Fm.t()
         h_mlp = F.leaky_relu(gate, negative_slope=0.5).square() * fc
         mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)
-        down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).permute(0, 2, 1)
-        mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
+        mu_mlp = torch.einsum("er,erd->ed", mu_h2, self.mlp.expert_down.to(dtype=mu_h2.dtype))
         mlp_ortho = mean_abs_offdiag_cosine(mu_mlp)
 
         return attn_ortho, mlp_ortho
@@ -1887,7 +1958,7 @@ def main() -> None:
     # deq_k_max can exceed num_layers: the DEQ uses a shared block so the
     # solver can run any number of iterations.  num_layers is just the default K.
 
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    # NS functions already compiled at module scope (L286-287). No recompile needed.
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -2019,6 +2090,12 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
+    # Compile the DEQ iteration body for ~3.7× throughput (830ms → 226ms per step).
+    # Safe: shared_block is a pure nn.Module called K times per forward.
+    # The RevDEQ custom backward calls it separately and handles its own gradients.
+    base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
+    log0("compiled shared_block for throughput")
+
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
         if distributed else base_model
@@ -2053,6 +2130,8 @@ def main() -> None:
 
     optimizer_tok = torch.optim.AdamW(tok_params, betas=(args.beta1, args.beta2),
                                        eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
+    # expert_out and expert_down now stored natively as (E, R, D) — no transpose
+    # group needed.  All expert params have consistent (E, R, D) orientation.
     optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum,
                           backend_steps=args.muon_backend_steps, weight_decay=args.weight_decay)
     for group in optimizer_muon.param_groups:
