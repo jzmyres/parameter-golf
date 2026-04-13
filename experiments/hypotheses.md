@@ -94,13 +94,16 @@ designed to test it with a single controlled variable change.
 **To verify:** Test a config that collapsed (e.g., 12exp rank128) at progressively higher WD {0.36, 0.72, 1.44} with β held constant. If it stabilizes, WD→stability is confirmed.
 **Isolation:** β must be held constant. If β also changes, the effect is confounded.
 
-### H18: β controls DEQ convergence speed — PRIORITY
-**Claim:** Higher β → larger per-iteration solver step → DEQ converges in fewer iterations → gg_iter reaches ~0 earlier → better FP quality within fixed K. β is the lever for CONVERGENCE SPEED, independent of training stability.
-**Mechanism:** β is the relaxation coefficient: z_{n+1} = (1-β)z_n + β·f(z_n). Larger β → faster approach to fixed point → fewer wasted iterations.
-**Prediction:** At fixed WD (stability guaranteed), increasing β should: (a) reduce the K at which gg_iter reaches ~0, (b) improve K-sweep monotonicity (less K=8→K=16 degradation), (c) NOT cause training collapse (because WD handles stability).
-**Partial evidence:** β=0.10 vs β=0.20 at WD=0.18 showed β=0.20 was slightly worse (H6). But WD=0.18 may not have been high enough to stabilize β=0.20.
-**To verify:** At WD=0.72 (verified stable for β=0.20), test β={0.10, 0.20, 0.30} and compare: (a) gg_iter[K-1] at each β, (b) K-sweep monotonicity, (c) training stability. If higher β gives faster convergence without collapse, H18 is verified.
-**Isolation:** WD must be held constant. Only β changes.
+### H18: β controls DEQ convergence speed — TESTED
+**Claim:** Higher β → faster convergence → better FP quality.
+**Test:** Iter 13 (β=0.20) vs iter 14a (β=0.30), both at WD=0.72. Single variable change.
+**Evidence:**
+- β=0.30 residuals 40-50% lower at every K (converges ~2× faster per iteration) ✓
+- β=0.30 gg_iter[15]=0.067 vs β=0.20's 0.082 (gate closer to zero) ✓
+- BUT: β=0.30 K=8→K=64 degradation +0.020 vs β=0.20's +0.009 (2× worse FP quality) ✗
+**Verdict:** ⚠️ PARTIALLY TRUE — β controls convergence SPEED (verified) but NOT FP quality. Higher β converges faster TO A DIFFERENT (WORSE) fixed point.
+**Mechanism (revised):** The coupled-state relaxation `z_{n+1} = (1-β)z_n + β·f(z_n)` with finite K doesn't reach the true FP — it reaches a β-dependent intermediate. Lower β intermediates are closer to the optimal FP.
+**Implication:** Use the LOWEST β that converges within the K budget. Higher β is NOT better even when WD stabilizes it. β=0.20 at WD=0.72 beats β=0.30 at WD=0.72 on FP quality.
 
 **Relationship between H17 and H18:**
 - WD and β address DIFFERENT failure modes: WD→stability, β→convergence speed
@@ -125,8 +128,9 @@ designed to test it with a single controlled variable change.
 | 0.30 | ~1.44? | iter 14a flat gate at WD=0.72 → needs more WD |
 
 Suggests WD_min ∝ β² (or some power law). Each β increment needs proportionally MORE WD.
-**To verify:** Test β=0.30 at WD=1.44. If gate becomes dome-shaped → H19 verified.
-**Implication:** H18 (β→convergence speed) is CONDITIONALLY true — only when WD is scaled up to match. Without matching WD, higher β just flattens the gate with no convergence benefit.
+**Update from iter 14a:** The flat gate at step 200 was TRANSIENT — by step 356, the dome shape formed even at WD=0.72/β=0.30. The "defense mechanism" is a training-phase phenomenon, not a permanent state. H19 may not need WD=1.44; the dome just forms slower at higher β.
+**Status:** OBSERVED but initial interpretation was premature. The dome-formation delay may be β-dependent, not WD-dependent.
+**Revised test:** Compare dome formation SPEED at (WD=0.72/β=0.30) vs (WD=1.44/β=0.30) — does higher WD make the dome form earlier in training?
 
 ### H12: Wider K jitter fixes FP quality degradation
 **Claim:** Training at K∈{4,8,12,16} forces the model to optimize FP quality at all K, making K-sweep monotone.
