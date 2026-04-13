@@ -1179,6 +1179,7 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
+        self.post_norm = RMSNorm()  # iter 19: normalize output before next DEQ iteration
         if bool(tie_attn_mlp_router):
             shared = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0)
             self.attn_router = shared
@@ -1330,7 +1331,8 @@ class Block(nn.Module):
             rg = getattr(self.attn_router, "_router_gate_last_mean", None)
             if rg is not None:
                 self._router_gate_call_track.append(rg)
-        return (1.0 - gg_tok).to(dtype=z_in.dtype).unsqueeze(-1) * z_in + gg_tok.to(dtype=z_in.dtype).unsqueeze(-1) * z2
+        raw_out = (1.0 - gg_tok).to(dtype=z_in.dtype).unsqueeze(-1) * z_in + gg_tok.to(dtype=z_in.dtype).unsqueeze(-1) * z2
+        return self.post_norm(raw_out)  # iter 19: bound hidden state magnitude across DEQ iterations
 
 
 # ---------------------------------------------------------------------------
