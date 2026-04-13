@@ -105,3 +105,56 @@ designed to test it with a single controlled variable change.
 ### H16: Single-step diffusion CTP enriches embedding gradients
 **Claim:** Noisy soft-embed input + CTP denoising gives gradient to more embedding rows.
 **Test:** Queued (advanced training block)
+
+---
+
+## Completed Iterations
+
+| Iter | Config (changes from prev) | val_bpb | Status | Hypotheses tested |
+|---|---|---|---|---|
+| 0a1 | parallel resid raw sum, β=0.35 | — | crash (step 600) | H1 |
+| 0a2 | parallel resid 0.5× | — | crash (step 600) | H1 |
+| 0a4 | no inner resid + gg_gate + β=0.20 | 2.407 | discard (SWA/EMA killed) | H2, H3 |
+| 1 | + SWA off + EMA off | 1.621 | discard | H3 |
+| 2 | + gg_gate bias 1.5 | 1.620 | discard (no effect) | H4 |
+| 3a1 | 12exp rank128 | — | crash (routing collapse) | H5 |
+| 3a3 | 8exp rank128 | 1.623 | discard | H5 |
+| 4 | 16exp rank64 (1 GPU) | 2.135 | discard (structural test) | H5 |
+| 5 | WD 0.06→0.09 (1 GPU) | 1.884 | discard | H7 |
+| 6a1 | dim768 + bigram↓ + 16exp rank128 | — | crash (routing collapse) | H5 |
+| 6a2 | dim768 + bigram↓ + 8exp rank128 | 1.818 | discard | H8, H11 |
+| 7 | β=0.10 | 1.796 | discard | H6 |
+| 7b | β=0.05 | 1.820 | discard (gate saturated) | H6 |
+| 8 | rank 256/384 | 1.882 | discard (throughput penalty) | H8 |
+| **9** | **WD=0.18** | **1.754** | **KEEP (baseline)** | H7 |
+| 10 | WD=0.36 | 1.779 | discard | H7 |
+| 11 | dim896 rank96/144 | ~1.89 | killed (worse) | H8 |
+| 12b | WD=0.36 (fixed K-sweep) | 1.778 | discard | H10 (first valid K-sweep) |
+| **13** | **WD=0.72, β=0.20, K jitter {4,8,12,16}** | **TBD** | **running** | **H9, H12** |
+
+## Iteration Schedule (upcoming)
+
+| Iter | Config change | Tests hypothesis | Depends on |
+|---|---|---|---|
+| **13** | WD=0.72, β=0.20, K jitter {4,8,12,16}, fast eval | H9 (WD→stable β), H12 (K jitter→FP quality) | — |
+| 14 | WD=0.72, β=0.30 (if 13 stable) OR WD=1.44, β=0.20 (if 13 fails) | H9 (push further), H13 (WD-β diagonal) | iter 13 |
+| 15 | Lock (WD, β). Test 12exp rank128 at high WD | H5 (expert collapse addressable by WD?) | iter 14 |
+| | **— Gate statistics infrastructure —** | | |
+| 16 | Track all gates per-iter (router, injection, gg, attn gate) | Observability for H14 | iter 15 |
+| | **— Architecture exploration —** | | |
+| 17 | Router sigmoid gate (input-dependent, init open) | H14 | iter 16 |
+| 18 | Injection mechanism exploration | New hypothesis | iter 17 |
+| 19 | Post-norm vs pre-norm | New hypothesis | iter 18 |
+| | **— Advanced training objectives —** | | |
+| 20 | Quant-noise injection in DEQ iterations | H15 | iter 19 |
+| 21 | Single-step diffusion CTP | H16 | iter 20 |
+| | **— Scaling law experiments —** | | |
+| 22-26 | Grid: vary (dim, rank, experts) at locked (WD, β) | Scaling law | iter 21 |
+
+### Permanent protocol for all iterations
+- K jitter: {4, 8, 12, 16} (train at varying K to force good FP)
+- K-sweep: {4, 8, 16, 32, 64} with fast eval (256 seqs) + per-K diagnostics
+- Pre-commit: /simplify → coderabbit → pr-review-toolkit → superpowers review
+- Save full-precision weights (model_full.pt) before quantization
+- Update this hypothesis log after each iteration
+- Stability over task performance
