@@ -182,7 +182,7 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 | 14a | β=0.30 at WD=0.72 | 2.046 | discard | H18 (speed yes, FP quality no) |
 | 14b | WD=1.44, β=0.30 | 2.081 | discard | H19 (WD=1.44 too high) |
 | 15 | 12exp rank128 at WD=0.72 | 2.033 | discard | **H5 RESOLVED** (collapse = WD-fixable) |
-| **16** | **Gate statistics infrastructure** | **TBD** | **next** | Observability |
+| **16** | **Gate statistics infrastructure** | **TBD** | **running** | Observability (gg_iter + inj_iter + attn_gate_iter) |
 
 ## Iteration Schedule (upcoming)
 
