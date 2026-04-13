@@ -281,10 +281,13 @@ def _ns5_batched(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     return X
 
 
-# Compile both NS backends for throughput (just the math, not the full model).
-# Safe on L40S: these are small pure-tensor functions, no triton kernel issues.
-zeropower_via_newtonschulz5 = torch.compile(_ns5_2d)
-zeropower_via_newtonschulz5_batched = torch.compile(_ns5_batched)
+# Compile NS backends for throughput.  Graceful fallback to eager if compile fails.
+try:
+    zeropower_via_newtonschulz5 = torch.compile(_ns5_2d)
+    zeropower_via_newtonschulz5_batched = torch.compile(_ns5_batched)
+except Exception:
+    zeropower_via_newtonschulz5 = _ns5_2d
+    zeropower_via_newtonschulz5_batched = _ns5_batched
 
 
 class Muon(torch.optim.Optimizer):
@@ -584,10 +587,12 @@ def load_data_shard(file: Path) -> Tensor:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
     header_bytes = 256 * np.dtype("<i4").itemsize
-    # Use memmap so multiple DDP ranks share OS page cache instead of
-    # allocating full copies per process.
-    tokens_np = np.memmap(file, dtype="<u2", mode="r", offset=header_bytes, shape=(num_tokens,))
-    return torch.from_numpy(np.array(tokens_np, dtype=np.uint16))
+    # Use memmap so multiple DDP ranks share OS page cache.
+    # torch.from_numpy on a memmap returns a view (no copy) — the tensor
+    # is backed by the file's page cache.  Slicing in TokenStream.take()
+    # only materializes the accessed pages.
+    tokens_mmap = np.memmap(file, dtype="<u2", mode="r", offset=header_bytes, shape=(num_tokens,))
+    return torch.from_numpy(tokens_mmap.view(np.uint16))
 
 
 class TokenStream:
@@ -1686,7 +1691,9 @@ class GPT(nn.Module):
                 z, z_prev = RevDEQFunction.apply(f_theta, x0, z_init, beta, K, *params)
                 return z, z_prev, None, None
 
-            acc_dtype = torch.float64 if (not self.training and self.deq_backward == "revdeq") else torch.float32
+            # FP32 accumulators for the unrolled solver (eval + non-revdeq train).
+            # FP64 is only needed inside RevDEQFunction for exact reversibility.
+            acc_dtype = torch.float32
             y_acc = z_init.to(acc_dtype)
             z_acc = z_init.to(acc_dtype)
             z = z_init
@@ -2090,11 +2097,12 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # Compile the DEQ iteration body for ~3.7× throughput (830ms → 226ms per step).
-    # Safe: shared_block is a pure nn.Module called K times per forward.
-    # The RevDEQ custom backward calls it separately and handles its own gradients.
-    base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
-    log0("compiled shared_block for throughput")
+    # Compile the DEQ iteration body for throughput.  Graceful fallback if compile fails.
+    try:
+        base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
+        log0("compiled shared_block for throughput")
+    except Exception as e:
+        log0(f"shared_block compile failed ({e}), running eager")
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
@@ -2505,7 +2513,7 @@ def main() -> None:
     # is exploiting a specific iteration count rather than a true fixed point.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
     log0("k_sweep:start")
-    k_sweep_values = [4, 8, 16, 32, 64]  # geometric doubling; fast eval makes K=64 affordable
+    k_sweep_values = [4, 8, 16, 32, 64, 128]  # geometric doubling to K=128; fast eval keeps total sweep <5 min
     k_sweep_results: dict[int, float] = {}
     for k_eval in k_sweep_values:
         # Pass deq_k explicitly — run_validation uses it directly instead of

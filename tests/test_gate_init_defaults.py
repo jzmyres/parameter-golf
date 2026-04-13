@@ -24,7 +24,7 @@ class TestGateInitDefaults(unittest.TestCase):
         torch.manual_seed(0)
         b = Block(dim=32, num_heads=4, num_kv_heads=2, rope_base=10000.0, qk_gain_init=1.0, mlp_mult=2.0)
         bias = float(b.gg_gate.bias.detach().float().item())
-        self.assertAlmostEqual(bias, 0.0, places=6)
+        self.assertAlmostEqual(bias, 1.5, places=4)  # sigmoid(1.5) ≈ 0.82
 
 
 if __name__ == "__main__":
