@@ -2737,20 +2737,137 @@ def main() -> None:
     if conv_rel is not None and float(conv_rel) > 0.1:
         _failures.append(f"iter_conv_rel={conv_rel:.4f} > 0.1 (solver not converging at eval K)")
 
+    # Classify each failure and prescribe a fix from the verified-hypothesis
+    # troubleshooting table.  A failed run is INVALID (cannot be promoted to
+    # baseline) but its diagnostics + retry_hint guide the NEXT iteration's
+    # config change — the agent applies the prescribed fix and reruns.  We
+    # do NOT raise here: letting the process exit cleanly preserves all the
+    # artifacts and log output the fix decision needs.
+    def _prescribe(failure: str) -> dict:
+        """Map a failure string to its canonical hypothesis-verified fix."""
+        low = failure.lower()
+        if "min_share" in low or "balance_cv" in low:
+            return {
+                "failure": failure,
+                "category": "routing_imbalance",
+                "hypothesis": "H9 VERIFIED, H5 RESOLVED — routing collapse is WD-addressable",
+                "fix": "Increase muon_weight_decay by 1.5× (e.g. 0.72→1.08). "
+                       "If already ≥1.0, also increase attn_balance_mult or mlp_balance_mult by 1.5×. "
+                       "Cap at WD=1.44 — H19 showed 1.44 is already too high for β=0.20.",
+                "config_change": {"muon_weight_decay_mult": 1.5},
+            }
+        if "ortho" in low:
+            return {
+                "failure": failure,
+                "category": "expert_collapse",
+                "hypothesis": "H5 RESOLVED — collapse is WD-fixable",
+                "fix": "Increase muon_weight_decay by 1.5×. If no effect, drop num_experts by 1 step.",
+                "config_change": {"muon_weight_decay_mult": 1.5},
+            }
+        if "inj_max" in low or "inj_mean" in low:
+            return {
+                "failure": failure,
+                "category": "injection_collapse",
+                "hypothesis": "H23 PROPOSED — vanishing injection violates z* = f(z*, x0)",
+                "fix": "Jump to Phase 5 iter 24 (injection floor: clamp inj_gate ≥ 0.05) "
+                       "or iter 22 (per-iter injection schedule).",
+                "config_change": {"inject_next_iter": 24},
+            }
+        if "gg_max" in low:
+            return {
+                "failure": failure,
+                "category": "gate_collapsed",
+                "hypothesis": "H20 VERIFIED — post-norm unlocks flat gg regime",
+                "fix": "Verify post_norm enabled on Block output. If already on, lower deq_beta by 0.05 "
+                       "for tighter contraction that justifies higher gate.",
+                "config_change": {"deq_beta_delta": -0.05},
+            }
+        if "gg_min" in low:
+            return {
+                "failure": failure,
+                "category": "gate_saturated",
+                "hypothesis": "H18 VERIFIED — β controls convergence speed",
+                "fix": "Increase deq_beta by 0.05 so the model learns a smaller per-iter update.",
+                "config_change": {"deq_beta_delta": 0.05},
+            }
+        if "k-sweep" in low:
+            return {
+                "failure": failure,
+                "category": "fp_quality_loss",
+                "hypothesis": "H12 VERIFIED (wider K jitter → better FP), H23 PROPOSED (injection collapse → input-loss)",
+                "fix": "Widen K jitter: increase deq_k_max 16→20 (training sees K=20 sometimes). "
+                       "If inj_iter also flagged, fix injection first (Phase 5) — it's upstream.",
+                "config_change": {"deq_k_max_delta": 4},
+            }
+        if "iter_conv_rel" in low:
+            return {
+                "failure": failure,
+                "category": "solver_divergence",
+                "hypothesis": "H9 + H18 VERIFIED",
+                "fix": "Increase muon_weight_decay 1.5× (H9) OR lower deq_beta by 0.05 (H18).",
+                "config_change": {"muon_weight_decay_mult": 1.5},
+            }
+        return {
+            "failure": failure,
+            "category": "unknown",
+            "hypothesis": "none",
+            "fix": "Manual analysis required — check hypotheses.md for related observations.",
+            "config_change": {},
+        }
+
     if _failures:
-        log0("✗ POST-INT6 HARD ASSERTION FAILURES:")
-        for w in _failures:
-            log0(f"  ✗ {w}")
-        log0(f"({len(_failures)} failure(s) — run is INVALID and cannot be promoted to baseline)")
-        # Tear down DDP cleanly before raising so other ranks don't deadlock.
-        if distributed:
-            dist.barrier()
-            dist.destroy_process_group()
-        raise RuntimeError(
-            f"Post-int6 health assertions failed ({len(_failures)}): "
-            + "; ".join(_failures)
-        )
-    log0("✓ POST-INT6 HEALTH: all hard assertions passed (expert balance, ortho, gate trend, injection, FP convergence)")
+        log0("✗ POST-INT6 HARD ASSERTION FAILURES — run is INVALID (cannot promote)")
+        prescriptions = [_prescribe(f) for f in _failures]
+        # Merge config_change suggestions, preferring the most common multiplier.
+        from collections import Counter
+        log0(f"  {len(_failures)} failure(s):")
+        for p in prescriptions:
+            log0(f"  ✗ [{p['category']}] {p['failure']}")
+            log0(f"     hypothesis: {p['hypothesis']}")
+            log0(f"     fix:        {p['fix']}")
+        # Aggregate config suggestions for the orchestrator / agent.
+        agg: dict = {}
+        for p in prescriptions:
+            for k, v in p["config_change"].items():
+                agg.setdefault(k, []).append(v)
+        suggested_config: dict = {}
+        for k, vs in agg.items():
+            # For multiplicative/additive hints, prefer the max-impact adjustment.
+            if k.endswith("_mult"):
+                suggested_config[k] = max(vs)
+            elif k.endswith("_delta"):
+                suggested_config[k] = max(vs, key=abs)  # largest-magnitude delta
+            else:
+                suggested_config[k] = Counter(vs).most_common(1)[0][0]
+        log0(f"  SUGGESTED CONFIG CHANGE: {suggested_config}")
+        # Write machine-readable retry hint next to the artifacts.
+        if master_process:
+            import json
+            retry_hint = {
+                "run_valid": False,
+                "failure_count": len(_failures),
+                "prescriptions": prescriptions,
+                "suggested_config": suggested_config,
+            }
+            with open(Path("experiments/weights/current") / "retry_hint.json", "w") as fh:
+                json.dump(retry_hint, fh, indent=2)
+            log0("  retry_hint.json written — next iter should apply suggested_config")
+        # Mark meta.json so update_results.sh / --promote can refuse.
+        if master_process and meta_path is not None:
+            import json
+            with open(meta_path, "r") as f:
+                meta_json = json.load(f)
+            meta_json["run_valid"] = False
+            meta_json["failure_categories"] = [p["category"] for p in prescriptions]
+            with open(meta_path, "w") as f:
+                json.dump(meta_json, f)
+    else:
+        log0("✓ POST-INT6 HEALTH: all hard assertions passed (expert balance, ortho, gate trend, injection, FP convergence)")
+        if master_process:
+            import json
+            retry_hint_path = Path("experiments/weights/current") / "retry_hint.json"
+            if retry_hint_path.exists():
+                retry_hint_path.unlink()  # stale hint from a previous failure
 
     # Restore eval K for any downstream sliding-window eval.
     base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)

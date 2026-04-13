@@ -89,6 +89,21 @@ fi
 
 # --- Step 3: Promote current → baseline (if --promote) ---
 if [ "$PROMOTE" = true ]; then
+    # Refuse to promote if the run was flagged INVALID by post-int6 assertions.
+    # The train script writes retry_hint.json and sets run_valid=false in meta.json
+    # when any hard assertion fails.  Agent must apply the prescribed fix and rerun.
+    CURRENT_META="$WEIGHTS_DIR/current/meta.json"
+    if [ -f "$CURRENT_META" ]; then
+        run_valid=$(python3 -c "import json; d=json.load(open('$CURRENT_META')); print(d.get('run_valid', True))" 2>/dev/null || echo "True")
+        if [ "$run_valid" = "False" ]; then
+            echo "✗ REFUSING TO PROMOTE — run is INVALID (post-int6 assertions failed)."
+            if [ -f "$WEIGHTS_DIR/current/retry_hint.json" ]; then
+                echo "  See experiments/weights/current/retry_hint.json for prescribed fix."
+                python3 -c "import json; d=json.load(open('$WEIGHTS_DIR/current/retry_hint.json')); print('  suggested_config:', d.get('suggested_config', {}))"
+            fi
+            exit 2
+        fi
+    fi
     # Backup existing baseline before overwriting.
     if [ -f "$LOGDIR/baseline.log" ]; then
         cp "$LOGDIR/baseline.log" "$LOGDIR/baseline_backup.log"

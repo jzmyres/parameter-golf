@@ -293,6 +293,31 @@ Locked config: WD=0.72, β=0.20, K jitter {4,8,12,16}, 8exp, dim=768, post-norm,
 | 36 | dim=768, rank=96/144, 12exp | more experts, lower rank (H5 confirmed stable at WD=0.72) | Phase 7 |
 | 37 | dim=768, rank=128/192, 8exp, mlp_mult=4 | wider MLP | Phase 7 |
 
+### Troubleshooting table — hypothesis-verified fixes for assertion failures
+
+When a post-int6 hard assertion fails, the training script writes `retry_hint.json`
+with the prescribed fix from the table below.  The next iteration should apply
+the fix (not discard the run) and re-test.  Each prescription traces to a
+VERIFIED or RESOLVED hypothesis from this document.
+
+| Failure category | Prescribed fix | Hypothesis |
+|---|---|---|
+| routing_imbalance (min_share, balance_cv) | `muon_weight_decay × 1.5` (cap 1.44) | H9 VERIFIED, H5 RESOLVED |
+| expert_collapse (ortho) | `muon_weight_decay × 1.5`, else drop num_experts by 1 step | H5 RESOLVED |
+| injection_collapse (inj_max, inj_mean) | Apply Phase 5 iter 24 (injection floor) or iter 22 (per-iter schedule) | H23 PROPOSED |
+| gate_collapsed (gg_max<0.3) | Verify post_norm on; else `deq_beta - 0.05` | H20 VERIFIED |
+| gate_saturated (gg_min>0.95) | `deq_beta + 0.05` (smaller per-iter update) | H18 VERIFIED |
+| fp_quality_loss (K-sweep non-monotone) | Widen K jitter (`deq_k_max + 4`); fix injection first if also flagged | H12 VERIFIED, H23 PROPOSED |
+| solver_divergence (iter_conv_rel>0.1) | `muon_weight_decay × 1.5` (H9) or `deq_beta - 0.05` (H18) | H9 + H18 |
+
+**Retry protocol:**
+1. If `run_valid=false` in `experiments/weights/current/meta.json`, the run is INVALID
+2. Read `retry_hint.json` for the prescribed config change
+3. Apply the change to `train_gpt.py` defaults (or pass as CLI override)
+4. Re-run training from scratch (same iter number + "retry N" suffix in commit)
+5. If the retry also fails with a different category, apply that fix next
+6. Give up after 3 retries — the config may not be reachable from the current basin
+
 ### Permanent protocol for all iterations
 - K jitter: {4, 8, 12, 16} (train at varying K to force good FP — H12 VERIFIED)
 - K-sweep: {4, 8, 16, 32, 64, 128} with fast eval (256 seqs) + per-K diagnostics
