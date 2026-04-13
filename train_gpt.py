@@ -851,6 +851,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
+        self._attn_gate_last_mean: float | None = None  # per-call attn gate mean
 
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         bsz, seqlen, dim = x_n.shape
@@ -888,7 +889,10 @@ class CausalSelfAttention(nn.Module):
                 v_use = v.repeat_interleave(rep, dim=1)
             y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
 
-        y = y * torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
+        attn_gate_act = torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
+        y = y * attn_gate_act
+        if _should_diag(self.training):
+            self._attn_gate_last_mean = float(attn_gate_act.detach().float().mean().item())
         return y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
     def mix_experts_from_shared(self, y: Tensor, w: Tensor) -> Tensor:
@@ -1188,6 +1192,9 @@ class Block(nn.Module):
         self._gg_count = 0
         self._gg_call_track_enabled = False
         self._gg_call_track: list[float] = []
+        # Per-call tracking for all gates (iter 16: gate statistics infra)
+        self._inj_call_track: list[float] = []
+        self._attn_gate_call_track: list[float] = []
 
         self.inj_gate = CastedLinear(dim, 1, bias=True)
         self._inj_gate_last_mean: float | None = None
@@ -1200,7 +1207,10 @@ class Block(nn.Module):
         u = z_n.mean(dim=(0, 1), keepdim=True)
         g = torch.sigmoid(self.inj_gate(u)).squeeze(-1)
         if _should_diag(self.training):
-            self._inj_gate_last_mean = float(g.detach().float().mean().item())
+            g_val = float(g.detach().float().mean().item())
+            self._inj_gate_last_mean = g_val
+            if self._gg_call_track_enabled:
+                self._inj_call_track.append(g_val)
         return g
 
     @dynamo_disable
@@ -1286,6 +1296,10 @@ class Block(nn.Module):
         gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)
         if self._gg_track_enabled or self._gg_call_track_enabled:
             self._record_gg_diag(gg_tok.detach())
+            # Capture attn gate for per-iteration tracking
+            ag = getattr(self.attn, "_attn_gate_last_mean", None)
+            if ag is not None:
+                self._attn_gate_call_track.append(ag)
         return (1.0 - gg_tok).to(dtype=z_in.dtype).unsqueeze(-1) * z_in + gg_tok.to(dtype=z_in.dtype).unsqueeze(-1) * z2
 
 
@@ -1559,6 +1573,8 @@ class GPT(nn.Module):
         self.shared_block._gg_track_enabled = bool(track_gg)
         self.shared_block._gg_call_track = []
         self.shared_block._gg_call_track_enabled = bool(track_gg)
+        self.shared_block._inj_call_track = []
+        self.shared_block._attn_gate_call_track = []
         try:
             f_theta = self.shared_block
             if self.training and self.deq_backward == "revdeq":
@@ -1592,6 +1608,18 @@ class GPT(nn.Module):
                 self._gg_iter_last_solve = [0.5 * (calls[2*i] + calls[2*i+1]) for i in range(K)]
             else:
                 self._gg_iter_last_solve = []
+            # Aggregate inj_gate per-iteration (each iter has 2 calls: y-step + z-step)
+            inj_calls = list(getattr(self.shared_block, "_inj_call_track", []) or [])
+            if len(inj_calls) == 2 * K:
+                self._inj_iter_last_solve = [0.5 * (inj_calls[2*i] + inj_calls[2*i+1]) for i in range(K)]
+            else:
+                self._inj_iter_last_solve = []
+            # Aggregate attn_gate per-iteration (1 call per block forward, 2 per iter)
+            ag_calls = list(getattr(self.shared_block, "_attn_gate_call_track", []) or [])
+            if len(ag_calls) == 2 * K:
+                self._attn_gate_iter_last_solve = [0.5 * (ag_calls[2*i] + ag_calls[2*i+1]) for i in range(K)]
+            else:
+                self._attn_gate_iter_last_solve = []
 
     def _run_backbone(self, x: Tensor) -> Tensor:
         x0 = x
@@ -2052,6 +2080,14 @@ def main() -> None:
         if gg_iter is not None and len(gg_iter) > 0:
             iter_str = ",".join(f"{float(v):.3f}" for v in gg_iter)
             parts.append(f"gg_iter:[{iter_str}]")
+        # Per-iteration injection gate trajectory
+        inj_iter = getattr(m, "_inj_iter_last_solve", None)
+        if inj_iter is not None and len(inj_iter) > 0:
+            parts.append(f"inj_iter:[{','.join(f'{v:.3f}' for v in inj_iter)}]")
+        # Per-iteration attention gate trajectory
+        ag_iter = getattr(m, "_attn_gate_iter_last_solve", None)
+        if ag_iter is not None and len(ag_iter) > 0:
+            parts.append(f"attn_gate_iter:[{','.join(f'{v:.3f}' for v in ag_iter)}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
@@ -2370,6 +2406,12 @@ def main() -> None:
         gg_iter = getattr(base_m_for_roundtrip, "_gg_iter_last_solve", None)
         if gg_iter and len(gg_iter) > 0:
             diag_parts.append(f"gg_iter:[{','.join(f'{v:.3f}' for v in gg_iter)}]")
+        inj_iter = getattr(base_m_for_roundtrip, "_inj_iter_last_solve", None)
+        if inj_iter and len(inj_iter) > 0:
+            diag_parts.append(f"inj_iter:[{','.join(f'{v:.3f}' for v in inj_iter)}]")
+        ag_iter = getattr(base_m_for_roundtrip, "_attn_gate_iter_last_solve", None)
+        if ag_iter and len(ag_iter) > 0:
+            diag_parts.append(f"attn_gate_iter:[{','.join(f'{v:.3f}' for v in ag_iter)}]")
         gg_mean = getattr(base_m_for_roundtrip, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             diag_parts.append(f"gg_mean:{gg_mean:.4f}")
