@@ -357,7 +357,9 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
 
 def run_validation(args, model, rank, world_size, device, grad_accum_steps,
                    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                   *, full_validation: bool) -> tuple[float, float]:
+                   *, full_validation: bool, deq_k: int | None = None) -> tuple[float, float]:
+    """Validate on the val set.  deq_k overrides the number of DEQ solver
+    iterations; when None (default) uses args.deq_k_eval."""
     local_batch_tokens = args.val_batch_size // world_size
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
@@ -370,10 +372,11 @@ def run_validation(args, model, rank, world_size, device, grad_accum_steps,
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    model.eval()
+    model.train(False)
     base_m = model.module if hasattr(model, "module") else model
     prev_k = getattr(base_m, "_deq_k_override", None)
-    base_m._deq_k_override = int(getattr(args, "deq_k_eval", base_m.num_layers))
+    k = int(deq_k if deq_k is not None else getattr(args, "deq_k_eval", base_m.num_layers))
+    base_m._deq_k_override = k
     with torch.inference_mode():
         for batch_start in range(seq_start, seq_end, local_batch_seqs):
             batch_end = min(batch_start + local_batch_seqs, seq_end)
@@ -2344,13 +2347,15 @@ def main() -> None:
     k_sweep_values = [4, 8, 16, 32, 64]  # extrapolate beyond training K to test true convergence
     k_sweep_results: dict[int, float] = {}
     for k_eval in k_sweep_values:
-        base_m_for_roundtrip._deq_k_override = int(k_eval)
-        # Enable router diagnostics so gg_iter + DEQ convergence are captured per K.
+        # Pass deq_k explicitly — run_validation uses it directly instead of
+        # reading from args.deq_k_eval (which was the root cause of the bug
+        # that made all previous K-sweeps flat: the callee clobbered the
+        # caller's _deq_k_override with args.deq_k_eval=8).
         with router_diagnostics(enabled=True, step_tag=k_eval):
             _, bpb_k = run_validation(
                 args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                full_validation=True,
+                full_validation=True, deq_k=k_eval,
             )
         k_sweep_results[k_eval] = float(bpb_k)
         # Log val_bpb + per-iteration gg trajectory + DEQ diagnostics for this K.
