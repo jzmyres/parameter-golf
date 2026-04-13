@@ -104,17 +104,39 @@ designed to test it with a single controlled variable change.
 
 **Relationship between H17 and H18:**
 - WD and β address DIFFERENT failure modes: WD→stability, β→convergence speed
-- They are orthogonal in principle but coupled through the Jacobian norm
+- They are NOT fully orthogonal — see H19 (gate defense mechanism)
 - Recipe: first set WD high enough for stability (H17), then tune β for convergence speed (H18)
-- This gives a principled 2-step optimization instead of a 2D grid search
+- BUT: increasing β may require proportionally more WD (H19)
+
+### H19: Higher β requires proportionally higher WD to maintain dome-shaped gate — PRIORITY
+**Claim:** The model has a "defense mechanism": when β is too high relative to WD, the gate flattens to ~0.22 (shallow DEQ regime) to prevent instability. Only when WD is high enough does the model feel "safe" to open the gate in a dome-shaped pattern (genuine iterative depth usage).
+**Mechanism:** At β×spectral_norm(J) ≈ 1 (near instability boundary), the gate flattens to reduce effective per-iter update. At β×spectral_norm(J) << 1 (well within stability), the gate opens to dome shape because larger updates are safe.
+**Observed evidence:**
+- β=0.20 at WD=0.36 → FAILED (unstable, smoke crashed)
+- β=0.20 at WD=0.72 → dome gate [0.88→0.08] ✓ (safe enough to open gate)
+- β=0.30 at WD=0.72 → **flat gate [0.30→0.19]** (defensive — WD=0.72 not enough for β=0.30)
+**Prediction:** β=0.30 at WD=1.44 → dome gate (WD high enough for β=0.30 to feel safe)
+**Emerging scaling law for min WD:**
+
+| β | Min WD for dome-shaped gate | Evidence |
+|---|---|---|
+| 0.10 | ~0.18 | iter 7 |
+| 0.20 | ~0.72 | iter 13 (dome), iter 12b WD=0.36 failed |
+| 0.30 | ~1.44? | iter 14a flat gate at WD=0.72 → needs more WD |
+
+Suggests WD_min ∝ β² (or some power law). Each β increment needs proportionally MORE WD.
+**To verify:** Test β=0.30 at WD=1.44. If gate becomes dome-shaped → H19 verified.
+**Implication:** H18 (β→convergence speed) is CONDITIONALLY true — only when WD is scaled up to match. Without matching WD, higher β just flattens the gate with no convergence benefit.
 
 ### H12: Wider K jitter fixes FP quality degradation
 **Claim:** Training at K∈{4,8,12,16} forces the model to optimize FP quality at all K, making K-sweep monotone.
-**Test:** Iter 13 (running) — WD=0.72/β=0.20 + K jitter {4,8,12,16}
+**Test:** Iter 13 — WD=0.72/β=0.20 + K jitter {4,8,12,16}
+**Evidence:** K=8→K=16 Δ reduced from +0.025 (iter 12b) to +0.0002 (125× improvement). K=8→K=64 Δ reduced from +0.047 to +0.009 (5× improvement). Strong evidence but NOT fully verified — small residual degradation at K=32/64 remains.
 
 ### H13: The optimal (WD, β) pair lies on a diagonal
 **Claim:** As WD increases, optimal β increases proportionally.
 **Test:** Planned — need 2D sweep data
+**Partial evidence:** H19 suggests WD_min ∝ β². The diagonal relationship exists for STABILITY (min WD per β), but may differ for PERFORMANCE (optimal WD per β for best val_bpb).
 
 ### H14: Router sigmoid gate improves expert utilization
 **Claim:** Input-dependent sigmoid gate on softmax routing weights helps DEQ convergence.
@@ -161,10 +183,10 @@ designed to test it with a single controlled variable change.
 | Iter | Config change | Tests | Depends on |
 |---|---|---|---|
 | **13** | WD=0.72, β=0.20, K jitter {4,8,12,16} | H17 (stable?), H12 (K jitter→FP) | — |
-| 14a | WD=0.72, **β=0.30** (hold WD, increase β only) | **H18** (faster convergence at same stability?) | iter 13 stable |
-| 14b | WD=0.72, **β=0.10** (hold WD, decrease β only) | **H18** (control: slower convergence?) | iter 13 stable |
-| 15 | **WD=1.44**, β=0.20 (hold β, increase WD only) | **H17** (even more stable? diminishing returns?) | iter 13 stable |
-| 15b | If 13 fails: **WD=1.44**, β=0.20 | **H17** (WD=0.72 wasn't enough → double again) | iter 13 fails |
+| **14a** | **WD=0.72, β=0.30** (hold WD, increase β) | **H18, H19** (gate went flat → β too high for WD=0.72) | **running** |
+| **14b** | **WD=1.44, β=0.30** (double WD to match β) | **H19** (does higher WD restore dome-shaped gate at β=0.30?) | iter 14a |
+| 14c | WD=0.72, β=0.10 (decrease β at same WD) | H18 control: slower convergence? | if needed |
+| 15 | WD=1.44, β=0.20 (hold β=0.20, increase WD) | H17 (more WD at proven-good β) | if needed |
 
 **Decision point after Phase 1:**
 - H17 verified → WD is the stability lever, set to minimum stable value
