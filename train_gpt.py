@@ -129,7 +129,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.72  # iter 13: WD=0.36/β=0.20 failed smoke → doubled WD for more stability
+    weight_decay = 1.44  # iter 14b: test if higher WD restores dome gate faster at β=0.30 (H19)
     tied_embed_init_std = 0.005
 
     # Routing
