@@ -2277,6 +2277,12 @@ def main() -> None:
     if master_process:
         log0(f"Code size: {len(code.encode('utf-8'))} bytes")
         sd = base_model.state_dict()
+        # Save full-precision (bf16) weights before quantization for diagnostic
+        # re-evaluation (K-sweep at new K values, gate analysis) without retraining.
+        weights_dir = Path("experiments/weights/current")
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(sd, weights_dir / "model_full.pt")
+        log0(f"saved full-precision weights: {weights_dir / 'model_full.pt'}")
         int6_cats = {"matrix", "embed", "bigram"}
         qsd, meta = mixed_quantize_int6(sd, int6_cats)
         buf = io.BytesIO()
