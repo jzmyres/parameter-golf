@@ -12,6 +12,14 @@ Status levels:
 A hypothesis is only VERIFIED (or REFUTED) when a future iteration is explicitly
 designed to test it with a single controlled variable change.
 
+**Confound-aware logging:** When multiple variables change simultaneously:
+- **CAN claim:** "the combination (A + B) produces outcome X"
+- **CANNOT claim:** "A alone causes X" or "B alone causes X"
+- **To isolate:** test A alone (hold B constant) and B alone (hold A constant)
+- Example: if (12exp + WD=0.72) works but (12exp + WD=0.06) collapsed, we
+  cannot say "12 experts is inherently unstable" — only that it collapsed
+  UNDER the tested WD. The collapse might be addressable by increasing WD.
+
 ---
 
 ## VERIFIED
@@ -42,9 +50,17 @@ designed to test it with a single controlled variable change.
 **Observation:** gg_gate.bias=1.5 (init gg_tok=0.82) was driven back to 0.11 by step 200 (iter 2).
 **Confounds:** Only tested one init value at one config. Need: test with constrained/frozen gate.
 
-### H5: Routing collapse risk scales as num_experts × expert_rank²
-**Observation:** 12 experts at rank 128 collapsed; 8 at rank 128 stable; 16 at rank 64 stable.
-**Confounds:** Different routing regularization may change the threshold. Need: controlled sweep of (E, R) at fixed regularization.
+### H5: Routing collapse is caused by expert count alone
+**Observation:**
+- (12exp, rank128, WD=0.06, β=0.35) → collapsed at step 400
+- (8exp, rank128, WD=0.06, β=0.35) → stable 743 steps
+- (16exp, rank64, WD=0.09, β=0.10) → stable 372 steps
+- (16exp, rank128, WD=0.18, β=0.10) → collapsed at step 400
+**CAN claim:** routing collapsed under these specific (E, R, WD, β) combinations.
+**CANNOT claim:** "12+ experts is inherently unstable" — never tested at high WD. Higher WD might stabilize (per verified H9).
+**CANNOT claim:** "collapse scales as E×R²" — only observed at low WD.
+**To isolate:** test (8exp vs 12exp) at identical (WD=0.72, β=0.20, rank128).
+**Confounds:** WD, β, and routing regularization all differed across tests.
 
 ### H6: β has a U-shaped optimum (at WD=0.18)
 **Observation:** β=0.05 (1.820), β=0.10 (1.796), β=0.20 (1.818). Best at 0.10.
