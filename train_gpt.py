@@ -1148,14 +1148,12 @@ class MoSHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    # iter 15: test 12 experts at locked WD=0.72 (H5 revisited).
-    # Previous 12-expert attempts collapsed at WD=0.06 (iter 3a1) and WD=0.18
-    # (iter 6a1).  H9 (verified) showed higher WD expands stability.  If
-    # 12 experts works at WD=0.72, the earlier collapse was WD-addressable.
+    # Locked config: 8 experts (iter 13 best at 1h budget).
+    # H5 resolved: 12exp works at WD=0.72 but throughput penalty hurts val_bpb.
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False, num_experts: int = 12):
+                 tie_attn_mlp_router: bool = False, num_experts: int = 8):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()

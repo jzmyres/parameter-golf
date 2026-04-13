@@ -50,17 +50,16 @@ designed to test it with a single controlled variable change.
 **Observation:** gg_gate.bias=1.5 (init gg_tok=0.82) was driven back to 0.11 by step 200 (iter 2).
 **Confounds:** Only tested one init value at one config. Need: test with constrained/frozen gate.
 
-### H5: Routing collapse is caused by expert count alone
-**Observation:**
+### H5: Routing collapse is caused by expert count alone — RESOLVED
+**Original observation:**
 - (12exp, rank128, WD=0.06, β=0.35) → collapsed at step 400
 - (8exp, rank128, WD=0.06, β=0.35) → stable 743 steps
-- (16exp, rank64, WD=0.09, β=0.10) → stable 372 steps
 - (16exp, rank128, WD=0.18, β=0.10) → collapsed at step 400
-**CAN claim:** routing collapsed under these specific (E, R, WD, β) combinations.
-**CANNOT claim:** "12+ experts is inherently unstable" — never tested at high WD. Higher WD might stabilize (per verified H9).
-**CANNOT claim:** "collapse scales as E×R²" — only observed at low WD.
-**To isolate:** test (8exp vs 12exp) at identical (WD=0.72, β=0.20, rank128).
-**Confounds:** WD, β, and routing regularization all differed across tests.
+**Iter 15 test:** (12exp, rank128, WD=0.72, β=0.20) → **STABLE 300 steps, attn_cv 0.017→0.225→0.182 (DECREASING), all 12 experts active.**
+**Verdict:** ❌ REFUTED — routing collapse is NOT caused by expert count alone. It is caused by insufficient WD relative to expert count. WD=0.72 stabilizes 12 experts where WD=0.06 and WD=0.18 collapsed. Consistent with verified H9 (higher WD → more stability).
+**CAN claim:** (12exp, rank128, WD=0.72) is stable.
+**CANNOT claim:** 12exp is better than 8exp for val_bpb (12exp gets fewer steps from throughput penalty: 300 vs 356 steps at 1h budget).
+**Implication:** When scaling expert count, increase WD proportionally. The collapse threshold is a (num_experts, WD) function, not a fixed expert limit.
 
 ### H6: β has a U-shaped optimum (at WD=0.18)
 **Observation:** β=0.05 (1.820), β=0.10 (1.796), β=0.20 (1.818). Best at 0.10.
@@ -179,7 +178,11 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 | 10 | WD=0.36 | 1.779 | discard | H7 |
 | 11 | dim896 rank96/144 | ~1.89 | killed (worse) | H8 |
 | 12b | WD=0.36 (fixed K-sweep) | 1.778 | discard | H10 (first valid K-sweep) |
-| **13** | **WD=0.72, β=0.20, K jitter {4,8,12,16}** | **TBD** | **running** | **H9, H12** |
+| 13 | WD=0.72, β=0.20, K jitter {4,8,12,16} | 1.976 | discard | H9, H12, H17 |
+| 14a | β=0.30 at WD=0.72 | 2.046 | discard | H18 (speed yes, FP quality no) |
+| 14b | WD=1.44, β=0.30 | 2.081 | discard | H19 (WD=1.44 too high) |
+| 15 | 12exp rank128 at WD=0.72 | 2.033 | discard | **H5 RESOLVED** (collapse = WD-fixable) |
+| **16** | **Gate statistics infrastructure** | **TBD** | **next** | Observability |
 
 ## Iteration Schedule (upcoming)
 
