@@ -113,7 +113,7 @@ class Hyperparameters:
     rope_base = 10000.0
     logit_softcap = 30.0
     qk_gain_init = 5.0
-    deq_beta = 0.20  # iter 13: test if WD=0.36 tolerates higher β (stability test — higher WD → smaller Jacobian → wider stable β range)
+    deq_beta = 0.30  # iter 14a: H18 test — does higher β give faster DEQ convergence at WD=0.72? (single variable change from iter 13's β=0.20)
 
     # Optimizer
     tied_embed_lr = 0.03
