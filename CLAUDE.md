@@ -266,9 +266,23 @@ When proposing architecture improvements:
   - DDP tests: verify multi-GPU correctness
   - Artifact size tests: verify <= 16MB after compression
 
-### Simplify Before Commit
-- Run `/simplify` on every successful experiment before committing
-- Keep code clean and minimal — complexity must earn its keep
+### Pre-Commit Review Chain
+Before EVERY commit, run this chain:
+1. `/simplify` — clean up code
+2. `coderabbit:review` — AI code review
+3. `pr-review-toolkit:review-pr` — comprehensive PR review
+4. `superpowers:requesting-code-review` — verify requirements
+5. Apply simple, first-principled fixes to valid issues
+6. Then `git commit`
+
+### Hypothesis Log (`experiments/hypotheses.md`)
+- **READ before each experiment** — check if a relevant hypothesis exists
+- **Design experiments to test ONE hypothesis** with a single controlled variable
+- **Status levels**: VERIFIED (controlled test), OBSERVED (confounded evidence), PROPOSED (untested), REFUTED (controlled disproof)
+- A hypothesis is only VERIFIED when a dedicated experiment tests it with all else equal
+- **Update after each experiment** — record the verdict and implication
+- **Use as troubleshooting manual** — when DEQ diverges, routing collapses, or K-sweep degrades, consult the log for known fixes (e.g., H9: double WD when β is too high)
+- **Stability over task performance** — prefer verified-stable configs over slightly-better-but-unverified ones
 
 ### Simplicity Criterion
 - All else equal, simpler is better
