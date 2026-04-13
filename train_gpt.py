@@ -144,7 +144,7 @@ class Hyperparameters:
     router_bias_lr = 0.10
     router_bias_clip = 10.0
     mos_ortho_out_coef = 1e-3
-    tie_attn_mlp_router = True
+    tie_attn_mlp_router = False
 
     # DEQ solver
     deq_backward = "revdeq"
@@ -1293,6 +1293,9 @@ class Block(nn.Module):
         self._inj_call_track: list[float] = []
         self._attn_gate_call_track: list[float] = []
         self._router_gate_call_track: list[float] = []
+        # Per-component router gate tracking (attn vs FFN separately)
+        self._attn_router_gate_call_track: list[float] = []
+        self._mlp_router_gate_call_track: list[float] = []
 
         self.inj_gate = CastedLinear(dim, 1, bias=True)
         self._inj_gate_last_mean: float | None = None
@@ -1387,6 +1390,10 @@ class Block(nn.Module):
         x_attn = self.attn_norm(x)
         x_attn_n = _rms_norm(x_attn)
         w_attn = self.attn_router(x_attn)
+        # Capture attn router gate BEFORE mlp_router call overwrites it (tied router)
+        _tracking = self._gg_track_enabled or self._gg_call_track_enabled
+        if _tracking:
+            attn_rg = getattr(self.attn_router, "_router_gate_last_mean", None)
         y_shared = self.attn._attn_shared_from_normed(x_attn_n)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
 
@@ -1397,13 +1404,19 @@ class Block(nn.Module):
         z2 = attn_mix + mlp_mix
 
         gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)
-        if self._gg_track_enabled or self._gg_call_track_enabled:
+        if _tracking:
             self._record_gg_diag(gg_tok.detach())
             # Capture attn gate for per-iteration tracking
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
             if ag is not None:
                 self._attn_gate_call_track.append(ag)
-            # Capture router gate for per-iteration tracking (uses attn_router since tied)
+            # Per-component router gates (attn captured before mlp call, mlp captured after)
+            if attn_rg is not None:
+                self._attn_router_gate_call_track.append(attn_rg)
+            mlp_rg = getattr(self.mlp_router, "_router_gate_last_mean", None)
+            if mlp_rg is not None:
+                self._mlp_router_gate_call_track.append(mlp_rg)
+            # Combined router gate (average of attn+mlp for backward compat)
             rg = getattr(self.attn_router, "_router_gate_last_mean", None)
             if rg is not None:
                 self._router_gate_call_track.append(rg)
@@ -1684,6 +1697,8 @@ class GPT(nn.Module):
         self.shared_block._inj_call_track = []
         self.shared_block._attn_gate_call_track = []
         self.shared_block._router_gate_call_track = []
+        self.shared_block._attn_router_gate_call_track = []
+        self.shared_block._mlp_router_gate_call_track = []
         try:
             f_theta = self.shared_block
             if self.training and self.deq_backward == "revdeq":
@@ -1731,12 +1746,23 @@ class GPT(nn.Module):
                 self._attn_gate_iter_last_solve = [0.5 * (ag_calls[2*i] + ag_calls[2*i+1]) for i in range(K)]
             else:
                 self._attn_gate_iter_last_solve = []
-            # Aggregate router_gate per-iteration
+            # Aggregate router_gate per-iteration (combined, backward compat)
             rg_calls = list(getattr(self.shared_block, "_router_gate_call_track", []) or [])
             if len(rg_calls) == 2 * K:
                 self._router_gate_iter_last_solve = [0.5 * (rg_calls[2*i] + rg_calls[2*i+1]) for i in range(K)]
             else:
                 self._router_gate_iter_last_solve = []
+            # Per-component router gates (attn vs FFN)
+            attn_rg_calls = list(getattr(self.shared_block, "_attn_router_gate_call_track", []) or [])
+            if len(attn_rg_calls) == 2 * K:
+                self._attn_router_gate_iter_last_solve = [0.5 * (attn_rg_calls[2*i] + attn_rg_calls[2*i+1]) for i in range(K)]
+            else:
+                self._attn_router_gate_iter_last_solve = []
+            mlp_rg_calls = list(getattr(self.shared_block, "_mlp_router_gate_call_track", []) or [])
+            if len(mlp_rg_calls) == 2 * K:
+                self._mlp_router_gate_iter_last_solve = [0.5 * (mlp_rg_calls[2*i] + mlp_rg_calls[2*i+1]) for i in range(K)]
+            else:
+                self._mlp_router_gate_iter_last_solve = []
 
     def _run_backbone(self, x: Tensor) -> Tensor:
         x0 = x
@@ -2214,10 +2240,17 @@ def main() -> None:
         ag_iter = getattr(m, "_attn_gate_iter_last_solve", None)
         if ag_iter is not None and len(ag_iter) > 0:
             parts.append(f"attn_gate_iter:[{','.join(f'{v:.3f}' for v in ag_iter)}]")
-        # Per-iteration router gate trajectory
+        # Per-iteration router gate trajectory (combined, backward compat)
         rg_iter = getattr(m, "_router_gate_iter_last_solve", None)
         if rg_iter is not None and len(rg_iter) > 0:
             parts.append(f"router_gate_iter:[{','.join(f'{v:.3f}' for v in rg_iter)}]")
+        # Per-component router gate trajectories (attn vs FFN)
+        attn_rg_iter = getattr(m, "_attn_router_gate_iter_last_solve", None)
+        if attn_rg_iter is not None and len(attn_rg_iter) > 0:
+            parts.append(f"attn_rg_iter:[{','.join(f'{v:.3f}' for v in attn_rg_iter)}]")
+        mlp_rg_iter = getattr(m, "_mlp_router_gate_iter_last_solve", None)
+        if mlp_rg_iter is not None and len(mlp_rg_iter) > 0:
+            parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
@@ -2545,6 +2578,12 @@ def main() -> None:
         rg_iter = getattr(base_m_for_roundtrip, "_router_gate_iter_last_solve", None)
         if rg_iter and len(rg_iter) > 0:
             diag_parts.append(f"router_gate_iter:[{','.join(f'{v:.3f}' for v in rg_iter)}]")
+        attn_rg_iter = getattr(base_m_for_roundtrip, "_attn_router_gate_iter_last_solve", None)
+        if attn_rg_iter and len(attn_rg_iter) > 0:
+            diag_parts.append(f"attn_rg_iter:[{','.join(f'{v:.3f}' for v in attn_rg_iter)}]")
+        mlp_rg_iter = getattr(base_m_for_roundtrip, "_mlp_router_gate_iter_last_solve", None)
+        if mlp_rg_iter and len(mlp_rg_iter) > 0:
+            diag_parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
         gg_mean = getattr(base_m_for_roundtrip, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             diag_parts.append(f"gg_mean:{gg_mean:.4f}")
@@ -2557,6 +2596,75 @@ def main() -> None:
         log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
     k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
     log0(f"k_sweep:done {k_parts}")
+
+    # ── Final hard assertions on post-int6 model health ──────────────────
+    # These run after the K-sweep so all diagnostics are populated from the
+    # K=128 (or highest K) eval pass.  Failures are logged as warnings, not
+    # crashes, so the run still produces usable data — but they flag issues
+    # that should be investigated before promoting to baseline.
+    _assert_warnings: list[str] = []
+
+    # 1. Expert health: balanced usage + orthogonality
+    for prefix, router in (("attn", getattr(base_m_for_roundtrip.shared_block.attn, "attn_router", None)),
+                           ("mlp", getattr(base_m_for_roundtrip.shared_block.mlp, "mlp_router", None))):
+        if router is None:
+            continue
+        cv = getattr(router, "_expert_balance_cv", None)
+        if cv is not None and float(cv) > 0.5:
+            _assert_warnings.append(f"{prefix}_balance_cv={cv:.3f} > 0.5 (routing imbalance)")
+        ent = getattr(router, "_expert_entropy", None)
+        n_exp = getattr(router, "num_experts", 8)
+        max_ent = math.log(n_exp)
+        if ent is not None and max_ent > 0 and float(ent) / max_ent < 0.7:
+            _assert_warnings.append(f"{prefix}_entropy={ent:.3f} < 70% of max ({max_ent:.3f}) (expert collapse)")
+    for attr_name in ("attn", "mlp"):
+        ortho = getattr(getattr(base_m_for_roundtrip.shared_block, attr_name, None), "_out_ortho_cos_sim", None)
+        if ortho is not None and float(ortho) > 0.3:
+            _assert_warnings.append(f"{attr_name}_ortho={ortho:.3f} > 0.3 (experts not diverse)")
+
+    # 2. Global gate trend: gg should be active (not collapsed to 0 or 1)
+    gg_iter_final = getattr(base_m_for_roundtrip, "_gg_iter_last_solve", None)
+    if gg_iter_final and len(gg_iter_final) >= 4:
+        gg_min = min(gg_iter_final)
+        gg_max = max(gg_iter_final)
+        if gg_max < 0.3:
+            _assert_warnings.append(f"gg_max={gg_max:.3f} < 0.3 (gate collapsed — model not using DEQ iterations)")
+        if gg_min > 0.95:
+            _assert_warnings.append(f"gg_min={gg_min:.3f} > 0.95 (gate saturated — no convergence signal)")
+
+    # 3. FP convergence: K-sweep should be monotone-improving or plateauing
+    if len(k_sweep_results) >= 2:
+        ks_sorted = sorted(k_sweep_results.items())
+        best_bpb = min(v for _, v in ks_sorted)
+        worst_high_k = max(v for k, v in ks_sorted if k >= 16) if any(k >= 16 for k, _ in ks_sorted) else None
+        if worst_high_k is not None and worst_high_k - best_bpb > 0.03:
+            _assert_warnings.append(
+                f"K-sweep degradation: best={best_bpb:.4f} worst_k>=16={worst_high_k:.4f} "
+                f"(Δ={worst_high_k - best_bpb:.4f} > 0.03 — input-dependence may be lost at high K, see H23)"
+            )
+        # Check monotonicity from K=8 onward (K=4 may be legitimately worse due to under-iteration)
+        ks_from_8 = [(k, v) for k, v in ks_sorted if k >= 8]
+        for i in range(1, len(ks_from_8)):
+            if ks_from_8[i][1] > ks_from_8[i-1][1] + 0.005:
+                _assert_warnings.append(
+                    f"K-sweep non-monotone: k={ks_from_8[i-1][0]} bpb={ks_from_8[i-1][1]:.4f} → "
+                    f"k={ks_from_8[i][0]} bpb={ks_from_8[i][1]:.4f} (Δ=+{ks_from_8[i][1]-ks_from_8[i-1][1]:.4f})"
+                )
+                break  # only flag first non-monotone step
+
+    # 4. Iter convergence: relative convergence should be small at highest K
+    conv_rel = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel", None)
+    if conv_rel is not None and float(conv_rel) > 0.1:
+        _assert_warnings.append(f"iter_conv_rel={conv_rel:.4f} > 0.1 (solver not converging at eval K)")
+
+    if _assert_warnings:
+        log0("⚠ POST-INT6 HEALTH WARNINGS:")
+        for w in _assert_warnings:
+            log0(f"  ⚠ {w}")
+        log0(f"({len(_assert_warnings)} warning(s) — review before promoting to baseline)")
+    else:
+        log0("✓ POST-INT6 HEALTH: all assertions passed (expert balance, gate trend, FP convergence)")
+
     # Restore eval K for any downstream sliding-window eval.
     base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
 

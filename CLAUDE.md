@@ -106,6 +106,7 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
 
 ### Experiment Loop
 1. Read git state: `git log --oneline -20` + `results.tsv`
+1a. **Read `experiments/hypotheses.md`** — review relevant hypotheses, state what this iteration tests
 2. Make ONE focused change to `train_gpt.py`
 2a. Run `python experiments/smoke_test.py` — MUST PASS before long training. Checks:
    - Loss decreases (not diverging)
@@ -127,6 +128,7 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
     - Promote to baseline: `bash experiments/update_results.sh --promote`
     - **ALWAYS review + `/simplify` before committing improvements** to keep code clean
 11. If val_bpb equal or worse -> `git revert` to previous good state (weights stay in previous/)
+12. **Update `experiments/hypotheses.md`** — record results, update hypothesis statuses, note confounds
 13. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
 
 ### Logging, Weights & Plotting (REQUIRED every iteration)
@@ -276,11 +278,11 @@ Before EVERY commit, run this chain:
 6. Then `git commit`
 
 ### Hypothesis Log (`experiments/hypotheses.md`)
-- **READ before each experiment** — check if a relevant hypothesis exists
+- **READ BEFORE each iteration** — review relevant hypotheses, state what's being tested, check for known fixes
+- **UPDATE AFTER each iteration** — record the verdict, update hypothesis statuses, note confounds
 - **Design experiments to test ONE hypothesis** with a single controlled variable
 - **Status levels**: VERIFIED (controlled test), OBSERVED (confounded evidence), PROPOSED (untested), REFUTED (controlled disproof)
 - A hypothesis is only VERIFIED when a dedicated experiment tests it with all else equal
-- **Update after each experiment** — record the verdict and implication
 - **Use as troubleshooting manual** — when DEQ diverges, routing collapses, or K-sweep degrades, consult the log for known fixes (e.g., H9: double WD when β is too high)
 - **Stability over task performance** — prefer verified-stable configs over slightly-better-but-unverified ones
 
