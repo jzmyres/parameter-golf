@@ -113,7 +113,7 @@ class Hyperparameters:
     rope_base = 10000.0
     logit_softcap = 30.0
     qk_gain_init = 5.0
-    deq_beta = 0.10  # optimal: sweep tested {0.05, 0.10, 0.20} — U-shaped, 0.10 is Pareto best (1.796 post-int6)
+    deq_beta = 0.20  # iter 13: test if WD=0.36 tolerates higher β (stability test — higher WD → smaller Jacobian → wider stable β range)
 
     # Optimizer
     tied_embed_lr = 0.03
@@ -129,7 +129,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.36  # iter 12: high-WD rerun with K={4,8,16,32,64} sweep to test DEQ extrapolation
+    weight_decay = 0.72  # iter 13: WD=0.36/β=0.20 failed smoke → doubled WD for more stability
     tied_embed_init_std = 0.005
 
     # Routing
@@ -150,9 +150,9 @@ class Hyperparameters:
     deq_backward = "revdeq"
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 8
-    deq_k_step = 4  # K in {4, 8}
-    deq_k_eval = 8
+    deq_k_max = 16
+    deq_k_step = 4  # K in {4, 8, 12, 16} — wider jitter forces model to optimize FP quality at all K
+    deq_k_eval = 16  # eval at max training K
 
     # Architecture knobs
     # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
@@ -181,7 +181,7 @@ class Hyperparameters:
     ema_update_every = 1
 
     eval_stride = 0
-    eval_batch_seqs = 32
+    eval_batch_seqs = 256  # fast eval: 256 seqs × 2048 = 512K tokens (~8x more representative than 32)
 
 
 def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
@@ -1820,8 +1820,8 @@ def main() -> None:
         raise ValueError("deq_k_min must be positive")
     if int(args.deq_k_max) < int(args.deq_k_min):
         raise ValueError("deq_k_max must be >= deq_k_min")
-    if int(args.deq_k_max) > int(args.num_layers):
-        raise ValueError(f"deq_k_max must be <= num_layers={int(args.num_layers)}")
+    # deq_k_max can exceed num_layers: the DEQ uses a shared block so the
+    # solver can run any number of iterations.  num_layers is just the default K.
 
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -2350,18 +2350,22 @@ def main() -> None:
     # is exploiting a specific iteration count rather than a true fixed point.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
     log0("k_sweep:start")
-    k_sweep_values = [4, 8, 16, 32, 64]  # extrapolate beyond training K to test true convergence
+    k_sweep_values = [4, 8, 16, 32, 64]  # geometric doubling; fast eval makes K=64 affordable
     k_sweep_results: dict[int, float] = {}
     for k_eval in k_sweep_values:
         # Pass deq_k explicitly — run_validation uses it directly instead of
         # reading from args.deq_k_eval (which was the root cause of the bug
         # that made all previous K-sweeps flat: the callee clobbered the
         # caller's _deq_k_override with args.deq_k_eval=8).
+        # Use fast eval (small subset) for K-sweep — full validation is too
+        # expensive at high K (K=40 = 40 solver iters per batch).  The
+        # roundtrip_verification already ran full validation at the default K;
+        # the sweep only needs relative comparisons across K values.
         with router_diagnostics(enabled=True, step_tag=k_eval):
             _, bpb_k = run_validation(
                 args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-                full_validation=True, deq_k=k_eval,
+                full_validation=False, deq_k=k_eval,
             )
         k_sweep_results[k_eval] = float(bpb_k)
         # Log val_bpb + per-iteration gg trajectory + DEQ diagnostics for this K.
