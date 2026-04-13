@@ -1248,7 +1248,7 @@ class Block(nn.Module):
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
         g_inj = self._inj_gate_from(z_sub).to(dtype=z_sub.dtype)
-        x = z_sub + g_inj * (x0_sub - z_sub)
+        x = z_sub + g_inj * x0_sub  # additive injection (matches forward)
 
         x_attn = self.attn_norm(x)
         x_attn_n = _rms_norm(x_attn)
@@ -1287,7 +1287,14 @@ class Block(nn.Module):
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
         g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
-        x = z_in + g_inj * (x0 - z_in)
+        # Iter 18: additive injection instead of lerp.
+        # Old (lerp): x = z_in + g_inj * (x0 - z_in) = (1-g_inj)*z_in + g_inj*x0
+        # New (additive): x = z_in + g_inj * x0
+        # Additive decouples z_in from x0: the model keeps ALL of z_in and
+        # ADDS a gated fraction of x0.  This gives cleaner gradient flow to
+        # z_in (no (1-g_inj) scaling) and lets the model decide the injection
+        # magnitude independently of how much z_in to preserve.
+        x = z_in + g_inj * x0
 
         # Parallel residuals with the inner residual REMOVED.  Attention and
         # MLP both read the same pre-residual input x and their outputs sum
