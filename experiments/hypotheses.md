@@ -295,7 +295,8 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 | **21** | **Untied routers + token-local inj (H29) + DDP-safe health assertions** | **1.6706** | **INVALID under OLD strict gates (would PROMOTE under NEW val_bpb-primary policy)** | **H29 VERIFIED** |
 | 21-retry | + WD 0.72→1.08, K_max 16→20 (over-engineered for old gates) | 2.108 | discard (val_bpb regression — WD over-regularized; K=128 catastrophic Δ=1.675) | confirmed: WD=1.08 + K_max=20 anti-synergistic |
 | 21-retry-2 | revert WD/K_max + max_pairwise ortho LOSS (bug — sparse gradient) | 1.882 | discard (val_bpb regression; K=128 Δ=3.27, even worse than 21-retry) | confirmed: max_pairwise as LOSS breaks training |
-| 21-retry-3 | + decouple LOSS=max_mean (smooth) and GATE=max_pairwise (clean) | running | TBD — expected ~1.67 matching iter 21 | iter 21 dynamics restored with proper loss/gate decoupling |
+| 21-retry-3 | + decouple LOSS=max_mean (smooth) and GATE=max_pairwise (clean) | **1.892** | discard (val_bpb regressed +0.19 from baseline 1.705; K=128 Δ=1.79) | loss/gate decoupling helped (K128 went 3.27→1.79) but did NOT restore iter 21's 1.67 — root cause unclear, requires repro |
+| 21-retry-4 | repro test: HEAD code (val_bpb-primary + H32 ortho loss removed) | running | TBD — disambiguates: bf16 noise vs real regression | if 1.67-ish: noise; if ~1.89: confirms regression, root-cause needed |
 
 **Iter 21 val_bpb 1.6706 is BETTER than 1.705 (-0.034), but 5 hard assertions failed under OLD gates:**
 - `mlp_min_share=0.037 < 0.075` (OLD threshold; NEW threshold 0.01 — would PASS)
