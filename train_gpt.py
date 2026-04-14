@@ -1110,9 +1110,8 @@ class CausalSelfAttention(nn.Module):
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
         self._attn_gate_last_mean: float | None = None  # per-call attn gate mean
-        # Phase 4.5 22-add-all: RMSNorm after gated SDPA (post-non-linearity).
-        # Normalizes per-head attention output before the expert mix projection.
-        self.attn_sdpa_post_norm = RMSNorm(dim)
+        # Phase 4.5 22-rm-attn-sdpa-post: removed attn_sdpa_post_norm.
+        # Testing if RMSNorm after gated SDPA was doing useful work.
 
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         bsz, seqlen, dim = x_n.shape
@@ -1154,9 +1153,8 @@ class CausalSelfAttention(nn.Module):
         y = y * attn_gate_act
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._attn_gate_last_mean = float(attn_gate_act.detach().float().mean().item())
-        y_out = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        # Phase 4.5 22-add-all: RMSNorm after gated SDPA.
-        return self.attn_sdpa_post_norm(y_out)
+        # Phase 4.5 22-rm-attn-sdpa-post: no post-SDPA norm (returns raw).
+        return y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
     def mix_experts_from_shared(self, y: Tensor, w: Tensor) -> Tensor:
         B, T, D = y.shape
