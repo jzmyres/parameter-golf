@@ -342,7 +342,7 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 
 | Iter | Optimization | Expected gain | Effort | Risk |
 |---|---|---|---|---|
-| **T1** | Grouped expert mixing via `torch.bmm` over E dimension (replace einsum/loop) | 15-25% | Medium | Low — pure refactor, same math |
+| ~~T1~~ | ~~Grouped expert mixing via `torch.bmm`~~ — **ALREADY IMPLEMENTED** (`mix_experts_from_shared` L1167, `mix_experts` L1241 both use torch.bmm; input projections use flattened matmul, already optimal). No further win here. | 0 (done) | — | — |
 | **T2** | Defer diagnostic CPU sync to log time (record GPU-only inside DEQ loop) | 5-10% | Low | Low — already partially done for routers |
 | **T3** | Compile with `dynamic=True` so single graph handles K∈{4,8,16} | 2-5% steady, eliminates K-recompile re-warmup | Low | Medium — past dynamo bugs may have been fixed in newer torch |
 | **T4** | Drop full validation in mid-train val cycles; only fast subset; full val once at end | 5-10% (saves ~30s × N val cycles per hour) | Low | Low |
