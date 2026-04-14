@@ -161,13 +161,13 @@ class Hyperparameters:
     mlp_balance_mult = 1.0
     bal_loss_coef = 5e-3
     router_health_coef = 0.25
-    block_ortho_aux_coef = 1.0
+    block_ortho_aux_coef = 0.0  # disabled (loss should focus on task perf, not chase gates; the max_pairwise>0.9 GATE already catches duplicate experts)
     block_ortho_aux_every = 4
     block_ortho_aux_tokens = 64
     router_bias_update = True
     router_bias_lr = 0.10
     router_bias_clip = 10.0
-    mos_ortho_out_coef = 1e-3
+    mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
     tie_attn_mlp_router = False
 
     # DEQ solver
@@ -3210,18 +3210,19 @@ def main() -> None:
 
     # 6. RevDEQ reconstruction error: the backward reconstructs forward states
     # from the solver's final state; ||reconstructed_z - z|| must stay small
-    # for the reversibility invariant to hold.  Bf16 + FP64 accumulators: we
-    # typically see 1e-3 to 1e-1 on a healthy run.  >1.0 means reversibility
-    # is broken — gradients are unreliable.  Value is the last-recorded from
-    # the final training step before eval (populated by RevDEQFunction backward).
+    # for the reversibility invariant to hold AND for high-quality gradients.
+    # Bf16 + FP64 accumulators: healthy runs see 1e-3 to 1e-2 typically.
+    # Tightened from 1.0 → 0.1 (matches smoke test threshold; lower recon err
+    # = higher-quality gradients = more efficient training).  >0.1 means the
+    # reversibility approximation is degrading and gradients become noisy.
     recon_err_local = getattr(base_m_for_roundtrip.shared_block, "_deq_recon_error_last_bwd", None)
     recon_err = _ddp_mean_scalar(
         float(recon_err_local) if recon_err_local is not None else None
     )
-    if recon_err is not None and recon_err > 1.0:
+    if recon_err is not None and recon_err > 0.1:
         _failures.append(
-            f"deq_recon_err={recon_err:.3e} > 1.0 (RevDEQ reversibility broken — "
-            f"backward reconstructs forward states incorrectly, gradients unreliable)"
+            f"deq_recon_err={recon_err:.3e} > 0.1 (RevDEQ reversibility degrading — "
+            f"gradients getting noisy, training efficiency drops)"
         )
 
     # Classify each failure and prescribe a fix from the verified-hypothesis

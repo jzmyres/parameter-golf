@@ -477,9 +477,10 @@ VERIFIED or RESOLVED hypothesis from this document.
   - inj_max ≥ 0.05 AND inj_mean ≥ 0.01 (x0 injection non-zero — H23 DEQ input-dependence)
   - K-sweep degradation: worst K≥16 within 0.1 of best (gross FP collapse only; the 0.005 monotone gate was below the noise floor — current best baseline 1.705 also fails it. Finite-K fluctuation of 0.005-0.01 is expected and not a structural failure.)
   - iter_conv_rel ≤ 0.1 at highest K (solver converges at eval K)
-  - deq_recon_err ≤ 1.0 (RevDEQ reversibility — backward reconstructs forward states correctly)
+  - deq_recon_err ≤ 0.1 (RevDEQ reversibility — tightened from 1.0; lower recon = higher-quality gradients = more efficient training; matches smoke test threshold)
   - **NOT checked:** balance_cv (training optimizes this via balance_loss; not a structural invariant)
 - **Artifact budget HARD cap**: code + compressed model ≤ 16,000,000 bytes (fails early)
 - Untied attn/mlp routers (separate sigmoid gates and routing weights per component)
 - **H29 PRINCIPLE**: every gate must be input-dependent AND token-local — no `.mean(dim=batch,seq)` before any gate.  Streaming / prefix-caching invariance depends on this.  Verify any new gate with: "does chunking the sequence change this gate's value for unchanged tokens?" → must be NO.
 - **H31 PRINCIPLE**: LOSS and GATE metrics must be DIFFERENT by design — LOSS uses smooth signals (e.g. mean over all pairs); GATE uses worst-case (e.g. max over pairs). When designing a new gate, never reuse the loss metric for "consistency" — that breaks gradient flow. Cross-reference: max_pairwise (gate) vs max_mean (loss) for ortho.
+- **H32 PRINCIPLE**: LOSS focuses on TASK PERFORMANCE — don't add regularization terms that exist purely to satisfy gates. The LOSS budget is finite; every coefficient steals gradient signal from val_bpb. Gate failures are caught by the GATE; the LOSS doesn't need to also chase them. Removed: `mos_ortho_out_coef = 0` and `block_ortho_aux_coef = 0` (were 1e-3 and 1.0 — chasing the ortho gate that's now properly handled by max_pairwise > 0.9 detection + WD-driven natural diversification).
