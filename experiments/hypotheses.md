@@ -37,11 +37,12 @@ designed to test it with a single controlled variable change.
 **Status:** ✅ VERIFIED
 **Implication:** K jitter is a permanent training requirement. Small residual degradation at K>32 remains (+0.011 at K=64 in best config) but is 5× smaller than without jitter.
 
-### H15: Quant-noise injection in DEQ iterations — REFUTED
+### H15: Quant-noise injection in DEQ iterations — REFUTED (fundamental incompatibility)
 **Claim:** Quantization noise during DEQ iterations makes FP robust to int6.
 **Test:** Iter 20 — quant-noise at rate=0.10 (recon 10.9, smoke FAILED) and rate=0.01 (recon 3.55, smoke FAILED).
-**Root cause:** RevDEQ backward reconstructs forward states using current weights. Random per-call quant-noise makes forward non-deterministic, breaking reconstruction. Fundamentally incompatible.
-**Status:** ❌ REFUTED
+**Root cause (fundamental, not implementation):** RevDEQ achieves O(1) memory backward by *reconstructing* forward states during backward, which requires `f(z, x0, W)` to be deterministic. Fresh-sampled per-call noise `W_noisy = W + ε_n` gives different outputs in forward vs. backward reconstruction because `ε_n^forward` is not saved. Noise magnitude tracks reconstruction error linearly (10% → recon 10.9; 1% → recon 3.55).
+**Why fixes don't help:** Saving every ε_n defeats O(1) memory; deterministic noise from (iter_index, seed) removes the stochasticity benefit; a single ε across all K iterations reduces to "train a perturbed model" (not noise).
+**Status:** ❌ REFUTED (incompatibility is fundamental to RevDEQ, not a bug)
 **Implication:** Quant-noise is incompatible with RevDEQ's reversibility. The quant gap (0.002-0.008 BPB) is already tiny and not worth addressing this way.
 
 ### H18: β controls DEQ convergence speed — VERIFIED (PARTIAL)
@@ -107,6 +108,20 @@ designed to test it with a single controlled variable change.
 **Confounds:** Tested on top of additive injection (iter 18) and router sigmoid gate (iter 17). Need: test post-norm alone.
 **Evidence strength:** STRONG — the gg regime change is dramatic and the val_bpb delta is the largest from any single arch change.
 **Implication:** Post-norm is load-bearing for deep DEQ utilization. Do not remove.
+
+### H20a: Per-component post-norm (attn + FFN separately) may improve on Block-level
+**Claim:** The Block-level post-norm (`rms_norm(raw_out)` on `(1-gg)*z_in + gg*(attn+mlp)`) bounds the TOTAL magnitude but not the individual branch magnitudes. If attn and FFN operate at very different scales, one branch's magnitude dominates `attn_mix + mlp_mix` while the other is effectively suppressed. Per-component post-norm (`rms_norm(attn_mix) + rms_norm(mlp_mix)`) lets each branch find its own operating point.
+**Mechanism:** Decouples magnitude control between attn and FFN; each branch can independently learn how much to contribute per iteration.
+**Prediction:** -0.005 to -0.015 bpb if branches had imbalanced magnitudes at the Block-output-norm baseline.
+**Risk:** Doubles the bounded magnitude in z2 (each branch now norm-1 instead of their sum being norm-1). May require compensating gg_gate adjustment.
+**Test:** Phase 4.5 iter 22a.
+
+### H20b: Per-expert post-norm may improve on per-component
+**Claim:** Within a component (attn or FFN), experts with different magnitudes get weighted by the router. If expert i has magnitude 10× expert j, router weights effectively give expert i 10× more influence regardless of routing decision. Per-expert post-norm (before weight-mixing) removes this inter-expert magnitude conflict.
+**Mechanism:** Each expert output is normalized to unit RMS before the softmax-routing weighted mix, so the router's weight fully determines expert contribution (not magnitude × weight).
+**Prediction:** -0.005 to -0.015 bpb if expert magnitudes are imbalanced under current init/training.
+**Risk:** Adds num_experts RMSNorms per component (16 per block at 8 experts × 2 components). Cost is small but non-zero. Also changes expert dynamics fundamentally — the routing+mixing regime is no longer just softmax-weighted sum of raw outputs, it's softmax-weighted sum of normalized outputs.
+**Test:** Phase 4.5 iter 22b (only if 22a confirms per-component path is productive).
 
 ### H21: Correct per-expert Muon preconditioning changes optimization landscape
 **Observation:** Batched NS fix (per-expert instead of flattened) + torch.compile → val_bpb 1.705 (from 1.897). The NS fix alone changed which optimization trajectory the model follows. Previously, all expert gradients were flattened into one (E*R, D) matrix for NS, corrupting per-expert preconditioning.
@@ -247,11 +262,27 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 - **Phase 3** (iters 17-20): Router sigmoid gate, additive injection, post-norm (KEEP), quant-noise (REFUTED).
 - **Muon fix**: Batched NS + compile → NEW BEST 1.705.
 
-### Phase 4: Throughput baseline + untied routers (NEXT)
+### Phase 4: Throughput baseline + untied routers (RUNNING)
 
 | Iter | Config change | Hypothesis | Depends on |
 |---|---|---|---|
 | **21** | Untied attn/mlp routers + per-component router gate tracking + all throughput fixes (memmap, FP32 eval, K=128) | Separate router learning + throughput baseline | — |
+
+### Phase 4.5: Post-norm granularity (PRIORITY — front of queue)
+
+Post-norm on Block output (iter 19) gave −0.061 bpb — biggest arch improvement.
+Test whether more granular normalization helps: per-component (before gg gate
+integration) or even per-expert (before expert-weight mixing).
+
+| Iter | Config change | Hypothesis | Depends on |
+|---|---|---|---|
+| **22a** | RMSNorm on attn output AND RMSNorm on FFN output separately (before z2 = attn_mix + mlp_mix) | H20+: per-component normalization may give independent control over each branch's magnitude, letting attn and FFN each find their own operating point | iter 21 |
+| **22b** | RMSNorm on each expert output BEFORE weight-mixing (one norm per expert, not per-component) | H20++: if per-component helps, the finer granularity may help more — each expert can stabilize its magnitude independently, reducing inter-expert magnitude conflict | iter 22a result |
+
+**Expected outcomes:**
+- 22a win → add to locked config, skip 22b (simpler wins)
+- 22a wash/lose → 22b either (i) wins (expert-level needed) or (ii) loses too (Block-output norm is the correct granularity)
+- 22b win → adds ~8 RMSNorm modules per block (cheap) but changes expert mixing regime
 
 ### Phase 5: Injection mechanism rework (H23-H27) — PRIORITY
 
@@ -259,11 +290,11 @@ The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ req
 
 | Iter | Config change | Hypothesis | Depends on |
 |---|---|---|---|
-| **22** | Per-iteration injection schedule (K learnable scalars) | H24 — decouple bootstrap vs late-iter injection | iter 21 |
-| **23** | Residual injection: inject (x0 - z_in) error signal | H25 — self-regulating input-dependence | iter 21 |
-| **24** | Injection floor: clamp inj_gate ≥ 0.05 | H23 — minimal fix to ensure input-dependence persists | iter 21 |
-| **25** | Multi-scale injection (per-iter dim-wise gating on x0) | H26 — coarse early, fine late | iter 22-24 best |
-| **26** | Refinement soft-embed injection during DEQ solve | H27 — dual x0 + x0_refined injection | iter 22-24 best |
+| **23** | Per-iteration injection schedule (K learnable scalars) | H24 — decouple bootstrap vs late-iter injection | Phase 4.5 |
+| **24** | Residual injection: inject (x0 - z_in) error signal | H25 — self-regulating input-dependence | Phase 4.5 |
+| **25** | Injection floor: clamp inj_gate ≥ 0.05 | H23 — minimal fix to ensure input-dependence persists | Phase 4.5 |
+| **26** | Multi-scale injection (per-iter dim-wise gating on x0) | H26 — coarse early, fine late | iter 23-25 best |
+| **27** | Refinement soft-embed injection during DEQ solve | H27 — dual x0 + x0_refined injection | iter 23-25 best |
 
 ### Phase 6: Training objectives + activation
 

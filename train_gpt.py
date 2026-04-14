@@ -920,28 +920,29 @@ class SoftDenseRouter(nn.Module):
     @dynamo_disable
     def _record_diagnostics(self, share: Tensor, reduce_dims: tuple[int, ...]) -> None:
         mean_mass = share.mean(dim=reduce_dims)
-        per_token_ent = -(share * (share + 1e-8).log()).sum(-1)
-        # Keep tensors on GPU so DDP reductions at the post-eval assertion time
-        # don't need to re-stage from CPU.  _expert_usage (Python list) is
-        # materialized only on rank 0 for the log sites that consume it.
-        # Non-master ranks skip the .cpu().tolist() sync to keep per-forward
-        # eval overhead minimal across K-sweep and fast validation.
+        # Keep usage + CV on GPU for the DDP reductions at post-eval assertion
+        # time, so non-master ranks don't need a per-forward .cpu() sync.
+        # Entropy + sparsity + the Python list are only needed by master-rank
+        # log sites (format_expert_info), so we compute them only on master.
+        # This keeps non-master eval forward cost to a single mean() + std().
         self._expert_usage_gpu = mean_mass.float().detach()
-        self._expert_entropy_gpu = per_token_ent.mean().detach()
         self._expert_balance_cv_gpu = (
             mean_mass.std() / mean_mass.mean().clamp_min(1e-8)
         ).detach()
         is_master = (not dist.is_available() or not dist.is_initialized()
                      or dist.get_rank() == 0)
         if is_master:
+            per_token_ent = -(share * (share + 1e-8).log()).sum(-1)
             self._expert_usage = mean_mass.float().cpu().tolist()
             ent = float(per_token_ent.mean().item())
             self._expert_entropy = ent
+            self._expert_entropy_gpu = per_token_ent.mean().detach()
             self._expert_sparsity = 1.0 - (ent / max(math.log(float(self.num_experts)), 1e-8))
             self._expert_balance_cv = float(self._expert_balance_cv_gpu.item())
         else:
             self._expert_usage = None
             self._expert_entropy = None
+            self._expert_entropy_gpu = None
             self._expert_sparsity = None
             self._expert_balance_cv = None
         self._diag_step = _ROUTER_DIAGNOSTICS_STEP
@@ -2069,6 +2070,25 @@ def main() -> None:
             f.write("")
         print(logfile, flush=True)
 
+        # Clear stale artifacts from any previous run so a crash mid-way doesn't
+        # leave a half-written experiments/weights/current/ that gets picked up
+        # by update_results.sh --promote.  Also preemptively write meta.json
+        # with run_valid=false so even if THIS run aborts before the final
+        # assertion, promotion refuses.
+        current_dir = Path("experiments/weights/current")
+        if current_dir.exists():
+            for f in current_dir.iterdir():
+                if f.is_file():
+                    f.unlink()
+        current_dir.mkdir(parents=True, exist_ok=True)
+        import json as _json_init
+        with open(current_dir / "meta.json", "w") as mf:
+            _json_init.dump(
+                {"val_bpb": 0.0, "artifact_bytes": 0, "step": 0, "commit": "",
+                 "run_valid": False, "status": "in_progress"},
+                mf,
+            )
+
     def log0(msg: str, console: bool = True) -> None:
         if not master_process:
             return
@@ -2578,12 +2598,17 @@ def main() -> None:
         import json
         meta_path = weights_dir / "meta.json"
         with open(meta_path, "w") as f:
+            # run_valid stays false until the post-int6 assertions pass at the
+            # end of main().  If the run aborts between here and there, the
+            # stale false keeps update_results.sh --promote from picking it up.
             json.dump({
                 "val_bpb": 0.0,
                 "artifact_bytes": artifact_bytes,
                 "step": step,
                 "commit": subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                                          capture_output=True, text=True, check=False).stdout.strip(),
+                "run_valid": False,
+                "status": "artifact_written",
             }, f)
 
         log0("roundtrip_verification:start")
@@ -2737,7 +2762,10 @@ def main() -> None:
         present = torch.tensor([0.0 if t is None else 1.0], device=device)
         value = torch.zeros(length, device=device)
         if t is not None:
-            value.copy_(t.detach().float().view(length))
+            # .reshape() instead of .view() — if the diagnostic tensor ever
+            # comes in non-contiguous (e.g., after a slice or advanced index),
+            # .view() would raise but .reshape() handles it gracefully.
+            value.copy_(t.detach().float().reshape(length))
         dist.all_reduce(present, op=dist.ReduceOp.SUM)
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         n = float(present.item())
@@ -3026,6 +3054,16 @@ def main() -> None:
             retry_hint_path = Path("experiments/weights/current") / "retry_hint.json"
             if retry_hint_path.exists():
                 retry_hint_path.unlink()  # stale hint from a previous failure
+            # Flip run_valid=true now that all hard assertions passed — this is
+            # the ONLY code path that sets it.  update_results.sh --promote
+            # reads this flag.
+            if meta_path is not None and meta_path.exists():
+                with open(meta_path, "r") as f:
+                    meta_json = json.load(f)
+                meta_json["run_valid"] = True
+                meta_json["status"] = "validated"
+                with open(meta_path, "w") as f:
+                    json.dump(meta_json, f)
 
     # Restore eval K for any downstream sliding-window eval.
     base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
