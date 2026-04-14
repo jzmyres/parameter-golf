@@ -1110,6 +1110,9 @@ class CausalSelfAttention(nn.Module):
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
         self._attn_gate_last_mean: float | None = None  # per-call attn gate mean
+        # Phase 4.5 22-add-all: RMSNorm after gated SDPA (post-non-linearity).
+        # Normalizes per-head attention output before the expert mix projection.
+        self.attn_sdpa_post_norm = RMSNorm(dim)
 
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         bsz, seqlen, dim = x_n.shape
@@ -1151,7 +1154,9 @@ class CausalSelfAttention(nn.Module):
         y = y * attn_gate_act
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._attn_gate_last_mean = float(attn_gate_act.detach().float().mean().item())
-        return y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y_out = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        # Phase 4.5 22-add-all: RMSNorm after gated SDPA.
+        return self.attn_sdpa_post_norm(y_out)
 
     def mix_experts_from_shared(self, y: Tensor, w: Tensor) -> Tensor:
         B, T, D = y.shape
@@ -1223,6 +1228,9 @@ class MLP(nn.Module):
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
+        # Phase 4.5 22-add-all: RMSNorm on per-expert hidden (after leaky_relu²).
+        # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
+        self.hidden_post_norm = RMSNorm(self.expert_rank)
 
     def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False) -> Tensor:
         B, T, D = x.shape
@@ -1236,7 +1244,10 @@ class MLP(nn.Module):
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
         h = F.leaky_relu(gate, negative_slope=0.5).square() * fc
-        h = h.view(N, E, R) * w_flat.unsqueeze(-1)
+        h = h.view(N, E, R)
+        # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
+        h = self.hidden_post_norm(h)
+        h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
         out = out_e.sum(dim=0)  # (N, D)
@@ -1449,7 +1460,11 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm(dim)
         self.mlp_norm = RMSNorm(dim)
-        self.post_norm = RMSNorm(dim)  # iter 19: normalize output before next DEQ iteration
+        self.post_norm = RMSNorm(dim)  # iter 19 H20: normalize output before next DEQ iteration (load-bearing, do NOT remove)
+        # Phase 4.5 iter 22-add-all: learnable RMSNorm at all reasonable post-non-linearity positions.
+        # Subsequent iters remove one at a time; keep removed if val_bpb doesn't regress > 0.015.
+        self.attn_post_mix_norm = RMSNorm(dim)  # after attn_mix output (post expert-weighted sum)
+        self.mlp_post_mix_norm = RMSNorm(dim)   # after mlp_mix output (post expert-weighted sum)
         if bool(tie_attn_mlp_router):
             shared = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0)
             self.attn_router = shared
@@ -1600,6 +1615,12 @@ class Block(nn.Module):
         x_mlp = self.mlp_norm(x)
         w_mlp = self.mlp_router(x_mlp, pre_normed=True)
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True)
+
+        # Phase 4.5 22-add-all: per-component post-norm after expert mix
+        # (post-non-linearity, post-expert-weighted sum).  Subsequent iters
+        # test if either can be removed without val_bpb regression > 0.015.
+        attn_mix = self.attn_post_mix_norm(attn_mix)
+        mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
         z2 = attn_mix + mlp_mix
 
@@ -1835,6 +1856,9 @@ class GPT(nn.Module):
         self._block_ortho_aux_loss: Tensor | None = None
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm(model_dim)
+        # Phase 4.5 22-add-all: learnable RMSNorm after bigram residual add
+        # (replaces parameter-free _rms_norm in _encode).
+        self.embed_post_norm = RMSNorm(model_dim)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -2090,7 +2114,9 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        x = _rms_norm(x)
+        # Phase 4.5 22-add-all: learnable post-norm after bigram residual add
+        # (was parameter-free _rms_norm before).
+        x = self.embed_post_norm(x)
         x = self._run_backbone(x)
         return self.final_norm(x)
 
