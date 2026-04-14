@@ -844,6 +844,12 @@ class SoftDenseRouter(nn.Module):
         self._expert_entropy = None
         self._expert_sparsity = None
         self._expert_balance_cv = None
+        # GPU-resident views used by DDP reductions — populated by
+        # _record_diagnostics on every rank during eval, avoiding per-forward
+        # cpu() syncs on non-master ranks.
+        self._expert_usage_gpu: Tensor | None = None
+        self._expert_entropy_gpu: Tensor | None = None
+        self._expert_balance_cv_gpu: Tensor | None = None
         self._diag_step: int | None = None
 
     @torch.no_grad()
@@ -905,18 +911,39 @@ class SoftDenseRouter(nn.Module):
                     self._expert_entropy = None
                     self._expert_sparsity = None
                     self._expert_balance_cv = None
+                    self._expert_usage_gpu = None
+                    self._expert_entropy_gpu = None
+                    self._expert_balance_cv_gpu = None
                     self._diag_step = None
         return p
 
     @dynamo_disable
     def _record_diagnostics(self, share: Tensor, reduce_dims: tuple[int, ...]) -> None:
         mean_mass = share.mean(dim=reduce_dims)
-        self._expert_usage = mean_mass.float().cpu().tolist()
         per_token_ent = -(share * (share + 1e-8).log()).sum(-1)
-        ent = float(per_token_ent.mean().item())
-        self._expert_entropy = ent
-        self._expert_sparsity = 1.0 - (ent / max(math.log(float(self.num_experts)), 1e-8))
-        self._expert_balance_cv = float((mean_mass.std() / mean_mass.mean().clamp_min(1e-8)).item())
+        # Keep tensors on GPU so DDP reductions at the post-eval assertion time
+        # don't need to re-stage from CPU.  _expert_usage (Python list) is
+        # materialized only on rank 0 for the log sites that consume it.
+        # Non-master ranks skip the .cpu().tolist() sync to keep per-forward
+        # eval overhead minimal across K-sweep and fast validation.
+        self._expert_usage_gpu = mean_mass.float().detach()
+        self._expert_entropy_gpu = per_token_ent.mean().detach()
+        self._expert_balance_cv_gpu = (
+            mean_mass.std() / mean_mass.mean().clamp_min(1e-8)
+        ).detach()
+        is_master = (not dist.is_available() or not dist.is_initialized()
+                     or dist.get_rank() == 0)
+        if is_master:
+            self._expert_usage = mean_mass.float().cpu().tolist()
+            ent = float(per_token_ent.mean().item())
+            self._expert_entropy = ent
+            self._expert_sparsity = 1.0 - (ent / max(math.log(float(self.num_experts)), 1e-8))
+            self._expert_balance_cv = float(self._expert_balance_cv_gpu.item())
+        else:
+            self._expert_usage = None
+            self._expert_entropy = None
+            self._expert_sparsity = None
+            self._expert_balance_cv = None
         self._diag_step = _ROUTER_DIAGNOSTICS_STEP
 
 
@@ -2537,6 +2564,11 @@ def main() -> None:
             dist.destroy_process_group()
         raise RuntimeError(_budget_info or "Artifact budget violated on rank 0 (see master log for details)")
 
+    # Master continues: persist the int6 artifact, meta.json, and roundtrip
+    # the quantized weights back into base_model before the DDP broadcast.
+    # This MUST live at the master_process indent (not inside the violation
+    # check) or the run silently evaluates the bf16 model.
+    if master_process:
         weights_dir = Path("experiments/weights/current")
         weights_dir.mkdir(parents=True, exist_ok=True)
         artifact_path = weights_dir / "model.int6.ptz"
@@ -2670,14 +2702,42 @@ def main() -> None:
         return None if n == 0.0 else float(value.item()) / n
 
     def _ddp_mean_vec(v: list[float] | None, length: int) -> list[float] | None:
+        # Length-mismatch is a programmer error (rank-local diagnostic stored
+        # with wrong shape) — fail hard rather than silently zero-fill, which
+        # would turn a real bug into a false assertion pass/fail.
+        if v is not None and len(v) != length:
+            raise RuntimeError(
+                f"_ddp_mean_vec: length mismatch (got {len(v)}, expected {length}); "
+                f"diagnostic tensor is inconsistent with num_experts"
+            )
         if not distributed:
             return None if v is None else [float(x) for x in v]
         # Pad / zero-fill based on presence so ALL ranks call all_reduce with
         # matching shapes even if some ranks never populated the diagnostic.
         present = torch.tensor([0.0 if v is None else 1.0], device=device)
         value = torch.zeros(length, device=device)
-        if v is not None and len(v) == length:
+        if v is not None:
             value.copy_(torch.tensor([float(x) for x in v], device=device))
+        dist.all_reduce(present, op=dist.ReduceOp.SUM)
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        n = float(present.item())
+        if n == 0.0:
+            return None
+        return (value / n).detach().cpu().tolist()
+
+    def _ddp_mean_tensor_vec(t: Tensor | None, length: int) -> list[float] | None:
+        """Like _ddp_mean_vec but takes a GPU tensor directly — avoids the
+        per-rank .cpu().tolist() sync that diagnostics would need otherwise."""
+        if t is not None and t.numel() != length:
+            raise RuntimeError(
+                f"_ddp_mean_tensor_vec: length mismatch (got {t.numel()}, expected {length})"
+            )
+        if not distributed:
+            return None if t is None else t.detach().float().cpu().tolist()
+        present = torch.tensor([0.0 if t is None else 1.0], device=device)
+        value = torch.zeros(length, device=device)
+        if t is not None:
+            value.copy_(t.detach().float().view(length))
         dist.all_reduce(present, op=dist.ReduceOp.SUM)
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         n = float(present.item())
@@ -2713,30 +2773,53 @@ def main() -> None:
         except Exception:
             return None
 
-    check_specs = [
-        ("attn",
-         getattr(shared_block.attn, "attn_router", None),
-         lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None)),
-        ("mlp",
-         getattr(shared_block.mlp, "mlp_router", None),
-         lambda: getattr(shared_block.mlp, "_out_ortho_cos_sim", None)),
-        ("mos_ctp",
-         type("_Usg", (), {"num_experts": _mos_num_experts("ctp"),
-                           "_expert_usage": _mos_usage("ctp")})() if mos_head is not None else None,
-         lambda: _mos_ortho("ctp")),
-        ("mos_ntp",
-         type("_Usg", (), {"num_experts": _mos_num_experts("ntp"),
-                           "_expert_usage": _mos_usage("ntp")})() if mos_head is not None else None,
-         lambda: _mos_ortho("ntp")),
-    ]
+    # Each spec: (prefix, num_experts, usage_gpu_getter, usage_list_getter, ortho_getter).
+    # Usage is preferentially read as a GPU tensor (populated on every rank,
+    # no per-forward cpu sync) falling back to the list if only master set it.
+    check_specs = []
+    attn_router = getattr(shared_block.attn, "attn_router", None)
+    mlp_router = getattr(shared_block.mlp, "mlp_router", None)
+    if attn_router is not None:
+        check_specs.append((
+            "attn", int(attn_router.num_experts),
+            lambda: getattr(attn_router, "_expert_usage_gpu", None),
+            lambda: getattr(attn_router, "_expert_usage", None),
+            lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None),
+        ))
+    if mlp_router is not None:
+        check_specs.append((
+            "mlp", int(mlp_router.num_experts),
+            lambda: getattr(mlp_router, "_expert_usage_gpu", None),
+            lambda: getattr(mlp_router, "_expert_usage", None),
+            lambda: getattr(shared_block.mlp, "_out_ortho_cos_sim", None),
+        ))
+    if mos_head is not None:
+        n_ctp = _mos_num_experts("ctp")
+        n_ntp = _mos_num_experts("ntp")
+        check_specs.append((
+            "mos_ctp", n_ctp,
+            lambda: None,  # MoS diagnostics are list-only (single forward per batch)
+            lambda: _mos_usage("ctp"),
+            lambda: _mos_ortho("ctp"),
+        ))
+        check_specs.append((
+            "mos_ntp", n_ntp,
+            lambda: None,
+            lambda: _mos_usage("ntp"),
+            lambda: _mos_ortho("ntp"),
+        ))
 
-    for prefix, router, ortho_getter in check_specs:
-        n_exp = int(getattr(router, "num_experts", 0)) if router is not None else 0
-        usage_local = getattr(router, "_expert_usage", None) if router is not None else None
-        # EVERY rank must call _ddp_mean_vec with the same `length` argument
-        # (else the all_reduce shapes disagree), so derive it from num_experts
-        # which is model-structural and identical across ranks.
-        usage = _ddp_mean_vec(usage_local, n_exp) if n_exp > 0 else None
+    for prefix, n_exp, usage_gpu_getter, usage_list_getter, ortho_getter in check_specs:
+        if n_exp <= 0:
+            continue
+        # Prefer the GPU-tensor path (no cpu sync on non-master ranks).  Fall
+        # back to the list path if that router didn't populate the GPU copy.
+        usage_gpu = usage_gpu_getter()
+        usage = (
+            _ddp_mean_tensor_vec(usage_gpu, n_exp)
+            if usage_gpu is not None
+            else _ddp_mean_vec(usage_list_getter(), n_exp)
+        )
         if usage is not None and len(usage) > 0:
             min_share = float(min(usage))
             min_share_thresh = 0.6 / float(n_exp)
