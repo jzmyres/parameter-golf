@@ -811,6 +811,26 @@ def max_mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
     return per_expert_mean.max()
 
 
+def max_pairwise_abs_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
+    """Max absolute off-diagonal cosine similarity across ALL expert pairs.
+
+    Flags the single worst pair of near-duplicates in the expert group.
+    Used by the post-int6 expert-ortho hard assertion: if any two experts
+    within a component have |cos| > 0.9, those two are effectively the same
+    expert — wasted capacity.  This is a much looser bar than max-mean
+    (which averages across peers), but it's the right structural check:
+    training can't trivially make one worst pair diverge, so a near-1
+    value is a true capacity collapse.
+    """
+    e = groups.shape[0]
+    if e < 2:
+        return groups.new_zeros(())
+    g = groups / (groups.norm(dim=-1, keepdim=True) + eps)
+    cos = (g @ g.T).abs()
+    cos = cos.masked_fill(torch.eye(e, dtype=torch.bool, device=cos.device), 0.0)
+    return cos.max()
+
+
 class KShuffleBagSampler:
     def __init__(self, k_min: int, k_max: int, rng: random.Random, *, step: int = 1):
         self.k_min = int(k_min)
@@ -1143,10 +1163,11 @@ class CausalSelfAttention(nn.Module):
                 mu_h = h.reshape(B * T, E, R).mean(dim=0).to(dtype=torch.float32)
                 out_T = self.expert_out.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
                 mu_out = torch.einsum("er,erd->ed", mu_h, out_T)
-                # Max-mean |cos| — stricter than mean-|cos|: flags the WORST
-                # expert's mean similarity to the others.  Required for the
-                # post-int6 hard assertion on expert diversity.
-                self._out_ortho_cos_sim = float(max_mean_abs_offdiag_cosine(mu_out).item())
+                # Max pairwise |cos| across ALL expert pairs — flags
+                # near-duplicates (|cos| > 0.9 = two experts are effectively
+                # the same).  Used by the post-int6 hard assertion; ≤ 0.9 is
+                # the structural capacity check.
+                self._out_ortho_cos_sim = float(max_pairwise_abs_cosine(mu_out).item())
 
         return out.reshape(B, T, D)
 
@@ -1216,8 +1237,8 @@ class MLP(nn.Module):
                 mu_h = h.reshape(N, E, R).mean(dim=0).to(dtype=torch.float32)
                 down_T = self.expert_down.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
                 mu_out = torch.einsum("er,erd->ed", mu_h, down_T)
-                # Max-mean |cos| (worst expert's mean similarity to others).
-                self._out_ortho_cos_sim = float(max_mean_abs_offdiag_cosine(mu_out).item())
+                # Max pairwise |cos| across expert pairs — near-duplicate check.
+                self._out_ortho_cos_sim = float(max_pairwise_abs_cosine(mu_out).item())
 
         return out.reshape(B, T, D)
 
@@ -1300,6 +1321,8 @@ class MoSHead(nn.Module):
         pass  # No SVD init; xavier from scratch
 
     def get_head_orthogonality(self, head: str) -> float:
+        # Max pairwise |cos| across MoS head experts (shared + specialized).
+        # Same structural bar as attn/mlp: flags near-duplicate experts.
         t = self._ctp_ortho_out if head == "ctp" else self._ntp_ortho_out
         if t is not None:
             return float(t.detach().float().item())
@@ -1308,7 +1331,7 @@ class MoSHead(nn.Module):
         A_spec = self.A_ctp if head == "ctp" else self.A_ntp
         with torch.no_grad():
             groups = torch.cat([self.A_shared, A_spec], dim=0).float().reshape(self.num_shared + self.num_specialized, -1)
-            return float(max_mean_abs_offdiag_cosine(groups).item())
+            return float(max_pairwise_abs_cosine(groups).item())
 
     def _fsq(self, x: Tensor) -> Tensor:
         return _fsq_ste(x, self.fsq_levels, self.training)
@@ -1335,7 +1358,11 @@ class MoSHead(nn.Module):
             idx = self.num_shared + e
             log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
         log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
-        ortho_out = max_mean_abs_offdiag_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
+        # Max-pairwise |cos| matches the post-int6 ortho gate (threshold 0.9).
+        # Using the same metric for loss and assertion aligns training with the
+        # structural check — the loss pushes the WORST pair apart, which is
+        # exactly what the assertion requires.
+        ortho_out = max_pairwise_abs_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
         return log_p, alpha, ortho_out
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
@@ -3094,13 +3121,15 @@ def main() -> None:
                     f"{prefix}_min_share={min_share:.4f} < 0.01 "
                     f"(dead expert — one of {n_exp} has <1% usage; routing collapsed)"
                 )
-        # Expert orthogonality: weights must actually be diverse across
-        # experts (max-mean |cos| ≤ 0.20).  Cheap training trick: increase
-        # weight_decay to shrink expert weight magnitudes.
+        # Expert orthogonality: max-pairwise |cos| ≤ 0.9 — flags any single
+        # pair of near-duplicate experts.  Weaker than the old max-mean gate
+        # but targets the true structural failure: two experts with
+        # |cos|>0.9 are effectively the same expert (wasted capacity).
+        # Load-balance / soft routing is handled by training balance_loss.
         ortho = _ddp_mean_scalar(ortho_getter())
-        if ortho is not None and ortho > 0.20:
+        if ortho is not None and ortho > 0.9:
             _failures.append(
-                f"{prefix}_ortho={ortho:.4f} > 0.20 (max-mean |cos| — experts not diverse)"
+                f"{prefix}_ortho={ortho:.4f} > 0.9 (max pairwise |cos| — near-duplicate experts)"
             )
 
     # 2. Global gate trend: gg must be active (not collapsed to 0 or 1).

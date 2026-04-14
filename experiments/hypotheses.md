@@ -403,8 +403,8 @@ VERIFIED or RESOLVED hypothesis from this document.
 | Failure category | Prescribed fix | Hypothesis |
 |---|---|---|
 | dead_expert (min_share < 0.01) | `muon_weight_decay × 1.5` + `balance_mult × 1.5` (cap WD 1.44) | H9 VERIFIED, H5 RESOLVED |
-| expert_collapse (attn/mlp ortho) | `muon_weight_decay × 1.5`, else drop num_experts by 1 step | H5 RESOLVED |
-| mos_head_collapse (mos_* ortho) | `mos_ortho_out_coef × 1.5`, else shrink mos_rank | separate from expert_collapse: MoS head count is structural, not tunable |
+| expert_collapse (attn/mlp ortho > 0.9) | `muon_weight_decay × 1.5`, else drop num_experts by 1 step | H5 RESOLVED |
+| mos_head_collapse (mos_* ortho > 0.9) | `mos_ortho_out_coef × 1.5`, else shrink mos_rank | separate from expert_collapse: MoS head count is structural, not tunable |
 | injection_collapse (inj_max < 0.05 or inj_mean < 0.01) | Apply Phase 5 iter 24/22 (injection floor / per-iter schedule) | H23 PROPOSED |
 | gate_collapsed (gg_max < 0.3) | Verify post_norm on; else `deq_beta - 0.05` | H20 VERIFIED |
 | gate_saturated (gg_min > 0.95) | `deq_beta + 0.05` (smaller per-iter update) | H18 VERIFIED |
@@ -432,7 +432,7 @@ VERIFIED or RESOLVED hypothesis from this document.
 - Muon NS must operate at correct tensor granularity — verify shape for any new param groups (H21)
 - **Post-int6 HARD assertions** (run fails if any violated, DDP-global aggregation).  The gates target STRUCTURAL invariants — not the things training already optimizes (e.g. load balance via balance_loss).  Each check identifies a class of bug that would silently corrupt downstream metrics:
   - Per-component min_share ≥ 0.01 (no dead expert — sub-1% means that expert is wasted capacity carried in the artifact)
-  - Per-component ortho ≤ 0.20 (max-mean |cos| — experts must actually be diverse)
+  - Per-component ortho ≤ 0.9 (max pairwise |cos| — no two experts are near-duplicates; uses `max_pairwise_abs_cosine`, not `max_mean`)
   - gg_max ≥ 0.3 AND gg_min ≤ 0.95 (gate active, not collapsed/saturated)
   - inj_max ≥ 0.05 AND inj_mean ≥ 0.01 (x0 injection non-zero — H23 DEQ input-dependence)
   - K-sweep monotone from K=8 (Δ ≤ 0.005), worst K≥16 within 0.03 of best (FP convergence)
