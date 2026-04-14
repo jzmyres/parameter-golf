@@ -158,16 +158,16 @@ class Hyperparameters:
     # DEQ solver
     # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
-    # Benchmark at batch=8/seq=1024: unroll is 3.21x faster (358 ms vs 1151 ms).
-    # At real training batch, unroll needs higher grad_accum to fit in VRAM.
-    # grad_accum_steps auto-scales based on this flag below (L2079 area):
-    # revdeq → grad_accum=4, unroll → grad_accum=16 (per-microstep batch
-    # quartered; total tokens per optimizer step unchanged).  3.21× per-
-    # microstep speedup, 4× more microsteps → net ~0.8× wall-clock per
-    # optimizer step, but the per-microstep timing was at benchmark-size
-    # batch; at the smaller per-microstep batch of training, unroll should
-    # still be net faster.
-    deq_backward = "unroll"
+    # Benchmark at batch=8/seq=1024 (WITHOUT compile on either side): unroll
+    # is 3.21× faster (358 ms vs 1151 ms).  However, torch.compile + DDP +
+    # unrolled autograd hits two separate compile/DDP interaction bugs:
+    #   - dynamic=False → loss.requires_grad=False (grad_fn broken)
+    #   - dynamic=True  → dynamo backend crash in KV attention module
+    # revdeq+compile is the current best (val_bpb=1.705) — the 3.7× benchmark
+    # compile speedup (real ~1.6× with DDP) offsets much of the backward-mode
+    # gap.  Stay on revdeq+compile until compile+unroll compatibility is
+    # resolved (queued as follow-up investigation).
+    deq_backward = "revdeq"
     deq_k_jitter = True
     deq_k_min = 4
     deq_k_max = 16
@@ -2080,11 +2080,12 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     # Base grad_accum: 8 global microsteps / world_size (so per-rank microstep
     # count is modest).  When deq_backward="unroll" we store K-step activations
-    # per microstep, which at the default per-microstep batch OOM's on 48GB
-    # L40S — bump grad_accum 4× for unroll so per-microstep batch is quartered.
+    # per microstep, so bump grad_accum 4× to keep per-microstep batch small
+    # enough to fit in 48 GB L40S per rank.  revdeq's O(1) backward memory
+    # means the base grad_accum is fine.
     _base_grad_accum = max(1, math.ceil(8 / world_size))
     if getattr(args, "deq_backward", "revdeq") == "unroll":
-        grad_accum_steps = _base_grad_accum * 4  # e.g. 2 GPUs: 4 → 16
+        grad_accum_steps = _base_grad_accum * 4
     else:
         grad_accum_steps = _base_grad_accum
     global_seqs = args.train_batch_tokens // args.train_seq_len
@@ -2236,22 +2237,16 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # Compile the DEQ iteration body for throughput.  When deq_backward="unroll",
-    # compile is DISABLED on both modes for a fair comparison (matching the
-    # speed_compare_backward.py benchmark setup where unroll measured 3.21×
-    # faster without compile).  Attempted compile+unroll+DDP:
-    #   - dynamic=False → grad_fn tracking broken (loss has no grad_fn)
-    #   - dynamic=True  → dynamo backend crash ('int' has no 'meta')
-    # Chasing these is a rabbit hole; keep compile off for apples-to-apples.
-    # For revdeq-only runs (final 8×H100), re-enable compile via override.
-    if args.deq_backward == "unroll":
-        log0("shared_block compile OFF (deq_backward=unroll — control variable for fair comparison)")
-    else:
-        try:
-            base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
-            log0("compiled shared_block for throughput (dynamic=False, deq_backward=revdeq)")
-        except Exception as e:
-            log0(f"shared_block compile failed ({e}), running eager")
+    # Compile the DEQ iteration body for throughput.  Always enabled — the
+    # ~1.6× real speedup (3.7× benchmark) is a free win on any backward mode
+    # that supports it.  RevDEQ does (custom autograd.Function wraps the
+    # compiled inner call as one op).  Unroll currently does NOT work with
+    # compile+DDP (grad_fn tracking issues); resolving that is queued.
+    try:
+        base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
+        log0(f"compiled shared_block for throughput (dynamic=False, deq_backward={args.deq_backward})")
+    except Exception as e:
+        log0(f"shared_block compile failed ({e}), running eager")
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)

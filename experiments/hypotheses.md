@@ -305,18 +305,31 @@ give complementary data even if one loses.
 - 22a loses, 22b wins → per-expert is the right granularity (more surprising)
 - Both lose → Block-output norm granularity is optimal (negative-result signal useful for scaling law)
 
-### Phase 4.6: Throughput — unroll backward (LOCKED IN with grad_accum=16)
+### Phase 4.6: Throughput — unroll backward (BLOCKED on compile+DDP compatibility)
 
 `deq_backward="revdeq"` does 3× forward FLOPs per backward (forward + reconstruction + gradient).  Unrolled does 2× (standard autograd).
 
-**Small-batch benchmark (batch=8, seq=1024, post-token-local-inj fix):**
+**Small-batch benchmark (batch=8, seq=1024, NO compile on either side):**
 - `revdeq`: 1150.9 ms/step, 2.42 GB peak
 - `unroll`:  358.4 ms/step, 31.17 GB peak
 - **Speedup: 3.21×** (way above 1.5× theoretical — revdeq's reconstruction is also slower per-pass due to FP64 ops)
 
-**Fit adjustment:** Default `grad_accum_steps=4` (on 2 GPUs) → 32 seqs × 2048 per microstep → OOM with unroll at ~44 GB.  Bumping `grad_accum_steps=16` → 8 seqs × 2048 per microstep, matching the benchmark's per-microstep size → ~22 GB peak per rank (fits with headroom).  **Total tokens per optimizer step unchanged** — we do 4× more microsteps, each 4× smaller.  Wall-clock per optimizer step is still a net win because unroll's per-microstep speedup is 3.21×.
+**Blocker: compile + unroll + DDP is broken (two separate bugs):**
+- `torch.compile(shared_block, dynamic=False)` + unroll + DDP → `loss.requires_grad=False`, backward fails ("element 0 of tensors does not require grad and does not have a grad_fn")
+- `torch.compile(shared_block, dynamic=True)` + unroll + DDP → dynamo backend crash inside KV-attention (`AttributeError: 'int' object has no attribute 'meta'`)
 
-**Decision:** `deq_backward="unroll"` is now the default on 2×L40S, with auto-scaled `grad_accum_steps = base × 4` when unroll is selected.  Revert to `"revdeq"` (and default grad_accum) via CLI override for 8×H100 final runs where memory may bind per-rank.
+Since `torch.compile(shared_block)` gives ~1.6× real speedup on revdeq (3.7× benchmark), dropping it to enable unroll would largely cancel out unroll's 3.21× per-microstep win at training batch size (especially since OOM forces 4× more microsteps for unroll).
+
+**Decision:** Stay on `deq_backward="revdeq"` + compile (matches the current best val_bpb=1.705 baseline).  Queue the compile+unroll compatibility fix as a follow-up investigation:
+
+| Approach | Notes | Priority |
+|---|---|---|
+| Compile `_deq_solve` as a whole instead of `shared_block` | One compiled graph for the K-step loop — avoids the "32 compiled calls in a Python loop" DDP interaction | High — most likely to work |
+| `torch._dynamo.disable` just the path that triggers the crash | Surgical fix; keeps compile on the rest | Medium |
+| Try `mode="reduce-overhead"` with CUDA graphs | Different codegen path, different interaction | Low — likely similar issues |
+| Switch to unroll+no-compile on 8×H100 final run only | H100 has more VRAM; compile yield may be smaller there | Fallback if nothing else works |
+
+**For now:** `deq_backward="revdeq"` + compile enabled is the default.
 
 ### Phase 5: Injection mechanism rework (H23-H27) — PRIORITY
 
