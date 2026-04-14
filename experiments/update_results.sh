@@ -103,8 +103,12 @@ if [ "$PROMOTE" = true ]; then
 import json, sys
 try:
     d = json.load(open("$CURRENT_META"))
-    # Both flags must match the final-success path exactly (strict).
-    if d.get("run_valid") is True and d.get("status") == "validated":
+    # NEW POLICY (val_bpb-primary): val_bpb_q is recorded → run_valid=true.
+    # Gate failures are tracked as tech debt (status=validated_with_tech_debt)
+    # but still allow promotion.  Only refuse if val_bpb wasn't written or
+    # status is in_progress / artifact_written (run aborted before final eval).
+    valid_statuses = {"validated", "validated_clean", "validated_with_tech_debt"}
+    if d.get("run_valid") is True and d.get("status") in valid_statuses:
         print("VALID")
     else:
         print("INVALID")

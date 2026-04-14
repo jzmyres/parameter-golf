@@ -312,9 +312,9 @@ give complementary data even if one loses.
 
 | Iter | Config change | Hypothesis | Depends on |
 |---|---|---|---|
-| **22a** | RMSNorm on attn output AND RMSNorm on FFN output separately (before z2 = attn_mix + mlp_mix) | H20a: per-component normalization may give independent control over each branch's magnitude, letting attn and FFN each find their own operating point | iter 21 |
-| **22b** | RMSNorm on each expert output BEFORE weight-mixing (one norm per expert, not per-component) | H20b: if per-component helps, the finer granularity may help more — each expert can stabilize its magnitude independently, reducing inter-expert magnitude conflict | iter 21 (independent from 22a) |
-| **22c** | β jitter alongside K jitter: sample β ∈ {0.10, 0.20, 0.30} per training step (β±0.1 from current 0.20) | H30: β jitter makes the model robust to varying contraction rates, similar to how K jitter (H12 VERIFIED) handles varying solver depths.  Should improve K=128 extrapolation by reducing β-specific overfitting at training time. | iter 21 (independent) |
+| **22b** | RMSNorm on each expert output BEFORE weight-mixing (one norm per expert) — FIRST per user priority | H20b: per-expert normalization removes inter-expert magnitude conflict; the finest granularity available | iter 21-retry-3 promotion |
+| **22a** | RMSNorm on attn output AND RMSNorm on FFN output separately (before z2 = attn_mix + mlp_mix) | H20a: per-component normalization gives independent magnitude control to each branch | after 22b |
+| **22c** | β jitter: sample β ∈ {0.10, 0.20, 0.30} per training step (β±0.1) | H30: β jitter makes model robust to varying contraction rates (parallel to K jitter / H12 VERIFIED); targets K=128 extrapolation. If β=0.30 sample causes solver_divergence, the existing prescription system bumps WD×1.5 (consistent with H19). | after 22a |
 
 **Outcomes are not exclusive:**
 - Both 22a/22b win → keep the stricter one (22b), combined with Block-output norm
@@ -439,7 +439,7 @@ VERIFIED or RESOLVED hypothesis from this document.
 - Locked (WD, β) = (0.72, 0.20) unless explicitly testing a WD/β hypothesis
 - Post-norm on Block output is load-bearing — do not remove (H20)
 - Muon NS must operate at correct tensor granularity — verify shape for any new param groups (H21)
-- **Post-int6 HARD assertions** (run fails if any violated, DDP-global aggregation).  The gates target STRUCTURAL invariants — not the things training already optimizes (e.g. load balance via balance_loss).  Each check identifies a class of bug that would silently corrupt downstream metrics:
+- **Post-int6 hard gates** (NEW POLICY: tech debt, NOT promotion blockers — val_bpb improvement is the sole promotion criterion). The gates flag STRUCTURAL issues and prescribe fixes for the next iteration; they no longer block --promote. Run validity = "val_bpb was recorded" (run_valid=true whenever the eval completes).
   - Per-component min_share ≥ 0.01 (no dead expert — sub-1% means that expert is wasted capacity carried in the artifact)
   - Per-component ortho ≤ 0.9 (max pairwise |cos| — no two experts are near-duplicates; uses `max_pairwise_abs_cosine`, not `max_mean`)
   - gg_max ≥ 0.3 AND gg_min ≤ 0.95 (gate active, not collapsed/saturated)

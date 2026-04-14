@@ -186,7 +186,8 @@ class Hyperparameters:
     deq_k_jitter = True
     deq_k_min = 4
     deq_k_max = 16  # locked: Phase 1 (H12 VERIFIED — K jitter to max-train-K is the principled bound)
-    deq_k_step = 4  # K in {4, 8, 12, 16} — jitter forces model to optimize FP quality at all training K
+    deq_k_step = 4  # used only when deq_k_jitter_set is None
+    deq_k_jitter_set = (4, 8, 16)  # explicit K bag — dropped K=12 (K=8 + K=16 bracket it, ~7% throughput gain)
     deq_k_eval = 16  # eval at max training K
 
     # Architecture knobs
@@ -832,16 +833,24 @@ def max_pairwise_abs_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
 
 
 class KShuffleBagSampler:
-    def __init__(self, k_min: int, k_max: int, rng: random.Random, *, step: int = 1):
+    def __init__(self, k_min: int, k_max: int, rng: random.Random, *, step: int = 1,
+                 values: list[int] | None = None):
+        # Explicit `values` overrides range(k_min, k_max+1, step) — lets us
+        # express non-uniform K sets like {4, 8, 16} (skipping K=12 because
+        # K=8 and K=16 bracket it well; ~7% throughput gain).
         self.k_min = int(k_min)
         self.k_max = int(k_max)
         self.step = int(step)
+        self.values = sorted(set(int(v) for v in values)) if values else None
         self.rng = rng
         self._bag: list[int] = []
 
     def sample(self) -> int:
         if not self._bag:
-            self._bag = list(range(self.k_min, self.k_max + 1, self.step))
+            if self.values is not None:
+                self._bag = list(self.values)
+            else:
+                self._bag = list(range(self.k_min, self.k_max + 1, self.step))
             self.rng.shuffle(self._bag)
         return int(self._bag.pop())
 
@@ -2361,7 +2370,10 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     k_rng = random.Random(args.seed + 12345)
-    k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max, k_rng, step=int(args.deq_k_step))
+    _k_jitter_set = getattr(args, "deq_k_jitter_set", None)
+    k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max, k_rng,
+                                    step=int(args.deq_k_step),
+                                    values=list(_k_jitter_set) if _k_jitter_set else None)
 
     def deq_k_for_step(step_i: int) -> int:
         k = 0
@@ -3329,11 +3341,14 @@ def main() -> None:
         }
 
     if _failures:
-        log0("✗ POST-INT6 HARD ASSERTION FAILURES — run is INVALID (cannot promote)")
+        # NEW POLICY (val_bpb-primary): gate failures DO NOT block promotion.
+        # They're tracked as tech debt for the next iteration's prescription.
+        # Promotion is gated on val_bpb improvement only (per CLAUDE.md L127-138).
+        log0("⚠ POST-INT6 HARD GATE FAILURES — tech debt, will be addressed by next iter's prescription")
         prescriptions = [_prescribe(f) for f in _failures]
         log0(f"  {len(_failures)} failure(s):")
         for p in prescriptions:
-            log0(f"  ✗ [{p['category']}] {p['failure']}")
+            log0(f"  ⚠ [{p['category']}] {p['failure']}")
             log0(f"     hypothesis: {p['hypothesis']}")
             log0(f"     fix:        {p['fix']}")
         # Aggregate config suggestions for the orchestrator / agent.
@@ -3362,21 +3377,21 @@ def main() -> None:
             with open(Path("experiments/weights/current") / "retry_hint.json", "w") as fh:
                 json.dump(retry_hint, fh, indent=2)
             log0("  retry_hint.json written — next iter should apply suggested_config")
-        # Mark meta.json so update_results.sh / --promote can refuse.
+        # Record failure categories in meta.json for the next iter's analysis,
+        # but DO NOT set run_valid=false (val_bpb-primary policy).
         if master_process and meta_path is not None:
             with open(meta_path, "r") as f:
                 meta_json = json.load(f)
-            meta_json["run_valid"] = False
             meta_json["failure_categories"] = [p["category"] for p in prescriptions]
+            meta_json["gate_status"] = "tech_debt"  # promoted but with known issues
             with open(meta_path, "w") as f:
                 json.dump(meta_json, f)
-    # Track whether hard assertions passed.  We'll flip run_valid=true ONLY
-    # after val_bpb + sliding val are also written, so a crash between here
-    # and the final meta update can't leave run_valid=true with val_bpb=0.0.
-    _assertions_passed = False
+    # Under val_bpb-primary policy, "passed" means "completed" (val_bpb is the
+    # promotion criterion).  Gate failures are tech debt, not blockers.
+    # _assertions_passed remains True iff there were zero failures (clean run).
+    _assertions_passed = not _failures
     if not _failures:
-        _assertions_passed = True
-        log0("✓ POST-INT6 HEALTH: all hard assertions passed (no dead experts, expert ortho, gate trend, injection, FP convergence, reversibility)")
+        log0("✓ POST-INT6 HEALTH: all hard gates passed (no dead experts, expert ortho, gate trend, injection, FP convergence, reversibility)")
         if master_process:
             retry_hint_path = Path("experiments/weights/current") / "retry_hint.json"
             if retry_hint_path.exists():
@@ -3404,9 +3419,12 @@ def main() -> None:
         with open(meta_path, "r") as f:
             meta_json = json.load(f)
         meta_json["val_bpb"] = val_bpb_q
-        if _assertions_passed:
-            meta_json["run_valid"] = True
-            meta_json["status"] = "validated"
+        # NEW POLICY (val_bpb-primary): run_valid=true whenever val_bpb is
+        # written, regardless of gate failures.  Promotion criterion is val_bpb
+        # improvement + 16MB budget; gate failures are tech debt for the next
+        # iter (tracked via meta_json["failure_categories"] + retry_hint.json).
+        meta_json["run_valid"] = True
+        meta_json["status"] = "validated_clean" if _assertions_passed else "validated_with_tech_debt"
         with open(meta_path, "w") as f:
             json.dump(meta_json, f)
 
