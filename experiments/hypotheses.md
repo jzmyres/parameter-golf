@@ -333,7 +333,32 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 |---|---|---|---|
 | **21** | Untied attn/mlp routers + per-component router gate tracking + all throughput fixes (memmap, FP32 eval, K=128) | Separate router learning + throughput baseline | — |
 
-### Phase 4.5: Norm position ablation (PRIORITY — systematic, NOT one-off iters)
+### Phase 4.4: Throughput micro-optimizations (FIRST — before norm ablation)
+
+**Rationale:** more steps/hour means every subsequent iter (norm ablation, injection rework, training objectives, scaling law) gets a better signal per compute hour. Front-loading throughput work compounds.
+
+**Top 5 ROI iters in priority order:**
+
+| Iter | Optimization | Expected gain | Effort | Risk |
+|---|---|---|---|---|
+| **T1** | Grouped expert mixing via `torch.bmm` over E dimension (replace einsum/loop) | 15-25% | Medium | Low — pure refactor, same math |
+| **T2** | Defer diagnostic CPU sync to log time (record GPU-only inside DEQ loop) | 5-10% | Low | Low — already partially done for routers |
+| **T3** | Compile with `dynamic=True` so single graph handles K∈{4,8,16} | 2-5% steady, eliminates K-recompile re-warmup | Low | Medium — past dynamo bugs may have been fixed in newer torch |
+| **T4** | Drop full validation in mid-train val cycles; only fast subset; full val once at end | 5-10% (saves ~30s × N val cycles per hour) | Low | Low |
+| **T5** | Activation-checkpoint MoS head (256MB logits tensor, recomputable) | Modest step time, enables larger batch (better grad signal, fewer microsteps) | Medium | Low |
+
+**Run order:** T1 → T2 → T3 → T4 → T5. Each iter measured against the previous baseline.
+
+**Performance-lossless requirement (HARD):** each throughput iter must be NUMERICALLY EQUIVALENT to the baseline within tolerance. The training trajectory and val_bpb must not regress beyond bf16 noise floor (~0.005 BPB). Throughput optimizations that "trade quality for speed" are NOT acceptable here — those go in different phases. Each iter ships with:
+1. **Unit test** verifying numerical equivalence of the changed forward path against the prior implementation (e.g., for T1: a test that runs both old einsum and new bmm path on random input, asserts max-abs-error < 1e-4 in bf16 / < 1e-6 in fp32)
+2. **Smoke test** passes (same loss-decrease + recon-err trajectories as prior)
+3. **Short comparative training run** (50-100 steps) showing matched loss/val_bpb trajectory vs prior baseline
+4. **Throughput measurement** (ms/step at steady state) showing the gain
+5. Promote on val_bpb improvement OR equivalent val_bpb + measured throughput gain (val_bpb-primary policy + throughput as tiebreaker)
+
+**Goal:** end Phase 4.4 with combined ~30-40% throughput improvement, ZERO val_bpb regression, then proceed to Phase 4.5 norm ablation with faster iter cadence.
+
+### Phase 4.5: Norm position ablation (after Phase 4.4 throughput is done)
 
 **Approach** (per user direction): instead of separate one-off iters for specific norm positions, do a SYSTEMATIC ablation:
 1. **Iter 22-add-all**: add LEARNABLE RMSNorm at ALL reasonable post-non-linearity positions. Make all RMSNorms learnable (weight ∈ R^dim, currently parameter-free).
@@ -397,21 +422,9 @@ The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ req
 | 31 | Gated attention gate position (before SDPA vs after) | Records + paper arXiv 2505.06708 | Phase 6 |
 | 32 | FSQ-STE weight QAT (replace post-hoc int6 with trained-in FSQ) | H28 — closes quant gap, RevDEQ-compatible (deterministic) | Phase 6 |
 
-### Phase 7.4: Throughput micro-optimizations (runs BEFORE Phase 7.5 unroll investigation)
-
-**Top 5 ROI throughput optimizations** (orthogonal to arch — can interleave with Phase 4.5/5/6 if convenient):
-
-| # | Iter | Optimization | Expected gain | Effort | Risk |
-|---|---|---|---|---|---|
-| 1 | T1 | Grouped expert mixing via `torch.bmm` over E dimension | 15-25% | Medium | Low |
-| 2 | T2 | Defer all diagnostic CPU sync to log time (record GPU only inside DEQ loop) | 5-10% | Low | Low |
-| 3 | T3 | Compile with `dynamic=True` so single graph handles K∈{4,8,16} (eliminate K-specialization recompile) | 2-5% steady, eliminates re-warmup | Low | Medium (dynamo bugs in past) |
-| 4 | T4 | Drop full validation in mid-train val; only fast subset; full val once at end | 5-10% | Low | Low |
-| 5 | T5 | Activation-checkpoint MoS head (256MB logits tensor, recomputable) | Modest step time, enables larger batch | Medium | Low |
-
-**Decision:** run T1 + T2 (highest gain × lowest risk) as immediate throughput iters after the Phase 4.5 norm ablation settles.  T3/T4/T5 deferred until after Phase 7 if time permits.
-
 ### Phase 7.5: Throughput optimization — unroll+compile investigation (runs BEFORE Phase 8)
+
+(Phase 7.4 throughput micro-opts have been moved to Phase 4.4 — front-loaded for compounding effect.)
 
 **Goal:** Maximize training throughput *before* committing compute to the Phase 8 scaling-law grid.  More steps/hour in the sweep = more hyperparameter points covered per 1h iter budget.  Doing this *after* Phase 7 ensures the throughput measurement uses the final arch (post-OrthoInit, skip-gates, etc.); doing it *before* Phase 8 means the scaling sweep gets the fastest possible backward path.
 
