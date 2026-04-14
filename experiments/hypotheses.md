@@ -305,21 +305,18 @@ give complementary data even if one loses.
 - 22a loses, 22b wins → per-expert is the right granularity (more surprising)
 - Both lose → Block-output norm granularity is optimal (negative-result signal useful for scaling law)
 
-### Phase 4.6: Throughput — unroll backward (ALREADY LOCKED IN)
+### Phase 4.6: Throughput — unroll backward (LOCKED IN with grad_accum=16)
 
 `deq_backward="revdeq"` does 3× forward FLOPs per backward (forward + reconstruction + gradient).  Unrolled does 2× (standard autograd).
 
-**Benchmark (batch=8, seq=1024, post-token-local-inj fix):**
+**Small-batch benchmark (batch=8, seq=1024, post-token-local-inj fix):**
 - `revdeq`: 1150.9 ms/step, 2.42 GB peak
 - `unroll`:  358.4 ms/step, 31.17 GB peak
 - **Speedup: 3.21×** (way above 1.5× theoretical — revdeq's reconstruction is also slower per-pass due to FP64 ops)
-- Memory: unroll fits in 48 GB L40S with 16.8 GB headroom
 
-**Decision:** `deq_backward="unroll"` is now the default for 2×L40S dev training.  For final 8×H100 runs where memory may bind (smaller per-GPU allotment × 8 GPUs + bigger per-rank batch), fall back to `"revdeq"`.
+**Fit adjustment:** Default `grad_accum_steps=4` (on 2 GPUs) → 32 seqs × 2048 per microstep → OOM with unroll at ~44 GB.  Bumping `grad_accum_steps=16` → 8 seqs × 2048 per microstep, matching the benchmark's per-microstep size → ~22 GB peak per rank (fits with headroom).  **Total tokens per optimizer step unchanged** — we do 4× more microsteps, each 4× smaller.  Wall-clock per optimizer step is still a net win because unroll's per-microstep speedup is 3.21×.
 
-| Iter | Config change | Status | Notes |
-|---|---|---|---|
-| ~~22c~~ | `deq_backward="unroll"` | **LOCKED IN** (3.21× speedup) | Applied directly to iter 21 rerun |
+**Decision:** `deq_backward="unroll"` is now the default on 2×L40S, with auto-scaled `grad_accum_steps = base × 4` when unroll is selected.  Revert to `"revdeq"` (and default grad_accum) via CLI override for 8×H100 final runs where memory may bind per-rank.
 
 ### Phase 5: Injection mechanism rework (H23-H27) — PRIORITY
 

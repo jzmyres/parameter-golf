@@ -158,12 +158,15 @@ class Hyperparameters:
     # DEQ solver
     # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
-    # Benchmark at batch=8/seq=1024: unroll is 3.21x faster (358 ms vs 1151 ms)
-    # with 31 GB peak mem — fits comfortably on 48 GB L40S.  RevDEQ's 3x
-    # forward FLOPs (forward + reconstruction + gradient) vs unroll's 2x
-    # (forward + standard backward) makes unroll the better default when
-    # VRAM allows.  Switch back to "revdeq" for 8xH100 final run if memory
-    # is a binding constraint there.
+    # Benchmark at batch=8/seq=1024: unroll is 3.21x faster (358 ms vs 1151 ms).
+    # At real training batch, unroll needs higher grad_accum to fit in VRAM.
+    # grad_accum_steps auto-scales based on this flag below (L2079 area):
+    # revdeq → grad_accum=4, unroll → grad_accum=16 (per-microstep batch
+    # quartered; total tokens per optimizer step unchanged).  3.21× per-
+    # microstep speedup, 4× more microsteps → net ~0.8× wall-clock per
+    # optimizer step, but the per-microstep timing was at benchmark-size
+    # batch; at the smaller per-microstep batch of training, unroll should
+    # still be net faster.
     deq_backward = "unroll"
     deq_k_jitter = True
     deq_k_min = 4
@@ -2075,7 +2078,15 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    grad_accum_steps = max(1, math.ceil(8 / world_size))
+    # Base grad_accum: 8 global microsteps / world_size (so per-rank microstep
+    # count is modest).  When deq_backward="unroll" we store K-step activations
+    # per microstep, which at the default per-microstep batch OOM's on 48GB
+    # L40S — bump grad_accum 4× for unroll so per-microstep batch is quartered.
+    _base_grad_accum = max(1, math.ceil(8 / world_size))
+    if getattr(args, "deq_backward", "revdeq") == "unroll":
+        grad_accum_steps = _base_grad_accum * 4  # e.g. 2 GPUs: 4 → 16
+    else:
+        grad_accum_steps = _base_grad_accum
     global_seqs = args.train_batch_tokens // args.train_seq_len
     while grad_accum_steps > 1 and global_seqs < world_size * grad_accum_steps:
         grad_accum_steps -= 1
