@@ -156,7 +156,15 @@ class Hyperparameters:
     tie_attn_mlp_router = False
 
     # DEQ solver
-    deq_backward = "revdeq"
+    # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
+    # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
+    # Benchmark at batch=8/seq=1024: unroll is 3.21x faster (358 ms vs 1151 ms)
+    # with 31 GB peak mem — fits comfortably on 48 GB L40S.  RevDEQ's 3x
+    # forward FLOPs (forward + reconstruction + gradient) vs unroll's 2x
+    # (forward + standard backward) makes unroll the better default when
+    # VRAM allows.  Switch back to "revdeq" for 8xH100 final run if memory
+    # is a binding constraint there.
+    deq_backward = "unroll"
     deq_k_jitter = True
     deq_k_min = 4
     deq_k_max = 16
@@ -1365,10 +1373,19 @@ class Block(nn.Module):
             self.inj_gate.bias.fill_(-2.1972246)  # sigmoid(-2.2) ~ 0.1
 
     def _inj_gate_from(self, z_in: Tensor) -> Tensor:
+        # Token-local injection gate: one sigmoid value per (batch, seq) position,
+        # computed from that token's own RMSNorm-ed hidden state.  The previous
+        # implementation averaged z_in across (batch, seq) before the gate,
+        # which made the DEQ update depend on OTHER examples in the batch and
+        # on how the sequence was chunked — breaking streaming / prefix-caching
+        # invariance.  Token-local gates preserve causality: the gate for token
+        # (b, t) only depends on that token's state.  Principle: every gate in
+        # the block (inj, gg, attn, router) is input-dependent AND token-local.
         z_n = _rms_norm(z_in)
-        u = z_n.mean(dim=(0, 1), keepdim=True)
-        g = torch.sigmoid(self.inj_gate(u)).squeeze(-1)
+        g = torch.sigmoid(self.inj_gate(z_n))  # [B, T, 1]
         if _should_diag(self.training):
+            # Log the scalar mean across (batch, seq) for plotting — this is
+            # just a reduction of the token-local gates, NOT the gate itself.
             g_val = float(g.detach().float().mean().item())
             self._inj_gate_last_mean = g_val
             if self._gg_call_track_enabled:

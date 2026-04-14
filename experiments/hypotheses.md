@@ -37,7 +37,16 @@ designed to test it with a single controlled variable change.
 **Status:** ✅ VERIFIED
 **Implication:** K jitter is a permanent training requirement. Small residual degradation at K>32 remains (+0.011 at K=64 in best config) but is 5× smaller than without jitter.
 
-### H15: Quant-noise injection in DEQ iterations — REFUTED (fundamental incompatibility)
+### H29: All gates must be input-dependent AND token-local — PRINCIPLE
+**Claim:** Every gate in the DEQ block (injection, gg, attention, router) must be computed from the CURRENT TOKEN's hidden state without reduction over batch or sequence.  Otherwise the update map depends on other examples in the batch or how sequences are chunked, breaking streaming / prefix-caching invariance and making the fixed point batch-dependent.
+**Violation found:** iter 21 — `_inj_gate_from` computed `g = sigmoid(inj_gate(mean(z_in, dim=(batch, seq))))`.  This meant injection depended on ALL tokens in the batch + sequence, not just the current token.  Chunking a sequence differently changed the mean → changed the gate → changed the fixed point.  Changed batch size → changed the mean → changed gates.  Cross-example coupling through a DEQ block is a serious structural bug.
+**Fix applied:** `g = sigmoid(inj_gate(rms_norm(z_in)))` → shape `[B, T, 1]`, per-token.  Smoke test passed with similar recon/convergence profile.
+**Other gates verified token-local:**
+- `gg_gate(x_attn_n)`: input is per-token RMSNorm(z_in + g_inj*x0) → ✓
+- `router_gate(x_n)` (attn + mlp routers): input is per-token RMSNorm — ✓
+- `attn_gate` (from Q projection): inherently per-token — ✓
+**Status:** ✅ VERIFIED (fix in place, smoke test passes)
+**Implication:** When adding any new gate, it MUST be computed from the current token's state only.  No `.mean(dim=(0, 1))` or similar before a gate.
 **Claim:** Quantization noise during DEQ iterations makes FP robust to int6.
 **Test:** Iter 20 — quant-noise at rate=0.10 (recon 10.9, smoke FAILED) and rate=0.01 (recon 3.55, smoke FAILED).
 **Root cause (fundamental, not implementation):** RevDEQ achieves O(1) memory backward by *reconstructing* forward states during backward, which requires `f(z, x0, W)` to be deterministic. Fresh-sampled per-call noise `W_noisy = W + ε_n` gives different outputs in forward vs. backward reconstruction because `ε_n^forward` is not saved. Noise magnitude tracks reconstruction error linearly (10% → recon 10.9; 1% → recon 3.55).
@@ -296,13 +305,21 @@ give complementary data even if one loses.
 - 22a loses, 22b wins → per-expert is the right granularity (more surprising)
 - Both lose → Block-output norm granularity is optimal (negative-result signal useful for scaling law)
 
-### Phase 4.6: Throughput — switch to unrolled backward
+### Phase 4.6: Throughput — unroll backward (ALREADY LOCKED IN)
 
-`deq_backward="revdeq"` does 3× forward FLOPs per backward (forward + reconstruction + gradient).  Unrolled does 2× (standard autograd).  ~33% faster per step at the cost of O(K) activation memory.  On 48GB L40S with K=16/dim=768/seq=2048: ~3 GB activations — fits comfortably.
+`deq_backward="revdeq"` does 3× forward FLOPs per backward (forward + reconstruction + gradient).  Unrolled does 2× (standard autograd).
 
-| Iter | Config change | Hypothesis | Depends on |
+**Benchmark (batch=8, seq=1024, post-token-local-inj fix):**
+- `revdeq`: 1150.9 ms/step, 2.42 GB peak
+- `unroll`:  358.4 ms/step, 31.17 GB peak
+- **Speedup: 3.21×** (way above 1.5× theoretical — revdeq's reconstruction is also slower per-pass due to FP64 ops)
+- Memory: unroll fits in 48 GB L40S with 16.8 GB headroom
+
+**Decision:** `deq_backward="unroll"` is now the default for 2×L40S dev training.  For final 8×H100 runs where memory may bind (smaller per-GPU allotment × 8 GPUs + bigger per-rank batch), fall back to `"revdeq"`.
+
+| Iter | Config change | Status | Notes |
 |---|---|---|---|
-| **22c** | `deq_backward="unroll"` (standard autograd through unrolled K DEQ iterations) | Eliminates reconstruction compute; should give ~1.3× training throughput with unchanged or better val_bpb (FP32 accumulators instead of FP64) | iter 21 |
+| ~~22c~~ | `deq_backward="unroll"` | **LOCKED IN** (3.21× speedup) | Applied directly to iter 21 rerun |
 
 ### Phase 5: Injection mechanism rework (H23-H27) — PRIORITY
 
@@ -394,3 +411,4 @@ VERIFIED or RESOLVED hypothesis from this document.
   - iter_conv_rel ≤ 0.1 at highest K
 - **Artifact budget HARD cap**: code + compressed model ≤ 16,000,000 bytes (fails early)
 - Untied attn/mlp routers (separate sigmoid gates and routing weights per component)
+- **H29 PRINCIPLE**: every gate must be input-dependent AND token-local — no `.mean(dim=batch,seq)` before any gate.  Streaming / prefix-caching invariance depends on this.  Verify any new gate with: "does chunking the sequence change this gate's value for unchanged tokens?" → must be NO.
