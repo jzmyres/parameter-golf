@@ -1321,11 +1321,12 @@ class MoSHead(nn.Module):
         pass  # No SVD init; xavier from scratch
 
     def get_head_orthogonality(self, head: str) -> float:
-        # Max pairwise |cos| across MoS head experts (shared + specialized).
-        # Same structural bar as attn/mlp: flags near-duplicate experts.
-        t = self._ctp_ortho_out if head == "ctp" else self._ntp_ortho_out
-        if t is not None:
-            return float(t.detach().float().item())
+        # GATE metric: max pairwise |cos| across MoS head experts (shared + specialized),
+        # computed on the A weight matrices directly.  We DO NOT fall back to the
+        # cached ortho_out (which is now a max_mean LOSS value, used for smoother
+        # gradient signal during training).  Loss and gate are deliberately decoupled:
+        #   - LOSS: max_mean (smoother gradient, every pair contributes)
+        #   - GATE: max_pairwise (clean duplicate detection at threshold 0.9)
         if self.num_shared + self.num_specialized < 2:
             return 0.0
         A_spec = self.A_ctp if head == "ctp" else self.A_ntp
@@ -1358,11 +1359,12 @@ class MoSHead(nn.Module):
             idx = self.num_shared + e
             log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
         log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
-        # Max-pairwise |cos| matches the post-int6 ortho gate (threshold 0.9).
-        # Using the same metric for loss and assertion aligns training with the
-        # structural check — the loss pushes the WORST pair apart, which is
-        # exactly what the assertion requires.
-        ortho_out = max_pairwise_abs_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
+        # LOSS term uses max-mean for smoother gradient (every pair contributes).
+        # The assertion-time GATE separately uses max-pairwise (≤ 0.9 threshold)
+        # for clean duplicate detection.  iter 21-retry-2 confirmed empirically:
+        # using max-pairwise as the loss gives sparse gradients (only worst pair
+        # updates per step), degrading val_bpb 1.67 → 1.88 vs the max-mean loss.
+        ortho_out = max_mean_abs_offdiag_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
         return log_p, alpha, ortho_out
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
