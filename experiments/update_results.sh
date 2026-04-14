@@ -163,12 +163,15 @@ echo "Weights:"
 for d in baseline previous current; do
     meta="$WEIGHTS_DIR/$d/meta.json"
     if [ -f "$meta" ]; then
-        # Extract key fields from meta.json
-        bpb=$(python3 -c "import json; print(json.load(open('$meta'))['val_bpb'])" 2>/dev/null)
-        commit=$(python3 -c "import json; print(json.load(open('$meta'))['git_commit'])" 2>/dev/null)
-        size=$(python3 -c "import json; print(json.load(open('$meta'))['artifact_bytes'])" 2>/dev/null)
-        steps=$(python3 -c "import json; print(json.load(open('$meta'))['steps'])" 2>/dev/null)
-        echo "  $d/  val_bpb=$bpb  commit=$commit  artifact=${size}B  steps=$steps"
+        # Extract key fields from meta.json.  Use .get() with fallbacks so the
+        # script never aborts under `set -e` if a key is missing or spelled
+        # differently across runs (commit/git_commit, step/steps).
+        bpb=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('val_bpb','?'))" 2>/dev/null || echo "?")
+        commit=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('git_commit', d.get('commit','?')))" 2>/dev/null || echo "?")
+        size=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('artifact_bytes','?'))" 2>/dev/null || echo "?")
+        steps=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('steps', d.get('step','?')))" 2>/dev/null || echo "?")
+        valid=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('run_valid', True))" 2>/dev/null || echo "?")
+        echo "  $d/  val_bpb=$bpb  commit=$commit  artifact=${size}B  steps=$steps  valid=$valid"
     else
         echo "  $d/  (no meta.json)"
     fi

@@ -919,12 +919,13 @@ class SoftDenseRouter(nn.Module):
 
     @dynamo_disable
     def _record_diagnostics(self, share: Tensor, reduce_dims: tuple[int, ...]) -> None:
+        # GPU-only recording — no .cpu()/.item() sync on any rank during the
+        # forward pass.  Both usage + CV stay as detached GPU tensors; master
+        # additionally keeps the per-token entropy GPU tensor for log time.
+        # The Python list/float views used by format_expert_info are
+        # materialized lazily via _materialize_diag_lists(), which should be
+        # called exactly once per log site (not per forward).
         mean_mass = share.mean(dim=reduce_dims)
-        # Keep usage + CV on GPU for the DDP reductions at post-eval assertion
-        # time, so non-master ranks don't need a per-forward .cpu() sync.
-        # Entropy + sparsity + the Python list are only needed by master-rank
-        # log sites (format_expert_info), so we compute them only on master.
-        # This keeps non-master eval forward cost to a single mean() + std().
         self._expert_usage_gpu = mean_mass.float().detach()
         self._expert_balance_cv_gpu = (
             mean_mass.std() / mean_mass.mean().clamp_min(1e-8)
@@ -933,19 +934,36 @@ class SoftDenseRouter(nn.Module):
                      or dist.get_rank() == 0)
         if is_master:
             per_token_ent = -(share * (share + 1e-8).log()).sum(-1)
-            self._expert_usage = mean_mass.float().cpu().tolist()
-            ent = float(per_token_ent.mean().item())
-            self._expert_entropy = ent
             self._expert_entropy_gpu = per_token_ent.mean().detach()
-            self._expert_sparsity = 1.0 - (ent / max(math.log(float(self.num_experts)), 1e-8))
-            self._expert_balance_cv = float(self._expert_balance_cv_gpu.item())
         else:
-            self._expert_usage = None
-            self._expert_entropy = None
             self._expert_entropy_gpu = None
-            self._expert_sparsity = None
-            self._expert_balance_cv = None
+        # Clear any previously-materialized list-form diagnostics.  Log sites
+        # that need Python-native values call _materialize_diag_lists() first.
+        self._expert_usage = None
+        self._expert_entropy = None
+        self._expert_sparsity = None
+        self._expert_balance_cv = None
         self._diag_step = _ROUTER_DIAGNOSTICS_STEP
+
+    @dynamo_disable
+    def _materialize_diag_lists(self) -> None:
+        """Lazily convert GPU-resident diagnostic tensors to Python values.
+
+        One .cpu() sync per call covers usage + entropy + CV.  Safe to call
+        multiple times — subsequent calls short-circuit if the list is already
+        materialized for the current _diag_step.
+        """
+        if self._expert_usage is not None:
+            return  # already materialized for current step
+        if self._expert_usage_gpu is None:
+            return
+        self._expert_usage = self._expert_usage_gpu.detach().float().cpu().tolist()
+        if self._expert_balance_cv_gpu is not None:
+            self._expert_balance_cv = float(self._expert_balance_cv_gpu.item())
+        if self._expert_entropy_gpu is not None:
+            ent = float(self._expert_entropy_gpu.item())
+            self._expert_entropy = ent
+            self._expert_sparsity = 1.0 - (ent / max(math.log(float(self.num_experts)), 1e-8))
 
 
 # ---------------------------------------------------------------------------
@@ -2083,8 +2101,13 @@ def main() -> None:
         current_dir.mkdir(parents=True, exist_ok=True)
         import json as _json_init
         with open(current_dir / "meta.json", "w") as mf:
+            # Write BOTH schema variants (step/steps, commit/git_commit) so the
+            # log-rotation script's python3 json reads don't abort under set -e
+            # regardless of which key it expects.
             _json_init.dump(
-                {"val_bpb": 0.0, "artifact_bytes": 0, "step": 0, "commit": "",
+                {"val_bpb": 0.0, "artifact_bytes": 0,
+                 "step": 0, "steps": 0,
+                 "commit": "", "git_commit": "",
                  "run_valid": False, "status": "in_progress"},
                 mf,
             )
@@ -2320,6 +2343,11 @@ def main() -> None:
         if hasattr(m, "shared_block"):
             for prefix, router in (("attn", getattr(m.shared_block.attn, "attn_router", None)),
                                    ("mlp", getattr(m.shared_block.mlp, "mlp_router", None))):
+                # Recording is GPU-only; materialize the Python-list view once
+                # here (at log time) rather than per-forward.  One .cpu() sync
+                # per router per log instead of K per DEQ solve.
+                if router is not None and hasattr(router, "_materialize_diag_lists"):
+                    router._materialize_diag_lists()
                 ok = router is not None and getattr(router, "_expert_usage", None) is not None
                 if ok and require_step_match and getattr(router, "_diag_step", None) != step:
                     ok = False
@@ -2598,15 +2626,22 @@ def main() -> None:
         import json
         meta_path = weights_dir / "meta.json"
         with open(meta_path, "w") as f:
-            # run_valid stays false until the post-int6 assertions pass at the
-            # end of main().  If the run aborts between here and there, the
-            # stale false keeps update_results.sh --promote from picking it up.
+            # run_valid stays false until the post-int6 assertions pass AND
+            # val_bpb is finalized at the end of main().  If the run aborts
+            # between here and there, stale run_valid=false keeps
+            # update_results.sh --promote from picking it up.
+            # Write both step/steps and commit/git_commit for schema compat.
+            _git_commit = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, check=False,
+            ).stdout.strip()
             json.dump({
                 "val_bpb": 0.0,
                 "artifact_bytes": artifact_bytes,
                 "step": step,
-                "commit": subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                                         capture_output=True, text=True, check=False).stdout.strip(),
+                "steps": step,
+                "commit": _git_commit,
+                "git_commit": _git_commit,
                 "run_valid": False,
                 "status": "artifact_written",
             }, f)
@@ -3047,23 +3082,18 @@ def main() -> None:
             meta_json["failure_categories"] = [p["category"] for p in prescriptions]
             with open(meta_path, "w") as f:
                 json.dump(meta_json, f)
-    else:
+    # Track whether hard assertions passed.  We'll flip run_valid=true ONLY
+    # after val_bpb + sliding val are also written, so a crash between here
+    # and the final meta update can't leave run_valid=true with val_bpb=0.0.
+    _assertions_passed = False
+    if not _failures:
+        _assertions_passed = True
         log0("✓ POST-INT6 HEALTH: all hard assertions passed (expert balance, ortho, gate trend, injection, FP convergence)")
         if master_process:
             import json
             retry_hint_path = Path("experiments/weights/current") / "retry_hint.json"
             if retry_hint_path.exists():
                 retry_hint_path.unlink()  # stale hint from a previous failure
-            # Flip run_valid=true now that all hard assertions passed — this is
-            # the ONLY code path that sets it.  update_results.sh --promote
-            # reads this flag.
-            if meta_path is not None and meta_path.exists():
-                with open(meta_path, "r") as f:
-                    meta_json = json.load(f)
-                meta_json["run_valid"] = True
-                meta_json["status"] = "validated"
-                with open(meta_path, "w") as f:
-                    json.dump(meta_json, f)
 
     # Restore eval K for any downstream sliding-window eval.
     base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
@@ -3078,12 +3108,19 @@ def main() -> None:
         )
         log0(f"sliding_validation:done val_bpb:{sliding_bpb:.6f}")
 
-    # Master-only: update meta.json with the final val_bpb.
+    # Master-only: update meta.json with the final val_bpb AND flip
+    # run_valid=true (if all hard assertions passed).  Writing both atomically
+    # at the very end — after sliding val + all eval passes — ensures a crash
+    # between the assertion success and here leaves run_valid=false with
+    # val_bpb=0.0, so update_results.sh --promote refuses a half-finished run.
     if master_process and meta_path is not None:
         import json
         with open(meta_path, "r") as f:
             meta_json = json.load(f)
         meta_json["val_bpb"] = val_bpb_q
+        if _assertions_passed:
+            meta_json["run_valid"] = True
+            meta_json["status"] = "validated"
         with open(meta_path, "w") as f:
             json.dump(meta_json, f)
 

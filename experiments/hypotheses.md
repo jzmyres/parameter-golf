@@ -210,6 +210,15 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 **Expected:** Better FP quality + possibly better val_bpb from richer injection signal.
 **Risk:** Parameter cost (K × projection matrices). May conflict with RevDEQ's weight-sharing requirement (same f across iterations). Could be implemented as a small number of "injection modes" (2-3) rather than K separate projections.
 
+### H28: FSQ-based weight QAT closes the post-int6 quantization gap — RevDEQ-compatible
+**Claim:** Replacing post-hoc int6 quantization with FSQ-based weight quantization during training (QAT via STE) closes the 0.002-0.008 BPB quant gap because the model learns representations robust to lattice-projection quantization noise.
+**Key insight:** Unlike random per-call quant-noise (H15 REFUTED, breaks RevDEQ reversibility), FSQ is **deterministic** — same weights → same quantized output. RevDEQ backward reconstruction re-applies FSQ to the current weights and reproduces the forward values exactly. **No reversibility break.**
+**Mechanism:** Apply FSQ-STE to each weight matrix during forward. Forward uses lattice-projected weights; backward passes the gradient through as identity (STE). The model's gradients now "see" the quantization, so it learns to compensate.
+**Prediction:** Closes 0.002-0.008 BPB quant gap + possibly enables higher compression (FSQ index storage vs int6+zstd could save bytes).
+**Risk:** Implementation cost. The current codebase has FSQ only for MoS intermediate projections, not weights. Extending to weights requires wrapping all matmul weights with `_fsq_ste(w, fsq_levels)`.
+**Compatibility:** Fully compatible with RevDEQ (see "Key insight"). Also compatible with Muon optimizer (operates on gradients, unaffected by forward-time lattice projection).
+**Test:** Queued for late-stage exploration (after Phase 5 injection work + Phase 4.5/4.6). Could potentially replace int6+zstd entirely.
+
 ### H27: Injection from refinement soft-embed during DEQ solve
 **Claim:** Currently `x0_refined` (soft embedding from prior refinement step) only initializes `z0`. Injecting it during the DEQ solve (as a second input signal alongside raw `x0`) gives the solver access to denoised context throughout.
 **Mechanism:** `x = z_in + g_inj * x0 + g_ref * x0_refined` with a separate gate for the refinement signal. At refinement step 0 (no prior prediction), `x0_refined = x0` so it reduces to current behavior.
@@ -272,17 +281,28 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 
 Post-norm on Block output (iter 19) gave −0.061 bpb — biggest arch improvement.
 Test whether more granular normalization helps: per-component (before gg gate
-integration) or even per-expert (before expert-weight mixing).
+integration) or even per-expert (before expert-weight mixing).  Both iters run
+independently (22b does not wait on 22a) — they test different hypotheses and
+give complementary data even if one loses.
 
 | Iter | Config change | Hypothesis | Depends on |
 |---|---|---|---|
-| **22a** | RMSNorm on attn output AND RMSNorm on FFN output separately (before z2 = attn_mix + mlp_mix) | H20+: per-component normalization may give independent control over each branch's magnitude, letting attn and FFN each find their own operating point | iter 21 |
-| **22b** | RMSNorm on each expert output BEFORE weight-mixing (one norm per expert, not per-component) | H20++: if per-component helps, the finer granularity may help more — each expert can stabilize its magnitude independently, reducing inter-expert magnitude conflict | iter 22a result |
+| **22a** | RMSNorm on attn output AND RMSNorm on FFN output separately (before z2 = attn_mix + mlp_mix) | H20a: per-component normalization may give independent control over each branch's magnitude, letting attn and FFN each find their own operating point | iter 21 |
+| **22b** | RMSNorm on each expert output BEFORE weight-mixing (one norm per expert, not per-component) | H20b: if per-component helps, the finer granularity may help more — each expert can stabilize its magnitude independently, reducing inter-expert magnitude conflict | iter 21 (independent from 22a) |
 
-**Expected outcomes:**
-- 22a win → add to locked config, skip 22b (simpler wins)
-- 22a wash/lose → 22b either (i) wins (expert-level needed) or (ii) loses too (Block-output norm is the correct granularity)
-- 22b win → adds ~8 RMSNorm modules per block (cheap) but changes expert mixing regime
+**Outcomes are not exclusive:**
+- Both win → keep the stricter one (22b), combined with Block-output norm
+- 22a wins, 22b loses → per-component is the right granularity
+- 22a loses, 22b wins → per-expert is the right granularity (more surprising)
+- Both lose → Block-output norm granularity is optimal (negative-result signal useful for scaling law)
+
+### Phase 4.6: Throughput — switch to unrolled backward
+
+`deq_backward="revdeq"` does 3× forward FLOPs per backward (forward + reconstruction + gradient).  Unrolled does 2× (standard autograd).  ~33% faster per step at the cost of O(K) activation memory.  On 48GB L40S with K=16/dim=768/seq=2048: ~3 GB activations — fits comfortably.
+
+| Iter | Config change | Hypothesis | Depends on |
+|---|---|---|---|
+| **22c** | `deq_backward="unroll"` (standard autograd through unrolled K DEQ iterations) | Eliminates reconstruction compute; should give ~1.3× training throughput with unchanged or better val_bpb (FP32 accumulators instead of FP64) | iter 21 |
 
 ### Phase 5: Injection mechanism rework (H23-H27) — PRIORITY
 
@@ -310,11 +330,13 @@ The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ req
 | 29 | OrthoInit on all large weight matrices | Records evidence — better gradient propagation through DEQ | Phase 6 |
 | 30 | Skip gates between DEQ iterations (U-Net style) | Adapted from records 2026-04-09 | Phase 6 |
 | 31 | Gated attention gate position (before SDPA vs after) | Records + paper arXiv 2505.06708 | Phase 6 |
-| 32 | MoS head rework (FSQ levels + rank sweep) | Output head capacity tuning | Phase 6 |
+| 32 | FSQ-STE weight QAT (replace post-hoc int6 with trained-in FSQ) | H28 — closes quant gap, RevDEQ-compatible (deterministic) | Phase 6 |
 
 ### Phase 8: Scaling law grid (FINAL — locked config)
 
 Locked config: WD=0.72, β=0.20, K jitter {4,8,12,16}, 8exp, dim=768, post-norm, untied router sigmoid gates, best injection mechanism from Phase 5, batched Muon NS, compiled shared_block, best techniques from Phase 7.
+
+**FSQ on MoS is already enabled by default (`fsq_levels=8`) via `_fsq_ste` in MoSHead forward.** The hyperparams `fsq_levels` and `mos_rank` are currently hard-coded in `GPT.__init__` (L1688) and should be plumbed through to `args` for the scaling law sweep.
 
 | Iter | Config change | Variable | Depends on |
 |---|---|---|---|
@@ -323,6 +345,9 @@ Locked config: WD=0.72, β=0.20, K jitter {4,8,12,16}, 8exp, dim=768, post-norm,
 | 35 | dim=768, rank=192/288, 4exp | fewer experts, higher rank | Phase 7 |
 | 36 | dim=768, rank=96/144, 12exp | more experts, lower rank (H5 confirmed stable at WD=0.72) | Phase 7 |
 | 37 | dim=768, rank=128/192, 8exp, mlp_mult=4 | wider MLP | Phase 7 |
+| 38 | FSQ levels sweep: fsq_levels ∈ {4, 6, 8, 12, 16} | MoS output-head lattice granularity; higher = smoother logits but lossier quant | plumb `fsq_levels` as arg first |
+| 39 | MoS rank sweep: mos_rank ∈ {128, 192, 256, 320} | Output head capacity vs artifact size | plumb `mos_rank` as arg first |
+| 40 | Joint (fsq_levels, mos_rank) at best-dim from 33-34 | Combined output-head sweep | iter 38 + 39 |
 
 ### Troubleshooting table — hypothesis-verified fixes for assertion failures
 
