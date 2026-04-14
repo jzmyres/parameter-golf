@@ -1228,6 +1228,9 @@ class MLP(nn.Module):
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
+        # Phase 4.5 22-add-all: RMSNorm on per-expert hidden (after leaky_relu²).
+        # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
+        self.hidden_post_norm = RMSNorm(self.expert_rank)
 
     def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False) -> Tensor:
         B, T, D = x.shape
@@ -1241,7 +1244,10 @@ class MLP(nn.Module):
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
         h = F.leaky_relu(gate, negative_slope=0.5).square() * fc
-        h = h.view(N, E, R) * w_flat.unsqueeze(-1)
+        h = h.view(N, E, R)
+        # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
+        h = self.hidden_post_norm(h)
+        h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
         out = out_e.sum(dim=0)  # (N, D)
