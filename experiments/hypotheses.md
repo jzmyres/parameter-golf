@@ -37,6 +37,13 @@ designed to test it with a single controlled variable change.
 **Status:** ✅ VERIFIED
 **Implication:** K jitter is a permanent training requirement. Small residual degradation at K>32 remains (+0.011 at K=64 in best config) but is 5× smaller than without jitter.
 
+### H30: β jitter improves K=128 extrapolation
+**Claim:** Training at fixed β=0.20 leaves the model β-specific. Sampling β ∈ {0.10, 0.20, 0.30} per step (β±0.1) makes the model robust to varying contraction rates, complementing K jitter (H12 VERIFIED, which handled varying solver depths).
+**Mechanism:** At eval-time K=128, the effective dynamics differ from training-time K=16 even at the same β. β jitter forces the model to learn a wider basin of (β, K) combinations. By H18 (β controls convergence speed but lower β = better FP quality), the model trained at jittered β should converge to a lower-β-equivalent FP at deep K.
+**Test:** Phase 4.5 iter 22c — replace `deq_beta = 0.20` constant with per-step uniform sample from {0.10, 0.20, 0.30}.
+**Risk:** Small β (0.10) may be too slow to converge in K=4 jitter samples (smoke could fail). If so, narrow to {0.15, 0.20, 0.25}.
+**Status:** PROPOSED.
+
 ### H29: All gates must be input-dependent AND token-local — PRINCIPLE
 **Claim:** Every gate in the DEQ block (injection, gg, attention, router) must be computed from the CURRENT TOKEN's hidden state without reduction over batch or sequence.  Otherwise the update map depends on other examples in the batch or how sequences are chunked, breaking streaming / prefix-caching invariance and making the fixed point batch-dependent.
 **Violation found:** iter 21 — `_inj_gate_from` computed `g = sigmoid(inj_gate(mean(z_in, dim=(batch, seq))))`.  This meant injection depended on ALL tokens in the batch + sequence, not just the current token.  Chunking a sequence differently changed the mean → changed the gate → changed the fixed point.  Changed batch size → changed the mean → changed gates.  Cross-example coupling through a DEQ block is a serious structural bug.
@@ -307,12 +314,14 @@ give complementary data even if one loses.
 |---|---|---|---|
 | **22a** | RMSNorm on attn output AND RMSNorm on FFN output separately (before z2 = attn_mix + mlp_mix) | H20a: per-component normalization may give independent control over each branch's magnitude, letting attn and FFN each find their own operating point | iter 21 |
 | **22b** | RMSNorm on each expert output BEFORE weight-mixing (one norm per expert, not per-component) | H20b: if per-component helps, the finer granularity may help more — each expert can stabilize its magnitude independently, reducing inter-expert magnitude conflict | iter 21 (independent from 22a) |
+| **22c** | β jitter alongside K jitter: sample β ∈ {0.10, 0.20, 0.30} per training step (β±0.1 from current 0.20) | H30: β jitter makes the model robust to varying contraction rates, similar to how K jitter (H12 VERIFIED) handles varying solver depths.  Should improve K=128 extrapolation by reducing β-specific overfitting at training time. | iter 21 (independent) |
 
 **Outcomes are not exclusive:**
-- Both win → keep the stricter one (22b), combined with Block-output norm
+- Both 22a/22b win → keep the stricter one (22b), combined with Block-output norm
 - 22a wins, 22b loses → per-component is the right granularity
 - 22a loses, 22b wins → per-expert is the right granularity (more surprising)
 - Both lose → Block-output norm granularity is optimal (negative-result signal useful for scaling law)
+- 22c (β jitter) → primarily targets K=128 degradation; complementary to 22a/22b
 
 ### Phase 5: Injection mechanism rework (H23-H27) — PRIORITY
 
