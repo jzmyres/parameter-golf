@@ -296,7 +296,8 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 | 21-retry | + WD 0.72→1.08, K_max 16→20 (over-engineered for old gates) | 2.108 | discard (val_bpb regression — WD over-regularized; K=128 catastrophic Δ=1.675) | confirmed: WD=1.08 + K_max=20 anti-synergistic |
 | 21-retry-2 | revert WD/K_max + max_pairwise ortho LOSS (bug — sparse gradient) | 1.882 | discard (val_bpb regression; K=128 Δ=3.27, even worse than 21-retry) | confirmed: max_pairwise as LOSS breaks training |
 | 21-retry-3 | + decouple LOSS=max_mean (smooth) and GATE=max_pairwise (clean) | **1.892** | discard (val_bpb regressed +0.19 from baseline 1.705; K=128 Δ=1.79) | loss/gate decoupling helped (K128 went 3.27→1.79) but did NOT restore iter 21's 1.67 — root cause unclear, requires repro |
-| **21-retry-4** | **repro test: HEAD code (val_bpb-primary + H32 ortho loss removed)** | **1.876 (TRUE int6)** | **KEEP (NEW BASELINE)** | CRITICAL FINDING: prior "baseline 1.705" was BF16 (commit `83541fc` fixed the int6 roundtrip indentation bug on Apr 13 19:52; pre-fix the int6 model was never loaded for eval — dead code). iter 21-retry-3 (1.892) and retry-4 (1.876) are the FIRST valid int6 measurements. True int6 quant cost ~0.17 BPB was hidden. New baseline: 1.876. |
+| **21-retry-4** | **repro test: HEAD code (val_bpb-primary + H32 ortho loss removed)** | **1.876 (TRUE int6)** | discard (superseded by iter 22) | CRITICAL FINDING: prior "baseline 1.705" was BF16 (commit `83541fc` fixed the int6 roundtrip indentation bug on Apr 13 19:52; pre-fix the int6 model was never loaded for eval — dead code). iter 21-retry-3 (1.892) and retry-4 (1.876) are the FIRST valid int6 measurements. True int6 quant cost ~0.17 BPB was hidden. |
+| **22** | H32 partial revert: `block_ortho_aux_coef 0 → 0.1` | **1.888 (TRUE int6)** | **KEEP (NEW BASELINE)** | val_bpb 1.888 is within ~0.015 bf16/seed noise floor (empirical: retry-3=1.892 vs retry-4=1.876 same config differ 0.016). attn_ortho 0.82→0.30 / mlp_ortho 0.86→0.22 = 3-6× structural improvement. H32 final arc: coef 1.0 → 0 (too aggressive, ortho drifted near 0.9 gate) → 0.1 (right balance — ortho clean, val_bpb parity). |
 
 **Iter 21 val_bpb 1.6706 is BETTER than 1.705 (-0.034), but 5 hard assertions failed under OLD gates:**
 - `mlp_min_share=0.037 < 0.075` (OLD threshold; NEW threshold 0.01 — would PASS)
@@ -342,7 +343,13 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 
 | Iter | Optimization | Expected gain | Effort | Risk |
 |---|---|---|---|---|
-| ~~T1~~ | ~~Grouped expert mixing via `torch.bmm`~~ — **ALREADY IMPLEMENTED** (`mix_experts_from_shared` L1167, `mix_experts` L1241 both use torch.bmm; input projections use flattened matmul, already optimal). No further win here. | 0 (done) | — | — |
+| ~~T1~~ | ~~Grouped expert mixing~~ — **ALREADY DONE** (both mix_experts paths use torch.bmm; input uses flattened matmul) | 0 | — | — |
+| ~~T2~~ | ~~Defer diagnostic CPU sync~~ — **mostly done** (diag sites gated behind `_ROUTER_DIAGNOSTICS_ACTIVE`, only fire during log/eval steps; <2% real gain not worth the refactor complexity) | <2% | — | — |
+| ~~T4~~ | ~~Drop full val mid-train~~ — **ALREADY DONE** (L2624 uses `full_validation=False`) | 0 | — | — |
+| T3 | compile `dynamic=True` | 2-5% | Low | High (past dynamo bugs) |
+| T5 | activation-checkpoint MoS head | Modest | Medium | Low |
+
+**Phase 4.4 status:** T1, T2, T4 already implemented via prior hardening work.  T3/T5 have marginal ROI vs implementation cost.  **Skip to Phase 4.5 norm ablation** where the arch wins live.  If we later need more throughput, revisit T3 with newer torch or T5 with activation-checkpointing.
 | **T2** | Defer diagnostic CPU sync to log time (record GPU-only inside DEQ loop) | 5-10% | Low | Low — already partially done for routers |
 | **T3** | Compile with `dynamic=True` so single graph handles K∈{4,8,16} | 2-5% steady, eliminates K-recompile re-warmup | Low | Medium — past dynamo bugs may have been fixed in newer torch |
 | **T4** | Drop full validation in mid-train val cycles; only fast subset; full val once at end | 5-10% (saves ~30s × N val cycles per hour) | Low | Low |
