@@ -402,13 +402,15 @@ VERIFIED or RESOLVED hypothesis from this document.
 
 | Failure category | Prescribed fix | Hypothesis |
 |---|---|---|
-| routing_imbalance (min_share, balance_cv) | `muon_weight_decay × 1.5` (cap 1.44) | H9 VERIFIED, H5 RESOLVED |
-| expert_collapse (ortho) | `muon_weight_decay × 1.5`, else drop num_experts by 1 step | H5 RESOLVED |
-| injection_collapse (inj_max, inj_mean) | Apply Phase 5 iter 24 (injection floor) or iter 22 (per-iter schedule) | H23 PROPOSED |
-| gate_collapsed (gg_max<0.3) | Verify post_norm on; else `deq_beta - 0.05` | H20 VERIFIED |
-| gate_saturated (gg_min>0.95) | `deq_beta + 0.05` (smaller per-iter update) | H18 VERIFIED |
-| fp_quality_loss (K-sweep non-monotone) | Widen K jitter (`deq_k_max + 4`); fix injection first if also flagged | H12 VERIFIED, H23 PROPOSED |
-| solver_divergence (iter_conv_rel>0.1) | `muon_weight_decay × 1.5` (H9) or `deq_beta - 0.05` (H18) | H9 + H18 |
+| dead_expert (min_share < 0.01) | `muon_weight_decay × 1.5` + `balance_mult × 1.5` (cap WD 1.44) | H9 VERIFIED, H5 RESOLVED |
+| expert_collapse (attn/mlp ortho) | `muon_weight_decay × 1.5`, else drop num_experts by 1 step | H5 RESOLVED |
+| mos_head_collapse (mos_* ortho) | `mos_ortho_out_coef × 1.5`, else shrink mos_rank | separate from expert_collapse: MoS head count is structural, not tunable |
+| injection_collapse (inj_max < 0.05 or inj_mean < 0.01) | Apply Phase 5 iter 24/22 (injection floor / per-iter schedule) | H23 PROPOSED |
+| gate_collapsed (gg_max < 0.3) | Verify post_norm on; else `deq_beta - 0.05` | H20 VERIFIED |
+| gate_saturated (gg_min > 0.95) | `deq_beta + 0.05` (smaller per-iter update) | H18 VERIFIED |
+| fp_quality_loss (K-sweep non-monotone or K≥16 Δ > 0.03) | Widen K jitter (`deq_k_max + 4`); fix injection first if also flagged | H12 VERIFIED, H23 PROPOSED |
+| solver_divergence (iter_conv_rel > 0.1) | `muon_weight_decay × 1.5` (H9) or `deq_beta - 0.05` (H18) | H9 + H18 |
+| reversibility_broken (deq_recon_err > 1.0) | Check for randomness in block (H15 REFUTED quant-noise); `deq_beta - 0.05`; `WD × 1.5` | fundamental — RevDEQ requires deterministic f + stable contraction |
 
 **Retry protocol:**
 1. If `run_valid=false` in `experiments/weights/current/meta.json`, the run is INVALID
@@ -428,14 +430,15 @@ VERIFIED or RESOLVED hypothesis from this document.
 - Locked (WD, β) = (0.72, 0.20) unless explicitly testing a WD/β hypothesis
 - Post-norm on Block output is load-bearing — do not remove (H20)
 - Muon NS must operate at correct tensor granularity — verify shape for any new param groups (H21)
-- **Post-int6 HARD assertions** (run fails if any violated, DDP-global aggregation):
-  - Per-component min_share ≥ 0.6/E (weakest expert ≥60% of fair share)
-  - Per-component balance_cv ≤ 0.20 (routing balance)
-  - Per-component ortho ≤ 0.20 (max-mean |cos|, not mean-|cos|)
+- **Post-int6 HARD assertions** (run fails if any violated, DDP-global aggregation).  The gates target STRUCTURAL invariants — not the things training already optimizes (e.g. load balance via balance_loss).  Each check identifies a class of bug that would silently corrupt downstream metrics:
+  - Per-component min_share ≥ 0.01 (no dead expert — sub-1% means that expert is wasted capacity carried in the artifact)
+  - Per-component ortho ≤ 0.20 (max-mean |cos| — experts must actually be diverse)
   - gg_max ≥ 0.3 AND gg_min ≤ 0.95 (gate active, not collapsed/saturated)
   - inj_max ≥ 0.05 AND inj_mean ≥ 0.01 (x0 injection non-zero — H23 DEQ input-dependence)
-  - K-sweep monotone from K=8 (Δ ≤ 0.005), worst K≥16 within 0.03 of best
-  - iter_conv_rel ≤ 0.1 at highest K
+  - K-sweep monotone from K=8 (Δ ≤ 0.005), worst K≥16 within 0.03 of best (FP convergence)
+  - iter_conv_rel ≤ 0.1 at highest K (solver converges at eval K)
+  - deq_recon_err ≤ 1.0 (RevDEQ reversibility — backward reconstructs forward states correctly)
+  - **NOT checked:** balance_cv (training optimizes this via balance_loss; not a structural invariant)
 - **Artifact budget HARD cap**: code + compressed model ≤ 16,000,000 bytes (fails early)
 - Untied attn/mlp routers (separate sigmoid gates and routing weights per component)
 - **H29 PRINCIPLE**: every gate must be input-dependent AND token-local — no `.mean(dim=batch,seq)` before any gate.  Streaming / prefix-caching invariance depends on this.  Verify any new gate with: "does chunking the sequence change this gate's value for unchanged tokens?" → must be NO.

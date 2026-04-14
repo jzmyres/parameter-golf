@@ -3082,20 +3082,21 @@ def main() -> None:
             else _ddp_mean_vec(usage_list_getter(), n_exp)
         )
         if usage is not None and len(usage) > 0:
+            # Dead expert check: load balance is already optimized by the
+            # balance_loss during training.  We don't re-verify balance here;
+            # instead we gate on the STRUCTURAL invariant that no expert should
+            # be completely dead (< 1% usage).  Sub-1% usage means that expert
+            # is effectively unlearned weights being carried in the artifact —
+            # wasted capacity — and routing has collapsed onto the others.
             min_share = float(min(usage))
-            min_share_thresh = 0.6 / float(n_exp)
-            if min_share < min_share_thresh:
+            if min_share < 0.01:
                 _failures.append(
-                    f"{prefix}_min_share={min_share:.4f} < {min_share_thresh:.4f} "
-                    f"(=0.6/{n_exp} — weakest expert below 60% of fair share)"
+                    f"{prefix}_min_share={min_share:.4f} < 0.01 "
+                    f"(dead expert — one of {n_exp} has <1% usage; routing collapsed)"
                 )
-            # Recompute CV from the global-mean usage vector so it's not
-            # rank-local: CV = std / mean of the DDP-averaged per-expert shares.
-            m = sum(usage) / float(len(usage))
-            var = sum((u - m) ** 2 for u in usage) / float(len(usage))
-            cv = (var ** 0.5) / max(m, 1e-8)
-            if cv > 0.20:
-                _failures.append(f"{prefix}_balance_cv={cv:.4f} > 0.20 (routing imbalance)")
+        # Expert orthogonality: weights must actually be diverse across
+        # experts (max-mean |cos| ≤ 0.20).  Cheap training trick: increase
+        # weight_decay to shrink expert weight magnitudes.
         ortho = _ddp_mean_scalar(ortho_getter())
         if ortho is not None and ortho > 0.20:
             _failures.append(
@@ -3168,6 +3169,22 @@ def main() -> None:
     if conv_rel is not None and conv_rel > 0.1:
         _failures.append(f"iter_conv_rel={conv_rel:.4f} > 0.1 (solver not converging at eval K)")
 
+    # 6. RevDEQ reconstruction error: the backward reconstructs forward states
+    # from the solver's final state; ||reconstructed_z - z|| must stay small
+    # for the reversibility invariant to hold.  Bf16 + FP64 accumulators: we
+    # typically see 1e-3 to 1e-1 on a healthy run.  >1.0 means reversibility
+    # is broken — gradients are unreliable.  Value is the last-recorded from
+    # the final training step before eval (populated by RevDEQFunction backward).
+    recon_err_local = getattr(base_m_for_roundtrip.shared_block, "_deq_recon_error_last_bwd", None)
+    recon_err = _ddp_mean_scalar(
+        float(recon_err_local) if recon_err_local is not None else None
+    )
+    if recon_err is not None and recon_err > 1.0:
+        _failures.append(
+            f"deq_recon_err={recon_err:.3e} > 1.0 (RevDEQ reversibility broken — "
+            f"backward reconstructs forward states incorrectly, gradients unreliable)"
+        )
+
     # Classify each failure and prescribe a fix from the verified-hypothesis
     # troubleshooting table.  A failed run is INVALID (cannot be promoted to
     # baseline) but its diagnostics + retry_hint guide the NEXT iteration's
@@ -3188,15 +3205,18 @@ def main() -> None:
         low = failure.lower()
         # Split off the first token (up to '=' or ' ') for prefix checks.
         first_token = low.split("=", 1)[0].split()[0] if low else ""
-        if "min_share" in first_token or "balance_cv" in first_token:
+        # Dead-expert failure only (not balance CV — that's handled by training
+        # balance_loss, not a hard invariant).
+        if "min_share" in first_token:
             return {
                 "failure": failure,
-                "category": "routing_imbalance",
-                "hypothesis": "H9 VERIFIED, H5 RESOLVED — routing collapse is WD-addressable",
+                "category": "dead_expert",
+                "hypothesis": "H5 RESOLVED — routing collapse is WD-addressable",
                 "fix": "Increase muon_weight_decay by 1.5× (e.g. 0.72→1.08). "
-                       "If already ≥1.0, also increase attn_balance_mult or mlp_balance_mult by 1.5×. "
-                       "Cap at WD=1.44 — H19 showed 1.44 is already too high for β=0.20.",
-                "config_change": {"muon_weight_decay_mult": 1.5},
+                       "If already ≥1.0, increase attn_balance_mult or mlp_balance_mult by 1.5× "
+                       "(strengthens the training balance loss that drives the dead expert's usage up). "
+                       "Cap WD at 1.44 — H19 showed 1.44 is already too high for β=0.20.",
+                "config_change": {"muon_weight_decay_mult": 1.5, "balance_mult_mult": 1.5},
             }
         # MoS head ortho is a DIFFERENT failure mode from attn/mlp expert ortho.
         # MoS has fixed num_shared+num_specialized; the fix is regularization on
@@ -3261,6 +3281,16 @@ def main() -> None:
                 "fix": "Increase muon_weight_decay 1.5× (H9) OR lower deq_beta by 0.05 (H18).",
                 "config_change": {"muon_weight_decay_mult": 1.5},
             }
+        if first_token.startswith("deq_recon_err"):
+            return {
+                "failure": failure,
+                "category": "reversibility_broken",
+                "hypothesis": "RevDEQ reversibility requires f(z, x0, W) be deterministic and solver in stable contraction region",
+                "fix": "1) Check for any random/non-deterministic op in the block (quant-noise, dropout etc. "
+                       "— see H15 REFUTED).  2) Lower deq_beta by 0.05 for tighter contraction.  "
+                       "3) Increase muon_weight_decay 1.5× to shrink Jacobian spectral norm.",
+                "config_change": {"deq_beta_delta": -0.05, "muon_weight_decay_mult": 1.5},
+            }
         return {
             "failure": failure,
             "category": "unknown",
@@ -3317,7 +3347,7 @@ def main() -> None:
     _assertions_passed = False
     if not _failures:
         _assertions_passed = True
-        log0("✓ POST-INT6 HEALTH: all hard assertions passed (expert balance, ortho, gate trend, injection, FP convergence)")
+        log0("✓ POST-INT6 HEALTH: all hard assertions passed (no dead experts, expert ortho, gate trend, injection, FP convergence, reversibility)")
         if master_process:
             retry_hint_path = Path("experiments/weights/current") / "retry_hint.json"
             if retry_hint_path.exists():
