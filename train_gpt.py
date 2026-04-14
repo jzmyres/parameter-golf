@@ -2236,20 +2236,22 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # Compile the DEQ iteration body for throughput.  Graceful fallback if
-    # compile fails.  For deq_backward="unroll", the earlier attempt with
-    # `dynamic=False` broke grad_fn tracking because DDP gradient hooks on a
-    # compiled module called many times in a Python loop can lose the graph
-    # connection.  We use `dynamic=True` for unroll (dynamo recompiles as
-    # needed per-call instead of specializing static shapes once) which keeps
-    # the autograd chain intact.  This keeps compile as a CONTROL variable
-    # across both backward modes so the revdeq-vs-unroll comparison is fair.
-    try:
-        _dyn = True if args.deq_backward == "unroll" else False
-        base_model.shared_block = torch.compile(base_model.shared_block, dynamic=_dyn)
-        log0(f"compiled shared_block for throughput (dynamic={_dyn}, deq_backward={args.deq_backward})")
-    except Exception as e:
-        log0(f"shared_block compile failed ({e}), running eager")
+    # Compile the DEQ iteration body for throughput.  When deq_backward="unroll",
+    # compile is DISABLED on both modes for a fair comparison (matching the
+    # speed_compare_backward.py benchmark setup where unroll measured 3.21×
+    # faster without compile).  Attempted compile+unroll+DDP:
+    #   - dynamic=False → grad_fn tracking broken (loss has no grad_fn)
+    #   - dynamic=True  → dynamo backend crash ('int' has no 'meta')
+    # Chasing these is a rabbit hole; keep compile off for apples-to-apples.
+    # For revdeq-only runs (final 8×H100), re-enable compile via override.
+    if args.deq_backward == "unroll":
+        log0("shared_block compile OFF (deq_backward=unroll — control variable for fair comparison)")
+    else:
+        try:
+            base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
+            log0("compiled shared_block for throughput (dynamic=False, deq_backward=revdeq)")
+        except Exception as e:
+            log0(f"shared_block compile failed ({e}), running eager")
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
