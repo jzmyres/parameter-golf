@@ -333,19 +333,34 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 |---|---|---|---|
 | **21** | Untied attn/mlp routers + per-component router gate tracking + all throughput fixes (memmap, FP32 eval, K=128) | Separate router learning + throughput baseline | — |
 
-### Phase 4.5: Post-norm granularity (PRIORITY — front of queue)
+### Phase 4.5: Norm position ablation (PRIORITY — systematic, NOT one-off iters)
 
-Post-norm on Block output (iter 19) gave −0.061 bpb — biggest arch improvement.
-Test whether more granular normalization helps: per-component (before gg gate
-integration) or even per-expert (before expert-weight mixing).  Both iters run
-independently (22b does not wait on 22a) — they test different hypotheses and
-give complementary data even if one loses.
+**Approach** (per user direction): instead of separate one-off iters for specific norm positions, do a SYSTEMATIC ablation:
+1. **Iter 22-add-all**: add LEARNABLE RMSNorm at ALL reasonable post-non-linearity positions. Make all RMSNorms learnable (weight ∈ R^dim, currently parameter-free).
+2. **Iters 22-rm-{position}**: remove ONE position at a time. Keep removed if val_bpb doesn't regress meaningfully (≥ −0.005 noise floor).
+3. Continue until no further simplification possible.
 
-| Iter | Config change | Hypothesis | Depends on |
-|---|---|---|---|
-| **22b** | RMSNorm on each expert output BEFORE weight-mixing (one norm per expert) — FIRST per user priority | H20b: per-expert normalization removes inter-expert magnitude conflict; the finest granularity available | iter 21-retry-3 promotion |
-| **22a** | RMSNorm on attn output AND RMSNorm on FFN output separately (before z2 = attn_mix + mlp_mix) | H20a: per-component normalization gives independent magnitude control to each branch | after 22b |
-| **22c** | β jitter: sample β ∈ {0.10, 0.20, 0.30} per training step (β±0.1) | H30: β jitter makes model robust to varying contraction rates (parallel to K jitter / H12 VERIFIED); targets K=128 extrapolation. If β=0.30 sample causes solver_divergence, the existing prescription system bumps WD×1.5 (consistent with H19). | after 22a |
+**Reasonable post-norm positions (AFTER non-linearities, not after softmax/sigmoid):**
+- After gated SDPA in attention (sigmoid×softmax×V output, before output projection)
+- After leaky_relu² in MLP (before fc-down)
+- After per-expert output (each expert's projected output, before weighted mixing) — H20b candidate
+- After attn_mix per-component (before z2 = attn_mix + mlp_mix) — H20a candidate
+- After mlp_mix per-component
+- After Block output (current `post_norm` — H20 VERIFIED, do NOT remove)
+- After bigram embedding addition (residual sum into tok_emb)
+- After tok_emb (before DEQ entry)
+
+**Skip (already bounded by their non-linearity):**
+- After softmax (router output is a probability)
+- After sigmoid gates (gg, inj, attn_gate, router_gate)
+- After RMSNorm itself
+
+**Pre-norm vs post-norm**: also test pre-norm (norm BEFORE the non-linearity instead of after). Single iter to compare.
+
+**β jitter (H30)** — runs as separate Phase 4.5b iter after the norm ablation settles:
+- Sample β ∈ {0.10, 0.20, 0.30} per training step
+- If β=0.30 causes solver_divergence, the existing prescription bumps WD×1.5 (H19 path)
+- Targets K=128 extrapolation
 
 **Outcomes are not exclusive:**
 - Both 22a/22b win → keep the stricter one (22b), combined with Block-output norm
@@ -381,6 +396,20 @@ The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ req
 | 30 | Skip gates between DEQ iterations (U-Net style) | Adapted from records 2026-04-09 | Phase 6 |
 | 31 | Gated attention gate position (before SDPA vs after) | Records + paper arXiv 2505.06708 | Phase 6 |
 | 32 | FSQ-STE weight QAT (replace post-hoc int6 with trained-in FSQ) | H28 — closes quant gap, RevDEQ-compatible (deterministic) | Phase 6 |
+
+### Phase 7.4: Throughput micro-optimizations (runs BEFORE Phase 7.5 unroll investigation)
+
+**Top 5 ROI throughput optimizations** (orthogonal to arch — can interleave with Phase 4.5/5/6 if convenient):
+
+| # | Iter | Optimization | Expected gain | Effort | Risk |
+|---|---|---|---|---|---|
+| 1 | T1 | Grouped expert mixing via `torch.bmm` over E dimension | 15-25% | Medium | Low |
+| 2 | T2 | Defer all diagnostic CPU sync to log time (record GPU only inside DEQ loop) | 5-10% | Low | Low |
+| 3 | T3 | Compile with `dynamic=True` so single graph handles K∈{4,8,16} (eliminate K-specialization recompile) | 2-5% steady, eliminates re-warmup | Low | Medium (dynamo bugs in past) |
+| 4 | T4 | Drop full validation in mid-train val; only fast subset; full val once at end | 5-10% | Low | Low |
+| 5 | T5 | Activation-checkpoint MoS head (256MB logits tensor, recomputable) | Modest step time, enables larger batch | Medium | Low |
+
+**Decision:** run T1 + T2 (highest gain × lowest risk) as immediate throughput iters after the Phase 4.5 norm ablation settles.  T3/T4/T5 deferred until after Phase 7 if time permits.
 
 ### Phase 7.5: Throughput optimization — unroll+compile investigation (runs BEFORE Phase 8)
 
