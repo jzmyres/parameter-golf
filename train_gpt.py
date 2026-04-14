@@ -736,6 +736,21 @@ class RMSNorm(nn.Module):
         return y
 
 
+class PerExpertRMSNorm(nn.Module):
+    """RMSNorm with per-expert learnable weight (E, D).
+
+    Normalizes over the last (D) dim and multiplies by a weight of shape (E, D)
+    so each expert has its own scale.  Direction-preserving — cosine-based
+    diagnostics (ortho_aux, expert similarity) are invariant to this scale.
+    """
+    def __init__(self, num_experts: int, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.dim = int(dim)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_experts, dim, dtype=torch.float32))
+
+
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
@@ -1113,6 +1128,11 @@ class CausalSelfAttention(nn.Module):
         # Phase 4.5 22-add-all: RMSNorm after gated SDPA (post-non-linearity).
         # Normalizes per-head attention output before the expert mix projection.
         self.attn_sdpa_post_norm = RMSNorm(dim)
+        # Phase 4.5 22-add-expert-norms (b): per-expert RMSNorm on each
+        # attention expert's output (E, N, D) before summing into the mixed
+        # output.  Weight shape (E, D).  Mirrors the MLP version — both expert
+        # banks now have a per-expert magnitude correction before composition.
+        self.expert_out_post_norm = PerExpertRMSNorm(num_experts, dim)
 
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         bsz, seqlen, dim = x_n.shape
@@ -1170,6 +1190,9 @@ class CausalSelfAttention(nn.Module):
         # (E, D, R) -> (E, R, D) view (no copy); compute E independent GEMMs.
         O_T = self.expert_out.to(dtype=y_flat.dtype).transpose(1, 2)
         out_e = torch.bmm(h.transpose(0, 1), O_T)  # (E, N, D)
+        # Phase 4.5 22-add-expert-norms (b): per-expert RMSNorm on each expert's
+        # output before summing.  weight (E, D) broadcasts over N as (E, 1, D).
+        out_e = _rms_norm(out_e, self.expert_out_post_norm.eps) * self.expert_out_post_norm.weight.to(dtype=out_e.dtype).unsqueeze(1)
         out = out_e.sum(dim=0)  # (N, D)
 
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
@@ -1228,9 +1251,16 @@ class MLP(nn.Module):
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
-        # Phase 4.5 22-add-all: RMSNorm on per-expert hidden (after leaky_relu²).
-        # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
-        self.hidden_post_norm = RMSNorm(self.expert_rank)
+        # Phase 4.5 22-add-expert-norms (a): per-expert RMSNorm on hidden after
+        # leaky_relu².  Weight shape (E, R) — each expert has its own scale on
+        # its rank-R bottleneck activation.  Replaces the prior shared (R,) form.
+        self.hidden_post_norm = PerExpertRMSNorm(num_experts, self.expert_rank)
+        # Phase 4.5 22-add-expert-norms (b): per-expert RMSNorm on each
+        # expert's OUTPUT (E, N, D) before summing into the mixed output.
+        # Weight shape (E, D).  Lets each expert correct its own contribution
+        # magnitude before composition.  Composes cleanly with the existing
+        # Block.mlp_post_mix_norm (which norms the SUM after this).
+        self.expert_out_post_norm = PerExpertRMSNorm(num_experts, dim)
 
     def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False) -> Tensor:
         B, T, D = x.shape
@@ -1245,11 +1275,15 @@ class MLP(nn.Module):
         fc = x_flat @ Fm.t()
         h = F.leaky_relu(gate, negative_slope=0.5).square() * fc
         h = h.view(N, E, R)
-        # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
-        h = self.hidden_post_norm(h)
+        # Phase 4.5 22-add-expert-norms (a): per-expert RMSNorm on hidden after
+        # leaky_relu².  weight (E, R) broadcasts over N axis of (N, E, R).
+        h = _rms_norm(h, self.hidden_post_norm.eps) * self.hidden_post_norm.weight.to(dtype=h.dtype)
         h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
+        # Phase 4.5 22-add-expert-norms (b): per-expert RMSNorm on each expert's
+        # output before summing.  weight (E, D) broadcasts over N as (E, 1, D).
+        out_e = _rms_norm(out_e, self.expert_out_post_norm.eps) * self.expert_out_post_norm.weight.to(dtype=out_e.dtype).unsqueeze(1)
         out = out_e.sum(dim=0)  # (N, D)
 
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
