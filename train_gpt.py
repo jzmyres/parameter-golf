@@ -1856,9 +1856,10 @@ class GPT(nn.Module):
         self._block_ortho_aux_loss: Tensor | None = None
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm(model_dim)
-        # Phase 4.5 22-add-all: learnable RMSNorm after bigram residual add
-        # (replaces parameter-free _rms_norm in _encode).
-        self.embed_post_norm = RMSNorm(model_dim)
+        # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
+        # the parameter-free `_rms_norm` in _encode.  Tests if the learnable
+        # weight there was doing useful work.  Keep removed if val_bpb
+        # doesn't regress > 0.015 vs 22-add-all baseline (1.891).
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -2114,9 +2115,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        # Phase 4.5 22-add-all: learnable post-norm after bigram residual add
-        # (was parameter-free _rms_norm before).
-        x = self.embed_post_norm(x)
+        # Phase 4.5 22-rm-embed-post: back to parameter-free _rms_norm here.
+        x = _rms_norm(x)
         x = self._run_backbone(x)
         return self.final_norm(x)
 
