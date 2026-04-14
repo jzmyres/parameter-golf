@@ -55,11 +55,20 @@ def dynamo_disable(fn):
 
 
 def _should_diag(training: bool) -> bool:
-    """Return True if this rank should record diagnostics right now."""
+    """Return True if this rank should record diagnostics right now.
+
+    Training: rank 0 only (master-logged, other ranks save the compute).
+    Eval: ALL ranks — the post-eval DDP-global assertions need every rank to
+    have populated diagnostics so dist.all_reduce() has matching participants.
+    Rank-gating still happens at the log sites, not here.
+    """
     if training and not _ROUTER_DIAGNOSTICS_ACTIVE:
         return False
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank() == 0
+    if training:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+        return True
+    # Eval path: every rank populates local diagnostics.
     return True
 
 
@@ -2476,6 +2485,11 @@ def main() -> None:
     base_model.train(False)
     meta_path: Path | None = None
     val_bpb_q = 0.0
+    # Budget-violation flag must be visible on EVERY rank so the raise below
+    # executes collectively — raising only on master would leave other ranks
+    # blocked forever on a later broadcast / barrier.
+    _budget_violated = torch.zeros(1, device=device)
+    _budget_info = ""
     if master_process:
         code_bytes = len(code.encode('utf-8'))
         log0(f"Code size: {code_bytes} bytes")
@@ -2506,10 +2520,22 @@ def main() -> None:
         total_bytes = code_bytes + artifact_bytes
         log0(f"total_bytes:{total_bytes} (code:{code_bytes} + artifact:{artifact_bytes}) budget:16000000")
         if total_bytes > 16_000_000:
-            raise RuntimeError(
+            _budget_violated.fill_(1.0)
+            _budget_info = (
                 f"Artifact budget violated: total_bytes={total_bytes} > 16,000,000 "
                 f"(code={code_bytes} + artifact={artifact_bytes})"
             )
+    # Broadcast violation flag from rank 0 so every rank raises collectively,
+    # avoiding the deadlock where master raises but workers block on broadcasts
+    # below.  dist.broadcast uses the rank-0 value on all ranks.
+    if distributed:
+        dist.broadcast(_budget_violated, src=0)
+    if float(_budget_violated.item()) > 0.5:
+        # Tear down DDP cleanly on ALL ranks before raising.
+        if distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        raise RuntimeError(_budget_info or "Artifact budget violated on rank 0 (see master log for details)")
 
         weights_dir = Path("experiments/weights/current")
         weights_dir.mkdir(parents=True, exist_ok=True)
@@ -2628,40 +2654,89 @@ def main() -> None:
     # the global view that actually matters.
     _failures: list[str] = []
 
-    # Helper: DDP-global mean of a scalar float (None→None pass-through).
+    # Deadlock-safe DDP helpers.  Every rank MUST enter all_reduce regardless
+    # of whether its local value is None, so a NaN/zero sentinel + presence
+    # mask is used to preserve pass-through semantics while keeping all ranks
+    # in lock-step.  Returns (None, True) when the value was absent on every
+    # rank (nothing to assert); otherwise the global mean over ranks that had it.
     def _ddp_mean_scalar(x: float | None) -> float | None:
-        if x is None:
-            return None
-        if distributed:
-            t = torch.tensor([float(x)], device=device)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            return float(t.item()) / float(world_size)
-        return float(x)
+        if not distributed:
+            return None if x is None else float(x)
+        present = torch.tensor([0.0 if x is None else 1.0], device=device)
+        value = torch.tensor([0.0 if x is None else float(x)], device=device)
+        dist.all_reduce(present, op=dist.ReduceOp.SUM)
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        n = float(present.item())
+        return None if n == 0.0 else float(value.item()) / n
 
-    # Helper: DDP-global mean of a 1D usage vector (None→None pass-through).
-    def _ddp_mean_vec(v: list[float] | None) -> list[float] | None:
-        if v is None:
+    def _ddp_mean_vec(v: list[float] | None, length: int) -> list[float] | None:
+        if not distributed:
+            return None if v is None else [float(x) for x in v]
+        # Pad / zero-fill based on presence so ALL ranks call all_reduce with
+        # matching shapes even if some ranks never populated the diagnostic.
+        present = torch.tensor([0.0 if v is None else 1.0], device=device)
+        value = torch.zeros(length, device=device)
+        if v is not None and len(v) == length:
+            value.copy_(torch.tensor([float(x) for x in v], device=device))
+        dist.all_reduce(present, op=dist.ReduceOp.SUM)
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        n = float(present.item())
+        if n == 0.0:
             return None
-        t = torch.tensor([float(x) for x in v], device=device)
-        if distributed:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            t = t / float(world_size)
-        return t.detach().cpu().tolist()
+        return (value / n).detach().cpu().tolist()
 
-    # 1. Expert health per component (DDP-global).  Hard requirements:
+    # 1. Expert health per routed component (DDP-global).  Hard requirements:
     #      min_share ≥ 0.6 / E   (weakest expert gets ≥60% of its fair share)
     #      balance_cv ≤ 0.20     (mean-share dispersion across experts)
     #      ortho     ≤ 0.20     (max-mean |cos| — worst expert's similarity)
-    for prefix, router, ortho_host in (
-        ("attn", getattr(base_m_for_roundtrip.shared_block.attn, "attn_router", None),
-                 getattr(base_m_for_roundtrip.shared_block, "attn", None)),
-        ("mlp",  getattr(base_m_for_roundtrip.shared_block.mlp, "mlp_router", None),
-                 getattr(base_m_for_roundtrip.shared_block, "mlp", None)),
-    ):
-        if router is None:
-            continue
-        n_exp = int(getattr(router, "num_experts", 8))
-        usage = _ddp_mean_vec(getattr(router, "_expert_usage", None))
+    #
+    # Covers all four routed components: attn, mlp, mos_ctp, mos_ntp.  The
+    # project spec requires all four to pass the same health bar.
+    shared_block = base_m_for_roundtrip.shared_block
+    mos_head = getattr(base_m_for_roundtrip, "mos_head", None)
+
+    def _mos_usage(head: str) -> list[float] | None:
+        if mos_head is None:
+            return None
+        return getattr(mos_head, f"_{head}_expert_usage", None)
+
+    def _mos_num_experts(head: str) -> int:
+        if mos_head is None:
+            return 0
+        return int(getattr(mos_head, "num_shared", 0)) + int(getattr(mos_head, "num_specialized", 0))
+
+    def _mos_ortho(head: str) -> float | None:
+        if mos_head is None or not hasattr(mos_head, "get_head_orthogonality"):
+            return None
+        try:
+            return float(mos_head.get_head_orthogonality(head))
+        except Exception:
+            return None
+
+    check_specs = [
+        ("attn",
+         getattr(shared_block.attn, "attn_router", None),
+         lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None)),
+        ("mlp",
+         getattr(shared_block.mlp, "mlp_router", None),
+         lambda: getattr(shared_block.mlp, "_out_ortho_cos_sim", None)),
+        ("mos_ctp",
+         type("_Usg", (), {"num_experts": _mos_num_experts("ctp"),
+                           "_expert_usage": _mos_usage("ctp")})() if mos_head is not None else None,
+         lambda: _mos_ortho("ctp")),
+        ("mos_ntp",
+         type("_Usg", (), {"num_experts": _mos_num_experts("ntp"),
+                           "_expert_usage": _mos_usage("ntp")})() if mos_head is not None else None,
+         lambda: _mos_ortho("ntp")),
+    ]
+
+    for prefix, router, ortho_getter in check_specs:
+        n_exp = int(getattr(router, "num_experts", 0)) if router is not None else 0
+        usage_local = getattr(router, "_expert_usage", None) if router is not None else None
+        # EVERY rank must call _ddp_mean_vec with the same `length` argument
+        # (else the all_reduce shapes disagree), so derive it from num_experts
+        # which is model-structural and identical across ranks.
+        usage = _ddp_mean_vec(usage_local, n_exp) if n_exp > 0 else None
         if usage is not None and len(usage) > 0:
             min_share = float(min(usage))
             min_share_thresh = 0.6 / float(n_exp)
@@ -2677,7 +2752,7 @@ def main() -> None:
             cv = (var ** 0.5) / max(m, 1e-8)
             if cv > 0.20:
                 _failures.append(f"{prefix}_balance_cv={cv:.4f} > 0.20 (routing imbalance)")
-        ortho = _ddp_mean_scalar(getattr(ortho_host, "_out_ortho_cos_sim", None))
+        ortho = _ddp_mean_scalar(ortho_getter())
         if ortho is not None and ortho > 0.20:
             _failures.append(
                 f"{prefix}_ortho={ortho:.4f} > 0.20 (max-mean |cos| — experts not diverse)"
