@@ -153,7 +153,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.72  # locked: Phase 1 concluded WD=0.72 optimal (WD=1.44 too high, WD=0.36 too low for β=0.20)
+    weight_decay = 1.08  # iter 21-retry: 1.5× from 0.72 to counter routing_imbalance + mos_head_collapse (retry_hint)
     tied_embed_init_std = 0.005
 
     # Routing
@@ -185,8 +185,8 @@ class Hyperparameters:
     deq_backward = "revdeq"
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 16
-    deq_k_step = 4  # K in {4, 8, 12, 16} — wider jitter forces model to optimize FP quality at all K
+    deq_k_max = 20  # iter 21-retry: 16→20 to widen jitter against fp_quality_loss at k128 (retry_hint)
+    deq_k_step = 4  # K in {4, 8, 12, 16, 20} — wider jitter forces model to optimize FP quality at all K
     deq_k_eval = 16  # eval at max training K
 
     # Architecture knobs
