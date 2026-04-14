@@ -4,6 +4,7 @@ Measures actual per-step compute delta on the current hardware.
 If unroll is significantly faster AND VRAM fits, switch the default for training.
 """
 import sys, time
+from pathlib import Path
 sys.path.insert(0, ".")
 import numpy as np
 import torch
@@ -12,10 +13,11 @@ from train_gpt import GPT, Hyperparameters, router_diagnostics
 
 
 def _load_data(vocab_size=1024, total=65536):
-    raw = np.fromfile(
-        "./data/datasets/fineweb10B_sp1024/fineweb_train_000000.bin",
-        dtype=np.int16, count=total,
-    )
+    # Read data path from Hyperparameters so this benchmark works across environments.
+    from train_gpt import Hyperparameters
+    data_path = getattr(Hyperparameters(), "data_path", "./data/datasets/fineweb10B_sp1024/")
+    shard = Path(data_path) / "fineweb_train_000000.bin"
+    raw = np.fromfile(str(shard), dtype=np.int16, count=total)
     return torch.from_numpy(raw.astype(np.int64)).clamp(0, vocab_size - 1).cuda()
 
 

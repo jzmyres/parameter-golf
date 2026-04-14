@@ -90,19 +90,35 @@ fi
 # --- Step 3: Promote current → baseline (if --promote) ---
 if [ "$PROMOTE" = true ]; then
     # Refuse to promote if the run was flagged INVALID by post-int6 assertions.
-    # The train script writes retry_hint.json and sets run_valid=false in meta.json
-    # when any hard assertion fails.  Agent must apply the prescribed fix and rerun.
+    # Fail CLOSED: require both run_valid=True AND status=="validated" in meta.json.
+    # Any of {missing meta.json, JSON parse error, missing keys, False, "other"}
+    # refuses promotion.  The old fail-open default silently promoted half-finished
+    # runs whose meta.json was truncated.
     CURRENT_META="$WEIGHTS_DIR/current/meta.json"
-    if [ -f "$CURRENT_META" ]; then
-        run_valid=$(python3 -c "import json; d=json.load(open('$CURRENT_META')); print(d.get('run_valid', True))" 2>/dev/null || echo "True")
-        if [ "$run_valid" = "False" ]; then
-            echo "✗ REFUSING TO PROMOTE — run is INVALID (post-int6 assertions failed)."
-            if [ -f "$WEIGHTS_DIR/current/retry_hint.json" ]; then
-                echo "  See experiments/weights/current/retry_hint.json for prescribed fix."
-                python3 -c "import json; d=json.load(open('$WEIGHTS_DIR/current/retry_hint.json')); print('  suggested_config:', d.get('suggested_config', {}))"
-            fi
-            exit 2
+    if [ ! -f "$CURRENT_META" ]; then
+        echo "✗ REFUSING TO PROMOTE — no meta.json at $CURRENT_META"
+        exit 2
+    fi
+    run_valid=$(python3 - <<PY 2>/dev/null || echo "INVALID"
+import json, sys
+try:
+    d = json.load(open("$CURRENT_META"))
+    # Both flags must match the final-success path exactly (strict).
+    if d.get("run_valid") is True and d.get("status") == "validated":
+        print("VALID")
+    else:
+        print("INVALID")
+except Exception:
+    print("INVALID")
+PY
+)
+    if [ "$run_valid" != "VALID" ]; then
+        echo "✗ REFUSING TO PROMOTE — run is INVALID (post-int6 assertions failed or meta.json malformed)."
+        if [ -f "$WEIGHTS_DIR/current/retry_hint.json" ]; then
+            echo "  See experiments/weights/current/retry_hint.json for prescribed fix."
+            python3 -c "import json; d=json.load(open('$WEIGHTS_DIR/current/retry_hint.json')); print('  suggested_config:', d.get('suggested_config', {}))" 2>/dev/null || true
         fi
+        exit 2
     fi
     # Backup existing baseline before overwriting.
     if [ -f "$LOGDIR/baseline.log" ]; then
@@ -132,8 +148,13 @@ cd "$PROJECT_ROOT"
 # Prefer a Python with matplotlib available for plotting.
 PLOT_PYTHON=(python)
 if ! python -c "import matplotlib" >/dev/null 2>&1; then
-    if command -v conda >/dev/null 2>&1 && conda env list 2>/dev/null | awk '{print $1}' | grep -qx "deq"; then
-        PLOT_PYTHON=(conda run -n deq python)
+    if command -v conda >/dev/null 2>&1; then
+        if conda env list 2>/dev/null | awk '{print $1}' | grep -qx "opg"; then
+            PLOT_PYTHON=(conda run -n opg python)
+        elif conda env list 2>/dev/null | awk '{print $1}' | grep -qx "deq"; then
+            # Legacy fallback for older environments.
+            PLOT_PYTHON=(conda run -n deq python)
+        fi
     fi
 fi
 

@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-import copy
 import glob
 import io
 import argparse
+import json
 import math
 import os
 import random
@@ -23,6 +23,7 @@ import sys
 import time
 import uuid
 import zlib
+from collections import Counter
 from pathlib import Path
 
 try:
@@ -44,6 +45,20 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # ---------------------------------------------------------------------------
 _ROUTER_DIAGNOSTICS_ACTIVE = False
 _ROUTER_DIAGNOSTICS_STEP: int | None = None
+_DEQ_SOLVE_ACTIVE = False
+
+
+def _unwrap_compiled_module(m: nn.Module) -> nn.Module:
+    """Return the original module when `m` is a `torch.compile` wrapper.
+
+    `torch.compile(nn.Module)` returns a wrapper (e.g., OptimizedModule) whose
+    `forward` dispatches into the original module. Attribute *writes* against
+    the wrapper do not reliably affect the original module, so any code that
+    toggles module-local flags (gate/diagnostics tracking) should write to the
+    unwrapped module.
+    """
+    orig = getattr(m, "_orig_mod", None)
+    return orig if isinstance(orig, nn.Module) else m
 
 
 def dynamo_disable(fn):
@@ -232,7 +247,9 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "tie-attn-mlp-router", "swa-enabled", "ema-enabled",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
-    p.add_argument("--deq-backward", type=str, default=None, choices=["autograd", "revdeq"])
+    # Backward compat: "unroll" is the established name in experiments/docs.
+    # "autograd" is accepted as an alias for the same mode.
+    p.add_argument("--deq-backward", type=str, default=None, choices=["unroll", "autograd", "revdeq"])
     p.add_argument("--router-bias-lr", type=float, default=None)
     p.add_argument("--router-bias-clip", type=float, default=None)
     ns, unknown = p.parse_known_args(argv)
@@ -467,9 +484,17 @@ def run_validation(args, model, rank, world_size, device, grad_accum_steps,
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 _ = model(x, y)
-            batch_loss = torch.tensor(base_m._ntp_loss, device=device)
+            loss_t = getattr(base_m, "_ntp_loss_t", None)
+            if isinstance(loss_t, torch.Tensor):
+                batch_loss = loss_t.detach().to(device=device, dtype=torch.float64)
+            else:
+                batch_loss = torch.tensor(
+                    float(getattr(base_m, "_ntp_loss", 0.0)),
+                    device=device,
+                    dtype=torch.float64,
+                )
             batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_loss_sum += batch_loss * batch_token_count
             val_token_count += batch_token_count
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
@@ -693,12 +718,21 @@ def _rms_norm(x: Tensor, eps: float = 1e-6) -> Tensor:
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, *, affine: bool = True):
         super().__init__()
+        self.dim = int(dim)
         self.eps = eps
+        if affine:
+            self.weight = nn.Parameter(torch.ones(self.dim, dtype=torch.float32))
+        else:
+            self.register_parameter("weight", None)
 
     def forward(self, x: Tensor) -> Tensor:
-        return _rms_norm(x, self.eps)
+        y = _rms_norm(x, self.eps)
+        w = getattr(self, "weight", None)
+        if isinstance(w, torch.Tensor):
+            return y * w.to(dtype=y.dtype)
+        return y
 
 
 class CastedLinear(nn.Linear):
@@ -836,7 +870,9 @@ class SoftDenseRouter(nn.Module):
         self.cv_target = float(cv_target)
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
-        self.health_scale = 1.0
+        # Tensor buffer to avoid Python-float guards inside torch.compile graphs.
+        # Kept behind a property so legacy code/tests can assign `health_scale = 5.0`.
+        self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
         self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32), persistent=True)
@@ -863,6 +899,18 @@ class SoftDenseRouter(nn.Module):
         self._expert_balance_cv_gpu: Tensor | None = None
         self._diag_step: int | None = None
 
+    @property
+    def health_scale(self) -> float:
+        try:
+            return float(self._health_scale.detach().float().item())
+        except Exception:
+            return 1.0
+
+    @health_scale.setter
+    def health_scale(self, value: float) -> None:
+        with torch.no_grad():
+            self._health_scale.fill_(float(value))
+
     @torch.no_grad()
     def bias_update(self, *, lr: float, clip: float, distributed: bool) -> None:
         ms = self._mean_share_last
@@ -884,15 +932,15 @@ class SoftDenseRouter(nn.Module):
         if clip > 0:
             self.expert_bias.clamp_(min=-clip, max=clip)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x_n = _rms_norm(x)
+    def forward(self, x: Tensor, *, pre_normed: bool = False) -> Tensor:
+        x_n = x if bool(pre_normed) else _rms_norm(x)
         route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
         # Gate in logit space: softmax(a + log_sigmoid(b)) is mathematically
         # identical to softmax(a)*sigmoid(b)/renorm, but stays "pure softmax"
         # and avoids explicit renormalization.
         gate_logits = F.logsigmoid(self.router_gate(x_n))
         p = torch.softmax(route_logits + gate_logits, dim=-1)
-        if _should_diag(self.training):
+        if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._router_gate_last_mean = float(gate_logits.detach().exp().float().mean().item())
         if self.training:
             reduce_dims = tuple(range(p.ndim - 1))
@@ -903,13 +951,21 @@ class SoftDenseRouter(nn.Module):
             min_share_loss = torch.relu(mean_share.new_tensor(lb) - mean_share).pow(2).mean() if lb > 0.0 else mean_share.new_zeros(())
             cv = mean_share.std() / mean_share.mean().clamp_min(1e-8)
             cv_loss = torch.relu(cv - mean_share.new_tensor(self.cv_target)).pow(2) if self.cv_target > 0.0 else mean_share.new_zeros(())
-            hs = float(self.health_scale)
+            hs = self._health_scale.to(dtype=min_share_loss.dtype)
             self._balance_loss = mse
-            self._health_loss = float(self.min_share_loss_weight) * hs * min_share_loss + float(self.cv_loss_weight) * hs * cv_loss
+            self._health_loss = (
+                float(self.min_share_loss_weight) * hs * min_share_loss
+                + float(self.cv_loss_weight) * hs * cv_loss
+            )
             self._mean_share_last = mean_share.detach()
             with torch.no_grad():
                 if _should_diag(self.training):
                     self._record_diagnostics(p.detach(), reduce_dims)
+                    # Backward compatibility: standalone-router tests expect
+                    # list-form diagnostics immediately when diagnostics are on.
+                    # Avoid materializing inside DEQ solves (would sync K×).
+                    if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and not bool(_DEQ_SOLVE_ACTIVE):
+                        self._materialize_diag_lists()
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._health_loss = torch.tensor(0.0, device=x.device)
@@ -917,6 +973,8 @@ class SoftDenseRouter(nn.Module):
             with torch.no_grad():
                 if _should_diag(self.training):
                     self._record_diagnostics(p.detach(), tuple(range(p.ndim - 1)))
+                    if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and not bool(_DEQ_SOLVE_ACTIVE):
+                        self._materialize_diag_lists()
                 else:
                     self._expert_usage = None
                     self._expert_entropy = None
@@ -941,8 +999,8 @@ class SoftDenseRouter(nn.Module):
         self._expert_balance_cv_gpu = (
             mean_mass.std() / mean_mass.mean().clamp_min(1e-8)
         ).detach()
-        is_master = (not dist.is_available() or not dist.is_initialized()
-                     or dist.get_rank() == 0)
+        distributed = dist.is_available() and dist.is_initialized()
+        is_master = (not distributed) or dist.get_rank() == 0
         if is_master:
             per_token_ent = -(share * (share + 1e-8).log()).sum(-1)
             self._expert_entropy_gpu = per_token_ent.mean().detach()
@@ -955,6 +1013,10 @@ class SoftDenseRouter(nn.Module):
         self._expert_sparsity = None
         self._expert_balance_cv = None
         self._diag_step = _ROUTER_DIAGNOSTICS_STEP
+
+        # Do not materialize list-form diagnostics here: this function can be
+        # called 2*K times per DEQ solve. Materialization happens either at
+        # log sites (format_expert_info) or at the end of the DEQ solve.
 
     @dynamo_disable
     def _materialize_diag_lists(self) -> None:
@@ -1004,7 +1066,10 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
         self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
         self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
-        self.expert_out = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        # Layout (E, D, R) matches repo tests/experiments. Computation uses
+        # a transpose view to (E, R, D) so we can do batched GEMMs without
+        # materializing a permuted copy each forward.
+        self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_proj.data[e])
             nn.init.xavier_uniform_(self.expert_out.data[e])
@@ -1055,7 +1120,7 @@ class CausalSelfAttention(nn.Module):
 
         attn_gate_act = torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
         y = y * attn_gate_act
-        if _should_diag(self.training):
+        if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._attn_gate_last_mean = float(attn_gate_act.detach().float().mean().item())
         return y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
@@ -1066,15 +1131,17 @@ class CausalSelfAttention(nn.Module):
         y_flat = y.reshape(N, D)
         w_flat = w.reshape(N, E).to(dtype=y_flat.dtype)
         P = self.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, D)
-        O = self.expert_out.to(dtype=y_flat.dtype).reshape(E * R, D)
         h = y_flat @ P.t()
-        h = (h.view(N, E, R) * w_flat.unsqueeze(-1)).view(N, E * R)
-        out = h @ O
+        h = h.view(N, E, R) * w_flat.unsqueeze(-1)
+        # (E, D, R) -> (E, R, D) view (no copy); compute E independent GEMMs.
+        O_T = self.expert_out.to(dtype=y_flat.dtype).transpose(1, 2)
+        out_e = torch.bmm(h.transpose(0, 1), O_T)  # (E, N, D)
+        out = out_e.sum(dim=0)  # (N, D)
 
-        if _should_diag(self.training):
+        if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
                 mu_h = h.reshape(B * T, E, R).mean(dim=0).to(dtype=torch.float32)
-                out_T = self.expert_out.to(dtype=mu_h.dtype)
+                out_T = self.expert_out.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
                 mu_out = torch.einsum("er,erd->ed", mu_h, out_T)
                 # Max-mean |cos| — stricter than mean-|cos|: flags the WORST
                 # expert's mean similarity to the others.  Required for the
@@ -1116,7 +1183,9 @@ class MLP(nn.Module):
         self.expert_rank = expert_rank if expert_rank > 0 else max(hidden // max(num_experts, 1), 1)
         self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
-        self.expert_down = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        # Layout (E, D, R) matches repo tests/experiments; computation uses
+        # a transpose view to (E, R, D) for batched GEMMs.
+        self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_gate.data[e])
             nn.init.xavier_uniform_(self.expert_fc.data[e])
@@ -1125,26 +1194,28 @@ class MLP(nn.Module):
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
 
-    def mix_experts(self, x: Tensor, w: Tensor) -> Tensor:
+    def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False) -> Tensor:
         B, T, D = x.shape
         E, R = self.num_experts, self.expert_rank
-        x_n = _rms_norm(x)
+        x_n = x if bool(pre_normed) else _rms_norm(x)
         N = B * T
         x_flat = x_n.reshape(N, D)
         w_flat = w.reshape(N, E).to(dtype=x_flat.dtype)
         G = self.expert_gate.to(dtype=x_flat.dtype).reshape(E * R, D)
         Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)
-        Dwn = self.expert_down.to(dtype=x_flat.dtype).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
         h = F.leaky_relu(gate, negative_slope=0.5).square() * fc
-        h = (h.view(N, E, R) * w_flat.unsqueeze(-1)).view(N, E * R)
-        out = h @ Dwn
+        h = h.view(N, E, R) * w_flat.unsqueeze(-1)
+        Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
+        out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
+        out = out_e.sum(dim=0)  # (N, D)
 
-        if _should_diag(self.training):
+        if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
                 mu_h = h.reshape(N, E, R).mean(dim=0).to(dtype=torch.float32)
-                mu_out = torch.einsum("er,erd->ed", mu_h, self.expert_down.to(dtype=mu_h.dtype))
+                down_T = self.expert_down.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
+                mu_out = torch.einsum("er,erd->ed", mu_h, down_T)
                 # Max-mean |cos| (worst expert's mean similarity to others).
                 self._out_ortho_cos_sim = float(max_mean_abs_offdiag_cosine(mu_out).item())
 
@@ -1208,6 +1279,11 @@ class MoSHead(nn.Module):
         self._diag_step: int | None = None
         self._ctp_ortho_out: Tensor | None = None
         self._ntp_ortho_out: Tensor | None = None
+        # GPU-resident diagnostics for DDP-safe reductions (avoid per-forward CPU sync).
+        self._ctp_expert_usage_gpu: Tensor | None = None
+        self._ntp_expert_usage_gpu: Tensor | None = None
+        self._ctp_expert_balance_cv_gpu: Tensor | None = None
+        self._ntp_expert_balance_cv_gpu: Tensor | None = None
         self._init_params()
 
     def _init_params(self):
@@ -1269,6 +1345,9 @@ class MoSHead(nn.Module):
         log_p_n, alpha_n, ortho_ntp = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
         self._ctp_ortho_out = ortho_ctp
         self._ntp_ortho_out = ortho_ntp
+        distributed = dist.is_available() and dist.is_initialized()
+        is_master = (not distributed) or dist.get_rank() == 0
+
         if self.training:
             bal = torch.tensor(0.0, device=x.device)
             for alpha_soft in [alpha_d, alpha_n]:
@@ -1276,42 +1355,45 @@ class MoSHead(nn.Module):
                 target = torch.ones_like(mean_a) / alpha_soft.shape[-1]
                 bal = bal + F.mse_loss(mean_a, target)
             self._balance_loss = bal
-            with torch.no_grad():
-                if _should_diag(self.training):
-                    for alpha_soft, ua, ea, ca in [
-                        (alpha_d, '_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
-                        (alpha_n, '_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
-                    ]:
-                        a = alpha_soft.detach()
-                        mean_a = a.mean(dim=0)
-                        setattr(self, ua, mean_a.float().cpu().tolist())
-                        per_token_ent = -(a * (a + 1e-8).log()).sum(-1)
-                        setattr(self, ea, per_token_ent.mean().item())
-                        setattr(self, ca, (mean_a.std() / mean_a.mean().clamp_min(1e-8)).item())
-                    self._diag_step = _ROUTER_DIAGNOSTICS_STEP
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
-            with torch.no_grad():
-                if _should_diag(self.training):
-                    for alpha_soft, ua, ea, ca in [
-                        (alpha_d, '_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
-                        (alpha_n, '_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
-                    ]:
-                        mean_a = alpha_soft.mean(dim=0)
-                        setattr(self, ua, mean_a.float().cpu().tolist())
-                        per_token_ent = -(alpha_soft * (alpha_soft + 1e-8).log()).sum(-1)
-                        setattr(self, ea, per_token_ent.mean().item())
-                        setattr(self, ca, (mean_a.std() / mean_a.mean()).item())
-                    self._diag_step = _ROUTER_DIAGNOSTICS_STEP
-                else:
-                    for ua, ea, ca in [
-                        ('_ctp_expert_usage', '_ctp_expert_entropy', '_ctp_expert_balance_cv'),
-                        ('_ntp_expert_usage', '_ntp_expert_entropy', '_ntp_expert_balance_cv'),
-                    ]:
-                        setattr(self, ua, None)
-                        setattr(self, ea, None)
-                        setattr(self, ca, None)
-                    self._diag_step = None
+
+        # Diagnostics: store GPU-resident mean expert shares (+ CV) so post-int6
+        # health checks can all-reduce without forcing a per-forward CPU sync.
+        # Only materialize Python lists on master when diagnostics are explicitly
+        # enabled (router_diagnostics), keeping eval fast by default.
+        with torch.no_grad():
+            if _should_diag(self.training):
+                a_d = alpha_d.detach()
+                a_n = alpha_n.detach()
+                mean_d = a_d.mean(dim=0).float().detach()
+                mean_n = a_n.mean(dim=0).float().detach()
+                self._ctp_expert_usage_gpu = mean_d
+                self._ntp_expert_usage_gpu = mean_n
+                self._ctp_expert_balance_cv_gpu = (mean_d.std() / mean_d.mean().clamp_min(1e-8)).detach()
+                self._ntp_expert_balance_cv_gpu = (mean_n.std() / mean_n.mean().clamp_min(1e-8)).detach()
+                self._diag_step = _ROUTER_DIAGNOSTICS_STEP
+                # Default: no Python-native diagnostics (avoid CPU sync).
+                self._ctp_expert_usage = None
+                self._ntp_expert_usage = None
+                self._ctp_expert_balance_cv = None
+                self._ntp_expert_balance_cv = None
+                if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and is_master:
+                    # Backward-compat: retain list-form usage on master when explicitly enabled.
+                    self._ctp_expert_usage = mean_d.cpu().tolist()
+                    self._ntp_expert_usage = mean_n.cpu().tolist()
+                    self._ctp_expert_balance_cv = float(self._ctp_expert_balance_cv_gpu.float().item())
+                    self._ntp_expert_balance_cv = float(self._ntp_expert_balance_cv_gpu.float().item())
+            else:
+                self._ctp_expert_usage_gpu = None
+                self._ntp_expert_usage_gpu = None
+                self._ctp_expert_balance_cv_gpu = None
+                self._ntp_expert_balance_cv_gpu = None
+                self._ctp_expert_usage = None
+                self._ntp_expert_usage = None
+                self._ctp_expert_balance_cv = None
+                self._ntp_expert_balance_cv = None
+                self._diag_step = None
         return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
 
 
@@ -1327,9 +1409,9 @@ class Block(nn.Module):
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  tie_attn_mlp_router: bool = False, num_experts: int = 8):
         super().__init__()
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
-        self.post_norm = RMSNorm()  # iter 19: normalize output before next DEQ iteration
+        self.attn_norm = RMSNorm(dim)
+        self.mlp_norm = RMSNorm(dim)
+        self.post_norm = RMSNorm(dim)  # iter 19: normalize output before next DEQ iteration
         if bool(tie_attn_mlp_router):
             shared = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0)
             self.attn_router = shared
@@ -1386,7 +1468,7 @@ class Block(nn.Module):
         # the block (inj, gg, attn, router) is input-dependent AND token-local.
         z_n = _rms_norm(z_in)
         g = torch.sigmoid(self.inj_gate(z_n))  # [B, T, 1]
-        if _should_diag(self.training):
+        if _should_diag(self.training) and (self._gg_track_enabled or self._gg_call_track_enabled):
             # Log the scalar mean across (batch, seq) for plotting — this is
             # just a reduction of the token-local gates, NOT the gate itself.
             g_val = float(g.detach().float().mean().item())
@@ -1414,15 +1496,15 @@ class Block(nn.Module):
         x = z_sub + g_inj * x0_sub  # additive injection (matches forward)
 
         x_attn = self.attn_norm(x)
-        x_attn_n = _rms_norm(x_attn)
-        w_attn = self.attn_router(x_attn)
-        y_shared = self.attn._attn_shared_from_normed(x_attn_n)
+        w_attn = self.attn_router(x_attn, pre_normed=True)
+        y_shared = self.attn._attn_shared_from_normed(x_attn)
         E, R = self.attn.num_experts, self.attn.expert_rank
         y_flat = y_shared.reshape(bsz * t, dim)
         P = self.attn.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, dim)
         h = y_flat @ P.t()
         mu_h = h.reshape(bsz * t, E, R).mean(dim=0).to(dtype=torch.float32)
-        mu_attn = torch.einsum("er,erd->ed", mu_h, self.attn.expert_out.to(dtype=mu_h.dtype))
+        out_T = self.attn.expert_out.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
+        mu_attn = torch.einsum("er,erd->ed", mu_h, out_T)
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
@@ -1430,10 +1512,9 @@ class Block(nn.Module):
         # MLP reads x, not x + attn_mix.  Ortho diagnostic stays aligned with
         # the z2 = attn + mlp form in forward().
         x_mlp = self.mlp_norm(x)
-        w_mlp = self.mlp_router(x_mlp)
-        x_mlp_n = _rms_norm(x_mlp)
+        w_mlp = self.mlp_router(x_mlp, pre_normed=True)
         N = bsz * t
-        x_flat = x_mlp_n.reshape(N, dim)
+        x_flat = x_mlp.reshape(N, dim)
         E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
         G = self.mlp.expert_gate.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
         Fm = self.mlp.expert_fc.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
@@ -1441,7 +1522,8 @@ class Block(nn.Module):
         fc = x_flat @ Fm.t()
         h_mlp = F.leaky_relu(gate, negative_slope=0.5).square() * fc
         mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)
-        mu_mlp = torch.einsum("er,erd->ed", mu_h2, self.mlp.expert_down.to(dtype=mu_h2.dtype))
+        down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).transpose(1, 2)  # (E, R, D)
+        mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
         mlp_ortho = mean_abs_offdiag_cosine(mu_mlp)
 
         return attn_ortho, mlp_ortho
@@ -1469,22 +1551,21 @@ class Block(nn.Module):
         # weight as training progresses, without the ~2x update-magnitude
         # blow-up that broke attempts 1 and 2.
         x_attn = self.attn_norm(x)
-        x_attn_n = _rms_norm(x_attn)
-        w_attn = self.attn_router(x_attn)
+        w_attn = self.attn_router(x_attn, pre_normed=True)
         # Capture attn router gate BEFORE mlp_router call overwrites it (tied router)
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
             attn_rg = getattr(self.attn_router, "_router_gate_last_mean", None)
-        y_shared = self.attn._attn_shared_from_normed(x_attn_n)
+        y_shared = self.attn._attn_shared_from_normed(x_attn)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
 
         x_mlp = self.mlp_norm(x)
-        w_mlp = self.mlp_router(x_mlp)
-        mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp)
+        w_mlp = self.mlp_router(x_mlp, pre_normed=True)
+        mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True)
 
         z2 = attn_mix + mlp_mix
 
-        gg_tok = torch.sigmoid(self.gg_gate(x_attn_n)).squeeze(-1)
+        gg_tok = torch.sigmoid(self.gg_gate(x_attn)).squeeze(-1)
         if _tracking:
             self._record_gg_diag(gg_tok.detach())
             # Capture attn gate for per-iteration tracking
@@ -1498,9 +1579,13 @@ class Block(nn.Module):
             if mlp_rg is not None:
                 self._mlp_router_gate_call_track.append(mlp_rg)
             # Combined router gate (average of attn+mlp for backward compat)
-            rg = getattr(self.attn_router, "_router_gate_last_mean", None)
-            if rg is not None:
-                self._router_gate_call_track.append(rg)
+            rg_vals = []
+            if attn_rg is not None:
+                rg_vals.append(float(attn_rg))
+            if mlp_rg is not None:
+                rg_vals.append(float(mlp_rg))
+            if rg_vals:
+                self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
         raw_out = (1.0 - gg_tok).to(dtype=z_in.dtype).unsqueeze(-1) * z_in + gg_tok.to(dtype=z_in.dtype).unsqueeze(-1) * z2
         return self.post_norm(raw_out)  # iter 19: bound hidden state magnitude across DEQ iterations
 
@@ -1558,10 +1643,15 @@ class RevDEQFunction(torch.autograd.Function):
                 z_state = z_acc.to(state_dtype)
 
             if out_y is not None:
-                try:
-                    setattr(f_theta, "_deq_residual_proxy", float((z_state - out_y.to(state_dtype)).norm().item()))
-                except Exception:
-                    pass
+                if bool(ctx.do_recon_diag):
+                    try:
+                        setattr(
+                            f_theta,
+                            "_deq_residual_proxy_t",
+                            (z_state - out_y.to(state_dtype)).norm().detach(),
+                        )
+                    except Exception:
+                        pass
 
         ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(), z_prev_state.detach())
         ctx.z_init_state = z_init_state
@@ -1678,7 +1768,7 @@ class GPT(nn.Module):
                  attn_ortho_out_coef: float = 0.0, mlp_ortho_out_coef: float = 0.0,
                  deq_backward: str = "revdeq", block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
-                 tie_attn_mlp_router: bool = True):
+                 tie_attn_mlp_router: bool = False):  # iter 21: untied is the locked default
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
@@ -1706,7 +1796,7 @@ class GPT(nn.Module):
         self._block_ortho_aux_enabled = False
         self._block_ortho_aux_loss: Tensor | None = None
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
-        self.final_norm = RMSNorm()
+        self.final_norm = RMSNorm(model_dim)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1766,24 +1856,28 @@ class GPT(nn.Module):
         return soft_embed
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
+        global _DEQ_SOLVE_ACTIVE
         beta = self.deq_beta
         dtype = x0.dtype
         K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
-        track_gg = _should_diag(self.training)
-        self.shared_block._gg_sum = 0.0
-        self.shared_block._gg_count = 0
-        self.shared_block._gg_track_enabled = bool(track_gg)
-        self.shared_block._gg_call_track = []
-        self.shared_block._gg_call_track_enabled = bool(track_gg)
-        self.shared_block._inj_call_track = []
-        self.shared_block._attn_gate_call_track = []
-        self.shared_block._router_gate_call_track = []
-        self.shared_block._attn_router_gate_call_track = []
-        self.shared_block._mlp_router_gate_call_track = []
+        track_gg = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+        sb = _unwrap_compiled_module(self.shared_block)
+        sb._gg_sum = 0.0
+        sb._gg_count = 0
+        sb._gg_track_enabled = bool(track_gg)
+        sb._gg_call_track = []
+        sb._gg_call_track_enabled = bool(track_gg)
+        sb._inj_call_track = []
+        sb._attn_gate_call_track = []
+        sb._router_gate_call_track = []
+        sb._attn_router_gate_call_track = []
+        sb._mlp_router_gate_call_track = []
+        prev_deq_flag = bool(_DEQ_SOLVE_ACTIVE)
+        _DEQ_SOLVE_ACTIVE = True
         try:
             f_theta = self.shared_block
             if self.training and self.deq_backward == "revdeq":
-                params = tuple(p for p in self.shared_block.parameters() if p.requires_grad)
+                params = tuple(p for p in sb.parameters() if p.requires_grad)
                 z, z_prev = RevDEQFunction.apply(f_theta, x0, z_init, beta, K, *params)
                 return z, z_prev, None, None
 
@@ -1804,46 +1898,62 @@ class GPT(nn.Module):
                 z = z_acc.to(dtype)
             return z, z_prev, y_acc, z_acc
         finally:
-            self.shared_block._gg_track_enabled = False
-            self.shared_block._gg_call_track_enabled = False
-            if self.shared_block._gg_count > 0:
-                self._gg_mean_last_solve = float(self.shared_block._gg_sum / self.shared_block._gg_count)
+            _DEQ_SOLVE_ACTIVE = prev_deq_flag
+            sb._gg_track_enabled = False
+            sb._gg_call_track_enabled = False
+            if sb._gg_count > 0:
+                self._gg_mean_last_solve = float(sb._gg_sum / sb._gg_count)
             else:
                 self._gg_mean_last_solve = None
-            calls = list(getattr(self.shared_block, "_gg_call_track", []) or [])
+            calls = list(getattr(sb, "_gg_call_track", []) or [])
             if len(calls) == 2 * K:
                 self._gg_iter_last_solve = [0.5 * (calls[2*i] + calls[2*i+1]) for i in range(K)]
             else:
                 self._gg_iter_last_solve = []
             # Aggregate inj_gate per-iteration (each iter has 2 calls: y-step + z-step)
-            inj_calls = list(getattr(self.shared_block, "_inj_call_track", []) or [])
+            inj_calls = list(getattr(sb, "_inj_call_track", []) or [])
             if len(inj_calls) == 2 * K:
                 self._inj_iter_last_solve = [0.5 * (inj_calls[2*i] + inj_calls[2*i+1]) for i in range(K)]
             else:
                 self._inj_iter_last_solve = []
             # Aggregate attn_gate per-iteration (1 call per block forward, 2 per iter)
-            ag_calls = list(getattr(self.shared_block, "_attn_gate_call_track", []) or [])
+            ag_calls = list(getattr(sb, "_attn_gate_call_track", []) or [])
             if len(ag_calls) == 2 * K:
                 self._attn_gate_iter_last_solve = [0.5 * (ag_calls[2*i] + ag_calls[2*i+1]) for i in range(K)]
             else:
                 self._attn_gate_iter_last_solve = []
             # Aggregate router_gate per-iteration (combined, backward compat)
-            rg_calls = list(getattr(self.shared_block, "_router_gate_call_track", []) or [])
+            rg_calls = list(getattr(sb, "_router_gate_call_track", []) or [])
             if len(rg_calls) == 2 * K:
                 self._router_gate_iter_last_solve = [0.5 * (rg_calls[2*i] + rg_calls[2*i+1]) for i in range(K)]
             else:
                 self._router_gate_iter_last_solve = []
             # Per-component router gates (attn vs FFN)
-            attn_rg_calls = list(getattr(self.shared_block, "_attn_router_gate_call_track", []) or [])
+            attn_rg_calls = list(getattr(sb, "_attn_router_gate_call_track", []) or [])
             if len(attn_rg_calls) == 2 * K:
                 self._attn_router_gate_iter_last_solve = [0.5 * (attn_rg_calls[2*i] + attn_rg_calls[2*i+1]) for i in range(K)]
             else:
                 self._attn_router_gate_iter_last_solve = []
-            mlp_rg_calls = list(getattr(self.shared_block, "_mlp_router_gate_call_track", []) or [])
+            mlp_rg_calls = list(getattr(sb, "_mlp_router_gate_call_track", []) or [])
             if len(mlp_rg_calls) == 2 * K:
                 self._mlp_router_gate_iter_last_solve = [0.5 * (mlp_rg_calls[2*i] + mlp_rg_calls[2*i+1]) for i in range(K)]
             else:
                 self._mlp_router_gate_iter_last_solve = []
+
+            # Backward compat: after a DEQ solve with router_diagnostics enabled,
+            # materialize list-form router diagnostics exactly once (not per-iter).
+            if track_gg and bool(_ROUTER_DIAGNOSTICS_ACTIVE):
+                try:
+                    seen: set[int] = set()
+                    for r in [sb.attn.attn_router, sb.mlp.mlp_router]:
+                        rid = id(r)
+                        if rid in seen:
+                            continue
+                        seen.add(rid)
+                        if hasattr(r, "_materialize_diag_lists"):
+                            r._materialize_diag_lists()
+                except Exception:
+                    pass
 
     def _run_backbone(self, x: Tensor) -> Tensor:
         x0 = x
@@ -1871,19 +1981,58 @@ class GPT(nn.Module):
             self._deq_z_init_last = z.detach()
             z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        if self.training:
-            if z_prev is not None:
-                abs_conv = (z - z_prev).float().norm().item()
-                z_norm_diag = z.detach().float().norm().clamp_min(1.0).item()
-                self._deq_iter_convergence = abs_conv
-                self._deq_iter_convergence_rel = abs_conv / z_norm_diag
-                proxy = getattr(self.shared_block, "_deq_residual_proxy", None)
-                self._deq_residuals = [float(proxy)] if proxy is not None else [abs_conv]
-                if _should_diag(self.training):
-                    with torch.no_grad():
-                        f_z_final = self.shared_block(z, x0_refined)
-                        self._deq_residuals = [(z - f_z_final).float().norm().item()]
+        # DEQ diagnostics: keep tensor fields for low-overhead logging, but
+        # also maintain legacy float/list fields for existing experiments.
+        self._deq_residual_t = None
+        self._deq_iter_convergence_t = None
+        self._deq_iter_convergence_rel_t = None
 
+        abs_conv_t = None
+        if z_prev is not None:
+            abs_conv_t = (z - z_prev).float().norm().detach()
+            z_norm_t = z.detach().float().norm().clamp_min(1.0).detach()
+            self._deq_iter_convergence_t = abs_conv_t
+            self._deq_iter_convergence_rel_t = (abs_conv_t / z_norm_t).detach()
+
+        proxy_t = getattr(self.shared_block, "_deq_residual_proxy_t", None)
+        if isinstance(proxy_t, torch.Tensor):
+            self._deq_residual_t = proxy_t.detach()
+        elif isinstance(abs_conv_t, torch.Tensor):
+            self._deq_residual_t = abs_conv_t
+
+        # If diagnostics are enabled, compute the true residual ||z - f(z)||.
+        if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and z_prev is not None:
+            with torch.no_grad():
+                f_z_final = self.shared_block(z, x0_refined)
+                self._deq_residual_t = (z - f_z_final).float().norm().detach()
+
+        distributed = dist.is_available() and dist.is_initialized()
+        is_master = (not distributed) or dist.get_rank() == 0
+
+        # Legacy scalar convergence/residuals (used by experiments/*).
+        legacy_diag = (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+        # Avoid GPU→CPU sync in the hot training path by only materializing
+        # floats when diagnostics are enabled (or in eval mode).
+        self._deq_iter_convergence = 0.0 if is_master else None
+        self._deq_iter_convergence_rel = 0.0 if is_master else None
+        self._deq_residuals = [0.0] if is_master else []
+        if is_master and legacy_diag and isinstance(abs_conv_t, torch.Tensor):
+            try:
+                self._deq_iter_convergence = float(abs_conv_t.float().item())
+            except Exception:
+                self._deq_iter_convergence = 0.0
+        if is_master and legacy_diag and isinstance(self._deq_iter_convergence_rel_t, torch.Tensor):
+            try:
+                self._deq_iter_convergence_rel = float(self._deq_iter_convergence_rel_t.float().item())
+            except Exception:
+                self._deq_iter_convergence_rel = 0.0
+        if is_master and legacy_diag and isinstance(self._deq_residual_t, torch.Tensor):
+            try:
+                self._deq_residuals = [float(self._deq_residual_t.float().item())]
+            except Exception:
+                self._deq_residuals = [0.0]
+
+        if self.training:
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
                 max_tokens = int(getattr(self, "_block_ortho_aux_tokens_override", self.block_ortho_aux_tokens))
                 attn_o, mlp_o = self.shared_block.ortho_aux(z, x0_refined, max_tokens=max_tokens)
@@ -1896,21 +2045,6 @@ class GPT(nn.Module):
                 attn_b = F.relu(attn_o - thr).pow(2)
                 mlp_b = F.relu(mlp_o - thr).pow(2)
                 self._block_ortho_aux_loss = 0.5 * (attn_b + mlp_b)
-
-        if not self.training:
-            with torch.no_grad():
-                f_z_final = self.shared_block(z, x0_refined)
-                abs_conv = (z - z_prev).float().norm().item()
-                z_norm_diag = z.float().norm().clamp_min(1.0).item()
-                self._deq_residuals = [(z - f_z_final).float().norm().item()]
-                self._deq_iter_convergence = abs_conv
-                self._deq_iter_convergence_rel = abs_conv / z_norm_diag
-                try:
-                    attn_o, mlp_o = self.shared_block.ortho_aux(z, x0_refined, max_tokens=128)
-                    self.shared_block.attn._out_ortho_cos_sim = float(attn_o.float().item())
-                    self.shared_block.mlp._out_ortho_cos_sim = float(mlp_o.float().item())
-                except Exception:
-                    pass
 
         return z
 
@@ -1949,8 +2083,20 @@ class GPT(nn.Module):
         ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
         ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
         bal_loss, health_loss = self._collect_routing_losses(ntp_loss.device)
-        self._ntp_loss = ntp_loss.detach().item()
-        self._ctp_loss = ctp_loss.detach().item()
+        self._ntp_loss_t = ntp_loss.detach()
+        self._ctp_loss_t = ctp_loss.detach()
+        # Backward-compatible scalar fields used by experiments/*.
+        if (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE):
+            try:
+                self._ntp_loss = float(self._ntp_loss_t.float().item())
+                self._ctp_loss = float(self._ctp_loss_t.float().item())
+            except Exception:
+                self._ntp_loss = float(ntp_loss.detach().float().mean().item())
+                self._ctp_loss = float(ctp_loss.detach().float().mean().item())
+        else:
+            # Avoid per-forward sync in the training hot path.
+            self._ntp_loss = 0.0
+            self._ctp_loss = 0.0
         refine_alpha = float(getattr(self, "_refine_mix_alpha", 0.5))
         refine_strength = min(max(refine_alpha / 0.5, 0.0), 1.0)
         ctp_weight = 0.05 * self.num_refinements * refine_strength
@@ -2065,6 +2211,10 @@ def main() -> None:
     if not getattr(args, "run_id", ""):
         args.run_id = str(uuid.uuid4())
 
+    # Normalize backward-mode naming: "autograd" is an alias for "unroll".
+    if getattr(args, "deq_backward", None) == "autograd":
+        args.deq_backward = "unroll"
+
     if int(args.deq_k_min) <= 0:
         raise ValueError("deq_k_min must be positive")
     if int(args.deq_k_max) < int(args.deq_k_min):
@@ -2128,12 +2278,11 @@ def main() -> None:
                 if f.is_file():
                     f.unlink()
         current_dir.mkdir(parents=True, exist_ok=True)
-        import json as _json_init
         with open(current_dir / "meta.json", "w") as mf:
             # Write BOTH schema variants (step/steps, commit/git_commit) so the
             # log-rotation script's python3 json reads don't abort under set -e
             # regardless of which key it expects.
-            _json_init.dump(
+            json.dump(
                 {"val_bpb": 0.0, "artifact_bytes": 0,
                  "step": 0, "steps": 0,
                  "commit": "", "git_commit": "",
@@ -2242,11 +2391,14 @@ def main() -> None:
     # that supports it.  RevDEQ does (custom autograd.Function wraps the
     # compiled inner call as one op).  Unroll currently does NOT work with
     # compile+DDP (grad_fn tracking issues); resolving that is queued.
-    try:
-        base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
-        log0(f"compiled shared_block for throughput (dynamic=False, deq_backward={args.deq_backward})")
-    except Exception as e:
-        log0(f"shared_block compile failed ({e}), running eager")
+    if distributed and getattr(args, "deq_backward", "revdeq") == "unroll":
+        log0("skipping torch.compile(shared_block): deq_backward=unroll is incompatible with compile+DDP")
+    else:
+        try:
+            base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
+            log0(f"compiled shared_block for throughput (dynamic=False, deq_backward={args.deq_backward})")
+        except Exception as e:
+            log0(f"shared_block compile failed ({e}), running eager")
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
@@ -2282,8 +2434,9 @@ def main() -> None:
 
     optimizer_tok = torch.optim.AdamW(tok_params, betas=(args.beta1, args.beta2),
                                        eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
-    # expert_out and expert_down now stored natively as (E, R, D) — no transpose
-    # group needed.  All expert params have consistent (E, R, D) orientation.
+    # expert_out and expert_down use (E, D, R) (out-proj matrices D×R).
+    # Other expert banks use (E, R, D). Muon handles both via the last-2-dims
+    # NS preconditioner; no special transpose param group is needed.
     optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum,
                           backend_steps=args.muon_backend_steps, weight_decay=args.weight_decay)
     for group in optimizer_muon.param_groups:
@@ -2327,15 +2480,18 @@ def main() -> None:
         parts: list[str] = []
         if hasattr(m, "_deq_k_last"):
             parts.append(f"deq_k:{int(m._deq_k_last)}")
-        if hasattr(m, "_deq_residuals") and getattr(m, "_deq_residuals"):
-            parts.append(f"deq_residual:{m._deq_residuals[-1]:.6f}")
+        resid_t = getattr(m, "_deq_residual_t", None)
+        if isinstance(resid_t, torch.Tensor):
+            parts.append(f"deq_residual:{float(resid_t.detach().float().item()):.6f}")
         recon = getattr(m, "_deq_recon_error", None)
         if recon is not None:
             parts.append(f"deq_recon_err:{float(recon):.3e}")
-        if hasattr(m, "_deq_iter_convergence"):
-            parts.append(f"deq_iter_conv:{m._deq_iter_convergence:.6f}")
-        if hasattr(m, "_deq_iter_convergence_rel"):
-            parts.append(f"deq_iter_conv_rel:{m._deq_iter_convergence_rel:.6f}")
+        conv_t = getattr(m, "_deq_iter_convergence_t", None)
+        if isinstance(conv_t, torch.Tensor):
+            parts.append(f"deq_iter_conv:{float(conv_t.detach().float().item()):.6f}")
+        conv_rel_t = getattr(m, "_deq_iter_convergence_rel_t", None)
+        if isinstance(conv_rel_t, torch.Tensor):
+            parts.append(f"deq_iter_conv_rel:{float(conv_rel_t.detach().float().item()):.6f}")
         if hasattr(m, "shared_block") and getattr(m.shared_block, "_gg_last", None) is not None:
             parts.append(f"gg:{float(m.shared_block._gg_last):.4f}")
         gg_mean = getattr(m, "_gg_mean_last_solve", None)
@@ -2455,8 +2611,8 @@ def main() -> None:
         late_frac = min(max((time_frac - 0.70) / 0.30, 0.0), 1.0)
         health_scale = 1.0 + 4.0 * float(late_frac)
         try:
-            base_model.shared_block.attn_router.health_scale = health_scale
-            base_model.shared_block.mlp_router.health_scale = health_scale
+            base_model.shared_block.attn_router.health_scale = float(health_scale)
+            base_model.shared_block.mlp_router.health_scale = float(health_scale)
         except Exception:
             pass
 
@@ -2545,8 +2701,10 @@ def main() -> None:
                 swa_count += 1
 
         if will_log_train:
-            ntp = getattr(base_model, '_ntp_loss', 0.0)
-            ctp = getattr(base_model, '_ctp_loss', 0.0)
+            ntp_t = getattr(base_model, '_ntp_loss_t', None)
+            ctp_t = getattr(base_model, '_ctp_loss_t', None)
+            ntp = float(ntp_t.detach().float().item()) if isinstance(ntp_t, torch.Tensor) else 0.0
+            ctp = float(ctp_t.detach().float().item()) if isinstance(ctp_t, torch.Tensor) else 0.0
             base_model._deq_recon_error = getattr(base_model.shared_block, "_deq_recon_error_last_bwd", None)
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step, require_step_match=True) if master_process else ""
@@ -2656,7 +2814,6 @@ def main() -> None:
         with open(artifact_path, "wb") as f:
             f.write(compressed)
 
-        import json
         meta_path = weights_dir / "meta.json"
         with open(meta_path, "w") as f:
             # run_valid stays false until the post-int6 assertions pass AND
@@ -2757,12 +2914,12 @@ def main() -> None:
         gg_mean = getattr(base_m_for_roundtrip, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             diag_parts.append(f"gg_mean:{gg_mean:.4f}")
-        conv_rel = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel", None)
-        if conv_rel is not None:
-            diag_parts.append(f"iter_conv_rel:{conv_rel:.6f}")
-        residual_list = getattr(base_m_for_roundtrip, "_deq_residuals", None)
-        if residual_list and len(residual_list) > 0:
-            diag_parts.append(f"residual:{residual_list[-1]:.2f}")
+        conv_rel_t = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel_t", None)
+        if isinstance(conv_rel_t, torch.Tensor):
+            diag_parts.append(f"iter_conv_rel:{float(conv_rel_t.detach().float().item()):.6f}")
+        resid_t = getattr(base_m_for_roundtrip, "_deq_residual_t", None)
+        if isinstance(resid_t, torch.Tensor):
+            diag_parts.append(f"residual:{float(resid_t.detach().float().item()):.2f}")
         log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
     k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
     log0(f"k_sweep:done {k_parts}")
@@ -2795,14 +2952,15 @@ def main() -> None:
         return None if n == 0.0 else float(value.item()) / n
 
     def _ddp_mean_vec(v: list[float] | None, length: int) -> list[float] | None:
-        # Length-mismatch is a programmer error (rank-local diagnostic stored
-        # with wrong shape) — fail hard rather than silently zero-fill, which
-        # would turn a real bug into a false assertion pass/fail.
+        # Length-mismatch: coerce to absent and log (on master).  Raising here
+        # would deadlock DDP — if only some ranks have the wrong shape, they'd
+        # raise while peer ranks enter dist.all_reduce below and wait forever.
+        # Soft-degrade preserves liveness; a divergent diagnostic will still
+        # show up as an assertion failure (via the presence mask averaging).
         if v is not None and len(v) != length:
-            raise RuntimeError(
-                f"_ddp_mean_vec: length mismatch (got {len(v)}, expected {length}); "
-                f"diagnostic tensor is inconsistent with num_experts"
-            )
+            if master_process:
+                log0(f"[WARN] _ddp_mean_vec length mismatch: got {len(v)} expected {length} — treating as absent")
+            v = None
         if not distributed:
             return None if v is None else [float(x) for x in v]
         # Pad / zero-fill based on presence so ALL ranks call all_reduce with
@@ -2820,11 +2978,13 @@ def main() -> None:
 
     def _ddp_mean_tensor_vec(t: Tensor | None, length: int) -> list[float] | None:
         """Like _ddp_mean_vec but takes a GPU tensor directly — avoids the
-        per-rank .cpu().tolist() sync that diagnostics would need otherwise."""
+        per-rank .cpu().tolist() sync that diagnostics would need otherwise.
+        Like _ddp_mean_vec, soft-degrades on length mismatch rather than raising,
+        to avoid DDP deadlocks."""
         if t is not None and t.numel() != length:
-            raise RuntimeError(
-                f"_ddp_mean_tensor_vec: length mismatch (got {t.numel()}, expected {length})"
-            )
+            if master_process:
+                log0(f"[WARN] _ddp_mean_tensor_vec length mismatch: got {t.numel()} expected {length} — treating as absent")
+            t = None
         if not distributed:
             return None if t is None else t.detach().float().cpu().tolist()
         present = torch.tensor([0.0 if t is None else 1.0], device=device)
@@ -2855,6 +3015,11 @@ def main() -> None:
         if mos_head is None:
             return None
         return getattr(mos_head, f"_{head}_expert_usage", None)
+
+    def _mos_usage_gpu(head: str) -> Tensor | None:
+        if mos_head is None:
+            return None
+        return getattr(mos_head, f"_{head}_expert_usage_gpu", None)
 
     def _mos_num_experts(head: str) -> int:
         if mos_head is None:
@@ -2894,13 +3059,13 @@ def main() -> None:
         n_ntp = _mos_num_experts("ntp")
         check_specs.append((
             "mos_ctp", n_ctp,
-            lambda: None,  # MoS diagnostics are list-only (single forward per batch)
+            lambda: _mos_usage_gpu("ctp"),
             lambda: _mos_usage("ctp"),
             lambda: _mos_ortho("ctp"),
         ))
         check_specs.append((
             "mos_ntp", n_ntp,
-            lambda: None,
+            lambda: _mos_usage_gpu("ntp"),
             lambda: _mos_usage("ntp"),
             lambda: _mos_ortho("ntp"),
         ))
@@ -2938,23 +3103,27 @@ def main() -> None:
             )
 
     # 2. Global gate trend: gg must be active (not collapsed to 0 or 1).
+    # DDP-reduce rank-local max/min so the assertion sees the global view —
+    # a gate collapsed on one worker but healthy on master should still fail.
     gg_iter_final = getattr(base_m_for_roundtrip, "_gg_iter_last_solve", None)
-    if gg_iter_final and len(gg_iter_final) >= 4:
-        gg_min = min(gg_iter_final)
-        gg_max = max(gg_iter_final)
-        if gg_max < 0.3:
-            _failures.append(f"gg_max={gg_max:.3f} < 0.3 (gate collapsed — DEQ iterations unused)")
-        if gg_min > 0.95:
-            _failures.append(f"gg_min={gg_min:.3f} > 0.95 (gate saturated — no convergence signal)")
+    gg_max_local = max(gg_iter_final) if gg_iter_final and len(gg_iter_final) >= 4 else None
+    gg_min_local = min(gg_iter_final) if gg_iter_final and len(gg_iter_final) >= 4 else None
+    gg_max = _ddp_mean_scalar(gg_max_local)
+    gg_min = _ddp_mean_scalar(gg_min_local)
+    if gg_max is not None and gg_max < 0.3:
+        _failures.append(f"gg_max={gg_max:.3f} < 0.3 (gate collapsed — DEQ iterations unused)")
+    if gg_min is not None and gg_min > 0.95:
+        _failures.append(f"gg_min={gg_min:.3f} > 0.95 (gate saturated — no convergence signal)")
 
     # 3. Injection gate: x0 must be injected sometimes so the fixed point
     #    remains input-specific (H23).  Hard requirement: max inj_iter ≥ 0.05
-    #    AND mean inj_iter ≥ 0.01.  A vanishing injection means `f(z, x0) ≈ f(z)`
-    #    at late iterations, so different inputs can converge to the same z*.
+    #    AND mean inj_iter ≥ 0.01.  DDP-reduced for the same reason as gg above.
     inj_iter_final = getattr(base_m_for_roundtrip, "_inj_iter_last_solve", None)
-    if inj_iter_final and len(inj_iter_final) > 0:
-        inj_max = max(inj_iter_final)
-        inj_mean = sum(inj_iter_final) / len(inj_iter_final)
+    inj_max_local = max(inj_iter_final) if inj_iter_final and len(inj_iter_final) > 0 else None
+    inj_mean_local = (sum(inj_iter_final) / len(inj_iter_final)) if inj_iter_final and len(inj_iter_final) > 0 else None
+    inj_max = _ddp_mean_scalar(inj_max_local)
+    inj_mean = _ddp_mean_scalar(inj_mean_local)
+    if inj_max is not None and inj_mean is not None:
         if inj_max < 0.05:
             _failures.append(
                 f"inj_max={inj_max:.4f} < 0.05 (injection collapsed — DEQ fixed point "
@@ -2987,8 +3156,16 @@ def main() -> None:
                 break
 
     # 5. Iter convergence: relative convergence must be small at highest K.
-    conv_rel = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel", None)
-    if conv_rel is not None and float(conv_rel) > 0.1:
+    # DDP-reduce the rank-local conv_rel so the assertion sees the global mean
+    # (matches the treatment of ortho/usage above).  Without this, master's
+    # local eval shard could pass while a worker sees divergence.
+    conv_rel_t = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel_t", None)
+    conv_rel_local = (
+        float(conv_rel_t.detach().float().item())
+        if isinstance(conv_rel_t, torch.Tensor) else None
+    )
+    conv_rel = _ddp_mean_scalar(conv_rel_local)
+    if conv_rel is not None and conv_rel > 0.1:
         _failures.append(f"iter_conv_rel={conv_rel:.4f} > 0.1 (solver not converging at eval K)")
 
     # Classify each failure and prescribe a fix from the verified-hypothesis
@@ -2998,9 +3175,20 @@ def main() -> None:
     # do NOT raise here: letting the process exit cleanly preserves all the
     # artifacts and log output the fix decision needs.
     def _prescribe(failure: str) -> dict:
-        """Map a failure string to its canonical hypothesis-verified fix."""
+        """Map a failure string to its canonical hypothesis-verified fix.
+
+        Uses prefix-anchored matching on the LHS of the failure string's first
+        token (e.g. "mos_ntp_ortho=...") so substrings like "ortho" don't
+        over-match.  Order within mutually-exclusive categories doesn't matter;
+        order across them (routing > ortho > ...) reflects which fix to prefer
+        when a single failure could theoretically classify as multiple (it can't
+        in practice with prefix-anchored matching but the defensive ordering
+        remains).
+        """
         low = failure.lower()
-        if "min_share" in low or "balance_cv" in low:
+        # Split off the first token (up to '=' or ' ') for prefix checks.
+        first_token = low.split("=", 1)[0].split()[0] if low else ""
+        if "min_share" in first_token or "balance_cv" in first_token:
             return {
                 "failure": failure,
                 "category": "routing_imbalance",
@@ -3010,7 +3198,19 @@ def main() -> None:
                        "Cap at WD=1.44 — H19 showed 1.44 is already too high for β=0.20.",
                 "config_change": {"muon_weight_decay_mult": 1.5},
             }
-        if "ortho" in low:
+        # MoS head ortho is a DIFFERENT failure mode from attn/mlp expert ortho.
+        # MoS has fixed num_shared+num_specialized; the fix is regularization on
+        # the head, not the expert-count knob.  Check MoS-prefixed first.
+        if first_token.startswith("mos_") and "ortho" in first_token:
+            return {
+                "failure": failure,
+                "category": "mos_head_collapse",
+                "hypothesis": "MoSHead orthogonality under-regularized",
+                "fix": "Increase mos_ortho_out_coef by 1.5× (currently 1e-3 → 1.5e-3). "
+                       "If no effect, shrink mos_rank or add a lightweight orthogonality loss inside the head.",
+                "config_change": {"mos_ortho_out_coef_mult": 1.5},
+            }
+        if "ortho" in first_token:  # now attn_ortho / mlp_ortho only
             return {
                 "failure": failure,
                 "category": "expert_collapse",
@@ -3018,7 +3218,7 @@ def main() -> None:
                 "fix": "Increase muon_weight_decay by 1.5×. If no effect, drop num_experts by 1 step.",
                 "config_change": {"muon_weight_decay_mult": 1.5},
             }
-        if "inj_max" in low or "inj_mean" in low:
+        if first_token.startswith("inj_max") or first_token.startswith("inj_mean"):
             return {
                 "failure": failure,
                 "category": "injection_collapse",
@@ -3027,7 +3227,7 @@ def main() -> None:
                        "or iter 22 (per-iter injection schedule).",
                 "config_change": {"inject_next_iter": 24},
             }
-        if "gg_max" in low:
+        if first_token.startswith("gg_max"):
             return {
                 "failure": failure,
                 "category": "gate_collapsed",
@@ -3036,7 +3236,7 @@ def main() -> None:
                        "for tighter contraction that justifies higher gate.",
                 "config_change": {"deq_beta_delta": -0.05},
             }
-        if "gg_min" in low:
+        if first_token.startswith("gg_min"):
             return {
                 "failure": failure,
                 "category": "gate_saturated",
@@ -3044,7 +3244,7 @@ def main() -> None:
                 "fix": "Increase deq_beta by 0.05 so the model learns a smaller per-iter update.",
                 "config_change": {"deq_beta_delta": 0.05},
             }
-        if "k-sweep" in low:
+        if low.startswith("k-sweep"):  # "K-sweep ..." failures have free-form text
             return {
                 "failure": failure,
                 "category": "fp_quality_loss",
@@ -3053,7 +3253,7 @@ def main() -> None:
                        "If inj_iter also flagged, fix injection first (Phase 5) — it's upstream.",
                 "config_change": {"deq_k_max_delta": 4},
             }
-        if "iter_conv_rel" in low:
+        if first_token.startswith("iter_conv_rel"):
             return {
                 "failure": failure,
                 "category": "solver_divergence",
@@ -3072,8 +3272,6 @@ def main() -> None:
     if _failures:
         log0("✗ POST-INT6 HARD ASSERTION FAILURES — run is INVALID (cannot promote)")
         prescriptions = [_prescribe(f) for f in _failures]
-        # Merge config_change suggestions, preferring the most common multiplier.
-        from collections import Counter
         log0(f"  {len(_failures)} failure(s):")
         for p in prescriptions:
             log0(f"  ✗ [{p['category']}] {p['failure']}")
@@ -3096,7 +3294,6 @@ def main() -> None:
         log0(f"  SUGGESTED CONFIG CHANGE: {suggested_config}")
         # Write machine-readable retry hint next to the artifacts.
         if master_process:
-            import json
             retry_hint = {
                 "run_valid": False,
                 "failure_count": len(_failures),
@@ -3108,7 +3305,6 @@ def main() -> None:
             log0("  retry_hint.json written — next iter should apply suggested_config")
         # Mark meta.json so update_results.sh / --promote can refuse.
         if master_process and meta_path is not None:
-            import json
             with open(meta_path, "r") as f:
                 meta_json = json.load(f)
             meta_json["run_valid"] = False
@@ -3123,7 +3319,6 @@ def main() -> None:
         _assertions_passed = True
         log0("✓ POST-INT6 HEALTH: all hard assertions passed (expert balance, ortho, gate trend, injection, FP convergence)")
         if master_process:
-            import json
             retry_hint_path = Path("experiments/weights/current") / "retry_hint.json"
             if retry_hint_path.exists():
                 retry_hint_path.unlink()  # stale hint from a previous failure
@@ -3147,7 +3342,6 @@ def main() -> None:
     # between the assertion success and here leaves run_valid=false with
     # val_bpb=0.0, so update_results.sh --promote refuses a half-finished run.
     if master_process and meta_path is not None:
-        import json
         with open(meta_path, "r") as f:
             meta_json = json.load(f)
         meta_json["val_bpb"] = val_bpb_q
