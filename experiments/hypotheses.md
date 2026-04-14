@@ -268,8 +268,17 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 | **19** | **Post-norm (RMSNorm on Block output)** | **1.897** | **KEEP** | **H20 — biggest arch change, -0.061** |
 | 20 | Quant-noise injection | — | crash | **H15 REFUTED** — incompatible with RevDEQ |
 | **best** | **Muon batched NS + compile + all fixes** | **1.705** | **KEEP (baseline)** | **H21 — correct per-expert preconditioning** |
+| **21** | **Untied routers + token-local inj (H29) + DDP-safe health assertions** | **1.6706** | **INVALID — can't promote** (5 assertions failed) | **H29 VERIFIED, H23 caught by hard assertion** |
 
-**Current best: val_bpb 1.705 post-int6, artifact 4.90 MB, K-sweep: k4=1.731 k8=1.711 k16=1.711 k32=1.715 k64=1.722**
+**Iter 21 val_bpb 1.6706 is BETTER than 1.705 (-0.034), but 5 hard assertions failed:**
+- `mlp_min_share=0.037 < 0.075` (MLP routing imbalance — one expert starved)
+- `mlp_balance_cv=0.280 > 0.20`
+- `mos_ntp_ortho=0.211 > 0.20`
+- K-sweep degradation k128 (Δ=0.043 > 0.03)
+- K-sweep non-monotone K32→K64 (+0.010 > 0.005)
+
+**Suggested fix (from retry_hint.json):** `WD × 1.5 (0.72→1.08)` + `deq_k_max + 4 (16→20)`
+**Next iter 21-retry:** apply both, re-run, verify assertions pass.
 **Record baseline: val_bpb 1.213 → gap = 0.49 BPB**
 
 ## Iteration Schedule
@@ -305,32 +314,6 @@ give complementary data even if one loses.
 - 22a loses, 22b wins → per-expert is the right granularity (more surprising)
 - Both lose → Block-output norm granularity is optimal (negative-result signal useful for scaling law)
 
-### Phase 4.6: Throughput — unroll backward (BLOCKED on compile+DDP compatibility)
-
-`deq_backward="revdeq"` does 3× forward FLOPs per backward (forward + reconstruction + gradient).  Unrolled does 2× (standard autograd).
-
-**Small-batch benchmark (batch=8, seq=1024, NO compile on either side):**
-- `revdeq`: 1150.9 ms/step, 2.42 GB peak
-- `unroll`:  358.4 ms/step, 31.17 GB peak
-- **Speedup: 3.21×** (way above 1.5× theoretical — revdeq's reconstruction is also slower per-pass due to FP64 ops)
-
-**Blocker: compile + unroll + DDP is broken (two separate bugs):**
-- `torch.compile(shared_block, dynamic=False)` + unroll + DDP → `loss.requires_grad=False`, backward fails ("element 0 of tensors does not require grad and does not have a grad_fn")
-- `torch.compile(shared_block, dynamic=True)` + unroll + DDP → dynamo backend crash inside KV-attention (`AttributeError: 'int' object has no attribute 'meta'`)
-
-Since `torch.compile(shared_block)` gives ~1.6× real speedup on revdeq (3.7× benchmark), dropping it to enable unroll would largely cancel out unroll's 3.21× per-microstep win at training batch size (especially since OOM forces 4× more microsteps for unroll).
-
-**Decision:** Stay on `deq_backward="revdeq"` + compile (matches the current best val_bpb=1.705 baseline).  Queue the compile+unroll compatibility fix as a follow-up investigation:
-
-| Approach | Notes | Priority |
-|---|---|---|
-| Compile `_deq_solve` as a whole instead of `shared_block` | One compiled graph for the K-step loop — avoids the "32 compiled calls in a Python loop" DDP interaction | High — most likely to work |
-| `torch._dynamo.disable` just the path that triggers the crash | Surgical fix; keeps compile on the rest | Medium |
-| Try `mode="reduce-overhead"` with CUDA graphs | Different codegen path, different interaction | Low — likely similar issues |
-| Switch to unroll+no-compile on 8×H100 final run only | H100 has more VRAM; compile yield may be smaller there | Fallback if nothing else works |
-
-**For now:** `deq_backward="revdeq"` + compile enabled is the default.
-
 ### Phase 5: Injection mechanism rework (H23-H27) — PRIORITY
 
 The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ requirement that z* depends on x0. These experiments test whether improving injection fixes the K=64 degradation (+0.011).
@@ -347,8 +330,8 @@ The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ req
 
 | Iter | Config change | Hypothesis | Depends on |
 |---|---|---|---|
-| **27** | Single-step diffusion CTP (noisy soft-embed + denoise) | H16 — enriches embedding gradients | Phase 5 best |
-| **28** | LeakyReLU(0.5)² in MLP experts | Records evidence — consistent wins | Phase 5 best |
+| **28a** | Single-step diffusion CTP (noisy soft-embed + denoise) | H16 — enriches embedding gradients | Phase 5 best |
+| **28b** | LeakyReLU(0.5)² in MLP experts | Records evidence — consistent wins | Phase 5 best |
 
 ### Phase 7: Advanced techniques (if gap to record > 0.3 BPB)
 
@@ -359,7 +342,41 @@ The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ req
 | 31 | Gated attention gate position (before SDPA vs after) | Records + paper arXiv 2505.06708 | Phase 6 |
 | 32 | FSQ-STE weight QAT (replace post-hoc int6 with trained-in FSQ) | H28 — closes quant gap, RevDEQ-compatible (deterministic) | Phase 6 |
 
-### Phase 8: Scaling law grid (FINAL — locked config)
+### Phase 7.5: Throughput optimization — unroll+compile investigation (runs BEFORE Phase 8)
+
+**Goal:** Maximize training throughput *before* committing compute to the Phase 8 scaling-law grid.  More steps/hour in the sweep = more hyperparameter points covered per 1h iter budget.  Doing this *after* Phase 7 ensures the throughput measurement uses the final arch (post-OrthoInit, skip-gates, etc.); doing it *before* Phase 8 means the scaling sweep gets the fastest possible backward path.
+
+**Core hypothesis:** A WORKING `unroll + torch.compile` configuration would be faster than the current `revdeq + torch.compile` baseline at real training batch, because:
+- Unroll does 2× forward FLOPs per backward vs revdeq's 3× (no reconstruction pass)
+- Unroll uses FP32 accumulators vs revdeq's FP64 (revdeq needs FP64 for exact reversibility; unroll doesn't)
+- Small-batch benchmark (no compile on either side) measured **3.21× speedup**: unroll 358 ms vs revdeq 1151 ms at batch=8/seq=1024
+
+**Blocker:** compile + unroll + DDP hits two separate bugs:
+- `torch.compile(shared_block, dynamic=False)` + unroll + DDP → `loss.requires_grad=False` (grad_fn broken)
+- `torch.compile(shared_block, dynamic=True)` + unroll + DDP → dynamo backend crash in KV-attention (`'int' has no 'meta'`)
+
+**Investigation plan (apply in order, stop when one works):**
+
+| Step | Approach | Why it might work |
+|---|---|---|
+| A | Compile `_deq_solve` (entire K-step loop) instead of `shared_block` | One compiled graph for the whole loop — avoids "32 compiled calls in a Python loop" interaction with DDP gradient hooks.  The whole DEQ solve becomes a single autograd op from DDP's POV. |
+| B | `mode="reduce-overhead"` (uses CUDA graphs) | Different codegen path that may not hit the grad_fn-tracking bug; CUDA graphs are explicitly designed for repeated identical calls. |
+| C | `torch._dynamo.disable` surgically on the DDP-critical paths, keep compile everywhere else | Keeps most of the speedup while avoiding the specific failing interaction. |
+| D | Upgrade torch to a newer minor release if available | Both bugs may be fixed upstream; check release notes. |
+| E | Compile + unroll WITHOUT DDP (single-GPU control) → confirms the bugs are DDP-specific | Diagnostic only, rules out compile/unroll incompatibility that isn't DDP-mediated. |
+
+**Benchmark protocol once a fix works:**
+1. Run `experiments/speed_compare_backward.py` at the REAL training batch (not the small benchmark size).  Need per-microstep timing AND per-optimizer-step timing (since unroll may need more grad_accum to fit VRAM).
+2. Run a full 1h training with each config (compile+revdeq vs compile+unroll) at the then-current best arch.  Compare:
+   - total steps completed
+   - val_bpb at 1h
+   - post-int6 val_bpb
+   - K-sweep FP quality (any difference in solver quality at K=128)
+3. **Decision rule:** switch to unroll only if `(steps × val_bpb_improvement) per hour` is higher AND the Phase 7 K-sweep hard assertions still pass.  Not just faster ms/step.
+
+**Fallback if no fix works:** stay on `revdeq + compile` for Phase 8.  Revisit on 8×H100 where the VRAM constraint relaxes and compile+unroll compatibility may differ.
+
+### Phase 8: Scaling law grid (FINAL — locked config + best backward mode from Phase 7.5)
 
 Locked config: WD=0.72, β=0.20, K jitter {4,8,12,16}, 8exp, dim=768, post-norm, untied router sigmoid gates, best injection mechanism from Phase 5, batched Muon NS, compiled shared_block, best techniques from Phase 7.
 
