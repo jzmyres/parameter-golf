@@ -2138,7 +2138,15 @@ class GPT(nn.Module):
             r_health = getattr(r, "_health_loss", zero)
             bal = bal + float(router_weights.get(rid, 0.0)) * r_bal
             health = health + float(router_weights.get(rid, 0.0)) * r_health
-        bal = bal + getattr(self.mos_head, '_balance_loss', zero)
+        # iter 26-lb-loss: bump MoS balance weight 50x to address dead expert
+        # in MoS NTP router (min_share stuck at 0.006).  The MSE-to-uniform loss
+        # on mean(alpha) was computed but with weight 1.0 — too weak.  With
+        # bal_loss_coef=5e-3 downstream, effective weight becomes 50 × 5e-3 = 0.25,
+        # giving gradient signal ~50× stronger on router logits for underused
+        # MoS experts.  WD cannot fix routing-space collapse (it makes dead
+        # experts worse by decaying their already-unused weights); LB loss
+        # is the principled complementary fix.
+        bal = bal + 50.0 * getattr(self.mos_head, '_balance_loss', zero)
         return bal, health
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
