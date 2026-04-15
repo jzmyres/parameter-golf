@@ -1158,7 +1158,9 @@ class CausalSelfAttention(nn.Module):
         # Phase 4.5 22-add-all: RMSNorm after gated SDPA.
         return self.attn_sdpa_post_norm(y_out)
 
-    def mix_experts_from_shared(self, y: Tensor, w: Tensor) -> Tensor:
+    def mix_experts_from_shared(self, y: Tensor, w: Tensor,
+                                 *, inj_term: Tensor | None = None) -> Tensor:
+        # Phase 5e-1 iter 27b-pos-expert-out: same per-expert injection as MLP.
         B, T, D = y.shape
         E, R = self.num_experts, self.expert_rank
         N = B * T
@@ -1170,6 +1172,10 @@ class CausalSelfAttention(nn.Module):
         # (E, D, R) -> (E, R, D) view (no copy); compute E independent GEMMs.
         O_T = self.expert_out.to(dtype=y_flat.dtype).transpose(1, 2)
         out_e = torch.bmm(h.transpose(0, 1), O_T)  # (E, N, D)
+        # Phase 5e-1 iter 27b-pos-expert-out: per-expert inj add.
+        if inj_term is not None:
+            inj_flat = inj_term.reshape(N, D).to(dtype=out_e.dtype) / float(E)
+            out_e = out_e + inj_flat.unsqueeze(0)
         out = out_e.sum(dim=0)  # (N, D)
 
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
@@ -1232,7 +1238,12 @@ class MLP(nn.Module):
         # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
         self.hidden_post_norm = RMSNorm(self.expert_rank)
 
-    def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False) -> Tensor:
+    def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
+                    inj_term: Tensor | None = None) -> Tensor:
+        # Phase 5e-1 iter 27b-pos-expert-out: optional per-expert injection.
+        # If inj_term (B, T, D) is provided, distribute it across experts as
+        # (inj_term / E) added to each out_e before sum.  Total contribution
+        # to summed out is inj_term (E × inj_term/E = inj_term).
         B, T, D = x.shape
         E, R = self.num_experts, self.expert_rank
         x_n = x if bool(pre_normed) else _rms_norm(x)
@@ -1250,6 +1261,10 @@ class MLP(nn.Module):
         h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
+        # Phase 5e-1 iter 27b-pos-expert-out: per-expert inj add.
+        if inj_term is not None:
+            inj_flat = inj_term.reshape(N, D).to(dtype=out_e.dtype) / float(E)  # (N, D)
+            out_e = out_e + inj_flat.unsqueeze(0)  # broadcast over E
         out = out_e.sum(dim=0)  # (N, D)
 
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
@@ -1586,15 +1601,17 @@ class Block(nn.Module):
         return attn_ortho, mlp_ortho
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # Phase 5e-1 iter 27a-pos-mix-out: injection POSITION moved from
-        # P-begin to P-mix-out.  z passes through attn/mlp/experts unchanged
-        # by x0; x0 is added directly to the post-z2 raw_out at the end.
-        # Same gate computation (sigmoid·Linear·LN(z_in)) — only WHERE the
-        # x0 contribution enters the residual changes.  Hypothesis: bypass
-        # the transformation chain so x0 has a direct path to z*, possibly
-        # cleaner gradient flow to inj_gate.
+        # Phase 5e-1 iter 27b-pos-expert-out: injection at P-expert-out.
+        # x0 is added inside mix_experts via inj_term=g_inj·x0, distributed
+        # as (inj_term/E) per-expert before sum.  Total contribution per
+        # mix call: inj_term (E·(inj_term/E)). Both attn_mix and mlp_mix
+        # receive the same inj_term, so net z2 += 2·inj_term.  Hypothesis:
+        # injecting closer to the expert output gives x0 a path that goes
+        # through routing weights without going through the full expert
+        # nonlinearity stack.
         g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
-        x = z_in  # P-mix-out: NO injection at begin
+        x = z_in
+        inj_term = g_inj * x0  # (B, T, D)
 
         # Parallel residuals with the inner residual REMOVED.  Attention and
         # MLP both read the same pre-residual input x and their outputs sum
@@ -1614,11 +1631,11 @@ class Block(nn.Module):
         if _tracking:
             attn_rg = getattr(self.attn_router, "_router_gate_last_mean", None)
         y_shared = self.attn._attn_shared_from_normed(x_attn)
-        attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
+        attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn, inj_term=inj_term)
 
         x_mlp = self.mlp_norm(x)
         w_mlp = self.mlp_router(x_mlp, pre_normed=True)
-        mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True)
+        mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
 
         # Phase 4.5 22-add-all: per-component post-norm after expert mix
         # (post-non-linearity, post-expert-weighted sum).  Subsequent iters
@@ -1650,11 +1667,9 @@ class Block(nn.Module):
                 rg_vals.append(float(mlp_rg))
             if rg_vals:
                 self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
-        # Phase 5e-1 iter 27a-pos-mix-out: x0 added at P-mix-out (end), with
-        # the same gate as before.  This gives x0 a direct path to z* that
-        # bypasses the transform chain — testing whether late injection works
-        # better than the iter 23C P-begin position.
-        raw_out = 0.5 * z2.to(dtype=z_in.dtype) + g_inj * x0
+        # Phase 5e-1 iter 27b-pos-expert-out: x0 was injected via inj_term
+        # inside mix_experts; raw_out reverts to clean transform.
+        raw_out = 0.5 * z2.to(dtype=z_in.dtype)
         return self.post_norm(raw_out)  # iter 19: bound hidden state magnitude across DEQ iterations
 
 
