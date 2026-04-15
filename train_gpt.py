@@ -1504,49 +1504,31 @@ class Block(nn.Module):
         self._attn_router_gate_call_track: list[float] = []
         self._mlp_router_gate_call_track: list[float] = []
 
-        # Phase 5 iter 23A: replace the inj_gate (token-local sigmoid scalar
-        # gate on x0) with an always-on low-rank projection of x0.
-        # Form: inj = inj_B(inj_A(LN(x0))).  No gate to collapse — every DEQ
-        # iteration sees x0 by construction.  inj_B init small (std=0.02) so
-        # injection magnitude starts bounded; W-decay on inj_B keeps it bounded
-        # long-term.  α absorbed into inj_B (mathematically redundant scalar).
-        # Rank: kv_latent_dim (matches the MLA pattern — proven sufficient
-        # compression of dim-D signals in this codebase).
-        inj_rank = int(self.attn.kv_latent_dim)
-        self.inj_A = CastedLinear(dim, inj_rank, bias=False)
-        self.inj_B = CastedLinear(inj_rank, dim, bias=False)
+        self.inj_gate = CastedLinear(dim, 1, bias=True)
+        self._inj_gate_last_mean: float | None = None
         with torch.no_grad():
-            nn.init.normal_(self.inj_B.weight, mean=0.0, std=0.02)
-        # Tracks for (||inj||/||z||, cos(inj, z)) per call instead of the gate
-        # scalar.  Both are in [0, ∞) and (-1, 1) respectively; they replace
-        # the old _inj_call_track which logged sigmoid values.
-        self._inj_mag_call_track: list[float] = []
-        self._inj_cos_call_track: list[float] = []
-        self._inj_mag_last: float | None = None
-        self._inj_cos_last: float | None = None
+            self.inj_gate.weight.zero_()
+            self.inj_gate.bias.fill_(-2.1972246)  # sigmoid(-2.2) ~ 0.1
 
-    def _inj_proj_from(self, x0: Tensor, z_in: Tensor | None = None) -> Tensor:
-        # Always-on low-rank projection of x0 — no z_in dependence in the
-        # injection itself (z_in only used for diagnostics).  Direction is
-        # set by inj_A,inj_B; magnitude controlled by inj_B init scale + WD.
-        x0_n = _rms_norm(x0)
-        inj = self.inj_B(self.inj_A(x0_n))
-        if z_in is not None and _should_diag(self.training) and (self._gg_track_enabled or self._gg_call_track_enabled):
-            with torch.no_grad():
-                inj_f = inj.detach().float()
-                z_f = z_in.detach().float()
-                inj_norm = inj_f.norm(dim=-1)  # [B, T]
-                z_norm = z_f.norm(dim=-1).clamp_min(1e-8)
-                mag_ratio = float((inj_norm / z_norm).mean().item())
-                # Cosine across last dim, mean over (B, T).
-                cos = (inj_f * z_f).sum(dim=-1) / (inj_f.norm(dim=-1).clamp_min(1e-8) * z_norm)
-                cos_val = float(cos.mean().item())
-                self._inj_mag_last = mag_ratio
-                self._inj_cos_last = cos_val
-                if self._gg_call_track_enabled:
-                    self._inj_mag_call_track.append(mag_ratio)
-                    self._inj_cos_call_track.append(cos_val)
-        return inj
+    def _inj_gate_from(self, z_in: Tensor) -> Tensor:
+        # Token-local injection gate: one sigmoid value per (batch, seq) position,
+        # computed from that token's own RMSNorm-ed hidden state.  The previous
+        # implementation averaged z_in across (batch, seq) before the gate,
+        # which made the DEQ update depend on OTHER examples in the batch and
+        # on how the sequence was chunked — breaking streaming / prefix-caching
+        # invariance.  Token-local gates preserve causality: the gate for token
+        # (b, t) only depends on that token's state.  Principle: every gate in
+        # the block (inj, gg, attn, router) is input-dependent AND token-local.
+        z_n = _rms_norm(z_in)
+        g = torch.sigmoid(self.inj_gate(z_n))  # [B, T, 1]
+        if _should_diag(self.training) and (self._gg_track_enabled or self._gg_call_track_enabled):
+            # Log the scalar mean across (batch, seq) for plotting — this is
+            # just a reduction of the token-local gates, NOT the gate itself.
+            g_val = float(g.detach().float().mean().item())
+            self._inj_gate_last_mean = g_val
+            if self._gg_call_track_enabled:
+                self._inj_call_track.append(g_val)
+        return g
 
     @dynamo_disable
     def _record_gg_diag(self, gg_tok: Tensor) -> None:
@@ -1563,9 +1545,8 @@ class Block(nn.Module):
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
-        # Phase 5 iter 23A: always-on low-rank injection (no gate).
-        inj = self._inj_proj_from(x0_sub).to(dtype=z_sub.dtype)
-        x = z_sub + inj  # always-on additive injection (matches forward)
+        g_inj = self._inj_gate_from(z_sub).to(dtype=z_sub.dtype)
+        x = z_sub + g_inj * x0_sub  # additive injection (matches forward)
 
         x_attn = self.attn_norm(x)
         w_attn = self.attn_router(x_attn, pre_normed=True)
@@ -1601,14 +1582,15 @@ class Block(nn.Module):
         return attn_ortho, mlp_ortho
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # Phase 5 iter 23A: always-on low-rank injection of x0, no gate.
-        # inj = inj_B(inj_A(LN(x0))) — projected and added to z_in.  The
-        # input is structurally injected EVERY DEQ iteration: there is no
-        # gate that can collapse to 0 and break the z* = f(z*, x0) identity.
-        # Magnitude: governed by inj_B init (std=0.02) and WD; direction is
-        # learned by inj_A,inj_B.  Diagnostics: ||inj||/||z_in||, cos(inj, z_in).
-        inj = self._inj_proj_from(x0, z_in=z_in).to(dtype=z_in.dtype)
-        x = z_in + inj
+        g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
+        # Iter 18: additive injection instead of lerp.
+        # Old (lerp): x = z_in + g_inj * (x0 - z_in) = (1-g_inj)*z_in + g_inj*x0
+        # New (additive): x = z_in + g_inj * x0
+        # Additive decouples z_in from x0: the model keeps ALL of z_in and
+        # ADDS a gated fraction of x0.  This gives cleaner gradient flow to
+        # z_in (no (1-g_inj) scaling) and lets the model decide the injection
+        # magnitude independently of how much z_in to preserve.
+        x = z_in + g_inj * x0
 
         # Parallel residuals with the inner residual REMOVED.  Attention and
         # MLP both read the same pre-residual input x and their outputs sum
@@ -1949,8 +1931,6 @@ class GPT(nn.Module):
         sb._gg_call_track = []
         sb._gg_call_track_enabled = bool(track_gg)
         sb._inj_call_track = []
-        sb._inj_mag_call_track = []
-        sb._inj_cos_call_track = []
         sb._attn_gate_call_track = []
         sb._router_gate_call_track = []
         sb._attn_router_gate_call_track = []
@@ -1993,19 +1973,12 @@ class GPT(nn.Module):
                 self._gg_iter_last_solve = [0.5 * (calls[2*i] + calls[2*i+1]) for i in range(K)]
             else:
                 self._gg_iter_last_solve = []
-            # Phase 5 iter 23A: aggregate ||inj||/||z_in|| and cos(inj, z_in)
-            # per-iteration (each iter = 2 calls: y-step + z-step).  Replaces
-            # the old gate scalar tracking — the gate no longer exists.
-            mag_calls = list(getattr(sb, "_inj_mag_call_track", []) or [])
-            cos_calls = list(getattr(sb, "_inj_cos_call_track", []) or [])
-            if len(mag_calls) == 2 * K:
-                self._inj_iter_last_solve = [0.5 * (mag_calls[2*i] + mag_calls[2*i+1]) for i in range(K)]
+            # Aggregate inj_gate per-iteration (each iter has 2 calls: y-step + z-step)
+            inj_calls = list(getattr(sb, "_inj_call_track", []) or [])
+            if len(inj_calls) == 2 * K:
+                self._inj_iter_last_solve = [0.5 * (inj_calls[2*i] + inj_calls[2*i+1]) for i in range(K)]
             else:
                 self._inj_iter_last_solve = []
-            if len(cos_calls) == 2 * K:
-                self._inj_cos_iter_last_solve = [0.5 * (cos_calls[2*i] + cos_calls[2*i+1]) for i in range(K)]
-            else:
-                self._inj_cos_iter_last_solve = []
             # Aggregate attn_gate per-iteration (1 call per block forward, 2 per iter)
             ag_calls = list(getattr(sb, "_attn_gate_call_track", []) or [])
             if len(ag_calls) == 2 * K:
@@ -2600,17 +2573,10 @@ def main() -> None:
         if gg_iter is not None and len(gg_iter) > 0:
             iter_str = ",".join(f"{float(v):.3f}" for v in gg_iter)
             parts.append(f"gg_iter:[{iter_str}]")
-        # Phase 5 iter 23A: per-iteration injection magnitude ratio
-        # ||inj||/||z_in|| (was: gate sigmoid value).  Replaces the gate
-        # because the gate no longer exists — injection is always-on.
+        # Per-iteration injection gate trajectory
         inj_iter = getattr(m, "_inj_iter_last_solve", None)
         if inj_iter is not None and len(inj_iter) > 0:
             parts.append(f"inj_iter:[{','.join(f'{v:.3f}' for v in inj_iter)}]")
-        # Per-iteration cos(inj, z_in) trajectory — direction info to complement
-        # the magnitude.  Cos near 0 = orthogonal injection; cos near ±1 = aligned.
-        inj_cos_iter = getattr(m, "_inj_cos_iter_last_solve", None)
-        if inj_cos_iter is not None and len(inj_cos_iter) > 0:
-            parts.append(f"inj_cos_iter:[{','.join(f'{v:.3f}' for v in inj_cos_iter)}]")
         # Per-iteration attention gate trajectory
         ag_iter = getattr(m, "_attn_gate_iter_last_solve", None)
         if ag_iter is not None and len(ag_iter) > 0:
@@ -3219,13 +3185,25 @@ def main() -> None:
     if gg_min is not None and gg_min > 0.95:
         _failures.append(f"gg_min={gg_min:.3f} > 0.95 (gate saturated — no convergence signal)")
 
-    # 3. Phase 5 iter 23A: injection-gate assertion DROPPED.
-    #    Old gate checked sigmoid(inj_gate) ≥ 0.05 to ensure x0-dependence at FP.
-    #    The new always-on injection (z + B(A(LN(x0)))) injects x0 at every iter
-    #    by construction — there is no gate that can collapse to 0.  The new
-    #    inj_iter values are ||inj||/||z_in|| magnitude ratios (different scale
-    #    from old gate values); they're tracked for diagnostics only, not gated.
-    #    The fixed-point's x0-dependence is now *structurally* guaranteed.
+    # 3. Injection gate: x0 must be injected sometimes so the fixed point
+    #    remains input-specific (H23).  Hard requirement: max inj_iter ≥ 0.05
+    #    AND mean inj_iter ≥ 0.01.  DDP-reduced for the same reason as gg above.
+    inj_iter_final = getattr(base_m_for_roundtrip, "_inj_iter_last_solve", None)
+    inj_max_local = max(inj_iter_final) if inj_iter_final and len(inj_iter_final) > 0 else None
+    inj_mean_local = (sum(inj_iter_final) / len(inj_iter_final)) if inj_iter_final and len(inj_iter_final) > 0 else None
+    inj_max = _ddp_mean_scalar(inj_max_local)
+    inj_mean = _ddp_mean_scalar(inj_mean_local)
+    if inj_max is not None and inj_mean is not None:
+        if inj_max < 0.05:
+            _failures.append(
+                f"inj_max={inj_max:.4f} < 0.05 (injection collapsed — DEQ fixed point "
+                f"no longer input-specific, violates z* = f(z*, x0), see H23)"
+            )
+        if inj_mean < 0.01:
+            _failures.append(
+                f"inj_mean={inj_mean:.4f} < 0.01 (avg injection near zero — "
+                f"x0 dependence lost across solver)"
+            )
 
     # 4. FP convergence: K-sweep degradation gate.  Threshold 0.1 catches gross
     # FP collapse (model exploits a specific K and degrades dramatically at others)
