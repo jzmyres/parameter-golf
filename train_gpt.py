@@ -1476,20 +1476,19 @@ class Block(nn.Module):
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
                                          expert_rank=attn_expert_rank, router=self.attn_router)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.mlp_router)
-        self.gg_gate = CastedLinear(dim, 1, bias=True)
-        with torch.no_grad():
-            self.gg_gate.weight.zero_()
-            # iter 2: initialize gg_gate.bias = 1.5 so init gg_tok = sigmoid(1.5)
-            # ~ 0.82.  Combined with deq_beta=0.20, the per-iteration update at
-            # init is 0.20 * 0.82 = 0.164 (~3.7x larger than iter 1's converged
-            # 0.044), so K matters: K=4 reaches ~49% of the fixed point, K=8
-            # reaches ~76%, K=16 reaches ~94%.  In iter 1 the model learned
-            # gg_tok ~ 0.22 and the K-sweep was flat (k4=k8=k16=1.6209) because
-            # the solver converged in <4 iters and the iterative depth was
-            # wasted.  Starting high lets the optimizer choose whether to use
-            # the depth -- if it lowers gg_tok again, we know the model is
-            # actively choosing shallow; if it stays high, we get real depth.
-            self.gg_gate.bias.fill_(1.5)
+        # Phase 5b iter 23C-gg-no-residual: gg_gate REMOVED and z residual
+        # REMOVED.  New update form:
+        #     raw_out = 0.5 * z2            (where z2 = attn_mix + mlp_mix)
+        # Compare:
+        #   Old:      raw_out = (1-g)·z_in + g·z2  (gated lerp between pass-through and transform)
+        #   iter 23B: raw_out = z_in + 0.2·z2      (residual, trivial FP when z2=0 at z_in)
+        #   iter 23C: raw_out = 0.5·z2             (no residual, trivial FP only at z=0)
+        # The FP equation is z* = 0.5·z2(z*) — the transform must MAP to itself
+        # (scaled by 0.5).  A trivial FP at z=0 exists but supervised loss at
+        # training K pushes strongly away from it (zero state → catastrophic
+        # loss).  Contraction: df/dz = 0.5·J_transform (no identity term), so
+        # the solver is naturally contractive when J_transform is bounded.
+        # gg_iter diagnostic emits constant 1.0 as a marker.
         self._gg_last: float | None = None
         self._gg_track_enabled = False
         self._gg_sum = 0.0
@@ -1624,8 +1623,9 @@ class Block(nn.Module):
 
         z2 = attn_mix + mlp_mix
 
-        gg_tok = torch.sigmoid(self.gg_gate(x_attn)).squeeze(-1)
+        # Phase 5b iter 23C-gg-no-residual: no gg_gate — emit constant 1.0 diag.
         if _tracking:
+            gg_tok = torch.ones(x_attn.shape[:-1], device=x_attn.device, dtype=x_attn.dtype)
             self._record_gg_diag(gg_tok.detach())
             # Capture attn gate for per-iteration tracking
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
@@ -1645,7 +1645,8 @@ class Block(nn.Module):
                 rg_vals.append(float(mlp_rg))
             if rg_vals:
                 self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
-        raw_out = (1.0 - gg_tok).to(dtype=z_in.dtype).unsqueeze(-1) * z_in + gg_tok.to(dtype=z_in.dtype).unsqueeze(-1) * z2
+        # Phase 5b iter 23C: non-residual update — transform replaces state.
+        raw_out = 0.5 * z2.to(dtype=z_in.dtype)
         return self.post_norm(raw_out)  # iter 19: bound hidden state magnitude across DEQ iterations
 
 
@@ -3175,15 +3176,8 @@ def main() -> None:
     # 2. Global gate trend: gg must be active (not collapsed to 0 or 1).
     # DDP-reduce rank-local max/min so the assertion sees the global view —
     # a gate collapsed on one worker but healthy on master should still fail.
-    gg_iter_final = getattr(base_m_for_roundtrip, "_gg_iter_last_solve", None)
-    gg_max_local = max(gg_iter_final) if gg_iter_final and len(gg_iter_final) >= 4 else None
-    gg_min_local = min(gg_iter_final) if gg_iter_final and len(gg_iter_final) >= 4 else None
-    gg_max = _ddp_mean_scalar(gg_max_local)
-    gg_min = _ddp_mean_scalar(gg_min_local)
-    if gg_max is not None and gg_max < 0.3:
-        _failures.append(f"gg_max={gg_max:.3f} < 0.3 (gate collapsed — DEQ iterations unused)")
-    if gg_min is not None and gg_min > 0.95:
-        _failures.append(f"gg_min={gg_min:.3f} > 0.95 (gate saturated — no convergence signal)")
+    # Phase 5b iter 23C: gg_gate removed; gg_iter is always 1.0 (diag marker).
+    # Collapse-check assertion no longer applies — no gate to collapse.
 
     # 3. Injection gate: x0 must be injected sometimes so the fixed point
     #    remains input-specific (H23).  Hard requirement: max inj_iter ≥ 0.05
