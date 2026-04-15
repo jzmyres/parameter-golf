@@ -132,6 +132,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 768  # optimal: dim sweep showed 768 > 896 > 1024 (expert rank more valuable than shared attn width)
     num_heads = 8
+    num_experts = 8  # H5: single source for attn + mlp expert banks (CLAUDE.md SSOT)
     mlp_mult = 3.0
     tie_embeddings = True
     rope_base = 10000.0
@@ -1075,7 +1076,7 @@ class SoftDenseRouter(nn.Module):
 class CausalSelfAttention(nn.Module):
     """MLA with Gated Attention + expert bank."""
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
-                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 6,
+                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
         self.num_heads = num_heads
@@ -1160,7 +1161,9 @@ class CausalSelfAttention(nn.Module):
 
     def mix_experts_from_shared(self, y: Tensor, w: Tensor,
                                  *, inj_term: Tensor | None = None) -> Tensor:
-        # Phase 5e-1 iter 27b-pos-expert-out: same per-expert injection as MLP.
+        # Per-expert injection path. Built for iter 27b-pos-expert-out (called
+        # with inj_term=g_inj·x0). iter 27d passes inj_term=None — the path is
+        # preserved as live infra for future Phase 5e-1 / 5e-2 sweeps.
         B, T, D = y.shape
         E, R = self.num_experts, self.expert_rank
         N = B * T
@@ -1172,7 +1175,8 @@ class CausalSelfAttention(nn.Module):
         # (E, D, R) -> (E, R, D) view (no copy); compute E independent GEMMs.
         O_T = self.expert_out.to(dtype=y_flat.dtype).transpose(1, 2)
         out_e = torch.bmm(h.transpose(0, 1), O_T)  # (E, N, D)
-        # Phase 5e-1 iter 27b-pos-expert-out: per-expert inj add.
+        # Distribute inj_term across experts: total summed contribution is
+        # inj_term (E × inj_term/E). Disabled in iter 27d; kept for 5e sweeps.
         if inj_term is not None:
             inj_flat = inj_term.reshape(N, D).to(dtype=out_e.dtype) / float(E)
             out_e = out_e + inj_flat.unsqueeze(0)
@@ -1216,7 +1220,7 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     """LeakyReLU(0.5)^2-gated MLP expert bank."""
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 6,
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
         hidden = int(mlp_mult * dim)
@@ -1240,10 +1244,11 @@ class MLP(nn.Module):
 
     def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
                     inj_term: Tensor | None = None) -> Tensor:
-        # Phase 5e-1 iter 27b-pos-expert-out: optional per-expert injection.
+        # Optional per-expert injection (built for iter 27b-pos-expert-out).
         # If inj_term (B, T, D) is provided, distribute it across experts as
-        # (inj_term / E) added to each out_e before sum.  Total contribution
-        # to summed out is inj_term (E × inj_term/E = inj_term).
+        # (inj_term / E) added to each out_e before sum, so the total summed
+        # contribution is inj_term (E × inj_term/E). iter 27d passes None;
+        # this path is preserved as live infra for future Phase 5e sweeps.
         B, T, D = x.shape
         E, R = self.num_experts, self.expert_rank
         x_n = x if bool(pre_normed) else _rms_norm(x)
@@ -1261,7 +1266,7 @@ class MLP(nn.Module):
         h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
-        # Phase 5e-1 iter 27b-pos-expert-out: per-expert inj add.
+        # Per-expert inj add (disabled in 27d; see mix_experts docstring above).
         if inj_term is not None:
             inj_flat = inj_term.reshape(N, D).to(dtype=out_e.dtype) / float(E)  # (N, D)
             out_e = out_e + inj_flat.unsqueeze(0)  # broadcast over E
@@ -1559,13 +1564,12 @@ class Block(nn.Module):
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
-        # Phase 5e-1 iter 27a-pos-mix-out: ortho_aux mirrors the new
-        # injection position — z passes through transform unchanged.  The
-        # ortho diagnostic measures expert directionality, which is
-        # injection-position-invariant; we still compute g_inj here for
-        # diagnostic-tracking parity but x0 is NOT added before the experts.
+        # Phase 5e-1 iter 27d: mirror the forward expert input so the
+        # diagnostic tracks the actual collapse mode (small-g_inj makes this
+        # nearly identical to clean z, but the optimizer can grow g_inj — and
+        # if the injected expert path collapses we want this to fire).
         g_inj = self._inj_gate_from(z_sub).to(dtype=z_sub.dtype)
-        x = z_sub  # P-mix-out: experts see clean z
+        x = z_sub + g_inj * x0_sub
 
         x_attn = self.attn_norm(x)
         w_attn = self.attn_router(x_attn, pre_normed=True)
@@ -1668,8 +1672,10 @@ class Block(nn.Module):
                 rg_vals.append(float(mlp_rg))
             if rg_vals:
                 self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
-        # Phase 5e-1 iter 27b-pos-expert-out: x0 was injected via inj_term
-        # inside mix_experts; raw_out reverts to clean transform.
+        # Phase 5e-1 iter 27d-pos-expert-in: x0 enters via x_expert_in
+        # (RMSNorm of injected z) on both attn and mlp expert paths; routers
+        # see clean z_in. inj_term=None disables the per-expert add inside
+        # mix_experts*, so raw_out is purely 0.5·z2.
         raw_out = 0.5 * z2.to(dtype=z_in.dtype)
         return self.post_norm(raw_out)  # iter 19: bound hidden state magnitude across DEQ iterations
 
@@ -1852,7 +1858,8 @@ class GPT(nn.Module):
                  attn_ortho_out_coef: float = 0.0, mlp_ortho_out_coef: float = 0.0,
                  deq_backward: str = "revdeq", block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
-                 tie_attn_mlp_router: bool = False):  # iter 21: untied is the locked default
+                 tie_attn_mlp_router: bool = False,  # iter 21: untied is the locked default
+                 num_experts: int = 8):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
@@ -1863,10 +1870,14 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = nn.Identity()  # Required by arch tests
+        # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
+        # (threaded from Hyperparameters; verified by experiments/test_arch.py).
+        self.num_experts = int(num_experts)
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                   tie_attn_mlp_router=tie_attn_mlp_router)
+                                   tie_attn_mlp_router=tie_attn_mlp_router,
+                                   num_experts=self.num_experts)
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2479,6 +2490,7 @@ def main() -> None:
         deq_backward=args.deq_backward, block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         tie_attn_mlp_router=args.tie_attn_mlp_router,
+        num_experts=args.num_experts,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -3212,8 +3224,11 @@ def main() -> None:
     # Collapse-check assertion no longer applies — no gate to collapse.
 
     # 3. Injection gate: x0 must be injected sometimes so the fixed point
-    #    remains input-specific (H23).  Hard requirement: max inj_iter ≥ 0.05
-    #    AND mean inj_iter ≥ 0.01.  DDP-reduced for the same reason as gg above.
+    #    remains input-specific (H23).  Soft gate (info-level): max inj_iter ≥
+    #    0.05 AND mean inj_iter ≥ 0.01.  Per CLAUDE.md val_bpb-primary policy,
+    #    a violation populates failure_categories + retry_hint.json for the
+    #    NEXT iteration but does NOT block --promote on val_bpb improvement.
+    #    DDP-reduced for the same reason as gg above.
     inj_iter_final = getattr(base_m_for_roundtrip, "_inj_iter_last_solve", None)
     inj_max_local = max(inj_iter_final) if inj_iter_final and len(inj_iter_final) > 0 else None
     inj_mean_local = (sum(inj_iter_final) / len(inj_iter_final)) if inj_iter_final and len(inj_iter_final) > 0 else None
@@ -3304,11 +3319,11 @@ def main() -> None:
                 "failure": failure,
                 "category": "dead_expert",
                 "hypothesis": "H5 RESOLVED — routing collapse is WD-addressable",
-                "fix": "Increase muon_weight_decay by 1.5× (e.g. 0.72→1.08). "
+                "fix": "Increase weight_decay by 1.5× (e.g. 0.72→1.08; applied to both Muon and AdamW groups). "
                        "If already ≥1.0, increase attn_balance_mult or mlp_balance_mult by 1.5× "
                        "(strengthens the training balance loss that drives the dead expert's usage up). "
                        "Cap WD at 1.44 — H19 showed 1.44 is already too high for β=0.20.",
-                "config_change": {"muon_weight_decay_mult": 1.5, "balance_mult_mult": 1.5},
+                "config_change": {"weight_decay_mult": 1.5, "balance_mult_mult": 1.5},
             }
         # MoS head ortho is a DIFFERENT failure mode from attn/mlp expert ortho.
         # MoS has fixed num_shared+num_specialized; the fix is regularization on
@@ -3327,17 +3342,20 @@ def main() -> None:
                 "failure": failure,
                 "category": "expert_collapse",
                 "hypothesis": "H5 RESOLVED — collapse is WD-fixable",
-                "fix": "Increase muon_weight_decay by 1.5×. If no effect, drop num_experts by 1 step.",
-                "config_change": {"muon_weight_decay_mult": 1.5},
+                "fix": "Increase weight_decay by 1.5× (applied to both Muon and AdamW groups). "
+                       "If no effect, drop num_experts by 1 step.",
+                "config_change": {"weight_decay_mult": 1.5},
             }
         if first_token.startswith("inj_max") or first_token.startswith("inj_mean"):
             return {
                 "failure": failure,
                 "category": "injection_collapse",
-                "hypothesis": "H23 PROPOSED — vanishing injection violates z* = f(z*, x0)",
-                "fix": "Jump to Phase 5 iter 24 (injection floor: clamp inj_gate ≥ 0.05) "
-                       "or iter 22 (per-iter injection schedule).",
-                "config_change": {"inject_next_iter": 24},
+                "hypothesis": "H23-refined VERIFIED — gate-collapse pathology migrates "
+                              "between gg_gate and inj_gate; structural fixes (Phase 5e) > clamps",
+                "fix": "Continue Phase 5e injection-mechanism sweep: 5e-1 picks the best "
+                       "POSITION (27a/b/d), 5e-2 picks the best TRANSFORMATION (28a W-identity "
+                       "vs 28b W-full-rank). Avoid clamps — they only delay collapse migration.",
+                "config_change": {"phase": "5e"},
             }
         if first_token.startswith("gg_max"):
             return {
@@ -3372,8 +3390,8 @@ def main() -> None:
                 "failure": failure,
                 "category": "solver_divergence",
                 "hypothesis": "H9 + H18 VERIFIED",
-                "fix": "Increase muon_weight_decay 1.5× (H9) OR lower deq_beta by 0.05 (H18).",
-                "config_change": {"muon_weight_decay_mult": 1.5},
+                "fix": "Increase weight_decay 1.5× (H9) OR lower deq_beta by 0.05 (H18).",
+                "config_change": {"weight_decay_mult": 1.5},
             }
         if first_token.startswith("deq_recon_err"):
             return {
@@ -3382,8 +3400,8 @@ def main() -> None:
                 "hypothesis": "RevDEQ reversibility requires f(z, x0, W) be deterministic and solver in stable contraction region",
                 "fix": "1) Check for any random/non-deterministic op in the block (quant-noise, dropout etc. "
                        "— see H15 REFUTED).  2) Lower deq_beta by 0.05 for tighter contraction.  "
-                       "3) Increase muon_weight_decay 1.5× to shrink Jacobian spectral norm.",
-                "config_change": {"deq_beta_delta": -0.05, "muon_weight_decay_mult": 1.5},
+                       "3) Increase weight_decay 1.5× to shrink Jacobian spectral norm.",
+                "config_change": {"deq_beta_delta": -0.05, "weight_decay_mult": 1.5},
             }
         return {
             "failure": failure,

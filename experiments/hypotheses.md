@@ -298,6 +298,59 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 | 21-retry-3 | + decouple LOSS=max_mean (smooth) and GATE=max_pairwise (clean) | **1.892** | discard (val_bpb regressed +0.19 from baseline 1.705; K=128 Δ=1.79) | loss/gate decoupling helped (K128 went 3.27→1.79) but did NOT restore iter 21's 1.67 — root cause unclear, requires repro |
 | **21-retry-4** | **repro test: HEAD code (val_bpb-primary + H32 ortho loss removed)** | **1.876 (TRUE int6)** | discard (superseded by iter 22) | CRITICAL FINDING: prior "baseline 1.705" was BF16 (commit `83541fc` fixed the int6 roundtrip indentation bug on Apr 13 19:52; pre-fix the int6 model was never loaded for eval — dead code). iter 21-retry-3 (1.892) and retry-4 (1.876) are the FIRST valid int6 measurements. True int6 quant cost ~0.17 BPB was hidden. |
 | **22** | H32 partial revert: `block_ortho_aux_coef 0 → 0.1` | **1.888 (TRUE int6)** | **KEEP (NEW BASELINE)** | val_bpb 1.888 is within ~0.015 bf16/seed noise floor (empirical: retry-3=1.892 vs retry-4=1.876 same config differ 0.016). attn_ortho 0.82→0.30 / mlp_ortho 0.86→0.22 = 3-6× structural improvement. H32 final arc: coef 1.0 → 0 (too aggressive, ortho drifted near 0.9 gate) → 0.1 (right balance — ortho clean, val_bpb parity). |
+| **22-add-all** | Add 5 LEARNABLE RMSNorms at all reasonable post-non-linearity positions (attn_sdpa_post, hidden_post, attn/mlp_post_mix, embed_post) | **1.891** | **KEEP** | Within noise of baseline 1.888. Big win: K=128 Δ collapsed 1.93 → 0.53 (3.6× extrapolation improvement). Establishes "all norms in" as the starting point for systematic ablation. |
+| **22-rm-embed-post** | Remove `GPT.embed_post_norm` (learnable RMSNorm after tok+bigram embed) | **1.885** | **KEEP** | val_bpb IMPROVED -0.006 vs 22-add-all — that learnable norm at embed entry was harmful. K=128 Δ regressed somewhat but val_bpb-primary promotes. |
+| **22-rm-attn-sdpa-post** | Remove `CausalSelfAttention.attn_sdpa_post_norm` | 1.895 | **REVERTED (3d78cfe)** | val_bpb within noise but K=128 Δ regressed 0.53 → 2.09 (4× FP-quality loss). User principle: K=128 extrapolation IS a primary measure of FP quality; norms preserving it are load-bearing. New dual-gate KEEP criterion adopted. |
+| **22-rm-hidden-post** | Remove `MLP.hidden_post_norm` (norm on per-expert hidden after leaky_relu²) | 1.897 | **REVERTED (`c47324f`)** | int6 val_bpb 1.897 within 0.015 noise of baseline 1.885 → gate (a) PASS. K-sweep: k4=1.944 k8=1.906(best) k16=1.907 k32=1.912 k64=1.963 k128=**3.425** → K=128 Δ=1.519 BPB regression (vs baseline ~0.5) → gate (b) FAIL. `hidden_post_norm` is load-bearing for K=128 extrapolation. Pattern confirmed: removing learnable RMSNorms degrades FP-quality at deep K even when val_bpb at training-K is unchanged. |
+| **Phase 4.5 ablation summary** | Norm ablation closed | — | — | **CONCLUSION**: of the 5 RMSNorms added in 22-add-all, ONE was harmful (`embed_post_norm`, removed → improvement to 1.885) and the other 4 (`attn_sdpa_post_norm`, `hidden_post_norm`, `attn_post_mix_norm`, `mlp_post_mix_norm`) all preserve K=128 extrapolation. Final baseline: **22-rm-embed-post `73ae2e9`, val_bpb=1.885**. attn_post_mix_norm and mlp_post_mix_norm not individually tested (assumed load-bearing by analogy; can defer-test later if motivated). |
+| **22-add-expert-norms** | (a) Expand `MLP.hidden_post_norm` to per-expert weight (E, R); (b) NEW per-expert output norm (E, D) on BOTH MLP and CSA experts | 1.930 | **REVERTED (`90b21c6`)** | Both gates fail: (a) val_bpb 1.930 vs baseline 1.885 → +0.045 BPB outside 0.015 noise floor; (b) K=128 Δ=0.808 (k8=1.936 best, k128=2.744) > 0.5 threshold. K-sweep: k4=1.961 k8=1.936 k16=1.938 k32=1.945 k64=2.002 k128=2.744. Per-expert norms harmed both task perf AND extrapolation — likely the per-expert weights diverged during the 1-iter training budget, breaking expert-bank composition. **Bisect into 22a + 22b to identify which one caused the regression.** |
+| **22a-hidden-per-expert** | (a) ONLY: expand `MLP.hidden_post_norm` weight from shared (R,) to per-expert (E, R) | TBD | queued behind iter 23A | Bisection of failed 22-add-expert-norms. Tests whether the per-expert hidden scale alone caused regression. ~672 added params (8 experts × 96-rank for the expansion). |
+| **22b-out-per-expert** | (b) ONLY: NEW per-expert output norm (E, D) on both MLP and CSA experts (before sum). Leave `hidden_post_norm` shared (R,). | TBD | queued behind 22a | Bisection of failed 22-add-expert-norms. Tests whether the per-expert output norm alone caused regression. ~12K added params (2 banks × 8 experts × 768D). |
+| **23A** ★ | Phase 5: always-on low-rank injection — replace inj_gate with `z + inj_B(inj_A(LN(x0)))`, rank=384, inj_B init std=0.02, no α, drop `inj_max ≥ 0.05` gate. Track ||inj||/||z|| + cos(inj, z). | 1.891 | **REVERTED (`bc3a428`)** | Gate (a) passes (val_bpb 1.891 within noise of 1.885), but gate (b) FAILS: K=128 Δ=1.852 (k8=1.900 best, k128=**3.751**). **KEY FINDING: failure mode MOVED, not eliminated.** inj_iter at K=128 now HEALTHY [0.11→0.37→plateau 0.22] — injection is preserved across deep iters. But gg_iter at K=128 now COLLAPSES [1.00, 1.00, ..., 0.008, 0.004, 0.000] — gg_gate saturates to 0 by iter 20, `(1-gg)·z_in` dominates → z_in passes through unchanged at deep K. **H23-REFINED**: gate-collapse pathology migrated from inj_gate to gg_gate. Removing one DoF shifted the model's escape route. Also: dead `mos_ntp_min_share=0.008`. |
+| **Phase 5 reassessment** | — | — | — | The DEQ identity `z* = f(z*, x0)` requires BOTH (1) x0 enters `f` meaningfully AND (2) the transformation `f` does nontrivial work at deep K. iter 23A fixed (1) but broke (2). **Deeper insight**: both residual-form `z* = z + α·z2` and lerp-form `z* = (1-g)z + g·z2` admit a TRIVIAL fixed point at any z where `z2 = 0` (or `g = 0`). The model learns to shut down z2 to satisfy the FP cheaply. Phase 5b tests three fixes in parallel. |
+| **23B-gg** | Phase 5b: remove gg_gate, fixed-α=0.2 residual (`raw_out = z + 0.2·z2`). inj_gate UNCHANGED. | 1.992 | **REVERTED (`6292df0`)** | Both gates fail: val_bpb 1.992 (+0.107 from 1.885). K-sweep: k4=2.089 k8=2.029 **k16=2.004 best** k32=2.305 k64=4.056 k128=5.074 → K=128 Δ=3.07 (WORSE than iter 23A's 1.85). Fixed α=0.2 too rigid for training-K perf. The residual form's "z2=0 at z*" trivial FP remains — removing per-token gate alone doesn't eliminate the escape route. |
+| **23C-gg-no-residual** ★★★ | Phase 5b-alt: no gg_gate AND no residual-z (`raw_out = 0.5·z2`). FP eqn: `z* = 0.5·z2(z*)` — transform must map to itself, not zero. | **1.865** | **PROMOTED (new BASELINE `3970083`)** | **🎯 BREAKTHROUGH**: val_bpb 1.865 (**-0.020 vs prior baseline 1.885**, first improvement since iter 22). K-sweep: k4=1.891 k8=**1.854** k16=1.872 k32=1.882 k64=1.882 k128=**1.882** → K=128 Δ=**0.028** (vs baseline ~0.5, iter 23A 1.85, iter 23B 3.07). **First truly stable DEQ fixed point across K=4→K=128**. Removing the residual eliminated the trivial `z2=0` FP escape, model learned a genuine dynamic FP. Tech debt: attn_ortho=0.92 (duplicate experts), mos_ntp_min_share=0.008 (dead expert) — non-blocking per val_bpb-primary policy. |
+| **23D-bundle** | Phase 5-bundle: always-on inj + no gg + no residual. FP: `z* = 0.5·z2(z*) + inj(x0)`. | 1.914 | **REVERTED (`c053476`)** | Gate (a) FAILS +0.049 vs 1.865. Gate (b) PASSES (K=128 Δ=0.247, well under 0.5). K-sweep: k4=1.948 k8=1.903 k16=1.926 k32=2.014 k64=2.106 k128=2.150. attn_ortho=0.34 (big improvement from baseline's 0.92) but mos_ntp dead expert persists (0.009). **Finding**: always-on inj HURT val_bpb AND reduced K-sweep flatness vs 23C. The per-token inj_gate of baseline was actively helping — forcing always-on removes useful modulation. 23C's (no residual + per-token inj_gate) is the principled sweet spot. |
+| **24-wd-bump** ★ | Bump Muon weight_decay 0.72 → 1.08 on iter 23C baseline. | 1.955 | **RE-APPLIED (`d10004f`) — KEPT despite val_bpb regression** | Gate (a) failed in short-budget val_bpb (+0.09), but K-sweep remarkably flat: k4=1.983 k8=**1.946** k16=1.967 k32=1.979 k64=1.980 k128=1.980 → Δ=**0.034** (even flatter than 23C). k64→k128 asymptote confirms true FP convergence. **User decision: preserve WD=1.08 as locked config because K→∞ FP stability is the primary objective of a DEQ model; val_bpb degradation is a training-speed artifact addressable by OTHER iters.** attn_ortho 0.92→0.20 improved, mos_ntp_min_share 0.008→0.006 WORSE — WD can partially address ortho (weight-space) but NOT dead expert (routing-space). Next iter: dead-expert fix in router space. |
+| **25 (aborted)** | Per-channel learnable β via unrolled solver. | smoke FAIL | **UNCOMMITTED, DISCARDED** | Unrolled solver's O(K) autograd regressed training 10×. Proper impl needs custom RevDEQ backward (~30-50 LOC). Deferred for retry session. |
+| **26-lb-loss** ★ | Bump MoS balance loss weight 50× (effective 0.25 with bal_loss_coef downstream). Addresses MoS NTP dead expert. | **1.951** | **PROMOTED (new BASELINE `802b436`)** | All gates pass: val_bpb 1.951 (-0.004 vs 1.955), K-sweep flat k4=1.982 k8=**1.941** k16=1.962 k32=1.975 k64=1.976 k128=1.977 → Δ=0.036, status=**validated_clean** (mos_ntp_min_share ≥ 0.01 — dead expert resurrected). LB loss successfully addressed routing-space collapse where WD couldn't reach. |
+| **27a-pos-mix-out** ★ | Phase 5e-1 position sweep #1: move injection from P-begin to P-mix-out. | **1.906** | **PROMOTED (new BASELINE `6c9a06b`)** | -0.045 vs prior baseline! K-sweep clean: k4=1.947 k8=**1.914** k16=1.915 k32=1.938 k64=1.967 k128=1.985 → Δ=0.071. tech debt: attn_ortho=0.918 (duplicate attn experts — new tech debt vs iter 26's clean status). Major arch win — direct x0 path to z* via post-z2 add. |
+| **27b-pos-expert-out** ★ | Phase 5e-1 position sweep #2: per-expert injection inside mix_experts. | **1.902** | **PROMOTED (new BASELINE `9edc6af`)** | val_bpb improved -0.004 vs 27a. K=128 Δ=**0.039** (tighter than 27a's 0.071). Tech debt: inj_max=0.010 < 0.05 (gate collapsed — but effective net injection is 2×g_inj·x0 from attn+mlp sum, so small gate value still meaningful). |
+| **27c-pos-router-in** | Phase 5e-1 position sweep #3: inject ONLY into router inputs. | 2.093 | **REVERTED (`27faf0d`)** | CATASTROPHIC FAIL on both gates: val_bpb +0.19 vs 27b; K-sweep k4=2.13 k8=2.11 k16=2.11 **k32=5.41 k64=5.42 k128=5.42** → Δ=3.31. Experts never see x0 → FP became x0-independent past K=16 → solver diverges to meaningless basin. **Structural conclusion: experts MUST see x0 for FP x0-dependence to hold.** |
+| **27d-pos-expert-in** | Phase 5e-1 position sweep #4: inject ONLY into expert inputs (routers read clean z). Mirror of 27c. | TBD | running (commit `a5cb789`, pid 53163) | Tests the opposite asymmetry: experts get x0 for feature extraction; routing stays state-only. Smoke clean (loss -2.98). KEEP if val_bpb ≤ 1.917 AND K=128 Δ ≤ 0.5. |
+
+### Phase 5e: Injection mechanism experiments (queued, after iter 26)
+
+**Per user direction (revised 2026-04-15):** find best **POSITION FIRST**, then best **TRANSFORMATION** with that position. Identity = `x = z_in + x0` literally (no W, no gate, no scaling).
+
+#### Phase 5e-1: POSITION sweep (transform = current sigmoid·Linear·LN gate)
+
+| Iter | Variant | Where to inject |
+|---|---|---|
+| (baseline) | P-begin = iter 23C current | `x = z_in + g·x0` before attn_norm/mlp_norm — z passes through transform with x0 mixed in |
+| **27a** | P-mix-out | `raw_out = 0.5·z2 + g·x0` — x0 added AFTER transform (bypasses attn/mlp) |
+| **27b** | P-expert-out | `out_e = ... + (g/E)·x0` per-expert before sum (1/E to keep magnitude bounded) |
+| **27c** | P-router-in | Inject into x_attn/x_mlp ONLY for routers (`router(z+g·x0)`); experts read clean z |
+| **27d** | P-expert-in | Inject into expert inputs ONLY (not routers); routers read clean z |
+
+#### Phase 5e-2: TRANSFORMATION sweep (use best position from 5e-1)
+
+| Iter | Variant | Form |
+|---|---|---|
+| (baseline) | current = sigmoid(Linear(LN(z_in)))·x0 | per-token z-dependent gate |
+| **28a** | W-identity | `x = z_in + x0` — direct add, no W, no gate, no scaling |
+| **28b** | W-full-rank | `x = z_in + W·x0` with W full-rank D×D learnable, init small (std=0.02) |
+
+### Phase 5f: Norm ablation (queued, after Phase 5e)
+
+Re-run systematic norm ablation on the new best architecture once injection mechanism is settled. Removes the 4 learnable RMSNorms (22-rm-attn-sdpa-post, 22-rm-hidden-post, 22-rm-attn-mix-post, 22-rm-mlp-mix-post) one at a time, apply dual-gate (val_bpb + K=128 Δ).
+
+### Phase 5g: Deferred to later (per user direction)
+
+- iter 25 learnable per-channel β (needs custom RevDEQ backward ~30 LOC)
+- iter 26 PSD on expert layers (inductive bias only, no MON guarantee)
+- iter 27 TBPTT (needs RevDEQ surgery too)
+| **25-learnable-β (aborted)** | Per-channel learnable β via `nn.Parameter(full((D,), logit(0.20)))`, sigmoid-wrapped, applied via unrolled solver (switched deq_backward="unroll" to enable autograd through β). | smoke FAIL | **UNCOMMITTED, DISCARDED** | Smoke: loss delta only -0.285 (vs baseline -2.75 at 300 steps) — 10× slower convergence. Root cause: unrolled solver's O(K) autograd backward injects much more gradient noise than RevDEQ's implicit differentiation. RevDEQ is essential for our setup; proper iter 25 requires custom autograd.Function backward that manually computes grad_β ∝ Σ(f(z) - y)·∂L/∂y across K iters. That's ~30-50 LOC of custom backward surgery — deferred for retry. |
 
 **Iter 21 val_bpb 1.6706 is BETTER than 1.705 (-0.034), but 5 hard assertions failed under OLD gates:**
 - `mlp_min_share=0.037 < 0.075` (OLD threshold; NEW threshold 0.01 — would PASS)
@@ -402,17 +455,80 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 - Both lose → Block-output norm granularity is optimal (negative-result signal useful for scaling law)
 - 22c (β jitter) → primarily targets K=128 degradation; complementary to 22a/22b
 
-### Phase 5: Injection mechanism rework (H23-H27) — PRIORITY
+### Phase 5: Injection mechanism rework — PRIORITY (re-prioritized after user feedback 2026-04-14)
 
-The injection gate decays to ~0.002 by iter 5, potentially violating the DEQ requirement that z* depends on x0. These experiments test whether improving injection fixes the K=64 degradation (+0.011).
+**Root cause of inj-gate collapse:** `g(z)` is z-dependent. At z* = f(z*, x0), additional injection is a perturbation that backward gradient suppresses to drive `g→0` because loss is evaluated at converged z*. Once z* encodes x0, the gate has no incentive to keep injecting. **This breaks the DEQ identity** `z* = f(z*, x0)` (z* becomes independent of x0 at deep K) and is the upstream cause of K=128 collapse.
 
-| Iter | Config change | Hypothesis | Depends on |
+**User principle (verified principled):** Removing the gate entirely is more principled than any patch — it adds zero degrees of freedom that can misbehave and structurally enforces that every iteration sees x0. With learnable B,A in the projection, the injection magnitude is fully controlled by B's init scale (std=0.02 or zero-init) and B's weight-decay; no separate scaling parameter is needed (α would just be absorbed into B).
+
+**Plan: test BOTH Form A and Form B as parallel iterations** (user direction 2026-04-14). Form C (residual at input side, `B(A(x0 - z_in))`) is REJECTED — x0 lives in embedding space, z_in lives in DEQ state space, subtracting them at input side scrambles semantics; both Form A and Form B avoid this by either not subtracting or subtracting in z-space after projection.
+
+**α design — DROPPED for 23A/23B** (user feedback 2026-04-14): when B and A are learnable, scalar α is **mathematically redundant** because `α · B(A(x)) = (αB)(A(x))` — the optimizer absorbs α into B. Adding α as a separate learnable parameter is a no-op that wastes 1 DoF. The injection magnitude is controlled by B's init (e.g., std=0.02 or zero-init) and B's weight-decay — both jobs α was nominally doing. **α is only needed in 24c-min** where there is no projection matrix to absorb it; there α is learnable with regularization toward 0.1 to prevent collapse.
+
+| Iter | Form | Config change | Why | Depends on |
+|---|---|---|---|---|
+| **23A** ★ | A: always-on, no gate | `z_hat = z + B(A(LN(x0)))`; B small-init (std=0.02), no α | Simplest — no gate to collapse, x0 always seen, FP exists if B small. Minimum DoF. | Phase 4.5 |
+| **23B** ★ | B: residual in z-space | `z_hat = z + B(A(LN(x0))) - LN(z_in)`; B small-init (std=0.02), no α | Self-regulating — error → 0 in z-space as z_in absorbs projected x0; "collapse" becomes meaningful. | Phase 4.5 |
+
+**Decision criterion for 23A vs 23B:** primary = val_bpb; tiebreaker = K=128 Δ (smaller is better — measures FP-quality preservation across deep extrapolation, the property the gate-collapse pathology specifically broke). If both improve val_bpb but B has cleaner K=128 behavior, prefer B. If A has both cleaner val_bpb AND comparable K=128, prefer A on Occam grounds (fewer ops).
+
+**Iter 24/25/26 (old plan) — DROPPED as not principled** (user feedback 2026-04-14):
+- *Per-iteration α schedule (K learnable scalars):* if 23A works, schedule is unnecessary by definition; if 23B works, residual already encodes per-iter signal. Defeats the purpose of 23A/B.
+- *Multi-scale dim-wise α:* `α[d] · B(...)[d] = (diag(α) @ B)(...)[d]` is mathematically redundant with B — the optimizer can already absorb α[d] into B. Splits one DoF into two with no new expressiveness.
+- *Dual x0 + x0_refined in refinement:* only conditionally principled; needs an observed failure mode in soft-embed averaging to motivate. Not a general improvement.
+
+**Iter 24 (new plan) — projection capacity sweep** (only if 23A/B are marginal; skip if clean win):
+
+| Sub-iter | Form | Projection DoF | Question |
 |---|---|---|---|
-| **23** | Per-iteration injection schedule (K learnable scalars) | H24 — decouple bootstrap vs late-iter injection | Phase 4.5 |
-| **24** | Residual injection: inject (x0 - z_in) error signal | H25 — self-regulating input-dependence | Phase 4.5 |
-| **25** | Injection floor: clamp inj_gate ≥ 0.05 | H23 — minimal fix to ensure input-dependence persists | Phase 4.5 |
-| **26** | Multi-scale injection (per-iter dim-wise gating on x0) | H26 — coarse early, fine late | iter 23-25 best |
-| **27** | Refinement soft-embed injection during DEQ solve | H27 — dual x0 + x0_refined injection | iter 23-25 best |
+| **24c-min** | `α · LN(x0)` (no A, no B) — α IS needed here (no matrix to absorb), learnable with reg toward 0.1 | 1 (scalar α) | Is *any* projection needed? Or does raw normalized x0 suffice? |
+| **24c-mid** | `B(A(LN(x0)))`, rank = kv_latent_dim (current) — no α | 2·D·r | Baseline reference |
+| **24c-max** | `C(LN(x0))` with single full-rank C (D×D) — no α | D² | Does full-rank projection help? Single D×D is mathematically equivalent to full-rank B(A(·)) (since B@A collapses to one D×D matrix when both are full-rank) but uses **half the params** — strictly better for efficiency. |
+
+If 24c-min ≈ 24c-mid → drop B (and A) entirely on Occam grounds. If 24c-max ≫ 24c-mid → projection capacity is bottlenecked, raise rank. Otherwise keep current rank.
+
+After Phase 5 closes (winner of 23A/23B, optionally with 24c result), proceed directly to Phase 6 (training objectives).
+
+### Phase 5c: DEQ-theoretic iterations (user-directed 2026-04-15)
+
+Three principled DEQ improvements queued. User policy: "keep trying β and MON — if it doesn't work, try other optimizations first, then come back."
+
+| Iter | Change | Why | Risk |
+|---|---|---|---|
+| **25-learnable-β** | β: scalar 0.20 → per-channel `R^D` vector via `sigmoid(raw_β)`; init fill 0.20 | Different channels have different contraction needs — aggressive β for stable channels, conservative for unstable. RevDEQ reversibility preserved (element-wise division). | +768 params/block. If fails, retry with (a) per-layer not per-channel, (b) softplus clamp not sigmoid, (c) MLP-gated β |
+| **26-PSD-expert-layers** | Parameterize `expert_out` + `expert_down` (dominant-spectral-path linear maps) as PSD `W = L·L^T` | **Inductive-bias only, NOT a MON theoretical guarantee.** See footnote below. | If fails, retry variants: (a) shifted-PSD `W = (ε·I + L·L^T)/(c + \|\|L\|\|²)` adding spectral-norm bound, (b) only `expert_down` PSD, (c) smaller L rank |
+
+**Footnote on iter 26 — theoretical status:**
+
+Partial PSD parameterization of `expert_out`/`expert_down` does **NOT** invoke any MON theorem guarantee. The MON theorem requires the *entire operator* `f(z, x) = σ(W·z + U·x + b)` to have that specific single-layer form with `I - W` shifted-PSD. Our block is `f(z, x0) = 0.5·(attn_mix(z) + mlp_mix(z))` which includes softmax attention, MoE soft routing, LeakyReLU² (non-monotone), and gated attention — none of which fit MON's operator form. Even if `expert_out = L·L^T` (PSD), the Jacobian `J_f` has the form `Σ_e [∂w_e/∂z·expert_out_e·(...) + w_e·expert_out_e·∂(path)/∂z]`, and the product of PSD with non-monotone matrices is **not** monotone. Monotonicity does NOT compose.
+
+What iter 26 actually buys:
+- ✓ Nonneg-eigenvalue direction structure on those specific matrices (aesthetic / regularizer)
+- ✓ Reduced parameter dimensionality
+- ✗ NO unique FP guarantee
+- ✗ NO unconditional convergence guarantee
+- ✗ NO spectral norm bound (PSD has eigenvalues in [0, ∞) — unbounded above)
+- ✗ NO global Lipschitz / contraction guarantee
+
+For a real MON guarantee on our architecture, we'd need either (a) to restructure an entire block component into the `σ(Wz + Ux + b)` form, (b) to replace the block with vanilla MonDEQ (loses MoE/MLA), or (c) to apply layer-wise spectral-norm bounds everywhere (the "hacky" approach, done systematically).
+
+**Treat iter 26 as an empirical experiment in architectural inductive bias**, not a theoretical upgrade. Expected value: PSD constraint may improve K-sweep flatness by shaping the dominant-path spectrum; may also regress val_bpb by reducing model capacity. Pure empirical question.
+| **27-TBPTT** | RevDEQFunction.backward: detach z at iter K-k, only gradient-propagate through last k of K iters | Throughput saving (backward ~75% at k=4/K=16). With 23C's stable FP, early-iter grads may be near-redundant. | If task perf regresses, retry at different k values |
+
+### Phase 5d: Code hygiene sweep (from feedback review 2026-04-15)
+
+Priority bugs/fixes not blocking arch iters — can run in parallel / between training runs:
+
+| # | Fix | Priority |
+|---|---|---|
+| 5.5 | `experiments/smoke_test.py` `_load_real_data` reads shard 256×int32 header as int16 tokens → garbage. Replace with `load_data_shard()` (matches train loader). | **Bug, fix now** |
+| 5.4 | `tests/test_post_int6_helpers.py` + `tests/test_gate_init_defaults.py` + `experiments/test_input_injection_hypernet.py` reference removed `inj_gate`/`gg_gate`. Delete or rewrite for always-on state. | **Bug, fix now** |
+| 5.3 | Emit a single canonical `final_postquant val_bpb:X` line in train_gpt.py; update `plot_metrics.py:154` + `update_results.sh:152` to read it (or from `meta.json[val_bpb]`). Last `val_bpb:` match currently hits K-sweep tail, not scored full-val. | **Fix now** |
+| 5.6 | `zstandard` is an env prerequisite (already in requirements.txt; do **not** modify dependency files). Code path: try `import zstandard` first, then fallback to `lzma` (not `zlib` — worse ratio, risks 16MB blow). | High |
+| 5.1 | Update old CLAUDE.md/comment thresholds to match current relaxed gates (min_share < 0.01, ortho > 0.9, no CV gate). The strict thresholds are stale from pre-val_bpb-primary era. | Medium |
+| 5.2 | Router health constraints: enforce on BOTH attn+mlp separately; align `plot_eval_metrics.py:186` keys. | Medium |
+| 5.7 | Add `--diagnostics={0,1}` flag. Competition default 0 skips full_weights_save + K-sweep + plot subprocesses; dev default 1 keeps current. Important for 600s competition budget. | Medium (before 8×H100 final) |
+| 5.8 | Muon's allreduce on top of DDP grad allreduce is redundant bandwidth. Switch Muon to `broadcast-from-owner` per-shard, or drop DDP reduction where Muon handles. | Low (defer; Phase 4.4 throughput was front-loaded) |
 
 ### Phase 6: Training objectives + activation
 
@@ -492,14 +608,14 @@ VERIFIED or RESOLVED hypothesis from this document.
 
 | Failure category | Prescribed fix | Hypothesis |
 |---|---|---|
-| dead_expert (min_share < 0.01) | `muon_weight_decay × 1.5` + `balance_mult × 1.5` (cap WD 1.44) | H9 VERIFIED, H5 RESOLVED |
-| expert_collapse (attn/mlp ortho > 0.9) | `muon_weight_decay × 1.5`, else drop num_experts by 1 step | H5 RESOLVED |
+| dead_expert (min_share < 0.01) | `weight_decay × 1.5` + `balance_mult × 1.5` (cap WD 1.44; applied to both Muon and AdamW groups) | H9 VERIFIED, H5 RESOLVED |
+| expert_collapse (attn/mlp ortho > 0.9) | `weight_decay × 1.5`, else drop num_experts by 1 step | H5 RESOLVED |
 | mos_head_collapse (mos_* ortho > 0.9) | `mos_ortho_out_coef × 1.5`, else shrink mos_rank | separate from expert_collapse: MoS head count is structural, not tunable |
 | injection_collapse (inj_max < 0.05 or inj_mean < 0.01) | Apply Phase 5 iter 24/22 (injection floor / per-iter schedule) | H23 PROPOSED |
 | gate_collapsed (gg_max < 0.3) | Verify post_norm on; else `deq_beta - 0.05` | H20 VERIFIED |
 | gate_saturated (gg_min > 0.95) | `deq_beta + 0.05` (smaller per-iter update) | H18 VERIFIED |
 | fp_quality_loss (K-sweep degradation Δ > 0.1) | Widen K jitter (`deq_k_max + 4`); fix injection first if also flagged | H12 VERIFIED, H23 PROPOSED |
-| solver_divergence (iter_conv_rel > 0.1) | `muon_weight_decay × 1.5` (H9) or `deq_beta - 0.05` (H18) | H9 + H18 |
+| solver_divergence (iter_conv_rel > 0.1) | `weight_decay × 1.5` (H9) or `deq_beta - 0.05` (H18) | H9 + H18 |
 | reversibility_broken (deq_recon_err > 1.0) | Check for randomness in block (H15 REFUTED quant-noise); `deq_beta - 0.05`; `WD × 1.5` | fundamental — RevDEQ requires deterministic f + stable contraction |
 
 **Retry protocol:**

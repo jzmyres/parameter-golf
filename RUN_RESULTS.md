@@ -8,11 +8,11 @@ Baseline vs current plots are sourced from:
 - Baseline: `experiments/training_logs/baseline.log`
 - Current: `experiments/training_logs/current.log`
 
-### Discarded (kept for note only)
-- `experiments/training_logs/discarded_resid_gate_20260403_033804.log`: post-quant `val_bpb=1.53627464` (worse)
-
-### Baseline (kept)
-- `experiments/training_logs/baseline.log`: post-quant `val_bpb=1.47009552`
+To extract the latest scored metric from a log:
+```bash
+grep "val_bpb:" experiments/training_logs/baseline.log | tail -1
+grep "val_bpb:" experiments/training_logs/current.log | tail -1
+```
 
 ## Pending Run
 

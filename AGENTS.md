@@ -46,7 +46,7 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 5. `git commit -m "experiment: <description>"`
 6. Run training: redirect to `experiments/training_logs/current.log`
 7. Extract: `grep "val_bpb:\|peak_vram_mb:\|artifact.*bytes" experiments/training_logs/current.log`
-8. Log to `experiments/results.tsv`
+8. Log to `results.tsv` (untracked)
 9. Run `python experiments/plot_metrics.py` and `python experiments/plot_progress.py` to update plots
 10. If improved AND artifact <= 16MB:
     - Run `/simplify` skill
@@ -65,7 +65,7 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 
 ### Never
 - Never modify evaluation or data loading code
-- Never commit `results.tsv` (keep untracked)
+- Never commit `results.tsv` or `run.log` (keep untracked)
 - Never skip TDD — tests before implementation
 - Never skip `/simplify` before committing successful experiments
 - Never introduce GPU-count-specific code without proper DDP guards
@@ -74,7 +74,7 @@ Start from the converged consensus config of the top 3 leaderboard entries (docu
 ## Git Convention
 - Branch: `autoresearch/<tag>`
 - Commit prefix: `experiment:` for experiments, `fix:` for bug fixes
-- Results.tsv is untracked — git is the experiment history
+- `results.tsv` is untracked — git is the experiment history
 
 ## Crash Recovery
 - Read `tail -n 50 run.log` for stack trace

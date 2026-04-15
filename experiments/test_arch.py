@@ -7,10 +7,6 @@ import torch
 def _get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def _sigmoid(x: torch.Tensor) -> torch.Tensor:
-    return 1 / (1 + (-x).exp())
-
-
 def _make_model(**overrides):
     from train_gpt import GPT
     defaults = dict(
@@ -31,16 +27,26 @@ def _make_model(**overrides):
 
 def test_all_constraints():
     """Test that all 5 constraints are satisfied."""
-    model = _make_model()
+    # Anchor against the configured num_experts to catch silent drift between
+    # Hyperparameters / GPT.__init__ / Block / MLP / CSA defaults (CLAUDE.md
+    # "Config Single-Source-of-Truth").  Override to a small value here so
+    # CPU-only smoke runs stay fast; the assertion still pins the chain.
+    expected_E = 4
+    model = _make_model(num_experts=expected_E)
 
     # Check constraint #1: RevDEQ
     assert model.shared_block is not None, "Must have shared_block (RevDEQ)"
     assert model.blocks is None, "blocks should be None in DEQ mode"
     assert hasattr(model, 'deq_beta'), "Must have deq_beta relaxation parameter"
+    assert model.num_experts == expected_E, (
+        f"GPT.num_experts must mirror the constructor arg, got {model.num_experts}"
+    )
 
     # Check constraint #3: MLA with Gated Attention
     attn = model.shared_block.attn
-    assert attn.num_experts == 6, f"Attention must use 6 experts, got {attn.num_experts}"
+    assert attn.num_experts == model.num_experts, (
+        f"CSA must inherit num_experts from GPT, got {attn.num_experts} vs {model.num_experts}"
+    )
     assert hasattr(attn, 'c_kv_down'), "Must have KV compression (MLA)"
     assert hasattr(attn, 'c_k_nope'), "Must have non-RoPE key decompress"
     assert hasattr(attn, 'c_k_rope'), "Must have decoupled RoPE key"
@@ -48,7 +54,9 @@ def test_all_constraints():
 
     # Check constraint #2: Soft Dense Routing (Dense MoE)
     mlp = model.shared_block.mlp
-    assert mlp.num_experts == 6, f"MLP must use 6 experts, got {mlp.num_experts}"
+    assert mlp.num_experts == model.num_experts, (
+        f"MLP must inherit num_experts from GPT, got {mlp.num_experts} vs {model.num_experts}"
+    )
     assert hasattr(mlp, 'expert_gate'), "Must have expert_gate (3D per-expert params)"
     assert hasattr(mlp, 'expert_fc'), "Must have expert_fc (3D per-expert params)"
     assert hasattr(mlp, 'expert_down'), "Must have expert_down (3D per-expert params)"

@@ -30,41 +30,46 @@ Challenge: March 18 – April 30, 2026. Prize: $1M in OpenAI compute credits.
   - TSUEmbedding: low-rank V→rank→d_model via SVD init
 
 ## Current SOTA
-val_bpb = 1.1194 (abaybektursun, 2026-03-23)
-Key techniques: LeakyReLU(0.5)², TTT, Parallel Muon, XSA, GPTQ-lite, EMA
+- **Leaderboard SOTA**: val_bpb = 1.1194 (abaybektursun, 2026-03-23). Key techniques: LeakyReLU(0.5)², TTT, Parallel Muon, XSA, GPTQ-lite, EMA. **Reference only** — our autoresearch baseline is independent.
+- **This repo's working baseline** (true int6, dev hardware): tracked in `experiments/hypotheses.md` (latest promoted iter row). Update this line in the same commit that promotes a new baseline.
 
 ## Training Budget
 - **8xH100 SXM (competition)**: 600 seconds (10 min) — original competition constraint
 - **2xL40S (dev)**: 1200 seconds (20 min) — relaxed for development hardware
 
-## Converged Best-Known Config (Iteration 0 Baseline)
-This is the consensus of the top 3 leaderboard entries. Use as starting point.
+## Current Architecture (single source of truth: `train_gpt.py` `Hyperparameters`)
+The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you edit one, edit the other in the same commit (see "Config Single-Source-of-Truth" under Development Practices).
 
 ### Architecture
 | Parameter | Value |
 |---|---|
-| num_layers | 10 |
-| model_dim | 512 |
+| num_layers | 12 |
+| model_dim | 768 |
 | num_heads | 8 |
 | num_kv_heads | 4 |
-| mlp_mult | 3 (hidden=1536) |
+| num_experts | 8 |
+| mlp_mult | 3.0 (hidden = 768 × 3 / num_experts via low-rank experts) |
 | train_seq_len | 2048 |
-| train_batch_tokens | 786,432 |
+| train_batch_tokens | 524,288 |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
+| deq_beta | 0.20 |
+| num_refinements | 1 |
 
 ### Optimizer
 | Parameter | Value |
 |---|---|
-| matrix_lr | 0.02 |
+| matrix_lr | 0.022 |
 | scalar_lr | 0.02 |
+| router_lr | 0.005 |
 | tied_embed_lr | 0.03 |
+| embed_lr | 0.6 |
 | muon_momentum | 0.99 |
-| momentum_warmup_start | 0.92 |
-| momentum_warmup_steps | 1500 |
-| muon_weight_decay | 0.04 |
+| muon_momentum_warmup_start | 0.92 |
+| muon_momentum_warmup_steps | 800 |
+| weight_decay | 1.08 (iter 24; applied to both AdamW and Muon param groups) |
 | grad_clip_norm | 0.3 |
-| warmdown_iters | 3000 |
+| warmdown_frac | 0.72 |
 
 ### Quantization & Techniques
 - int6 per-row quantization + zstd-22 compression
@@ -298,6 +303,17 @@ Before EVERY commit, run this chain:
 - A 0.001 bpb improvement adding 20 lines of hacky code? Probably not worth it
 - Removing code and getting equal results? Definitely keep
 - Favor removing complexity over adding it
+
+### Config Single-Source-of-Truth
+Every tunable architectural knob (`num_layers`, `num_heads`, `num_experts`, `model_dim`, `mlp_mult`, ranks, etc.) MUST appear exactly once — in `train_gpt.py`'s `Hyperparameters` class — and be plumbed from there to every constructor. Defaults inside sub-module `__init__` signatures are allowed only as a fallback; the authoritative value for any run is `Hyperparameters.<field>`.
+
+Rules:
+1. **Add to Hyperparameters first**, then thread through `GPT.__init__` → `Block.__init__` → leaf modules. Never introduce a new knob whose only home is a constructor default.
+2. **Tests assert against the config, not a literal**. `assert model.num_experts == args.num_experts` is allowed; `assert model.num_experts == 6` (or `>= 2`) is forbidden — the first catches drift, the second hides it.
+3. **CLAUDE.md "Current Architecture" table is mirror-only**. Edits to `Hyperparameters` and edits to that table MUST land in the same commit. Do not update one without the other.
+4. **`opg_doc.tex` §2.1 and the "Current SOTA"/"working baseline" lines are dated artifacts**. A PR that mutates `Block.forward`, the DEQ equation, or the promoted baseline MUST update these in the same commit, or open a `TODO(paper)` ticket noting the divergence.
+
+Rationale (incident from 2026-04-15 review): five drift defects shipped together — a stale 27b comment in iter 27d code, CLAUDE.md's config table two phases behind real code, `num_experts` hardcoded in three classes, a test silently relaxed from `== 6` to `>= 2`, and `opg_doc.tex` describing a removed `gg_gate`. All five share one root cause: configuration was duplicated across files with no single source of truth, so each editor only updated the file in front of them. This subsection codifies the fix.
 
 ## Submission Process (when ready)
 1. Run 3 seeds (e.g., 42, 1337, 2024) on 8xH100

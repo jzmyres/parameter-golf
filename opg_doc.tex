@@ -20,9 +20,9 @@
   rulecolor=\color{black!20},
 }
 
-\title{OPG (parameter-golf): Forward Pass and Losses\\\small Two nested loops: self-refinement and RevDEQ}
+\title{OPG (parameter-golf): Forward Pass and Losses\\\small RevDEQ backbone + dense soft routing + MLA/gated attention + MoS/FSQ + self-refinement}
 \author{Code-aligned documentation for \texttt{train\_gpt.py}}
-\date{2026-04-03}
+\date{2026-04-15}
 
 \begin{document}
 \maketitle
@@ -38,21 +38,27 @@ function. The specification below is intended to be self-contained and auditable
 \tableofcontents
 \newpage
 
-\section{Practical defaults (throughput on 2$\times$A100 DDP)}
+\section{Practical defaults (code defaults; throughput-oriented)}
 \label{sec:throughput}
 \paragraph{Goal.}
-For local iteration on this dev box (2$\times$A100 with DDP), the code defaults are chosen to maximize
-\emph{tokens/second} while keeping behavior identical to the training/eval pipeline.
+The defaults in \texttt{Hyperparameters} are throughput-oriented while maintaining DDP correctness and evaluation parity.
+Some knobs are \emph{time-gated} (refinement, router health scaling) to reduce early instability and emphasize final health.
 
-\paragraph{Defaults (as of 2026-04-06).}
+\paragraph{Defaults (as of 2026-04-15).}
 \begin{itemize}
-  \item \texttt{train\_batch\_tokens = 65536} (conservative throughput default on 2$\times$A100; larger batches require stability retuning).
-  \item \texttt{compile\_train = 0} by default: \texttt{torch.compile} was empirically much slower for the shared RevDEQ block on 2$\times$A100.
-  \item K-jitter uses a shuffle-bag over \texttt{[deq\_k\_min, deq\_k\_max]} with \textbf{no ramp} by default (stable from step 1).
+  \item \texttt{train\_batch\_tokens = 524288}, \texttt{train\_seq\_len = 2048} (global tokens/step; per-rank tokens scale with world size).
+  \item \texttt{torch.compile(shared\_block, dynamic=False)} is attempted by default for throughput; it is skipped only when
+        running DDP with \texttt{deq\_backward="unroll"} (compile+DDP+unroll incompatibility in current PyTorch).
+  \item DEQ iteration count uses K-jitter by default: a shuffle-bag over \texttt{deq\_k\_jitter\_set=(4,8,16)} with broadcast from rank 0 each step.
+  \item Self-refinement is ramped in late: \texttt{num\_refinements} is set to 0 until \texttt{time\_frac} exceeds
+        \texttt{num\_refinements\_ramp\_frac} (default 0.85), then enabled and the refinement mixing coefficient ramps up.
+  \item Router health pressure increases late: \texttt{health\_scale} ramps linearly from 1.0 to 5.0 over the final 30\% of wallclock
+        (from \texttt{time\_frac}=0.70 to 1.00).
 \end{itemize}
 
-\paragraph{Optional compile path.}
-\texttt{compile\_train=1} remains supported for experimentation, but is not the throughput default on 2$\times$A100.
+\paragraph{Terminology note.}
+The script uses \texttt{num\_layers} as the default DEQ iteration count $K$; it is not a stack of distinct blocks.
+The backbone is a \emph{single shared} transformer block iterated $K$ times inside the RevDEQ solver.
 
 \section{Notation (shapes and conventions)}
 \paragraph{Discrete inputs and targets.}
@@ -70,6 +76,14 @@ The model operates on:
 \[
   x_0 \in \mathbb{R}^{B\times T\times d}\quad\text{(input embedding to the backbone)},\qquad
   z \in \mathbb{R}^{B\times T\times d}\quad\text{(hidden state)}.
+\]
+
+\paragraph{Normalization notation.}
+The code uses both parameter-free RMS normalization (\texttt{F.rms\_norm} via \texttt{\_rms\_norm}) and learnable RMSNorm modules
+(\texttt{RMSNorm}, with an elementwise weight). In the math below, we write:
+\[
+  \mathrm{rms\_norm}(\cdot)\ \text{for parameter-free normalization},\qquad
+  \mathrm{RMSNorm}(\cdot)\ \text{for a learnable RMSNorm module}.
 \]
 
 \paragraph{Distributions.}
@@ -107,23 +121,25 @@ Training losses are computed \emph{only on the final output} after the last refi
 Inputs: token IDs x [B,T], targets y [B,T]
 Hyperparams: R=num_refinements, K=num_layers, beta=deq_beta
 
-# 1) Base input embedding (SmearGate is identity / removed)
-x0^(0) = RMSNorm( Emb(x) + BigramHashEmb(x) )   # BigramHashEmb may be disabled
+# 1) Base input embedding
+x0^(0) = rms_norm( Emb(x) + BigramHashEmb(x) )   # BigramHashEmb may be disabled
 prev_soft = x0^(0)
 z_init = x0^(0)
 
 for r = 0..R:
   if r > 0:
-    # No-grad: predict -> prob dist -> soft embed
+    # No-grad: predict -> prob dist -> soft embed (topk=64)
     p_mix = MixProb( p_CTP(z^(r-1)), Shift(p_NTP(z^(r-1))) )
-    soft = SoftEmbedTopK(p_mix, E)             # RMSNorm applied inside
-    x0^(r) = 0.5 * soft + 0.5 * prev_soft      # EMA coupling
+    soft = SoftEmbedTopK(p_mix, E, topk=64)     # rms_norm applied inside
+    alpha = refine_mix_alpha in [0, 0.5]        # ramps up when refinement enabled
+    x0^(r) = alpha * soft + (1-alpha) * prev_soft
     prev_soft = stopgrad(x0^(r))
-    z_init = x0^(r)                            # warm start from refined input
+    z_init = x0^(r)                             # warm start from refined input
   else:
     x0^(0) already defined
 
-  z^(r) = RevDEQ_Solve( f_theta, x0^(r), z_init, beta, K )
+  K_eff = (_deq_k_override if set else K)       # jitters during training; fixed for eval
+  z^(r) = RevDEQ_Solve( f_theta, x0^(r), z_init, beta, K_eff )
 
 # 2) Final head
 h = RMSNorm(z^(R))
@@ -174,7 +190,7 @@ The implementation still applies NaN/Inf guarding.
 \subsection{Soft embedding from a top-$\kappa$ approximation}
 \label{sec:softembed}
 The code approximates the expected embedding under $p_{\text{mix}}$ using a top-$\kappa$ truncation
-(default $\kappa=128$; notation uses $\kappa$ to avoid confusion with the DEQ iteration count $K$).
+(default $\kappa=64$; notation uses $\kappa$ to avoid confusion with the DEQ iteration count $K$).
 Let $\mathcal{S}_\kappa(t)$ be the indices of the top-$\kappa$ probabilities at position $t$.
 Define a renormalized distribution over $\mathcal{S}_\kappa(t)$:
 \[
@@ -188,12 +204,13 @@ The soft embedding is the expected embedding under $\tilde p_{\text{mix}}$:
 \]
 Implementation note: the expected embedding is computed in chunks to avoid materializing a large $[B,T,\kappa,d]$ tensor.
 
-\subsection{EMA coupling (refinement state update)}
-Refinement updates the \emph{input embedding} for the next solve via an EMA:
+\subsection{Refinement coupling (input embedding update)}
+Refinement updates the \emph{input embedding} for the next solve by mixing the new soft embedding with the previous refined input:
 \[
-  x_0^{(r)} \;=\; \tfrac{1}{2}x_{\text{soft}}^{(r)} + \tfrac{1}{2}x_0^{(r-1)}.
+  x_0^{(r)} \;=\; \alpha\,x_{\text{soft}}^{(r)} + (1-\alpha)\,x_0^{(r-1)},
 \]
-The previous refined input is detached in code, so gradients do not flow through earlier refinement steps.
+where $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$ is ramped up when refinement is enabled.
+The previous refined input is detached in code (\texttt{prev\_soft = x0\_refined.detach()}), so gradients do not flow through earlier refinement steps.
 
 \paragraph{One-hot as a special case.}
 The $r=0$ embedding path corresponds to a delta distribution at each position
@@ -218,50 +235,83 @@ The solve returns the terminal state $z^{(r)}\equiv z_K^{(r)}$ and also tracks $
 \subsection{Backward modes (same forward)}
 The forward dynamics above are the same for both backward modes:
 \begin{itemize}
-  \item \texttt{deq\_backward=autograd}: explicit unroll retains activations and supports differentiable output-space regularizers.
-  \item \texttt{deq\_backward=revdeq}: uses a custom memory-efficient backward (\texttt{RevDEQFunction}) that reconstructs states in reverse.
+  \item \texttt{deq\_backward="unroll"} (alias: \texttt{"autograd"}): explicit unroll retains activations and supports differentiable output-space regularizers.
+  \item \texttt{deq\_backward="revdeq"}: uses a custom memory-efficient backward (\texttt{RevDEQFunction}) that reconstructs states in reverse.
     FP64 add/sub is used inside reconstruction for numerical stability; reconstruction error is logged only for this mode.
 \end{itemize}
 
 \section{Update function \texorpdfstring{$f_\theta(z,x_0)$}{f(z,x0)} (Block)}
 \label{sec:f_theta}
 
-\subsection{Input injection via a pooled scalar gate}
-The block injects $x_0$ into the current state using a \emph{pooled scalar} convex gate.
-Let $z_{\text{in}}$ denote the pre-injection state (identity anchor for the DEQ update).
-Define a pooled summary vector from normalized state:
+\subsection{Input injection via a token-local gate (experts only)}
+Let $z_{\text{in}}\in\mathbb{R}^{B\times T\times d}$ denote the current DEQ state and $x_0$ the (possibly refined) input embedding.
+The block computes a \emph{token-local} injection gate:
 \[
-  u \;=\; \mathbb{E}_{b,t}[\mathrm{RMSNorm}(z_{\text{in}})[b,t,:]] \in \mathbb{R}^d.
+  g_{\text{inj}} \;=\; \sigma(\mathrm{inj}( \mathrm{RMSNorm}(z_{\text{in}}))) \in (0,1)^{B\times T\times 1}.
 \]
-The injection gate is a learned scalar:
+Injection is applied only to the \emph{expert feature inputs} (not to routing decisions):
 \[
-  g_{\text{inj}} \;=\; \sigma(w_{\text{inj}}^\top u + b_{\text{inj}})\in(0,1),
+  x_{\text{router}} = z_{\text{in}},\qquad
+  x_{\text{expert}} = z_{\text{in}} + g_{\text{inj}}\odot x_0.
 \]
-and injection is a convex update written additively:
-\[
-  x \;=\; z_{\text{in}} + g_{\text{inj}}(x_0 - z_{\text{in}}).
-\]
-This keeps the injection cost small and stable under DEQ iteration while anchoring the solve to the token embedding.
+Routers read $x_{\text{router}}$ (state-only). Experts read $x_{\text{expert}}$ (state + gated embedding).
 
 \subsection{Component-level dense routing (Soft Dense Routing)}
 The block contains two dense MoE components: attention and MLP. Each has its own router.
-For a router input $h\in\mathbb{R}^d$, routing weights are:
+For a \emph{normalized} router input $h_n\in\mathbb{R}^d$ (in code, produced by a learnable \texttt{RMSNorm} in the block),
+routing weights are:
 \[
-  w(h) \;=\; \mathrm{softmax}(\ell(h))\in\Delta^{E-1},
+  w(h_n) \;=\; \mathrm{softmax}\big(W_r\,h_n + b_{\text{expert}} + \log\sigma(W_g\,h_n+b_g)\big)\in\Delta^{E-1},
 \]
 so $w\in\mathbb{R}_{\ge 0}^{E}$ and $\sum_{e=1}^{E} w_e = 1$ (pure softmax; no post-softmax sigmoid gating).
 All experts process all tokens; the routed update is the convex mixture of expert outputs.
 
-\subsection{Global residual gate for contraction}
-The block computes a per-token global gate $g_g(x)\in(0,1)$ from the normalized attention input:
+\paragraph{Training-time router losses.}
+Let $\bar w=\mathbb{E}_{b,t}[w_{b,t}]$. Each router tracks:
 \[
-  g_g(x)\;=\;\sigma(\mathrm{gg}(\mathrm{RMSNorm}(x)))\in(0,1).
+  L_{\text{bal}}=\left\|\bar w-\tfrac{1}{E}\mathbf{1}\right\|_2^2,
 \]
-Let $z_2$ be the post-attention+MLP residual result. The block update is:
+and a ``health'' barrier term that targets the final-only constraints (min-share and CV):
 \[
-  f_\theta(z_{\text{in}},x_0)\;=\;(1-g_g)\,z_{\text{in}} + g_g\,z_2.
+  L_{\text{health}}=\mathrm{health\_scale}\Big(
+    \lambda_{\min}\,\mathbb{E}_e\big[\max(0,\tfrac{0.6}{E}-\bar w_e)^2\big]
+    + \lambda_{\mathrm{cv}}\, \max(0,\mathrm{CV}(\bar w)-0.20)^2
+  \Big),
 \]
-This provides an explicit, logged knob for fixed-point behavior; convergence is monitored but not a hard constraint.
+where $\lambda_{\min}$ and $\lambda_{\mathrm{cv}}$ are router-specific weights (attention and MLP use different values in code).
+(\texttt{health\_scale} ramps up late in wallclock.) Additionally, an out-of-graph bias controller updates
+\texttt{expert\_bias} toward a target distribution that boosts experts below the min-share threshold.
+
+\subsection{Parallel attention + MLP update (no learned residual gate)}
+The block computes attention and MLP updates from the same pre-residual input and adds them:
+\[
+  z_2 \;=\; \mathrm{Norm}_{\text{attn}}(\Delta_{\text{attn}}) + \mathrm{Norm}_{\text{mlp}}(\Delta_{\text{mlp}}),
+\]
+then emits
+\[
+  f_\theta(z_{\text{in}},x_0)\;=\;\mathrm{RMSNorm}_{\text{post}}\!\left(0.5\,z_2\right).
+\]
+There is no learned ``gg'' residual gate in the current code; a constant-1.0 ``gg'' diagnostic is kept only for backward-compatible logging.
+
+\subsection{MLA + gated attention (within $\Delta_{\text{attn}}$)}
+\label{sec:mla}
+The attention module is ``MLA-style'': it compresses K/V through a latent projection and uses a decoupled RoPE path.
+From normalized input $u=\mathrm{RMSNorm}(x_{\text{expert}})$:
+\begin{itemize}
+  \item Queries: a single linear \texttt{c\_q} produces both $Q$ and per-head gate logits, then $Q$ is split into a RoPE slice and a no-RoPE slice.
+  \item Keys/values: \texttt{c\_kv\_down} produces a latent K/V; $K_{\text{noRoPE}}$ and $V$ come from the latent, while $K_{\text{RoPE}}$ is projected directly from $u$.
+  \item RoPE: apply rotary embedding only to the RoPE slices of $Q$ and $K$, then concatenate RoPE and no-RoPE parts.
+  \item SDPA: use \texttt{scaled\_dot\_product\_attention} in causal mode (GQA when \texttt{num\_kv\_heads != num\_heads}).
+  \item Gated attention: apply a head-specific sigmoid gate \emph{after} SDPA: $Y \leftarrow Y \odot \sigma(g_{\text{attn}} + b_{\text{gate}})$.
+  \item Post-SDPA norm: apply RMSNorm to the gated attention output before expert mixing.
+\end{itemize}
+
+\subsection{MLP expert bank (within $\Delta_{\text{mlp}}$)}
+The MLP path is an expert bank with a squared leaky-ReLU gate:
+\[
+  h = \mathrm{LeakyReLU}(xW_g;0.5)^2 \odot (xW_f),
+\]
+applied per expert, with per-expert RMSNorm on the hidden rank dimension before dense mixing and a per-expert down projection.
 
 \section{Heads and losses (training objective)}
 \label{sec:loss}
@@ -280,51 +330,48 @@ The script uses \texttt{F.nll\_loss} on the log-probabilities:
   L_{\text{NTP}} = \mathrm{NLL}(\log p_{\text{NTP}}, y),\qquad
   L_{\text{CTP}} = \mathrm{NLL}(\log p_{\text{CTP}}, x).
 \]
-The CTP weight scales with refinement steps:
+The CTP weight is gated by the refinement ramp (early training uses $R=0$):
 \[
-  \lambda_{\text{CTP}} = 0.1\,R.
+  \lambda_{\text{CTP}} = 0.05\,R\cdot \mathrm{clip}\!\left(\frac{\alpha}{0.5},\,0,\,1\right),
 \]
+where $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$ is the refinement mixing coefficient.
 
-\subsection{Router health loss (hard-constraint shaped)}
-Each router defines a per-token share distribution $w\in\Delta^{E-1}$. Let $\bar w=\mathbb{E}_{b,t}[w_{b,t}]$.
-The training-time router loss is a constraint-shaped combination:
+\subsection{MoSHead (CTP+NTP) + FSQ + auxiliary metrics}
+The head is a dual Mixture-of-Softmaxes with FSQ quantization in the low-rank space:
+\begin{itemize}
+  \item Each of CTP and NTP has a softmax gate over \texttt{num\_shared + num\_specialized} experts.
+  \item Each expert maps $h$ to a rank-$r$ vector, applies FSQ ($L$ levels) via a tanh bound + STE rounding, then projects to vocab logits.
+  \item The final distribution is a log-space mixture via \texttt{logaddexp} accumulation and renormalization.
+\end{itemize}
+The head also tracks (i) a balance loss on mean routing weights, and (ii) an orthogonality proxy used only if enabled by a coefficient.
+
+\subsection{Block orthogonality auxiliary loss (optional)}
+When enabled (periodically during training), the code computes a small auxiliary ``expert separation'' diagnostic on a short prefix
+of tokens (default 64): it estimates per-expert mean outputs for attention and MLP expert banks and computes a mean off-diagonal
+absolute cosine similarity. The loss is a soft barrier above 0.20:
 \[
-  L_{\text{bal}}=\left\|\bar w-\tfrac{1}{E}\mathbf{1}\right\|_2^2
-  \;+\; \lambda_{\min}\,\mathbb{E}_{e}\big[\max(0, \tfrac{0.6}{E}-\bar w_e)^2\big]
-  \;+\; \lambda_{\mathrm{cv}}\,\max(0, \mathrm{CV}(\bar w)-0.20)^2,
+  L_{\text{block-ortho-aux}}=\tfrac{1}{2}\Big(\max(0,o_{\text{attn}}-0.20)^2+\max(0,o_{\text{mlp}}-0.20)^2\Big).
 \]
-where $\mathrm{CV}(\bar w)=\mathrm{std}(\bar w)/\mathrm{mean}(\bar w)$. These soft barriers target the final-only hard constraints
-(min-share and CV) without over-regularizing already-healthy routing.
-Additionally, a loss-free bias controller updates router logits outside autograd to counteract collapse.
-In code, the barrier weights are multiplied by a late-phase scalar \texttt{health\_scale} to emphasize end-of-run constraint satisfaction.
-
-\paragraph{Router optimizer.}
-Router weight matrices are optimized with a separate AdamW group (\texttt{router\_lr}) instead of Muon, because routers are
-control modules whose sharpness strongly affects both expert health and DEQ stability.
-
-\subsection{Output-space orthogonality penalties (autograd-unroll only)}
-When \texttt{deq\_backward=autograd}, the model may add differentiable output-space orthogonality penalties for expert outputs.
-The tracked statistic is a mean off-diagonal absolute cosine similarity across experts:
-\[
-  \mathrm{Ortho}(o) \;=\; \mathbb{E}_{e\ne e'}\left[\,\left|\cos(o^{(e)}, o^{(e')})\right|\,\right].
-\]
-The loss includes weighted orthogonality terms for attention/MLP experts and for the MoS head (CTP + NTP).
 
 \subsection{Total loss returned by \texttt{GPT.forward}}
 The model returns:
 \[
   L \;=\; L_{\text{NTP}} + \lambda_{\text{CTP}}L_{\text{CTP}}
-  + \lambda_{\text{bal}}L_{\text{bal}} + \lambda_{\text{spar}}L_{\text{spar}}
+  + \lambda_{\text{bal}}L_{\text{bal}}
+  + \lambda_{\text{health}}L_{\text{health}}
   + \lambda_{\text{mos}}L_{\text{mos-ortho}}
-  + \lambda_{\text{attn}}L_{\text{attn-ortho}} + \lambda_{\text{mlp}}L_{\text{mlp-ortho}},
+  + \lambda_{\text{blk}}L_{\text{block-ortho-aux}},
 \]
-where $L_{\text{spar}}$ is currently a zero placeholder in code (hook for sparsity losses, not actively used).
-
-% Intermediate DEQ supervision is not used in the current training pipeline.
+where the coefficients match code:
 \[
-  L_{\text{sup}} \;=\; \sum_{k\in\mathcal{K}_{\text{sup}}} \omega_k\ \mathrm{NLL}(\log p_{\text{NTP}}(z_k), y),
+  \lambda_{\text{bal}}=\texttt{bal\_loss\_coef},\quad
+  \lambda_{\text{health}}=\texttt{router\_health\_coef},\quad
+  \lambda_{\text{mos}}=\texttt{mos\_ortho\_out\_coef},\quad
+  \lambda_{\text{blk}}=\texttt{block\_ortho\_aux\_coef}\cdot \texttt{\_block\_ortho\_aux\_coef\_scale}.
 \]
-and the returned loss includes $+\lambda_{\text{sup}}L_{\text{sup}}$.
+\paragraph{Balance aggregation detail.}
+In code, $L_{\text{bal}}$ includes (i) the attention-router and MLP-router MSE-to-uniform terms (weighted by \texttt{attn\_balance\_mult} and
+\texttt{mlp\_balance\_mult}), and (ii) an additional $50\times$ multiplier on the MoSHead balance loss to prevent dead head experts.
 
 \section{Symbol mapping (doc $\leftrightarrow$ code)}
 \begin{center}
@@ -335,11 +382,13 @@ Doc symbol & Code identifier \\
 $R$ & \texttt{GPT.num\_refinements} \\
 $K$ & \texttt{GPT.num\_layers} \\
 $\beta$ & \texttt{GPT.deq\_beta} \\
+$K_{\text{eff}}$ & \texttt{GPT.\_deq\_k\_override} (if set; else \texttt{num\_layers}) \\
 $x_0^{(r)}$ & \texttt{x0\_refined} inside \texttt{GPT.\_run\_backbone} \\
 $z^{(r)}$ & \texttt{z} returned by \texttt{GPT.\_deq\_solve} \\
 $f_\theta$ & \texttt{Block.forward(z, x0)} (\texttt{GPT.shared\_block}) \\
 $p_{\text{mix}}$ & \texttt{p\_mix} inside \texttt{GPT.\_get\_soft\_embedding} \\
-top-$\kappa$ & \texttt{GPT.\_get\_soft\_embedding(topk=...)} \\
+top-$\kappa$ & \texttt{GPT.\_get\_soft\_embedding(topk=...)} (default $\kappa=64$) \\
+$\alpha$ & \texttt{GPT.\_refine\_mix\_alpha} (ramped; $0\rightarrow 0.5$) \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -350,6 +399,14 @@ top-$\kappa$ & \texttt{GPT.\_get\_soft\_embedding(topk=...)} \\
 RevDEQ: Reversible Deep Equilibrium Models.
 \newblock arXiv:2509.12917.
 \newblock \url{https://arxiv.org/abs/2509.12917v1}
+\bibitem{dense_routing}
+Soft (dense) routing inspiration: Sparsely-Gated MoE routing with dense variants.
+\newblock arXiv:2308.00951.
+\newblock \url{https://arxiv.org/abs/2308.00951}
+\bibitem{gated_attn}
+Gated attention (head-wise output gating after SDPA).
+\newblock arXiv:2505.06708.
+\newblock \url{https://arxiv.org/abs/2505.06708}
 \end{thebibliography}
 
 \end{document}

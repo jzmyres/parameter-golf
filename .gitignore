@@ -11,6 +11,14 @@ data/docs_selected.jsonl
 logs/
 # Local scratch / agent state
 .remember/
+# Local run artifacts (never commit)
+results.tsv
+run.log
+run.pid
+.codex
+.claude/
+.nfs*
+records_baseline/
 # Autoresearch generated outputs
 final_model.*
 experiments/training_logs/
