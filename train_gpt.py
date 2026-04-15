@@ -1601,17 +1601,16 @@ class Block(nn.Module):
         return attn_ortho, mlp_ortho
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # Phase 5e-1 iter 27b-pos-expert-out: injection at P-expert-out.
-        # x0 is added inside mix_experts via inj_term=g_inj·x0, distributed
-        # as (inj_term/E) per-expert before sum.  Total contribution per
-        # mix call: inj_term (E·(inj_term/E)). Both attn_mix and mlp_mix
-        # receive the same inj_term, so net z2 += 2·inj_term.  Hypothesis:
-        # injecting closer to the expert output gives x0 a path that goes
-        # through routing weights without going through the full expert
-        # nonlinearity stack.
+        # Phase 5e-1 iter 27d-pos-expert-in: inject ONLY into expert inputs.
+        # Routers read clean z_in; experts receive z_in + g_inj·x0.  Mirror
+        # image of 27c (which did router-only).  Hypothesis: experts should
+        # see x0 (feature info) but routing decisions should be state-only
+        # (x0-independent).  This preserves x0 dependence of FP via the
+        # expert feature paths.
         g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
-        x = z_in
-        inj_term = g_inj * x0  # (B, T, D)
+        x = z_in                           # routers see clean z
+        x_expert_in = z_in + g_inj * x0    # experts see injected z
+        inj_term = None                    # no per-expert inj via mix_experts
 
         # Parallel residuals with the inner residual REMOVED.  Attention and
         # MLP both read the same pre-residual input x and their outputs sum
@@ -1624,17 +1623,19 @@ class Block(nn.Module):
         # margin; the optimizer can learn the gate to increase transformation
         # weight as training progresses, without the ~2x update-magnitude
         # blow-up that broke attempts 1 and 2.
-        x_attn = self.attn_norm(x)
-        w_attn = self.attn_router(x_attn, pre_normed=True)
+        x_attn_router = self.attn_norm(x)                   # router: clean
+        w_attn = self.attn_router(x_attn_router, pre_normed=True)
         # Capture attn router gate BEFORE mlp_router call overwrites it (tied router)
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
             attn_rg = getattr(self.attn_router, "_router_gate_last_mean", None)
+        x_attn = self.attn_norm(x_expert_in)                # experts: injected
         y_shared = self.attn._attn_shared_from_normed(x_attn)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn, inj_term=inj_term)
 
-        x_mlp = self.mlp_norm(x)
-        w_mlp = self.mlp_router(x_mlp, pre_normed=True)
+        x_mlp_router = self.mlp_norm(x)                      # router: clean
+        w_mlp = self.mlp_router(x_mlp_router, pre_normed=True)
+        x_mlp = self.mlp_norm(x_expert_in)                   # experts: injected
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
 
         # Phase 4.5 22-add-all: per-component post-norm after expert mix
