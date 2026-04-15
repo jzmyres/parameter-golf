@@ -153,7 +153,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.72  # locked: Phase 1 concluded WD=0.72 optimal (WD=1.44 too high, WD=0.36 too low for β=0.20)
+    weight_decay = 1.08  # iter 24: bumped 0.72 → 1.08 (× 1.5) to address persistent mos_ntp dead expert on 23C baseline
     tied_embed_init_std = 0.005
 
     # Routing
