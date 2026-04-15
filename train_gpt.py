@@ -184,6 +184,16 @@ class Hyperparameters:
     # gap.  Stay on revdeq+compile until compile+unroll compatibility is
     # resolved (queued as follow-up investigation).
     deq_backward = "revdeq"
+    # iter 28-tbptt: Truncated BPTT. Backward reconstructs only the last
+    # `deq_bptt_k` forward iterations; earlier iters contribute no gradient.
+    # 0 (or >= num_layers) = full BPTT.  Rationale: for a contractive DEQ,
+    # per-iter VJP magnitudes decay geometrically toward x0, so the last few
+    # iters should dominate the total param gradient.  If the hypothesis
+    # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
+    deq_bptt_k = 8  # iter 28b: milder truncation after k=4 FAILED. VJP
+    # ratio observed ≈ 0.77, so tail-4 captured only ~40% of gradient;
+    # tail-8 captures ~86% — expected ≤ 0.02 val_bpb regression with
+    # ~25% throughput gain (only K_fwd=16 steps are truncated).
     deq_k_jitter = True
     deq_k_min = 4
     deq_k_max = 16  # locked: Phase 1 (H12 VERIFIED — K jitter to max-train-K is the principled bound)
@@ -233,7 +243,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "block-ortho-aux-tokens", "bigram-vocab-size", "bigram-dim",
         "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
         "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
-        "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval",
+        "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
         "warmdown-frac", "num-refinements-ramp-frac",
     ]:
         py_name = name.replace("-", "_")
@@ -1703,7 +1713,7 @@ class RevDEQFunction(torch.autograd.Function):
             return contextlib.nullcontext()
 
     @staticmethod
-    def forward(ctx, f_theta, x0, z_init, beta, K, *params):
+    def forward(ctx, f_theta, x0, z_init, beta, K, bptt_k, *params):
         acc_dtype = torch.float64
         state_dtype = torch.float32
         compute_dtype = z_init.dtype
@@ -1749,6 +1759,7 @@ class RevDEQFunction(torch.autograd.Function):
         ctx.beta = beta
         ctx.beta_inv = beta_inv
         ctx.K = K
+        ctx.bptt_k = int(bptt_k) if bptt_k else 0
         ctx.compute_dtype = compute_dtype
         ctx.device_type = device_type
         ctx.params = params
@@ -1778,7 +1789,13 @@ class RevDEQFunction(torch.autograd.Function):
         y_next64 = y_terminal.to(acc_dtype)
         z_next64 = z_terminal.to(acc_dtype)
 
-        for _ in range(K):
+        bptt_k = int(getattr(ctx, "bptt_k", 0) or 0)
+        K_bwd = K if (bptt_k <= 0 or bptt_k >= K) else bptt_k
+        truncated = K_bwd < K
+        diag_vjp_per_iter: list[tuple[float, float]] = []
+        do_vjp_diag = bool(getattr(ctx, "do_recon_diag", False))
+
+        for _ in range(K_bwd):
             y_local = y_next64.detach().to(compute_dtype).requires_grad_()
             x_local = x0.detach().to(x0.dtype).requires_grad_()
             with torch.enable_grad():
@@ -1801,6 +1818,12 @@ class RevDEQFunction(torch.autograd.Function):
             grads_z = torch.autograd.grad(out_z, (z_local, x_local2, *params_req),
                                           grad_outputs=grad_seed_z, allow_unused=True)
             vjp_z = grads_z[0].to(state_dtype)
+
+            if do_vjp_diag:
+                diag_vjp_per_iter.append((
+                    float(vjp_y.norm().item()),
+                    float(vjp_z.norm().item()),
+                ))
 
             bar_z = beta_inv * bar_z + vjp_z
             bar_y = beta_inv * bar_y_acc
@@ -1831,14 +1854,27 @@ class RevDEQFunction(torch.autograd.Function):
             except Exception:
                 pass
 
-        z_init_grad = (bar_y + bar_z).to(x0.dtype)
+        # TBPTT: if we stopped before reaching iter 0, bar_y+bar_z live at an
+        # intermediate iter, not at z_init — zero the grad rather than inject
+        # a bogus signal into the embedding path.
+        if truncated:
+            z_init_grad = torch.zeros_like(x0)
+        else:
+            z_init_grad = (bar_y + bar_z).to(x0.dtype)
+        if do_vjp_diag and diag_vjp_per_iter:
+            try:
+                setattr(f_theta, "_tbptt_vjp_iter_last_bwd", diag_vjp_per_iter)
+                setattr(f_theta, "_tbptt_bwd_k_last", int(K_bwd))
+                setattr(f_theta, "_tbptt_fwd_k_last", int(K))
+            except Exception:
+                pass
         param_grads_out: list[torch.Tensor | None] = [None] * len(params_all)
         for j, all_idx in enumerate(req_indices):
             g = cur_param_grads_req[j]
             if g is None:
                 continue
             param_grads_out[all_idx] = g.to(dtype=params_all[all_idx].dtype)
-        return (None, cur_x_grad.to(x0.dtype), z_init_grad, None, None, *param_grads_out)
+        return (None, cur_x_grad.to(x0.dtype), z_init_grad, None, None, None, *param_grads_out)
 
 
 # ---------------------------------------------------------------------------
@@ -1856,7 +1892,8 @@ class GPT(nn.Module):
                  mlp_balance_mult: float = 1.0, bal_loss_coef: float = 5e-3,
                  router_health_coef: float = 0.25, mos_ortho_out_coef: float = 0.0,
                  attn_ortho_out_coef: float = 0.0, mlp_ortho_out_coef: float = 0.0,
-                 deq_backward: str = "revdeq", block_ortho_aux_coef: float = 0.0,
+                 deq_backward: str = "revdeq", deq_bptt_k: int = 0,
+                 block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
                  tie_attn_mlp_router: bool = False,  # iter 21: untied is the locked default
                  num_experts: int = 8):
@@ -1885,6 +1922,7 @@ class GPT(nn.Module):
         self.router_health_coef = float(router_health_coef)
         self.mos_ortho_out_coef = float(mos_ortho_out_coef)
         self.deq_backward = deq_backward
+        self.deq_bptt_k = int(deq_bptt_k)
         self.block_ortho_aux_coef = float(block_ortho_aux_coef)
         self.block_ortho_aux_every = int(block_ortho_aux_every)
         self.block_ortho_aux_tokens = int(block_ortho_aux_tokens)
@@ -1977,7 +2015,8 @@ class GPT(nn.Module):
             f_theta = self.shared_block
             if self.training and self.deq_backward == "revdeq":
                 params = tuple(p for p in sb.parameters() if p.requires_grad)
-                z, z_prev = RevDEQFunction.apply(f_theta, x0, z_init, beta, K, *params)
+                bptt_k = int(getattr(self, "deq_bptt_k", 0) or 0)
+                z, z_prev = RevDEQFunction.apply(f_theta, x0, z_init, beta, K, bptt_k, *params)
                 return z, z_prev, None, None
 
             # FP32 accumulators for the unrolled solver (eval + non-revdeq train).
@@ -2487,7 +2526,8 @@ def main() -> None:
         deq_beta=args.deq_beta, attn_balance_mult=args.attn_balance_mult,
         mlp_balance_mult=args.mlp_balance_mult, bal_loss_coef=args.bal_loss_coef,
         router_health_coef=args.router_health_coef, mos_ortho_out_coef=args.mos_ortho_out_coef,
-        deq_backward=args.deq_backward, block_ortho_aux_coef=args.block_ortho_aux_coef,
+        deq_backward=args.deq_backward, deq_bptt_k=args.deq_bptt_k,
+        block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         tie_attn_mlp_router=args.tie_attn_mlp_router,
         num_experts=args.num_experts,
@@ -2622,6 +2662,18 @@ def main() -> None:
         inj_iter = getattr(m, "_inj_iter_last_solve", None)
         if inj_iter is not None and len(inj_iter) > 0:
             parts.append(f"inj_iter:[{','.join(f'{v:.3f}' for v in inj_iter)}]")
+        # TBPTT: per-backward-iter VJP norms (index 0 = last forward iter).
+        # A steep decay confirms the gradient-scale hypothesis.
+        sb_for_vjp = getattr(m, "shared_block", None)
+        vjp_iter = getattr(sb_for_vjp, "_tbptt_vjp_iter_last_bwd", None) if sb_for_vjp is not None else None
+        if vjp_iter and len(vjp_iter) > 0:
+            # log vjp_y + vjp_z sum per backward iter for compactness
+            sums = [float(a) + float(b) for a, b in vjp_iter]
+            parts.append(f"tbptt_vjp:[{','.join(f'{v:.2e}' for v in sums)}]")
+            k_bwd = getattr(sb_for_vjp, "_tbptt_bwd_k_last", None)
+            k_fwd = getattr(sb_for_vjp, "_tbptt_fwd_k_last", None)
+            if k_bwd is not None and k_fwd is not None:
+                parts.append(f"tbptt_k:{int(k_bwd)}/{int(k_fwd)}")
         # Per-iteration attention gate trajectory
         ag_iter = getattr(m, "_attn_gate_iter_last_solve", None)
         if ag_iter is not None and len(ag_iter) > 0:
