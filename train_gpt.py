@@ -1544,8 +1544,13 @@ class Block(nn.Module):
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
+        # Phase 5e-1 iter 27a-pos-mix-out: ortho_aux mirrors the new
+        # injection position — z passes through transform unchanged.  The
+        # ortho diagnostic measures expert directionality, which is
+        # injection-position-invariant; we still compute g_inj here for
+        # diagnostic-tracking parity but x0 is NOT added before the experts.
         g_inj = self._inj_gate_from(z_sub).to(dtype=z_sub.dtype)
-        x = z_sub + g_inj * x0_sub  # additive injection (matches forward)
+        x = z_sub  # P-mix-out: experts see clean z
 
         x_attn = self.attn_norm(x)
         w_attn = self.attn_router(x_attn, pre_normed=True)
@@ -1581,15 +1586,15 @@ class Block(nn.Module):
         return attn_ortho, mlp_ortho
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
+        # Phase 5e-1 iter 27a-pos-mix-out: injection POSITION moved from
+        # P-begin to P-mix-out.  z passes through attn/mlp/experts unchanged
+        # by x0; x0 is added directly to the post-z2 raw_out at the end.
+        # Same gate computation (sigmoid·Linear·LN(z_in)) — only WHERE the
+        # x0 contribution enters the residual changes.  Hypothesis: bypass
+        # the transformation chain so x0 has a direct path to z*, possibly
+        # cleaner gradient flow to inj_gate.
         g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
-        # Iter 18: additive injection instead of lerp.
-        # Old (lerp): x = z_in + g_inj * (x0 - z_in) = (1-g_inj)*z_in + g_inj*x0
-        # New (additive): x = z_in + g_inj * x0
-        # Additive decouples z_in from x0: the model keeps ALL of z_in and
-        # ADDS a gated fraction of x0.  This gives cleaner gradient flow to
-        # z_in (no (1-g_inj) scaling) and lets the model decide the injection
-        # magnitude independently of how much z_in to preserve.
-        x = z_in + g_inj * x0
+        x = z_in  # P-mix-out: NO injection at begin
 
         # Parallel residuals with the inner residual REMOVED.  Attention and
         # MLP both read the same pre-residual input x and their outputs sum
@@ -1645,8 +1650,11 @@ class Block(nn.Module):
                 rg_vals.append(float(mlp_rg))
             if rg_vals:
                 self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
-        # Phase 5b iter 23C: non-residual update — transform replaces state.
-        raw_out = 0.5 * z2.to(dtype=z_in.dtype)
+        # Phase 5e-1 iter 27a-pos-mix-out: x0 added at P-mix-out (end), with
+        # the same gate as before.  This gives x0 a direct path to z* that
+        # bypasses the transform chain — testing whether late injection works
+        # better than the iter 23C P-begin position.
+        raw_out = 0.5 * z2.to(dtype=z_in.dtype) + g_inj * x0
         return self.post_norm(raw_out)  # iter 19: bound hidden state magnitude across DEQ iterations
 
 
