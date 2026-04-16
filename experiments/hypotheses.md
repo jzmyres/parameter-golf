@@ -103,6 +103,7 @@ The sparse gradient (only the worst pair updates per step) starved the routing d
 | `U` (inj_lin) | ✓ **CERTIFIED 1-Lip** via spectral_norm (iter 31, commit `e41dee9`) | §6.1 | done |
 | `attn_norm`/`mlp_norm` (state path) | ✓ **CERTIFIED 1-Lip** via Π_R ball projection R=2√d (iter 32, commit `5cff932`) | §4.1 | done |
 | `attn.expert_out`, `mlp.expert_down` (output expert matrices) | ✓ **CERTIFIED per-expert σ_max ≤ 1** via `PerExpertSpectralNormCap` (iter 33, commit `a14ac6e`) | §6.1 | done |
+| `attn.expert_proj`, `mlp.expert_gate`, `mlp.expert_fc` (input-side expert matrices) | ✓ **CERTIFIED per-expert σ_max ≤ 1** via `PerExpertSpectralNormCap` (iter 33b, commit `a8c0ffb`) — **all 5 expert banks now certified** | §6.1 | done |
 | `u = z + b(x_0)` | ✓ Lip=1 | §4.2 | — |
 | `attn_norm`/`mlp_norm` (learnable RMSNorm) | ✗ | §4.1 | Replace with `Π_R` |
 | `attn_router` (softmax of `Linear+logσ`) | ✗ (unbounded logits) | §4.3 | Use L2-distance or SIPS |
@@ -452,7 +453,7 @@ failure.
 | 31 | spectral-U | `‖U‖_2≤1` via `nn.utils.parametrizations.spectral_norm` (1 power iter/fwd) | §6.1 | **PROMOTED ★ (commit `e41dee9`)** | **1.9294** (+0.007 vs iter30) | **0.019** (≈ iter30's 0.018) |
 | 32 | pi_R-state | replace `attn_norm`, `mlp_norm` on state path with Π_R ball projection (R=2√d≈55.4). Post-mix norms deferred to later iter. | §4.1 | **PROMOTED ★ (commit `5cff932`)** | **1.9197** (-0.010 vs iter31) | **0.012** (tightest so far) |
 | 33 | spectral-experts | per-expert σ_max ≤ 1 via `PerExpertSpectralNormCap` on `attn.expert_out` and `mlp.expert_down` (output-side matrices) | §6.1, §6.6 | **PROMOTED ★ (commit `a14ac6e`)** | **1.9266** (+0.007 vs iter32) | **0.020** (≈ iter32's 0.012) |
-| 33b | spectral-experts-full | extend per-expert σ_max ≤ 1 to `attn.expert_proj`, `mlp.expert_gate`, `mlp.expert_fc` (input-side matrices); total 5 banks certified | §6.1 | queued | — | — |
+| 33b | spectral-experts-full | extend per-expert σ_max ≤ 1 to `attn.expert_proj`, `mlp.expert_gate`, `mlp.expert_fc` (input-side matrices); total 5 banks certified | §6.1 | **PROMOTED ★ (commit `a8c0ffb`)** | **1.9174** (-0.009 improvement!) | **0.016** (tighter) |
 | 34A | router-L2 | L2-distance router `s_j=tanh(-γ‖q-c_j‖²)` with γ bounded | §4.3 Option B | queued | — | — |
 | 34B | router-SIPS | SIPS `s_j=γ·φ(‖q‖)·ψ(‖k_j‖)·cos(q,k_j)` with γ bounded | §4.3 Option A | queued | — | — |
 | 35 | single-router | collapse attn/mlp routers into one `E=E_attn+E_mlp` pool | §4.3 | queued | — | — |

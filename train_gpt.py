@@ -168,6 +168,11 @@ class Hyperparameters:
     router_bias_update = True
     router_bias_lr = 0.10
     router_bias_clip = 10.0
+    # iter 34A (opg_doc.tex §4.3 Option B): router scoring mode.
+    #   "linear" = legacy `W_r x_n + b + log σ(W_g x_n)` (iter 30-33b baseline)
+    #   "l2"     = `tanh(-γ‖x_n − c_j‖²)` with learnable prototypes c_j,
+    #              1-Lipschitz scoring (this iter).
+    router_scoring = "l2"
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
     tie_attn_mlp_router = False
 
@@ -972,21 +977,43 @@ class BigramHashEmbedding(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SoftDenseRouter(nn.Module):
-    """Dense softmax routing over experts (no top-k, no dropping)."""
+    """Dense softmax routing over experts (no top-k, no dropping).
+
+    Two scoring modes (iter 34 A/B, opg_doc.tex §4.3):
+      - scoring='linear' (default, iter 30-33b baseline): logits =
+        `W_r x_n + b_expert + log σ(W_g x_n + b_g)` — unbounded Linear
+        over RMSNorm-ed input, gated by a sigmoid.  NOT 1-Lipschitz in
+        input.
+      - scoring='l2' (iter 34A): logits = `tanh(-γ‖x_n − c_j‖²)` using
+        learnable prototypes c_j ∈ R^dim.  1-Lipschitz in input under
+        bounded-state assumption (doc §4.3 Option B, §6.4) — tanh
+        saturation caps the composition's Lipschitz constant.  γ is
+        fixed at 1.0 initially (not learnable), can be promoted later.
+    """
     def __init__(self, dim: int, num_experts: int, *,
                  min_share_frac: float = 0.6, cv_target: float = 0.20,
-                 min_share_loss_weight: float = 1.0, cv_loss_weight: float = 0.10):
+                 min_share_loss_weight: float = 1.0, cv_loss_weight: float = 0.10,
+                 scoring: str = "linear"):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
         self.cv_target = float(cv_target)
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
+        self.scoring = str(scoring)
+        assert self.scoring in ("linear", "l2"), f"unknown scoring: {scoring}"
         # Tensor buffer to avoid Python-float guards inside torch.compile graphs.
         # Kept behind a property so legacy code/tests can assign `health_scale = 5.0`.
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
+        # L2-distance scoring: learnable prototypes c_j and fixed γ.  When
+        # scoring='linear', prototypes are unused (kept as a zero-init module
+        # attribute for state-dict compatibility).
+        self.prototypes = nn.Parameter(torch.empty(num_experts, dim))
+        with torch.no_grad():
+            nn.init.normal_(self.prototypes, std=0.02)
+        self.l2_gamma = 1.0
         self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32), persistent=True)
         # Input-dependent sigmoid gate on routing weights (iter 17, H14).
         # Init fully open: weight=0, bias=5.0 → sigmoid(5)≈0.993.
@@ -1046,7 +1073,19 @@ class SoftDenseRouter(nn.Module):
 
     def forward(self, x: Tensor, *, pre_normed: bool = False) -> Tensor:
         x_n = x if bool(pre_normed) else _rms_norm(x)
-        route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
+        if self.scoring == "l2":
+            # L2-distance logits (doc §4.3 Option B, §6.4):
+            #   s_j = tanh(-γ · ‖x_n − c_j‖²)
+            # 1-Lipschitz under tanh saturation; γ=1.0 fixed.
+            # x_n: (..., D), prototypes: (E, D).  Broadcast to (..., E).
+            c = self.prototypes.to(dtype=x_n.dtype)
+            diff = x_n.unsqueeze(-2) - c                     # (..., E, D)
+            dist_sq = diff.pow(2).sum(dim=-1)                 # (..., E)
+            route_logits = torch.tanh(-self.l2_gamma * dist_sq)
+            route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
+        else:
+            # Linear scoring (iter 30-33b baseline).
+            route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
         # Gate in logit space: softmax(a + log_sigmoid(b)) is mathematically
         # identical to softmax(a)*sigmoid(b)/renorm, but stays "pure softmax"
         # and avoids explicit renormalization.
@@ -1558,7 +1597,8 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False, num_experts: int = 8):
+                 tie_attn_mlp_router: bool = False, num_experts: int = 8,
+                 router_scoring: str = "linear"):
         super().__init__()
         # iter 32 (opg_doc.tex §4.1): replace learnable RMSNorm on the shared
         # router/expert state path with Euclidean-ball projection Π_R.
@@ -1582,12 +1622,12 @@ class Block(nn.Module):
         self.attn_post_mix_norm = RMSNorm(dim)  # after attn_mix output (post expert-weighted sum)
         self.mlp_post_mix_norm = RMSNorm(dim)   # after mlp_mix output (post expert-weighted sum)
         if bool(tie_attn_mlp_router):
-            shared = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0)
+            shared = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0, scoring=router_scoring)
             self.attn_router = shared
             self.mlp_router = shared
         else:
-            self.attn_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0)
-            self.mlp_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=5.0, cv_loss_weight=1.0)
+            self.attn_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0, scoring=router_scoring)
+            self.mlp_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=5.0, cv_loss_weight=1.0, scoring=router_scoring)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
                                          expert_rank=attn_expert_rank, router=self.attn_router)
@@ -2011,6 +2051,7 @@ class GPT(nn.Module):
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
                  tie_attn_mlp_router: bool = False,  # iter 21: untied is the locked default
+                 router_scoring: str = "linear",
                  num_experts: int = 8):
         super().__init__()
         self.tie_embeddings = tie_embeddings
@@ -2029,7 +2070,8 @@ class GPT(nn.Module):
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
                                    tie_attn_mlp_router=tie_attn_mlp_router,
-                                   num_experts=self.num_experts)
+                                   num_experts=self.num_experts,
+                                   router_scoring=router_scoring)
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2646,6 +2688,7 @@ def main() -> None:
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         tie_attn_mlp_router=args.tie_attn_mlp_router,
         num_experts=args.num_experts,
+        router_scoring=args.router_scoring,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
