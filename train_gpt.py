@@ -807,30 +807,60 @@ class PerExpertSpectralNormCap(nn.Module):
         self.register_buffer("v", F.normalize(torch.randn(E, N), dim=-1), persistent=False)
         self.n_power_iters = int(n_power_iters)
 
+    @torch.no_grad()
+    def update_uv_(self, W: Tensor) -> None:
+        """Run power iteration against the current `W` and write `u`, `v`.
+
+        Call this once per optimizer step (before the next forward pass),
+        NEVER inside `forward()`.  `forward()` must be stateless so that
+        RevDEQ's O(1) backward reconstruction produces identical σ to the
+        original forward (see Permanent protocol rule 4 in
+        `experiments/hypotheses.md`).
+        """
+        W32 = W.detach().float()
+        u = self.u.detach().float().clone()
+        v = self.v.detach().float().clone()
+        for _ in range(self.n_power_iters):
+            v = F.normalize(torch.einsum("emn,em->en", W32, u), dim=-1, eps=1e-12)
+            u = F.normalize(torch.einsum("emn,en->em", W32, v), dim=-1, eps=1e-12)
+        self.u.copy_(u.to(dtype=self.u.dtype))
+        self.v.copy_(v.to(dtype=self.v.dtype))
+
     def forward(self, W: Tensor) -> Tensor:
+        """Stateless σ estimate and scale.  Reads `self.u`, `self.v` but does
+        NOT mutate them — that's handled by `update_uv_()` called explicitly
+        once per optimizer step.  This keeps `f_theta` deterministic within
+        a DEQ solve, so RevDEQ's backward reconstruction reproduces σ
+        exactly (review item 3, Phase 6a.2)."""
         W32 = W.float()
-        with torch.no_grad():
-            # Start from fresh clones of the persistent buffers.  RevDEQ
-            # calls this forward twice per training step (once in the
-            # forward pass, once during backward reconstruction).  If we
-            # used `self.u`/`self.v` directly in the sigma einsum below,
-            # the in-place `copy_` here would bump their version counter
-            # between the two forwards, triggering "variable needed for
-            # gradient has been modified by an inplace operation" errors.
-            # Also force-cast u/v to fp32 so `.bfloat16()` on the parent
-            # model doesn't create a dtype mismatch against W32.
-            u = self.u.detach().float().clone()
-            v = self.v.detach().float().clone()
-            for _ in range(self.n_power_iters):
-                v = F.normalize(torch.einsum("emn,em->en", W32, u), dim=-1, eps=1e-12)
-                u = F.normalize(torch.einsum("emn,en->em", W32, v), dim=-1, eps=1e-12)
-            self.u.copy_(u.to(dtype=self.u.dtype))
-            self.v.copy_(v.to(dtype=self.v.dtype))
-        # σ_max estimate per expert: differentiable only through W; u, v are
-        # detached constants (from the no-grad block) for this computation.
+        u = self.u.detach().float()
+        v = self.v.detach().float()
         sigma = torch.einsum("em,emn,en->e", u, W32, v).abs()  # (E,)
         scale = (1.0 / sigma.clamp(min=1.0)).to(W.dtype)
         return W * scale.view(-1, 1, 1)
+
+
+def refresh_spectral_norms(model: nn.Module) -> None:
+    """Walk `model` and run one power iteration for every
+    `PerExpertSpectralNormCap` parametrization, refreshing its `u`, `v`
+    buffers so σ estimates track `W` as training updates it.
+
+    Call once right after model construction (so the first forward has
+    non-random u/v) and once per optimizer step (after `opt.step()`,
+    before the next forward).
+    """
+    for mod in model.modules():
+        plist_dict = getattr(mod, "parametrizations", None)
+        if plist_dict is None:
+            continue
+        for plist in plist_dict.values():
+            # ParametrizationList exposes the raw weight as `.original`.
+            W = getattr(plist, "original", None)
+            if W is None:
+                continue
+            for p in plist:
+                if isinstance(p, PerExpertSpectralNormCap):
+                    p.update_uv_(W)
 
 
 class CastedLinear(nn.Linear):
@@ -2755,6 +2785,10 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
+    # Phase 6a.2 (review 3): seed u, v for every PerExpertSpectralNormCap so
+    # σ estimates are meaningful on the first forward, not random.
+    refresh_spectral_norms(base_model)
+
     # Compile the DEQ iteration body for throughput.  Always enabled — the
     # ~1.6× real speedup (3.7× benchmark) is a free win on any backward mode
     # that supports it.  RevDEQ does (custom autograd.Function wraps the
@@ -3053,6 +3087,11 @@ def main() -> None:
             _preclip = 0.0
         for opt in optimizers:
             opt.step()
+        # Phase 6a.2 (review 3): refresh spectral-norm u/v after every
+        # optimizer step so σ estimates track the freshly-updated W.  Never
+        # inside `forward()` — that would break RevDEQ's determinism
+        # requirement (Permanent protocol rule 4).
+        refresh_spectral_norms(base_model)
 
         if args.router_bias_update:
             seen: set[int] = set()
