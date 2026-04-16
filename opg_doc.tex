@@ -6,11 +6,21 @@
 \usepackage{microtype}
 \usepackage{geometry}
 \geometry{margin=1in}
-\usepackage{amsmath,amssymb,mathtools}
+
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
 \usepackage{booktabs}
-\usepackage{hyperref}
+\usepackage{enumitem}
 \usepackage{xcolor}
+\usepackage{hyperref}
 \usepackage{listings}
+\usepackage{array}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black
+}
 
 \lstset{
   basicstyle=\ttfamily\small,
@@ -18,395 +28,527 @@
   columns=fullflexible,
   frame=single,
   rulecolor=\color{black!20},
+  showstringspaces=false,
 }
 
-\title{OPG (parameter-golf): Forward Pass and Losses\\\small RevDEQ backbone + dense soft routing + MLA/gated attention + MoS/FSQ + self-refinement}
-\author{Code-aligned documentation for \texttt{train\_gpt.py}}
-\date{2026-04-15}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{definition}[theorem]{Definition}
+
+\title{OPG (parameter-golf): Contractive RevDEQ Backbone (Proposed)\\\large Dense routing with Lipschitz budget + unique fixed point}
+\author{Project document (architecture + convergence proof sketch)\\\small with code-aligned appendices for \texttt{train\_gpt.py}}
+\date{2026-04-16}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-This document is a rigorous, math-first description of the current model forward pass and training loss as implemented
-in \texttt{train\_gpt.py}. The core clarification is that the model contains \emph{two distinct iteration axes}:
-(i) a \textbf{self-refinement loop} that feeds predicted token distributions back into the \emph{input embedding}, and
-(ii) a \textbf{RevDEQ coupled-state loop} that iterates the \emph{hidden state} to approach a fixed point of a learned update
-function. The specification below is intended to be self-contained and auditable against the code.
+This document defines a \emph{proposed} RevDEQ backbone architecture as an explicit fixed-point map $T_x$ with a \emph{certifiable}
+contraction budget, yielding a \textbf{unique} fixed point and \textbf{global} convergence via Banach.
+The mainline design keeps \textbf{parallel attention + FFN} and \textbf{input-dependent dense routing}, but replaces ad-hoc state gates
+with (i) an \textbf{exogenous} injection $b(x_0)$ and (ii) \textbf{Lipschitz-controlled} router scoring (SIPS and L2-distance options).
+To make the convergence argument self-contained, we spell out simple sufficient conditions under which each submodule is \textbf{non-expansive}
+(1-Lipschitz) under a chosen norm, and we provide an expressiveness discussion showing the architecture remains transformer-like on bounded domains.
+
+\paragraph{Status.}
+Theorems and proofs in the main body apply to the \emph{proposed} contractive design. Appendices document the \emph{current} code in
+\texttt{train\_gpt.py} (RevDEQ + dense routers + MLA/gated SDPA + MoS/FSQ + optional self-refinement) and list the explicit gaps.
 \end{abstract}
 
 \tableofcontents
 \newpage
 
-\section{Practical defaults (code defaults; throughput-oriented)}
-\label{sec:throughput}
-\paragraph{Goal.}
-The defaults in \texttt{Hyperparameters} are throughput-oriented while maintaining DDP correctness and evaluation parity.
-Some knobs are \emph{time-gated} (refinement, router health scaling) to reduce early instability and emphasize final health.
+\section{Executive changes relative to the current code}
+\label{sec:exec}
 
-\paragraph{Defaults (as of 2026-04-15).}
-\begin{itemize}
-  \item \texttt{train\_batch\_tokens = 524288}, \texttt{train\_seq\_len = 2048} (global tokens/step; per-rank tokens scale with world size).
-  \item \texttt{torch.compile(shared\_block, dynamic=False)} is attempted by default for throughput; it is skipped only when
-        running DDP with \texttt{deq\_backward="unroll"} (compile+DDP+unroll incompatibility in current PyTorch).
-  \item DEQ iteration count uses K-jitter by default: a shuffle-bag over \texttt{deq\_k\_jitter\_set=(4,8,16)} with broadcast from rank 0 each step.
-  \item Self-refinement is ramped in late: \texttt{num\_refinements} is set to 0 until \texttt{time\_frac} exceeds
-        \texttt{num\_refinements\_ramp\_frac} (default 0.85), then enabled and the refinement mixing coefficient ramps up.
-  \item Router health pressure increases late: \texttt{health\_scale} ramps linearly from 1.0 to 5.0 over the final 30\% of wallclock
-        (from \texttt{time\_frac}=0.70 to 1.00).
-\end{itemize}
+The current code (\texttt{train\_gpt.py}) implements a RevDEQ solver over a shared block with token-local injection gates, dense softmax routing,
+MLA-style attention with post-SDPA head gates, and a dual MoS head (CTP+NTP) with FSQ. A late wallclock ramp optionally enables an outer
+self-refinement loop that re-embeds predicted token distributions. This document proposes a \emph{certifiable} backbone map $T_x$ by:
 
-\paragraph{Terminology note.}
-The script uses \texttt{num\_layers} as the default DEQ iteration count $K$; it is not a stack of distinct blocks.
-The backbone is a \emph{single shared} transformer block iterated $K$ times inside the RevDEQ solver.
+\begin{enumerate}[leftmargin=2em,itemsep=0.25em]
+  \item \textbf{Mainline scope}: the main body focuses on a \emph{single} iteration axis: the inner RevDEQ equilibrium solve for a strict contraction $T_x$.
+  \item \textbf{Injection}: remove any state-dependent injection gate from the certified map. Use an \emph{exogenous} injection
+        $b(x_0)$ that contains an identity path so the backbone cannot become input-independent by collapsing a learned gate.
+  \item \textbf{Routing}: keep routing \emph{input-dependent} on the DEQ state $z$, but parameterize logits using a Lipschitz-controlled score
+        (SIPS or L2-distance), yielding an explicit bound on router sensitivity.
+  \item \textbf{Contraction shell}: wrap the routed update $G_\theta$ with a scalar $\tau\in(0,1)$ to ensure $T_x$ is a strict contraction:
+        $T_x(z)=(1-\tau)\,b(x_0)+\tau\,G_\theta(z,x_0)$.
+\end{enumerate}
 
-\section{Notation (shapes and conventions)}
-\paragraph{Discrete inputs and targets.}
-Let $V$ be the vocabulary size, $B$ the batch size, and $T$ the sequence length.
-Inputs and targets are integer token IDs:
+\paragraph{Reader guide.}
+Sections~\ref{sec:notation}--\ref{sec:convergence} define $T_x$ and give sufficient conditions for a unique fixed point.
+Section~\ref{sec:expressive} discusses expressiveness under 1-Lipschitz constraints.
+Appendix~\ref{app:current_code} documents the current code architecture; Appendix~\ref{app:gaps} summarizes the difference.
+
+\section{Notation, norms, and Lipschitz constants}
+\label{sec:notation}
+
+Let $V$ be vocabulary size, $B$ batch size, $T$ sequence length, and $d$ model width.
+Token IDs and next-token targets:
 \[
   x \in \{0,\dots,V-1\}^{B\times T},\qquad
   y \in \{0,\dots,V-1\}^{B\times T}.
 \]
-In training, $y$ is the next-token target corresponding to $x$ (data windowing/stride is handled outside the model).
-
-\paragraph{Embeddings and states.}
-Let $d$ be the model dimension and $E\in\mathbb{R}^{V\times d}$ be the token embedding matrix.
-The model operates on:
+Embeddings and states:
 \[
-  x_0 \in \mathbb{R}^{B\times T\times d}\quad\text{(input embedding to the backbone)},\qquad
-  z \in \mathbb{R}^{B\times T\times d}\quad\text{(hidden state)}.
+  x_0 \in \mathbb{R}^{B\times T\times d},\qquad
+  z \in \mathbb{R}^{B\times T\times d}.
 \]
 
-\paragraph{Normalization notation.}
-The code uses both parameter-free RMS normalization (\texttt{F.rms\_norm} via \texttt{\_rms\_norm}) and learnable RMSNorm modules
-(\texttt{RMSNorm}, with an elementwise weight). In the math below, we write:
+\paragraph{Norm choice.}
+All Lipschitz statements in the main body use the Frobenius norm on tensors:
 \[
-  \mathrm{rms\_norm}(\cdot)\ \text{for parameter-free normalization},\qquad
-  \mathrm{RMSNorm}(\cdot)\ \text{for a learnable RMSNorm module}.
+  \|z\| := \|z\|_F = \sqrt{\sum_{b,t,i} z_{bti}^2}.
 \]
+This identifies $\mathbb{R}^{B\times T\times d}$ with a Euclidean space, which is complete.
 
-\paragraph{Distributions.}
-The model produces two log-probability tensors:
+\begin{definition}[Lipschitz constant]
+For a map $F:\mathcal{X}\to\mathcal{X}$ on a normed space $(\mathcal{X},\|\cdot\|)$, define
 \[
-  \log p_{\text{CTP}} \in \mathbb{R}^{B\times T\times V},\qquad
-  \log p_{\text{NTP}} \in \mathbb{R}^{B\times T\times V},
+  \mathrm{Lip}(F) := \inf\{L\ge 0:\ \|F(u)-F(v)\|\le L\,\|u-v\|\ \forall u,v\in\mathcal{X}\}.
 \]
-which are consumed in two ways:
-\begin{itemize}
-  \item for training losses, they are used directly in a negative log-likelihood;
-  \item for self-refinement, the code converts them into \emph{valid} probability distributions by
-    exponentiating and renormalizing in fp32.
-\end{itemize}
+We call $F$ \emph{non-expansive} if $\mathrm{Lip}(F)\le 1$ and a \emph{contraction} if $\mathrm{Lip}(F)<1$.
+\end{definition}
 
-\paragraph{Two iteration axes.}
-We distinguish:
-\begin{itemize}
-  \item \textbf{Self-refinement iteration} $r\in\{0,1,\dots,R\}$ where $R=\texttt{num\_refinements}$.
-    This is the outer loop: \emph{solve $\rightarrow$ predict $\rightarrow$ soft-embed $\rightarrow$ re-solve}.
-  \item \textbf{DEQ iteration} $k\in\{0,1,\dots,K-1\}$ where $K=\texttt{num\_layers}$.
-    This is the inner loop: coupled-state iteration that repeatedly applies a learned update function.
-\end{itemize}
+\paragraph{Code normalization notation (appendices).}
+The current code uses both parameter-free RMS normalization (\texttt{F.rms\_norm} via \texttt{\_rms\_norm}) and learnable RMSNorm modules.
+In the appendices we write $\mathrm{rms\_norm}(\cdot)$ for the parameter-free version and $\mathrm{RMSNorm}(\cdot)$ for a learnable RMSNorm.
+These are \emph{not} globally 1-Lipschitz without additional constraints; the certified design below uses explicit 1-Lipschitz projections.
 
-\section{End-to-end forward algorithm (single source of truth)}
+\section{End-to-end forward algorithm (single DEQ solve; proposed)}
 \label{sec:forward}
 
-\paragraph{Overview.}
-The model maps token IDs $x$ to final hidden states $z^{(R)}$ via a backbone solve that may be repeated for refinement.
-It then maps $z^{(R)}$ to two distributions (CTP and NTP) via a dual \textbf{MoSHead}.
-Training losses are computed \emph{only on the final output} after the last refinement solve.
-
-\paragraph{Pseudocode (matches \texttt{GPT.\_encode} + \texttt{GPT.\_run\_backbone}).}
+\paragraph{High-level algorithm.}
+The proposed backbone runs a single RevDEQ equilibrium solve for a strict contraction map $T_x$:
 \begin{lstlisting}
 Inputs: token IDs x [B,T], targets y [B,T]
-Hyperparams: R=num_refinements, K=num_layers, beta=deq_beta
+Hyperparams: K=num_layers, beta=deq_beta
 
-# 1) Base input embedding
-x0^(0) = rms_norm( Emb(x) + BigramHashEmb(x) )   # BigramHashEmb may be disabled
-prev_soft = x0^(0)
-z_init = x0^(0)
+# 1) Base input embedding (same as current code)
+x0 = rms_norm( Emb(x) + BigramHashEmb(x) )        # BigramHashEmb optional
 
-for r = 0..R:
-  if r > 0:
-    # No-grad: predict -> prob dist -> soft embed (topk=64)
-    p_mix = MixProb( p_CTP(z^(r-1)), Shift(p_NTP(z^(r-1))) )
-    soft = SoftEmbedTopK(p_mix, E, topk=64)     # rms_norm applied inside
-    alpha = refine_mix_alpha in [0, 0.5]        # ramps up when refinement enabled
-    x0^(r) = alpha * soft + (1-alpha) * prev_soft
-    prev_soft = stopgrad(x0^(r))
-    z_init = x0^(r)                             # warm start from refined input
-  else:
-    x0^(0) already defined
+# 2) Certified RevDEQ equilibrium solve
+z0 = x0                                           # warm start
+z  = RevDEQ_Solve( T_x, z0, beta, K_eff )
 
-  K_eff = (_deq_k_override if set else K)       # jitters during training; fixed for eval
-  z^(r) = RevDEQ_Solve( f_theta, x0^(r), z_init, beta, K_eff )
-
-# 2) Final head
-h = RMSNorm(z^(R))
+# 3) Output head + losses (same as current code)
+h = RMSNorm(z)
 log p_CTP, log p_NTP = MoSHead(h)
-loss = NLL(log p_NTP, y) + ... (aux losses)
+loss = NLL(log p_NTP, y) + auxiliary losses
 \end{lstlisting}
 
-\section{Outer loop: self-refinement over input embeddings ($r$)}
-\label{sec:refinement}
+\paragraph{Scope note.}
+The optional outer self-refinement loop used in the current code is preserved in Appendix~\ref{app:refinement} and is not part of the contraction proof.
+
+\section{Inner loop: RevDEQ coupled-state solver}
+\label{sec:deq}
+
+RevDEQ maintains two states $y_k$ and $z_k$ and applies the fixed-point map twice per step:
+\begin{align}
+  y_{k+1} &= (1-\beta)\,y_k + \beta\, T_x(z_k),\\
+  z_{k+1} &= (1-\beta)\,z_k + \beta\, T_x(y_{k+1}),
+\end{align}
+for $k=0,\dots,K-1$, with initialization $y_0=z_0$.
+
+\begin{remark}[Convergence link]
+If $T_x$ is a strict contraction with constant $k<1$, then the Picard iteration $z\leftarrow T_x(z)$ converges globally.
+The RevDEQ relaxation parameter $\beta$ is a solver knob; a common sufficient stability range is $0<\beta<2/(k+1)$.
+\end{remark}
+
+\section{The proposed fixed-point map $T_x$}
+\label{sec:map}
+
+\subsection{1-Lipschitz projections (certified normalization)}
+\label{sec:proj}
+
+To keep the mainline certifiable, we use explicit non-expansive projections instead of unconstrained normalization.
+For a radius $R>0$, define the Euclidean ball in $\mathbb{R}^{B\times T\times d}$:
+\[
+  \mathcal{B}_R := \{u:\ \|u\|\le R\}.
+\]
+Let $\Pi_R$ be the projection onto $\mathcal{B}_R$:
+\[
+  \Pi_R(u) := \arg\min_{v\in\mathcal{B}_R}\|u-v\|.
+\]
+This projection has a key property:
+\begin{proposition}[Projection is 1-Lipschitz]
+$\Pi_R$ is non-expansive: $\|\Pi_R(u)-\Pi_R(v)\|\le \|u-v\|$ for all $u,v$.
+\end{proposition}
+
+\subsection{Injection (no state-dependent gate)}
+\label{sec:inj}
+
+Define an exogenous additive injection
+\begin{equation}
+  \label{eq:bx0}
+  b(x_0) := x_0 + U\,\Pi_R(x_0),
+\end{equation}
+where $U\in\mathbb{R}^{d\times d}$ is learned with a spectral norm constraint $\|U\|_2\le 1$ (Section~\ref{sec:modules}).
+
+\begin{remark}[Why include the identity path $x_0$]
+If injection were only $U\Pi_R(x_0)$, the model could drift toward input-independence by learning $U\approx 0$.
+Including $x_0$ guarantees the fixed-point map remains input-dependent even if the learned adapter collapses.
+\end{remark}
+
+\subsection{Router input and scoring (SIPS and L2-distance)}
+\label{sec:routing}
+
+Let the router read a projected view of the current state plus injection:
+\[
+  r(z,x_0) := \Pi_R(z + b(x_0)) \in \mathbb{R}^{B\times T\times d}.
+\]
+Let $q(z,x_0)=W_q\,r(z,x_0)$ with $\|W_q\|_2\le 1$. The router defines logits $s\in\mathbb{R}^{B\times T\times E}$
+for a combined expert pool $E=E_{\text{attn}}+E_{\text{ffn}}$ and dense weights
+\[
+  w(z,x_0)=\mathrm{softmax}(s(z,x_0))\in\Delta^{E-1}.
+\]
+
+\paragraph{Option A (SIPS).}
+For expert anchors $k_j\in\mathbb{R}^{d_r}$ and bounded transforms $\phi,\psi:[0,\infty)\to[0,1]$,
+\[
+  s_j = \gamma\;\phi(\|q\|)\;\psi(\|k_j\|)\;\cos(q,k_j),
+\]
+with a bounded scale $\gamma\in[0,\gamma_{\max}]$.
+
+\paragraph{Option B (L2-distance).}
+For prototypes $c_j\in\mathbb{R}^{d_r}$,
+\[
+  s_j = \rho\!\left(-\gamma\,\|q-c_j\|_2^2\right),
+\]
+where $\rho$ is a 1-Lipschitz saturation (e.g.\ $\rho(t)=\tanh(t)$) and $\gamma\in[0,\gamma_{\max}]$.
+Note that $\|q-c\|^2=\|q\|^2+\|c\|^2-2q^\top c$, so this can be implemented efficiently using dot products and norms.
+
+\subsection{Parallel routed expert update $G_\theta$}
+\label{sec:Gtheta}
+
+Define the shared expert input
+\[
+  u(z,x_0) := \Pi_R(z+b(x_0)).
+\]
+All experts read $u$. Let $\{A_e\}_{e=1}^{E_{\text{attn}}}$ be attention experts and $\{M_e\}_{e=1}^{E_{\text{ffn}}}$ be FFN experts,
+each constructed to be 1-Lipschitz (Section~\ref{sec:modules}).
+Split mixture weights:
+\[
+  w^A_e := w_e,\ e=1..E_{\text{attn}},\qquad
+  w^M_e := w_{E_{\text{attn}}+e},\ e=1..E_{\text{ffn}}.
+\]
+Compute dense mixtures:
+\begin{align}
+  \Delta_{\text{attn}}(z,x_0) &= \sum_{e=1}^{E_{\text{attn}}} w^A_e(z,x_0)\,A_e(u(z,x_0)),\\
+  \Delta_{\text{ffn}}(z,x_0)  &= \sum_{e=1}^{E_{\text{ffn}}}  w^M_e(z,x_0)\,M_e(u(z,x_0)).
+\end{align}
+To keep outputs bounded and preserve a clean non-expansive budget, optionally project each mixture:
+\[
+  \bar\Delta_{\text{attn}}(z,x_0) := \Pi_R(\Delta_{\text{attn}}(z,x_0)),\qquad
+  \bar\Delta_{\text{ffn}}(z,x_0) := \Pi_R(\Delta_{\text{ffn}}(z,x_0)).
+\]
+Combine in parallel (the $\tfrac12$ matches the stabilizing scale used in the current code):
+\begin{equation}
+  \label{eq:Gtheta}
+  G_\theta(z,x_0) := \tfrac12\Big(\bar\Delta_{\text{attn}}(z,x_0)+\bar\Delta_{\text{ffn}}(z,x_0)\Big).
+\end{equation}
+
+\subsection{Contractive wrapper (the map actually solved)}
+\label{sec:Tx}
+
+Finally define
+\begin{equation}
+  \label{eq:Tx}
+  T_x(z) := (1-\tau)\,b(x_0) + \tau\,G_\theta(z,x_0),
+  \qquad 0<\tau\le\tau_{\max}<1.
+\end{equation}
+$\tau$ may be fixed, or predicted by a bounded head and then clamped by $\tau_{\max}$.
+
+\section{Module-by-module simplicity and 1-Lipschitz proof sketches}
+\label{sec:modules}
+
+This section gives sufficient conditions to make each component of $T_x$ non-expansive under $\|\cdot\|_F$.
+The guiding rule is: \emph{use only (i) linear maps with operator norm $\le 1$, (ii) 1-Lipschitz nonlinearities,
+and (iii) 1-Lipschitz projections/clamps to keep states bounded.}
+
+\subsection{Linear maps}
+\begin{proposition}[Linear Lipschitz constant]
+For $f(u)=Wu$, $\mathrm{Lip}(f)=\|W\|_2$ (spectral norm). In particular, if $\|W\|_2\le 1$ then $f$ is 1-Lipschitz.
+\end{proposition}
+\begin{remark}[How to enforce $\|W\|_2\le 1$]
+Use spectral normalization or parameterize $W$ via a constrained factorization (e.g.\ $W=\alpha\tilde W$ with $\alpha\le 1/\|\tilde W\|_2$).
+\end{remark}
+
+\subsection{Elementwise nonlinearities}
+\begin{proposition}[Standard 1-Lipschitz activations]
+The following are 1-Lipschitz on $\mathbb{R}$: $\tanh$, $\mathrm{ReLU}$, and $\mathrm{LeakyReLU}(\cdot;\eta)$ for $\eta\in[0,1]$.
+Elementwise application preserves 1-Lipschitzness under $\|\cdot\|_F$.
+\end{proposition}
+
+\subsection{Rotary embeddings / orthogonal transforms}
+\begin{proposition}[Orthogonal transforms are 1-Lipschitz]
+If $Q$ is orthogonal ($Q^\top Q=I$), then $\|Qu-Qv\|=\|u-v\|$. Therefore $Q$ is 1-Lipschitz.
+\end{proposition}
+\begin{remark}
+RoPE applies a block-diagonal rotation to pairs of coordinates, which is orthogonal.
+\end{remark}
+
+\subsection{Softmax}
+\label{sec:softmax_lip}
+\begin{proposition}[Softmax Jacobian bound in $\ell_2$ (sketch)]
+Let $\sigma:\mathbb{R}^E\to\Delta^{E-1}$ be softmax. Its Jacobian is $J=\mathrm{diag}(p)-pp^\top$ where $p=\sigma(s)$.
+One can show $\|J\|_2\le 1/2$ for all $s$, hence softmax is $1/2$-Lipschitz in $\ell_2$:
+$\|\sigma(a)-\sigma(b)\|_2\le \tfrac12\|a-b\|_2$.
+\end{proposition}
+
+\subsection{Router scoring: explicit Lipschitz bounds (sketch)}
+\label{sec:router_lip}
+
+\begin{proposition}[L2-distance logits are Lipschitz on bounded sets (sketch)]
+Fix $\gamma\in[0,\gamma_{\max}]$ and let prototypes satisfy $\|c_j\|_2\le R_c$. Suppose the router query satisfies $\|q\|_2\le R_q$.
+Define logits $s_j(q)=\rho(-\gamma\|q-c_j\|_2^2)$ where $\rho$ is 1-Lipschitz.
+Then each $s_j$ is Lipschitz with
+\[
+  \mathrm{Lip}(s_j)\ \le\ 2\gamma_{\max}(R_q+R_c).
+\]
+\end{proposition}
+\begin{remark}[Reason]
+The gradient of $-\gamma\|q-c\|^2$ w.r.t.\ $q$ is $-2\gamma(q-c)$, whose norm is bounded by $2\gamma(\|q\|+\|c\|)$.
+Composition with 1-Lipschitz $\rho$ does not increase the bound.
+\end{remark}
+
+\begin{corollary}[Dense weights inherit a bound via softmax]
+If $s:\mathbb{R}^{d_r}\to\mathbb{R}^E$ is $L_s$-Lipschitz in $\ell_2$, then $w=\mathrm{softmax}\circ s$ is $(L_s/2)$-Lipschitz in $\ell_2$.
+\end{corollary}
+
+\begin{remark}[SIPS option]
+SIPS can be treated similarly by ensuring (i) bounded scale $\gamma$, (ii) bounded anchor norms, and (iii) a normalization of $q$ that is well-behaved
+on the solver region (e.g.\ by projecting $q$ away from 0 before forming $\cos(\cdot,\cdot)$). We treat SIPS as an alternative implementation option
+and rely on the same ``bounded query + bounded scale'' principle to control $L_s$.
+\end{remark}
+
+\subsection{Dense routed mixtures}
+\begin{proposition}[Mixture Lipschitz bound (sufficient condition)]
+Assume (i) each expert $E_j$ is 1-Lipschitz, (ii) expert outputs are bounded on the solver region:
+$\|E_j(u)\|\le B$ for all $u$ encountered, and (iii) router weights $w(\cdot)$ are $L_w$-Lipschitz in $\ell_1$.
+Then the mixture $F(u)=\sum_j w_j(u)E_j(u)$ is Lipschitz with
+\[
+  \mathrm{Lip}(F)\ \le\ 1 + B\,L_w.
+\]
+\end{proposition}
+\begin{remark}[Practical non-expansive mixture]
+To make $G_\theta$ provably non-expansive, either (a) ensure $L_w$ is very small (Lipschitz-controlled logits + softmax),
+or (b) add an output projection: $\Delta\leftarrow \Pi_R(\Delta)$, which caps $B$ and is 1-Lipschitz.
+\end{remark}
+
+\subsection{Certified attention and FFN experts}
+\paragraph{Attention expert $A_e$ (L2 attention; MLA-compatible).}
+Define a single expert as a composition of 1-Lipschitz parts:
+\[
+  q = W^Q_e\,u,\quad k = W^K_e\,u,\quad v = W^V_e\,u,\qquad \|W^\cdot_e\|_2\le 1,
+\]
+optionally followed by RoPE rotations (1-Lipschitz). For each token position $t$, define L2 attention weights over previous positions $j\le t$:
+\[
+  a_{tj} = \frac{\exp(-\gamma\|q_t-k_j\|_2^2)}{\sum_{i\le t}\exp(-\gamma\|q_t-k_i\|_2^2)},\qquad
+  o_t = \sum_{j\le t} a_{tj}\,v_j.
+\]
+Finally project the output: $A_e(u)=\Pi_R(W^O_e\,o)$ with $\|W^O_e\|_2\le 1$.
+Under bounded states (enforced by $\Pi_R$ on $u$) and bounded $\gamma$, the scoring map is Lipschitz (Section~\ref{sec:router_lip})
+and L2 self-attention admits explicit Lipschitz bounds (see \cite{l2_attention} for a detailed treatment).
+
+\paragraph{FFN expert $M_e$ (1-Lipschitz MLP).}
+A simple 1-Lipschitz FFN expert is
+\[
+  M_e(u) = \Pi_R\!\left(W^{(2)}_e\,\phi(W^{(1)}_e\,u)\right),
+\]
+where $\|W^{(1)}_e\|_2\le 1$, $\|W^{(2)}_e\|_2\le 1$, and $\phi$ is 1-Lipschitz (e.g.\ $\tanh$, ReLU, or GroupSort).
+GroupSort networks in particular provide strong approximation results within the Lipschitz class \cite{groupsort}.
+
+\section{Convergence guarantee: Banach + contraction shell}
+\label{sec:convergence}
+
+\begin{theorem}[Banach contraction mapping principle]
+Let $(\mathcal{X},\|\cdot\|)$ be complete and $T:\mathcal{X}\to\mathcal{X}$ satisfy $\|T(u)-T(v)\|\le k\|u-v\|$ for some $k\in[0,1)$.
+Then $T$ has a unique fixed point $u^\star$, and $u_{n+1}=T(u_n)$ converges to $u^\star$ for any $u_0\in\mathcal{X}$.
+\end{theorem}
+
+\begin{corollary}[Certified design rule]
+If $G_\theta(\cdot,x_0)$ is non-expansive in $z$ (i.e.\ $\mathrm{Lip}_z(G_\theta)\le 1$), then $T_x$ in \eqref{eq:Tx} is a strict contraction
+with constant at most $\tau_{\max}<1$. Therefore $T_x$ has a unique fixed point and the equilibrium solve is globally well-posed.
+\end{corollary}
+
+\begin{remark}[Fixed-point uniqueness vs expert ``uniqueness'']
+Banach guarantees a \emph{unique fixed point} $z^\star$ for a given input $x_0$; it does not guarantee that different experts in the MoE bank
+are distinct functions. Expert diversity is a separate modeling goal typically enforced by routing health constraints and/or orthogonality diagnostics
+(as used in the current code).
+\end{remark}
+
+\section{Expressiveness (why this remains transformer-like)}
+\label{sec:expressive}
+
+\paragraph{1-Lipschitz does not mean weak.}
+Modern LLMs operate on bounded hidden states due to normalization and finite precision. On bounded domains, 1-Lipschitz function classes can still be rich.
+
+\paragraph{Universal approximation within a Lipschitz class (sketch).}
+GroupSort networks with norm-constrained linear maps can approximate any 1-Lipschitz function on compact sets (Anil et al.).
+Thus, the FFN experts can be expressive while remaining certifiably non-expansive.
+
+\paragraph{Transformer-like behavior from the equilibrium map.}
+If routing is chosen to be nearly input-only (small $L_w$) and $G_\theta$ is expressive in $x_0$, then the fixed point can behave like a deep transformer.
+RevDEQ iteration provides implicit depth (iterated application of a shared block), while dense MoE provides additional capacity without sparsity.
+
+\section{Head and losses (code-aligned; not part of the contraction proof)}
+\label{sec:loss}
+
+After the DEQ solve, both the proposed and current models use a dual MoS head (CTP+NTP) with FSQ in the rank space:
+\[
+  h=\mathrm{RMSNorm}(z),\qquad
+  \log p_{\text{CTP}},\ \log p_{\text{NTP}} = \mathrm{MoSHead}(h).
+\]
+The current training objective in \texttt{train\_gpt.py} is:
+\[
+  L = L_{\text{NTP}} + \lambda_{\text{CTP}}L_{\text{CTP}}
+    + \lambda_{\text{bal}}L_{\text{bal}}
+    + \lambda_{\text{health}}L_{\text{health}}
+    + \lambda_{\text{mos}}L_{\text{mos-ortho}}
+    + \lambda_{\text{blk}}L_{\text{block-ortho-aux}},
+\]
+where $L_{\text{NTP}}=\mathrm{NLL}(\log p_{\text{NTP}},y)$ and $L_{\text{CTP}}=\mathrm{NLL}(\log p_{\text{CTP}},x)$.
+The CTP weight is refinement-gated in code:
+\[
+  \lambda_{\text{CTP}} = 0.05\,R\cdot \mathrm{clip}\!\left(\frac{\alpha}{0.5},\,0,\,1\right),
+\]
+with $R=\texttt{num\_refinements}$ (often 0 early) and $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$.
+
+\paragraph{Routing auxiliary losses (summary).}
+The code tracks two kinds of routing penalties:
+\begin{itemize}[leftmargin=2em,itemsep=0.25em]
+  \item $L_{\text{bal}}$: MSE-to-uniform on mean expert shares for the attention and MLP routers (plus a strongly upweighted MoSHead balance term to prevent dead head experts).
+  \item $L_{\text{health}}$: barrier-style penalties that target the final-only constraints, including per-expert min-share threshold $0.6/E$ and balance CV threshold $0.20$,
+        multiplied by a late-phase \texttt{health\_scale} ramp.
+\end{itemize}
+
+\appendix
+
+\section{Self-refinement loop (current code; unchanged)}
+\label{app:refinement}
+
+The current code optionally runs an outer refinement loop after a late wallclock ramp. It re-embeds a mixture of predicted distributions:
 
 \subsection{Initial input embedding ($r=0$)}
-The initial embedding is:
 \[
-  x_0^{(0)} \;=\; \mathrm{RMSNorm}\!\left(E[x] + \mathrm{BigramHashEmb}(x)\right),
+  x_0^{(0)} \;=\; \mathrm{rms\_norm}\!\left(E[x] + \mathrm{BigramHashEmb}(x)\right).
 \]
-where \texttt{BigramHashEmb} may be disabled (then it contributes $0$).
 
-\subsection{From predictions to a valid refinement distribution ($r>0$)}
+\subsection{Refinement distribution ($r>0$)}
 At the end of solve $r-1$, define $h^{(r-1)}=\mathrm{RMSNorm}(z^{(r-1)})$ and compute:
 \[
   \log p_{\text{CTP}}^{(r-1)},\ \log p_{\text{NTP}}^{(r-1)} \;=\; \mathrm{MoSHead}(h^{(r-1)}).
 \]
-For self-refinement, the code converts each log-prob into a numerically stable probability distribution:
+Convert log-probabilities to probabilities in fp32 and define a shifted NTP distribution:
 \[
-  \mathrm{Prob}(\log p)[v] \;=\;
-  \frac{\exp(\log p[v])}{\sum_{u=1}^{V}\exp(\log p[u])}\quad\text{(computed in fp32, then renormalized)}.
-\]
-Let $p_{\text{CTP}}^{(r-1)}=\mathrm{Prob}(\log p_{\text{CTP}}^{(r-1)})$.
-Define a shifted next-token distribution so that position $t$ uses the previous token's next-token predictor:
-\[
-  p_{\text{NTP,shift}}^{(r-1)}[t] \;\equiv\;
+  p_{\text{NTP,shift}}^{(r-1)}[t] \equiv
   \begin{cases}
     p_{\text{NTP}}^{(r-1)}[0] & t=0,\\
     p_{\text{NTP}}^{(r-1)}[t-1] & t\ge 1.
   \end{cases}
 \]
-Then the mixed refinement distribution is:
+Then
 \[
-  p_{\text{mix}}^{(r-1)}[t] \;=\;
+  p_{\text{mix}}^{(r-1)}[t] =
   \begin{cases}
     p_{\text{CTP}}^{(r-1)}[0] & t=0,\\
-    \tfrac{1}{2}p_{\text{CTP}}^{(r-1)}[t] + \tfrac{1}{2}p_{\text{NTP,shift}}^{(r-1)}[t] & t\ge 1.
+    \tfrac12 p_{\text{CTP}}^{(r-1)}[t] + \tfrac12 p_{\text{NTP,shift}}^{(r-1)}[t] & t\ge 1.
   \end{cases}
 \]
-Because both inputs are valid distributions, $p_{\text{mix}}$ is also a valid distribution in exact arithmetic.
-The implementation still applies NaN/Inf guarding.
 
-\subsection{Soft embedding from a top-$\kappa$ approximation}
-\label{sec:softembed}
-The code approximates the expected embedding under $p_{\text{mix}}$ using a top-$\kappa$ truncation
-(default $\kappa=64$; notation uses $\kappa$ to avoid confusion with the DEQ iteration count $K$).
-Let $\mathcal{S}_\kappa(t)$ be the indices of the top-$\kappa$ probabilities at position $t$.
-Define a renormalized distribution over $\mathcal{S}_\kappa(t)$:
-\[
-  \tilde p_{\text{mix}}[t,v] \;=\;
-  \frac{p_{\text{mix}}[t,v]}{\sum_{u\in\mathcal{S}_\kappa(t)} p_{\text{mix}}[t,u]}
-  \qquad (v\in\mathcal{S}_\kappa(t)).
-\]
-The soft embedding is the expected embedding under $\tilde p_{\text{mix}}$:
-\[
-  x_{\text{soft}}^{(r)}[t] \;=\; \mathrm{RMSNorm}\!\left(\sum_{v\in\mathcal{S}_\kappa(t)} \tilde p_{\text{mix}}^{(r-1)}[t,v]\ E[v]\right).
-\]
-Implementation note: the expected embedding is computed in chunks to avoid materializing a large $[B,T,\kappa,d]$ tensor.
-
-\subsection{Refinement coupling (input embedding update)}
-Refinement updates the \emph{input embedding} for the next solve by mixing the new soft embedding with the previous refined input:
+\subsection{Soft embedding and coupling}
+Approximate the expected embedding under $p_{\text{mix}}$ with a top-$\kappa$ truncation (current default $\kappa=64$),
+then mix with the previous refined input:
 \[
   x_0^{(r)} \;=\; \alpha\,x_{\text{soft}}^{(r)} + (1-\alpha)\,x_0^{(r-1)},
 \]
-where $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$ is ramped up when refinement is enabled.
-The previous refined input is detached in code (\texttt{prev\_soft = x0\_refined.detach()}), so gradients do not flow through earlier refinement steps.
+where $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$ is ramped up when refinement is enabled and the previous refined input is detached.
 
-\paragraph{One-hot as a special case.}
-The $r=0$ embedding path corresponds to a delta distribution at each position
-($p(v)=\mathbb{1}[v=x_t]$), whose expected embedding is exactly $E[x_t]$.
+\section{Current \texttt{train\_gpt.py} backbone snapshot (code-aligned)}
+\label{app:current_code}
 
-\section{Inner loop: RevDEQ coupled-state solver over hidden states ($k$)}
-\label{sec:deq}
+This appendix documents the current implementation of the update function $f_\theta(z,x_0)$ and routing/attention/MLP modules in \texttt{train\_gpt.py}.
+It is not part of the contraction proof in the main body.
 
-\subsection{Coupled-state fixed-\texorpdfstring{$K$}{K} iteration (explicit unroll)}
-Within a single refinement solve $r$, the backbone runs $K$ coupled-state iterations with relaxation parameter $\beta\in(0,1)$.
-It maintains two states $y_k^{(r)}$ and $z_k^{(r)}$ (both in $\mathbb{R}^{B\times T\times d}$) and applies $f_\theta$ twice per step:
-\begin{align}
-  y_{k+1}^{(r)} &= (1-\beta)\,y_k^{(r)} + \beta\, f_\theta\!\left(z_k^{(r)}, x_0^{(r)}\right),\\
-  z_{k+1}^{(r)} &= (1-\beta)\,z_k^{(r)} + \beta\, f_\theta\!\left(y_{k+1}^{(r)}, x_0^{(r)}\right),
-\end{align}
-for $k=0,\dots,K-1$.
-
-\paragraph{Warm start and terminal output.}
-The code uses $y_0^{(r)}=z_0^{(r)}=z_{\text{init}}^{(r)}$ and sets $z_{\text{init}}^{(r)}=x_0^{(r)}$.
-The solve returns the terminal state $z^{(r)}\equiv z_K^{(r)}$ and also tracks $z_{K-1}^{(r)}$ for convergence diagnostics.
-
-\subsection{Backward modes (same forward)}
-The forward dynamics above are the same for both backward modes:
-\begin{itemize}
-  \item \texttt{deq\_backward="unroll"} (alias: \texttt{"autograd"}): explicit unroll retains activations and supports differentiable output-space regularizers.
-  \item \texttt{deq\_backward="revdeq"}: uses a custom memory-efficient backward (\texttt{RevDEQFunction}) that reconstructs states in reverse.
-    FP64 add/sub is used inside reconstruction for numerical stability; reconstruction error is logged only for this mode.
-\end{itemize}
-
-\section{Update function \texorpdfstring{$f_\theta(z,x_0)$}{f(z,x0)} (Block)}
-\label{sec:f_theta}
-
-\subsection{Input injection via a token-local gate (experts only)}
-Let $z_{\text{in}}\in\mathbb{R}^{B\times T\times d}$ denote the current DEQ state and $x_0$ the (possibly refined) input embedding.
-The block computes a \emph{token-local} injection gate:
+\subsection{State update form}
+The shared block computes parallel attention and MLP mixtures and emits
 \[
-  g_{\text{inj}} \;=\; \sigma(\mathrm{inj}( \mathrm{RMSNorm}(z_{\text{in}}))) \in (0,1)^{B\times T\times 1}.
-\]
-Injection is applied only to the \emph{expert feature inputs} (not to routing decisions):
-\[
-  x_{\text{router}} = z_{\text{in}},\qquad
-  x_{\text{expert}} = z_{\text{in}} + g_{\text{inj}}\odot x_0.
-\]
-Routers read $x_{\text{router}}$ (state-only). Experts read $x_{\text{expert}}$ (state + gated embedding).
-
-\subsection{Component-level dense routing (Soft Dense Routing)}
-The block contains two dense MoE components: attention and MLP. Each has its own router.
-For a \emph{normalized} router input $h_n\in\mathbb{R}^d$ (in code, produced by a learnable \texttt{RMSNorm} in the block),
-routing weights are:
-\[
-  w(h_n) \;=\; \mathrm{softmax}\big(W_r\,h_n + b_{\text{expert}} + \log\sigma(W_g\,h_n+b_g)\big)\in\Delta^{E-1},
-\]
-so $w\in\mathbb{R}_{\ge 0}^{E}$ and $\sum_{e=1}^{E} w_e = 1$ (pure softmax; no post-softmax sigmoid gating).
-All experts process all tokens; the routed update is the convex mixture of expert outputs.
-
-\paragraph{Training-time router losses.}
-Let $\bar w=\mathbb{E}_{b,t}[w_{b,t}]$. Each router tracks:
-\[
-  L_{\text{bal}}=\left\|\bar w-\tfrac{1}{E}\mathbf{1}\right\|_2^2,
-\]
-and a ``health'' barrier term that targets the final-only constraints (min-share and CV):
-\[
-  L_{\text{health}}=\mathrm{health\_scale}\Big(
-    \lambda_{\min}\,\mathbb{E}_e\big[\max(0,\tfrac{0.6}{E}-\bar w_e)^2\big]
-    + \lambda_{\mathrm{cv}}\, \max(0,\mathrm{CV}(\bar w)-0.20)^2
-  \Big),
-\]
-where $\lambda_{\min}$ and $\lambda_{\mathrm{cv}}$ are router-specific weights (attention and MLP use different values in code).
-(\texttt{health\_scale} ramps up late in wallclock.) Additionally, an out-of-graph bias controller updates
-\texttt{expert\_bias} toward a target distribution that boosts experts below the min-share threshold.
-
-\subsection{Parallel attention + MLP update (no learned residual gate)}
-The block computes attention and MLP updates from the same pre-residual input and adds them:
-\[
-  z_2 \;=\; \mathrm{Norm}_{\text{attn}}(\Delta_{\text{attn}}) + \mathrm{Norm}_{\text{mlp}}(\Delta_{\text{mlp}}),
-\]
-then emits
-\[
-  f_\theta(z_{\text{in}},x_0)\;=\;\mathrm{RMSNorm}_{\text{post}}\!\left(0.5\,z_2\right).
-\]
-There is no learned ``gg'' residual gate in the current code; a constant-1.0 ``gg'' diagnostic is kept only for backward-compatible logging.
-
-\subsection{MLA + gated attention (within $\Delta_{\text{attn}}$)}
-\label{sec:mla}
-The attention module is ``MLA-style'': it compresses K/V through a latent projection and uses a decoupled RoPE path.
-From normalized input $u=\mathrm{RMSNorm}(x_{\text{expert}})$:
-\begin{itemize}
-  \item Queries: a single linear \texttt{c\_q} produces both $Q$ and per-head gate logits, then $Q$ is split into a RoPE slice and a no-RoPE slice.
-  \item Keys/values: \texttt{c\_kv\_down} produces a latent K/V; $K_{\text{noRoPE}}$ and $V$ come from the latent, while $K_{\text{RoPE}}$ is projected directly from $u$.
-  \item RoPE: apply rotary embedding only to the RoPE slices of $Q$ and $K$, then concatenate RoPE and no-RoPE parts.
-  \item SDPA: use \texttt{scaled\_dot\_product\_attention} in causal mode (GQA when \texttt{num\_kv\_heads != num\_heads}).
-  \item Gated attention: apply a head-specific sigmoid gate \emph{after} SDPA: $Y \leftarrow Y \odot \sigma(g_{\text{attn}} + b_{\text{gate}})$.
-  \item Post-SDPA norm: apply RMSNorm to the gated attention output before expert mixing.
-\end{itemize}
-
-\subsection{MLP expert bank (within $\Delta_{\text{mlp}}$)}
-The MLP path is an expert bank with a squared leaky-ReLU gate:
-\[
-  h = \mathrm{LeakyReLU}(xW_g;0.5)^2 \odot (xW_f),
-\]
-applied per expert, with per-expert RMSNorm on the hidden rank dimension before dense mixing and a per-expert down projection.
-
-\section{Heads and losses (training objective)}
-\label{sec:loss}
-
-\subsection{CTP and NTP log-probabilities}
-After the final refinement solve ($r=R$), compute:
-\[
-  h=\mathrm{RMSNorm}(z^{(R)}),\qquad
-  \log p_{\text{CTP}},\ \log p_{\text{NTP}} = \mathrm{MoSHead}(h).
-\]
-CTP is trained to predict the current token $x$, and NTP predicts the next token $y$.
-
-\subsection{Main negative log-likelihood losses}
-The script uses \texttt{F.nll\_loss} on the log-probabilities:
-\[
-  L_{\text{NTP}} = \mathrm{NLL}(\log p_{\text{NTP}}, y),\qquad
-  L_{\text{CTP}} = \mathrm{NLL}(\log p_{\text{CTP}}, x).
-\]
-The CTP weight is gated by the refinement ramp (early training uses $R=0$):
-\[
-  \lambda_{\text{CTP}} = 0.05\,R\cdot \mathrm{clip}\!\left(\frac{\alpha}{0.5},\,0,\,1\right),
-\]
-where $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$ is the refinement mixing coefficient.
-
-\subsection{MoSHead (CTP+NTP) + FSQ + auxiliary metrics}
-The head is a dual Mixture-of-Softmaxes with FSQ quantization in the low-rank space:
-\begin{itemize}
-  \item Each of CTP and NTP has a softmax gate over \texttt{num\_shared + num\_specialized} experts.
-  \item Each expert maps $h$ to a rank-$r$ vector, applies FSQ ($L$ levels) via a tanh bound + STE rounding, then projects to vocab logits.
-  \item The final distribution is a log-space mixture via \texttt{logaddexp} accumulation and renormalization.
-\end{itemize}
-The head also tracks (i) a balance loss on mean routing weights, and (ii) an orthogonality proxy used only if enabled by a coefficient.
-
-\subsection{Block orthogonality auxiliary loss (optional)}
-When enabled (periodically during training), the code computes a small auxiliary ``expert separation'' diagnostic on a short prefix
-of tokens (default 64): it estimates per-expert mean outputs for attention and MLP expert banks and computes a mean off-diagonal
-absolute cosine similarity. The loss is a soft barrier above 0.20:
-\[
-  L_{\text{block-ortho-aux}}=\tfrac{1}{2}\Big(\max(0,o_{\text{attn}}-0.20)^2+\max(0,o_{\text{mlp}}-0.20)^2\Big).
+  f_\theta(z_{\text{in}},x_0)=\mathrm{RMSNorm}_{\text{post}}\!\left(0.5\left[\mathrm{Norm}_{\text{attn}}(\Delta_{\text{attn}})+\mathrm{Norm}_{\text{mlp}}(\Delta_{\text{mlp}})\right]\right).
 \]
 
-\subsection{Total loss returned by \texttt{GPT.forward}}
-The model returns:
+\subsection{Token-local injection (experts only)}
+The code computes a token-local gate $g_{\text{inj}}=\sigma(\mathrm{inj}(\mathrm{rms\_norm}(z_{\text{in}})))$ and injects only into expert inputs:
 \[
-  L \;=\; L_{\text{NTP}} + \lambda_{\text{CTP}}L_{\text{CTP}}
-  + \lambda_{\text{bal}}L_{\text{bal}}
-  + \lambda_{\text{health}}L_{\text{health}}
-  + \lambda_{\text{mos}}L_{\text{mos-ortho}}
-  + \lambda_{\text{blk}}L_{\text{block-ortho-aux}},
+  x_{\text{router}}=z_{\text{in}},\qquad
+  x_{\text{expert}}=z_{\text{in}}+g_{\text{inj}}\odot x_0.
 \]
-where the coefficients match code:
-\[
-  \lambda_{\text{bal}}=\texttt{bal\_loss\_coef},\quad
-  \lambda_{\text{health}}=\texttt{router\_health\_coef},\quad
-  \lambda_{\text{mos}}=\texttt{mos\_ortho\_out\_coef},\quad
-  \lambda_{\text{blk}}=\texttt{block\_ortho\_aux\_coef}\cdot \texttt{\_block\_ortho\_aux\_coef\_scale}.
-\]
-\paragraph{Balance aggregation detail.}
-In code, $L_{\text{bal}}$ includes (i) the attention-router and MLP-router MSE-to-uniform terms (weighted by \texttt{attn\_balance\_mult} and
-\texttt{mlp\_balance\_mult}), and (ii) an additional $50\times$ multiplier on the MoSHead balance loss to prevent dead head experts.
+Routers read $x_{\text{router}}$; experts read $x_{\text{expert}}$.
 
-\section{Symbol mapping (doc $\leftrightarrow$ code)}
+\subsection{Dense router in code}
+For a normalized router input $h_n$ (from a learnable \texttt{RMSNorm} in the block), the router computes logits
+\[
+  s = W_r h_n + b_{\text{expert}} + \log\sigma(W_g h_n + b_g),
+\qquad w=\mathrm{softmax}(s).
+\]
+Routing is dense (no top-$k$), and the extra $\log\sigma(\cdot)$ term acts as a per-expert logit gate while preserving a final pure softmax.
+
+\subsection{MLA + gated SDPA (current attention)}
+The current attention uses MLA-style KV compression and decoupled RoPE/no-RoPE splits, with causal SDPA and a head-wise sigmoid gate applied
+\emph{after} SDPA output. This is described in the (older) code-aligned document; the certified mainline instead recommends L2 attention.
+
+\section{Proposed vs current: gap table}
+\label{app:gaps}
+
 \begin{center}
-\begin{tabular}{ll}
+\begin{tabular}{@{}p{0.42\linewidth}p{0.52\linewidth}@{}}
 \toprule
-Doc symbol & Code identifier \\
+\textbf{Certified proposal (main body)} & \textbf{Current code (\texttt{train\_gpt.py})} \\
 \midrule
-$R$ & \texttt{GPT.num\_refinements} \\
-$K$ & \texttt{GPT.num\_layers} \\
-$\beta$ & \texttt{GPT.deq\_beta} \\
-$K_{\text{eff}}$ & \texttt{GPT.\_deq\_k\_override} (if set; else \texttt{num\_layers}) \\
-$x_0^{(r)}$ & \texttt{x0\_refined} inside \texttt{GPT.\_run\_backbone} \\
-$z^{(r)}$ & \texttt{z} returned by \texttt{GPT.\_deq\_solve} \\
-$f_\theta$ & \texttt{Block.forward(z, x0)} (\texttt{GPT.shared\_block}) \\
-$p_{\text{mix}}$ & \texttt{p\_mix} inside \texttt{GPT.\_get\_soft\_embedding} \\
-top-$\kappa$ & \texttt{GPT.\_get\_soft\_embedding(topk=...)} (default $\kappa=64$) \\
-$\alpha$ & \texttt{GPT.\_refine\_mix\_alpha} (ramped; $0\rightarrow 0.5$) \\
+Exogenous injection $b(x_0)$ with identity path; no state-gated injection in certified map & Token-local injection gate $g_{\text{inj}}(z)$ applied to expert inputs \\
+Router scoring via SIPS or L2-distance with explicit Lipschitz budget; single combined pool optional & Two routers (attn/mlp) with linear logits + $\log\sigma$ logit-gate + expert bias \\
+Explicit contraction shell with $\tau\le\tau_{\max}<1$ & No explicit $\tau$ parameter; stabilization via scaling (e.g.\ $0.5$) and training dynamics \\
+Certified attention: L2 attention (MLA-compatible) under norm constraints & Current attention: MLA + causal SDPA + post-SDPA head gates \\
+Certified ``normalization'': explicit 1-Lipschitz projection $\Pi_R$ & Uses \texttt{rms\_norm} and learnable \texttt{RMSNorm} (not globally 1-Lipschitz) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\section{Reference}
-\begin{thebibliography}{9}
+\section{References}
+\begin{thebibliography}{99}
+
+\bibitem{banach_hunter}
+John K. Hunter.
+\newblock \emph{Applied Analysis}, Chapter 3: The Contraction Mapping Theorem.
+\newblock UC Davis notes. \url{https://www.math.ucdavis.edu/~hunter/book/ch3.pdf}
+
 \bibitem{revdeq}
-RevDEQ: Reversible Deep Equilibrium Models.
-\newblock arXiv:2509.12917.
-\newblock \url{https://arxiv.org/abs/2509.12917v1}
-\bibitem{dense_routing}
-Soft (dense) routing inspiration: Sparsely-Gated MoE routing with dense variants.
-\newblock arXiv:2308.00951.
-\newblock \url{https://arxiv.org/abs/2308.00951}
-\bibitem{gated_attn}
-Gated attention (head-wise output gating after SDPA).
-\newblock arXiv:2505.06708.
-\newblock \url{https://arxiv.org/abs/2505.06708}
+Sam McCallum, Kamran Arora, James Foster.
+\newblock \emph{Reversible Deep Equilibrium Models (RevDEQ)}.
+\newblock arXiv:2509.12917. \url{https://arxiv.org/abs/2509.12917}
+
+\bibitem{l2_attention}
+Hyunjik Kim, George Papamakarios, Andriy Mnih.
+\newblock \emph{The Lipschitz Constant of Self-Attention}.
+\newblock arXiv:2006.04710. \url{https://arxiv.org/abs/2006.04710}
+
+\bibitem{l2r_sips}
+Minghao Yang, Ren Togo, Guang Li, Takahiro Ogawa, Miki Haseyama.
+\newblock \emph{L2R: Low-Rank and Lipschitz-Controlled Routing for Mixture-of-Experts}.
+\newblock arXiv:2601.21349. \url{https://arxiv.org/abs/2601.21349}
+
+\bibitem{groupsort}
+Cem Anil, James Lucas, Roger Grosse.
+\newblock \emph{Sorting out Lipschitz function approximation}.
+\newblock ICML 2019 / arXiv:1811.05381. \url{https://arxiv.org/abs/1811.05381}
+
+\bibitem{spectral_norm}
+Takeru Miyato, Toshiki Kataoka, Masanori Koyama, Yuichi Yoshida.
+\newblock \emph{Spectral Normalization for Generative Adversarial Networks}.
+\newblock arXiv:1802.05957. \url{https://arxiv.org/abs/1802.05957}
+
 \end{thebibliography}
 
 \end{document}
