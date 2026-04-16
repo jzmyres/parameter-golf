@@ -172,7 +172,7 @@ class Hyperparameters:
     #   "linear" = legacy `W_r x_n + b + log σ(W_g x_n)` (iter 30-33b baseline)
     #   "l2"     = `tanh(-γ‖x_n − c_j‖²)` with learnable prototypes c_j,
     #              1-Lipschitz scoring (this iter).
-    router_scoring = "l2"
+    router_scoring = "sips"  # iter 34B A/B test: SIPS (cosine similarity) vs iter 34A's L2-distance
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
     tie_attn_mlp_router = False
 
@@ -1001,7 +1001,7 @@ class SoftDenseRouter(nn.Module):
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
-        assert self.scoring in ("linear", "l2"), f"unknown scoring: {scoring}"
+        assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
         # Tensor buffer to avoid Python-float guards inside torch.compile graphs.
         # Kept behind a property so legacy code/tests can assign `health_scale = 5.0`.
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
@@ -1077,11 +1077,21 @@ class SoftDenseRouter(nn.Module):
             # L2-distance logits (doc §4.3 Option B, §6.4):
             #   s_j = tanh(-γ · ‖x_n − c_j‖²)
             # 1-Lipschitz under tanh saturation; γ=1.0 fixed.
-            # x_n: (..., D), prototypes: (E, D).  Broadcast to (..., E).
             c = self.prototypes.to(dtype=x_n.dtype)
             diff = x_n.unsqueeze(-2) - c                     # (..., E, D)
             dist_sq = diff.pow(2).sum(dim=-1)                 # (..., E)
             route_logits = torch.tanh(-self.l2_gamma * dist_sq)
+            route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
+        elif self.scoring == "sips":
+            # SIPS logits (doc §4.3 Option A, §6.5):
+            #   s_j = γ · cos(q, k_j)  where q=x_n, k_j=prototypes[j]
+            # cos is inherently bounded in [-1, 1] — tanh-like saturation
+            # without an explicit saturation layer.  1-Lipschitz scoring
+            # (composition of bounded-norm query, normalization, dot product).
+            c = self.prototypes.to(dtype=x_n.dtype)
+            # F.cosine_similarity broadcasts cleanly: (..., 1, D) vs (E, D)
+            cos_sim = F.cosine_similarity(x_n.unsqueeze(-2), c, dim=-1)  # (..., E)
+            route_logits = self.l2_gamma * cos_sim
             route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
         else:
             # Linear scoring (iter 30-33b baseline).
