@@ -1538,6 +1538,11 @@ class Block(nn.Module):
         with torch.no_grad():
             self.inj_gate.weight.zero_()
             self.inj_gate.bias.fill_(-2.1972246)  # sigmoid(-2.2) ~ 0.1
+        # Phase 5e-2 iter 29b: full-rank D→D transform of x0 (replaces
+        # the per-token sigmoid gate with per-dimension learned mixing).
+        self.inj_lin = CastedLinear(dim, dim, bias=False)
+        with torch.no_grad():
+            nn.init.normal_(self.inj_lin.weight, std=0.02)
 
     def _inj_gate_from(self, z_in: Tensor) -> Tensor:
         # Token-local injection gate: one sigmoid value per (batch, seq) position,
@@ -1574,12 +1579,8 @@ class Block(nn.Module):
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
-        # Phase 5e-1 iter 27d: mirror the forward expert input so the
-        # diagnostic tracks the actual collapse mode (small-g_inj makes this
-        # nearly identical to clean z, but the optimizer can grow g_inj — and
-        # if the injected expert path collapses we want this to fire).
-        g_inj = self._inj_gate_from(z_sub).to(dtype=z_sub.dtype)
-        x = z_sub + g_inj * x0_sub
+        # Phase 5e-2 iter 29b: mirror forward's learned linear injection.
+        x = z_sub + self.inj_lin(x0_sub)
 
         x_attn = self.attn_norm(x)
         w_attn = self.attn_router(x_attn, pre_normed=True)
@@ -1615,16 +1616,14 @@ class Block(nn.Module):
         return attn_ortho, mlp_ortho
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # Phase 5e-1 iter 27d-pos-expert-in: inject ONLY into expert inputs.
-        # Routers read clean z_in; experts receive z_in + g_inj·x0.  Mirror
-        # image of 27c (which did router-only).  Hypothesis: experts should
-        # see x0 (feature info) but routing decisions should be state-only
-        # (x0-independent).  This preserves x0 dependence of FP via the
-        # expert feature paths.
-        g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
-        x = z_in                           # routers see clean z
-        x_expert_in = z_in + g_inj * x0    # experts see injected z
-        inj_term = None                    # no per-expert inj via mix_experts
+        # Phase 5e-2 iter 29b-W-full-rank: replace sigmoid gate with learned
+        # D→D linear transform.  Instead of per-token scalar modulation
+        # (sigmoid(Linear(LN(z)))), learn a fixed per-dimension mixing of x0.
+        # Tests whether the gate's z-DEPENDENCE was load-bearing (iter 29a
+        # showed identity over-injects) or just the PARAMETRIC transform.
+        x = z_in                                      # routers see clean z
+        x_expert_in = z_in + self.inj_lin(x0)         # experts see W·x0
+        inj_term = None
 
         # Parallel residuals with the inner residual REMOVED.  Attention and
         # MLP both read the same pre-residual input x and their outputs sum
