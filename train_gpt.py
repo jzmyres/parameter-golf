@@ -1607,6 +1607,18 @@ class Block(nn.Module):
             PerExpertSpectralNormCap(self.attn.expert_out.shape),
         )
         torch.nn.utils.parametrize.register_parametrization(
+            self.attn, "expert_proj",
+            PerExpertSpectralNormCap(self.attn.expert_proj.shape),
+        )
+        torch.nn.utils.parametrize.register_parametrization(
+            self.mlp, "expert_gate",
+            PerExpertSpectralNormCap(self.mlp.expert_gate.shape),
+        )
+        torch.nn.utils.parametrize.register_parametrization(
+            self.mlp, "expert_fc",
+            PerExpertSpectralNormCap(self.mlp.expert_fc.shape),
+        )
+        torch.nn.utils.parametrize.register_parametrization(
             self.mlp, "expert_down",
             PerExpertSpectralNormCap(self.mlp.expert_down.shape),
         )
