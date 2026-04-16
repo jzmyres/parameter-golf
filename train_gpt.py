@@ -2656,11 +2656,19 @@ def main() -> None:
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    # Phase 6a.4 (review 6): fail loud on math-SDPA fallback.  The math
+    # kernel is ~10× slower than flash; a silent fallback invalidates
+    # wallclock comparisons.  Disabling it forces SDPA to raise instead of
+    # quietly slow-pathing — a promotion-gating regression we want to see.
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(True)
+    enable_math_sdp(False)
+    sdp_kernel_policy = (
+        "sdpa_kernels: flash=ON mem_eff=OFF math=OFF cudnn=OFF "
+        "(math fallback disabled — SDPA will raise on unsupported shapes)"
+    )
 
     logfile = None
     if master_process:
@@ -2728,6 +2736,7 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
+    log0(sdp_kernel_policy, console=False)
     log0("=" * 100, console=False)
 
     random.seed(args.seed)
