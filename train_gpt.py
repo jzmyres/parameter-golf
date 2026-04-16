@@ -817,13 +817,15 @@ class PerExpertSpectralNormCap(nn.Module):
             # the in-place `copy_` here would bump their version counter
             # between the two forwards, triggering "variable needed for
             # gradient has been modified by an inplace operation" errors.
-            u = self.u.clone()
-            v = self.v.clone()
+            # Also force-cast u/v to fp32 so `.bfloat16()` on the parent
+            # model doesn't create a dtype mismatch against W32.
+            u = self.u.detach().float().clone()
+            v = self.v.detach().float().clone()
             for _ in range(self.n_power_iters):
                 v = F.normalize(torch.einsum("emn,em->en", W32, u), dim=-1, eps=1e-12)
                 u = F.normalize(torch.einsum("emn,en->em", W32, v), dim=-1, eps=1e-12)
-            self.u.copy_(u)
-            self.v.copy_(v)
+            self.u.copy_(u.to(dtype=self.u.dtype))
+            self.v.copy_(v.to(dtype=self.v.dtype))
         # σ_max estimate per expert: differentiable only through W; u, v are
         # detached constants (from the no-grad block) for this computation.
         sigma = torch.einsum("em,emn,en->e", u, W32, v).abs()  # (E,)

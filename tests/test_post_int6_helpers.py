@@ -96,8 +96,11 @@ class TestSoftDenseRouterDiagMaterialization(unittest.TestCase):
         self.assertIsNone(r._expert_usage)
 
 
-class TestTokenLocalInjectionGate(unittest.TestCase):
-    """H29 principle: every gate must be input-dependent AND token-local."""
+class TestExogenousInjectionChunkingInvariance(unittest.TestCase):
+    """H29 principle: the contraction-shell injection b(x_0) = x_0 + U·rms_norm(x_0)
+    must be TOKEN-LOCAL (no reduction over batch or sequence).  The iter 30 shell
+    replaces the old `_inj_gate_from` token gate; the chunking-invariance check
+    migrates to the new `_compute_b_x0`."""
 
     def _fresh_block(self, dim: int = 16) -> Block:
         torch.manual_seed(0)
@@ -107,41 +110,56 @@ class TestTokenLocalInjectionGate(unittest.TestCase):
             attn_expert_rank=0, mlp_expert_rank=0,
         )
 
-    def test_gate_shape_is_per_token(self):
+    def test_b_x0_shape_is_same_as_input(self):
         blk = self._fresh_block()
         B, T, D = 2, 3, 16
-        z_in = torch.randn(B, T, D)
+        x0 = torch.randn(B, T, D)
         with torch.no_grad():
-            g = blk._inj_gate_from(z_in)
-        self.assertEqual(tuple(g.shape), (B, T, 1))
+            bx0 = blk._compute_b_x0(x0)
+        self.assertEqual(tuple(bx0.shape), (B, T, D))
 
-    def test_gate_is_chunking_invariant(self):
+    def test_b_x0_is_chunking_invariant(self):
         """Appending tokens to the end of the sequence must not change the
-        gate values for the earlier positions — streaming / prefix-caching
-        invariance that the old batch-mean gate violated."""
+        b(x_0) values at earlier positions — streaming / prefix-caching
+        invariance, because rms_norm operates on the last (feature) dim only.
+        Block put in inference mode to freeze the spectral_norm power iteration
+        (otherwise U changes between the two forwards — a separate correctness
+        issue fixed in Phase 6a.2)."""
         blk = self._fresh_block()
-        # Give the model non-trivial weights so the gate isn't constant.
-        for p in blk.inj_gate.parameters():
-            with torch.no_grad():
-                p.normal_(std=0.5)
-        B, T, D = 2, 3, 16
-        z_in = torch.randn(B, T, D)
-        z_ext = torch.cat([z_in, torch.randn(B, 4, D)], dim=1)
         with torch.no_grad():
-            g_short = blk._inj_gate_from(z_in)
-            g_long = blk._inj_gate_from(z_ext)
+            orig = getattr(blk.inj_lin, "weight_orig", None)
+            if orig is not None:
+                orig.normal_(std=0.3)
+            else:
+                blk.inj_lin.weight.normal_(std=0.3)
+        blk.train(False)
+        B, T, D = 2, 3, 16
+        x0_short = torch.randn(B, T, D)
+        x0_long = torch.cat([x0_short, torch.randn(B, 4, D)], dim=1)
+        with torch.no_grad():
+            b_short = blk._compute_b_x0(x0_short)
+            b_long = blk._compute_b_x0(x0_long)
         self.assertTrue(
-            torch.allclose(g_short, g_long[:, :T, :], atol=1e-6),
-            "Token-local gate depends on later tokens — H29 violation",
+            torch.allclose(b_short, b_long[:, :T, :], atol=1e-6),
+            "b(x_0) depends on later tokens — chunking / H29 violation",
         )
 
-    def test_gate_bounds(self):
+    def test_b_x0_structural_identity_path(self):
+        """Structural check: b(x_0) - U·rms_norm(x_0) == x_0.  Confirms the
+        identity term '+ x_0' is literally in the formula so input-dependence
+        cannot vanish if U collapses during training."""
+        from train_gpt import _rms_norm
+
         blk = self._fresh_block()
-        z_in = torch.randn(4, 8, 16)
+        blk.train(False)
+        x0 = torch.randn(4, 8, 16)
         with torch.no_grad():
-            g = blk._inj_gate_from(z_in)
-        self.assertTrue(torch.all(g >= 0.0).item())
-        self.assertTrue(torch.all(g <= 1.0).item())
+            bx0 = blk._compute_b_x0(x0)
+            inj_term = blk.inj_lin(_rms_norm(x0)).to(dtype=x0.dtype)
+        self.assertTrue(
+            torch.allclose(bx0 - inj_term, x0, atol=1e-5),
+            "b(x_0) - U·rms_norm(x_0) must equal x_0",
+        )
 
 
 if __name__ == "__main__":

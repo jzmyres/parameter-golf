@@ -457,7 +457,7 @@ failure.
 | 33b | spectral-experts-full | extend per-expert σ_max ≤ 1 to `attn.expert_proj`, `mlp.expert_gate`, `mlp.expert_fc` (input-side matrices); total 5 banks certified | §6.1 | **PROMOTED ★ (commit `a8c0ffb`)** | **1.9174** (-0.009 improvement!) | **0.016** (tighter) |
 | 34A | router-L2 | L2-distance router `s_j=tanh(-γ‖q-c_j‖²)` with γ=1.0 + learnable prototypes | §4.3 Option B | **PROMOTED ★ (commit `bef50df`)** | **1.9217** (+0.004 vs iter33b) | **0.037** (looser than iter33b's 0.016, still ≤ 0.5) |
 | 34B | router-SIPS | cosine-similarity `s_j=γ·cos(q, k_j)` (reuses iter 34A prototypes) | §4.3 Option A | **A/B LOSER** (commit `a405e9e` not promoted) | 1.9267 (+0.005 vs 34A) | **0.030** (better than 34A's 0.037 but loses on val_bpb) | SIPS has tighter K-sweep but +17% per-step cost kills wallclock val_bpb. L2+tanh remains default. |
-| 35 | single-router | collapse attn/mlp routers into one `E=E_attn+E_mlp` pool | §4.3 | queued | — | — |
+| 35 | **single-router (MANDATORY, doc §4.3)** | collapse attn/mlp routers into one `E=E_attn+E_mlp` pool; single softmax across combined pool; `w_attn = w[..., :E_a]`, `w_mlp = w[..., E_a:]` | §4.3 | queued (HARD CONSTRAINT) | — | — |
 | 36 | L2-attention | MLA+SDPA → L2 attention `a_tj=softmax(-γ‖q_t-k_j‖²)` under bounded state | §6.6 | queued | — | — |
 | 37 | lipschitz-mlp | MLP experts → spectral-norm MLP or GroupSort (close 1-Lip cert loop) | §6.2 | queued | — | — |
 
@@ -559,6 +559,40 @@ VERIFIED or RESOLVED hypothesis from this document.
 6. Give up after 3 retries — the config may not be reachable from the current basin
 
 ### Permanent protocol for all iterations
+
+#### HARD CONSTRAINTS (doc-alignment + process, added 2026-04-16)
+
+These four rules override ordinary promotion policy.  Violating any of them is
+a process bug, not a design choice.
+
+1. **Doc alignment is a HARD CONSTRAINT.**  Every module specified in
+   `opg_doc.tex` §3–6 MUST land in `train_gpt.py` (exogenous injection, τ-shell,
+   Π_R on state and post-mix norms, per-expert σ_max≤1, 1-Lip activations,
+   L2-distance attention, **single pooled router over E=E_attn+E_mlp**, etc.).
+   Capacity/throughput regressions within the carry-forward policy
+   (`Δval_bpb ≤ 0.03`, K=128 Δ ≤ 0.5) are acceptable tax for certification.
+   No doc-specified structure may be marked "optional".
+2. **Update this document after every iteration.**  A commit that lands an
+   iter without refreshing (a) the Phase 6 queue row, (b) the H33 audit
+   table, and (c) any hypothesis statuses affected is incomplete — the doc
+   is the autoresearch system's memory.
+3. **On launch, set a single 20-min `ScheduleWakeup`.**  When training is
+   kicked off, always create ONE wakeup at ~1200s to inspect `run.log` and
+   update this document.  Don't chain wakes up front; dynamically pace
+   further wakes (270s when cache-warm and close to completion, 1200–1800s
+   when genuinely idle).  Never sleep past 300s with no specific signal to
+   watch — that burns cache without purpose.
+4. **`f_theta` must be deterministic within a DEQ solve.**  RevDEQ's O(1)
+   backward reconstructs the forward during backward; any stateful
+   parametrization (spectral-norm power iteration, running stats, dropout,
+   stochastic noise) that writes to buffers inside `forward()` breaks
+   reconstruction and silently corrupts gradients.  Such updates MUST live
+   in explicit pre/post-solve hooks (e.g., `update_uv_()` called once per
+   optimizer step before the DEQ solve), never inside the `forward()`
+   invoked from `RevDEQFunction`.
+
+#### Defaults and gates
+
 - K jitter: **{4, 8, 16}** (dropped K=12 — K=8/16 bracket it; ~7% throughput gain. H12 VERIFIED)
 - K-sweep: {4, 8, 16, 32, 64, 128} with fast eval (256 seqs) + per-K diagnostics
 - Pre-commit: /simplify → coderabbit → pr-review-toolkit → superpowers review
