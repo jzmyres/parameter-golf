@@ -458,7 +458,7 @@ failure.
 | 34A | router-L2 | L2-distance router `s_j=tanh(-γ‖q-c_j‖²)` with γ=1.0 + learnable prototypes | §4.3 Option B | **PROMOTED ★ (commit `bef50df`)** | **1.9217** (+0.004 vs iter33b) | **0.037** (looser than iter33b's 0.016, still ≤ 0.5) |
 | 34B | router-SIPS | cosine-similarity `s_j=γ·cos(q, k_j)` (reuses iter 34A prototypes) | §4.3 Option A | **A/B LOSER** (commit `a405e9e` not promoted) | 1.9267 (+0.005 vs 34A) | **0.030** (better than 34A's 0.037 but loses on val_bpb) | SIPS has tighter K-sweep but +17% per-step cost kills wallclock val_bpb. L2+tanh remains default. |
 | 35 | **single-router (MANDATORY, doc §4.3)** | collapse attn/mlp routers into one `E=E_attn+E_mlp` pool; single softmax across combined pool; `w_attn = w[..., :E_a]`, `w_mlp = w[..., E_a:]` | §4.3 | queued (HARD CONSTRAINT) | — | — |
-| 36 | L2-attention | MLA+SDPA → L2 attention `a_tj=softmax(-γ‖q_t-k_j‖²)` under bounded state | §6.6 | queued | — | — |
+| 36 | **L2-attention + Phase 6a fixes** | MLA+SDPA → L2 attention via SDPA fast path (RMS-norm cancellation trick, γ=0.051) + Phase 6a: deterministic spectral-norm, matmul router, fp32 softmax, bounded prototypes, SDPA fail-loud | §6.6 | **PROMOTED ★ (commit `9146d74`)** | **1.9167** (-0.005 vs 34A=1.9217) | **0.030** (tighter than baseline 0.037) |
 | 37 | lipschitz-mlp | MLP experts → spectral-norm MLP or GroupSort (close 1-Lip cert loop) | §6.2 | queued | — | — |
 
 **Promotion rule — carry-forward on no-significant-degradation (user direction 2026-04-16):**
