@@ -445,7 +445,7 @@ failure.
 
 | # | Iter name | Change (one component) | Doc § | Status | val_bpb | K=128 Δ |
 |---|---|---|---|---|---|---|
-| 30 | **contraction-shell** | exogenous `b(x_0)=x_0+U·rms_norm(x_0)` + τ-shell + shared `u=z+b(x_0)` + `post_norm` removed | §4.2, §4.4, §4.5 | **RUNNING** (baseline for Phase 6) | TBD | TBD |
+| 30 | **contraction-shell** | exogenous `b(x_0)=x_0+U·rms_norm(x_0)` + τ-shell + shared `u=z+b(x_0)` + `post_norm` removed | §4.2, §4.4, §4.5 | **PROMOTED ★ (new Phase 6 baseline, commit `64387e3`)** | **1.9223** (+0.020 vs 27b=1.902) | **0.018** (2.2× tighter than baseline 0.039) |
 | 31 | spectral-U | `‖U‖_2≤1` via `nn.utils.parametrizations.spectral_norm` (1 power iter/fwd) | §6.1 | queued | — | — |
 | 32 | pi_R-state | replace all remaining learnable `RMSNorm` on state path (`attn_norm`, `mlp_norm`, `attn_post_mix_norm`, `mlp_post_mix_norm`, `attn_sdpa_post_norm`, `hidden_post_norm`) with Euclidean-ball projection `Π_R` | §4.1 | queued | — | — |
 | 33 | spectral-experts | spectral-norm constraint on all expert weight matrices (`W^Q/K/V/O`, `expert_proj`, `expert_out`, `expert_gate`, `expert_fc`, `expert_down`) | §6.1, §6.6 | queued | — | — |

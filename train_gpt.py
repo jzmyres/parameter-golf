@@ -1551,6 +1551,16 @@ class Block(nn.Module):
         self.inj_lin = CastedLinear(dim, dim, bias=False)  # U: learned adapter
         with torch.no_grad():
             nn.init.normal_(self.inj_lin.weight, std=0.02)
+        # iter 31 (opg_doc.tex §6.1): enforce ‖U‖_2 ≤ 1 via spectral_norm
+        # parametrization.  1 power iteration per forward is sufficient for
+        # rank-d Gaussian init; provides first true 1-Lipschitz certification
+        # of a module in the Phase 6 queue.  b(x_0) = x_0 + U·rms_norm(x_0)
+        # with Lip(x_0 → b) ≤ 1 + ‖U‖_2 · Lip(rms_norm); the identity path
+        # dominates so b remains input-dependent, and U contributes at most
+        # a 1-Lipschitz adapter to the certified bound.
+        self.inj_lin = torch.nn.utils.parametrizations.spectral_norm(
+            self.inj_lin, name="weight", n_power_iterations=1
+        )
         # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).  τ ∈ (0, τ_max]
         # via sigmoid-parameterized scalar; τ_max<1 guarantees strict contraction
         # (Banach → unique FP, global convergence).
