@@ -190,13 +190,10 @@ class Hyperparameters:
     # per-iter VJP magnitudes decay geometrically toward x0, so the last few
     # iters should dominate the total param gradient.  If the hypothesis
     # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
-    deq_bptt_k = 0  # iter 29a: TBPTT DISABLED (full BPTT).  iter 28b at
-    # k=8 FAILED val_bpb gate (1.9741 vs 1.917 gate, +0.072 vs baseline).
-    # VJP decay ratio was 0.82 per reverse step → last-8 captured only
-    # 83% of gradient, dropped 17% was too much bias for contractive-DEQ
-    # IFT alignment to recover.  Keep the TBPTT implementation (per user
-    # direction) as dormant code — re-enable with CLI --deq-bptt-k=<n>
-    # for future diagnostic or training experiments.
+    deq_bptt_k = 8  # iter 28b: milder truncation after k=4 FAILED. VJP
+    # ratio observed ≈ 0.77, so tail-4 captured only ~40% of gradient;
+    # tail-8 captures ~86% — expected ≤ 0.02 val_bpb regression with
+    # ~25% throughput gain (only K_fwd=16 steps are truncated).
     deq_k_jitter = True
     deq_k_min = 4
     deq_k_max = 16  # locked: Phase 1 (H12 VERIFIED — K jitter to max-train-K is the principled bound)
@@ -1577,10 +1574,12 @@ class Block(nn.Module):
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
-        # Phase 5e-2 iter 29a-W-identity: ortho_aux mirrors forward's
-        # identity injection (no gate) so the diagnostic tracks the
-        # actual expert input x = z_sub + x0_sub.
-        x = z_sub + x0_sub
+        # Phase 5e-1 iter 27d: mirror the forward expert input so the
+        # diagnostic tracks the actual collapse mode (small-g_inj makes this
+        # nearly identical to clean z, but the optimizer can grow g_inj — and
+        # if the injected expert path collapses we want this to fire).
+        g_inj = self._inj_gate_from(z_sub).to(dtype=z_sub.dtype)
+        x = z_sub + g_inj * x0_sub
 
         x_attn = self.attn_norm(x)
         w_attn = self.attn_router(x_attn, pre_normed=True)
@@ -1616,23 +1615,16 @@ class Block(nn.Module):
         return attn_ortho, mlp_ortho
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # Phase 5e-2 iter 29a-W-identity: TRANSFORMATION sweep after
-        # position 27d.  Replace the `sigmoid(Linear(LN(z_in)))·x0` gate
-        # with identity (x = z_in + x0 literally).  No gate, no W, no
-        # scaling.  Tests whether the learnable gate was doing useful
-        # work or whether a free, always-on injection is as good.
-        # Position stays P-expert-in (current HEAD).  Routers read clean
-        # z_in; experts receive z_in + x0 directly.  inj_gate module
-        # remains instantiated (weights unused) — kept to preserve
-        # weights compat and avoid invalidating prior checkpoints.
+        # Phase 5e-1 iter 27d-pos-expert-in: inject ONLY into expert inputs.
+        # Routers read clean z_in; experts receive z_in + g_inj·x0.  Mirror
+        # image of 27c (which did router-only).  Hypothesis: experts should
+        # see x0 (feature info) but routing decisions should be state-only
+        # (x0-independent).  This preserves x0 dependence of FP via the
+        # expert feature paths.
+        g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
         x = z_in                           # routers see clean z
-        x_expert_in = z_in + x0            # experts see identity-injected z
+        x_expert_in = z_in + g_inj * x0    # experts see injected z
         inj_term = None                    # no per-expert inj via mix_experts
-        if self._gg_track_enabled or self._gg_call_track_enabled:
-            # identity gate = constant 1.0 (for diag logging compat)
-            self._inj_gate_last_mean = 1.0
-            if self._gg_call_track_enabled:
-                self._inj_call_track.append(1.0)
 
         # Parallel residuals with the inner residual REMOVED.  Attention and
         # MLP both read the same pre-residual input x and their outputs sum
