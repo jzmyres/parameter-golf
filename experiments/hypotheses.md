@@ -85,6 +85,33 @@ The sparse gradient (only the worst pair updates per step) starved the routing d
 **Status:** ✅ VERIFIED (PARTIAL) — β controls convergence SPEED (confirmed) but NOT FP quality. Higher β converges faster TO A DIFFERENT (WORSE) fixed point.
 **Implication:** Use the LOWEST β that converges within the K budget. β=0.20 at WD=0.72 is optimal.
 
+### H32: Contraction-preserving proposals only — PRINCIPLE (2026-04-16)
+**Claim:** Every architectural change proposal must either (a) preserve strict contraction of $T_x$ under the chosen norm (so Banach still applies), or (b) arrive with a new convergence proof. A change that improves val_bpb while breaking the contraction property is a hidden regression at deep K (K=128+) — it exploits a specific iteration count rather than finding a unique fixed point.
+**Supporting evidence (from prior iters):**
+- iter 27c (router-only injection) — val_bpb +0.19, K=128=5.42 (Δ=3.31): solver diverges past K=16 because FP became x0-independent. Broke contraction in a specific direction.
+- sigmoid-gate collapse (baseline → iter 29) — gate learned to ≈0.01, making injection negligible; FP equation approximately x0-independent, K=128 Δ=0.039 (tax for breaking dependence).
+- iter 29a identity injection — preserved x0-dependence but broke contraction balance, val_bpb +0.044.
+**Status:** ✅ VERIFIED PRINCIPLE (via counterexamples).
+**Implication:** Before any smoke test for a new architectural proposal, audit **Lip_z(T_x) < 1** by tracing the Lipschitz constant through each module. Every proposal must trace to a sufficient condition in opg_doc.tex §6 (linear: `‖W‖_2 ≤ 1`; softmax: ≤ 1/2; RoPE: orthogonal; activation: 1-Lip; dense mixture: use `Π_R` projection or bound `L_w`).
+
+### H33: Iter 30 contraction-shell is STRUCTURALLY aligned, not CERTIFIED — AUDIT (2026-04-16)
+**Claim:** The current iter 30 implements the doc's *form* `T_x = (1-τ)b(x_0) + τ G_θ(z,x_0)` but does not satisfy the *premise* Lip_z(G_θ) ≤ 1.
+**Component audit (current iter 30 code):**
+| Component | 1-Lip in z? | Doc § | Fix needed |
+|---|---|---|---|
+| `b(x_0)` identity + `U·rms_norm(x_0)` | ✓ constant in z | §4.2 | — |
+| `u = z + b(x_0)` | ✓ Lip=1 | §4.2 | — |
+| `attn_norm`/`mlp_norm` (learnable RMSNorm) | ✗ | §4.1 | Replace with `Π_R` |
+| `attn_router` (softmax of `Linear+logσ`) | ✗ (unbounded logits) | §4.3 | Use L2-distance or SIPS |
+| `attn.mix_experts` (MLA + SDPA) | ✗ | §6.6 | Replace with L2 attention |
+| `mlp.mix_experts` (unconstrained `‖W‖_2`) | ✗ | §6.1-6.2 | Spectral norm on expert weights |
+| `attn_post_mix_norm`, `mlp_post_mix_norm` | ✗ | §4.1 | Replace with `Π_R` |
+| `0.5·(Δ_a + Δ_m)` scale | ≤ 1/2 (helps) | §4.4 | — |
+| `post_norm` (RMSNorm) | ✗ → **REMOVED** (2026-04-16 user direction) | §app:current_code | ✓ done; Π_R replacement queued for iter 32 |
+| τ-shell `(1-τ)b + τG` with τ≤0.9 | scales Lip(G) by τ | §4.5 | — |
+**Status:** Structurally aligned; Lipschitz certification deferred to iter 31-37 (systematic, one component per iter).
+**Implication:** iter 30 is still worth running as a "structural baseline" for the contraction shell: tests whether the exogenous injection + τ-form alone improves val_bpb / K-sweep, without certification. Subsequent iters add 1-Lip constraints one at a time.
+
 ---
 
 ## OBSERVED (need controlled verification)
@@ -318,39 +345,45 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 | **27b-pos-expert-out** ★ | Phase 5e-1 position sweep #2: per-expert injection inside mix_experts. | **1.902** | **PROMOTED (new BASELINE `9edc6af`)** | val_bpb improved -0.004 vs 27a. K=128 Δ=**0.039** (tighter than 27a's 0.071). Tech debt: inj_max=0.010 < 0.05 (gate collapsed — but effective net injection is 2×g_inj·x0 from attn+mlp sum, so small gate value still meaningful). |
 | **27c-pos-router-in** | Phase 5e-1 position sweep #3: inject ONLY into router inputs. | 2.093 | **REVERTED (`27faf0d`)** | CATASTROPHIC FAIL on both gates: val_bpb +0.19 vs 27b; K-sweep k4=2.13 k8=2.11 k16=2.11 **k32=5.41 k64=5.42 k128=5.42** → Δ=3.31. Experts never see x0 → FP became x0-independent past K=16 → solver diverges to meaningless basin. **Structural conclusion: experts MUST see x0 for FP x0-dependence to hold.** |
 | **27d-pos-expert-in** | Phase 5e-1 position sweep #4: inject ONLY into expert inputs (routers read clean z). Mirror of 27c. | 1.967 (trained fully; see run `23A`) | **REVERTED** (cleanup commit `623672f`) | val_bpb 1.967 > baseline 1.902 (+0.065). K-sweep clean (k4=2.004 k8=**1.967** k16=1.982 k32=2.000 k64=2.002 k128=2.003 → Δ=0.037) — FP validity intact, but task perf regressed. Asymmetric injection (expert-only) is not better than symmetric (27b). Phase 5e-1 CONCLUDED: **27b (P-expert-out symmetric) remains BASELINE `9edc6af` val_bpb=1.902**. |
-| **28-tbptt-k4** | **Pivot from Phase 5e-2:** Truncated BPTT with k=4. Tests gradient-scale hypothesis: do the last few DEQ iters dominate the total param gradient? Full-BPTT backward runs K reverse iters (~O(K) cost); if the tail dominates, we truncate to k and gain ~(K-k)/K throughput. | 2.33 @ step 200 (run died mid-training); effectively FAIL | **REVERTED (`7f1f907`)** | **VJP decay profile captured via `tbptt_vjp:[...]` diagnostic** — per-backward-iter VJP norm (index 0 = last forward iter). Observed decay ratios: step 9 ≈ 0.96 (near-flat), step 100 ≈ 0.85, step 200 ≈ 0.77. **Hypothesis WEAKLY supported**: decay is geometric but ratio far from 0.5 — with ratio 0.77, last 4-of-16 iters capture only ~40% of the total VJP sum, so 60% of the gradient is discarded. Throughput gain real (4877ms vs baseline 7625ms step_avg → +36%), but val_bpb@step200=2.33 vs baseline 2.29 (+0.04) — already trailing. Run killed at step 200 before completing. **Verdict: k=4 is too aggressive for the observed decay profile.** Retry at k=8 to capture ~86% of gradient with ~25% throughput gain. |
+| **28-tbptt-k4** | Truncated BPTT k=4 (gradient-scale hypothesis). | 2.33 @ step 200 (died) | **REVERTED (`7f1f907`)** | VJP decay ratio 0.77-0.96 (flat vs expected 0.5). Tail-4 captures only 40% → 60% gradient discarded. Throughput +36% but val_bpb trailing. |
+| **28b-tbptt-k8** | Milder k=8 (~83% capture). | **1.974** | **REVERTED** | FAIL by +0.072. Too much bias without compensation. |
+| **28c-tbptt-deeper-K** ★ | k=8 + K jitter (4,8,16,24), eval K=24. Use TBPTT savings for deeper K training. | **1.925** | **KEPT as gen-scaffold** (not promoted — val_bpb regression) | **K=128 Δ=0.015 vs baseline 0.039 — 2.6× TIGHTER**. Deeper-K hypothesis CONFIRMED. Val_bpb cost is the embed gradient truncation tax. K-sweep: k4=1.978 k8=**1.926** k16=1.932 k32=1.938 k64=1.940 k128=1.941. |
+| **28d-tbptt-k12** | Reduce truncation (k=8 → k=12, ~92% capture) to recover val_bpb gap. | **1.963** | **REGRESSED vs 28c** | FAIL by +0.061. K=128 Δ=0.012 (marginal vs 28c's 0.015). **Regressed on val_bpb** because +9% per-step cost (k=12 backward) gave only 425 steps vs 28c's 489. **TBPTT Pareto optimum is 28c (k=8 + K=24)**. |
 
-### Phase 5e: Injection mechanism experiments (queued, after iter 26)
+**TBPTT investigation closed (2026-04-16).**  Best point = 28c val_bpb 1.925
+(+0.023 vs baseline 1.902) trading task perf for **2.6× tighter K-sweep**.
+No config reached val_bpb gate.  Machinery retained (`deq_bptt_k=0` default,
+opt-in via CLI `--deq-bptt-k=N`).  The K-sweep tightening is a real
+generalization win and should be combined with Phase 6 contraction-shell
+architecture for a possible compounding improvement.
 
-**Per user direction (revised 2026-04-15):** find best **POSITION FIRST**, then best **TRANSFORMATION** with that position. Identity = `x = z_in + x0` literally (no W, no gate, no scaling).
+### Phase 5e/5f/5g: CLOSED (2026-04-16)
 
-#### Phase 5e-1: POSITION sweep (transform = current sigmoid·Linear·LN gate)
+Removed from active queue per user direction.  Summary of concluded work:
 
-| Iter | Variant | Where to inject |
-|---|---|---|
-| (baseline) | P-begin = iter 23C current | `x = z_in + g·x0` before attn_norm/mlp_norm — z passes through transform with x0 mixed in |
-| **27a** | P-mix-out | `raw_out = 0.5·z2 + g·x0` — x0 added AFTER transform (bypasses attn/mlp) |
-| **27b** | P-expert-out | `out_e = ... + (g/E)·x0` per-expert before sum (1/E to keep magnitude bounded) |
-| **27c** | P-router-in | Inject into x_attn/x_mlp ONLY for routers (`router(z+g·x0)`); experts read clean z |
-| **27d** | P-expert-in | Inject into expert inputs ONLY (not routers); routers read clean z |
+**Phase 5e (injection mechanism)** — Position sweep 27a/b/c/d + transformation
+sweep 29a/b ran to completion.  Position 27b (P-expert-out) was briefly
+baseline (val_bpb 1.902), but both identity (29a: 1.946) and full-rank W
+(29b: 1.953) **regressed** vs the sigmoid gate.  **Root-cause finding
+(user):** the sigmoid gate enables convergence to a trivial FP (x0-
+independent) because it can collapse to ~0, AND WD=1.08 forces any
+learnable injection parameter toward 0.  Neither identity nor full-rank W
+gave a Pareto improvement.  **Superseded by Phase 6 contraction shell**
+(exogenous injection `b(x_0) = x_0 + U·x_0` with identity path PLUS
+contraction wrapper `T_x = (1-τ)b + τG` — see new queue below).
 
-#### Phase 5e-2: TRANSFORMATION sweep (use best position from 5e-1)
+**Phase 5f (norm ablation)** — Dropped.  The proposed 1-Lipschitz
+projection `Π_R` from opg_doc.tex §4.1 supersedes ad-hoc RMSNorm
+removal.  Norm redesign will happen as part of Phase 6 Lipschitz
+certification, not as independent ablation.
 
-| Iter | Variant | Form |
-|---|---|---|
-| (baseline) | current = sigmoid(Linear(LN(z_in)))·x0 | per-token z-dependent gate |
-| **28a** | W-identity | `x = z_in + x0` — direct add, no W, no gate, no scaling |
-| **28b** | W-full-rank | `x = z_in + W·x0` with W full-rank D×D learnable, init small (std=0.02) |
-
-### Phase 5f: Norm ablation (queued, after Phase 5e)
-
-Re-run systematic norm ablation on the new best architecture once injection mechanism is settled. Removes the 4 learnable RMSNorms (22-rm-attn-sdpa-post, 22-rm-hidden-post, 22-rm-attn-mix-post, 22-rm-mlp-mix-post) one at a time, apply dual-gate (val_bpb + K=128 Δ).
-
-### Phase 5g: Deferred to later (per user direction)
-
-- iter 25 learnable per-channel β (needs custom RevDEQ backward ~30 LOC)
-- iter 26 PSD on expert layers (inductive bias only, no MON guarantee)
-- iter 27 TBPTT (needs RevDEQ surgery too)
+**Phase 5g (deferred: PSD, learnable-β, TBPTT)** —
+- TBPTT: tested (28-28d); conclusion below.
+- Learnable-β: still deferred (needs RevDEQ backward surgery).
+- PSD on expert layers: **DROPPED** — superseded by spectral-norm
+  constraint on U (`‖U‖_2 ≤ 1`) and 1-Lipschitz FFN experts per
+  opg_doc.tex §6 (same goal: controlled Lipschitz; cleaner
+  formulation).
 | **25-learnable-β (aborted)** | Per-channel learnable β via `nn.Parameter(full((D,), logit(0.20)))`, sigmoid-wrapped, applied via unrolled solver (switched deq_backward="unroll" to enable autograd through β). | smoke FAIL | **UNCOMMITTED, DISCARDED** | Smoke: loss delta only -0.285 (vs baseline -2.75 at 300 steps) — 10× slower convergence. Root cause: unrolled solver's O(K) autograd backward injects much more gradient noise than RevDEQ's implicit differentiation. RevDEQ is essential for our setup; proper iter 25 requires custom autograd.Function backward that manually computes grad_β ∝ Σ(f(z) - y)·∂L/∂y across K iters. That's ~30-50 LOC of custom backward surgery — deferred for retry. |
 
 **Iter 21 val_bpb 1.6706 is BETTER than 1.705 (-0.034), but 5 hard assertions failed under OLD gates:**
@@ -377,177 +410,70 @@ Re-run systematic norm ablation on the new best architecture once injection mech
 
 ## Iteration Schedule
 
-### Phases 1-3: COMPLETE ✅
-- **Phase 1** (iters 13-14b): Verified H9, H12, H18. Locked (WD=0.72, β=0.20).
-- **Phase 2** (iters 15-16): H5 RESOLVED (collapse = WD-fixable). Gate stats infra built.
-- **Phase 3** (iters 17-20): Router sigmoid gate, additive injection, post-norm (KEEP), quant-noise (REFUTED).
-- **Muon fix**: Batched NS + compile → NEW BEST 1.705.
+### Phases 1-5: COMPLETE (summary only; see § "Completed Iterations" above for results)
+- **Phase 1** (iters 13-14b): H9, H12, H18 VERIFIED. Locked (WD=0.72, β=0.20, K jitter).
+- **Phase 2** (iters 15-16): H5 RESOLVED (collapse = WD-fixable). Gate stats infra.
+- **Phase 3** (iters 17-20): Router sigmoid gate, additive injection, post-norm, quant-noise REFUTED.
+- **Phase 4** (iters 21-22): Throughput + untied routers + systematic norm ablation.
+- **Phase 4.5 result:** 22-add-all + targeted norm removals landed val_bpb 1.891-1.955.
+- **Phase 5a/b** (iters 23A-23C): injection rework (z_hat = z + B(A(LN(x0))) or residual). 23C-gg-no-residual baseline val_bpb ≈ 1.94-1.95.
+- **Phase 5c** (iters 24-27, 28-28d): WD bump (24), injection position/transformation sweep (27-29b), TBPTT (28-28d). **All closed.** See iteration table at line ~316.
+- **Phase 5d** code hygiene: 5.3/5.4/5.5/5.6 deferred as tech debt; not blocking.
+- **Phase 5e/5f/5g (norm ablation + injection mechanism + PSD-expert-layers): CLOSED** (2026-04-16 user direction). Superseded by Phase 6 below.
 
-### Phase 4: Throughput baseline + untied routers (RUNNING)
+**Current baseline:** 27b `9edc6af`, val_bpb=1.9020, K=128 Δ=0.039.
 
-| Iter | Config change | Hypothesis | Depends on |
-|---|---|---|---|
-| **21** | Untied attn/mlp routers + per-component router gate tracking + all throughput fixes (memmap, FP32 eval, K=128) | Separate router learning + throughput baseline | — |
+### Phase 6: Certified contraction shell (opg_doc.tex §3-5, 2026-04-16 — ACTIVE)
 
-### Phase 4.4: Throughput micro-optimizations (FIRST — before norm ablation)
+**Guiding principle (opg_doc.tex, H32):** every arch proposal must preserve
+strict contraction of $T_x$ under Frobenius norm (so Banach applies), be
+**simple** (one change at a time), and **principled** (each change traces to a
+sufficient condition in doc §6). Before smoke-testing a new proposal, audit
+**Lip_z(T_x) < 1** by tracing the Lipschitz constant through each module.
 
-**Rationale:** more steps/hour means every subsequent iter (norm ablation, injection rework, training objectives, scaling law) gets a better signal per compute hour. Front-loading throughput work compounds.
+**Certified design target (doc §4-5):**
+```
+b(x_0) = x_0 + U · Π_R(x_0)                # exogenous, identity-preserving
+u(z, x_0) = Π_R(z + b(x_0))                # shared expert/router input
+G_θ(z, x_0) = 0.5 · (Δ_attn + Δ_mlp)       # parallel mix of 1-Lip experts
+T_x(z) = (1-τ) · b(x_0) + τ · G_θ          # strict contraction (τ < 1)
+```
 
-**Top 5 ROI iters in priority order:**
+**Systematic queue (each iter = one component change, result column filled on completion):**
 
-| Iter | Optimization | Expected gain | Effort | Risk |
-|---|---|---|---|---|
-| ~~T1~~ | ~~Grouped expert mixing~~ — **ALREADY DONE** (both mix_experts paths use torch.bmm; input uses flattened matmul) | 0 | — | — |
-| ~~T2~~ | ~~Defer diagnostic CPU sync~~ — **mostly done** (diag sites gated behind `_ROUTER_DIAGNOSTICS_ACTIVE`, only fire during log/eval steps; <2% real gain not worth the refactor complexity) | <2% | — | — |
-| ~~T4~~ | ~~Drop full val mid-train~~ — **ALREADY DONE** (L2624 uses `full_validation=False`) | 0 | — | — |
-| T3 | compile `dynamic=True` | 2-5% | Low | High (past dynamo bugs) |
-| T5 | activation-checkpoint MoS head | Modest | Medium | Low |
+| Iter | Change | Doc § | Status | val_bpb | K=128 Δ | Notes |
+|---|---|---|---|---|---|---|
+| **30-contraction-shell** | Structural: exogenous `b(x_0) = x_0 + U·rms_norm(x_0)` (U = CastedLinear(D,D), std=0.02 init), τ ∈ (0,0.9] contraction wrapper, shared `u = z + b(x_0)` for routers+experts. Keep learnable RMSNorms, MLA, MoS (NOT yet 1-Lip certified). | §4.2, §4.4, §4.5 | **LAUNCHED (pending)** | TBD | TBD | First test of τ-shell + exogenous injection. Contraction proof does not yet apply (G_θ Lip unbounded) — tests empirical effect of structure alone. |
+| 31-spectral-U | Add `‖U‖_2 ≤ 1` via `nn.utils.parametrizations.spectral_norm` (1 power iter/fwd). 1-Lip adapter. | §6.1 | queued | TBD | TBD | First true 1-Lip cert. |
+| 32-pi_R-state | Replace `attn_norm`/`mlp_norm`/`post_norm` on state with Euclidean-ball projection `Π_R`. Bounds ‖z‖, makes state passing 1-Lip. | §4.1 | queued | TBD | TBD | Requires tuning R (start R = sqrt(d) · 2 ≈ 55). |
+| 33-spectral-experts | Spectral-norm constraint on all expert weight matrices (`W^Q/K/V/O`, `expert_proj`, `expert_out`, `expert_gate`, `expert_fc`, `expert_down`). | §6.1, §6.6 | queued | TBD | TBD | Many parametrizations; one-shot for all expert matrices. |
+| 34-L2-router-vs-sips | **A/B:** (A) L2-distance router `s_j = ρ(-γ‖q-c_j‖²)` with `ρ=tanh`, γ bounded. (B) SIPS `s_j = γ·φ(‖q‖)·ψ(‖k_j‖)·cos(q,k_j)`. Run both, pick winner on val_bpb + Lip_router. | §4.3 A/B | queued | TBD | TBD | **Rigorous A/B test per user direction.** Both replace current `Linear+logσ` logits. |
+| 35-single-router | Collapse `attn_router`/`mlp_router` → single combined router over `E = E_attn + E_mlp` pool. Simpler Lipschitz accounting. | §4.3 | queued | TBD | TBD | Big refactor of `Block.forward` expert-mix plumbing. |
+| 36-L2-attention | Replace MLA+SDPA with L2 attention `a_tj = softmax(-γ‖q_t-k_j‖²)`. 1-Lip under bounded states + γ. | §6.6 | queued | TBD | TBD | Major change; test in isolation after 33 (1-Lip expert MLPs). |
+| 37-lipschitz-mlp | Replace MLP experts with spectral-norm MLP (`W^(1)`, `W^(2)` ‖·‖₂ ≤ 1; LeakyReLU(η≤1) is 1-Lip). Optionally upgrade to GroupSort. | §6.2 | queued | TBD | TBD | Closes full 1-Lip certification loop. Then Banach proof applies. |
 
-**Phase 4.4 status:** T1, T2, T4 already implemented via prior hardening work.  T3/T5 have marginal ROI vs implementation cost.  **Skip to Phase 4.5 norm ablation** where the arch wins live.  If we later need more throughput, revisit T3 with newer torch or T5 with activation-checkpointing.
-| **T2** | Defer diagnostic CPU sync to log time (record GPU-only inside DEQ loop) | 5-10% | Low | Low — already partially done for routers |
-| **T3** | Compile with `dynamic=True` so single graph handles K∈{4,8,16} | 2-5% steady, eliminates K-recompile re-warmup | Low | Medium — past dynamo bugs may have been fixed in newer torch |
-| **T4** | Drop full validation in mid-train val cycles; only fast subset; full val once at end | 5-10% (saves ~30s × N val cycles per hour) | Low | Low |
-| **T5** | Activation-checkpoint MoS head (256MB logits tensor, recomputable) | Modest step time, enables larger batch (better grad signal, fewer microsteps) | Medium | Low |
+**Principle for promotion:**
+- Primary: val_bpb ≤ 1.917 (baseline + 0.015 tolerance) AND K=128 Δ ≤ 0.5.
+- Secondary (after 37 lands): run K-sweep to K=256+ and verify monotone convergence, confirming the certified Banach FP property.
+- Lipschitz audit: on each kept iter, add one row to H33 table marking the newly-certified component.
 
-**Run order:** T1 → T2 → T3 → T4 → T5. Each iter measured against the previous baseline.
+### Phase 6-contingent: compound deeper-K + TBPTT
 
-**Performance-lossless requirement (HARD):** each throughput iter must be NUMERICALLY EQUIVALENT to the baseline within tolerance. The training trajectory and val_bpb must not regress beyond bf16 noise floor (~0.005 BPB). Throughput optimizations that "trade quality for speed" are NOT acceptable here — those go in different phases. Each iter ships with:
-1. **Unit test** verifying numerical equivalence of the changed forward path against the prior implementation (e.g., for T1: a test that runs both old einsum and new bmm path on random input, asserts max-abs-error < 1e-4 in bf16 / < 1e-6 in fp32)
-2. **Smoke test** passes (same loss-decrease + recon-err trajectories as prior)
-3. **Short comparative training run** (50-100 steps) showing matched loss/val_bpb trajectory vs prior baseline
-4. **Throughput measurement** (ms/step at steady state) showing the gain
-5. Promote on val_bpb improvement OR equivalent val_bpb + measured throughput gain (val_bpb-primary policy + throughput as tiebreaker)
+TBPTT investigation (28-28d) closed without promotion. Best point 28c
+(val_bpb 1.925, K=128 Δ=0.015) retained as **generalization-scaffold option**:
+may recombine with Phase 6 architectures once val_bpb stabilizes, to test
+whether deeper-K training compounds with the certified contraction shell.
 
-**Goal:** end Phase 4.4 with combined ~30-40% throughput improvement, ZERO val_bpb regression, then proceed to Phase 4.5 norm ablation with faster iter cadence.
-
-### Phase 4.5: Norm position ablation (after Phase 4.4 throughput is done)
-
-**Approach** (per user direction): instead of separate one-off iters for specific norm positions, do a SYSTEMATIC ablation:
-1. **Iter 22-add-all**: add LEARNABLE RMSNorm at ALL reasonable post-non-linearity positions. Make all RMSNorms learnable (weight ∈ R^dim, currently parameter-free).
-2. **Iters 22-rm-{position}**: remove ONE position at a time. Keep removed if val_bpb doesn't regress meaningfully (≥ −0.005 noise floor).
-3. Continue until no further simplification possible.
-
-**Reasonable post-norm positions (AFTER non-linearities, not after softmax/sigmoid):**
-- After gated SDPA in attention (sigmoid×softmax×V output, before output projection)
-- After leaky_relu² in MLP (before fc-down)
-- After per-expert output (each expert's projected output, before weighted mixing) — H20b candidate
-- After attn_mix per-component (before z2 = attn_mix + mlp_mix) — H20a candidate
-- After mlp_mix per-component
-- After Block output (current `post_norm` — H20 VERIFIED, do NOT remove)
-- After bigram embedding addition (residual sum into tok_emb)
-- After tok_emb (before DEQ entry)
-
-**Skip (already bounded by their non-linearity):**
-- After softmax (router output is a probability)
-- After sigmoid gates (gg, inj, attn_gate, router_gate)
-- After RMSNorm itself
-
-**Pre-norm vs post-norm**: also test pre-norm (norm BEFORE the non-linearity instead of after). Single iter to compare.
-
-**β jitter (H30)** — runs as separate Phase 4.5b iter after the norm ablation settles:
-- Sample β ∈ {0.10, 0.20, 0.30} per training step
-- If β=0.30 causes solver_divergence, the existing prescription bumps WD×1.5 (H19 path)
-- Targets K=128 extrapolation
-
-**Outcomes are not exclusive:**
-- Both 22a/22b win → keep the stricter one (22b), combined with Block-output norm
-- 22a wins, 22b loses → per-component is the right granularity
-- 22a loses, 22b wins → per-expert is the right granularity (more surprising)
-- Both lose → Block-output norm granularity is optimal (negative-result signal useful for scaling law)
-- 22c (β jitter) → primarily targets K=128 degradation; complementary to 22a/22b
-
-### Phase 5: Injection mechanism rework — PRIORITY (re-prioritized after user feedback 2026-04-14)
-
-**Root cause of inj-gate collapse:** `g(z)` is z-dependent. At z* = f(z*, x0), additional injection is a perturbation that backward gradient suppresses to drive `g→0` because loss is evaluated at converged z*. Once z* encodes x0, the gate has no incentive to keep injecting. **This breaks the DEQ identity** `z* = f(z*, x0)` (z* becomes independent of x0 at deep K) and is the upstream cause of K=128 collapse.
-
-**User principle (verified principled):** Removing the gate entirely is more principled than any patch — it adds zero degrees of freedom that can misbehave and structurally enforces that every iteration sees x0. With learnable B,A in the projection, the injection magnitude is fully controlled by B's init scale (std=0.02 or zero-init) and B's weight-decay; no separate scaling parameter is needed (α would just be absorbed into B).
-
-**Plan: test BOTH Form A and Form B as parallel iterations** (user direction 2026-04-14). Form C (residual at input side, `B(A(x0 - z_in))`) is REJECTED — x0 lives in embedding space, z_in lives in DEQ state space, subtracting them at input side scrambles semantics; both Form A and Form B avoid this by either not subtracting or subtracting in z-space after projection.
-
-**α design — DROPPED for 23A/23B** (user feedback 2026-04-14): when B and A are learnable, scalar α is **mathematically redundant** because `α · B(A(x)) = (αB)(A(x))` — the optimizer absorbs α into B. Adding α as a separate learnable parameter is a no-op that wastes 1 DoF. The injection magnitude is controlled by B's init (e.g., std=0.02 or zero-init) and B's weight-decay — both jobs α was nominally doing. **α is only needed in 24c-min** where there is no projection matrix to absorb it; there α is learnable with regularization toward 0.1 to prevent collapse.
-
-| Iter | Form | Config change | Why | Depends on |
-|---|---|---|---|---|
-| **23A** ★ | A: always-on, no gate | `z_hat = z + B(A(LN(x0)))`; B small-init (std=0.02), no α | Simplest — no gate to collapse, x0 always seen, FP exists if B small. Minimum DoF. | Phase 4.5 |
-| **23B** ★ | B: residual in z-space | `z_hat = z + B(A(LN(x0))) - LN(z_in)`; B small-init (std=0.02), no α | Self-regulating — error → 0 in z-space as z_in absorbs projected x0; "collapse" becomes meaningful. | Phase 4.5 |
-
-**Decision criterion for 23A vs 23B:** primary = val_bpb; tiebreaker = K=128 Δ (smaller is better — measures FP-quality preservation across deep extrapolation, the property the gate-collapse pathology specifically broke). If both improve val_bpb but B has cleaner K=128 behavior, prefer B. If A has both cleaner val_bpb AND comparable K=128, prefer A on Occam grounds (fewer ops).
-
-**Iter 24/25/26 (old plan) — DROPPED as not principled** (user feedback 2026-04-14):
-- *Per-iteration α schedule (K learnable scalars):* if 23A works, schedule is unnecessary by definition; if 23B works, residual already encodes per-iter signal. Defeats the purpose of 23A/B.
-- *Multi-scale dim-wise α:* `α[d] · B(...)[d] = (diag(α) @ B)(...)[d]` is mathematically redundant with B — the optimizer can already absorb α[d] into B. Splits one DoF into two with no new expressiveness.
-- *Dual x0 + x0_refined in refinement:* only conditionally principled; needs an observed failure mode in soft-embed averaging to motivate. Not a general improvement.
-
-**Iter 24 (new plan) — projection capacity sweep** (only if 23A/B are marginal; skip if clean win):
-
-| Sub-iter | Form | Projection DoF | Question |
-|---|---|---|---|
-| **24c-min** | `α · LN(x0)` (no A, no B) — α IS needed here (no matrix to absorb), learnable with reg toward 0.1 | 1 (scalar α) | Is *any* projection needed? Or does raw normalized x0 suffice? |
-| **24c-mid** | `B(A(LN(x0)))`, rank = kv_latent_dim (current) — no α | 2·D·r | Baseline reference |
-| **24c-max** | `C(LN(x0))` with single full-rank C (D×D) — no α | D² | Does full-rank projection help? Single D×D is mathematically equivalent to full-rank B(A(·)) (since B@A collapses to one D×D matrix when both are full-rank) but uses **half the params** — strictly better for efficiency. |
-
-If 24c-min ≈ 24c-mid → drop B (and A) entirely on Occam grounds. If 24c-max ≫ 24c-mid → projection capacity is bottlenecked, raise rank. Otherwise keep current rank.
-
-After Phase 5 closes (winner of 23A/23B, optionally with 24c result), proceed directly to Phase 6 (training objectives).
-
-### Phase 5c: DEQ-theoretic iterations (user-directed 2026-04-15)
-
-Three principled DEQ improvements queued. User policy: "keep trying β and MON — if it doesn't work, try other optimizations first, then come back."
-
-| Iter | Change | Why | Risk |
-|---|---|---|---|
-| **25-learnable-β** | β: scalar 0.20 → per-channel `R^D` vector via `sigmoid(raw_β)`; init fill 0.20 | Different channels have different contraction needs — aggressive β for stable channels, conservative for unstable. RevDEQ reversibility preserved (element-wise division). | +768 params/block. If fails, retry with (a) per-layer not per-channel, (b) softplus clamp not sigmoid, (c) MLP-gated β |
-| **26-PSD-expert-layers** | Parameterize `expert_out` + `expert_down` (dominant-spectral-path linear maps) as PSD `W = L·L^T` | **Inductive-bias only, NOT a MON theoretical guarantee.** See footnote below. | If fails, retry variants: (a) shifted-PSD `W = (ε·I + L·L^T)/(c + \|\|L\|\|²)` adding spectral-norm bound, (b) only `expert_down` PSD, (c) smaller L rank |
-
-**Footnote on iter 26 — theoretical status:**
-
-Partial PSD parameterization of `expert_out`/`expert_down` does **NOT** invoke any MON theorem guarantee. The MON theorem requires the *entire operator* `f(z, x) = σ(W·z + U·x + b)` to have that specific single-layer form with `I - W` shifted-PSD. Our block is `f(z, x0) = 0.5·(attn_mix(z) + mlp_mix(z))` which includes softmax attention, MoE soft routing, LeakyReLU² (non-monotone), and gated attention — none of which fit MON's operator form. Even if `expert_out = L·L^T` (PSD), the Jacobian `J_f` has the form `Σ_e [∂w_e/∂z·expert_out_e·(...) + w_e·expert_out_e·∂(path)/∂z]`, and the product of PSD with non-monotone matrices is **not** monotone. Monotonicity does NOT compose.
-
-What iter 26 actually buys:
-- ✓ Nonneg-eigenvalue direction structure on those specific matrices (aesthetic / regularizer)
-- ✓ Reduced parameter dimensionality
-- ✗ NO unique FP guarantee
-- ✗ NO unconditional convergence guarantee
-- ✗ NO spectral norm bound (PSD has eigenvalues in [0, ∞) — unbounded above)
-- ✗ NO global Lipschitz / contraction guarantee
-
-For a real MON guarantee on our architecture, we'd need either (a) to restructure an entire block component into the `σ(Wz + Ux + b)` form, (b) to replace the block with vanilla MonDEQ (loses MoE/MLA), or (c) to apply layer-wise spectral-norm bounds everywhere (the "hacky" approach, done systematically).
-
-**Treat iter 26 as an empirical experiment in architectural inductive bias**, not a theoretical upgrade. Expected value: PSD constraint may improve K-sweep flatness by shaping the dominant-path spectrum; may also regress val_bpb by reducing model capacity. Pure empirical question.
-| **27-TBPTT** | RevDEQFunction.backward: detach z at iter K-k, only gradient-propagate through last k of K iters | Throughput saving (backward ~75% at k=4/K=16). With 23C's stable FP, early-iter grads may be near-redundant. | If task perf regresses, retry at different k values |
-
-### Phase 5d: Code hygiene sweep (from feedback review 2026-04-15)
-
-Priority bugs/fixes not blocking arch iters — can run in parallel / between training runs:
-
-| # | Fix | Priority |
+| Iter (candidate) | Change | When to revisit |
 |---|---|---|
-| 5.5 | `experiments/smoke_test.py` `_load_real_data` reads shard 256×int32 header as int16 tokens → garbage. Replace with `load_data_shard()` (matches train loader). | **Bug, fix now** |
-| 5.4 | `tests/test_post_int6_helpers.py` + `tests/test_gate_init_defaults.py` + `experiments/test_input_injection_hypernet.py` reference removed `inj_gate`/`gg_gate`. Delete or rewrite for always-on state. | **Bug, fix now** |
-| 5.3 | Emit a single canonical `final_postquant val_bpb:X` line in train_gpt.py; update `plot_metrics.py:154` + `update_results.sh:152` to read it (or from `meta.json[val_bpb]`). Last `val_bpb:` match currently hits K-sweep tail, not scored full-val. | **Fix now** |
-| 5.6 | `zstandard` is an env prerequisite (already in requirements.txt; do **not** modify dependency files). Code path: try `import zstandard` first, then fallback to `lzma` (not `zlib` — worse ratio, risks 16MB blow). | High |
-| 5.1 | Update old CLAUDE.md/comment thresholds to match current relaxed gates (min_share < 0.01, ortho > 0.9, no CV gate). The strict thresholds are stale from pre-val_bpb-primary era. | Medium |
-| 5.2 | Router health constraints: enforce on BOTH attn+mlp separately; align `plot_eval_metrics.py:186` keys. | Medium |
-| 5.7 | Add `--diagnostics={0,1}` flag. Competition default 0 skips full_weights_save + K-sweep + plot subprocesses; dev default 1 keeps current. Important for 600s competition budget. | Medium (before 8×H100 final) |
-| 5.8 | Muon's allreduce on top of DDP grad allreduce is redundant bandwidth. Switch Muon to `broadcast-from-owner` per-shard, or drop DDP reduction where Muon handles. | Low (defer; Phase 4.4 throughput was front-loaded) |
+| 30d-deeper-K | After 30 passes: add `deq_k_jitter_set=(4,8,16,24)` on top of contraction shell. Tests compounding effect on K=128 generalization. | After iter 30 promotion |
+| 30e-TBPTT-deep | `deq_bptt_k=8` + K∈{4,8,16,32}. Same compute as baseline, 2× training depth. | After 30d if K-sweep is clean |
 
-### Phase 6: Training objectives + activation
+### Phase 7: DEFERRED (unroll+compile, scaling-law grid) — see git history / prior queue
 
-| Iter | Config change | Hypothesis | Depends on |
-|---|---|---|---|
-| **28a** | Single-step diffusion CTP (noisy soft-embed + denoise) | H16 — enriches embedding gradients | Phase 5 best |
-| **28b** | LeakyReLU(0.5)² in MLP experts | Records evidence — consistent wins | Phase 5 best |
+Removed from active queue; revisit only after Phase 6 converges and we have a stable, certified architecture to scale.
 
-### Phase 7: Advanced techniques (if gap to record > 0.3 BPB)
 
-| Iter | Config change | Hypothesis | Depends on |
-|---|---|---|---|
-| 29 | OrthoInit on all large weight matrices | Records evidence — better gradient propagation through DEQ | Phase 6 |
-| 30 | Skip gates between DEQ iterations (U-Net style) | Adapted from records 2026-04-09 | Phase 6 |
-| 31 | Gated attention gate position (before SDPA vs after) | Records + paper arXiv 2505.06708 | Phase 6 |
-| 32 | FSQ-STE weight QAT (replace post-hoc int6 with trained-in FSQ) | H28 — closes quant gap, RevDEQ-compatible (deterministic) | Phase 6 |
-
-### Phase 7.5: Throughput optimization — unroll+compile investigation (runs BEFORE Phase 8)
 
 (Phase 7.4 throughput micro-opts have been moved to Phase 4.4 — front-loaded for compounding effect.)
 

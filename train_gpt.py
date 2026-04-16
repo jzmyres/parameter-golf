@@ -190,21 +190,18 @@ class Hyperparameters:
     # per-iter VJP magnitudes decay geometrically toward x0, so the last few
     # iters should dominate the total param gradient.  If the hypothesis
     # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
-    deq_bptt_k = 12  # iter 28d: bumped k=8 → k=12 to reduce embedding
-    # gradient truncation.  iter 28c at k=8 achieved K=128 Δ=0.015
-    # (2.6× tighter than baseline's 0.039 — deeper-K CONFIRMED), but
-    # val_bpb 1.925 missed gate by 0.008. Root cause: tok_emb has only
-    # ONE gradient path (DEQ injection; init_from_embedding is no-op),
-    # so 17% truncation = 17% effective embed_lr reduction.
-    # k=12 captures ~92% (ratio 0.82: (1-0.82^12)/(1-0.82^24) ≈ 0.92),
-    # halving the truncation penalty.  Cost: +5% backward time on
-    # K=16 and K=24 steps only; overall ~2-3% slower than 28c.
+    deq_bptt_k = 0  # iter 30: TBPTT disabled for clean contraction-shell test.
+    # TBPTT investigation (28-28d) concluded; best point was 28c (val_bpb
+    # 1.925, K=128 Δ=0.015 vs baseline 0.039).  Machinery retained in code
+    # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
+    # be re-combined with Phase 6 contraction shell in a follow-up iter once
+    # the new architecture stabilizes val_bpb.
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 24  # iter 28c: extended max from 16 → 24 (train at deeper K)
+    deq_k_max = 16  # iter 30: reset to baseline for clean Phase 6 comparison
     deq_k_step = 4
-    deq_k_jitter_set = (4, 8, 16, 24)  # iter 28c: add K=24 to attack K-sweep gap
-    deq_k_eval = 24  # iter 28c: eval at max training K (H12 policy)
+    deq_k_jitter_set = (4, 8, 16)  # iter 30: baseline jitter for isolated contraction-shell test
+    deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
     # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
@@ -1495,7 +1492,14 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm(dim)
         self.mlp_norm = RMSNorm(dim)
-        self.post_norm = RMSNorm(dim)  # iter 19 H20: normalize output before next DEQ iteration (load-bearing, do NOT remove)
+        # iter 30 (opg_doc.tex §4.5 + user direction 2026-04-16): post_norm REMOVED.
+        # Learnable RMSNorm has unbounded Lipschitz constant near ||x||=0 — it
+        # would break the τ-shell contraction property.  Without post_norm,
+        # Lip_z(T_x) = τ · Lip_z(G_θ), so τ < τ_max < 1 directly buys strict
+        # contraction once G_θ is 1-Lipschitz (progressive cert in iters 31-37).
+        # Hidden-state magnitude is instead bounded structurally by the shell:
+        # ‖T_x‖ ≤ (1-τ)‖b(x_0)‖ + τ‖G_θ‖, which is finite if G_θ is bounded.
+        # A proper `Π_R` projection (doc §4.1) replaces post_norm in iter 32.
         # Phase 4.5 iter 22-add-all: learnable RMSNorm at all reasonable post-non-linearity positions.
         # Subsequent iters remove one at a time; keep removed if val_bpb doesn't regress > 0.015.
         self.attn_post_mix_norm = RMSNorm(dim)  # after attn_mix output (post expert-weighted sum)
@@ -1538,31 +1542,30 @@ class Block(nn.Module):
         self._attn_router_gate_call_track: list[float] = []
         self._mlp_router_gate_call_track: list[float] = []
 
-        self.inj_gate = CastedLinear(dim, 1, bias=True)
-        self._inj_gate_last_mean: float | None = None
+        # iter 30 (opg_doc.tex §4.2, §4.5): certified contraction shell.
+        # Replace the state-dependent sigmoid gate with an EXOGENOUS injection
+        # b(x_0) = x_0 + U · rms_norm(x_0) that has an IDENTITY PATH (the +x_0
+        # term), so the fixed-point map cannot become input-independent even
+        # if U collapses to 0 under WD pressure.  This structurally eliminates
+        # the trivial-FP failure mode observed in the sigmoid-gate baseline.
+        self.inj_lin = CastedLinear(dim, dim, bias=False)  # U: learned adapter
         with torch.no_grad():
-            self.inj_gate.weight.zero_()
-            self.inj_gate.bias.fill_(-2.1972246)  # sigmoid(-2.2) ~ 0.1
+            nn.init.normal_(self.inj_lin.weight, std=0.02)
+        # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).  τ ∈ (0, τ_max]
+        # via sigmoid-parameterized scalar; τ_max<1 guarantees strict contraction
+        # (Banach → unique FP, global convergence).
+        self.tau_max: float = 0.9
+        self.tau_param = nn.Parameter(torch.tensor(-1.0))  # sigmoid(-1)≈0.27 → τ≈0.24 init
+        # Retain _inj_gate_last_mean attr name for logging compat (always 1.0 now)
+        self._inj_gate_last_mean: float | None = None
 
-    def _inj_gate_from(self, z_in: Tensor) -> Tensor:
-        # Token-local injection gate: one sigmoid value per (batch, seq) position,
-        # computed from that token's own RMSNorm-ed hidden state.  The previous
-        # implementation averaged z_in across (batch, seq) before the gate,
-        # which made the DEQ update depend on OTHER examples in the batch and
-        # on how the sequence was chunked — breaking streaming / prefix-caching
-        # invariance.  Token-local gates preserve causality: the gate for token
-        # (b, t) only depends on that token's state.  Principle: every gate in
-        # the block (inj, gg, attn, router) is input-dependent AND token-local.
-        z_n = _rms_norm(z_in)
-        g = torch.sigmoid(self.inj_gate(z_n))  # [B, T, 1]
-        if _should_diag(self.training) and (self._gg_track_enabled or self._gg_call_track_enabled):
-            # Log the scalar mean across (batch, seq) for plotting — this is
-            # just a reduction of the token-local gates, NOT the gate itself.
-            g_val = float(g.detach().float().mean().item())
-            self._inj_gate_last_mean = g_val
-            if self._gg_call_track_enabled:
-                self._inj_call_track.append(g_val)
-        return g
+    def _compute_b_x0(self, x0: Tensor) -> Tensor:
+        """Exogenous injection b(x_0) = x_0 + U·rms_norm(x_0) (doc §4.2)."""
+        return x0 + self.inj_lin(_rms_norm(x0)).to(dtype=x0.dtype)
+
+    def _tau(self) -> Tensor:
+        """τ = τ_max · sigmoid(tau_param) ∈ (0, τ_max). doc §4.5."""
+        return self.tau_max * torch.sigmoid(self.tau_param)
 
     @dynamo_disable
     def _record_gg_diag(self, gg_tok: Tensor) -> None:
@@ -1579,12 +1582,11 @@ class Block(nn.Module):
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
-        # Phase 5e-1 iter 27d: mirror the forward expert input so the
-        # diagnostic tracks the actual collapse mode (small-g_inj makes this
-        # nearly identical to clean z, but the optimizer can grow g_inj — and
-        # if the injected expert path collapses we want this to fire).
-        g_inj = self._inj_gate_from(z_sub).to(dtype=z_sub.dtype)
-        x = z_sub + g_inj * x0_sub
+        # iter 30 (opg_doc.tex §4.2): mirror forward's shared input u = z + b(x_0)
+        # where b(x_0) = x_0 + U·rms_norm(x_0).  Diagnostic tracks the expert
+        # input as used in forward.
+        b_x0_sub = self._compute_b_x0(x0_sub)
+        x = z_sub + b_x0_sub
 
         x_attn = self.attn_norm(x)
         w_attn = self.attn_router(x_attn, pre_normed=True)
@@ -1620,66 +1622,62 @@ class Block(nn.Module):
         return attn_ortho, mlp_ortho
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # Phase 5e-1 iter 27d-pos-expert-in: inject ONLY into expert inputs.
-        # Routers read clean z_in; experts receive z_in + g_inj·x0.  Mirror
-        # image of 27c (which did router-only).  Hypothesis: experts should
-        # see x0 (feature info) but routing decisions should be state-only
-        # (x0-independent).  This preserves x0 dependence of FP via the
-        # expert feature paths.
-        g_inj = self._inj_gate_from(z_in).to(dtype=z_in.dtype)
-        x = z_in                           # routers see clean z
-        x_expert_in = z_in + g_inj * x0    # experts see injected z
-        inj_term = None                    # no per-expert inj via mix_experts
+        # iter 30-contraction-shell (opg_doc.tex §4.2-4.5):
+        #   b(x_0) = x_0 + U · rms_norm(x_0)          — exogenous, identity-path
+        #   u(z, x_0) = z + b(x_0)                    — shared input (routers & experts)
+        #   G_θ(z, x_0) = 0.5 · (Δ_attn + Δ_mlp)      — parallel mix
+        #   T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0)     — strict contraction (τ<1)
+        # The identity path inside b(x_0) prevents input-independent fixed
+        # points (user finding 2026-04-15); the τ-shell gives Banach-unique FP.
+        b_x0 = self._compute_b_x0(x0)
+        u = z_in + b_x0                       # shared router + expert input
+        inj_term = None                        # no legacy per-expert injection
 
-        # Parallel residuals with the inner residual REMOVED.  Attention and
-        # MLP both read the same pre-residual input x and their outputs sum
-        # directly, without the `x +` add that the sequential and earlier
-        # parallel-residual attempts used.  The residual path is supplied
-        # entirely by the outer gg_gate below:
-        #   out = (1 - gg_tok) * z_in + gg_tok * (attn + mlp)
-        # Early training gg_tok is small so the transformation contribution
-        # is automatically gate-scaled, giving the solver a wide contraction
-        # margin; the optimizer can learn the gate to increase transformation
-        # weight as training progresses, without the ~2x update-magnitude
-        # blow-up that broke attempts 1 and 2.
-        x_attn_router = self.attn_norm(x)                   # router: clean
+        # Routers read u via their learnable RMSNorms (pre_normed=True avoids
+        # double-normalization inside SoftDenseRouter).
+        x_attn_router = self.attn_norm(u)
         w_attn = self.attn_router(x_attn_router, pre_normed=True)
-        # Capture attn router gate BEFORE mlp_router call overwrites it (tied router)
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
             attn_rg = getattr(self.attn_router, "_router_gate_last_mean", None)
-        x_attn = self.attn_norm(x_expert_in)                # experts: injected
+
+        # Experts share the same (normalized) u — doc §4.4 prescribes a single
+        # shared expert input; keeping attn_norm/mlp_norm as separate norms
+        # is a non-certified convenience (see hypotheses.md Phase 6 iter 33).
+        x_attn = x_attn_router
         y_shared = self.attn._attn_shared_from_normed(x_attn)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn, inj_term=inj_term)
 
-        x_mlp_router = self.mlp_norm(x)                      # router: clean
+        x_mlp_router = self.mlp_norm(u)
         w_mlp = self.mlp_router(x_mlp_router, pre_normed=True)
-        x_mlp = self.mlp_norm(x_expert_in)                   # experts: injected
+        x_mlp = x_mlp_router
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
 
-        # Phase 4.5 22-add-all: per-component post-norm after expert mix
-        # (post-non-linearity, post-expert-weighted sum).  Subsequent iters
-        # test if either can be removed without val_bpb regression > 0.015.
         attn_mix = self.attn_post_mix_norm(attn_mix)
         mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
-        z2 = attn_mix + mlp_mix
+        # G_θ: parallel mixture with the 0.5 stabilizing scale (doc §4.4).
+        G = 0.5 * (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
-        # Phase 5b iter 23C-gg-no-residual: no gg_gate — emit constant 1.0 diag.
+        # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).
+        tau = self._tau().to(dtype=z_in.dtype)
+        raw_out = (1.0 - tau) * b_x0 + tau * G
+
         if _tracking:
             gg_tok = torch.ones(x_attn.shape[:-1], device=x_attn.device, dtype=x_attn.dtype)
             self._record_gg_diag(gg_tok.detach())
-            # Capture attn gate for per-iteration tracking
+            # iter 30: inj trace is now the constant τ (contraction coefficient).
+            tau_val = float(tau.detach().float().mean().item())
+            self._inj_gate_last_mean = tau_val
+            self._inj_call_track.append(tau_val)
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
             if ag is not None:
                 self._attn_gate_call_track.append(ag)
-            # Per-component router gates (attn captured before mlp call, mlp captured after)
             if attn_rg is not None:
                 self._attn_router_gate_call_track.append(attn_rg)
             mlp_rg = getattr(self.mlp_router, "_router_gate_last_mean", None)
             if mlp_rg is not None:
                 self._mlp_router_gate_call_track.append(mlp_rg)
-            # Combined router gate (average of attn+mlp for backward compat)
             rg_vals = []
             if attn_rg is not None:
                 rg_vals.append(float(attn_rg))
@@ -1687,12 +1685,7 @@ class Block(nn.Module):
                 rg_vals.append(float(mlp_rg))
             if rg_vals:
                 self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
-        # Phase 5e-1 iter 27d-pos-expert-in: x0 enters via x_expert_in
-        # (RMSNorm of injected z) on both attn and mlp expert paths; routers
-        # see clean z_in. inj_term=None disables the per-expert add inside
-        # mix_experts*, so raw_out is purely 0.5·z2.
-        raw_out = 0.5 * z2.to(dtype=z_in.dtype)
-        return self.post_norm(raw_out)  # iter 19: bound hidden state magnitude across DEQ iterations
+        return raw_out  # iter 30: post_norm removed (would break τ-shell contraction)
 
 
 # ---------------------------------------------------------------------------

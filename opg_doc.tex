@@ -82,6 +82,18 @@ Sections~\ref{sec:notation}--\ref{sec:convergence} define $T_x$ and give suffici
 Section~\ref{sec:expressive} discusses expressiveness under 1-Lipschitz constraints.
 Appendix~\ref{app:current_code} documents the current code architecture; Appendix~\ref{app:gaps} summarizes the difference.
 
+\paragraph{Guiding principle for iteration proposals.}
+\emph{Every architectural change proposed in this document must preserve (or strengthen) the
+contraction-mapping property required by the Banach fixed-point theorem.} A
+proposal is admissible only if, after the change, $T_x$ remains a strict contraction
+(Lipschitz constant $<1$) under the norm chosen in Section~\ref{sec:notation}.
+Proposals should also be \textbf{simple} (one change at a time, ideally a single module replaced or one
+constraint added) and \textbf{principled} (each change traceable to a specific sufficient condition in
+Sections~\ref{sec:proj}--\ref{sec:modules}). Several candidate architectures listed in this
+document (e.g.\ SIPS vs.\ L2-distance routing, RMSNorm vs.\ $\Pi_R$ projection,
+MLA+SDPA vs.\ L2 attention) should be tested \emph{rigorously and thoroughly} against
+each other under this rubric.
+
 \section{Notation, norms, and Lipschitz constants}
 \label{sec:notation}
 
