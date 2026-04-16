@@ -774,6 +774,51 @@ class BallProjection(nn.Module):
         return u * scale
 
 
+class PerExpertSpectralNormCap(nn.Module):
+    """Per-expert spectral-norm cap for tensors of shape (E, M, N).
+
+    Applies `W / max(1, σ_max(W_e))` to each per-expert slice W_e = W[e].
+    1-Lipschitz parametrization (opg_doc.tex §6.1) — uses 1 power iteration
+    per forward to estimate σ_max per expert.  Expert matrices in our MoE
+    banks (`expert_out`, `expert_down`, `expert_proj`, etc.) are raw
+    nn.Parameter tensors rather than nn.Linear, so PyTorch's built-in
+    `torch.nn.utils.parametrizations.spectral_norm` doesn't apply directly;
+    this class is the per-expert generalization.
+
+    Registered via `torch.nn.utils.parametrize.register_parametrization`.
+    """
+    def __init__(self, weight_shape: torch.Size, n_power_iters: int = 1):
+        super().__init__()
+        assert len(weight_shape) == 3, f"expected 3D (E,M,N), got {weight_shape}"
+        E, M, N = weight_shape
+        self.register_buffer("u", F.normalize(torch.randn(E, M), dim=-1), persistent=False)
+        self.register_buffer("v", F.normalize(torch.randn(E, N), dim=-1), persistent=False)
+        self.n_power_iters = int(n_power_iters)
+
+    def forward(self, W: Tensor) -> Tensor:
+        W32 = W.float()
+        with torch.no_grad():
+            # Start from fresh clones of the persistent buffers.  RevDEQ
+            # calls this forward twice per training step (once in the
+            # forward pass, once during backward reconstruction).  If we
+            # used `self.u`/`self.v` directly in the sigma einsum below,
+            # the in-place `copy_` here would bump their version counter
+            # between the two forwards, triggering "variable needed for
+            # gradient has been modified by an inplace operation" errors.
+            u = self.u.clone()
+            v = self.v.clone()
+            for _ in range(self.n_power_iters):
+                v = F.normalize(torch.einsum("emn,em->en", W32, u), dim=-1, eps=1e-12)
+                u = F.normalize(torch.einsum("emn,en->em", W32, v), dim=-1, eps=1e-12)
+            self.u.copy_(u)
+            self.v.copy_(v)
+        # σ_max estimate per expert: differentiable only through W; u, v are
+        # detached constants (from the no-grad block) for this computation.
+        sigma = torch.einsum("em,emn,en->e", u, W32, v).abs()  # (E,)
+        scale = (1.0 / sigma.clamp(min=1.0)).to(W.dtype)
+        return W * scale.view(-1, 1, 1)
+
+
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
@@ -1547,6 +1592,24 @@ class Block(nn.Module):
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
                                          expert_rank=attn_expert_rank, router=self.attn_router)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.mlp_router)
+        # iter 33 (opg_doc.tex §6.1): per-expert spectral-norm cap on the
+        # dominant-spectral-path output matrices `expert_out` (attn) and
+        # `expert_down` (mlp).  These are raw nn.Parameter tensors of shape
+        # (E, D, R), so we register a custom per-expert parametrization that
+        # caps σ_max(W_e) ≤ 1 per-expert via 1 power iteration per forward.
+        # Starts narrow: only the OUTPUT projections; other expert weights
+        # (expert_proj, expert_gate, expert_fc) are deferred to iter 33b if
+        # this one lands cleanly.  The Lipschitz of the full expert path is
+        # bounded by σ_max(W_in) · Lip(nonlin) · σ_max(W_out), so capping
+        # W_out alone still provides a meaningful Lipschitz reduction.
+        torch.nn.utils.parametrize.register_parametrization(
+            self.attn, "expert_out",
+            PerExpertSpectralNormCap(self.attn.expert_out.shape),
+        )
+        torch.nn.utils.parametrize.register_parametrization(
+            self.mlp, "expert_down",
+            PerExpertSpectralNormCap(self.mlp.expert_down.shape),
+        )
         # Phase 5b iter 23C-gg-no-residual: gg_gate REMOVED and z residual
         # REMOVED.  New update form:
         #     raw_out = 0.5 * z2            (where z2 = attn_mix + mlp_mix)

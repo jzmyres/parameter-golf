@@ -101,6 +101,7 @@ The sparse gradient (only the worst pair updates per step) starved the routing d
 |---|---|---|---|
 | `b(x_0)` identity + `U·rms_norm(x_0)` | ✓ constant in z | §4.2 | — |
 | `U` (inj_lin) | ✓ **CERTIFIED 1-Lip** via spectral_norm (iter 31, commit `e41dee9`) | §6.1 | done |
+| `attn_norm`/`mlp_norm` (state path) | ✓ **CERTIFIED 1-Lip** via Π_R ball projection R=2√d (iter 32, commit `5cff932`) | §4.1 | done |
 | `u = z + b(x_0)` | ✓ Lip=1 | §4.2 | — |
 | `attn_norm`/`mlp_norm` (learnable RMSNorm) | ✗ | §4.1 | Replace with `Π_R` |
 | `attn_router` (softmax of `Linear+logσ`) | ✗ (unbounded logits) | §4.3 | Use L2-distance or SIPS |
@@ -448,7 +449,7 @@ failure.
 |---|---|---|---|---|---|---|
 | 30 | **contraction-shell** | exogenous `b(x_0)=x_0+U·rms_norm(x_0)` + τ-shell + shared `u=z+b(x_0)` + `post_norm` removed | §4.2, §4.4, §4.5 | **PROMOTED ★ (new Phase 6 baseline, commit `64387e3`)** | **1.9223** (+0.020 vs 27b=1.902) | **0.018** (2.2× tighter than baseline 0.039) |
 | 31 | spectral-U | `‖U‖_2≤1` via `nn.utils.parametrizations.spectral_norm` (1 power iter/fwd) | §6.1 | **PROMOTED ★ (commit `e41dee9`)** | **1.9294** (+0.007 vs iter30) | **0.019** (≈ iter30's 0.018) |
-| 32 | pi_R-state | replace all remaining learnable `RMSNorm` on state path (`attn_norm`, `mlp_norm`, `attn_post_mix_norm`, `mlp_post_mix_norm`, `attn_sdpa_post_norm`, `hidden_post_norm`) with Euclidean-ball projection `Π_R` | §4.1 | queued | — | — |
+| 32 | pi_R-state | replace `attn_norm`, `mlp_norm` on state path with Π_R ball projection (R=2√d≈55.4). Post-mix norms deferred to later iter. | §4.1 | **PROMOTED ★ (commit `5cff932`)** | **1.9197** (-0.010 vs iter31) | **0.012** (tightest so far) |
 | 33 | spectral-experts | spectral-norm constraint on all expert weight matrices (`W^Q/K/V/O`, `expert_proj`, `expert_out`, `expert_gate`, `expert_fc`, `expert_down`) | §6.1, §6.6 | queued | — | — |
 | 34A | router-L2 | L2-distance router `s_j=tanh(-γ‖q-c_j‖²)` with γ bounded | §4.3 Option B | queued | — | — |
 | 34B | router-SIPS | SIPS `s_j=γ·φ(‖q‖)·ψ(‖k_j‖)·cos(q,k_j)` with γ bounded | §4.3 Option A | queued | — | — |
