@@ -190,16 +190,17 @@ class Hyperparameters:
     # per-iter VJP magnitudes decay geometrically toward x0, so the last few
     # iters should dominate the total param gradient.  If the hypothesis
     # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
-    deq_bptt_k = 8  # iter 28b: milder truncation after k=4 FAILED. VJP
-    # ratio observed ≈ 0.77, so tail-4 captured only ~40% of gradient;
-    # tail-8 captures ~86% — expected ≤ 0.02 val_bpb regression with
-    # ~25% throughput gain (only K_fwd=16 steps are truncated).
+    deq_bptt_k = 8  # iter 28c: TBPTT captures ~83% of gradient at ratio
+    # 0.82.  Alone at K∈{4,8,16} this failed (iter 28b, val_bpb 1.974).
+    # Now paired with deeper K jitter (K=24 added) to use the compute
+    # savings for richer FP training.  Hypothesis: 83% of stronger
+    # gradient (from deeper K training) > 100% of weaker gradient.
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 16  # locked: Phase 1 (H12 VERIFIED — K jitter to max-train-K is the principled bound)
-    deq_k_step = 4  # used only when deq_k_jitter_set is None
-    deq_k_jitter_set = (4, 8, 16)  # explicit K bag — dropped K=12 (K=8 + K=16 bracket it, ~7% throughput gain)
-    deq_k_eval = 16  # eval at max training K
+    deq_k_max = 24  # iter 28c: extended max from 16 → 24 (train at deeper K)
+    deq_k_step = 4
+    deq_k_jitter_set = (4, 8, 16, 24)  # iter 28c: add K=24 to attack K-sweep gap
+    deq_k_eval = 24  # iter 28c: eval at max training K (H12 policy)
 
     # Architecture knobs
     # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
