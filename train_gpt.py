@@ -190,11 +190,15 @@ class Hyperparameters:
     # per-iter VJP magnitudes decay geometrically toward x0, so the last few
     # iters should dominate the total param gradient.  If the hypothesis
     # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
-    deq_bptt_k = 8  # iter 28c: TBPTT captures ~83% of gradient at ratio
-    # 0.82.  Alone at K∈{4,8,16} this failed (iter 28b, val_bpb 1.974).
-    # Now paired with deeper K jitter (K=24 added) to use the compute
-    # savings for richer FP training.  Hypothesis: 83% of stronger
-    # gradient (from deeper K training) > 100% of weaker gradient.
+    deq_bptt_k = 12  # iter 28d: bumped k=8 → k=12 to reduce embedding
+    # gradient truncation.  iter 28c at k=8 achieved K=128 Δ=0.015
+    # (2.6× tighter than baseline's 0.039 — deeper-K CONFIRMED), but
+    # val_bpb 1.925 missed gate by 0.008. Root cause: tok_emb has only
+    # ONE gradient path (DEQ injection; init_from_embedding is no-op),
+    # so 17% truncation = 17% effective embed_lr reduction.
+    # k=12 captures ~92% (ratio 0.82: (1-0.82^12)/(1-0.82^24) ≈ 0.92),
+    # halving the truncation penalty.  Cost: +5% backward time on
+    # K=16 and K=24 steps only; overall ~2-3% slower than 28c.
     deq_k_jitter = True
     deq_k_min = 4
     deq_k_max = 24  # iter 28c: extended max from 16 → 24 (train at deeper K)
