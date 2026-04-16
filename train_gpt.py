@@ -484,7 +484,7 @@ def run_validation(args, model, rank, world_size, device, grad_accum_steps,
     """Validate on the val set.  deq_k overrides the number of DEQ solver
     iterations; when None (default) uses args.deq_k_eval."""
     local_batch_tokens = args.val_batch_size // world_size
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
+    local_batch_seqs = max(1, local_batch_tokens // args.train_seq_len)
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     if full_validation or args.eval_batch_seqs <= 0:
         global_seqs = total_seqs
@@ -2071,9 +2071,12 @@ class RevDEQFunction(torch.autograd.Function):
             vjp_z = grads_z[0].to(state_dtype)
 
             if do_vjp_diag:
+                # Phase 6a.5 (review 9): store as GPU scalar tensors, not
+                # Python floats.  Avoids K synchronous GPU→CPU roundtrips
+                # per backward; the .item() sync happens once at log time.
                 diag_vjp_per_iter.append((
-                    float(vjp_y.norm().item()),
-                    float(vjp_z.norm().item()),
+                    vjp_y.detach().norm(),
+                    vjp_z.detach().norm(),
                 ))
 
             bar_z = beta_inv * bar_z + vjp_z
@@ -2939,8 +2942,10 @@ def main() -> None:
         sb_for_vjp = getattr(m, "shared_block", None)
         vjp_iter = getattr(sb_for_vjp, "_tbptt_vjp_iter_last_bwd", None) if sb_for_vjp is not None else None
         if vjp_iter and len(vjp_iter) > 0:
-            # log vjp_y + vjp_z sum per backward iter for compactness
-            sums = [float(a) + float(b) for a, b in vjp_iter]
+            # Phase 6a.5: values may be GPU tensors (deferred sync) or floats.
+            sums = [float(a.item() if hasattr(a, 'item') else a)
+                    + float(b.item() if hasattr(b, 'item') else b)
+                    for a, b in vjp_iter]
             parts.append(f"tbptt_vjp:[{','.join(f'{v:.2e}' for v in sums)}]")
             k_bwd = getattr(sb_for_vjp, "_tbptt_bwd_k_last", None)
             k_fwd = getattr(sb_for_vjp, "_tbptt_fwd_k_last", None)

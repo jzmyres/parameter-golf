@@ -91,6 +91,11 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
         deq_backward="revdeq",
+        router_scoring=args.router_scoring,
+        attention_l2=args.attention_l2,
+        l2_attn_gamma=args.l2_attn_gamma,
+        tie_attn_mlp_router=args.tie_attn_mlp_router,
+        num_experts=args.num_experts,
     ).cuda()
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
