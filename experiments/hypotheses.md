@@ -467,6 +467,16 @@ failure.
   compounding generalization (cf. iter 28c's K=128 Δ=0.015).
 - **30e-TBPTT-deep**: `deq_bptt_k=8` + K∈{4,8,16,32}, compute-neutral vs baseline,
   2× training depth.
+- **38-self-refinement** (orthogonal to the inner DEQ, documented in
+  opg_doc.tex §app:refinement): enable `num_refinements=1` (already plumbed
+  in `train_gpt.py`) and ramp `_refine_mix_alpha` up after 85% of wallclock.
+  Per the appendix, each outer refinement re-solves $T_{x^{(r)}}$ to its own
+  unique fixed point, so Banach still applies per-$r$; the detach on
+  $x_0^{(r-1)}$ plus $\alpha\le 0.5$ bounds the outer gradient path.  Tests
+  whether outer-loop prediction-feedback helps task perf.  Depends on 37
+  landing (so we measure the marginal effect on the fully-certified arch).
+  **Do NOT run before iter 37** — running on uncertified arch confounds
+  refinement benefit with solver-quality noise.
 
 ### Phase 7+ (deferred): throughput unroll+compile, scaling-law grid, FSQ/rank sweeps
 
