@@ -455,12 +455,52 @@ failure.
 | 36 | L2-attention | MLA+SDPA → L2 attention `a_tj=softmax(-γ‖q_t-k_j‖²)` under bounded state | §6.6 | queued | — | — |
 | 37 | lipschitz-mlp | MLP experts → spectral-norm MLP or GroupSort (close 1-Lip cert loop) | §6.2 | queued | — | — |
 
-**Promotion rule (val_bpb-primary with Lip gate):**
-- **Primary:** val_bpb ≤ iter-30-baseline + 0.015 tolerance AND K=128 Δ ≤ 0.5.
-- **Lipschitz secondary:** the newly-constrained component must be measurably
-  1-Lipschitz (or strictly tighter Lip than prior).  Add to H33 row on promotion.
-- **Final-state check (after 37):** run K-sweep to K=256+ and verify monotone
-  convergence to the Banach fixed point.
+**Promotion rule — carry-forward on no-significant-degradation (user direction 2026-04-16):**
+
+The Phase 6 queue is building a *certified* contraction arch.  Each individual
+Lipschitz constraint may slightly reduce capacity (small val_bpb hit) — but
+the CUMULATIVE architectural direction is the goal.  We therefore do NOT
+revert at each step on marginal regression; instead we carry forward unless
+the change is broken.
+
+- **Accept (carry to next iter)** if the change does NOT *significantly*
+  degrade gate metrics:
+  - val_bpb regression ≤ **0.03** (small arch-reshape cost, noise-ish).
+  - K=128 Δ ≤ 0.5 (FP still converges at deep K).
+  - No catastrophic failure on other gates (no NaN, no routing collapse,
+    mos_ortho ≤ 0.9, expert_min_share ≥ 0.005, etc.).
+  → `update_results.sh --promote`, update H33 audit row for the newly-
+     certified component, launch next iter in the queue.
+
+- **Fix-and-retry (stay on current iter)** if the change IS significant:
+  - val_bpb regression > 0.03 OR K=128 Δ > 0.5 OR any gate catastrophes.
+  → identify the **simplest, most principled fix** for the specific
+     failure mode, rerun the SAME iter with the fix.  Iterate (30.1 →
+     30.2 → ...) until the change is good enough to carry forward.
+  → Do NOT move to the next iter; do NOT abandon the constraint.
+     The architectural alignment direction is committed.
+
+- **Never revert past iter 30 baseline.**  The structural contraction shell
+  is the established foundation.  All subsequent Lipschitz constraints are
+  additive refinements — regressions are fixes-to-apply, not signals-to-abort.
+
+- **Principled-fix catalog per component (starting points; use the simplest
+  that works):**
+
+  | Iter | Failure mode | Simplest principled fix |
+  |---|---|---|
+  | 31 spectral-U | val_bpb ↑↑ | raise bound `‖U‖_2 ≤ c` with `c∈(1,2]`, ramp down over training; or warm up spectral norm from 2.0 to 1.0 over first N steps |
+  | 32 Π_R-state | val_bpb ↑↑ | tune radius R upward (e.g. `2·√d`→`4·√d`); apply Π_R only at Block boundary first, not per-component |
+  | 33 spectral-experts | val_bpb ↑↑ | relax `‖W‖_2 ≤ c` with c>1 globally; or exclude the LOWEST-rank expert weight (e.g., only expert_out, expert_down constrained) |
+  | 34A L2-router | routing collapse | tune γ upward to sharpen distances; widen prototype init range; try `ρ=identity` first before `tanh` |
+  | 34B SIPS | same | tune γ, bound φ and ψ ranges, normalize q to unit-sphere before cosine |
+  | 35 single-router | capacity loss | raise expert pool size E=E_attn+E_mlp+extra |
+  | 36 L2-attention | perf drop | tune γ for attention sharpness; keep causal mask; try hybrid L2 + softmax convex combo |
+  | 37 lipschitz-MLP | perf drop | relax ‖W^(1)‖·‖W^(2)‖ ≤ c with c>1; try GroupSort instead of LeakyReLU; widen hidden dim to recover capacity |
+
+- **Final-state check (after 37 lands):** run K-sweep to K=256+ and verify
+  monotone convergence to the Banach fixed point.  If achieved, the
+  certified contraction arch is in place as the new permanent baseline.
 
 ### Phase 6-contingent (optional, after iter 37 promotes):
 - **30d-deeper-K**: add `deq_k_jitter_set=(4,8,16,24)` on certified arch — tests
