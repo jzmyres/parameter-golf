@@ -749,6 +749,31 @@ class RMSNorm(nn.Module):
         return y
 
 
+class BallProjection(nn.Module):
+    """Per-token Euclidean ball projection Π_R(u) = u · min(1, R/‖u‖_2).
+
+    1-Lipschitz under Frobenius/ℓ2 norm (opg_doc.tex §4.1).  Unlike RMSNorm
+    (which normalizes to unit RMS, Lipschitz-unbounded near ‖u‖=0), this
+    projection ONLY shrinks vectors that exceed the ball of radius R; inside
+    the ball it acts as the identity.  Combined with bounded-domain 1-Lip
+    linear maps, it enables a certifiable contraction shell.
+
+    No learnable parameters — R is a fixed hyperparameter.
+    """
+    def __init__(self, dim: int, R: float):
+        super().__init__()
+        self.dim = int(dim)
+        self.R = float(R)
+
+    def forward(self, u: Tensor) -> Tensor:
+        # Per-token ℓ2 norm.  Compute in fp32 for numerical stability then
+        # cast the scale back to u.dtype (the forward is 1-Lipschitz for any
+        # positive eps added to norm — eps only matters when ‖u‖ → 0).
+        norm = u.float().pow(2).sum(dim=-1, keepdim=True).clamp_min(1e-12).sqrt_()
+        scale = (self.R / norm.clamp_min(self.R)).to(u.dtype)
+        return u * scale
+
+
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
@@ -1490,8 +1515,15 @@ class Block(nn.Module):
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  tie_attn_mlp_router: bool = False, num_experts: int = 8):
         super().__init__()
-        self.attn_norm = RMSNorm(dim)
-        self.mlp_norm = RMSNorm(dim)
+        # iter 32 (opg_doc.tex §4.1): replace learnable RMSNorm on the shared
+        # router/expert state path with Euclidean-ball projection Π_R.
+        # RMSNorm's Lipschitz is unbounded near ‖u‖=0; Π_R is 1-Lipschitz
+        # always.  Radius R = 2·√d ≈ 55.4 for dim=768 — large enough to act
+        # as identity on typical hidden states (‖u‖≈√d·σ with σ≈1) while
+        # bounding the rare norm-blowup case.
+        _R_state = 2.0 * math.sqrt(float(dim))
+        self.attn_norm = BallProjection(dim, R=_R_state)
+        self.mlp_norm = BallProjection(dim, R=_R_state)
         # iter 30 (opg_doc.tex §4.5 + user direction 2026-04-16): post_norm REMOVED.
         # Learnable RMSNorm has unbounded Lipschitz constant near ||x||=0 — it
         # would break the τ-shell contraction property.  Without post_norm,
