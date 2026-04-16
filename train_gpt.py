@@ -1053,6 +1053,11 @@ class SoftDenseRouter(nn.Module):
         with torch.no_grad():
             nn.init.normal_(self.prototypes, std=0.02)
         self.l2_gamma = 1.0
+        # Phase 6a.3 (review 10): bound prototypes to a fixed-radius ball so
+        # tanh(-γ‖·‖²) cannot saturate flat from an unbounded prototype.  The
+        # ball radius √d matches the expected norm of the RMS-normed router
+        # input (‖x_n‖ ≈ √d).  BallProjection is 1-Lipschitz.
+        self._prototype_ball = BallProjection(dim, R=math.sqrt(float(dim)))
         self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32), persistent=True)
         # Input-dependent sigmoid gate on routing weights (iter 17, H14).
         # Init fully open: weight=0, bias=5.0 → sigmoid(5)≈0.993.
@@ -1112,34 +1117,41 @@ class SoftDenseRouter(nn.Module):
 
     def forward(self, x: Tensor, *, pre_normed: bool = False) -> Tensor:
         x_n = x if bool(pre_normed) else _rms_norm(x)
-        if self.scoring == "l2":
-            # L2-distance logits (doc §4.3 Option B, §6.4):
-            #   s_j = tanh(-γ · ‖x_n − c_j‖²)
-            # 1-Lipschitz under tanh saturation; γ=1.0 fixed.
-            c = self.prototypes.to(dtype=x_n.dtype)
-            diff = x_n.unsqueeze(-2) - c                     # (..., E, D)
-            dist_sq = diff.pow(2).sum(dim=-1)                 # (..., E)
-            route_logits = torch.tanh(-self.l2_gamma * dist_sq)
-            route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
-        elif self.scoring == "sips":
-            # SIPS logits (doc §4.3 Option A, §6.5):
-            #   s_j = γ · cos(q, k_j)  where q=x_n, k_j=prototypes[j]
-            # cos is inherently bounded in [-1, 1] — tanh-like saturation
-            # without an explicit saturation layer.  1-Lipschitz scoring
-            # (composition of bounded-norm query, normalization, dot product).
-            c = self.prototypes.to(dtype=x_n.dtype)
-            # F.cosine_similarity broadcasts cleanly: (..., 1, D) vs (E, D)
-            cos_sim = F.cosine_similarity(x_n.unsqueeze(-2), c, dim=-1)  # (..., E)
-            route_logits = self.l2_gamma * cos_sim
+        D = self.prototypes.shape[-1]
+        if self.scoring in ("l2", "sips"):
+            # Phase 6a.3 (reviews 1, 10): replace the O(B·T·E·D) broadcast
+            # (x_n.unsqueeze(-2) - c) with a matmul-based distance / cosine,
+            # and apply the bounded-prototype projection.  Compute the
+            # kernel in fp32 to avoid catastrophic cancellation of
+            # ‖x‖² + ‖c‖² − 2·x·c in bf16.
+            leading = x_n.shape[:-1]
+            x_flat_32 = x_n.reshape(-1, D).float()
+            c_bounded = self._prototype_ball(self.prototypes)
+            c_32 = c_bounded.float()
+            if self.scoring == "l2":
+                # ‖x − c‖² = ‖x‖² + ‖c‖² − 2·x·cᵀ  (fp32-safe GEMM path)
+                xc = x_flat_32 @ c_32.t()  # (N, E)
+                x_sq = x_flat_32.pow(2).sum(dim=-1, keepdim=True)  # (N, 1)
+                c_sq = c_32.pow(2).sum(dim=-1)  # (E,)
+                dist_sq = (x_sq + c_sq - 2.0 * xc).clamp_min(0.0)
+                route_logits = torch.tanh(-self.l2_gamma * dist_sq)
+            else:  # "sips" — cosine similarity via normalized matmul
+                x_norm = F.normalize(x_flat_32, dim=-1, eps=1e-12)
+                c_norm = F.normalize(c_32, dim=-1, eps=1e-12)
+                route_logits = self.l2_gamma * (x_norm @ c_norm.t())
+            route_logits = route_logits.reshape(*leading, -1).to(dtype=x.dtype)
             route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
         else:
             # Linear scoring (iter 30-33b baseline).
             route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
         # Gate in logit space: softmax(a + log_sigmoid(b)) is mathematically
         # identical to softmax(a)*sigmoid(b)/renorm, but stays "pure softmax"
-        # and avoids explicit renormalization.
+        # and avoids explicit renormalization.  Phase 6a.3 (review 2):
+        # compute the softmax in fp32 for stability (bf16 softmax has rare
+        # NaN edge cases and degenerate routing under extreme inputs).
         gate_logits = F.logsigmoid(self.router_gate(x_n))
-        p = torch.softmax(route_logits + gate_logits, dim=-1)
+        logits_sum = (route_logits + gate_logits).float()
+        p = torch.softmax(logits_sum, dim=-1).to(dtype=x.dtype)
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._router_gate_last_mean = float(gate_logits.detach().exp().float().mean().item())
         if self.training:
