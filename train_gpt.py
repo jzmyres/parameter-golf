@@ -176,7 +176,10 @@ class Hyperparameters:
     # iter 36 (opg_doc.tex §6.6): L2-distance attention in place of SDPA.
     # a_tj = softmax(-γ · ‖q_t − k_j‖²) (causal). 1-Lipschitz under bounded Q,K.
     attention_l2 = True
-    l2_attn_gamma = 1.0
+    # γ = 1/(2·√d_head) ≈ 0.051 gives effective sharpness equivalent to
+    # SDPA's 1/√d scale.  Default γ=1.0 is ~20× sharper (near argmax) — too
+    # peaky for training; use the d_head-matched value.
+    l2_attn_gamma = 0.051  # for d_head=96 (model_dim=768, heads=8)
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
     tie_attn_mlp_router = False
 
@@ -1278,46 +1281,33 @@ class CausalSelfAttention(nn.Module):
         q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
 
         if getattr(self, "attention_l2", False):
-            # iter 36 (opg_doc.tex §6.6): L2-distance attention via SDPA trick.
+            # iter 36 (opg_doc.tex §6.6): L2-distance attention via SDPA fast path.
             #   a_tj ∝ exp(-γ ‖q_t − k_j‖²)
-            #       = exp(-γ‖q_t‖² − γ‖k_j‖² + 2γ·q_t·k_j)
-            # Since softmax over j is shift-invariant in scores, the `-γ‖q_t‖²`
-            # term is constant per query t and cancels.  So:
-            #   softmax_j(-γ‖q−k‖²) = softmax_j(2γ·q·k_j − γ‖k_j‖²)
-            # Reuse the fused SDPA kernel with:
-            #   q' = √(2γ)·q,  k' = √(2γ)·k,  attn_bias_j = -γ‖k_j‖²
-            # Memory-efficient: SDPA never materializes the full (T,T) matrix.
-            # Under bounded Q, K (via RMSNorm + Π_R), this is 1-Lipschitz per
-            # doc Prop 6.5.
+            #       = exp(-γ‖q_t‖² + 2γ·q_t·k_j − γ‖k_j‖²)
+            # Key observation: q_rope, q_nope, k_rope, k_nope are RMS-normalized
+            # on the feature dim, so ‖q_t‖² = ‖k_j‖² = d_head for all (t, j).
+            # BOTH terms are constants w.r.t. j → cancel in softmax over j.
+            # Thus:
+            #   softmax_j(-γ‖q−k‖²) = softmax_j(2γ·q_t·k_j)
+            # which is standard SDPA with q'=√(2γ)·q, k'=√(2γ)·k and scale=1.0.
+            # Fully 1-Lipschitz under bounded Q, K (doc Prop 6.5); reuses the
+            # fused memory-efficient SDPA kernel with is_causal=True.
             gamma = self.l2_attn_gamma
             scale_qk = math.sqrt(2.0 * gamma)
             q_l2 = q_full * scale_qk
             k_l2 = k_full * scale_qk
-            # k-key bias: -γ‖k‖² per (B, H_kv, T).  Broadcasts over queries.
-            k_bias = -gamma * k_full.pow(2).sum(dim=-1)          # (B, H_kv, T)
-            # Handle GQA: repeat K, V, and k_bias for num_heads per group.
-            if self.num_kv_heads != self.num_heads:
-                rep = self.num_heads // self.num_kv_heads
-                k_l2 = k_l2.repeat_interleave(rep, dim=1)
-                v_use = v.repeat_interleave(rep, dim=1)
-                k_bias = k_bias.repeat_interleave(rep, dim=1)
-            else:
-                v_use = v
-            # SDPA attn_mask of shape (B, H, 1, T): broadcasts over the query
-            # dim; softmax handles the combine with the implicit causal mask.
-            tq = q_l2.shape[-2]
-            tk = k_l2.shape[-2]
-            # Build causal component: (tq, tk) with -inf above diagonal.
-            causal = torch.triu(torch.zeros(tq, tk, device=q_l2.device, dtype=q_l2.dtype),
-                                diagonal=1)
-            causal = causal.masked_fill(causal.bool(), float("-inf"))
-            # Combine k_bias (B, H, 1, T) + causal (1, 1, T, T) → (B, H, T, T)
-            attn_mask = k_bias.unsqueeze(-2) + causal.unsqueeze(0).unsqueeze(0)
-            # scale=1.0 disables SDPA's default 1/√d; the scale_qk we baked
-            # into q/k already provides the full L2 scoring.
-            y = F.scaled_dot_product_attention(
-                q_l2, k_l2, v_use, attn_mask=attn_mask, is_causal=False, scale=1.0,
-            )
+            try:
+                y = F.scaled_dot_product_attention(
+                    q_l2, k_l2, v, attn_mask=None, is_causal=True, scale=1.0,
+                    enable_gqa=(self.num_kv_heads != self.num_heads),
+                )
+            except TypeError:
+                k_use, v_use = k_l2, v
+                if self.num_kv_heads != self.num_heads:
+                    rep = self.num_heads // self.num_kv_heads
+                    k_use = k_l2.repeat_interleave(rep, dim=1)
+                    v_use = v.repeat_interleave(rep, dim=1)
+                y = F.scaled_dot_product_attention(q_l2, k_use, v_use, attn_mask=None, is_causal=True, scale=1.0)
         else:
             try:
                 y = F.scaled_dot_product_attention(
