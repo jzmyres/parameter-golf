@@ -80,7 +80,6 @@ self-refinement loop that re-embeds predicted token distributions. This document
 \paragraph{Reader guide.}
 Sections~\ref{sec:notation}--\ref{sec:convergence} define $T_x$ and give sufficient conditions for a unique fixed point.
 Section~\ref{sec:expressive} discusses expressiveness under 1-Lipschitz constraints.
-Appendix~\ref{app:current_code} documents the current code architecture; Appendix~\ref{app:gaps} summarizes the difference.
 
 \paragraph{Guiding principle for iteration proposals.}
 \emph{Every architectural change proposed in this document must preserve (or strengthen) the
@@ -152,7 +151,7 @@ loss = NLL(log p_NTP, y) + auxiliary losses
 \end{lstlisting}
 
 \paragraph{Scope note.}
-The optional outer self-refinement loop used in the current code is preserved in Appendix~\ref{app:refinement} and is not part of the contraction proof.
+The certified mainline scope is a single inner DEQ equilibrium solve of the strict contraction $T_x$; any outer self-refinement loop is orthogonal and is not part of the contraction proof.
 
 \section{Inner loop: RevDEQ coupled-state solver}
 \label{sec:deq}
@@ -437,96 +436,13 @@ The code tracks two kinds of routing penalties:
         multiplied by a late-phase \texttt{health\_scale} ramp.
 \end{itemize}
 
-\appendix
-
-\section{Self-refinement loop (current code; unchanged)}
-\label{app:refinement}
-
-The current code optionally runs an outer refinement loop after a late wallclock ramp. It re-embeds a mixture of predicted distributions:
-
-\subsection{Initial input embedding ($r=0$)}
-\[
-  x_0^{(0)} \;=\; \mathrm{rms\_norm}\!\left(E[x] + \mathrm{BigramHashEmb}(x)\right).
-\]
-
-\subsection{Refinement distribution ($r>0$)}
-At the end of solve $r-1$, define $h^{(r-1)}=\mathrm{RMSNorm}(z^{(r-1)})$ and compute:
-\[
-  \log p_{\text{CTP}}^{(r-1)},\ \log p_{\text{NTP}}^{(r-1)} \;=\; \mathrm{MoSHead}(h^{(r-1)}).
-\]
-Convert log-probabilities to probabilities in fp32 and define a shifted NTP distribution:
-\[
-  p_{\text{NTP,shift}}^{(r-1)}[t] \equiv
-  \begin{cases}
-    p_{\text{NTP}}^{(r-1)}[0] & t=0,\\
-    p_{\text{NTP}}^{(r-1)}[t-1] & t\ge 1.
-  \end{cases}
-\]
-Then
-\[
-  p_{\text{mix}}^{(r-1)}[t] =
-  \begin{cases}
-    p_{\text{CTP}}^{(r-1)}[0] & t=0,\\
-    \tfrac12 p_{\text{CTP}}^{(r-1)}[t] + \tfrac12 p_{\text{NTP,shift}}^{(r-1)}[t] & t\ge 1.
-  \end{cases}
-\]
-
-\subsection{Soft embedding and coupling}
-Approximate the expected embedding under $p_{\text{mix}}$ with a top-$\kappa$ truncation (current default $\kappa=64$),
-then mix with the previous refined input:
-\[
-  x_0^{(r)} \;=\; \alpha\,x_{\text{soft}}^{(r)} + (1-\alpha)\,x_0^{(r-1)},
-\]
-where $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$ is ramped up when refinement is enabled and the previous refined input is detached.
-
-\section{Current \texttt{train\_gpt.py} backbone snapshot (code-aligned)}
-\label{app:current_code}
-
-This appendix documents the current implementation of the update function $f_\theta(z,x_0)$ and routing/attention/MLP modules in \texttt{train\_gpt.py}.
-It is not part of the contraction proof in the main body.
-
-\subsection{State update form}
-The shared block computes parallel attention and MLP mixtures and emits
-\[
-  f_\theta(z_{\text{in}},x_0)=\mathrm{RMSNorm}_{\text{post}}\!\left(0.5\left[\mathrm{Norm}_{\text{attn}}(\Delta_{\text{attn}})+\mathrm{Norm}_{\text{mlp}}(\Delta_{\text{mlp}})\right]\right).
-\]
-
-\subsection{Token-local injection (experts only)}
-The code computes a token-local gate $g_{\text{inj}}=\sigma(\mathrm{inj}(\mathrm{rms\_norm}(z_{\text{in}})))$ and injects only into expert inputs:
-\[
-  x_{\text{router}}=z_{\text{in}},\qquad
-  x_{\text{expert}}=z_{\text{in}}+g_{\text{inj}}\odot x_0.
-\]
-Routers read $x_{\text{router}}$; experts read $x_{\text{expert}}$.
-
-\subsection{Dense router in code}
-For a normalized router input $h_n$ (from a learnable \texttt{RMSNorm} in the block), the router computes logits
-\[
-  s = W_r h_n + b_{\text{expert}} + \log\sigma(W_g h_n + b_g),
-\qquad w=\mathrm{softmax}(s).
-\]
-Routing is dense (no top-$k$), and the extra $\log\sigma(\cdot)$ term acts as a per-expert logit gate while preserving a final pure softmax.
-
-\subsection{MLA + gated SDPA (current attention)}
-The current attention uses MLA-style KV compression and decoupled RoPE/no-RoPE splits, with causal SDPA and a head-wise sigmoid gate applied
-\emph{after} SDPA output. This is described in the (older) code-aligned document; the certified mainline instead recommends L2 attention.
-
-\section{Proposed vs current: gap table}
-\label{app:gaps}
-
-\begin{center}
-\begin{tabular}{@{}p{0.42\linewidth}p{0.52\linewidth}@{}}
-\toprule
-\textbf{Certified proposal (main body)} & \textbf{Current code (\texttt{train\_gpt.py})} \\
-\midrule
-Exogenous injection $b(x_0)$ with identity path; no state-gated injection in certified map & Token-local injection gate $g_{\text{inj}}(z)$ applied to expert inputs \\
-Router scoring via SIPS or L2-distance with explicit Lipschitz budget; single combined pool optional & Two routers (attn/mlp) with linear logits + $\log\sigma$ logit-gate + expert bias \\
-Explicit contraction shell with $\tau\le\tau_{\max}<1$ & No explicit $\tau$ parameter; stabilization via scaling (e.g.\ $0.5$) and training dynamics \\
-Certified attention: L2 attention (MLA-compatible) under norm constraints & Current attention: MLA + causal SDPA + post-SDPA head gates \\
-Certified ``normalization'': explicit 1-Lipschitz projection $\Pi_R$ & Uses \texttt{rms\_norm} and learnable \texttt{RMSNorm} (not globally 1-Lipschitz) \\
-\bottomrule
-\end{tabular}
-\end{center}
+%% Deprecated appendices (self-refinement snapshot, current-code snapshot,
+%% gap table) removed 2026-04-16 per user direction.  The appendix described
+%% stale code and would drift with every iteration; the main body is the
+%% single source of truth for the proposed certified architecture, and
+%% \texttt{train\_gpt.py} is the single source of truth for the actual
+%% implementation.  The progressive alignment between the two is tracked in
+%% \texttt{experiments/hypotheses.md}, not in this document.
 
 \section{References}
 \begin{thebibliography}{99}

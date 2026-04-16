@@ -423,108 +423,57 @@ certification, not as independent ablation.
 
 **Current baseline:** 27b `9edc6af`, val_bpb=1.9020, K=128 Δ=0.039.
 
-### Phase 6: Certified contraction shell (opg_doc.tex §3-5, 2026-04-16 — ACTIVE)
+### Phase 6: Certified contraction shell (opg_doc.tex §3-6, 2026-04-16 — ACTIVE)
 
-**Guiding principle (opg_doc.tex, H32):** every arch proposal must preserve
-strict contraction of $T_x$ under Frobenius norm (so Banach applies), be
-**simple** (one change at a time), and **principled** (each change traces to a
-sufficient condition in doc §6). Before smoke-testing a new proposal, audit
-**Lip_z(T_x) < 1** by tracing the Lipschitz constant through each module.
+**Guiding principle (opg_doc.tex, H32):** every proposal must preserve strict
+contraction of $T_x$ under Frobenius norm (so Banach applies), be **simple**
+(one change at a time), and **principled** (traceable to a sufficient condition
+in doc §6).  Before the smoke test for any new iter, audit Lip_z(T_x) < 1
+tracing through each module; update H33 table with the outcome.
 
 **Certified design target (doc §4-5):**
 ```
 b(x_0) = x_0 + U · Π_R(x_0)                # exogenous, identity-preserving
 u(z, x_0) = Π_R(z + b(x_0))                # shared expert/router input
 G_θ(z, x_0) = 0.5 · (Δ_attn + Δ_mlp)       # parallel mix of 1-Lip experts
-T_x(z) = (1-τ) · b(x_0) + τ · G_θ          # strict contraction (τ < 1)
+T_x(z) = (1-τ) · b(x_0) + τ · G_θ          # strict contraction (τ_max<1)
 ```
 
-**Systematic queue (each iter = one component change, result column filled on completion):**
+**Sequential queue** (iter runs only after predecessor promotes).  Each row
+tests ONE doc-aligned change.  Fill result columns on completion; revert on
+failure.
 
-| Iter | Change | Doc § | Status | val_bpb | K=128 Δ | Notes |
+| # | Iter name | Change (one component) | Doc § | Status | val_bpb | K=128 Δ |
 |---|---|---|---|---|---|---|
-| **30-contraction-shell** | Structural: exogenous `b(x_0) = x_0 + U·rms_norm(x_0)` (U = CastedLinear(D,D), std=0.02 init), τ ∈ (0,0.9] contraction wrapper, shared `u = z + b(x_0)` for routers+experts. Keep learnable RMSNorms, MLA, MoS (NOT yet 1-Lip certified). | §4.2, §4.4, §4.5 | **LAUNCHED (pending)** | TBD | TBD | First test of τ-shell + exogenous injection. Contraction proof does not yet apply (G_θ Lip unbounded) — tests empirical effect of structure alone. |
-| 31-spectral-U | Add `‖U‖_2 ≤ 1` via `nn.utils.parametrizations.spectral_norm` (1 power iter/fwd). 1-Lip adapter. | §6.1 | queued | TBD | TBD | First true 1-Lip cert. |
-| 32-pi_R-state | Replace `attn_norm`/`mlp_norm`/`post_norm` on state with Euclidean-ball projection `Π_R`. Bounds ‖z‖, makes state passing 1-Lip. | §4.1 | queued | TBD | TBD | Requires tuning R (start R = sqrt(d) · 2 ≈ 55). |
-| 33-spectral-experts | Spectral-norm constraint on all expert weight matrices (`W^Q/K/V/O`, `expert_proj`, `expert_out`, `expert_gate`, `expert_fc`, `expert_down`). | §6.1, §6.6 | queued | TBD | TBD | Many parametrizations; one-shot for all expert matrices. |
-| 34-L2-router-vs-sips | **A/B:** (A) L2-distance router `s_j = ρ(-γ‖q-c_j‖²)` with `ρ=tanh`, γ bounded. (B) SIPS `s_j = γ·φ(‖q‖)·ψ(‖k_j‖)·cos(q,k_j)`. Run both, pick winner on val_bpb + Lip_router. | §4.3 A/B | queued | TBD | TBD | **Rigorous A/B test per user direction.** Both replace current `Linear+logσ` logits. |
-| 35-single-router | Collapse `attn_router`/`mlp_router` → single combined router over `E = E_attn + E_mlp` pool. Simpler Lipschitz accounting. | §4.3 | queued | TBD | TBD | Big refactor of `Block.forward` expert-mix plumbing. |
-| 36-L2-attention | Replace MLA+SDPA with L2 attention `a_tj = softmax(-γ‖q_t-k_j‖²)`. 1-Lip under bounded states + γ. | §6.6 | queued | TBD | TBD | Major change; test in isolation after 33 (1-Lip expert MLPs). |
-| 37-lipschitz-mlp | Replace MLP experts with spectral-norm MLP (`W^(1)`, `W^(2)` ‖·‖₂ ≤ 1; LeakyReLU(η≤1) is 1-Lip). Optionally upgrade to GroupSort. | §6.2 | queued | TBD | TBD | Closes full 1-Lip certification loop. Then Banach proof applies. |
+| 30 | **contraction-shell** | exogenous `b(x_0)=x_0+U·rms_norm(x_0)` + τ-shell + shared `u=z+b(x_0)` + `post_norm` removed | §4.2, §4.4, §4.5 | **RUNNING** (baseline for Phase 6) | TBD | TBD |
+| 31 | spectral-U | `‖U‖_2≤1` via `nn.utils.parametrizations.spectral_norm` (1 power iter/fwd) | §6.1 | queued | — | — |
+| 32 | pi_R-state | replace all remaining learnable `RMSNorm` on state path (`attn_norm`, `mlp_norm`, `attn_post_mix_norm`, `mlp_post_mix_norm`, `attn_sdpa_post_norm`, `hidden_post_norm`) with Euclidean-ball projection `Π_R` | §4.1 | queued | — | — |
+| 33 | spectral-experts | spectral-norm constraint on all expert weight matrices (`W^Q/K/V/O`, `expert_proj`, `expert_out`, `expert_gate`, `expert_fc`, `expert_down`) | §6.1, §6.6 | queued | — | — |
+| 34A | router-L2 | L2-distance router `s_j=tanh(-γ‖q-c_j‖²)` with γ bounded | §4.3 Option B | queued | — | — |
+| 34B | router-SIPS | SIPS `s_j=γ·φ(‖q‖)·ψ(‖k_j‖)·cos(q,k_j)` with γ bounded | §4.3 Option A | queued | — | — |
+| 35 | single-router | collapse attn/mlp routers into one `E=E_attn+E_mlp` pool | §4.3 | queued | — | — |
+| 36 | L2-attention | MLA+SDPA → L2 attention `a_tj=softmax(-γ‖q_t-k_j‖²)` under bounded state | §6.6 | queued | — | — |
+| 37 | lipschitz-mlp | MLP experts → spectral-norm MLP or GroupSort (close 1-Lip cert loop) | §6.2 | queued | — | — |
 
-**Principle for promotion:**
-- Primary: val_bpb ≤ 1.917 (baseline + 0.015 tolerance) AND K=128 Δ ≤ 0.5.
-- Secondary (after 37 lands): run K-sweep to K=256+ and verify monotone convergence, confirming the certified Banach FP property.
-- Lipschitz audit: on each kept iter, add one row to H33 table marking the newly-certified component.
+**Promotion rule (val_bpb-primary with Lip gate):**
+- **Primary:** val_bpb ≤ iter-30-baseline + 0.015 tolerance AND K=128 Δ ≤ 0.5.
+- **Lipschitz secondary:** the newly-constrained component must be measurably
+  1-Lipschitz (or strictly tighter Lip than prior).  Add to H33 row on promotion.
+- **Final-state check (after 37):** run K-sweep to K=256+ and verify monotone
+  convergence to the Banach fixed point.
 
-### Phase 6-contingent: compound deeper-K + TBPTT
+### Phase 6-contingent (optional, after iter 37 promotes):
+- **30d-deeper-K**: add `deq_k_jitter_set=(4,8,16,24)` on certified arch — tests
+  compounding generalization (cf. iter 28c's K=128 Δ=0.015).
+- **30e-TBPTT-deep**: `deq_bptt_k=8` + K∈{4,8,16,32}, compute-neutral vs baseline,
+  2× training depth.
 
-TBPTT investigation (28-28d) closed without promotion. Best point 28c
-(val_bpb 1.925, K=128 Δ=0.015) retained as **generalization-scaffold option**:
-may recombine with Phase 6 architectures once val_bpb stabilizes, to test
-whether deeper-K training compounds with the certified contraction shell.
+### Phase 7+ (deferred): throughput unroll+compile, scaling-law grid, FSQ/rank sweeps
 
-| Iter (candidate) | Change | When to revisit |
-|---|---|---|
-| 30d-deeper-K | After 30 passes: add `deq_k_jitter_set=(4,8,16,24)` on top of contraction shell. Tests compounding effect on K=128 generalization. | After iter 30 promotion |
-| 30e-TBPTT-deep | `deq_bptt_k=8` + K∈{4,8,16,32}. Same compute as baseline, 2× training depth. | After 30d if K-sweep is clean |
-
-### Phase 7: DEFERRED (unroll+compile, scaling-law grid) — see git history / prior queue
-
-Removed from active queue; revisit only after Phase 6 converges and we have a stable, certified architecture to scale.
-
-
-
-(Phase 7.4 throughput micro-opts have been moved to Phase 4.4 — front-loaded for compounding effect.)
-
-**Goal:** Maximize training throughput *before* committing compute to the Phase 8 scaling-law grid.  More steps/hour in the sweep = more hyperparameter points covered per 1h iter budget.  Doing this *after* Phase 7 ensures the throughput measurement uses the final arch (post-OrthoInit, skip-gates, etc.); doing it *before* Phase 8 means the scaling sweep gets the fastest possible backward path.
-
-**Core hypothesis:** A WORKING `unroll + torch.compile` configuration would be faster than the current `revdeq + torch.compile` baseline at real training batch, because:
-- Unroll does 2× forward FLOPs per backward vs revdeq's 3× (no reconstruction pass)
-- Unroll uses FP32 accumulators vs revdeq's FP64 (revdeq needs FP64 for exact reversibility; unroll doesn't)
-- Small-batch benchmark (no compile on either side) measured **3.21× speedup**: unroll 358 ms vs revdeq 1151 ms at batch=8/seq=1024
-
-**Blocker:** compile + unroll + DDP hits two separate bugs:
-- `torch.compile(shared_block, dynamic=False)` + unroll + DDP → `loss.requires_grad=False` (grad_fn broken)
-- `torch.compile(shared_block, dynamic=True)` + unroll + DDP → dynamo backend crash in KV-attention (`'int' has no 'meta'`)
-
-**Investigation plan (apply in order, stop when one works):**
-
-| Step | Approach | Why it might work |
-|---|---|---|
-| A | Compile `_deq_solve` (entire K-step loop) instead of `shared_block` | One compiled graph for the whole loop — avoids "32 compiled calls in a Python loop" interaction with DDP gradient hooks.  The whole DEQ solve becomes a single autograd op from DDP's POV. |
-| B | `mode="reduce-overhead"` (uses CUDA graphs) | Different codegen path that may not hit the grad_fn-tracking bug; CUDA graphs are explicitly designed for repeated identical calls. |
-| C | `torch._dynamo.disable` surgically on the DDP-critical paths, keep compile everywhere else | Keeps most of the speedup while avoiding the specific failing interaction. |
-| D | Upgrade torch to a newer minor release if available | Both bugs may be fixed upstream; check release notes. |
-| E | Compile + unroll WITHOUT DDP (single-GPU control) → confirms the bugs are DDP-specific | Diagnostic only, rules out compile/unroll incompatibility that isn't DDP-mediated. |
-
-**Benchmark protocol once a fix works:**
-1. Run `experiments/speed_compare_backward.py` at the REAL training batch (not the small benchmark size).  Need per-microstep timing AND per-optimizer-step timing (since unroll may need more grad_accum to fit VRAM).
-2. Run a full 1h training with each config (compile+revdeq vs compile+unroll) at the then-current best arch.  Compare:
-   - total steps completed
-   - val_bpb at 1h
-   - post-int6 val_bpb
-   - K-sweep FP quality (any difference in solver quality at K=128)
-3. **Decision rule:** switch to unroll only if `(steps × val_bpb_improvement) per hour` is higher AND the Phase 7 K-sweep hard assertions still pass.  Not just faster ms/step.
-
-**Fallback if no fix works:** stay on `revdeq + compile` for Phase 8.  Revisit on 8×H100 where the VRAM constraint relaxes and compile+unroll compatibility may differ.
-
-### Phase 8: Scaling law grid (FINAL — locked config + best backward mode from Phase 7.5)
-
-Locked config: WD=0.72, β=0.20, K jitter {4,8,12,16}, 8exp, dim=768, post-norm, untied router sigmoid gates, best injection mechanism from Phase 5, batched Muon NS, compiled shared_block, best techniques from Phase 7.
-
-**FSQ on MoS is already enabled by default (`fsq_levels=8`) via `_fsq_ste` in MoSHead forward.** The hyperparams `fsq_levels` and `mos_rank` are currently hard-coded in `GPT.__init__` (L1688) and should be plumbed through to `args` for the scaling law sweep.
-
-| Iter | Config change | Variable | Depends on |
-|---|---|---|---|
-| 33 | dim=512, rank=128/192, 8exp | dim↓ (baseline comparison) | Phase 7 |
-| 34 | dim=1024, rank=96/144, 8exp | dim↑ (test if post-norm enables larger dim) | Phase 7 |
-| 35 | dim=768, rank=192/288, 4exp | fewer experts, higher rank | Phase 7 |
-| 36 | dim=768, rank=96/144, 12exp | more experts, lower rank (H5 confirmed stable at WD=0.72) | Phase 7 |
-| 37 | dim=768, rank=128/192, 8exp, mlp_mult=4 | wider MLP | Phase 7 |
-| 38 | FSQ levels sweep: fsq_levels ∈ {4, 6, 8, 12, 16} | MoS output-head lattice granularity; higher = smoother logits but lossier quant | plumb `fsq_levels` as arg first |
-| 39 | MoS rank sweep: mos_rank ∈ {128, 192, 256, 320} | Output head capacity vs artifact size | plumb `mos_rank` as arg first |
-| 40 | Joint (fsq_levels, mos_rank) at best-dim from 33-34 | Combined output-head sweep | iter 38 + 39 |
+Removed from the active queue to keep focus on Phase 6 doc-alignment.  Will
+be restored (or redesigned) once the certified contraction architecture is
+established and validated. See prior git history for the full pre-cleanup
+queue if needed.
 
 ### Troubleshooting table — hypothesis-verified fixes for assertion failures
 
