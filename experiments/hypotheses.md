@@ -456,7 +456,7 @@ failure.
 | 33 | spectral-experts | per-expert σ_max ≤ 1 via `PerExpertSpectralNormCap` on `attn.expert_out` and `mlp.expert_down` (output-side matrices) | §6.1, §6.6 | **PROMOTED ★ (commit `a14ac6e`)** | **1.9266** (+0.007 vs iter32) | **0.020** (≈ iter32's 0.012) |
 | 33b | spectral-experts-full | extend per-expert σ_max ≤ 1 to `attn.expert_proj`, `mlp.expert_gate`, `mlp.expert_fc` (input-side matrices); total 5 banks certified | §6.1 | **PROMOTED ★ (commit `a8c0ffb`)** | **1.9174** (-0.009 improvement!) | **0.016** (tighter) |
 | 34A | router-L2 | L2-distance router `s_j=tanh(-γ‖q-c_j‖²)` with γ=1.0 + learnable prototypes | §4.3 Option B | **PROMOTED ★ (commit `bef50df`)** | **1.9217** (+0.004 vs iter33b) | **0.037** (looser than iter33b's 0.016, still ≤ 0.5) |
-| 34B | router-SIPS | SIPS `s_j=γ·φ(‖q‖)·ψ(‖k_j‖)·cos(q,k_j)` with γ bounded | §4.3 Option A | queued | — | — |
+| 34B | router-SIPS | cosine-similarity `s_j=γ·cos(q, k_j)` (reuses iter 34A prototypes) | §4.3 Option A | **A/B LOSER** (commit `a405e9e` not promoted) | 1.9267 (+0.005 vs 34A) | **0.030** (better than 34A's 0.037 but loses on val_bpb) | SIPS has tighter K-sweep but +17% per-step cost kills wallclock val_bpb. L2+tanh remains default. |
 | 35 | single-router | collapse attn/mlp routers into one `E=E_attn+E_mlp` pool | §4.3 | queued | — | — |
 | 36 | L2-attention | MLA+SDPA → L2 attention `a_tj=softmax(-γ‖q_t-k_j‖²)` under bounded state | §6.6 | queued | — | — |
 | 37 | lipschitz-mlp | MLP experts → spectral-norm MLP or GroupSort (close 1-Lip cert loop) | §6.2 | queued | — | — |

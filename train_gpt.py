@@ -172,7 +172,11 @@ class Hyperparameters:
     #   "linear" = legacy `W_r x_n + b + log σ(W_g x_n)` (iter 30-33b baseline)
     #   "l2"     = `tanh(-γ‖x_n − c_j‖²)` with learnable prototypes c_j,
     #              1-Lipschitz scoring (this iter).
-    router_scoring = "sips"  # iter 34B A/B test: SIPS (cosine similarity) vs iter 34A's L2-distance
+    router_scoring = "l2"  # iter 34B A/B resolved: L2+tanh wins val_bpb (1.9217 vs SIPS 1.9267); SIPS K-sweep tighter (0.030 vs 0.037) but loses on val_bpb primary
+    # iter 36 (opg_doc.tex §6.6): L2-distance attention in place of SDPA.
+    # a_tj = softmax(-γ · ‖q_t − k_j‖²) (causal). 1-Lipschitz under bounded Q,K.
+    attention_l2 = True
+    l2_attn_gamma = 1.0
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
     tie_attn_mlp_router = False
 
@@ -1208,11 +1212,15 @@ class CausalSelfAttention(nn.Module):
     """MLA with Gated Attention + expert bank."""
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
-                 expert_rank: int = 0, router: SoftDenseRouter | None = None):
+                 expert_rank: int = 0, router: SoftDenseRouter | None = None,
+                 attention_l2: bool = False, l2_attn_gamma: float = 1.0):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        # iter 36 (opg_doc.tex §6.6): L2-distance attention opt-in flag.
+        self.attention_l2 = bool(attention_l2)
+        self.l2_attn_gamma = float(l2_attn_gamma)
         self.num_experts = num_experts
         self.expert_rank = expert_rank if expert_rank > 0 else max(dim // max(num_experts, 1), 1)
         self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
@@ -1269,18 +1277,50 @@ class CausalSelfAttention(nn.Module):
         k_full = torch.cat([k_rope, k_nope], dim=-1)
         q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
 
-        try:
-            y = F.scaled_dot_product_attention(
-                q_full, k_full, v, attn_mask=None, is_causal=True,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            )
-        except TypeError:
-            k_use, v_use = k_full, v
+        if getattr(self, "attention_l2", False):
+            # iter 36 (opg_doc.tex §6.6): L2-distance attention.
+            #   a_tj = softmax_j(-γ ‖q_t − k_j‖²)   (causal: j ≤ t)
+            #   o_t = Σ_j a_tj · v_j
+            # Under bounded Q, K (guaranteed by iter 32's Π_R and the
+            # RMSNorm on q/k inputs above), this gives a 1-Lipschitz
+            # attention (doc Prop 6.5: L_s ≤ 2γ_max·(R_q + R_c)).  The
+            # softmax-of-L2 is still convex-combination over values.
+            # Expansion: ‖q − k‖² = ‖q‖² + ‖k‖² − 2 q·k
+            q_use = q_full
+            k_use = k_full
+            v_use = v
             if self.num_kv_heads != self.num_heads:
                 rep = self.num_heads // self.num_kv_heads
                 k_use = k_full.repeat_interleave(rep, dim=1)
                 v_use = v.repeat_interleave(rep, dim=1)
-            y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
+            # Per-token ‖q‖², ‖k‖² (keep along feature dim collapsed)
+            q_norm_sq = q_use.pow(2).sum(dim=-1, keepdim=True)  # (B, H, T, 1)
+            k_norm_sq = k_use.pow(2).sum(dim=-1).unsqueeze(-2)  # (B, H, 1, T)
+            qk = torch.matmul(q_use, k_use.transpose(-1, -2))   # (B, H, T, T)
+            dist_sq = (q_norm_sq + k_norm_sq - 2.0 * qk).clamp_min_(0.0)
+            gamma = self.l2_attn_gamma
+            scores = -gamma * dist_sq                            # (B, H, T, T)
+            # Causal mask
+            tq, tk = scores.shape[-2], scores.shape[-1]
+            causal = torch.triu(torch.full((tq, tk), float("-inf"),
+                                           device=scores.device, dtype=scores.dtype),
+                                diagonal=1)
+            scores = scores + causal
+            attn = torch.softmax(scores, dim=-1)
+            y = torch.matmul(attn, v_use)                        # (B, H, T, head_dim)
+        else:
+            try:
+                y = F.scaled_dot_product_attention(
+                    q_full, k_full, v, attn_mask=None, is_causal=True,
+                    enable_gqa=(self.num_kv_heads != self.num_heads),
+                )
+            except TypeError:
+                k_use, v_use = k_full, v
+                if self.num_kv_heads != self.num_heads:
+                    rep = self.num_heads // self.num_kv_heads
+                    k_use = k_full.repeat_interleave(rep, dim=1)
+                    v_use = v.repeat_interleave(rep, dim=1)
+                y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
 
         attn_gate_act = torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
         y = y * attn_gate_act
@@ -1608,7 +1648,8 @@ class Block(nn.Module):
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  tie_attn_mlp_router: bool = False, num_experts: int = 8,
-                 router_scoring: str = "linear"):
+                 router_scoring: str = "linear",
+                 attention_l2: bool = False, l2_attn_gamma: float = 1.0):
         super().__init__()
         # iter 32 (opg_doc.tex §4.1): replace learnable RMSNorm on the shared
         # router/expert state path with Euclidean-ball projection Π_R.
@@ -1640,7 +1681,8 @@ class Block(nn.Module):
             self.mlp_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=5.0, cv_loss_weight=1.0, scoring=router_scoring)
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
-                                         expert_rank=attn_expert_rank, router=self.attn_router)
+                                         expert_rank=attn_expert_rank, router=self.attn_router,
+                                         attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.mlp_router)
         # iter 33 (opg_doc.tex §6.1): per-expert spectral-norm cap on the
         # dominant-spectral-path output matrices `expert_out` (attn) and
@@ -2062,6 +2104,8 @@ class GPT(nn.Module):
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
                  tie_attn_mlp_router: bool = False,  # iter 21: untied is the locked default
                  router_scoring: str = "linear",
+                 attention_l2: bool = False,
+                 l2_attn_gamma: float = 1.0,
                  num_experts: int = 8):
         super().__init__()
         self.tie_embeddings = tie_embeddings
@@ -2081,7 +2125,8 @@ class GPT(nn.Module):
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
                                    tie_attn_mlp_router=tie_attn_mlp_router,
                                    num_experts=self.num_experts,
-                                   router_scoring=router_scoring)
+                                   router_scoring=router_scoring,
+                                   attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2699,6 +2744,8 @@ def main() -> None:
         tie_attn_mlp_router=args.tie_attn_mlp_router,
         num_experts=args.num_experts,
         router_scoring=args.router_scoring,
+        attention_l2=args.attention_l2,
+        l2_attn_gamma=args.l2_attn_gamma,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
