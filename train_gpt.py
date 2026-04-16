@@ -1278,36 +1278,46 @@ class CausalSelfAttention(nn.Module):
         q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
 
         if getattr(self, "attention_l2", False):
-            # iter 36 (opg_doc.tex §6.6): L2-distance attention.
-            #   a_tj = softmax_j(-γ ‖q_t − k_j‖²)   (causal: j ≤ t)
-            #   o_t = Σ_j a_tj · v_j
-            # Under bounded Q, K (guaranteed by iter 32's Π_R and the
-            # RMSNorm on q/k inputs above), this gives a 1-Lipschitz
-            # attention (doc Prop 6.5: L_s ≤ 2γ_max·(R_q + R_c)).  The
-            # softmax-of-L2 is still convex-combination over values.
-            # Expansion: ‖q − k‖² = ‖q‖² + ‖k‖² − 2 q·k
-            q_use = q_full
-            k_use = k_full
-            v_use = v
+            # iter 36 (opg_doc.tex §6.6): L2-distance attention via SDPA trick.
+            #   a_tj ∝ exp(-γ ‖q_t − k_j‖²)
+            #       = exp(-γ‖q_t‖² − γ‖k_j‖² + 2γ·q_t·k_j)
+            # Since softmax over j is shift-invariant in scores, the `-γ‖q_t‖²`
+            # term is constant per query t and cancels.  So:
+            #   softmax_j(-γ‖q−k‖²) = softmax_j(2γ·q·k_j − γ‖k_j‖²)
+            # Reuse the fused SDPA kernel with:
+            #   q' = √(2γ)·q,  k' = √(2γ)·k,  attn_bias_j = -γ‖k_j‖²
+            # Memory-efficient: SDPA never materializes the full (T,T) matrix.
+            # Under bounded Q, K (via RMSNorm + Π_R), this is 1-Lipschitz per
+            # doc Prop 6.5.
+            gamma = self.l2_attn_gamma
+            scale_qk = math.sqrt(2.0 * gamma)
+            q_l2 = q_full * scale_qk
+            k_l2 = k_full * scale_qk
+            # k-key bias: -γ‖k‖² per (B, H_kv, T).  Broadcasts over queries.
+            k_bias = -gamma * k_full.pow(2).sum(dim=-1)          # (B, H_kv, T)
+            # Handle GQA: repeat K, V, and k_bias for num_heads per group.
             if self.num_kv_heads != self.num_heads:
                 rep = self.num_heads // self.num_kv_heads
-                k_use = k_full.repeat_interleave(rep, dim=1)
+                k_l2 = k_l2.repeat_interleave(rep, dim=1)
                 v_use = v.repeat_interleave(rep, dim=1)
-            # Per-token ‖q‖², ‖k‖² (keep along feature dim collapsed)
-            q_norm_sq = q_use.pow(2).sum(dim=-1, keepdim=True)  # (B, H, T, 1)
-            k_norm_sq = k_use.pow(2).sum(dim=-1).unsqueeze(-2)  # (B, H, 1, T)
-            qk = torch.matmul(q_use, k_use.transpose(-1, -2))   # (B, H, T, T)
-            dist_sq = (q_norm_sq + k_norm_sq - 2.0 * qk).clamp_min_(0.0)
-            gamma = self.l2_attn_gamma
-            scores = -gamma * dist_sq                            # (B, H, T, T)
-            # Causal mask
-            tq, tk = scores.shape[-2], scores.shape[-1]
-            causal = torch.triu(torch.full((tq, tk), float("-inf"),
-                                           device=scores.device, dtype=scores.dtype),
+                k_bias = k_bias.repeat_interleave(rep, dim=1)
+            else:
+                v_use = v
+            # SDPA attn_mask of shape (B, H, 1, T): broadcasts over the query
+            # dim; softmax handles the combine with the implicit causal mask.
+            tq = q_l2.shape[-2]
+            tk = k_l2.shape[-2]
+            # Build causal component: (tq, tk) with -inf above diagonal.
+            causal = torch.triu(torch.zeros(tq, tk, device=q_l2.device, dtype=q_l2.dtype),
                                 diagonal=1)
-            scores = scores + causal
-            attn = torch.softmax(scores, dim=-1)
-            y = torch.matmul(attn, v_use)                        # (B, H, T, head_dim)
+            causal = causal.masked_fill(causal.bool(), float("-inf"))
+            # Combine k_bias (B, H, 1, T) + causal (1, 1, T, T) → (B, H, T, T)
+            attn_mask = k_bias.unsqueeze(-2) + causal.unsqueeze(0).unsqueeze(0)
+            # scale=1.0 disables SDPA's default 1/√d; the scale_qk we baked
+            # into q/k already provides the full L2 scoring.
+            y = F.scaled_dot_product_attention(
+                q_l2, k_l2, v_use, attn_mask=attn_mask, is_causal=False, scale=1.0,
+            )
         else:
             try:
                 y = F.scaled_dot_product_attention(
