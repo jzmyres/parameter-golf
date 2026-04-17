@@ -1929,6 +1929,20 @@ class Block(nn.Module):
 
         return attn_ortho, mlp_ortho
 
+    @dynamo_disable
+    def _route_pooled(self, u_proj: Tensor) -> tuple[Tensor, Tensor]:
+        """Compute pooled routing weights and split at E boundary.
+
+        Excluded from torch.compile via @dynamo_disable because the single
+        w_all tensor consumed by two backward paths (attn + mlp) triggers
+        AOT autograd's "backward through graph a second time" error.
+        Making the router an opaque call from the compiled graph's
+        perspective lets each split backprop independently.
+        """
+        E = self.num_experts
+        w_all = self.router(u_proj, pre_normed=True)  # (..., 2E)
+        return w_all[..., :E].contiguous(), w_all[..., E:].contiguous()
+
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
         # iter 30-contraction-shell (opg_doc.tex §4.2-4.5):
         #   b(x_0) = x_0 + U · rms_norm(x_0)          — exogenous, identity-path
@@ -1945,13 +1959,7 @@ class Block(nn.Module):
         # One softmax → one call.  First E weights → attn, last E → MLP.
         E = self.num_experts
         u_proj = self.attn_norm(u)
-        w_all = self.router(u_proj, pre_normed=True)  # (..., 2E)
-        # .contiguous() makes each split a separate tensor, preventing
-        # torch.compile's AOT autograd from hitting "backward through
-        # the graph a second time" when both branches backprop through
-        # the single w_all node.
-        w_attn = w_all[..., :E].contiguous()
-        w_mlp = w_all[..., E:].contiguous()
+        w_attn, w_mlp = self._route_pooled(u_proj)
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
