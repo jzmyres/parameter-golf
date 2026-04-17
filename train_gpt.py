@@ -1714,8 +1714,12 @@ class Block(nn.Module):
         # A proper `Π_R` projection (doc §4.1) replaces post_norm in iter 32.
         # Phase 4.5 iter 22-add-all: learnable RMSNorm at all reasonable post-non-linearity positions.
         # Subsequent iters remove one at a time; keep removed if val_bpb doesn't regress > 0.015.
-        self.attn_post_mix_norm = RMSNorm(dim)  # after attn_mix output (post expert-weighted sum)
-        self.mlp_post_mix_norm = RMSNorm(dim)   # after mlp_mix output (post expert-weighted sum)
+        # iter 37b (opg_doc.tex §4.1): replace learnable RMSNorm on post-mix
+        # output with 1-Lip Π_R ball projection.  Same radius as state-path
+        # norms (attn_norm, mlp_norm) — closes the last unbounded-Lip norm
+        # in the Block.
+        self.attn_post_mix_norm = BallProjection(dim, R=_R_state)
+        self.mlp_post_mix_norm = BallProjection(dim, R=_R_state)
         if bool(tie_attn_mlp_router):
             shared = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0, scoring=router_scoring)
             self.attn_router = shared
