@@ -1900,8 +1900,8 @@ class Block(nn.Module):
         E = self.num_experts
         x_attn = self.attn_norm(x)
         w_all = self.router(x_attn, pre_normed=True)  # (..., 2E)
-        w_attn = w_all[..., :E]
-        w_mlp = w_all[..., E:]
+        w_attn = w_all[..., :E].contiguous()
+        w_mlp = w_all[..., E:].contiguous()
         y_shared = self.attn._attn_shared_from_normed(x_attn)
         R = self.attn.expert_rank
         y_flat = y_shared.reshape(bsz * t, dim)
@@ -1946,8 +1946,12 @@ class Block(nn.Module):
         E = self.num_experts
         u_proj = self.attn_norm(u)
         w_all = self.router(u_proj, pre_normed=True)  # (..., 2E)
-        w_attn = w_all[..., :E]
-        w_mlp = w_all[..., E:]
+        # .contiguous() makes each split a separate tensor, preventing
+        # torch.compile's AOT autograd from hitting "backward through
+        # the graph a second time" when both branches backprop through
+        # the single w_all node.
+        w_attn = w_all[..., :E].contiguous()
+        w_mlp = w_all[..., E:].contiguous()
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)

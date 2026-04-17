@@ -247,11 +247,12 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 **Test:** Iter 17 — small val_bpb win (-0.005) + 33% FP quality improvement. See H22 in OBSERVED.
 **Status:** Moved to OBSERVED as H22.
 
-### H34: Post-mix Π_R may be redundant under full 1-Lip certification — ABLATION REQUIRED
-**Claim:** The Phase 4.5 ablation (22-rm-attn-sdpa-post, 22-rm-hidden-post) showed removing post-non-linearity norms regressed K=128.  BUT that was conducted BEFORE the full 1-Lip certification chain (spectral norms on all expert banks, 1-Lip MLP activation, bounded router prototypes, Π_R on state inputs).  Under the certified design, expert outputs are naturally bounded: ‖expert_out‖ ≤ σ_max(W_out) · ‖hidden‖ ≤ 1 · R.  The weighted sum (softmax, sums to 1) is a convex combination of bounded vectors, also bounded by R.  So Δ_attn and Δ_ffn are theoretically bounded without an explicit Π_R.
-**Prediction:** If the certification is working as designed, removing post-mix norms should NOT regress K=128 Δ significantly (unlike the pre-cert ablation).  If it DOES regress, some component of the cert chain has a practical gap (e.g., bf16 precision eroding the spectral norm guarantee).
-**Test:** iter 39-rm-post-mix-norm (IMMEDIATELY after iter 35 promotes).
-**Status:** PROPOSED — queued, dependent on iter 35 landing.
+### H34: Post-norms redundant under cert; learnable pre-norms are the principled replacement
+**Claim:** Post-mix norms (RMSNorm on expert-weighted-sum output) are a crutch from pre-certification.  Under the full 1-Lip cert chain, expert outputs are bounded: σ_max(W) ≤ 1 + bounded input → bounded output.  But iter 37b showed that REMOVING the post-norm (replacing with hard-clamp Π_R) hurts capacity (-0.069 val_bpb).
+**Refined hypothesis:** The issue is not the PRESENCE of magnitude control but its LOCATION.  Post-norm (output-side) is a hard constraint that clips after the fact.  Pre-norm (input-side, learnable RMSNorm) controls magnitude where the model has freedom — BEFORE the 1-Lip transform.  Bounded input + 1-Lip weight = bounded output, WITHOUT output clipping.
+**Prediction:** Removing ALL post-mix norms AND adding learnable RMS pre-norms on ALL linear weights should maintain or improve val_bpb (learnable scale > hard clamp) while keeping K=128 Δ tight (1-Lip chain is intact).
+**Test:** iter 39-rm-post-norm-add-pre-norm (after iter 35).
+**Status:** PROPOSED — queued.  Iter 37b's K=128 Δ=0.003 (tightest ever) supports the 1-Lip chain working; its val_bpb regression (-0.069) is attributable to Π_R's loss of learnable capacity, which pre-norms restore.
 
 ### H16: Single-step diffusion CTP enriches embedding gradients
 **Claim:** Noisy soft-embed input + CTP denoising gives gradient to more embedding rows.
@@ -516,17 +517,28 @@ the change is broken.
   certified contraction arch is in place as the new permanent baseline.
 
 ### Phase 6 post-cert ablation (IMMEDIATELY after iter 35 promotes):
-- **39-rm-post-mix-norm** (user direction 2026-04-16): remove `attn_post_mix_norm`
-  and `mlp_post_mix_norm` entirely.  With the full 1-Lip certification chain
-  now in place (spectral norms on all expert banks + 1-Lip activation +
-  bounded prototypes + Π_R on state inputs), expert outputs are naturally
-  bounded — the post-mix Π_R may be redundant.  **The Phase 4.5 ablation that
-  showed these norms were "load-bearing" (22-rm-attn-sdpa-post, 22-rm-hidden-post)
-  was conducted BEFORE 1-Lip certification.**  That conclusion MUST be
-  re-verified under the certified design.  If K=128 Δ stays ≤ 0.5 and
-  val_bpb regression ≤ 0.03: promote (simpler arch, fewer ops).  If it
-  regresses: the cert chain isn't sufficient alone, keep Π_R post-mix.
-  Update opg_doc.tex §4.4 to match the outcome.
+- **39-rm-post-norm-add-pre-norm** (user direction 2026-04-16): two coupled changes:
+  1. **Remove ALL post-mix norms** — delete `attn_post_mix_norm` and
+     `mlp_post_mix_norm` entirely (both RMSNorm instances on expert-weighted-
+     sum output).
+  2. **Add learnable RMS pre-norm on ALL linear weights** — every linear layer
+     in the Block (expert banks, attention projections, injection U, router)
+     should have its input go through a learnable `RMSNorm(input_dim)` BEFORE
+     the matmul.  This replaces output-side magnitude control (post-norm) with
+     input-side magnitude control (pre-norm), which is architecturally cleaner:
+     - Pre-norm bounds the input magnitude (learnable scale gives capacity)
+     - σ_max(W) ≤ 1 constrains the transform (already certified)
+     - Together: bounded input + 1-Lip transform = bounded output WITHOUT
+       explicit output clipping
+     - RMSNorm's learnable scale provides the capacity that Π_R lacked
+       (iter 37b regression was caused by Π_R's hard clamp, not by the
+       concept of output bounding)
+  **The Phase 4.5 ablation that showed post-norms were "load-bearing" predates
+  1-Lip certification.**  That conclusion MUST be re-verified.  The pre-norm
+  approach is the principled alternative: control magnitudes at the INPUT where
+  the model has learnable freedom, not at the OUTPUT where hard clamps hurt
+  capacity.  If K=128 Δ ≤ 0.5 and Δval_bpb ≤ 0.03: promote.
+  Update opg_doc.tex §4.1/§4.4 to match the outcome.
 
 ### Phase 6-contingent (optional, after post-cert ablation):
 - **30d-deeper-K**: add `deq_k_jitter_set=(4,8,16,24)` on certified arch — tests
