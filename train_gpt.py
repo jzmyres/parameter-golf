@@ -183,6 +183,13 @@ class Hyperparameters:
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
     # tie_attn_mlp_router removed in iter 35: single pooled router is MANDATORY (doc §4.3)
 
+    # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
+    # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
+    # power-iteration VJP. One boundary forward + one VJP per step.
+    lyapunov_coef = 0.01       # λ_jac: weight of hinge penalty (small: ~1% of task loss)
+    lyapunov_gamma = 0.9       # γ: target spectral radius (< 1)
+    lyapunov_warmup_frac = 0.1 # ramp penalty from 0 over first 10% of steps
+
     # DEQ solver
     # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
@@ -1485,7 +1492,7 @@ class MLP(nn.Module):
         Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h = F.leaky_relu(gate, negative_slope=0.5) * fc
+        h = F.silu(gate) * fc
         h = h.view(N, E, R)
         # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
         h = self.hidden_post_norm(h)
@@ -1788,7 +1795,7 @@ class Block(nn.Module):
         Fm = self.mlp.expert_fc.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h_mlp = F.leaky_relu(gate, negative_slope=0.5) * fc
+        h_mlp = F.silu(gate) * fc
         mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)
         down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).transpose(1, 2)  # (E, R, D)
         mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
@@ -2079,7 +2086,10 @@ class GPT(nn.Module):
                  router_scoring: str = "linear",
                  attention_l2: bool = False,
                  l2_attn_gamma: float = 1.0,
-                 num_experts: int = 8):
+                 num_experts: int = 8,
+                 lyapunov_coef: float = 1.0,
+                 lyapunov_gamma: float = 0.9,
+                 lyapunov_warmup_frac: float = 0.1):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
@@ -2099,7 +2109,7 @@ class GPT(nn.Module):
                                    # iter 35: tie_attn_mlp_router removed; single pooled router always
                                    num_experts=self.num_experts,
                                    router_scoring=router_scoring,
-                                   attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
+                                   )
         self.deq_beta = float(deq_beta)
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
@@ -2113,6 +2123,13 @@ class GPT(nn.Module):
         self.block_ortho_aux_tokens = int(block_ortho_aux_tokens)
         self._block_ortho_aux_enabled = False
         self._block_ortho_aux_loss: Tensor | None = None
+        # iter 45 (opg_doc.tex §4): Lyapunov penalty state.
+        self.lyapunov_coef = float(lyapunov_coef)
+        self.lyapunov_gamma = float(lyapunov_gamma)
+        self.lyapunov_warmup_frac = float(lyapunov_warmup_frac)
+        self._lyapunov_v_buf: Tensor | None = None  # persistent power-iter vector
+        self._lyapunov_loss: Tensor | None = None    # last L_jac value
+        self._lyapunov_rho_hat: float = 0.0          # last ρ̂ estimate
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm(model_dim)
         # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
@@ -2352,6 +2369,44 @@ class GPT(nn.Module):
             except Exception:
                 self._deq_residuals = [0.0]
 
+        # iter 45 (opg_doc.tex §4): Lyapunov penalty at detached equilibrium.
+        # One boundary forward + one VJP to estimate ρ(J_{z*}).
+        # Warmup: ramp λ from 0 over lyapunov_warmup_frac of total steps.
+        self._lyapunov_loss = None
+        lyap_step = getattr(self, "_lyapunov_step", 0)
+        lyap_total = max(getattr(self, "_lyapunov_total_steps", 1), 1)
+        lyap_warmup = int(lyap_total * self.lyapunov_warmup_frac)
+        lyap_scale = min(lyap_step / max(lyap_warmup, 1), 1.0) if lyap_warmup > 0 else 1.0
+        if self.training and self.lyapunov_coef > 0.0 and lyap_scale > 0.0:
+            z_b = z.detach().requires_grad_(True)
+            # Boundary forward with MATH SDPA backend — FlashAttention's
+            # backward doesn't support create_graph=True (no 2nd-order derivs).
+            # Math backend is slower but runs only ONCE per step (not K times).
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            with sdpa_kernel(SDPBackend.MATH):
+                u_b = self.shared_block(z_b, x0_refined)
+            # Persistent power-iteration vector
+            if self._lyapunov_v_buf is None or self._lyapunov_v_buf.shape != z_b.shape:
+                self._lyapunov_v_buf = F.normalize(
+                    torch.randn_like(z_b).detach(), dim=-1, eps=1e-8
+                )
+            v = self._lyapunov_v_buf.detach()  # stop-gradient on direction
+            # VJP: v_next = J^T v (create_graph=True so grads reach θ)
+            v_next = torch.autograd.grad(
+                (u_b * v).sum(), z_b, create_graph=True, retain_graph=True,
+            )[0]
+            rho_hat = v_next.float().norm()
+            self._lyapunov_rho_hat = float(rho_hat.detach().item())
+            # Hinge loss: penalize only when ρ̂ > γ (with warmup scale)
+            self._lyapunov_loss = lyap_scale * self.lyapunov_coef * F.relu(
+                rho_hat - self.lyapunov_gamma
+            )
+            # Update persistent direction (stop-gradient)
+            with torch.no_grad():
+                v_next_det = v_next.detach().float()
+                v_norm = v_next_det.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                self._lyapunov_v_buf = (v_next_det / v_norm).to(z.dtype)
+
         if self.training:
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
                 max_tokens = int(getattr(self, "_block_ortho_aux_tokens_override", self.block_ortho_aux_tokens))
@@ -2440,6 +2495,11 @@ class GPT(nn.Module):
 
         eff_block_ortho_coef = float(self.block_ortho_aux_coef) * float(getattr(self, "_block_ortho_aux_coef_scale", 1.0))
 
+        # iter 45: Lyapunov penalty (ramped in over warmup)
+        lyap_loss = torch.tensor(0.0, device=ntp_loss.device)
+        if self.training and isinstance(self._lyapunov_loss, torch.Tensor):
+            lyap_loss = self._lyapunov_loss.to(device=ntp_loss.device)
+
         return (
             ntp_loss
             + ctp_weight * ctp_loss
@@ -2447,6 +2507,7 @@ class GPT(nn.Module):
             + self.router_health_coef * health_loss
             + self.mos_ortho_out_coef * mos_ortho_loss
             + eff_block_ortho_coef * block_ortho_aux
+            + lyap_loss
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -2725,6 +2786,9 @@ def main() -> None:
         router_scoring=args.router_scoring,
         attention_l2=args.attention_l2,
         l2_attn_gamma=args.l2_attn_gamma,
+        lyapunov_coef=args.lyapunov_coef,
+        lyapunov_gamma=args.lyapunov_gamma,
+        lyapunov_warmup_frac=args.lyapunov_warmup_frac,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -3014,6 +3078,9 @@ def main() -> None:
                 base_model._block_ortho_aux_enabled = False
                 base_model._block_ortho_aux_coef_scale = 1.0
                 base_model._block_ortho_aux_tokens_override = int(args.block_ortho_aux_tokens)
+                # iter 45: Lyapunov warmup state
+                base_model._lyapunov_step = step
+                base_model._lyapunov_total_steps = max(args.iterations, 1)
                 if args.block_ortho_aux_coef > 0.0 and micro_step == grad_accum_steps - 1:
                     base_model._block_ortho_aux_enabled = bool(
                         args.block_ortho_aux_every > 0 and (next_step % int(args.block_ortho_aux_every) == 0))
