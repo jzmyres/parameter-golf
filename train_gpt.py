@@ -1485,7 +1485,7 @@ class MLP(nn.Module):
         Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h = F.silu(gate) * fc
+        h = F.leaky_relu(gate, negative_slope=0.5) * fc
         h = h.view(N, E, R)
         # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
         h = self.hidden_post_norm(h)
@@ -1788,7 +1788,7 @@ class Block(nn.Module):
         Fm = self.mlp.expert_fc.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h_mlp = F.silu(gate) * fc
+        h_mlp = F.leaky_relu(gate, negative_slope=0.5) * fc
         mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)
         down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).transpose(1, 2)  # (E, R, D)
         mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
