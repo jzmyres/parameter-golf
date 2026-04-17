@@ -1818,9 +1818,6 @@ class Block(nn.Module):
         self._inj_call_track: list[float] = []
         self._attn_gate_call_track: list[float] = []
         self._router_gate_call_track: list[float] = []
-        # Per-component router gate tracking (attn vs FFN separately)
-        self._attn_router_gate_call_track: list[float] = []
-        self._mlp_router_gate_call_track: list[float] = []
 
         # iter 30 (opg_doc.tex §4.2, §4.5): certified contraction shell.
         # Replace the state-dependent sigmoid gate with an EXOGENOUS injection
@@ -1973,19 +1970,10 @@ class Block(nn.Module):
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
             if ag is not None:
                 self._attn_gate_call_track.append(ag)
-            if attn_rg is not None:
-                self._attn_router_gate_call_track.append(attn_rg)
-            # iter 35: single pooled router — attn_rg == mlp_rg (same instance)
-            mlp_rg = attn_rg
-            if mlp_rg is not None:
-                self._mlp_router_gate_call_track.append(mlp_rg)
-            rg_vals = []
-            if attn_rg is not None:
-                rg_vals.append(float(attn_rg))
-            if mlp_rg is not None:
-                rg_vals.append(float(mlp_rg))
-            if rg_vals:
-                self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
+            # Single pooled router — one gate value per call.
+            rg = attn_rg
+            if rg is not None:
+                self._router_gate_call_track.append(float(rg))
         return raw_out  # iter 30: post_norm removed (would break τ-shell contraction)
 
 
@@ -2308,8 +2296,6 @@ class GPT(nn.Module):
         sb._inj_call_track = []
         sb._attn_gate_call_track = []
         sb._router_gate_call_track = []
-        sb._attn_router_gate_call_track = []
-        sb._mlp_router_gate_call_track = []
         prev_deq_flag = bool(_DEQ_SOLVE_ACTIVE)
         _DEQ_SOLVE_ACTIVE = True
         try:
@@ -2367,18 +2353,6 @@ class GPT(nn.Module):
                 self._router_gate_iter_last_solve = [0.5 * (rg_calls[2*i] + rg_calls[2*i+1]) for i in range(K)]
             else:
                 self._router_gate_iter_last_solve = []
-            # Per-component router gates (attn vs FFN)
-            attn_rg_calls = list(getattr(sb, "_attn_router_gate_call_track", []) or [])
-            if len(attn_rg_calls) == 2 * K:
-                self._attn_router_gate_iter_last_solve = [0.5 * (attn_rg_calls[2*i] + attn_rg_calls[2*i+1]) for i in range(K)]
-            else:
-                self._attn_router_gate_iter_last_solve = []
-            mlp_rg_calls = list(getattr(sb, "_mlp_router_gate_call_track", []) or [])
-            if len(mlp_rg_calls) == 2 * K:
-                self._mlp_router_gate_iter_last_solve = [0.5 * (mlp_rg_calls[2*i] + mlp_rg_calls[2*i+1]) for i in range(K)]
-            else:
-                self._mlp_router_gate_iter_last_solve = []
-
             # Backward compat: after a DEQ solve with router_diagnostics enabled,
             # materialize list-form router diagnostics exactly once (not per-iter).
             if track_gg and bool(_ROUTER_DIAGNOSTICS_ACTIVE):
@@ -2876,10 +2850,13 @@ def main() -> None:
     # OPTIMIZER SETUP
     block_named_params = list(base_model.shared_block.named_parameters())
     # iter 35: single pooled router is Block.router (canonical name).  PyTorch
-    # deduplicates aliases (attn_router, mlp_router) by identity, so the param
-    # name is "router.router.weight", NOT "attn_router.router.weight".
+    # deduplicates aliases (attn_router, mlp_router) by identity, so all
+    # router sub-params start with "router." (not "attn_router." or "mlp_router.").
+    # Captures prototypes (L2 scoring), router.weight (linear scoring),
+    # router_gate.weight, and router_gate.bias — all get AdamW at router_lr
+    # with weight_decay=0 (routing weights should not decay toward zero).
     router_params = [p for name, p in block_named_params
-                     if name.endswith("router.router.weight")]
+                     if name.startswith("router.")]
     matrix_params = [p for name, p in block_named_params
                      if p.ndim >= 2 and not any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
     scalar_params = [p for name, p in block_named_params
@@ -3003,13 +2980,6 @@ def main() -> None:
         rg_iter = getattr(m, "_router_gate_iter_last_solve", None)
         if rg_iter is not None and len(rg_iter) > 0:
             parts.append(f"router_gate_iter:[{','.join(f'{v:.3f}' for v in rg_iter)}]")
-        # Per-component router gate trajectories (attn vs FFN)
-        attn_rg_iter = getattr(m, "_attn_router_gate_iter_last_solve", None)
-        if attn_rg_iter is not None and len(attn_rg_iter) > 0:
-            parts.append(f"attn_rg_iter:[{','.join(f'{v:.3f}' for v in attn_rg_iter)}]")
-        mlp_rg_iter = getattr(m, "_mlp_router_gate_iter_last_solve", None)
-        if mlp_rg_iter is not None and len(mlp_rg_iter) > 0:
-            parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
@@ -3394,12 +3364,6 @@ def main() -> None:
         rg_iter = getattr(base_m_for_roundtrip, "_router_gate_iter_last_solve", None)
         if rg_iter and len(rg_iter) > 0:
             diag_parts.append(f"router_gate_iter:[{','.join(f'{v:.3f}' for v in rg_iter)}]")
-        attn_rg_iter = getattr(base_m_for_roundtrip, "_attn_router_gate_iter_last_solve", None)
-        if attn_rg_iter and len(attn_rg_iter) > 0:
-            diag_parts.append(f"attn_rg_iter:[{','.join(f'{v:.3f}' for v in attn_rg_iter)}]")
-        mlp_rg_iter = getattr(base_m_for_roundtrip, "_mlp_router_gate_iter_last_solve", None)
-        if mlp_rg_iter and len(mlp_rg_iter) > 0:
-            diag_parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
         gg_mean = getattr(base_m_for_roundtrip, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             diag_parts.append(f"gg_mean:{gg_mean:.4f}")
