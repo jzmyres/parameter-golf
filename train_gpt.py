@@ -840,10 +840,52 @@ class PerExpertSpectralNormCap(nn.Module):
         return W * scale.view(-1, 1, 1)
 
 
+class SpectralNormCap(nn.Module):
+    """Stateless spectral-norm cap for 2D weight matrices (M, N).
+
+    Same pattern as PerExpertSpectralNormCap but for standard nn.Linear
+    weights (e.g., Block.inj_lin).  forward() is stateless; update_uv_()
+    runs power iteration (called once per optimizer step via
+    refresh_spectral_norms).  Replaces PyTorch's built-in spectral_norm
+    which mutates buffers during train-mode forward — breaking RevDEQ's
+    determinism requirement (Permanent protocol rule 4).
+    """
+    def __init__(self, weight_shape: torch.Size, n_power_iters: int = 1):
+        super().__init__()
+        assert len(weight_shape) == 2, f"expected 2D (M,N), got {weight_shape}"
+        M, N = weight_shape
+        self.register_buffer("u", F.normalize(torch.randn(M), dim=0), persistent=False)
+        self.register_buffer("v", F.normalize(torch.randn(N), dim=0), persistent=False)
+        self.n_power_iters = int(n_power_iters)
+
+    @torch.no_grad()
+    def update_uv_(self, W: Tensor) -> None:
+        W32 = W.detach().float()
+        u = self.u.detach().float().clone()
+        v = self.v.detach().float().clone()
+        for _ in range(self.n_power_iters):
+            v = F.normalize(W32.t() @ u, dim=0, eps=1e-12)
+            u = F.normalize(W32 @ v, dim=0, eps=1e-12)
+        self.u.copy_(u.to(dtype=self.u.dtype))
+        self.v.copy_(v.to(dtype=self.v.dtype))
+
+    def forward(self, W: Tensor) -> Tensor:
+        W32 = W.float()
+        u = self.u.detach().float()
+        v = self.v.detach().float()
+        sigma = (u @ W32 @ v).abs()
+        scale = (1.0 / sigma.clamp(min=1.0)).to(W.dtype)
+        return W * scale
+
+
+_SPECTRAL_CAP_TYPES = (PerExpertSpectralNormCap, SpectralNormCap)
+
+
 def refresh_spectral_norms(model: nn.Module) -> None:
-    """Walk `model` and run one power iteration for every
-    `PerExpertSpectralNormCap` parametrization, refreshing its `u`, `v`
-    buffers so σ estimates track `W` as training updates it.
+    """Walk `model` and run one power iteration for every spectral-norm
+    cap parametrization (both 2D `SpectralNormCap` and 3D
+    `PerExpertSpectralNormCap`), refreshing `u`, `v` buffers so σ
+    estimates track `W` as training updates it.
 
     Call once right after model construction (so the first forward has
     non-random u/v) and once per optimizer step (after `opt.step()`,
@@ -854,12 +896,11 @@ def refresh_spectral_norms(model: nn.Module) -> None:
         if plist_dict is None:
             continue
         for plist in plist_dict.values():
-            # ParametrizationList exposes the raw weight as `.original`.
             W = getattr(plist, "original", None)
             if W is None:
                 continue
             for p in plist:
-                if isinstance(p, PerExpertSpectralNormCap):
+                if isinstance(p, _SPECTRAL_CAP_TYPES):
                     p.update_uv_(W)
 
 
@@ -1798,15 +1839,15 @@ class Block(nn.Module):
         self.inj_lin = CastedLinear(dim, dim, bias=False)  # U: learned adapter
         with torch.no_grad():
             nn.init.normal_(self.inj_lin.weight, std=0.02)
-        # iter 31 (opg_doc.tex §6.1): enforce ‖U‖_2 ≤ 1 via spectral_norm
-        # parametrization.  1 power iteration per forward is sufficient for
-        # rank-d Gaussian init; provides first true 1-Lipschitz certification
-        # of a module in the Phase 6 queue.  b(x_0) = x_0 + U·rms_norm(x_0)
-        # with Lip(x_0 → b) ≤ 1 + ‖U‖_2 · Lip(rms_norm); the identity path
-        # dominates so b remains input-dependent, and U contributes at most
-        # a 1-Lipschitz adapter to the certified bound.
-        self.inj_lin = torch.nn.utils.parametrizations.spectral_norm(
-            self.inj_lin, name="weight", n_power_iterations=1
+        # iter 31 (opg_doc.tex §6.1): enforce ‖U‖_2 ≤ 1.  Uses our stateless
+        # SpectralNormCap (not PyTorch's built-in spectral_norm) because the
+        # built-in mutates u/v buffers during train-mode forward, breaking
+        # RevDEQ's determinism requirement.  Our version is stateless in
+        # forward(); update_uv_() is called once per opt step via
+        # refresh_spectral_norms() (Permanent protocol rule 4).
+        torch.nn.utils.parametrize.register_parametrization(
+            self.inj_lin, "weight",
+            SpectralNormCap(self.inj_lin.weight.shape),
         )
         # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).  τ ∈ (0, τ_max]
         # via sigmoid-parameterized scalar; τ_max<1 guarantees strict contraction
