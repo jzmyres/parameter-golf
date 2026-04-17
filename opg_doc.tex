@@ -239,7 +239,10 @@ Define the shared expert input
   u(z,x_0) := \Pi_R(z+b(x_0)).
 \]
 All experts read $u$. Let $\{A_e\}_{e=1}^{E_{\text{attn}}}$ be attention experts and $\{M_e\}_{e=1}^{E_{\text{ffn}}}$ be FFN experts,
-each constructed to be 1-Lipschitz (Section~\ref{sec:modules}).
+where FFN experts $\{M_e\}$ are constructed to be 1-Lipschitz and attention experts $\{A_e\}$
+are bounded by an analytic constant $L_{\text{attn}} = 1 + 4\gamma R^2 \ge 1$
+(Section~\ref{sec:modules}).  The aggregate Lipschitz constant $L_G$ of the mixture accounts
+for both (Section~\ref{sec:Tx}).
 Split mixture weights:
 \[
   w^A_e := w_e,\ e=1..E_{\text{attn}},\qquad
@@ -294,32 +297,49 @@ $\mathrm{softmax}_j(-\gamma\|q-k_j\|^2)$.  The augmented vectors are padded to t
 stride (multiple of 8) for flash attention compatibility.  Values $V$ are zero-padded to match,
 and the output is truncated back to $d_{\text{head}}$.
 
-\subsection{Contractive wrapper with analytic $\tau$}
+\subsection{Contractive wrapper with exogenous analytic $\tau$}
 \label{sec:Tx}
 
 Define
 \begin{equation}
   \label{eq:Tx}
-  T_x(z) := (1-\tau(u))\,b(x_0) + \tau(u)\,G_\theta(z,x_0),
+  T_x(z) := (1-\tau(x_0))\,b(x_0) + \tau(x_0)\,G_\theta(z,x_0),
 \end{equation}
-where $\tau$ is \textbf{input-dependent} and \textbf{analytically bounded}:
+where $\tau$ is \textbf{exogenous} (depends on $x_0$ only, not on the solver state $z$)
+and \textbf{analytically bounded}:
 \[
-  \tau(u) = \tau_{\max}\cdot\sigma(f_\tau(u)),\qquad
+  \tau(x_0) = \tau_{\max}\cdot\sigma(f_\tau(b(x_0))),\qquad
   \tau_{\max} = \frac{c}{L_G},\qquad c\in(0,1).
 \]
-Here $\sigma$ is the sigmoid function, $f_\tau$ is a learned linear projection, and $L_G$ is the
-analytic Lipschitz bound of $G_\theta$:
+Here $\sigma$ is the sigmoid function, $f_\tau$ is a learned linear projection applied to
+$b(x_0)$ (which depends only on $x_0$), and $L_G$ is the analytic Lipschitz bound of $G_\theta$:
 \[
   L_G = \underbrace{(1+4\gamma R^2)}_{L_{\text{attn}}} + R\cdot\underbrace{2\gamma R}_{L_w}.
 \]
-Since $\tau(u)\le\tau_{\max}$ always, we have
-$\mathrm{Lip}_z(T_x) \le \tau_{\max}\cdot L_G = c < 1$,
-giving a \textbf{rigorous Banach contraction guarantee} --- not empirical, not domain-dependent.
+
+\begin{theorem}[Rigorous Banach contraction guarantee]
+\label{thm:contraction}
+Because $x_0$ is constant with respect to $z$ during the inner Picard iteration,
+$\nabla_z \tau(x_0) = 0$.  Applying the product rule to the Jacobian:
+\[
+  \nabla_z T_x(z) = \underbrace{(G_\theta - b)\otimes \nabla_z\tau}_{=\,0\text{ (exogenous }\tau\text{)}}
+                   + \tau(x_0)\,\nabla_z G_\theta.
+\]
+Therefore $\mathrm{Lip}_z(T_x) \le \tau(x_0)\cdot\mathrm{Lip}_z(G_\theta) \le \tau_{\max}\cdot L_G = c < 1$.
+\end{theorem}
+
+\begin{remark}[Why $\tau$ must NOT depend on $z$]
+If $\tau$ were a function of $u = \Pi_R(z + b(x_0))$, the gradient $\nabla_z\tau \neq 0$
+would introduce an unbudgeted expansive term $\|G_\theta - b\|\cdot\|\nabla_z\tau\|$ in the
+Lipschitz bound --- a ``gradient leak'' that invalidates the contraction proof.
+Tying $\tau$ to the exogenous $x_0$ (via $b(x_0)$) eliminates this term exactly.
+\end{remark}
 
 \begin{remark}[Per-token modulation within the contraction budget]
-Making $\tau$ input-dependent lets the model allocate more update signal to tokens that need it
-(larger $\tau$, up to $\tau_{\max}$) and less to tokens already near the fixed point.
-The \emph{maximum} is analytically capped, so no token can break contraction.
+Making $\tau$ dependent on $x_0$ (not $z$) still provides per-token modulation:
+different input tokens get different $\tau$ values, allocating more update signal where
+the exogenous embedding suggests it is needed.  The maximum $\tau_{\max}$ is analytically
+capped, so no token can break contraction.
 \end{remark}
 
 \begin{remark}[Implication for $\beta$ (RevDEQ relaxation)]
@@ -328,7 +348,6 @@ $0 < \beta < 2/(c+1)$.  For $c=0.95$: $\beta < 1.03$.  This means $\beta$ can be
 increased to $0.5$ or higher for faster convergence, whereas without the guarantee the solver
 required conservative $\beta=0.20$ to avoid instability.
 \end{remark}
-$\tau$ may be fixed, or predicted by a bounded head and then clamped by $\tau_{\max}$.
 
 \section{Module-by-module simplicity and 1-Lipschitz proof sketches}
 \label{sec:modules}

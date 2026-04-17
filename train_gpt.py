@@ -1903,14 +1903,20 @@ class Block(nn.Module):
         """Exogenous injection b(x_0) = x_0 + U·Π_R(x_0) (iter 39b, 1-Lip)."""
         return x0 + self.inj_lin(self.attn_norm(x0)).to(dtype=x0.dtype)
 
-    def _tau(self, u: Tensor | None = None) -> Tensor:
-        """Input-dependent τ(u) = τ_max · sigmoid(f(u)), capped at τ_max.
-        Guarantees Banach contraction: τ ≤ τ_max = c/L_G → Lip(T_x) ≤ c < 1.
-        Falls back to τ_max/2 if u is None (diagnostic calls)."""
-        if u is None:
+    def _tau(self, x0_signal: Tensor | None = None) -> Tensor:
+        """Exogenous τ(x_0) = τ_max · sigmoid(f(x_0)), capped at τ_max.
+
+        CRITICAL: x0_signal must depend ONLY on x_0 (the exogenous input),
+        NOT on the solver state z.  If τ depended on z, the product rule
+        gives an unbudgeted ∇_z τ term that breaks the contraction proof.
+        With τ(x_0): ∇_z τ = 0, so Lip_z(T_x) = τ · L_G ≤ c < 1.
+
+        In Block.forward, pass b_x0 (which is a function of x_0 only).
+        Falls back to τ_max/2 if None (diagnostic calls)."""
+        if x0_signal is None:
             return torch.tensor(self._tau_max * 0.5, device=self.tau_param.device)
-        # Per-token τ: (B, T, 1)
-        tau = self._tau_max * torch.sigmoid(self.tau_gate(u))
+        # Per-token τ: (B, T, 1), exogenous w.r.t. z
+        tau = self._tau_max * torch.sigmoid(self.tau_gate(x0_signal))
         return tau
 
     @dynamo_disable
@@ -2017,9 +2023,12 @@ class Block(nn.Module):
         # artificially halved capacity.
         G = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
-        # iter 39b: input-dependent τ(u) = τ_max · sigmoid(f(u)), capped at
-        # τ_max = c/L_G.  Guarantees Lip(T_x) ≤ c < 1 (Banach).
-        tau = self._tau(u_proj).to(dtype=z_in.dtype)  # (B, T, 1)
+        # iter 39b fix: τ depends on x_0 ONLY (exogenous), NOT on z.
+        # If τ depended on z (via u_proj = Π_R(z+b(x0))), the product rule
+        # gives ∇_z T_x = (G-b)⊗∇_z τ + τ·∇_z G, and the first "gradient
+        # leak" term is unbudgeted — breaks the contraction proof.
+        # With τ(x_0): ∇_z τ = 0, so Lip_z(T_x) = τ·L_G ≤ c < 1. QED.
+        tau = self._tau(b_x0).to(dtype=z_in.dtype)  # (B, T, 1), exogenous
         raw_out = (1.0 - tau) * b_x0 + tau * G
 
         if _tracking:
