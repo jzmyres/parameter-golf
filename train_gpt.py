@@ -212,7 +212,7 @@ class Hyperparameters:
     deq_k_min = 4
     deq_k_max = 16  # iter 30: reset to baseline for clean Phase 6 comparison
     deq_k_step = 4
-    deq_k_jitter_set = (4, 8, 16)  # iter 30: baseline jitter for isolated contraction-shell test
+    deq_k_jitter_set = (4, 8, 12)  # T-opt 1/10: reduce max K from 16→12 (~4% throughput gain)
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
