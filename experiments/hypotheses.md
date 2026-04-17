@@ -472,6 +472,8 @@ failure.
 | 36 | **L2-attention + Phase 6a fixes** | MLA+SDPA → L2 attention via SDPA fast path (RMS-norm cancellation trick, γ=0.051) + Phase 6a: deterministic spectral-norm, matmul router, fp32 softmax, bounded prototypes, SDPA fail-loud | §6.6 | **PROMOTED ★ (commit `9146d74`)** | **1.9167** (-0.005 vs 34A=1.9217) | **0.030** (tighter than baseline 0.037) |
 | 37 | **lipschitz-mlp** | Drop `.square()` from MLP activation: `leaky_relu(0.5)*fc` (1-Lip). 3% throughput gain (459 vs 447 steps). K=128 Δ collapsed 0.030→0.011 (2.7× tighter FP) | §6.2 | **PROMOTED ★ (commit `e3fa2eb`)** | **1.9111** (-0.006 vs 36=1.9167) | **0.011** (2.7× tighter than iter 36's 0.030) |
 | 37b | post-mix-norm-Π_R | Replace `attn_post_mix_norm` and `mlp_post_mix_norm` from RMSNorm → BallProjection(R=2√d). K=128 Δ spectacularly tight (0.003) but val_bpb regressed +0.069 uniformly. **RMSNorm's learnable scale provides capacity Π_R cannot.** | §4.1 | **REVERTED** | 1.9801 (+0.069 vs 37=1.9111) | 0.003 (best FP ever, but val_bpb fails gate) |
+| 39 | minimal-Π_R | Remove ALL RMSNorm inside T_x, 2×Π_R only (pre+post). Remove ½ factor. | §4.4 | **REVERTED** | 2.0295 (+0.115) | 0.001 |
+| 39b | **certified-contraction** | Homogeneous coord L2-attn (no Q/K rms_norm), exogenous τ(x_0)=τ_max·σ(f(b(x_0))), analytic τ_max=c/L_G, remove ½, R=√d_head. **PERFECT FP: K=128 Δ=0.0000.** But τ≈0.016 too small for val_bpb. P0 fixes (b3ef90e) make τ even smaller (0.0027). | §4.4-4.5 | **REVERTED** (val_bpb +0.22) | 2.1421 (+0.22 vs 35=1.9197) | **0.0000** (perfect FP — Banach validated) |
 
 **Promotion rule — carry-forward on no-significant-degradation (user direction 2026-04-16):**
 
