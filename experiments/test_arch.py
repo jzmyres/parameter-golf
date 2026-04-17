@@ -12,7 +12,7 @@ def _make_model(**overrides):
     defaults = dict(
         vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
         num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
-        tied_embed_init_std=0.005, logit_softcap=30.0, rope_base=10000.0,
+        tied_embed_init_std=0.005, rope_base=10000.0,
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
         kv_latent_dim=0, num_refinements=1,
     )
@@ -36,7 +36,6 @@ def test_all_constraints():
 
     # Check constraint #1: RevDEQ
     assert model.shared_block is not None, "Must have shared_block (RevDEQ)"
-    assert model.blocks is None, "blocks should be None in DEQ mode"
     assert hasattr(model, 'deq_beta'), "Must have deq_beta relaxation parameter"
     assert model.num_experts == expected_E, (
         f"GPT.num_experts must mirror the constructor arg, got {model.num_experts}"
@@ -78,9 +77,6 @@ def test_all_constraints():
     soft = model._get_soft_embedding(z)
     assert soft.shape == z.shape, f"soft embedding must match z shape, got {tuple(soft.shape)}"
 
-    # SmearGate removed; keep the token embedding path unmodified by previous-token mixing.
-    import torch.nn as nn
-    assert isinstance(model.smear, nn.Identity)
     dim = model.tok_emb.embedding_dim
 
     # Soft Dense Routing must be pure softmax (no post-softmax sigmoid gating).

@@ -28,7 +28,7 @@ def _build_model():
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
     ).cuda()
     return model, args

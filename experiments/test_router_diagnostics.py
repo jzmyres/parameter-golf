@@ -55,7 +55,6 @@ class TestRouterDiagnostics(unittest.TestCase):
             mlp_mult=2.0,
             tie_embeddings=True,
             tied_embed_init_std=0.01,
-            logit_softcap=20.0,
             rope_base=1000.0,
             qk_gain_init=1.2,
             bigram_vocab_size=0,

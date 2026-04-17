@@ -28,3 +28,4 @@ experiments/__pycache__/
 # Local experiment artifacts (never commit)
 experiments/test_runs/
 experiments/archive/
+tmux*

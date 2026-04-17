@@ -33,12 +33,11 @@ def _build_model(args, backward_mode: str) -> GPT:
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
         deq_beta=args.deq_beta, deq_backward=backward_mode,
-        tie_attn_mlp_router=args.tie_attn_mlp_router,
     ).cuda()
 
 

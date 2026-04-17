@@ -71,11 +71,22 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | grad_clip_norm | 0.3 |
 | warmdown_frac | 0.72 |
 
+### Routing & Expert Ranks
+| Parameter | Value |
+|---|---|
+| router_scoring | l2 (L2-distance prototypes with tanh) |
+| attention_l2 | true (L2-distance attention via SDPA) |
+| l2_attn_gamma | 0.051 (matched to d_head=96) |
+| attn_expert_rank | 128 |
+| mlp_expert_rank | 192 |
+| bigram_vocab_size | 4096 |
+| bigram_dim | 128 |
+
 ### Quantization & Techniques
 - int6 per-row quantization + zstd-22 compression
 - FP16 tied embeddings
-- SmearGate + BigramHash(4096+) + OrthoInit
-- SWA every 50 steps, start_frac=0.4-0.5
+- BigramHash(4096+) + OrthoInit
+- SWA disabled (iter 1: dragged gates toward identity at 1h budget)
 - Sliding window eval (stride=64)
 
 ## How to Run
@@ -314,6 +325,21 @@ Rules:
 4. **`opg_doc.tex` §2.1 and the "Current SOTA"/"working baseline" lines are dated artifacts**. A PR that mutates `Block.forward`, the DEQ equation, or the promoted baseline MUST update these in the same commit, or open a `TODO(paper)` ticket noting the divergence.
 
 Rationale (incident from 2026-04-15 review): five drift defects shipped together — a stale 27b comment in iter 27d code, CLAUDE.md's config table two phases behind real code, `num_experts` hardcoded in three classes, a test silently relaxed from `== 6` to `>= 2`, and `opg_doc.tex` describing a removed `gg_gate`. All five share one root cause: configuration was duplicated across files with no single source of truth, so each editor only updated the file in front of them. This subsection codifies the fix.
+
+### Dead Code Audit Rule
+When a feature is removed (e.g., gg_gate, SmearGate, tie_attn_mlp_router), the SAME commit must:
+1. Remove ALL code paths that reference it (CLI args, constructor params, CONTROL_TENSOR_PATTERNS, diagnostic tracking)
+2. Remove ALL doc references (CLAUDE.md tables, comments saying "removed")
+3. Update ALL tests that assert on the removed feature
+4. `grep -rn` for the removed name across the entire codebase — if any match remains, it's incomplete
+
+### Module Alias Audit Rule
+When replacing N independent modules with a single shared instance (e.g., `attn_router` + `mlp_router` → single `router`):
+1. Verify all `named_parameters()` filters still match the canonical name (PyTorch deduplicates by identity)
+2. Verify all per-instance loops (bias_update, health_scale, diagnostics) use `id()` dedup
+3. Remove duplicate set/get operations on the same instance
+
+Rationale (incident from 2026-04-17 review): iter 35 pooled-router merge created module aliases (`attn_router` = `mlp_router` = `router`). The optimizer param filter still looked for `attn_router.router.weight` — a name PyTorch never generates for an alias. The router silently trained with Muon at 4.4x the intended LR and with weight decay, making `router_lr` a no-op. Same root cause as the 2026-04-15 incident: partial migration left stale references.
 
 ## Submission Process (when ready)
 1. Run 3 seeds (e.g., 42, 1337, 2024) on 8xH100

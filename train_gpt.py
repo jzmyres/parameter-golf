@@ -122,7 +122,7 @@ class Hyperparameters:
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 3600.0  # 2xL40S dev (1h budget); set 600 for 8xH100
+    max_wallclock_seconds = 3600.0  # generous dev default; CLI: --max-wallclock-seconds=1200 (dev) or 600 (8xH100)
 
     # Model architecture
     vocab_size = 1024
@@ -136,7 +136,6 @@ class Hyperparameters:
     mlp_mult = 3.0
     tie_embeddings = True
     rope_base = 10000.0
-    logit_softcap = 30.0
     qk_gain_init = 5.0
     deq_beta = 0.20  # locked: Phase 1 concluded β=0.20 optimal (lower β = better FP quality, H18 tested)
 
@@ -181,7 +180,6 @@ class Hyperparameters:
     # peaky for training; use the d_head-matched value.
     l2_attn_gamma = 0.051  # for d_head=96 (model_dim=768, heads=8)
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
-    # tie_attn_mlp_router removed in iter 35: single pooled router is MANDATORY (doc §4.3)
 
     # DEQ solver
     # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
@@ -270,7 +268,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             p.add_argument(f"--{name}", type=str, default=None)
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
-        "tie-attn-mlp-router", "swa-enabled", "ema-enabled",
+        "swa-enabled", "ema-enabled",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # Backward compat: "unroll" is the established name in experiments/docs.
@@ -283,7 +281,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         raise SystemExit(f"Unknown args: {unknown}")
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
-                 "tie_attn_mlp_router", "swa_enabled", "ema_enabled"}
+                 "swa_enabled", "ema_enabled"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -423,7 +421,6 @@ class Muon(torch.optim.Optimizer):
                         g = g.reshape(orig_shape)
                     start, end = offsets[i]
                     updates_flat[start:end] = g.reshape(-1)
-            curr = 0  # still needed for the unpack loop below
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
             wd = group.get("weight_decay", 0.0)
@@ -553,7 +550,7 @@ eval_val = run_validation
 # QUANTIZATION (uniform INT6 + SDClip)
 # ---------------------------------------------------------------------------
 
-CONTROL_TENSOR_PATTERNS = ("gg_w", "gg_b", "q_gain", "gate_bias", "bigram.scale")
+CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale")
 FP16_KEEP_PATTERNS = ("tok_emb",)
 SDCLIP_K_MATRIX = 12.85
 SDCLIP_K_EMBED = 20.0
@@ -1081,15 +1078,13 @@ class SoftDenseRouter(nn.Module):
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
-        assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
+        assert self.scoring in ("linear", "l2"), f"unknown scoring: {scoring}"
         # Tensor buffer to avoid Python-float guards inside torch.compile graphs.
         # Kept behind a property so legacy code/tests can assign `health_scale = 5.0`.
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
-        # L2-distance scoring: learnable prototypes c_j and fixed γ.  When
-        # scoring='linear', prototypes are unused (kept as a zero-init module
-        # attribute for state-dict compatibility).
+        # L2-distance scoring: learnable prototypes c_j and fixed γ.
         self.prototypes = nn.Parameter(torch.empty(num_experts, dim))
         with torch.no_grad():
             nn.init.normal_(self.prototypes, std=0.02)
@@ -1159,7 +1154,7 @@ class SoftDenseRouter(nn.Module):
     def forward(self, x: Tensor, *, pre_normed: bool = False) -> Tensor:
         x_n = x if bool(pre_normed) else _rms_norm(x)
         D = self.prototypes.shape[-1]
-        if self.scoring in ("l2", "sips"):
+        if self.scoring == "l2":
             # Phase 6a.3 (reviews 1, 10): replace the O(B·T·E·D) broadcast
             # (x_n.unsqueeze(-2) - c) with a matmul-based distance / cosine,
             # and apply the bounded-prototype projection.  Compute the
@@ -1169,17 +1164,12 @@ class SoftDenseRouter(nn.Module):
             x_flat_32 = x_n.reshape(-1, D).float()
             c_bounded = self._prototype_ball(self.prototypes)
             c_32 = c_bounded.float()
-            if self.scoring == "l2":
-                # ‖x − c‖² = ‖x‖² + ‖c‖² − 2·x·cᵀ  (fp32-safe GEMM path)
-                xc = x_flat_32 @ c_32.t()  # (N, E)
-                x_sq = x_flat_32.pow(2).sum(dim=-1, keepdim=True)  # (N, 1)
-                c_sq = c_32.pow(2).sum(dim=-1)  # (E,)
-                dist_sq = (x_sq + c_sq - 2.0 * xc).clamp_min(0.0)
-                route_logits = torch.tanh(-self.l2_gamma * dist_sq)
-            else:  # "sips" — cosine similarity via normalized matmul
-                x_norm = F.normalize(x_flat_32, dim=-1, eps=1e-12)
-                c_norm = F.normalize(c_32, dim=-1, eps=1e-12)
-                route_logits = self.l2_gamma * (x_norm @ c_norm.t())
+            # ‖x − c‖² = ‖x‖² + ‖c‖² − 2·x·cᵀ  (fp32-safe GEMM path)
+            xc = x_flat_32 @ c_32.t()  # (N, E)
+            x_sq = x_flat_32.pow(2).sum(dim=-1, keepdim=True)  # (N, 1)
+            c_sq = c_32.pow(2).sum(dim=-1)  # (E,)
+            dist_sq = (x_sq + c_sq - 2.0 * xc).clamp_min(0.0)
+            route_logits = torch.tanh(-self.l2_gamma * dist_sq)
             route_logits = route_logits.reshape(*leading, -1).to(dtype=x.dtype)
             route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
         else:
@@ -1301,7 +1291,7 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
-                 attention_l2: bool = False, l2_attn_gamma: float = 1.0):
+                 attention_l2: bool = False, l2_attn_gamma: float = 0.051):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -1336,7 +1326,6 @@ class CausalSelfAttention(nn.Module):
         self.gate_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
-        self._out_ortho_loss: Tensor | None = None
         self._attn_gate_last_mean: float | None = None  # per-call attn gate mean
         # Phase 4.5 22-add-all: RMSNorm after gated SDPA (post-non-linearity).
         # Normalizes per-head attention output before the expert mix projection.
@@ -1493,7 +1482,6 @@ class MLP(nn.Module):
             nn.init.xavier_uniform_(self.expert_down.data[e])
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
-        self._out_ortho_loss: Tensor | None = None
         # Phase 4.5 22-add-all: RMSNorm on per-expert hidden (after leaky_relu²).
         # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
         self.hidden_post_norm = RMSNorm(self.expert_rank)
@@ -1734,7 +1722,7 @@ class Block(nn.Module):
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 8,
                  router_scoring: str = "linear",
-                 attention_l2: bool = False, l2_attn_gamma: float = 1.0):
+                 attention_l2: bool = False, l2_attn_gamma: float = 0.051):
         super().__init__()
         # iter 32 (opg_doc.tex §4.1): replace learnable RMSNorm on the shared
         # router/expert state path with Euclidean-ball projection Π_R.
@@ -2198,39 +2186,33 @@ class RevDEQFunction(torch.autograd.Function):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: float, tie_embeddings: bool,
-                 tied_embed_init_std: float, logit_softcap: float, rope_base: float,
+                 tied_embed_init_std: float, rope_base: float,
                  qk_gain_init: float, bigram_vocab_size: int = 0, bigram_dim: int = 128,
                  kv_latent_dim: int = 0, num_refinements: int = 1,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  deq_beta: float = 0.35, attn_balance_mult: float = 5.0,
                  mlp_balance_mult: float = 1.0, bal_loss_coef: float = 5e-3,
                  router_health_coef: float = 0.25, mos_ortho_out_coef: float = 0.0,
-                 attn_ortho_out_coef: float = 0.0, mlp_ortho_out_coef: float = 0.0,
                  deq_backward: str = "revdeq", deq_bptt_k: int = 0,
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
-                 tie_attn_mlp_router: bool = True,  # iter 35: always pooled (doc §4.3)
                  router_scoring: str = "linear",
                  attention_l2: bool = False,
-                 l2_attn_gamma: float = 1.0,
+                 l2_attn_gamma: float = 0.051,
                  num_experts: int = 8):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
-        self.logit_softcap = logit_softcap
         self.num_layers = num_layers
         self.num_refinements = num_refinements
-        self.blocks = None  # Required by arch tests
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.smear = nn.Identity()  # Required by arch tests
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
         # (threaded from Hyperparameters; verified by experiments/test_arch.py).
         self.num_experts = int(num_experts)
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                   # iter 35: tie_attn_mlp_router removed; single pooled router always
                                    num_experts=self.num_experts,
                                    router_scoring=router_scoring,
                                    attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
@@ -2847,7 +2829,7 @@ def main() -> None:
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
@@ -2857,7 +2839,6 @@ def main() -> None:
         deq_backward=args.deq_backward, deq_bptt_k=args.deq_bptt_k,
         block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
-        tie_attn_mlp_router=True,  # iter 35: always pooled
         num_experts=args.num_experts,
         router_scoring=args.router_scoring,
         attention_l2=args.attention_l2,
@@ -2894,8 +2875,11 @@ def main() -> None:
 
     # OPTIMIZER SETUP
     block_named_params = list(base_model.shared_block.named_parameters())
+    # iter 35: single pooled router is Block.router (canonical name).  PyTorch
+    # deduplicates aliases (attn_router, mlp_router) by identity, so the param
+    # name is "router.router.weight", NOT "attn_router.router.weight".
     router_params = [p for name, p in block_named_params
-                     if name.endswith("attn_router.router.weight") or name.endswith("mlp_router.router.weight")]
+                     if name.endswith("router.router.weight")]
     matrix_params = [p for name, p in block_named_params
                      if p.ndim >= 2 and not any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
     scalar_params = [p for name, p in block_named_params
@@ -3112,8 +3096,7 @@ def main() -> None:
         late_frac = min(max((time_frac - 0.70) / 0.30, 0.0), 1.0)
         health_scale = 1.0 + 4.0 * float(late_frac)
         try:
-            base_model.shared_block.attn_router.health_scale = float(health_scale)
-            base_model.shared_block.mlp_router.health_scale = float(health_scale)
+            base_model.shared_block.router.health_scale = float(health_scale)
         except Exception:
             pass
 
