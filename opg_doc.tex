@@ -250,16 +250,41 @@ Compute dense mixtures:
   \Delta_{\text{attn}}(z,x_0) &= \sum_{e=1}^{E_{\text{attn}}} w^A_e(z,x_0)\,A_e(u(z,x_0)),\\
   \Delta_{\text{ffn}}(z,x_0)  &= \sum_{e=1}^{E_{\text{ffn}}}  w^M_e(z,x_0)\,M_e(u(z,x_0)).
 \end{align}
-To keep outputs bounded and preserve a clean non-expansive budget, optionally project each mixture:
-\[
-  \bar\Delta_{\text{attn}}(z,x_0) := \Pi_R(\Delta_{\text{attn}}(z,x_0)),\qquad
-  \bar\Delta_{\text{ffn}}(z,x_0) := \Pi_R(\Delta_{\text{ffn}}(z,x_0)).
-\]
-Combine in parallel (the $\tfrac12$ matches the stabilizing scale used in the current code):
+Combine in parallel and apply a \textbf{single} output projection on the combined update
+(the $\tfrac12$ matches the stabilizing scale used in the current code):
 \begin{equation}
   \label{eq:Gtheta}
-  G_\theta(z,x_0) := \tfrac12\Big(\bar\Delta_{\text{attn}}(z,x_0)+\bar\Delta_{\text{ffn}}(z,x_0)\Big).
+  G_\theta(z,x_0) := \Pi_R\!\left(\tfrac12\Big(\Delta_{\text{attn}}(z,x_0)+\Delta_{\text{ffn}}(z,x_0)\Big)\right).
 \end{equation}
+
+\begin{remark}[Minimal principled norms: $\Pi_R$ inside $T_x$, normalization outside]
+\label{rem:norm_separation}
+\textbf{Inside} the DEQ fixed-point map $T_x(z)$ (i.e., inside the block forward),
+use \emph{only} non-expansive clamps $\Pi_R$, not learnable RMSNorm or LayerNorm.
+\textbf{Outside} the fixed-point map (embeddings, final output head), learnable
+normalizations may be kept for optimization without affecting the DEQ contraction guarantee.
+
+Concretely, $T_x$ uses exactly \textbf{two} $\Pi_R$ projections:
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Pre-projection} (shared input): $u = \Pi_R(z + b(x_0))$ feeds the same bounded
+        vector to routers \emph{and} all experts.
+  \item \textbf{Post-projection} (combined update): $G_\theta = \Pi_R(\tfrac12(\Delta_{\text{attn}} + \Delta_{\text{ffn}}))$.
+\end{enumerate}
+No other norms or clamps appear inside $T_x$.  Learnable norms (RMSNorm) are
+reserved for outside the solve: embedding normalization, the final output-head
+norm, and refinement soft-embedding normalization.
+
+\emph{Why not RMSNorm inside $T_x$?}  RMSNorm is \textbf{not} globally 1-Lipschitz
+(its Jacobian norm diverges as $\|x\|\to 0$).  Using it inside the fixed-point
+map complicates the contraction analysis.  $\Pi_R$ is 1-Lipschitz by
+construction for any $R>0$, giving the contraction guarantee ``for free.''
+
+\emph{Why not remove all clamps?}  Without $\Pi_R$, the bounded-domain assumptions
+that make routers, softmax, and attention well-behaved in bf16 are lost, and
+$\tau<1$ alone cannot reliably prevent saturation or magnitude blow-up unless
+strict operator-norm constraints are enforced \emph{everywhere} (more complex
+than two $\Pi_R$ projections).
+\end{remark}
 
 \subsection{Contractive wrapper (the map actually solved)}
 \label{sec:Tx}
