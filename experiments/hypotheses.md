@@ -517,28 +517,38 @@ the change is broken.
   certified contraction arch is in place as the new permanent baseline.
 
 ### Phase 6 post-cert ablation (IMMEDIATELY after iter 35 promotes):
-- **39-rm-post-norm-add-pre-norm** (user direction 2026-04-16): two coupled changes:
-  1. **Remove ALL post-mix norms** — delete `attn_post_mix_norm` and
-     `mlp_post_mix_norm` entirely (both RMSNorm instances on expert-weighted-
-     sum output).
-  2. **Add learnable RMS pre-norm on ALL linear weights** — every linear layer
-     in the Block (expert banks, attention projections, injection U, router)
-     should have its input go through a learnable `RMSNorm(input_dim)` BEFORE
-     the matmul.  This replaces output-side magnitude control (post-norm) with
-     input-side magnitude control (pre-norm), which is architecturally cleaner:
-     - Pre-norm bounds the input magnitude (learnable scale gives capacity)
-     - σ_max(W) ≤ 1 constrains the transform (already certified)
-     - Together: bounded input + 1-Lip transform = bounded output WITHOUT
-       explicit output clipping
-     - RMSNorm's learnable scale provides the capacity that Π_R lacked
-       (iter 37b regression was caused by Π_R's hard clamp, not by the
-       concept of output bounding)
-  **The Phase 4.5 ablation that showed post-norms were "load-bearing" predates
-  1-Lip certification.**  That conclusion MUST be re-verified.  The pre-norm
-  approach is the principled alternative: control magnitudes at the INPUT where
-  the model has learnable freedom, not at the OUTPUT where hard clamps hurt
-  capacity.  If K=128 Δ ≤ 0.5 and Δval_bpb ≤ 0.03: promote.
-  Update opg_doc.tex §4.1/§4.4 to match the outcome.
+- **39-rm-ALL-post-norm-add-learnable-pre-norm** (user direction 2026-04-16):
+  Comprehensive norm overhaul.  Rule: if it's a post-norm → REMOVE.
+  If it's a pre-norm → make it learnable RMSNorm.
+
+  **REMOVE (4 post-norms):**
+  - `Block.attn_post_mix_norm = RMSNorm(dim)` — after attn expert weighted sum
+  - `Block.mlp_post_mix_norm = RMSNorm(dim)` — after mlp expert weighted sum
+  - `CSA.attn_sdpa_post_norm = RMSNorm(dim)` — after SDPA output
+  - `MLP.hidden_post_norm = RMSNorm(rank)` — per-expert hidden after activation
+
+  **CONVERT to learnable RMSNorm (7 pre-norms):**
+  - `Block.attn_norm = BallProjection` → `RMSNorm(dim)` (pre-norm on u)
+  - `Block.mlp_norm = BallProjection` → `RMSNorm(dim)` (pre-norm on u)
+  - `CSA: _rms_norm(q_rope/q_nope)` → learnable `RMSNorm(head_dim)` (pre-norm Q)
+  - `CSA: _rms_norm(k_rope/k_nope)` → learnable `RMSNorm(head_dim)` (pre-norm K)
+  - `MLP: _rms_norm(x)` in mix_experts → learnable `RMSNorm(dim)` (pre-norm expert input)
+  - `Router: _rms_norm(x)` in forward → learnable `RMSNorm(dim)` (pre-norm router input)
+  - `Block: _rms_norm(x0)` in _compute_b_x0 → learnable `RMSNorm(dim)` (pre-norm injection)
+
+  **FULL MODEL additional norms (outside Block):**
+  - `BigramHash: _rms_norm(h)` before proj → learnable `RMSNorm`
+  - `GPT._encode: _rms_norm(x)` after tok+bigram embed → learnable `RMSNorm`
+  - `GPT.final_norm = RMSNorm(model_dim)` — keep (already learnable, pre-norm for MoS head)
+  - `GPT._get_soft_embedding: _rms_norm(soft_embed)` → learnable `RMSNorm`
+  - `MoSHead: _rms_norm(h)` in _head_forward (line 1051) → learnable if applicable
+
+  **Total: 4 post-norms to REMOVE, 10+ pre-norms to make learnable.**
+
+  **Principle:** control magnitudes at the INPUT (learnable scale, model has
+  freedom) not the OUTPUT (hard clamp hurts capacity).  Bounded input +
+  1-Lip certified transform = bounded output without output clipping.
+  Update opg_doc.tex §4.1/§4.4 to match.
 
 ### Phase 6-contingent (optional, after post-cert ablation):
 - **30d-deeper-K**: add `deq_k_jitter_set=(4,8,16,24)` on certified arch — tests
