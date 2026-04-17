@@ -37,63 +37,77 @@
 \newtheorem{remark}[theorem]{Remark}
 \newtheorem{definition}[theorem]{Definition}
 
-\title{OPG (parameter-golf): Contractive RevDEQ Backbone (Proposed)\\\large Dense routing with Lipschitz budget + unique fixed point}
-\author{Project document (architecture + convergence proof sketch)\\\small with code-aligned appendices for \texttt{train\_gpt.py}}
-\date{2026-04-16}
+\title{OPG (parameter-golf): Lyapunov-Stable RevDEQ Backbone (Proposed)\\\large Dense routing + FlashAttention MLA SDPA + Jacobian spectral-radius regularization}
+\author{Project document (architecture + convergence guarantee)\\\small with code-aligned algorithmic guidance for \texttt{train\_gpt.py}}
+\date{2026-04-17}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-This document defines a \emph{proposed} RevDEQ backbone architecture as an explicit fixed-point map $T_x$ with a \emph{certifiable}
-contraction budget, yielding a \textbf{unique} fixed point and \textbf{global} convergence via Banach.
-The mainline design keeps \textbf{parallel attention + FFN} and \textbf{input-dependent dense routing}, but replaces ad-hoc state gates
-with (i) an \textbf{exogenous} injection $b(x_0)$ and (ii) \textbf{Lipschitz-controlled} router scoring (SIPS and L2-distance options).
-To make the convergence argument self-contained, we spell out simple sufficient conditions under which each submodule is \textbf{non-expansive}
-(1-Lipschitz) under a chosen norm, and we provide an expressiveness discussion showing the architecture remains transformer-like on bounded domains.
+The previous project document enforced \emph{global} convergence of the RevDEQ fixed-point solve by making the backbone map a
+\textbf{strict global contraction} (Banach). In practice, the required ingredients
+(ball projections $\Pi_R$, spectral-norm constraints on all linears, and an exogenous contraction shell)
+significantly reduce expressiveness and degrade performance.
 
-\paragraph{Status.}
-Theorems and proofs in the main body apply to the \emph{proposed} contractive design. Appendices document the \emph{current} code in
-\texttt{train\_gpt.py} (RevDEQ + dense routers + MLA/gated SDPA + MoS/FSQ + optional self-refinement) and list the explicit gaps.
+This revision replaces the global-contraction requirement with a \textbf{Lyapunov (local) stability} guarantee:
+for each input $x_0$, we train the backbone map $T_\theta(\cdot,x_0)$ so that the equilibrium $z^\star$
+found by the RevDEQ solver is a \textbf{strict local attractor}. Concretely, we enforce a \emph{local} condition
+on the Jacobian at the equilibrium, $\rho(J_{z^\star})<1$, where $J_{z^\star}=\nabla_z T_\theta(z^\star,x_0)$ and $\rho(\cdot)$ is the spectral radius.
+This condition implies (via a quadratic Lyapunov function) that the fixed point is locally exponentially stable,
+so fixed-point iteration (and damped variants such as RevDEQ) converges from initial states in its basin of attraction.
+
+Architecturally, we restore a \textbf{fully expressive} transformer-like block inside $T_\theta$:
+\textbf{no ball projections}, \textbf{no spectral normalization constraints}, and \textbf{standard FlashAttention (MLA + SDPA)}
+instead of L2-attention tricks. Stability is encouraged by (i) a \textbf{learnable RMSNorm preconditioner} before \emph{every} linear projection,
+(ii) standard bounded-derivative nonlinearities (e.g.\ SiLU/GELU/SwiGLU), and (iii) a \textbf{single, boundary-only Lyapunov penalty}
+computed with one efficient vector--Jacobian product (VJP) at the detached equilibrium state, using a \textbf{persistent power-iteration vector}
+carried across training steps to reliably target the dominant Jacobian direction.
+
+The result is a training recipe that isolates the expensive unrolled trajectory (handled by RevDEQ's reversible solver)
+from stability regularization (handled by one boundary VJP), recovering expressiveness while retaining a rigorous
+fixed-point convergence guarantee \emph{within the learned basin}. 
 \end{abstract}
 
 \tableofcontents
 \newpage
 
-\section{Executive changes relative to the current code}
+\section{Executive changes relative to the previous (Banach-contractive) document}
 \label{sec:exec}
 
-The current code (\texttt{train\_gpt.py}) implements a RevDEQ solver over a shared block with token-local injection gates, dense softmax routing,
-MLA-style attention with post-SDPA head gates, and a dual MoS head (CTP+NTP) with FSQ. A late wallclock ramp optionally enables an outer
-self-refinement loop that re-embeds predicted token distributions. This document proposes a \emph{certifiable} backbone map $T_x$ by:
+The previous document proved global uniqueness and global convergence by constructing a strict contraction map using:
+(i) Euclidean ball projections $\Pi_R$ inside the map, (ii) spectral-norm constraints $\|W\|_2\le 1$ for all linears, and
+(iii) an exogenous contraction shell parameter $\tau<1$ so that $\mathrm{Lip}(T_x)<1$ everywhere.
+
+This revision explicitly \textbf{drops global contraction} and instead adopts \textbf{Lyapunov local stability at the reached equilibrium}.
+The concrete changes are:
 
 \begin{enumerate}[leftmargin=2em,itemsep=0.25em]
-  \item \textbf{Mainline scope}: the main body focuses on a \emph{single} iteration axis: the inner RevDEQ equilibrium solve for a strict contraction $T_x$.
-  \item \textbf{Injection}: remove any state-dependent injection gate from the certified map. Use an \emph{exogenous} injection
-        $b(x_0)$ that contains an identity path so the backbone cannot become input-independent by collapsing a learned gate.
-  \item \textbf{Routing}: keep routing \emph{input-dependent} on the DEQ state $z$, but parameterize logits using a Lipschitz-controlled score
-        (SIPS or L2-distance), yielding an explicit bound on router sensitivity.
-  \item \textbf{Contraction shell}: wrap the routed update $G_\theta$ with a scalar $\tau\in(0,1)$ to ensure $T_x$ is a strict contraction:
-        $T_x(z)=(1-\tau)\,b(x_0)+\tau\,G_\theta(z,x_0)$.
+  \item \textbf{Convergence theory}: replace Banach/global contraction with \textbf{Lyapunov (local) stability} for the discrete-time dynamical system
+        $z_{k+1}=T_\theta(z_k,x_0)$, guaranteed when $\rho(\nabla_z T_\theta(z^\star,x_0))<1$ at the equilibrium $z^\star$ (Section~\ref{sec:lyapunov}).
+  \item \textbf{Remove hard contraction constraints}: remove all $\Pi_R$ projections, remove all spectral normalization constraints, and remove the analytic $\tau$-shell.
+        These were the main sources of lost expressiveness.
+  \item \textbf{Restore standard attention}: use \textbf{FlashAttention-friendly scaled dot-product attention} (MLA + SDPA) rather than L2-distance attention and
+        the homogeneous-coordinate trick.
+  \item \textbf{Stabilize via soft regularization + preconditioning}: add a \textbf{learnable RMSNorm} before \emph{every} linear projection
+        (router, Q/K/V/O, and MLP linears) and use standard nonlinearities (SiLU/GELU/SwiGLU).
+  \item \textbf{Efficient Lyapunov penalty}: enforce $\rho(J_{z^\star})\lesssim\gamma$ with a single boundary VJP at $z^\star$ (Section~\ref{sec:algorithm}),
+        using a \textbf{persistent} one-step power-iteration vector to reliably target the dominant Jacobian direction.
+        This avoids caching or differentiating through the full forward trajectory.
 \end{enumerate}
 
 \paragraph{Reader guide.}
-Sections~\ref{sec:notation}--\ref{sec:convergence} define $T_x$ and give sufficient conditions for a unique fixed point.
-Section~\ref{sec:expressive} discusses expressiveness under 1-Lipschitz constraints.
+Section~\ref{sec:arch} defines the new expressive backbone map.
+Section~\ref{sec:algorithm} gives the \emph{robust + efficient} training algorithm (RevDEQ + boundary Lyapunov penalty).
+Section~\ref{sec:lyapunov} states the Lyapunov stability conditions and provides a rigorous convergence proof.
 
-\paragraph{Guiding principle for iteration proposals.}
-\emph{Every architectural change proposed in this document must preserve (or strengthen) the
-contraction-mapping property required by the Banach fixed-point theorem.} A
-proposal is admissible only if, after the change, $T_x$ remains a strict contraction
-(Lipschitz constant $<1$) under the norm chosen in Section~\ref{sec:notation}.
-Proposals should also be \textbf{simple} (one change at a time, ideally a single module replaced or one
-constraint added) and \textbf{principled} (each change traceable to a specific sufficient condition in
-Sections~\ref{sec:proj}--\ref{sec:modules}). Several candidate architectures listed in this
-document (e.g.\ SIPS vs.\ L2-distance routing, RMSNorm vs.\ $\Pi_R$ projection,
-MLA+SDPA vs.\ L2 attention) should be tested \emph{rigorously and thoroughly} against
-each other under this rubric.
+\paragraph{Guiding principle for iteration proposals (updated).}
+\emph{Every architectural change proposed in this document must preserve solver robustness while keeping the model maximally expressive.}
+We no longer require global contraction. Instead, proposals should:
+(i) maintain or improve empirical convergence of the RevDEQ inner solve, and
+(ii) keep the learned equilibria locally stable by driving $\rho(\nabla_z T_\theta(z^\star,x_0))$ below a target $\gamma<1$ on the training distribution.
 
-\section{Notation, norms, and Lipschitz constants}
+\section{Notation and dynamical-system view}
 \label{sec:notation}
 
 Let $V$ be vocabulary size, $B$ batch size, $T$ sequence length, and $d$ model width.
@@ -102,511 +116,563 @@ Token IDs and next-token targets:
   x \in \{0,\dots,V-1\}^{B\times T},\qquad
   y \in \{0,\dots,V-1\}^{B\times T}.
 \]
-Embeddings and states:
+Embeddings and DEQ states:
 \[
   x_0 \in \mathbb{R}^{B\times T\times d},\qquad
   z \in \mathbb{R}^{B\times T\times d}.
 \]
 
-\paragraph{Norm choice.}
-All Lipschitz statements in the main body use the Frobenius norm on tensors:
+\paragraph{Norm.}
+Unless otherwise stated, we use the Frobenius norm on tensors:
 \[
   \|z\| := \|z\|_F = \sqrt{\sum_{b,t,i} z_{bti}^2}.
 \]
-This identifies $\mathbb{R}^{B\times T\times d}$ with a Euclidean space, which is complete.
+This identifies $\mathbb{R}^{B\times T\times d}$ with a Euclidean space (complete).
 
-\begin{definition}[Lipschitz constant]
-For a map $F:\mathcal{X}\to\mathcal{X}$ on a normed space $(\mathcal{X},\|\cdot\|)$, define
+\begin{definition}[Fixed point and equilibrium map]
+For a fixed input embedding $x_0$, define the backbone map $T_\theta(\cdot,x_0):\mathbb{R}^{B\times T\times d}\to\mathbb{R}^{B\times T\times d}$.
+A tensor $z^\star$ is a \emph{fixed point} (equilibrium) if
 \[
-  \mathrm{Lip}(F) := \inf\{L\ge 0:\ \|F(u)-F(v)\|\le L\,\|u-v\|\ \forall u,v\in\mathcal{X}\}.
+  z^\star = T_\theta(z^\star, x_0).
 \]
-We call $F$ \emph{non-expansive} if $\mathrm{Lip}(F)\le 1$ and a \emph{contraction} if $\mathrm{Lip}(F)<1$.
 \end{definition}
 
-\paragraph{Code normalization notation (appendices).}
-The current code uses both parameter-free RMS normalization (\texttt{F.rms\_norm} via \texttt{\_rms\_norm}) and learnable RMSNorm modules.
-In the appendices we write $\mathrm{rms\_norm}(\cdot)$ for the parameter-free version and $\mathrm{RMSNorm}(\cdot)$ for a learnable RMSNorm.
-These are \emph{not} globally 1-Lipschitz without additional constraints; the certified design below uses explicit 1-Lipschitz projections.
+\begin{definition}[Spectral radius]
+For a square linear operator (matrix) $A$, its spectral radius is
+\[
+  \rho(A) := \max\{|\lambda| : \lambda \text{ is an eigenvalue of } A\}.
+\]
+\end{definition}
 
-\section{End-to-end forward algorithm (single DEQ solve; proposed)}
-\label{sec:forward}
+\paragraph{Key shift (global $\Rightarrow$ local).}
+Banach required $\mathrm{Lip}(T_\theta(\cdot,x_0))<1$ \emph{for all $z$}.
+Here we only require a \textbf{local} condition at the equilibrium we actually reach:
+\[
+  \rho\!\left(\nabla_z T_\theta(z^\star,x_0)\right) < 1,
+\]
+which implies $z^\star$ is a \emph{strict local attractor} (Section~\ref{sec:lyapunov}).
+This does \emph{not} guarantee global uniqueness: multiple equilibria may exist, and initialization selects the basin.
 
-\paragraph{High-level algorithm.}
-The proposed backbone runs a single RevDEQ equilibrium solve for a strict contraction map $T_x$:
+\section{Expressive and stable fixed-point map}
+\label{sec:arch}
+
+We define $T_\theta$ to be transformer-like and fully expressive:
+\textbf{no ball projections}, \textbf{no spectral-norm constraints}, and \textbf{standard SDPA attention}.
+Stability is handled by \emph{training-time} Lyapunov regularization (Section~\ref{sec:algorithm}) rather than hard architectural clamps.
+
+\subsection{Input embedding}
+We retain the existing embedding stack:
+\begin{equation}
+  \label{eq:x0}
+  x_0 = \mathrm{rms\_norm}\!\left(E[x] + \mathrm{BigramHashEmb}(x)\right),
+\end{equation}
+where \texttt{BigramHashEmb} is optional and $\mathrm{rms\_norm}$ denotes the parameter-free RMS normalization currently used in code.
+(Any embedding-side normalization is outside the DEQ stability argument.)
+
+\subsection{NormedLinear: learnable RMSNorm before every linear}
+\label{sec:normedlinear}
+
+A central design choice is to insert a learnable RMSNorm \emph{before every} linear map used inside $T_\theta$.
+Define a reusable primitive:
+\begin{equation}
+  \label{eq:normedlinear}
+  \mathrm{NormedLinear}(h;W,b,g) \;:=\; W\,\mathrm{RMSNorm}(h;g) + b,
+\end{equation}
+where $\mathrm{RMSNorm}(\cdot;g)$ is learnable (scale $g$, with $\varepsilon$ for numerical stability).
+We use \eqref{eq:normedlinear} for:
+router projections, Q/K/V/O projections, and both MLP linears.
+
+\begin{remark}[Why this helps stability without killing expressiveness]
+RMSNorm preconditioning controls activation scale and reduces sensitivity to weight growth,
+making it easier for training to satisfy $\rho(J_{z^\star})<1$ without forcing $\|W\|_2\le 1$ globally.
+Unlike hard spectral constraints or $\Pi_R$ projections, this does not cap representational capacity away from the equilibrium.
+\end{remark}
+
+\subsection{Backbone block: dense routing over attention + MLP experts}
+\label{sec:block}
+
+Let $u = z + x_0$ be the combined state+input view.
+Compute a shared normalized representation $h = \mathrm{RMSNorm}(u)$.
+
+\paragraph{Router.}
+We maintain dense routing over a combined expert pool $E = E_{\text{attn}} + E_{\text{mlp}}$:
+\[
+  q = \mathrm{NormedLinear}(h;W_r,b_r,g_r),\qquad
+  s = q K_r^\top,\qquad
+  w = \mathrm{softmax}(s)\in\Delta^{E-1}.
+\]
+(Any of the existing router score parameterizations---dot-product, SIPS, etc.---can be used here.
+We no longer require a Lipschitz-controlled router; stability is handled by the Lyapunov penalty.)
+
+\paragraph{Attention experts (FlashAttention MLA + SDPA).}
+For attention expert $e$:
+\[
+  Q_e = \mathrm{NormedLinear}(h;W^Q_e,b^Q_e,g^Q_e),\quad
+  K_e = \mathrm{NormedLinear}(h;W^K_e,b^K_e,g^K_e),\quad
+  V_e = \mathrm{NormedLinear}(h;W^V_e,b^V_e,g^V_e).
+\]
+Apply RoPE to $Q_e,K_e$ (orthogonal) and compute causal scaled dot-product attention using a FlashAttention/SDPA kernel:
+\[
+  O_e = \mathrm{SDPA}(Q_e,K_e,V_e)\quad\text{(causal)}.
+\]
+Optionally apply MLA-style head gates (as in current code), then output-project:
+\[
+  A_e(h) = \mathrm{NormedLinear}(O_e;W^O_e,b^O_e,g^O_e).
+\]
+
+\paragraph{MLP experts (dense MoE, SwiGLU/GELU).}
+For MLP expert $e$, we use a gated MLP such as SwiGLU:
+\[
+  a_e = \mathrm{NormedLinear}(h;W^{(a)}_e,b^{(a)}_e,g^{(a)}_e),\qquad
+  b_e = \mathrm{NormedLinear}(h;W^{(b)}_e,b^{(b)}_e,g^{(b)}_e),
+\]
+\[
+  m_e = \phi(a_e)\odot b_e,\qquad
+  M_e(h) = \mathrm{NormedLinear}(m_e;W^{(2)}_e,b^{(2)}_e,g^{(2)}_e),
+\]
+with $\phi=\mathrm{SiLU}$ or $\mathrm{GELU}$.
+
+\paragraph{Dense mixture and residual update.}
+Let the expert outputs be collected as $\{E_j(h)\}_{j=1}^E$ with $E_j\in\{A_e,M_e\}$.
+Compute the dense mixture:
+\begin{equation}
+  \label{eq:mixture}
+  \Delta_\theta(z,x_0) := \sum_{j=1}^{E} w_j(z,x_0)\,E_j(h),
+  \qquad h = \mathrm{RMSNorm}(z+x_0).
+\end{equation}
+
+\paragraph{Fixed-point map (expressive, unclamped).}
+We define the equilibrium map as:
+\begin{equation}
+  \label{eq:Tx_new}
+  T_\theta(z,x_0) := x_0 + \Delta_\theta(z,x_0).
+\end{equation}
+This map is fully expressive (no $\Pi_R$, no $\|W\|_2$ constraints) and uses standard SDPA attention.
+Stability is enforced \emph{only} at the reached equilibrium using the Lyapunov penalty.
+
+\begin{remark}[Why keep an explicit $x_0$ injection]
+Even without a contraction proof, an explicit injection makes input-dependence structural:
+if the expert bank collapses to zero, $T_\theta(z,x_0)=x_0$ so the equilibrium remains input-dependent.
+This avoids the degenerate ``input-independent attractor'' failure mode.
+\end{remark}
+
+\section{RevDEQ solver and the efficient Lyapunov-regularized training algorithm}
+\label{sec:algorithm}
+
+This section presents the robust training algorithm requested:
+an efficient \textbf{RevDEQ + Lyapunov} procedure that
+(i) uses RevDEQ for the deep unrolled trajectory, and
+(ii) computes a stability penalty using only a \textbf{single} VJP at the detached equilibrium boundary.
+
+\subsection{Phase 1: RevDEQ forward pass (locating an equilibrium)}
+\label{sec:phase1}
+
+RevDEQ maintains two coupled states $y_k$ and $z_k$ and applies $T_\theta$ twice per step:
+\begin{align}
+  y_{k+1} &= (1-\beta)\,y_k + \beta\, T_\theta(z_k,x_0),\\
+  z_{k+1} &= (1-\beta)\,z_k + \beta\, T_\theta(y_{k+1},x_0),
+\end{align}
+initialized with $y_0=z_0=x_0$ (warm start), and run for $K$ steps or until convergence.
+
 \begin{lstlisting}
 Inputs: token IDs x [B,T], targets y [B,T]
-Hyperparams: K=num_layers, beta=deq_beta
+Hyperparams: K_max, beta in (0,1], eps_tol
 
-# 1) Base input embedding (same as current code)
-x0 = rms_norm( Emb(x) + BigramHashEmb(x) )        # BigramHashEmb optional
+# 1) Embed input
+x0 = rms_norm( Emb(x) + BigramHashEmb(x) )  # optional BigramHashEmb
 
-# 2) Certified RevDEQ equilibrium solve
-z0 = x0                                           # warm start
-z  = RevDEQ_Solve( T_x, z0, beta, K_eff )
+# 2) RevDEQ solve (forward)
+y_state = x0
+z_state = x0
+for k in 0..K_max-1:
+    y_next = (1-beta)*y_state + beta*T_theta(z_state, x0)
+    z_next = (1-beta)*z_state + beta*T_theta(y_next,  x0)
+    if ||z_next - z_state||_2 < eps_tol:
+        break
+    y_state, z_state = y_next, z_next
 
-# 3) Output head + losses (same as current code)
-h = RMSNorm(z)
-log p_CTP, log p_NTP = MoSHead(h)
-loss = NLL(log p_NTP, y) + auxiliary losses
+z_star = z_next                       # equilibrium candidate
+z_star_detached = z_star.detach()     # detach: do NOT keep trajectory graph
 \end{lstlisting}
 
-\paragraph{Scope note.}
-The certified mainline scope is a single inner DEQ equilibrium solve of the strict contraction $T_x$; any outer self-refinement loop is orthogonal and is not part of the contraction proof.  The self-refinement loop (retained for experimental study) is documented separately in Appendix~\ref{app:refinement}.
-
-\section{Inner loop: RevDEQ coupled-state solver}
-\label{sec:deq}
-
-RevDEQ maintains two states $y_k$ and $z_k$ and applies the fixed-point map twice per step:
-\begin{align}
-  y_{k+1} &= (1-\beta)\,y_k + \beta\, T_x(z_k),\\
-  z_{k+1} &= (1-\beta)\,z_k + \beta\, T_x(y_{k+1}),
-\end{align}
-for $k=0,\dots,K-1$, with initialization $y_0=z_0$.
-
-\begin{remark}[Convergence link]
-If $T_x$ is a strict contraction with constant $k<1$, then the Picard iteration $z\leftarrow T_x(z)$ converges globally.
-The RevDEQ relaxation parameter $\beta$ is a solver knob; a common sufficient stability range is $0<\beta<2/(k+1)$.
+\begin{remark}[Why detaching is essential]
+Without detaching, PyTorch would retain the entire forward trajectory to backpropagate through it,
+making memory scale as $O(K)$ and defeating the point of a DEQ. RevDEQ's reversible backward pass
+reconstructs the trajectory on demand (Phase 3) using $O(1)$ saved states.
 \end{remark}
 
-\section{The proposed fixed-point map $T_x$}
-\label{sec:map}
+\subsection{Phase 2: Boundary Lyapunov penalty via a single VJP}
+\label{sec:phase2}
 
-\subsection{1-Lipschitz projections (certified normalization)}
-\label{sec:proj}
+We now enforce that the reached equilibrium is a strict local attractor by encouraging
+\[
+  \rho\!\left(J_{z^\star}\right) \le \gamma < 1,
+  \qquad J_{z^\star} := \nabla_z T_\theta(z^\star,x_0).
+\]
+Computing $\rho(J_{z^\star})$ exactly is expensive, so we use an efficient power-style proxy
+requiring \textbf{one} boundary evaluation of $T_\theta$ and \textbf{one} VJP.
 
-To keep the mainline certifiable, we use explicit non-expansive projections instead of unconstrained normalization.
-For a radius $R>0$, define the Euclidean ball in $\mathbb{R}^{B\times T\times d}$:
+\paragraph{Persistent one-step power proxy (single VJP per step).}
+A single VJP in a fresh random direction estimates gain in that direction, but can \emph{severely underestimate}
+the true spectral radius (and thus leave the hinge penalty inactive) even when $\rho(J_{z^\star})>\gamma$.
+To keep the cost at \textbf{one} VJP per step while reliably aligning with the dominant eigendirection, we maintain
+a \emph{persistent} unit vector $v_{\text{buf}}$ across training steps.
+
+At step $t$, take $v=v_{\text{buf}}$ (stop-gradient) and compute the Jacobian-transpose vector product (VJP):
 \[
-  \mathcal{B}_R := \{u:\ \|u\|\le R\}.
+  v_{\text{next}} = J_{z^\star}^\top v = \nabla_{z^\star}\bigl(v^\top T_\theta(z^\star,x_0)\bigr).
 \]
-Let $\Pi_R$ be the projection onto $\mathcal{B}_R$:
+Then $\|v_{\text{next}}\|_2$ is a one-step estimate of local gain in the (tracked) direction.
+Finally, update the buffer for the next step using a stop-gradient normalization:
 \[
-  \Pi_R(u) := \arg\min_{v\in\mathcal{B}_R}\|u-v\|.
+  v_{\text{buf}} \leftarrow \mathrm{stopgrad}\!\left(\frac{v_{\text{next}}}{\|v_{\text{next}}\|_2+\varepsilon}\right).
 \]
-This projection has a key property:
-\begin{proposition}[Projection is 1-Lipschitz]
-$\Pi_R$ is non-expansive: $\|\Pi_R(u)-\Pi_R(v)\|\le \|u-v\|$ for all $u,v$.
+Because this compounds across steps, $v_{\text{buf}}$ behaves like amortized power iteration and aligns with the dominant eigendirection
+of $J_{z^\star}^\top$ over the course of training, without requiring $m>1$ VJPs per forward pass.
+
+\paragraph{Penalty.}
+Define a hinge loss:
+\begin{equation}
+  \label{eq:ljac}
+  L_{\text{jac}} = \lambda_{\text{jac}}\,\max\bigl(0,\,\|v_{\text{next}}\|_2 - \gamma\bigr),
+  \qquad \gamma \in (0,1).
+\end{equation}
+
+\begin{lstlisting}
+# 2) Lyapunov / Jacobian penalty at detached boundary
+z_b = z_star_detached.requires_grad_(True)
+u   = T_theta(z_b, x0)                        # one extra forward at boundary
+if v_buf is None or v_buf.shape != z_b.shape:
+    v_buf = normalize(randn_like(z_b).detach())
+v   = v_buf.detach()                          # persistent unit vector buffer (no grad)
+
+# VJP: v_next = J^T v   (create_graph=True so gradients reach theta)
+v_next = grad( (u * v).sum(), z_b, create_graph=True )[0]
+
+rho_hat = ||v_next||_2                        # one-step proxy
+L_jac   = lambda_jac * relu(rho_hat - gamma)
+
+# Stop-gradient update of the persistent direction
+v_buf = normalize(v_next.detach())            # or EMA-smoothed update (see Remark)
+\end{lstlisting}
+
+\begin{remark}[Why \texttt{create\_graph=True}]
+$L_{\text{jac}}$ must produce gradients w.r.t.\ parameters $\theta$.
+Since $v_{\text{next}}$ is itself a gradient w.r.t.\ $z_b$,
+backpropagating through it requires mixed second derivatives (one ``extra order''),
+but only for this \emph{single boundary evaluation}, not through the full trajectory.
+\end{remark}
+
+\begin{remark}[Optional: few-step power iteration]
+If a tighter estimate of $\rho(J_{z^\star})$ is needed, use $m=2\!-\!5$ steps:
+$v\leftarrow \mathrm{normalize}(J_{z^\star}^\top v)$, reusing the same boundary forward $u$
+with \texttt{retain\_graph=True}. This increases cost linearly in $m$ but remains boundary-only.
+\end{remark}
+
+\begin{remark}[Optional: EMA smoothing + DDP note]
+In practice, it can be beneficial to smooth the direction update:
+$v_{\text{buf}} \leftarrow \mathrm{normalize}(\mu\,v_{\text{buf}}+(1-\mu)\,\mathrm{normalize}(v_{\text{next}}))$
+with $\mu\in[0,0.99]$ and a stop-gradient update.
+In DDP, maintain $v_{\text{buf}}$ \emph{per rank/device}; no all-reduce is required for correctness, since the penalty is applied per local minibatch.
+If $\|v_{\text{next}}\|_2$ is numerically tiny, reinitialize $v_{\text{buf}}$ randomly to avoid a degenerate direction.
+\end{remark}
+
+\subsection{Phase 3: RevDEQ backward pass (exact unrolled gradient without IFT)}
+\label{sec:phase3}
+
+Let $L_{\text{task}}$ be the task loss computed from the equilibrium representation (Section~\ref{sec:head}).
+The total objective is:
+\[
+  L_{\text{total}} = L_{\text{task}}(z^\star) + L_{\text{jac}}(z^\star).
+\]
+
+RevDEQ provides a reversible backward pass:
+during the forward pass we discard intermediate states,
+and during the backward pass we reconstruct the trajectory in reverse and accumulate gradients
+without implicit-function-theorem (IFT) linear solves.
+
+\begin{lstlisting}
+# 3) Total loss and backward
+L_task  = TaskLoss(Head(RMSNorm(z_star_detached)), y)
+L_total = L_task + L_jac
+
+# Backprop rule:
+# - gradient of L_jac flows through boundary graph (u, v_next)
+# - gradient of L_task flows through RevDEQ's reversible backward that reconstructs the trajectory
+backward(L_total)
+\end{lstlisting}
+
+\begin{remark}[Correctness note]
+The exact algebra for inverting the RevDEQ leapfrog updates depends on the specific reversible block design.
+Conceptually, RevDEQ reconstructs $(y_k,z_k)$ in reverse using the known forward equations and recomputation of $T_\theta$.
+The key property is \emph{O(1)} memory in the forward pass and \emph{exact} gradients, without IFT matrix inversion.
+See \cite{revdeq} for the full reversible derivation.
+\end{remark}
+
+\section{Lyapunov stability guarantee for fixed-point convergence}
+\label{sec:lyapunov}
+
+We now give the requested rigorous definition + proof that a Jacobian spectral-radius condition yields fixed-point convergence,
+while allowing maximal expressiveness (no global Lipschitz clamps).
+
+\subsection{Definitions: stability and Lyapunov functions}
+
+Fix an input $x_0$ and abbreviate $T(z):=T_\theta(z,x_0)$.
+Let $z^\star$ be a fixed point: $z^\star=T(z^\star)$.
+Define the error $e_k := z_k - z^\star$ for an iteration $z_{k+1}=T(z_k)$.
+
+\begin{definition}[Local asymptotic stability (discrete time)]
+The fixed point $z^\star$ is \emph{locally asymptotically stable} if there exists $\delta>0$ such that
+for any initialization $z_0$ with $\|z_0-z^\star\|<\delta$, the iterates $z_k$ remain defined,
+stay in a neighborhood of $z^\star$, and satisfy $z_k\to z^\star$ as $k\to\infty$.
+If, additionally, $\|z_k-z^\star\|\le C\eta^k\|z_0-z^\star\|$ for some $C>0$ and $\eta\in(0,1)$, the fixed point is \emph{locally exponentially stable}.
+\end{definition}
+
+\begin{definition}[Lyapunov function (discrete time)]
+A continuously differentiable function $V:\mathbb{R}^{B\times T\times d}\to\mathbb{R}_{\ge 0}$ is a Lyapunov function around $z^\star$ if
+there exist constants $c_1,c_2,c_3>0$ and a neighborhood $\mathcal{N}$ of $z^\star$ such that for all $z\in\mathcal{N}$:
+\[
+  c_1\|z-z^\star\|^2 \le V(z) \le c_2\|z-z^\star\|^2,
+  \qquad
+  V(T(z)) - V(z) \le -c_3\|z-z^\star\|^2.
+\]
+\end{definition}
+
+\begin{proposition}[Lyapunov decrease implies convergence]
+If such a Lyapunov function exists, then $z^\star$ is locally exponentially stable.
 \end{proposition}
 
-\subsection{Injection (no state-dependent gate)}
-\label{sec:inj}
+\subsection{Main theorem: Jacobian spectral radius $<1$ implies local convergence}
 
-Define an exogenous additive injection
-\begin{equation}
-  \label{eq:bx0}
-  b(x_0) := x_0 + U\,\Pi_R(x_0),
-\end{equation}
-where $U\in\mathbb{R}^{d\times d}$ is learned with a spectral norm constraint $\|U\|_2\le 1$ (Section~\ref{sec:modules}).
-
-\begin{remark}[Why include the identity path $x_0$]
-If injection were only $U\Pi_R(x_0)$, the model could drift toward input-independence by learning $U\approx 0$.
-Including $x_0$ guarantees the fixed-point map remains input-dependent even if the learned adapter collapses.
-\end{remark}
-
-\subsection{Router input and scoring (SIPS and L2-distance)}
-\label{sec:routing}
-
-Let the router read a projected view of the current state plus injection:
+\begin{theorem}[Lyapunov (indirect) method for fixed points]
+\label{thm:lyap_main}
+Assume $T$ is continuously differentiable in a neighborhood of $z^\star$ and $z^\star=T(z^\star)$.
+Let $J := \nabla T(z^\star)$ denote the Jacobian (with respect to $z$).
+If
 \[
-  r(z,x_0) := \Pi_R(z + b(x_0)) \in \mathbb{R}^{B\times T\times d}.
+  \rho(J) < 1,
 \]
-Let $q(z,x_0)=W_q\,r(z,x_0)$ with $\|W_q\|_2\le 1$. The router defines logits $s\in\mathbb{R}^{B\times T\times E}$
-for a combined expert pool $E=E_{\text{attn}}+E_{\text{ffn}}$ and dense weights
-\[
-  w(z,x_0)=\mathrm{softmax}(s(z,x_0))\in\Delta^{E-1}.
-\]
-
-\paragraph{Option A (SIPS).}
-For expert anchors $k_j\in\mathbb{R}^{d_r}$ and bounded transforms $\phi,\psi:[0,\infty)\to[0,1]$,
-\[
-  s_j = \gamma\;\phi(\|q\|)\;\psi(\|k_j\|)\;\cos(q,k_j),
-\]
-with a bounded scale $\gamma\in[0,\gamma_{\max}]$.
-
-\paragraph{Option B (L2-distance).}
-For prototypes $c_j\in\mathbb{R}^{d_r}$,
-\[
-  s_j = \rho\!\left(-\gamma\,\|q-c_j\|_2^2\right),
-\]
-where $\rho$ is a 1-Lipschitz saturation (e.g.\ $\rho(t)=\tanh(t)$) and $\gamma\in[0,\gamma_{\max}]$.
-Note that $\|q-c\|^2=\|q\|^2+\|c\|^2-2q^\top c$, so this can be implemented efficiently using dot products and norms.
-
-\subsection{Parallel routed expert update $G_\theta$}
-\label{sec:Gtheta}
-
-Define the shared expert input
-\[
-  u(z,x_0) := \Pi_R(z+b(x_0)).
-\]
-All experts read $u$. Let $\{A_e\}_{e=1}^{E_{\text{attn}}}$ be attention experts and $\{M_e\}_{e=1}^{E_{\text{ffn}}}$ be FFN experts,
-where FFN experts $\{M_e\}$ are constructed to be 1-Lipschitz and attention experts $\{A_e\}$
-are bounded by an analytic constant $L_{\text{attn}} = 1 + 4\gamma R^2 \ge 1$
-(Section~\ref{sec:modules}).  The aggregate Lipschitz constant $L_G$ of the mixture accounts
-for both (Section~\ref{sec:Tx}).
-Split mixture weights:
-\[
-  w^A_e := w_e,\ e=1..E_{\text{attn}},\qquad
-  w^M_e := w_{E_{\text{attn}}+e},\ e=1..E_{\text{ffn}}.
-\]
-Compute dense mixtures:
-\begin{align}
-  \Delta_{\text{attn}}(z,x_0) &= \sum_{e=1}^{E_{\text{attn}}} w^A_e(z,x_0)\,A_e(u(z,x_0)),\\
-  \Delta_{\text{ffn}}(z,x_0)  &= \sum_{e=1}^{E_{\text{ffn}}}  w^M_e(z,x_0)\,M_e(u(z,x_0)).
-\end{align}
-Since the router produces a single softmax over the combined pool $E=E_{\text{attn}}+E_{\text{ffn}}$,
-the update is the exact convex combination:
-\begin{equation}
-  \label{eq:Gtheta}
-  G_\theta(z,x_0) := \sum_{e=1}^{E} w_e(z,x_0)\,E_e(u(z,x_0)).
-\end{equation}
-Note: no $\tfrac12$ factor --- the joint softmax already allocates the full unit budget
-across all experts.  The previous $\tfrac12$ was an artifact of separate per-component routers.
-
-\begin{remark}[Minimal principled norms: $\Pi_R$ inside $T_x$, normalization outside]
-\label{rem:norm_separation}
-\textbf{Inside} the DEQ fixed-point map $T_x(z)$,
-use \emph{only} non-expansive clamps $\Pi_R$ and 1-Lipschitz operations.
-No learnable RMSNorm or LayerNorm (RMSNorm has Lip $= 1/\|x\| \to \infty$ at $\|x\|\to 0$).
-\textbf{Outside} the fixed-point map (embeddings, final output head), learnable
-normalizations may be kept for optimization.
-
-Concretely, $T_x$ uses exactly \textbf{one} $\Pi_R$ pre-projection:
-$u = \Pi_R(z + b(x_0))$ with $R=\sqrt{d_{\text{head}}}$, feeding the same bounded vector to
-routers and all experts.  No post-norms appear inside $T_x$.
-
-\emph{Why $R=\sqrt{d_{\text{head}}}$?}  This matches the expected per-feature magnitude
-of RMS-normalized vectors (which outside-$T_x$ norms produce), keeping the bounded-domain
-assumptions tight.  Smaller $R$ gives tighter $L_{\text{attn}} = 1 + 4\gamma R^2$ and thus
-larger analytic $\tau$ (more useful contraction).
-\end{remark}
-
-\subsection{Homogeneous Coordinate L2-Attention}
-\label{sec:homogeneous_attn}
-
-Standard L2-distance attention requires $\|k_j\|^2$ to be constant across $j$ for an efficient
-SDPA fast-path (the ``RMS-norm cancellation trick'').  Since RMSNorm is not 1-Lipschitz, we
-instead absorb the key-dependent term into an augmented dot product via the
-\textbf{homogeneous coordinate trick}:
-\[
-  Q_{\text{aug}} = [\sqrt{2\gamma}\,q,\;\sqrt{\gamma}],\qquad
-  K_{\text{aug}} = [\sqrt{2\gamma}\,k,\;-\sqrt{\gamma}\,\|k\|^2].
-\]
-Then $\langle Q_{\text{aug}}, K_{\text{aug}}\rangle = 2\gamma\langle q,k\rangle - \gamma\|k\|^2$,
-which (after the query-norm cancellation in softmax) gives \textbf{exact} L2-distance attention:
-$\mathrm{softmax}_j(-\gamma\|q-k_j\|^2)$.  The augmented vectors are padded to the next hardware
-stride (multiple of 8) for flash attention compatibility.  Values $V$ are zero-padded to match,
-and the output is truncated back to $d_{\text{head}}$.
-
-\subsection{Contractive wrapper with exogenous analytic $\tau$}
-\label{sec:Tx}
-
-Define
-\begin{equation}
-  \label{eq:Tx}
-  T_x(z) := (1-\tau(x_0))\,b(x_0) + \tau(x_0)\,G_\theta(z,x_0),
-\end{equation}
-where $\tau$ is \textbf{exogenous} (depends on $x_0$ only, not on the solver state $z$)
-and \textbf{analytically bounded}:
-\[
-  \tau(x_0) = \tau_{\max}\cdot\sigma(f_\tau(b(x_0))),\qquad
-  \tau_{\max} = \frac{c}{L_G},\qquad c\in(0,1).
-\]
-Here $\sigma$ is the sigmoid function, $f_\tau$ is a learned linear projection applied to
-$b(x_0)$ (which depends only on $x_0$), and $L_G$ is the analytic Lipschitz bound of $G_\theta$:
-\[
-  L_G = \underbrace{(1+4\gamma R^2)}_{L_{\text{attn}}} + R\cdot\underbrace{2\gamma R}_{L_w}.
-\]
-
-\begin{theorem}[Rigorous Banach contraction guarantee]
-\label{thm:contraction}
-Because $x_0$ is constant with respect to $z$ during the inner Picard iteration,
-$\nabla_z \tau(x_0) = 0$.  Applying the product rule to the Jacobian:
-\[
-  \nabla_z T_x(z) = \underbrace{(G_\theta - b)\otimes \nabla_z\tau}_{=\,0\text{ (exogenous }\tau\text{)}}
-                   + \tau(x_0)\,\nabla_z G_\theta.
-\]
-Therefore $\mathrm{Lip}_z(T_x) \le \tau(x_0)\cdot\mathrm{Lip}_z(G_\theta) \le \tau_{\max}\cdot L_G = c < 1$.
+then $z^\star$ is locally exponentially stable for the iteration $z_{k+1}=T(z_k)$.
+Equivalently: there exists $\delta>0$ and $\eta\in(0,1)$ such that for all $\|z_0-z^\star\|<\delta$ we have $z_k\to z^\star$
+and $\|z_k-z^\star\|\le C\eta^k\|z_0-z^\star\|$ for some constant $C$.
 \end{theorem}
 
-\begin{remark}[Why $\tau$ must NOT depend on $z$]
-If $\tau$ were a function of $u = \Pi_R(z + b(x_0))$, the gradient $\nabla_z\tau \neq 0$
-would introduce an unbudgeted expansive term $\|G_\theta - b\|\cdot\|\nabla_z\tau\|$ in the
-Lipschitz bound --- a ``gradient leak'' that invalidates the contraction proof.
-Tying $\tau$ to the exogenous $x_0$ (via $b(x_0)$) eliminates this term exactly.
-\end{remark}
+\begin{proof}
+The proof uses a quadratic Lyapunov function derived from the \emph{discrete Lyapunov equation}.
 
-\begin{remark}[Per-token modulation within the contraction budget]
-Making $\tau$ dependent on $x_0$ (not $z$) still provides per-token modulation:
-different input tokens get different $\tau$ values, allocating more update signal where
-the exogenous embedding suggests it is needed.  The maximum $\tau_{\max}$ is analytically
-capped, so no token can break contraction.
-\end{remark}
+\paragraph{Step 1: linear case and Lyapunov equation.}
+Consider the linearized system $e_{k+1}=J e_k$. Since $\rho(J)<1$, the discrete Lyapunov theorem states:
+for any positive definite $Q\succ 0$, there exists a unique positive definite $P\succ 0$ solving
+\begin{equation}
+  \label{eq:lyap_eq}
+  J^\top P J - P = -Q.
+\end{equation}
+(One explicit solution is the convergent series $P=\sum_{i=0}^{\infty}(J^\top)^i Q J^i$, which converges because $\rho(J)<1$.)
 
-\begin{remark}[Implication for $\beta$ (RevDEQ relaxation)]
-With guaranteed $\mathrm{Lip}(T_x)\le c<1$, the RevDEQ solver's stability range is
-$0 < \beta < 2/(c+1)$.  For $c=0.95$: $\beta < 1.03$.  This means $\beta$ can be safely
-increased to $0.5$ or higher for faster convergence, whereas without the guarantee the solver
-required conservative $\beta=0.20$ to avoid instability.
-\end{remark}
-
-\section{Module-by-module simplicity and 1-Lipschitz proof sketches}
-\label{sec:modules}
-
-This section gives sufficient conditions to make each component of $T_x$ non-expansive under $\|\cdot\|_F$.
-The guiding rule is: \emph{use only (i) linear maps with operator norm $\le 1$, (ii) 1-Lipschitz nonlinearities,
-and (iii) 1-Lipschitz projections/clamps to keep states bounded.}
-
-\subsection{Linear maps}
-\begin{proposition}[Linear Lipschitz constant]
-For $f(u)=Wu$, $\mathrm{Lip}(f)=\|W\|_2$ (spectral norm). In particular, if $\|W\|_2\le 1$ then $f$ is 1-Lipschitz.
-\end{proposition}
-\begin{remark}[How to enforce $\|W\|_2\le 1$]
-Use spectral normalization or parameterize $W$ via a constrained factorization (e.g.\ $W=\alpha\tilde W$ with $\alpha\le 1/\|\tilde W\|_2$).
-\end{remark}
-
-\subsection{Elementwise nonlinearities}
-\begin{proposition}[Standard 1-Lipschitz activations]
-The following are 1-Lipschitz on $\mathbb{R}$: $\tanh$, $\mathrm{ReLU}$, and $\mathrm{LeakyReLU}(\cdot;\eta)$ for $\eta\in[0,1]$.
-Elementwise application preserves 1-Lipschitzness under $\|\cdot\|_F$.
-\end{proposition}
-
-\subsection{Rotary embeddings / orthogonal transforms}
-\begin{proposition}[Orthogonal transforms are 1-Lipschitz]
-If $Q$ is orthogonal ($Q^\top Q=I$), then $\|Qu-Qv\|=\|u-v\|$. Therefore $Q$ is 1-Lipschitz.
-\end{proposition}
-\begin{remark}
-RoPE applies a block-diagonal rotation to pairs of coordinates, which is orthogonal.
-\end{remark}
-
-\subsection{Softmax}
-\label{sec:softmax_lip}
-\begin{proposition}[Softmax Jacobian bound in $\ell_2$ (sketch)]
-Let $\sigma:\mathbb{R}^E\to\Delta^{E-1}$ be softmax. Its Jacobian is $J=\mathrm{diag}(p)-pp^\top$ where $p=\sigma(s)$.
-One can show $\|J\|_2\le 1/2$ for all $s$, hence softmax is $1/2$-Lipschitz in $\ell_2$:
-$\|\sigma(a)-\sigma(b)\|_2\le \tfrac12\|a-b\|_2$.
-\end{proposition}
-
-\subsection{Router scoring: explicit Lipschitz bounds (sketch)}
-\label{sec:router_lip}
-
-\begin{proposition}[L2-distance logits are Lipschitz on bounded sets (sketch)]
-Fix $\gamma\in[0,\gamma_{\max}]$ and let prototypes satisfy $\|c_j\|_2\le R_c$. Suppose the router query satisfies $\|q\|_2\le R_q$.
-Define logits $s_j(q)=\rho(-\gamma\|q-c_j\|_2^2)$ where $\rho$ is 1-Lipschitz.
-Then each $s_j$ is Lipschitz with
+Define $V_{\text{lin}}(e)=e^\top P e$.
+Then, using \eqref{eq:lyap_eq},
 \[
-  \mathrm{Lip}(s_j)\ \le\ 2\gamma_{\max}(R_q+R_c).
+  V_{\text{lin}}(e_{k+1}) - V_{\text{lin}}(e_k)
+  = e_k^\top (J^\top P J - P) e_k
+  = - e_k^\top Q e_k
+  \le -\lambda_{\min}(Q)\,\|e_k\|^2,
 \]
-\end{proposition}
-\begin{remark}[Reason]
-The gradient of $-\gamma\|q-c\|^2$ w.r.t.\ $q$ is $-2\gamma(q-c)$, whose norm is bounded by $2\gamma(\|q\|+\|c\|)$.
-Composition with 1-Lipschitz $\rho$ does not increase the bound.
-\end{remark}
+so $V_{\text{lin}}$ strictly decreases and $e_k\to 0$ exponentially.
 
-\begin{corollary}[Dense weights inherit a bound via softmax]
-If $s:\mathbb{R}^{d_r}\to\mathbb{R}^E$ is $L_s$-Lipschitz in $\ell_2$, then $w=\mathrm{softmax}\circ s$ is $(L_s/2)$-Lipschitz in $\ell_2$.
+\paragraph{Step 2: nonlinear remainder is higher order.}
+By differentiability of $T$ at $z^\star$, we have the expansion
+\[
+  T(z^\star+e) = z^\star + J e + r(e),
+\]
+where $\|r(e)\| = o(\|e\|)$ as $\|e\|\to 0$.
+Equivalently, for any $\varepsilon>0$ there exists $\delta>0$ such that
+\[
+  \|r(e)\| \le \varepsilon\,\|e\| \quad\text{for all }\|e\|\le \delta.
+\]
+
+\paragraph{Step 3: quadratic Lyapunov function for the nonlinear map.}
+Define $V(e)=e^\top P e$ with the same $P\succ 0$ from \eqref{eq:lyap_eq} (choose $Q=I$ for simplicity).
+For $\|e\|\le\delta$, write
+\[
+  e_{k+1} = J e_k + r(e_k).
+\]
+Then
+\begin{align*}
+  V(e_{k+1}) - V(e_k)
+  &= (J e_k + r)^\top P (J e_k + r) - e_k^\top P e_k\\
+  &= e_k^\top (J^\top P J - P) e_k + 2 e_k^\top J^\top P r + r^\top P r\\
+  &= -e_k^\top Q e_k + 2 e_k^\top J^\top P r + r^\top P r.
+\end{align*}
+Bound the remainder terms using Cauchy--Schwarz and $\|r\|\le \varepsilon\|e_k\|$:
+\[
+  |2 e_k^\top J^\top P r|
+  \le 2\|e_k\|\,\|J^\top P\|\,\|r\|
+  \le 2\|J^\top P\|\,\varepsilon\,\|e_k\|^2,
+\]
+\[
+  r^\top P r \le \|P\|\,\|r\|^2 \le \|P\|\,\varepsilon^2\,\|e_k\|^2.
+\]
+Therefore,
+\[
+  V(e_{k+1}) - V(e_k)
+  \le -\lambda_{\min}(Q)\|e_k\|^2 + 2\|J^\top P\|\,\varepsilon\,\|e_k\|^2 + \|P\|\,\varepsilon^2\,\|e_k\|^2.
+\]
+Choose $\varepsilon>0$ small enough that $2\|J^\top P\|\,\varepsilon + \|P\|\,\varepsilon^2 \le \tfrac12\lambda_{\min}(Q)$.
+Then, for $\|e_k\|\le\delta(\varepsilon)$,
+\[
+  V(e_{k+1}) - V(e_k) \le -\tfrac12\lambda_{\min}(Q)\,\|e_k\|^2,
+\]
+so $V$ is a valid Lyapunov function in a neighborhood.
+This implies local exponential stability of $e_k\to 0$ (standard discrete-time Lyapunov argument).
+\end{proof}
+
+\begin{corollary}[Local contraction in a Lyapunov norm]
+\label{cor:local_contraction}
+Under the assumptions of Theorem~\ref{thm:lyap_main}, there exists a positive definite $P$ and a neighborhood $\mathcal{N}$ of $z^\star$ such that
+$T$ is a contraction on $\mathcal{N}$ in the induced norm $\|e\|_P=\sqrt{e^\top P e}$:
+\[
+  \|T(z)-T(z^\star)\|_P \le \eta\,\|z-z^\star\|_P,\qquad \eta\in(0,1),\ \forall z\in\mathcal{N}.
+\]
+Hence fixed-point iteration converges for any initialization in $\mathcal{N}$, and the fixed point is unique within $\mathcal{N}$.
 \end{corollary}
 
-\begin{remark}[SIPS option]
-SIPS can be treated similarly by ensuring (i) bounded scale $\gamma$, (ii) bounded anchor norms, and (iii) a normalization of $q$ that is well-behaved
-on the solver region (e.g.\ by projecting $q$ away from 0 before forming $\cos(\cdot,\cdot)$). We treat SIPS as an alternative implementation option
-and rely on the same ``bounded query + bounded scale'' principle to control $L_s$.
+\begin{remark}[What we guarantee vs.\ what we \emph{do not} guarantee]
+The Lyapunov condition $\rho(J_{z^\star})<1$ guarantees:
+(i) existence of a \emph{basin} around $z^\star$ where convergence is geometric, and
+(ii) uniqueness of the equilibrium within that basin.
+It does \emph{not} guarantee global uniqueness or global convergence from arbitrary initializations.
+This is the intended trade-off to restore expressiveness.
 \end{remark}
 
-\subsection{Dense routed mixtures}
-\begin{proposition}[Mixture Lipschitz bound (sufficient condition)]
-Assume (i) each expert $E_j$ is 1-Lipschitz, (ii) expert outputs are bounded on the solver region:
-$\|E_j(u)\|\le B$ for all $u$ encountered, and (iii) router weights $w(\cdot)$ are $L_w$-Lipschitz in $\ell_1$.
-Then the mixture $F(u)=\sum_j w_j(u)E_j(u)$ is Lipschitz with
+\begin{proposition}[Damped iteration preserves local stability]
+\label{prop:damped}
+Under the assumptions of Theorem~\ref{thm:lyap_main}, define the damped map
 \[
-  \mathrm{Lip}(F)\ \le\ 1 + B\,L_w.
+  S_\beta(z) := (1-\beta)\,z + \beta\,T(z),\qquad \beta\in(0,1].
 \]
+Then $z^\star$ is also a fixed point of $S_\beta$ and is locally exponentially stable for the iteration
+$z_{k+1}=S_\beta(z_k)$.
+
+\emph{Proof.}
+Clearly $S_\beta(z^\star)=z^\star$.
+Let $J=\nabla T(z^\star)$ and $J_\beta=\nabla S_\beta(z^\star)=(1-\beta)I+\beta J$.
+If $\lambda$ is an eigenvalue of $J$, then $(1-\beta)+\beta\lambda$ is an eigenvalue of $J_\beta$.
+Using the triangle inequality and $\beta\in(0,1]$,
+\[
+  |(1-\beta)+\beta\lambda|
+  \le (1-\beta) + \beta|\lambda|
+  \le (1-\beta) + \beta\,\rho(J)
+  < (1-\beta)+\beta = 1.
+\]
+Hence $\rho(J_\beta)<1$, so Theorem~\ref{thm:lyap_main} applies to $S_\beta$ as well. \qed
 \end{proposition}
-\begin{remark}[Practical non-expansive mixture]
-To make $G_\theta$ provably non-expansive, either (a) ensure $L_w$ is very small (Lipschitz-controlled logits + softmax),
-or (b) add an output projection: $\Delta\leftarrow \Pi_R(\Delta)$, which caps $B$ and is 1-Lipschitz.
+
+\begin{remark}[Connection to RevDEQ damping]
+RevDEQ's forward updates are damped compositions of $T$ controlled by $\beta$.
+Proposition~\ref{prop:damped} shows that once $T$ has a locally stable equilibrium ($\rho(J_{z^\star})<1$),
+choosing $\beta\in(0,1]$ cannot destabilize that equilibrium.
+Empirically, moderate damping also improves robustness when the current iterate is still outside the basin.
 \end{remark}
 
-\subsection{Certified attention and FFN experts}
-\paragraph{Attention expert $A_e$ (L2 attention; MLA-compatible).}
-Define a single expert as a composition of 1-Lipschitz parts:
-\[
-  q = W^Q_e\,u,\quad k = W^K_e\,u,\quad v = W^V_e\,u,\qquad \|W^\cdot_e\|_2\le 1,
-\]
-optionally followed by RoPE rotations (1-Lipschitz). For each token position $t$, define L2 attention weights over previous positions $j\le t$:
-\[
-  a_{tj} = \frac{\exp(-\gamma\|q_t-k_j\|_2^2)}{\sum_{i\le t}\exp(-\gamma\|q_t-k_i\|_2^2)},\qquad
-  o_t = \sum_{j\le t} a_{tj}\,v_j.
-\]
-Finally project the output: $A_e(u)=\Pi_R(W^O_e\,o)$ with $\|W^O_e\|_2\le 1$.
-Under bounded states (enforced by $\Pi_R$ on $u$) and bounded $\gamma$, the scoring map is Lipschitz (Section~\ref{sec:router_lip})
-and L2 self-attention admits explicit Lipschitz bounds (see \cite{l2_attention} for a detailed treatment).
+\subsection{Link to the training objective}
+\label{sec:link_training}
 
-\paragraph{FFN expert $M_e$ (1-Lipschitz MLP).}
-A simple 1-Lipschitz FFN expert is
-\[
-  M_e(u) = \Pi_R\!\left(W^{(2)}_e\,\phi(W^{(1)}_e\,u)\right),
-\]
-where $\|W^{(1)}_e\|_2\le 1$, $\|W^{(2)}_e\|_2\le 1$, and $\phi$ is 1-Lipschitz (e.g.\ $\tanh$, ReLU, or GroupSort).
-GroupSort networks in particular provide strong approximation results within the Lipschitz class \cite{groupsort}.
+Theorem~\ref{thm:lyap_main} is a deterministic mathematical statement.
+In training, we approximate its hypothesis by penalizing a proxy for $\rho(J_{z^\star})$ at the equilibrium reached by the solver.
 
-\section{Convergence guarantee: Banach + contraction shell}
-\label{sec:convergence}
+\begin{proposition}[Training-time guarantee (conditional)]
+If, for a given input $x_0$, the learned parameters satisfy $\rho(\nabla_z T_\theta(z^\star,x_0))\le\gamma<1$ at the reached equilibrium $z^\star$,
+then $z^\star$ is a strict local attractor and the RevDEQ solve converges for any initialization within its basin (including warm starts that fall inside).
+\end{proposition}
 
-\begin{theorem}[Banach contraction mapping principle]
-Let $(\mathcal{X},\|\cdot\|)$ be complete and $T:\mathcal{X}\to\mathcal{X}$ satisfy $\|T(u)-T(v)\|\le k\|u-v\|$ for some $k\in[0,1)$.
-Then $T$ has a unique fixed point $u^\star$, and $u_{n+1}=T(u_n)$ converges to $u^\star$ for any $u_0\in\mathcal{X}$.
-\end{theorem}
-
-\begin{corollary}[Certified design rule]
-If $G_\theta(\cdot,x_0)$ is non-expansive in $z$ (i.e.\ $\mathrm{Lip}_z(G_\theta)\le 1$), then $T_x$ in \eqref{eq:Tx} is a strict contraction
-with constant at most $\tau_{\max}<1$. Therefore $T_x$ has a unique fixed point and the equilibrium solve is globally well-posed.
-\end{corollary}
-
-\begin{remark}[Fixed-point uniqueness vs expert ``uniqueness'']
-Banach guarantees a \emph{unique fixed point} $z^\star$ for a given input $x_0$; it does not guarantee that different experts in the MoE bank
-are distinct functions. Expert diversity is a separate modeling goal typically enforced by routing health constraints and/or orthogonality diagnostics
-(as used in the current code).
+\begin{remark}[Why this recovers expressiveness]
+The constraint is \emph{pointwise at equilibria on the data distribution}.
+Away from equilibria, $T_\theta$ can be arbitrarily expressive (and even expansive), as long as training shapes a stable basin around the reached fixed point.
+This is fundamentally less restrictive than global contraction, which caps sensitivity everywhere.
 \end{remark}
 
-\section{Expressiveness (why this remains transformer-like)}
-\label{sec:expressive}
+\section{Head and losses (code-aligned; stability-orthogonal)}
+\label{sec:head}
 
-\paragraph{1-Lipschitz does not mean weak.}
-Modern LLMs operate on bounded hidden states due to normalization and finite precision. On bounded domains, 1-Lipschitz function classes can still be rich.
-
-\paragraph{Universal approximation within a Lipschitz class (sketch).}
-GroupSort networks with norm-constrained linear maps can approximate any 1-Lipschitz function on compact sets (Anil et al.).
-Thus, the FFN experts can be expressive while remaining certifiably non-expansive.
-
-\paragraph{Transformer-like behavior from the equilibrium map.}
-If routing is chosen to be nearly input-only (small $L_w$) and $G_\theta$ is expressive in $x_0$, then the fixed point can behave like a deep transformer.
-RevDEQ iteration provides implicit depth (iterated application of a shared block), while dense MoE provides additional capacity without sparsity.
-
-\section{Head and losses (code-aligned; not part of the contraction proof)}
-\label{sec:loss}
-
-After the DEQ solve, both the proposed and current models use a dual MoS head (CTP+NTP) with FSQ in the rank space:
+After the DEQ solve, we use the existing head and task losses (orthogonal to the Lyapunov guarantee).
+Let $h=\mathrm{RMSNorm}(z^\star)$ and compute dual MoS logits (CTP+NTP) with FSQ:
 \[
-  h=\mathrm{RMSNorm}(z),\qquad
   \log p_{\text{CTP}},\ \log p_{\text{NTP}} = \mathrm{MoSHead}(h).
 \]
-The current training objective in \texttt{train\_gpt.py} is:
+The task loss is the standard NTP negative log-likelihood plus existing auxiliary losses:
 \[
-  L = L_{\text{NTP}} + \lambda_{\text{CTP}}L_{\text{CTP}}
+  L_{\text{task}} = L_{\text{NTP}} + \lambda_{\text{CTP}}L_{\text{CTP}}
     + \lambda_{\text{bal}}L_{\text{bal}}
     + \lambda_{\text{health}}L_{\text{health}}
     + \lambda_{\text{mos}}L_{\text{mos-ortho}}
-    + \lambda_{\text{blk}}L_{\text{block-ortho-aux}},
+    + \lambda_{\text{blk}}L_{\text{block-ortho-aux}}.
 \]
-where $L_{\text{NTP}}=\mathrm{NLL}(\log p_{\text{NTP}},y)$ and $L_{\text{CTP}}=\mathrm{NLL}(\log p_{\text{CTP}},x)$.
-The CTP weight is refinement-gated in code:
-\[
-  \lambda_{\text{CTP}} = 0.05\,R\cdot \mathrm{clip}\!\left(\frac{\alpha}{0.5},\,0,\,1\right),
-\]
-with $R=\texttt{num\_refinements}$ (often 0 early) and $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$.
 
-\paragraph{Routing auxiliary losses (summary).}
-The code tracks two kinds of routing penalties:
+\section{Practical notes and failure modes}
+\label{sec:practical}
+
+\paragraph{Choosing $\gamma$ and $\lambda_{\text{jac}}$.}
+A typical target is $\gamma\in[0.85,0.95]$. Smaller $\gamma$ yields faster convergence but can reduce expressiveness near equilibria.
+$\lambda_{\text{jac}}$ should be ramped (warm-up) so the model first learns useful representations and then sculpts stable basins.
+
+\paragraph{Persistent-vector estimator settings.}
+Maintain a unit buffer $v_{\text{buf}}$ updated as $v_{\text{buf}}\leftarrow \mathrm{normalize}(v_{\text{next}})$ with stop-gradient.
+Use $\varepsilon\approx 10^{-8}$ in the normalization denominator.
+Optionally smooth with EMA (Remark in Section~\ref{sec:phase2}) using $\mu\in[0,0.99]$.
+If $\|v_{\text{next}}\|_2$ is numerically tiny or the tensor shape changes (e.g.\ different $B,T$), reinitialize $v_{\text{buf}}$ randomly.
+
+\paragraph{Solver robustness knobs.}
+Even with Lyapunov regularization, it is prudent to keep:
 \begin{itemize}[leftmargin=2em,itemsep=0.25em]
-  \item $L_{\text{bal}}$: MSE-to-uniform on mean expert shares for the attention and MLP routers (plus a strongly upweighted MoSHead balance term to prevent dead head experts).
-  \item $L_{\text{health}}$: barrier-style penalties that target the final-only constraints, including per-expert min-share threshold $0.6/E$ and balance CV threshold $0.20$,
-        multiplied by a late-phase \texttt{health\_scale} ramp.
+  \item $\beta\in(0,1]$ (damping),
+  \item a maximum iteration cap $K_{\max}$,
+  \item an early-stop tolerance $\varepsilon$,
+  \item and a fallback policy if the solver fails to converge (e.g.\ use last iterate or increase damping).
 \end{itemize}
 
-%% The §app:current_code (stale state-update snapshot) and §app:gaps tables
-%% were removed 2026-04-16: they described pre-iter-30 code and would drift
-%% with every iteration.  The progressive code/doc alignment is tracked in
-%% experiments/hypotheses.md instead.  The self-refinement appendix below
-%% is retained as orthogonal content worth testing as an iteration.
+\paragraph{Multistability (multiple fixed points).}
+Local stability allows multiple equilibria per input.
+This can be beneficial (implicit ``modes''), but can also introduce training noise if the solver hops basins.
+Warm starts and modest damping $\beta$ mitigate basin switching.
 
 \appendix
 
-\section{Self-refinement loop (orthogonal; optional arch, testable iteration)}
+\section{Self-refinement loop (orthogonal; optional)}
 \label{app:refinement}
 
-This appendix describes an \emph{orthogonal} outer refinement loop that can be
-enabled independently of the certified $T_x$ solver. It is \textbf{not} part
-of the contraction proof and does not affect Banach uniqueness of the inner
-DEQ fixed point — each outer refinement $r$ solves a fresh contraction
-$T_{x^{(r)}}$ to its unique fixed point, with a new exogenous input
-$x^{(r)}$ derived from the previous solve's prediction.
-
-\subsection{Initial input embedding ($r=0$)}
-\[
-  x_0^{(0)} \;=\; \mathrm{rms\_norm}\!\left(E[x] + \mathrm{BigramHashEmb}(x)\right).
-\]
-
-\subsection{Refinement distribution ($r>0$)}
-At the end of solve $r-1$, define $h^{(r-1)}=\mathrm{RMSNorm}(z^{(r-1)})$ and compute:
-\[
-  \log p_{\text{CTP}}^{(r-1)},\ \log p_{\text{NTP}}^{(r-1)} \;=\; \mathrm{MoSHead}(h^{(r-1)}).
-\]
-Convert log-probabilities to probabilities in fp32 and define a shifted NTP distribution:
-\[
-  p_{\text{NTP,shift}}^{(r-1)}[t] \equiv
-  \begin{cases}
-    p_{\text{NTP}}^{(r-1)}[0] & t=0,\\
-    p_{\text{NTP}}^{(r-1)}[t-1] & t\ge 1.
-  \end{cases}
-\]
-Then
-\[
-  p_{\text{mix}}^{(r-1)}[t] =
-  \begin{cases}
-    p_{\text{CTP}}^{(r-1)}[0] & t=0,\\
-    \tfrac12 p_{\text{CTP}}^{(r-1)}[t] + \tfrac12 p_{\text{NTP,shift}}^{(r-1)}[t] & t\ge 1.
-  \end{cases}
-\]
-
-\subsection{Soft embedding and coupling}
-Approximate the expected embedding under $p_{\text{mix}}$ with a top-$\kappa$ truncation (current default $\kappa=64$),
-then mix with the previous refined input:
-\[
-  x_0^{(r)} \;=\; \alpha\,x_{\text{soft}}^{(r)} + (1-\alpha)\,x_0^{(r-1)},
-\]
-where $\alpha=\texttt{\_refine\_mix\_alpha}\in[0,0.5]$ is ramped up when refinement is enabled and the previous refined input is detached.
-
-\subsection{Why this preserves the certified design}
-For each fixed refinement index $r$, $x^{(r)}_0$ is a \emph{constant} input to the
-inner DEQ solve.  The Banach guarantee (Corollary in Section~\ref{sec:convergence})
-applies per-refinement: each outer step converges to the unique fixed point
-$z^{\star(r)}$ of $T_{x^{(r)}_0}$.  Refinement changes the \emph{input argument}
-of the contraction but not the Lipschitz constants of the map.  The detach on
-$x^{(r-1)}_0$ and the bounded blending coefficient $\alpha\le 0.5$ keep the
-outer loop from introducing unbounded gradients.
+The outer refinement loop described in the previous document remains orthogonal.
+Each refinement step simply changes the exogenous input embedding $x_0$ and then runs the same inner RevDEQ solve.
+The Lyapunov penalty and local stability argument apply per refinement step to the equilibrium reached for that $x_0$.
 
 \section{References}
 \begin{thebibliography}{99}
-
-\bibitem{banach_hunter}
-John K. Hunter.
-\newblock \emph{Applied Analysis}, Chapter 3: The Contraction Mapping Theorem.
-\newblock UC Davis notes. \url{https://www.math.ucdavis.edu/~hunter/book/ch3.pdf}
 
 \bibitem{revdeq}
 Sam McCallum, Kamran Arora, James Foster.
 \newblock \emph{Reversible Deep Equilibrium Models (RevDEQ)}.
 \newblock arXiv:2509.12917. \url{https://arxiv.org/abs/2509.12917}
 
-\bibitem{l2_attention}
-Hyunjik Kim, George Papamakarios, Andriy Mnih.
-\newblock \emph{The Lipschitz Constant of Self-Attention}.
-\newblock arXiv:2006.04710. \url{https://arxiv.org/abs/2006.04710}
+\bibitem{deq}
+Shaojie Bai, J. Zico Kolter, Vladlen Koltun.
+\newblock \emph{Deep Equilibrium Models}.
+\newblock NeurIPS 2019 / arXiv:1909.01377. \url{https://arxiv.org/abs/1909.01377}
 
-\bibitem{l2r_sips}
-Minghao Yang, Ren Togo, Guang Li, Takahiro Ogawa, Miki Haseyama.
-\newblock \emph{L2R: Low-Rank and Lipschitz-Controlled Routing for Mixture-of-Experts}.
-\newblock arXiv:2601.21349. \url{https://arxiv.org/abs/2601.21349}
+\bibitem{khalil}
+Hassan K. Khalil.
+\newblock \emph{Nonlinear Systems}, 3rd ed.
+\newblock Prentice Hall, 2002.
+\newblock (Discrete-time Lyapunov stability and the indirect method.)
+
+\bibitem{zhou_doyle_glover}
+Kemin Zhou, John C. Doyle, Keith Glover.
+\newblock \emph{Robust and Optimal Control}.
+\newblock Prentice Hall, 1996.
+\newblock (Discrete Lyapunov equation and stability.)
 
 \bibitem{groupsort}
 Cem Anil, James Lucas, Roger Grosse.
 \newblock \emph{Sorting out Lipschitz function approximation}.
 \newblock ICML 2019 / arXiv:1811.05381. \url{https://arxiv.org/abs/1811.05381}
-
-\bibitem{spectral_norm}
-Takeru Miyato, Toshiki Kataoka, Masanori Koyama, Yuichi Yoshida.
-\newblock \emph{Spectral Normalization for Generative Adversarial Networks}.
-\newblock arXiv:1802.05957. \url{https://arxiv.org/abs/1802.05957}
 
 \end{thebibliography}
 
