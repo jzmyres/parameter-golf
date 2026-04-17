@@ -635,19 +635,35 @@ Local stability allows multiple equilibria per input.
 This can be beneficial (implicit ``modes''), but can also introduce training noise if the solver hops basins.
 Warm starts and modest damping $\beta$ mitigate basin switching.
 
-\paragraph{Implementation principle: no \texttt{create\_graph=True} inside compiled regions.}
-\texttt{torch.compile} (AOTAutograd) does \textbf{not} support double backward / \texttt{create\_graph=True}.
-Attempting it causes donated-buffer conflicts or SIGSEGV under DDP.
-The Lyapunov penalty must therefore use a \textbf{surrogate loss} pattern:
+\paragraph{Implementation: two-forward approach (torch.compile + DDP compatible).}
+\texttt{torch.compile} (AOTAutograd) does \textbf{not} support \texttt{create\_graph=True} (double backward)
+or \texttt{retain\_graph=True} (donated buffer conflict). Furthermore, calling a compiled module with
+detached inputs inside the compiled forward corrupts cached tensor metadata (SIGSEGV under DDP).
+
+The solution is a \textbf{two-forward} approach computed \textbf{outside} the compiled model forward,
+in the training loop after \texttt{loss = model(x, y)} and before \texttt{loss.backward()}:
 \begin{enumerate}[leftmargin=2em,itemsep=0.1em]
-  \item Compute the VJP $v_{\text{next}} = J_{z^\star}^\top v$ with \texttt{create\_graph=False}.
-  \item If $\|v_{\text{next}}\|_2 > \gamma$: define surrogate $S = (f_\theta(z^\star) \cdot \hat{v}_{\text{next}})^\top \mathbf{1}$,
-        where $\hat{v}_{\text{next}} = v_{\text{next}} / \|v_{\text{next}}\|$ is detached.
-  \item $\nabla_\theta S = J^\top \hat{v}_{\text{next}}$ w.r.t.\ $\theta$ (first-order only), which is
-        exactly the spectral-radius gradient direction.
+  \item \textbf{Forward \#1 (VJP for $\hat\rho$):} Evaluate the \emph{uncompiled} block $T_\theta(z_b, x_0)$
+        with $z_b = z^\star_{\text{detached}}.\text{requires\_grad\_(True)}$.
+        Compute $v_{\text{next}} = J_{z^\star}^\top v$ via \texttt{autograd.grad(\ldots, create\_graph=False, retain\_graph=False)}.
+        This is fully compile-safe.  Update $v_{\text{buf}}$ with EMA smoothing.
+  \item \textbf{Forward \#2 (surrogate for $\nabla_\theta$):}  If $\hat\rho = \|v_{\text{next}}\| > \gamma$,
+        re-evaluate $u = T_\theta(z^\star_{\text{detached}}, x_0)$ (no \texttt{requires\_grad} on $z$, so gradient
+        flows to $\theta$ only).  Define surrogate $S = |u \cdot \hat{v}_{\text{next}}| \times (\hat\rho - \gamma)/\hat\rho$.
+        Add $\lambda_{\text{jac}} \cdot S$ to the loss before \texttt{backward()}.
+        $\nabla_\theta S = J^\top \hat{v}_{\text{next}}$ w.r.t.\ $\theta$ (first-order), which pushes $\theta$
+        to shrink $T_\theta$'s output projection onto the dominant eigendirection of $J$---the
+        spectral-radius gradient direction.
 \end{enumerate}
-Wrap the entire computation in \texttt{@torch.compiler.disable} so it causes a single graph break
-(runs once per training step, negligible overhead). This pattern is DDP-safe and compile-safe.
+Both forwards run on the \emph{uncompiled} base model (outside the compiled graph), using only
+\texttt{create\_graph=False} and \texttt{retain\_graph=False}.  Cost: 2 extra block forwards per step
+($\approx 2/K$ of the DEQ solve, $\sim$17\% overhead at $K=12$).
+
+\paragraph{Theoretical guarantee (conditional).}
+The power iteration in Forward~\#1 correctly estimates $\rho(J_{z^\star})$ (amortized over training steps).
+The surrogate gradient is a first-order approximation to $\nabla_\theta \rho$---not exact (which would require
+second derivatives), but strongly correlated.  The guarantee holds \emph{conditional} on runtime verification
+that the penalty successfully drives $\hat\rho < \gamma$ on the training distribution, which is logged every step.
 
 \appendix
 

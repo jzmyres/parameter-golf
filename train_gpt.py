@@ -2371,58 +2371,13 @@ class GPT(nn.Module):
             except Exception:
                 self._deq_residuals = [0.0]
 
-        # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
-        # Two-forward approach (compile+DDP safe):
-        #   Forward #1: VJP to estimate ρ̂ = ‖J^T v‖ (power iteration update)
-        #     → autograd.grad(create_graph=False, retain_graph=False) — compile safe
-        #   Forward #2: surrogate loss (f(z*) · v_dir).sum() for ∇_θ
-        #     → normal backprop, no autograd.grad — compile safe
-        # Both run INSIDE the compiled graph. Cost: 2 extra Block.forward/step.
+        # iter 45: store z* and x0 for Lyapunov penalty computation
+        # OUTSIDE the compiled forward (see training loop).
+        # Calling shared_block with detached inputs inside the compiled graph
+        # corrupts the compiled tensor metadata — must be done externally.
+        self._lyapunov_z_star = z.detach()
+        self._lyapunov_x0 = x0_refined.detach()
         self._lyapunov_loss = None
-        lyap_step = getattr(self, "_lyapunov_step", 0)
-        lyap_total = max(getattr(self, "_lyapunov_total_steps", 1), 1)
-        lyap_warmup = int(lyap_total * self.lyapunov_warmup_frac)
-        lyap_scale = min(lyap_step / max(lyap_warmup, 1), 1.0) if lyap_warmup > 0 else 1.0
-        if self.training and self.lyapunov_coef > 0.0 and lyap_scale > 0.0:
-            # Init persistent power-iteration vector
-            if getattr(self, '_lyapunov_v_buf', None) is None or self._lyapunov_v_buf.shape != z.shape:
-                self._lyapunov_v_buf = F.normalize(
-                    torch.randn_like(z).detach(), dim=-1, eps=1e-8
-                )
-            v = self._lyapunov_v_buf.detach()
-
-            # Forward #1: VJP for ρ̂ (create_graph=False, retain_graph=False)
-            z_b = z.detach().requires_grad_(True)
-            u_b1 = self.shared_block(z_b, x0_refined)
-            v_next = torch.autograd.grad(
-                (u_b1 * v).sum(), z_b,
-                create_graph=False, retain_graph=False,
-            )[0]
-            rho_hat = v_next.detach().float().norm()
-            self._lyapunov_rho_hat = float(rho_hat.item())
-
-            # EMA update of persistent direction (doc §4.2 Remark)
-            with torch.no_grad():
-                v_nf = v_next.detach().float()
-                v_nn = v_nf.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                if v_nn.mean() < 1e-6:
-                    self._lyapunov_v_buf = F.normalize(
-                        torch.randn_like(z).detach(), dim=-1, eps=1e-8
-                    )
-                else:
-                    mu = 0.9
-                    v_ema = mu * self._lyapunov_v_buf.float() + (1.0 - mu) * (v_nf / v_nn)
-                    self._lyapunov_v_buf = F.normalize(v_ema, dim=-1, eps=1e-8).to(z.dtype)
-
-            # Forward #2: surrogate loss for ∇_θ (only if ρ̂ > γ)
-            if rho_hat > self.lyapunov_gamma:
-                v_dir = (v_next.detach() / rho_hat.clamp(min=1e-8)).detach()
-                # z_b2 has NO grad — gradient flows to θ only (not z)
-                z_b2 = z.detach()
-                u_b2 = self.shared_block(z_b2, x0_refined)
-                surrogate = (u_b2 * v_dir).sum().abs()
-                scale = ((rho_hat - self.lyapunov_gamma) / rho_hat.clamp(min=1e-8)).item()
-                self._lyapunov_loss = lyap_scale * self.lyapunov_coef * scale * surrogate
 
         if self.training:
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
@@ -2512,10 +2467,8 @@ class GPT(nn.Module):
 
         eff_block_ortho_coef = float(self.block_ortho_aux_coef) * float(getattr(self, "_block_ortho_aux_coef_scale", 1.0))
 
-        # iter 45: Lyapunov penalty (ramped in over warmup)
-        lyap_loss = torch.tensor(0.0, device=ntp_loss.device)
-        if self.training and isinstance(self._lyapunov_loss, torch.Tensor):
-            lyap_loss = self._lyapunov_loss.to(device=ntp_loss.device)
+        # iter 45: Lyapunov penalty added externally in training loop
+        # (outside compiled forward to avoid tensor metadata corruption).
 
         return (
             ntp_loss
@@ -2524,7 +2477,6 @@ class GPT(nn.Module):
             + self.router_health_coef * health_loss
             + self.mos_ortho_out_coef * mos_ortho_loss
             + eff_block_ortho_coef * block_ortho_aux
-            + lyap_loss
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -3103,6 +3055,53 @@ def main() -> None:
                         args.block_ortho_aux_every > 0 and (next_step % int(args.block_ortho_aux_every) == 0))
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
+
+                # iter 45 (opg_doc.tex §4): Lyapunov penalty OUTSIDE compiled graph.
+                # Two-forward approach on the UNCOMPILED base_model.shared_block:
+                #   Forward #1: VJP for ρ̂ = ‖J^T v‖ (power iteration)
+                #   Forward #2: surrogate for ∇_θ (if ρ̂ > γ)
+                # Must run outside compiled forward to avoid tensor metadata corruption.
+                lyap_coef = float(base_model.lyapunov_coef)
+                lyap_warmup = int(max(args.iterations, 1) * base_model.lyapunov_warmup_frac)
+                lyap_scale = min(step / max(lyap_warmup, 1), 1.0) if lyap_warmup > 0 else 1.0
+                z_star = getattr(base_model, '_lyapunov_z_star', None)
+                x0_lyap = getattr(base_model, '_lyapunov_x0', None)
+                if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None:
+                    blk = base_model.shared_block
+                    # Init persistent vector
+                    v_buf = getattr(base_model, '_lyapunov_v_buf', None)
+                    if v_buf is None or v_buf.shape != z_star.shape:
+                        v_buf = F.normalize(torch.randn_like(z_star), dim=-1, eps=1e-8)
+                    v = v_buf.detach()
+                    gamma = float(base_model.lyapunov_gamma)
+                    # Single boundary forward (outside compiled graph → retain_graph safe)
+                    z_b = z_star.detach().requires_grad_(True)
+                    u_b = blk(z_b, x0_lyap)
+                    # VJP: v_next = J^T v (power iteration step)
+                    v_next = torch.autograd.grad(
+                        (u_b * v).sum(), z_b,
+                        create_graph=False, retain_graph=True,
+                    )[0]
+                    rho_hat = v_next.detach().float().norm()
+                    base_model._lyapunov_rho_hat = float(rho_hat.item())
+                    # EMA update of persistent direction (doc §4.2 Remark)
+                    with torch.no_grad():
+                        v_nf = v_next.float()
+                        v_nn = v_nf.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                        if v_nn.mean() < 1e-6:
+                            base_model._lyapunov_v_buf = F.normalize(
+                                torch.randn_like(z_star), dim=-1, eps=1e-8)
+                        else:
+                            mu = 0.9
+                            v_ema = mu * v_buf.float() + (1.0 - mu) * (v_nf / v_nn)
+                            base_model._lyapunov_v_buf = F.normalize(v_ema, dim=-1, eps=1e-8).to(z_star.dtype)
+                    # Surrogate loss (if ρ̂ > γ): reuse u_b (retain_graph kept it alive)
+                    if rho_hat.item() > gamma:
+                        v_dir = (v_next.detach() / rho_hat.clamp(min=1e-8)).detach()
+                        surrogate = (u_b * v_dir).sum().abs()
+                        hinge_scale = (rho_hat.item() - gamma) / max(rho_hat.item(), 1e-8)
+                        loss = loss + lyap_scale * lyap_coef * hinge_scale * surrogate
+
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
