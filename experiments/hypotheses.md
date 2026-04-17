@@ -247,12 +247,16 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 **Test:** Iter 17 — small val_bpb win (-0.005) + 33% FP quality improvement. See H22 in OBSERVED.
 **Status:** Moved to OBSERVED as H22.
 
-### H34: Post-norms redundant under cert; learnable pre-norms are the principled replacement
-**Claim:** Post-mix norms (RMSNorm on expert-weighted-sum output) are a crutch from pre-certification.  Under the full 1-Lip cert chain, expert outputs are bounded: σ_max(W) ≤ 1 + bounded input → bounded output.  But iter 37b showed that REMOVING the post-norm (replacing with hard-clamp Π_R) hurts capacity (-0.069 val_bpb).
-**Refined hypothesis:** The issue is not the PRESENCE of magnitude control but its LOCATION.  Post-norm (output-side) is a hard constraint that clips after the fact.  Pre-norm (input-side, learnable RMSNorm) controls magnitude where the model has freedom — BEFORE the 1-Lip transform.  Bounded input + 1-Lip weight = bounded output, WITHOUT output clipping.
-**Prediction:** Removing ALL post-mix norms AND adding learnable RMS pre-norms on ALL linear weights should maintain or improve val_bpb (learnable scale > hard clamp) while keeping K=128 Δ tight (1-Lip chain is intact).
-**Test:** iter 39-rm-post-norm-add-pre-norm (after iter 35).
-**Status:** PROPOSED — queued.  Iter 37b's K=128 Δ=0.003 (tightest ever) supports the 1-Lip chain working; its val_bpb regression (-0.069) is attributable to Π_R's loss of learnable capacity, which pre-norms restore.
+### H34: Minimal principled norms — Π_R inside T_x, RMSNorm outside
+**Claim:** The clean separation is: inside the DEQ fixed-point map T_x(z), use ONLY non-expansive Π_R clamps (1-Lip by construction, no analysis needed).  Outside the DEQ solve (embeddings, final head), keep norms for optimization without affecting contraction.
+**Insight from iter 37b:** Replacing per-component RMSNorm with per-component Π_R caused +0.069 val_bpb regression BUT K=128 Δ=0.003 (tightest ever).  The design had 4 separate Π_R projections — too many clamps, too restrictive.
+**Revised design (iter 39):** Just TWO Π_R projections inside Block.forward:
+1. One shared pre: `u = Π_R(z + b(x0))` — replaces attn_norm + mlp_norm
+2. One post on combined update: `Δ = Π_R(0.5*(Δ_attn + Δ_mlp))` — replaces all post-norms
+All other norms inside T_x REMOVED (Q/K norms, hidden_post_norm, sdpa_post_norm).
+**Prediction:** Simpler + fewer clamps = less capacity loss than iter 37b's 4× Π_R.  K-sweep should stay tight (1-Lip chain + Π_R post).  Val_bpb should be within carry-forward threshold because the model has ONE shared input (no separate norm paths) and ONE output clamp (vs 4 in iter 37b).
+**Test:** iter 39-minimal-principled-norms (after iter 35).
+**Status:** PROPOSED — queued.
 
 ### H16: Single-step diffusion CTP enriches embedding gradients
 **Claim:** Noisy soft-embed input + CTP denoising gives gradient to more embedding rows.
@@ -517,37 +521,60 @@ the change is broken.
   certified contraction arch is in place as the new permanent baseline.
 
 ### Phase 6 post-cert ablation (IMMEDIATELY after iter 35 promotes):
-- **39-rm-ALL-post-norm-add-learnable-pre-norm** (user direction 2026-04-16):
-  Comprehensive norm overhaul.  Rule: if it's a post-norm → REMOVE.
-  If it's a pre-norm → make it learnable RMSNorm.
+- **39-minimal-principled-norms** (revised user direction 2026-04-16):
+  Clean separation: **inside T_x(z) only non-expansive Π_R clamps**;
+  **outside the DEQ solve keep norms for optimization**.
 
-  **REMOVE (4 post-norms):**
-  - `Block.attn_post_mix_norm = RMSNorm(dim)` — after attn expert weighted sum
-  - `Block.mlp_post_mix_norm = RMSNorm(dim)` — after mlp expert weighted sum
-  - `CSA.attn_sdpa_post_norm = RMSNorm(dim)` — after SDPA output
-  - `MLP.hidden_post_norm = RMSNorm(rank)` — per-expert hidden after activation
+  **INSIDE Block.forward (the DEQ fixed-point map T_x(z)):**
+  Only TWO Π_R projections, no RMSNorm/LN:
 
-  **CONVERT to learnable RMSNorm (7 pre-norms):**
-  - `Block.attn_norm = BallProjection` → `RMSNorm(dim)` (pre-norm on u)
-  - `Block.mlp_norm = BallProjection` → `RMSNorm(dim)` (pre-norm on u)
-  - `CSA: _rms_norm(q_rope/q_nope)` → learnable `RMSNorm(head_dim)` (pre-norm Q)
-  - `CSA: _rms_norm(k_rope/k_nope)` → learnable `RMSNorm(head_dim)` (pre-norm K)
-  - `MLP: _rms_norm(x)` in mix_experts → learnable `RMSNorm(dim)` (pre-norm expert input)
-  - `Router: _rms_norm(x)` in forward → learnable `RMSNorm(dim)` (pre-norm router input)
-  - `Block: _rms_norm(x0)` in _compute_b_x0 → learnable `RMSNorm(dim)` (pre-norm injection)
+  1. **ONE shared pre-projection:**
+     `u = Π_R(z + b(x0))`
+     Feed same `u` to router AND all experts (collapse separate
+     `attn_norm`/`mlp_norm` into one `Π_R`).
 
-  **FULL MODEL additional norms (outside Block):**
-  - `BigramHash: _rms_norm(h)` before proj → learnable `RMSNorm`
-  - `GPT._encode: _rms_norm(x)` after tok+bigram embed → learnable `RMSNorm`
-  - `GPT.final_norm = RMSNorm(model_dim)` — keep (already learnable, pre-norm for MoS head)
-  - `GPT._get_soft_embedding: _rms_norm(soft_embed)` → learnable `RMSNorm`
-  - `MoSHead: _rms_norm(h)` in _head_forward (line 1051) → learnable if applicable
+  2. **ONE post-projection on the combined update:**
+     `Δ = Π_R(0.5 * (Δ_attn(u) + Δ_mlp(u)))`
+     Then: `T_x(z) = (1-τ) b(x0) + τ Δ`
 
-  **Total: 4 post-norms to REMOVE, 10+ pre-norms to make learnable.**
+  **REMOVE all other norms inside Block.forward:**
+  - `attn_norm = BallProjection` → replaced by shared u = Π_R(...)
+  - `mlp_norm = BallProjection` → replaced by shared u
+  - `attn_post_mix_norm = RMSNorm` → REMOVED (replaced by post Π_R on Δ)
+  - `mlp_post_mix_norm = RMSNorm` → REMOVED (replaced by post Π_R on Δ)
+  - `attn_sdpa_post_norm = RMSNorm` → REMOVED
+  - `hidden_post_norm = RMSNorm` → REMOVED
+  - `_rms_norm(q_rope/q_nope)` → REMOVED (Q,K bounded by Π_R input)
+  - `_rms_norm(k_rope/k_nope)` → REMOVED
+  - `_rms_norm(x)` in MLP.mix_experts → use pre_normed=True from u
+  - `_rms_norm(x)` in Router.forward → use pre_normed=True from u
 
-  **Principle:** control magnitudes at the INPUT (learnable scale, model has
-  freedom) not the OUTPUT (hard clamp hurts capacity).  Bounded input +
-  1-Lip certified transform = bounded output without output clipping.
+  **Note:** removing Q/K norms changes the effective attention temperature.
+  May need to recalibrate `l2_attn_gamma` (currently 0.051 = 1/(2√d_head)
+  calibrated for RMS-normed Q,K).
+
+  **OUTSIDE the DEQ solve (keep for optimization, not contraction):**
+  - `GPT._encode: _rms_norm(x)` — keep (embedding normalization)
+  - `GPT.final_norm = RMSNorm(model_dim)` — keep (pre-norm for MoS head)
+  - `GPT._get_soft_embedding: _rms_norm(soft_embed)` — keep
+  - `BigramHash: _rms_norm(h)` — keep
+  - MoSHead norms — keep (output head, not inside T_x)
+
+  **Why this is simpler + stronger than learnable-pre-norm approach:**
+  - Π_R is 1-Lip by construction (no analysis needed)
+  - RMSNorm inside T_x is NOT globally 1-Lip (complicates contraction)
+  - TWO Π_R projections vs 10+ learnable RMSNorm = much simpler
+  - τ < 1 + Π_R post = strict contraction "by construction"
+  - Without ANY projection, bf16 saturation/blow-ups aren't prevented
+    unless you add strict σ_max everywhere (more complex than Π_R)
+
+  **Contraction proof sketch:**
+  - Pre: ‖u‖ ≤ R (Π_R is 1-Lip)
+  - Experts: 1-Lip (spectral norm ≤ 1, 1-Lip activation)
+  - Dense mixture: convex combination of bounded expert outputs → ≤ R
+  - 0.5 scale + Π_R post: ‖Δ‖ ≤ R (safety net, rarely clips)
+  - T_x = (1-τ)b + τΔ: Lip_z(T_x) = τ·Lip_z(Δ) ≤ τ < 1 ✓
+
   Update opg_doc.tex §4.1/§4.4 to match.
 
 ### Phase 6-contingent (optional, after post-cert ablation):
