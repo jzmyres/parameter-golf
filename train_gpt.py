@@ -3055,10 +3055,9 @@ def main() -> None:
                     loss = model(x, y)
 
                 # iter 45 (opg_doc.tex §4): Lyapunov penalty OUTSIDE compiled graph.
-                # Two-forward approach on the UNCOMPILED base_model.shared_block:
-                #   Forward #1: VJP for ρ̂ = ‖J^T v‖ (power iteration)
-                #   Forward #2: surrogate for ∇_θ (if ρ̂ > γ)
-                # Must run outside compiled forward to avoid tensor metadata corruption.
+                # Single boundary forward on UNCOMPILED base_model.shared_block,
+                # with separate backward to avoid donated-buffer conflict.
+                lyap_loss_t = None
                 lyap_coef = float(base_model.lyapunov_coef)
                 lyap_warmup = int(max(args.iterations, 1) * base_model.lyapunov_warmup_frac)
                 lyap_scale = min(step / max(lyap_warmup, 1), 1.0) if lyap_warmup > 0 else 1.0
@@ -3104,9 +3103,6 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
             # Lyapunov backward runs SEPARATELY after main backward.
-            # Avoids donated-buffer conflict: compiled backward (main loss)
-            # uses donated buffers, then surrogate backward accumulates
-            # gradients on shared params via separate (uncompiled) graph.
             if lyap_loss_t is not None:
                 (lyap_loss_t * grad_scale).backward()
         train_loss /= grad_accum_steps
