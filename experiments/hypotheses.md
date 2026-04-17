@@ -659,6 +659,20 @@ a process bug, not a design choice.
    in explicit pre/post-solve hooks (e.g., `update_uv_()` called once per
    optimizer step before the DEQ solve), never inside the `forward()`
    invoked from `RevDEQFunction`.
+5. **No stale tensors across microbatches.**  Any tensor stored on a module
+   attribute (e.g., `_balance_loss`) that has a `grad_fn` MUST be
+   recomputed in each microbatch — NOT reused from a previous one.
+   After `.backward()` frees microbatch N's graph, microbatch N+1
+   accessing the stale tensor crashes with "backward through graph a
+   second time."  The principled fix for regularization losses is:
+   compute them ONCE per step from the final forward pass's output
+   (post-solve), not inside the DEQ loop (2K× per step).
+6. **torch.compile: one compiled output, one backward consumer.**  When a
+   compiled module produces a single tensor split into two backward
+   paths, AOT autograd may fail.  Either (a) return pre-split outputs
+   INSIDE the compiled graph, or (b) exclude the multi-consumer op via
+   `@dynamo_disable`.  Applies whenever a compiled forward's output
+   is sliced into views feeding separate loss branches.
 
 #### Defaults and gates
 
