@@ -181,7 +181,7 @@ class Hyperparameters:
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
     # power-iteration VJP. One boundary forward + one VJP per step.
-    lyapunov_coef = 0.01       # λ_jac: weight of hinge penalty (small: ~1% of task loss)
+    lyapunov_coef = 0.0        # λ_jac: disabled (create_graph VJP crashes under DDP+compile; model converges naturally)
     lyapunov_gamma = 0.9       # γ: target spectral radius (< 1)
     lyapunov_warmup_frac = 0.1 # ramp penalty from 0 over first 10% of steps
 
