@@ -596,6 +596,67 @@ the change is broken.
 - **Pre-requisite**: code must be aligned with opg_doc.tex before starting
   refinement benefit with solver-quality noise.
 
+### Phase 7.8 — Lyapunov Stability Theory for FP convergence (relax Banach contraction)
+
+**Motivation:** Banach contraction (Lip(T_x) < 1 everywhere) is *sufficient* for
+FP convergence but extremely restrictive — it forces τ_max ≈ 0.003-0.04, orthogonal
+expert parameterization, bounded-domain projections, and 1-Lip activations.  These
+constraints provably guarantee convergence but sacrifice model expressiveness
+(iter 39b: perfect FP with val_bpb +0.22 regression).
+
+**Lyapunov Stability Theory** provides a *weaker but still sufficient* guarantee:
+instead of requiring ‖J_T‖ < 1 globally, we need only a **Lyapunov function**
+V(z) ≥ 0 with V(z*) = 0 such that V(T(z)) < V(z) for all z ≠ z*.  This allows:
+- Local expansion in some directions (σ_max > 1) as long as V decreases overall
+- State-dependent contraction rates (tight where needed, loose where safe)
+- More expressive architectures that still converge to a unique FP
+
+**Natural Lyapunov candidates for DEQ:**
+- V(z) = ‖z - T(z)‖² (residual norm — already tracked as `deq_residual`)
+- V(z) = ‖z - z*‖² (distance to FP — requires FP estimate, e.g. from previous step)
+- V(z) = z^T P z for learned PSD matrix P (quadratic Lyapunov)
+- Learned V_φ(z) via auxiliary ICNN (input-convex neural network)
+
+**Verification:** At each DEQ iteration k, check V(z_{k+1}) < V(z_k).  If violated,
+fall back to damped update z_{k+1} = z_k + α(T(z_k) - z_k) with α chosen to
+guarantee V-decrease (line search or conservative α).
+
+**10 highest-ROI changes (priority order):**
+
+| # | Change | What it relaxes | Expected ROI | Risk |
+|---|---|---|---|---|
+| L1 | **Remove orthogonal constraint → spectral-norm cap σ_max ≤ c** | All-σ=1 isometry → σ_max ≤ c with c∈[1, 2]. Experts can amplify important directions while still bounded. Monitor V(z) = ‖z-T(z)‖² decrease per DEQ iter. | HIGH — orthogonal kills ~50% of rank capacity (singular value freedom). c=1.5 recovers it while V-decrease holds empirically. | If V increases, need adaptive α damping. |
+| L2 | **Raise τ_max to 1.0 with Lyapunov safeguard** | τ < 1 (contraction) → τ ≤ 1.0 with runtime V-decrease check. When τ=1, T_x = G_θ (full expressiveness, no shell attenuation). Fall back to τ < 1 only if V fails to decrease. | HIGH — τ≈0.9 already works (iter 35); τ=1.0 removes the (1-τ)b(x_0) anchor entirely, testing whether G_θ alone has a stable FP. | Loss of guaranteed convergence; need runtime fallback. |
+| L3 | **Restore learnable RMSNorm inside T_x** | Π_R-only (1-Lip) → RMSNorm (unbounded Lip near ‖x‖→0). RMSNorm's learnable scale provides capacity (iter 37b: +0.069 val_bpb from removing it). Lyapunov doesn't need bounded Lip; it needs V-decrease. | HIGH — directly recovers the capacity lost in iter 37b/39. | Near-zero-norm states could cause V spikes; add ‖z‖ floor. |
+| L4 | **Remove BallProjection Π_R clamps** | Bounded domain → unbounded. Π_R clips large states; removing it lets the model use the full representation space. Lyapunov V(z) can still decrease on unbounded domains. | MEDIUM — Π_R rarely activates (R=2√d is generous); removing it simplifies code and removes 1-Lip overhead. | Unbounded states → need V to handle large ‖z‖. Use V = ‖z-T(z)‖² which is norm-agnostic. |
+| L5 | **Allow state-dependent τ(z) instead of exogenous τ(x_0)** | Exogenous τ(b(x_0)) → τ(z). Under Banach, τ(z) leaks gradients (unbudgeted ∇_z τ term). Under Lyapunov, τ(z) is fine as long as V decreases — the model can adapt contraction strength to the current state. | MEDIUM — lets τ shrink in unstable regions and grow in stable ones. Gradient ∇_z τ now contributes usefully to learning. | If τ(z) oscillates, V may not decrease monotonically. Clamp τ∈[0.1, 1.0]. |
+| L6 | **Remove the 0.5 scale in G_θ** | G = 0.5·(Δ_attn + Δ_mlp) → G = Δ_attn + Δ_mlp (pooled router weights already sum to 1). The 0.5 was a contraction aid; Lyapunov doesn't need it. Doubles effective output magnitude. | MEDIUM — straightforward capacity gain. Already tested in iter 39 (worked for FP, hurt val_bpb only because τ was too small). | May need to adjust initial τ or learning rate. |
+| L7 | **Lyapunov-adaptive β (DEQ solver momentum)** | Fixed β=0.20 → β_k adapted per DEQ iteration based on V-decrease rate. If V(z_k) decreases fast, increase β (aggressive); if slow, decrease β (conservative). Similar to line-search in optimization. | MEDIUM — current β=0.20 is conservative. Adaptive β could halve the iterations needed for convergence, improving throughput. | Adds per-iteration overhead (V evaluation). Use V = ‖residual‖² which is already computed. |
+| L8 | **Spectral monitoring instead of spectral capping** | σ_max ≤ 1 (enforced) → σ_max tracked + logged (not enforced). Use σ_max as a diagnostic; let Lyapunov V-decrease be the convergence guarantee. Training naturally keeps σ moderate if the loss landscape favors convergence. | MEDIUM — removes the NS overhead (20 matmuls × 6 weights per Block.forward) while keeping the safety net of V monitoring. | Uncontrolled σ growth → solver divergence. Need hard fallback (clamp σ if V fails). |
+| L9 | **Restore gated-product MLP activation** | leaky_relu(0.5) × fc (1-Lip) → leaky_relu(0.5)² × fc (not 1-Lip but more expressive). The squared gate was removed in iter 37 for Lip certification. Under Lyapunov, the squared gate is fine as long as V decreases. | LOW-MEDIUM — iter 37 showed only -0.006 val_bpb from removing it. May not be worth the complexity. | Minor: squared gate can saturate; monitor expert entropy. |
+| L10 | **Train a lightweight Lyapunov certificate V_φ(z)** | Empirical V = ‖residual‖² → learned V_φ(z) via small ICNN (input-convex NN). Train V_φ alongside the model with loss L_V = max(0, V_φ(T(z)) - V_φ(z) + ε). Provides a tighter stability certificate than the residual heuristic. | LOW — theoretical elegance but significant implementation complexity. ICNN adds params + compute. Only justified if L1-L8 leave convergence unreliable. | ICNN training instability; V_φ might not generalize across the state space. Defer until L1-L8 are validated. |
+
+**Execution order:**
+1. L1 + L6 together (relax experts + remove 0.5 scale) — biggest capacity gain with
+   minimal risk. Add V = ‖z - T(z)‖² monitoring per DEQ iter (already tracked as
+   `deq_residual`; just verify it decreases monotonically).
+2. L3 (restore RMSNorm) — directly recovers iter 37b capacity loss.
+3. L2 + L5 (raise τ + state-dependent τ) — unlocks the full contraction shell.
+4. L7 + L8 (adaptive β + monitoring-only σ) — throughput gains.
+5. L4 + L9 (remove Π_R + restore squared gate) — diminishing returns.
+6. L10 (learned Lyapunov) — only if empirical V is insufficient.
+
+**Success criteria:**
+- val_bpb ≤ iter 35 baseline (1.9197) — must RECOVER lost expressiveness
+- K=128 residual monotonically decreasing (Lyapunov V-decrease)
+- No solver divergence over 10 consecutive training runs
+- Throughput ≥ iter 35 baseline (no NS overhead)
+
+**Theoretical reference:**
+- Lyapunov stability for discrete dynamical systems: Khalil, "Nonlinear Systems" §4.4
+- Lyapunov-based DEQ analysis: Winston & Kolter, "Monotone Operator Equilibrium Networks" (ICML 2020)
+- Input-convex neural networks: Amos, Xu & Kolter (ICML 2017)
+
 ### Phase 7+ (deferred): throughput unroll+compile, scaling-law grid, FSQ/rank sweeps
 
 Removed from the active queue to keep focus on Phase 6 doc-alignment.  Will
