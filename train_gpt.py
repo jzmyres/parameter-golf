@@ -1327,9 +1327,7 @@ class CausalSelfAttention(nn.Module):
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._attn_gate_last_mean: float | None = None  # per-call attn gate mean
-        # Phase 4.5 22-add-all: RMSNorm after gated SDPA (post-non-linearity).
-        # Normalizes per-head attention output before the expert mix projection.
-        self.attn_sdpa_post_norm = RMSNorm(dim)
+        # iter 39: attn_sdpa_post_norm REMOVED (post-norm inside T_x; doc Remark 4.6)
 
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         bsz, seqlen, dim = x_n.shape
@@ -1343,6 +1341,11 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
 
+        # Q/K rms_norm: KEPT — this is part of the L2-attention kernel spec,
+        # not an arbitrary normalization.  The SDPA fast path requires
+        # ‖k_j‖² = d_head (constant across j) for the cancellation trick.
+        # Without rms_norm, ‖k_j‖² varies → cancellation breaks → wrong
+        # attention distribution → DEQ diverges (smoke confirmed).
         q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
         k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
 
@@ -1402,7 +1405,7 @@ class CausalSelfAttention(nn.Module):
             self._attn_gate_last_mean = float(attn_gate_act.detach().float().mean().item())
         y_out = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         # Phase 4.5 22-add-all: RMSNorm after gated SDPA.
-        return self.attn_sdpa_post_norm(y_out)
+        return y_out  # iter 39: post-norm removed
 
     def mix_experts_from_shared(self, y: Tensor, w: Tensor,
                                  *, inj_term: Tensor | None = None) -> Tensor:
@@ -1484,7 +1487,7 @@ class MLP(nn.Module):
         self._out_ortho_cos_sim: float | None = None
         # Phase 4.5 22-add-all: RMSNorm on per-expert hidden (after leaky_relu²).
         # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
-        self.hidden_post_norm = RMSNorm(self.expert_rank)
+        # iter 39: hidden_post_norm REMOVED (post-norm inside T_x; doc Remark 4.6)
 
     def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
                     inj_term: Tensor | None = None) -> Tensor:
@@ -1505,8 +1508,7 @@ class MLP(nn.Module):
         fc = x_flat @ Fm.t()
         h = F.leaky_relu(gate, negative_slope=0.5) * fc
         h = h.view(N, E, R)
-        # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
-        h = self.hidden_post_norm(h)
+        # iter 39: hidden_post_norm removed (post-norm inside T_x)
         h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
@@ -1730,27 +1732,17 @@ class Block(nn.Module):
         # always.  Radius R = 2·√d ≈ 55.4 for dim=768 — large enough to act
         # as identity on typical hidden states (‖u‖≈√d·σ with σ≈1) while
         # bounding the rare norm-blowup case.
+        # iter 39 (opg_doc.tex §4.4 Remark 4.6): minimal principled norms.
+        # Inside T_x(z): ONLY two Π_R projections (1-Lip by construction).
+        # No RMSNorm/LN inside the DEQ map.
         _R_state = 2.0 * math.sqrt(float(dim))
-        self.attn_norm = BallProjection(dim, R=_R_state)
-        self.mlp_norm = BallProjection(dim, R=_R_state)
-        # iter 30 (opg_doc.tex §4.5 + user direction 2026-04-16): post_norm REMOVED.
-        # Learnable RMSNorm has unbounded Lipschitz constant near ||x||=0 — it
-        # would break the τ-shell contraction property.  Without post_norm,
-        # Lip_z(T_x) = τ · Lip_z(G_θ), so τ < τ_max < 1 directly buys strict
-        # contraction once G_θ is 1-Lipschitz (progressive cert in iters 31-37).
-        # Hidden-state magnitude is instead bounded structurally by the shell:
-        # ‖T_x‖ ≤ (1-τ)‖b(x_0)‖ + τ‖G_θ‖, which is finite if G_θ is bounded.
-        # A proper `Π_R` projection (doc §4.1) replaces post_norm in iter 32.
-        # Phase 4.5 iter 22-add-all: learnable RMSNorm at all reasonable post-non-linearity positions.
-        # Subsequent iters remove one at a time; keep removed if val_bpb doesn't regress > 0.015.
-        # Post-mix norms: learnable RMSNorm on expert-weighted-sum output.
-        # iter 37b tested replacing with BallProjection (Π_R) — K=128 Δ
-        # improved 0.011→0.003 (tightest FP ever) but val_bpb regressed
-        # +0.069 (1.911→1.980).  RMSNorm's learnable scale provides
-        # capacity that Π_R's hard clamp cannot.  Kept as RMSNorm;
-        # iter 39 will test removing entirely.
-        self.attn_post_mix_norm = RMSNorm(dim)
-        self.mlp_post_mix_norm = RMSNorm(dim)
+        # (1) ONE shared pre-projection: u = Π_R(z + b(x0))
+        self.pre_proj = BallProjection(dim, R=_R_state)
+        # (2) ONE post-projection on combined update: Δ = Π_R(G_θ)
+        self.post_proj = BallProjection(dim, R=_R_state)
+        # Legacy aliases for backward-compat diagnostics that read attn_norm/mlp_norm
+        self.attn_norm = self.pre_proj
+        self.mlp_norm = self.pre_proj
         # iter 35 (opg_doc.tex §4.3, MANDATORY): single pooled router over
         # E_attn + E_mlp = 2E experts.  One softmax across the combined pool
         # forces per-token attention-vs-MLP budget allocation.  First E weights
@@ -1847,8 +1839,8 @@ class Block(nn.Module):
         self._inj_gate_last_mean: float | None = None
 
     def _compute_b_x0(self, x0: Tensor) -> Tensor:
-        """Exogenous injection b(x_0) = x_0 + U·rms_norm(x_0) (doc §4.2)."""
-        return x0 + self.inj_lin(_rms_norm(x0)).to(dtype=x0.dtype)
+        """Exogenous injection b(x_0) = x_0 + U·Π_R(x_0) (doc §4.2, iter 39)."""
+        return x0 + self.inj_lin(self.pre_proj(x0)).to(dtype=x0.dtype)
 
     def _tau(self) -> Tensor:
         """τ = τ_max · sigmoid(tau_param) ∈ (0, τ_max). doc §4.5."""
@@ -1875,9 +1867,9 @@ class Block(nn.Module):
         b_x0_sub = self._compute_b_x0(x0_sub)
         x = z_sub + b_x0_sub
 
-        # iter 35: single pooled router, split weights at E boundary
+        # iter 39: single shared pre_proj for everything
         E = self.num_experts
-        x_attn = self.attn_norm(x)
+        x_attn = self.pre_proj(x)
         w_all = self.router(x_attn, pre_normed=True)  # (..., 2E)
         w_attn = w_all[..., :E].contiguous()
         w_mlp = w_all[..., E:].contiguous()
@@ -1892,7 +1884,8 @@ class Block(nn.Module):
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        x_mlp = self.mlp_norm(x)
+        # iter 39: single shared pre_proj (same u_proj for MLP)
+        x_mlp = x_attn  # same projected u
         N = bsz * t
         x_flat = x_mlp.reshape(N, dim)
         E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
@@ -1937,31 +1930,27 @@ class Block(nn.Module):
         # iter 35 (doc §4.3): single pooled router over 2E experts.
         # One softmax → one call.  First E weights → attn, last E → MLP.
         E = self.num_experts
-        u_proj = self.attn_norm(u)
+        # iter 39 (doc §4.4, Remark 4.6): ONE shared pre-projection
+        u_proj = self.pre_proj(u)
         w_attn, w_mlp = self._route_pooled(u_proj)
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
 
-        x_attn = u_proj
-        y_shared = self.attn._attn_shared_from_normed(x_attn)
+        # Both attn and MLP read the SAME projected u (doc §4.4)
+        y_shared = self.attn._attn_shared_from_normed(u_proj)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn, inj_term=inj_term)
+        mlp_mix = self.mlp.mix_experts(u_proj, w_mlp, pre_normed=True, inj_term=inj_term)
 
-        x_mlp = self.mlp_norm(u)
-        mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
-
-        attn_mix = self.attn_post_mix_norm(attn_mix)
-        mlp_mix = self.mlp_post_mix_norm(mlp_mix)
-
-        # G_θ: parallel mixture with the 0.5 stabilizing scale (doc §4.4).
-        G = 0.5 * (attn_mix + mlp_mix).to(dtype=z_in.dtype)
+        # iter 39: ONE post-projection on the combined update (doc §4.4 eq. 4)
+        G = self.post_proj(0.5 * (attn_mix + mlp_mix)).to(dtype=z_in.dtype)
 
         # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).
         tau = self._tau().to(dtype=z_in.dtype)
         raw_out = (1.0 - tau) * b_x0 + tau * G
 
         if _tracking:
-            gg_tok = torch.ones(x_attn.shape[:-1], device=x_attn.device, dtype=x_attn.dtype)
+            gg_tok = torch.ones(u_proj.shape[:-1], device=u_proj.device, dtype=u_proj.dtype)
             self._record_gg_diag(gg_tok.detach())
             # iter 30: inj trace is now the constant τ (contraction coefficient).
             tau_val = float(tau.detach().float().mean().item())

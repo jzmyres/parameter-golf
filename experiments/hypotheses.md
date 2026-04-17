@@ -577,7 +577,7 @@ the change is broken.
 
   Update opg_doc.tex §4.1/§4.4 to match.
 
-### Phase 6-contingent (optional, after post-cert ablation):
+### Phase 7.5 — deeper training + self-refinement (after Phase 7 throughput):
 - **30d-deeper-K**: add `deq_k_jitter_set=(4,8,16,24)` on certified arch — tests
   compounding generalization (cf. iter 28c's K=128 Δ=0.015).
 - **30e-TBPTT-deep**: `deq_bptt_k=8` + K∈{4,8,16,32}, compute-neutral vs baseline,
@@ -585,12 +585,12 @@ the change is broken.
 - **38-self-refinement** (orthogonal to the inner DEQ, documented in
   opg_doc.tex §app:refinement): enable `num_refinements=1` (already plumbed
   in `train_gpt.py`) and ramp `_refine_mix_alpha` up after 85% of wallclock.
-  Per the appendix, each outer refinement re-solves $T_{x^{(r)}}$ to its own
-  unique fixed point, so Banach still applies per-$r$; the detach on
-  $x_0^{(r-1)}$ plus $\alpha\le 0.5$ bounds the outer gradient path.  Tests
-  whether outer-loop prediction-feedback helps task perf.  Depends on 35
-  landing (so we measure the marginal effect on the fully-certified arch).
-  **Do NOT run before iter 35** — running on uncertified arch confounds
+
+### Phase 7.6 — contraction improvement + arch simplification + expressiveness:
+- Improve FP convergence quality (K=128 Δ → target < 0.005)
+- Simplify model architecture (fewer modules, fewer params, same or better val_bpb)
+- Improve expressiveness within 1-Lip constraints (GroupSort, wider experts, etc.)
+- **Pre-requisite**: code must be aligned with opg_doc.tex before starting
   refinement benefit with solver-quality noise.
 
 ### Phase 7+ (deferred): throughput unroll+compile, scaling-law grid, FSQ/rank sweeps

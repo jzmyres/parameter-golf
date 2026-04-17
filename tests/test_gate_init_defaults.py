@@ -56,14 +56,12 @@ class TestContractionShellDefaults(unittest.TestCase):
         include the identity path.  Structural check: b(x_0) - inj_term == x_0
         for any U, confirming the '+ x_0' term is literally in the formula
         (not replaced by something that happens to be close)."""
-        from train_gpt import _rms_norm
-
         b = _fresh_block(dim=32)
         b.train(False)
         x0 = torch.randn(2, 5, 32)
         with torch.no_grad():
             bx0 = b._compute_b_x0(x0)
-            inj_term = b.inj_lin(_rms_norm(x0)).to(dtype=x0.dtype)
+            inj_term = b.inj_lin(b.pre_proj(x0)).to(dtype=x0.dtype)
         self.assertEqual(tuple(bx0.shape), tuple(x0.shape))
         self.assertTrue(
             torch.allclose(bx0 - inj_term, x0, atol=1e-5),
