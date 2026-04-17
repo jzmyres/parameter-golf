@@ -1736,31 +1736,13 @@ class Block(nn.Module):
                  router_scoring: str = "linear",
                  attention_l2: bool = False, l2_attn_gamma: float = 1.0):
         super().__init__()
-        # iter 32 (opg_doc.tex §4.1): replace learnable RMSNorm on the shared
-        # router/expert state path with Euclidean-ball projection Π_R.
-        # RMSNorm's Lipschitz is unbounded near ‖u‖=0; Π_R is 1-Lipschitz
-        # always.  Radius R = 2·√d ≈ 55.4 for dim=768 — large enough to act
-        # as identity on typical hidden states (‖u‖≈√d·σ with σ≈1) while
-        # bounding the rare norm-blowup case.
-        _R_state = 2.0 * math.sqrt(float(dim))
-        self.attn_norm = BallProjection(dim, R=_R_state)
-        self.mlp_norm = BallProjection(dim, R=_R_state)
-        # iter 30 (opg_doc.tex §4.5 + user direction 2026-04-16): post_norm REMOVED.
-        # Learnable RMSNorm has unbounded Lipschitz constant near ||x||=0 — it
-        # would break the τ-shell contraction property.  Without post_norm,
-        # Lip_z(T_x) = τ · Lip_z(G_θ), so τ < τ_max < 1 directly buys strict
-        # contraction once G_θ is 1-Lipschitz (progressive cert in iters 31-37).
-        # Hidden-state magnitude is instead bounded structurally by the shell:
-        # ‖T_x‖ ≤ (1-τ)‖b(x_0)‖ + τ‖G_θ‖, which is finite if G_θ is bounded.
-        # A proper `Π_R` projection (doc §4.1) replaces post_norm in iter 32.
-        # Phase 4.5 iter 22-add-all: learnable RMSNorm at all reasonable post-non-linearity positions.
-        # Subsequent iters remove one at a time; keep removed if val_bpb doesn't regress > 0.015.
+        # iter 41 (opg_doc.tex §3.2 Lyapunov revision): learnable RMSNorm on
+        # shared state path h = RMSNorm(z + x_0).  Replaces iter 32's Π_R
+        # BallProjection — Lyapunov stability via soft regularization, not
+        # hard architectural clamps.  Single shared norm for both attn + MLP.
+        self.state_norm = RMSNorm(dim)
         # Post-mix norms: learnable RMSNorm on expert-weighted-sum output.
-        # iter 37b tested replacing with BallProjection (Π_R) — K=128 Δ
-        # improved 0.011→0.003 (tightest FP ever) but val_bpb regressed
-        # +0.069 (1.911→1.980).  RMSNorm's learnable scale provides
-        # capacity that Π_R's hard clamp cannot.  Kept as RMSNorm;
-        # iter 39 will test removing entirely.
+        # Provides capacity (iter 37b showed +0.069 regression from removing).
         self.attn_post_mix_norm = RMSNorm(dim)
         self.mlp_post_mix_norm = RMSNorm(dim)
         # iter 35 (opg_doc.tex §4.3, MANDATORY): single pooled router over
@@ -1777,97 +1759,24 @@ class Block(nn.Module):
                                          expert_rank=attn_expert_rank, router=self.router,
                                          attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
-        # iter 33 (opg_doc.tex §6.1): per-expert spectral-norm cap on the
-        # dominant-spectral-path output matrices `expert_out` (attn) and
-        # `expert_down` (mlp).  These are raw nn.Parameter tensors of shape
-        # (E, D, R), so we register a custom per-expert parametrization that
-        # caps σ_max(W_e) ≤ 1 per-expert via 1 power iteration per forward.
-        # Starts narrow: only the OUTPUT projections; other expert weights
-        # (expert_proj, expert_gate, expert_fc) are deferred to iter 33b if
-        # this one lands cleanly.  The Lipschitz of the full expert path is
-        # bounded by σ_max(W_in) · Lip(nonlin) · σ_max(W_out), so capping
-        # W_out alone still provides a meaningful Lipschitz reduction.
-        torch.nn.utils.parametrize.register_parametrization(
-            self.attn, "expert_out",
-            PerExpertSpectralNormCap(self.attn.expert_out.shape),
-        )
-        torch.nn.utils.parametrize.register_parametrization(
-            self.attn, "expert_proj",
-            PerExpertSpectralNormCap(self.attn.expert_proj.shape),
-        )
-        torch.nn.utils.parametrize.register_parametrization(
-            self.mlp, "expert_gate",
-            PerExpertSpectralNormCap(self.mlp.expert_gate.shape),
-        )
-        torch.nn.utils.parametrize.register_parametrization(
-            self.mlp, "expert_fc",
-            PerExpertSpectralNormCap(self.mlp.expert_fc.shape),
-        )
-        torch.nn.utils.parametrize.register_parametrization(
-            self.mlp, "expert_down",
-            PerExpertSpectralNormCap(self.mlp.expert_down.shape),
-        )
-        # Phase 5b iter 23C-gg-no-residual: gg_gate REMOVED and z residual
-        # REMOVED.  New update form:
-        #     raw_out = 0.5 * z2            (where z2 = attn_mix + mlp_mix)
-        # Compare:
-        #   Old:      raw_out = (1-g)·z_in + g·z2  (gated lerp between pass-through and transform)
-        #   iter 23B: raw_out = z_in + 0.2·z2      (residual, trivial FP when z2=0 at z_in)
-        #   iter 23C: raw_out = 0.5·z2             (no residual, trivial FP only at z=0)
-        # The FP equation is z* = 0.5·z2(z*) — the transform must MAP to itself
-        # (scaled by 0.5).  A trivial FP at z=0 exists but supervised loss at
-        # training K pushes strongly away from it (zero state → catastrophic
-        # loss).  Contraction: df/dz = 0.5·J_transform (no identity term), so
-        # the solver is naturally contractive when J_transform is bounded.
-        # gg_iter diagnostic emits constant 1.0 as a marker.
+        # iter 41 (opg_doc.tex §3 Lyapunov revision): remove ALL hard
+        # contraction constraints — no spectral-norm caps, no Π_R, no τ-shell,
+        # no inj_lin.  Stability via Lyapunov penalty (iter 45) + RMSNorm
+        # preconditioning.  Expressiveness fully restored.
+        #
+        # Diagnostic tracking (kept for logging compat):
         self._gg_last: float | None = None
         self._gg_track_enabled = False
         self._gg_sum = 0.0
         self._gg_count = 0
         self._gg_call_track_enabled = False
         self._gg_call_track: list[float] = []
-        # Per-call tracking for all gates (iter 16: gate statistics infra)
         self._inj_call_track: list[float] = []
         self._attn_gate_call_track: list[float] = []
         self._router_gate_call_track: list[float] = []
-        # Per-component router gate tracking (attn vs FFN separately)
         self._attn_router_gate_call_track: list[float] = []
         self._mlp_router_gate_call_track: list[float] = []
-
-        # iter 30 (opg_doc.tex §4.2, §4.5): certified contraction shell.
-        # Replace the state-dependent sigmoid gate with an EXOGENOUS injection
-        # b(x_0) = x_0 + U · rms_norm(x_0) that has an IDENTITY PATH (the +x_0
-        # term), so the fixed-point map cannot become input-independent even
-        # if U collapses to 0 under WD pressure.  This structurally eliminates
-        # the trivial-FP failure mode observed in the sigmoid-gate baseline.
-        self.inj_lin = CastedLinear(dim, dim, bias=False)  # U: learned adapter
-        with torch.no_grad():
-            nn.init.normal_(self.inj_lin.weight, std=0.02)
-        # iter 31 (opg_doc.tex §6.1): enforce ‖U‖_2 ≤ 1.  Uses our stateless
-        # SpectralNormCap (not PyTorch's built-in spectral_norm) because the
-        # built-in mutates u/v buffers during train-mode forward, breaking
-        # RevDEQ's determinism requirement.  Our version is stateless in
-        # forward(); update_uv_() is called once per opt step via
-        # refresh_spectral_norms() (Permanent protocol rule 4).
-        torch.nn.utils.parametrize.register_parametrization(
-            self.inj_lin, "weight",
-            SpectralNormCap(self.inj_lin.weight.shape),
-        )
-        # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).  τ ∈ (0, τ_max]
-        # via sigmoid-parameterized scalar; τ_max<1 guarantees strict contraction
-        # (Banach → unique FP, global convergence).
-        self.tau_max: float = 0.9
-        self.tau_param = nn.Parameter(torch.tensor(-1.0))  # sigmoid(-1)≈0.27 → τ≈0.24 init
-        # Retain _inj_gate_last_mean attr name for logging compat (always 1.0 now)
         self._inj_gate_last_mean: float | None = None
-
-    def _compute_b_x0(self, x0: Tensor) -> Tensor:
-        """Exogenous injection b(x_0) = x_0 + U·rms_norm(x_0) (doc §4.2)."""
-        return x0 + self.inj_lin(_rms_norm(x0)).to(dtype=x0.dtype)
-
-    def _tau(self) -> Tensor:
-        """τ = τ_max · sigmoid(tau_param) ∈ (0, τ_max). doc §4.5."""
-        return self.tau_max * torch.sigmoid(self.tau_param)
 
     @dynamo_disable
     def _record_gg_diag(self, gg_tok: Tensor) -> None:
@@ -1884,32 +1793,28 @@ class Block(nn.Module):
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
-        # iter 30 (opg_doc.tex §4.2): mirror forward's shared input u = z + b(x_0)
-        # where b(x_0) = x_0 + U·rms_norm(x_0).  Diagnostic tracks the expert
-        # input as used in forward.
-        b_x0_sub = self._compute_b_x0(x0_sub)
-        x = z_sub + b_x0_sub
+        # iter 41: mirror forward's h = RMSNorm(z + x_0)
+        x = z_sub + x0_sub
+        h = self.state_norm(x)
 
         # iter 35: single pooled router, split weights at E boundary
         E = self.num_experts
-        x_attn = self.attn_norm(x)
-        w_all = self.router(x_attn, pre_normed=True)  # (..., 2E)
+        w_all = self.router(h, pre_normed=True)  # (..., 2E)
         w_attn = w_all[..., :E].contiguous()
         w_mlp = w_all[..., E:].contiguous()
-        y_shared = self.attn._attn_shared_from_normed(x_attn)
+        y_shared = self.attn._attn_shared_from_normed(h)
         R = self.attn.expert_rank
         y_flat = y_shared.reshape(bsz * t, dim)
         P = self.attn.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, dim)
-        h = y_flat @ P.t()
-        mu_h = h.reshape(bsz * t, E, R).mean(dim=0).to(dtype=torch.float32)
+        hp = y_flat @ P.t()
+        mu_h = hp.reshape(bsz * t, E, R).mean(dim=0).to(dtype=torch.float32)
         out_T = self.attn.expert_out.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
         mu_attn = torch.einsum("er,erd->ed", mu_h, out_T)
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        x_mlp = x_attn  # Review-4: reuse — same BallProjection on same input
         N = bsz * t
-        x_flat = x_mlp.reshape(N, dim)
+        x_flat = h.reshape(N, dim)
         E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
         G = self.mlp.expert_gate.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
         Fm = self.mlp.expert_fc.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
@@ -1938,58 +1843,49 @@ class Block(nn.Module):
         return w_all[..., :E].contiguous(), w_all[..., E:].contiguous()
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # iter 30-contraction-shell (opg_doc.tex §4.2-4.5):
-        #   b(x_0) = x_0 + U · rms_norm(x_0)          — exogenous, identity-path
-        #   u(z, x_0) = z + b(x_0)                    — shared input (routers & experts)
-        #   G_θ(z, x_0) = 0.5 · (Δ_attn + Δ_mlp)      — parallel mix
-        #   T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0)     — strict contraction (τ<1)
-        # The identity path inside b(x_0) prevents input-independent fixed
-        # points (user finding 2026-04-15); the τ-shell gives Banach-unique FP.
-        b_x0 = self._compute_b_x0(x0)
-        u = z_in + b_x0                       # shared router + expert input
-        inj_term = None                        # no legacy per-expert injection
+        # iter 41 (opg_doc.tex §3.5, Lyapunov revision):
+        #   h = RMSNorm(z + x_0)                       — shared normalized representation
+        #   Δ_θ(z, x_0) = Σ w_j E_j(h)                — dense mixture (weights sum to 1)
+        #   T_θ(z, x_0) = x_0 + Δ_θ(z, x_0)           — expressive, unclamped
+        #
+        # No Π_R, no spectral-norm caps, no τ-shell, no inj_lin.
+        # Stability via Lyapunov penalty (iter 45) on ρ(J_{z*}).
+        # x_0 injection prevents input-independent attractors structurally.
+        u = z_in + x0
+        h = self.state_norm(u)                   # h = RMSNorm(z + x_0)
 
-        # iter 35 (doc §4.3): single pooled router over 2E experts.
-        # One softmax → one call.  First E weights → attn, last E → MLP.
+        # Pooled router over 2E experts (doc §3.3).
         E = self.num_experts
-        u_proj = self.attn_norm(u)
-        w_attn, w_mlp = self._route_pooled(u_proj)
+        w_attn, w_mlp = self._route_pooled(h)
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
 
-        x_attn = u_proj
-        y_shared = self.attn._attn_shared_from_normed(x_attn)
-        attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn, inj_term=inj_term)
-
-        # Review-4: reuse u_proj — attn_norm and mlp_norm are identical
-        # BallProjection(dim, R=2√d) on the same input u. One call suffices.
-        x_mlp = u_proj
-        mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
-
+        # Attention experts
+        y_shared = self.attn._attn_shared_from_normed(h)
+        attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
         attn_mix = self.attn_post_mix_norm(attn_mix)
+
+        # MLP experts
+        mlp_mix = self.mlp.mix_experts(h, w_mlp, pre_normed=True)
         mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
-        # G_θ: parallel mixture with the 0.5 stabilizing scale (doc §4.4).
-        G = 0.5 * (attn_mix + mlp_mix).to(dtype=z_in.dtype)
+        # Dense mixture Δ = attn_mix + mlp_mix (router weights sum to 1).
+        delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
-        # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).
-        tau = self._tau().to(dtype=z_in.dtype)
-        raw_out = (1.0 - tau) * b_x0 + tau * G
+        # T_θ(z, x_0) = x_0 + Δ_θ(z, x_0)
+        raw_out = x0 + delta
 
         if _tracking:
-            gg_tok = torch.ones(x_attn.shape[:-1], device=x_attn.device, dtype=x_attn.dtype)
+            gg_tok = torch.ones(h.shape[:-1], device=h.device, dtype=h.dtype)
             self._record_gg_diag(gg_tok.detach())
-            # iter 30: inj trace is now the constant τ (contraction coefficient).
-            tau_val = float(tau.detach().float().mean().item())
-            self._inj_gate_last_mean = tau_val
-            self._inj_call_track.append(tau_val)
+            self._inj_gate_last_mean = 1.0
+            self._inj_call_track.append(1.0)
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
             if ag is not None:
                 self._attn_gate_call_track.append(ag)
             if attn_rg is not None:
                 self._attn_router_gate_call_track.append(attn_rg)
-            # iter 35: single pooled router — attn_rg == mlp_rg (same instance)
             mlp_rg = attn_rg
             if mlp_rg is not None:
                 self._mlp_router_gate_call_track.append(mlp_rg)
@@ -2000,7 +1896,7 @@ class Block(nn.Module):
                 rg_vals.append(float(mlp_rg))
             if rg_vals:
                 self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
-        return raw_out  # iter 30: post_norm removed (would break τ-shell contraction)
+        return raw_out
 
 
 # ---------------------------------------------------------------------------
@@ -2303,8 +2199,6 @@ class GPT(nn.Module):
             d = W.shape[1]
             flat_idx = topk_idx.reshape(B * T, K)
             flat_p = topk_probs.reshape(B * T, K)
-            # Chunked to avoid OOM: full (B*T, K, d) tensor is ~24 GiB at
-            # production batch size. chunk=512 keeps peak at ~6 MiB per chunk.
             flat_out = W.new_empty((B * T, d))
             chunk = 512
             for s in range(0, B * T, chunk):
@@ -2461,10 +2355,8 @@ class GPT(nn.Module):
         elif isinstance(abs_conv_t, torch.Tensor):
             self._deq_residual_t = abs_conv_t
 
-        # Review-5: removed extra shared_block(z, x0_refined) call that ran a
-        # full block forward ONLY for residual diagnostics (~5-10% throughput).
-        # The last-iteration convergence ||z_K - z_{K-1}|| (abs_conv_t) is already
-        # a good proxy for ||z - T(z)|| and is available without extra compute.
+        # iter 41: removed extra shared_block() call for diagnostics.
+        # Use abs_conv_t (last-iteration ‖z_K - z_{K-1}‖) as residual proxy.
 
         distributed = dist.is_available() and dist.is_initialized()
         is_master = (not distributed) or dist.get_rank() == 0
