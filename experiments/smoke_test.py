@@ -94,7 +94,7 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         router_scoring=args.router_scoring,
         attention_l2=args.attention_l2,
         l2_attn_gamma=args.l2_attn_gamma,
-        tie_attn_mlp_router=args.tie_attn_mlp_router,
+        tie_attn_mlp_router=True,  # iter 35: always pooled
         num_experts=args.num_experts,
     ).cuda()
 

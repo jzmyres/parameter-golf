@@ -181,7 +181,7 @@ class Hyperparameters:
     # peaky for training; use the d_head-matched value.
     l2_attn_gamma = 0.051  # for d_head=96 (model_dim=768, heads=8)
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
-    tie_attn_mlp_router = False
+    # tie_attn_mlp_router removed in iter 35: single pooled router is MANDATORY (doc §4.3)
 
     # DEQ solver
     # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
@@ -1196,13 +1196,13 @@ class SoftDenseRouter(nn.Module):
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._router_gate_last_mean = float(gate_logits.detach().exp().float().mean().item())
         if self.training:
+            reduce_dims = tuple(range(p.ndim - 1))
             # Review 9: skip loss computation during DEQ sub-iterations.
             # The router is called 2×K times per DEQ solve, but only the
             # final _balance_loss/_health_loss values are collected by
             # GPT._collect_routing_losses().  The reductions (mean/std)
             # are pure overhead for intermediate iterations.
             if not bool(_DEQ_SOLVE_ACTIVE):
-                reduce_dims = tuple(range(p.ndim - 1))
                 mean_share = p.mean(dim=reduce_dims)
                 target = torch.ones_like(mean_share) / self.num_experts
                 mse = F.mse_loss(mean_share, target)
@@ -1738,7 +1738,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 tie_attn_mlp_router: bool = False, num_experts: int = 8,
+                 num_experts: int = 8,
                  router_scoring: str = "linear",
                  attention_l2: bool = False, l2_attn_gamma: float = 1.0):
         super().__init__()
@@ -1769,18 +1769,20 @@ class Block(nn.Module):
         # iter 39 will test removing entirely.
         self.attn_post_mix_norm = RMSNorm(dim)
         self.mlp_post_mix_norm = RMSNorm(dim)
-        if bool(tie_attn_mlp_router):
-            shared = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0, scoring=router_scoring)
-            self.attn_router = shared
-            self.mlp_router = shared
-        else:
-            self.attn_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=10.0, cv_loss_weight=2.0, scoring=router_scoring)
-            self.mlp_router = SoftDenseRouter(dim, num_experts, min_share_loss_weight=5.0, cv_loss_weight=1.0, scoring=router_scoring)
+        # iter 35 (opg_doc.tex §4.3, MANDATORY): single pooled router over
+        # E_attn + E_mlp = 2E experts.  One softmax across the combined pool
+        # forces per-token attention-vs-MLP budget allocation.  First E weights
+        # go to attention experts, last E to MLP experts.
+        self.num_experts = num_experts
+        self.router = SoftDenseRouter(dim, 2 * num_experts, min_share_loss_weight=10.0,
+                                      cv_loss_weight=2.0, scoring=router_scoring)
+        self.attn_router = self.router  # alias for backward-compat diagnostics
+        self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
-                                         expert_rank=attn_expert_rank, router=self.attn_router,
+                                         expert_rank=attn_expert_rank, router=self.router,
                                          attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
-        self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.mlp_router)
+        self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # iter 33 (opg_doc.tex §6.1): per-expert spectral-norm cap on the
         # dominant-spectral-path output matrices `expert_out` (attn) and
         # `expert_down` (mlp).  These are raw nn.Parameter tensors of shape
@@ -1894,10 +1896,14 @@ class Block(nn.Module):
         b_x0_sub = self._compute_b_x0(x0_sub)
         x = z_sub + b_x0_sub
 
+        # iter 35: single pooled router, split weights at E boundary
+        E = self.num_experts
         x_attn = self.attn_norm(x)
-        w_attn = self.attn_router(x_attn, pre_normed=True)
+        w_all = self.router(x_attn, pre_normed=True)  # (..., 2E)
+        w_attn = w_all[..., :E]
+        w_mlp = w_all[..., E:]
         y_shared = self.attn._attn_shared_from_normed(x_attn)
-        E, R = self.attn.num_experts, self.attn.expert_rank
+        R = self.attn.expert_rank
         y_flat = y_shared.reshape(bsz * t, dim)
         P = self.attn.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, dim)
         h = y_flat @ P.t()
@@ -1907,11 +1913,7 @@ class Block(nn.Module):
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        # Parallel residuals without inner residual (matches forward()): the
-        # MLP reads x, not x + attn_mix.  Ortho diagnostic stays aligned with
-        # the z2 = attn + mlp form in forward().
         x_mlp = self.mlp_norm(x)
-        w_mlp = self.mlp_router(x_mlp, pre_normed=True)
         N = bsz * t
         x_flat = x_mlp.reshape(N, dim)
         E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
@@ -1939,24 +1941,22 @@ class Block(nn.Module):
         u = z_in + b_x0                       # shared router + expert input
         inj_term = None                        # no legacy per-expert injection
 
-        # Routers read u via their learnable RMSNorms (pre_normed=True avoids
-        # double-normalization inside SoftDenseRouter).
-        x_attn_router = self.attn_norm(u)
-        w_attn = self.attn_router(x_attn_router, pre_normed=True)
+        # iter 35 (doc §4.3): single pooled router over 2E experts.
+        # One softmax → one call.  First E weights → attn, last E → MLP.
+        E = self.num_experts
+        u_proj = self.attn_norm(u)
+        w_all = self.router(u_proj, pre_normed=True)  # (..., 2E)
+        w_attn = w_all[..., :E]
+        w_mlp = w_all[..., E:]
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
-            attn_rg = getattr(self.attn_router, "_router_gate_last_mean", None)
+            attn_rg = getattr(self.router, "_router_gate_last_mean", None)
 
-        # Experts share the same (normalized) u — doc §4.4 prescribes a single
-        # shared expert input; keeping attn_norm/mlp_norm as separate norms
-        # is a non-certified convenience (see hypotheses.md Phase 6 iter 33).
-        x_attn = x_attn_router
+        x_attn = u_proj
         y_shared = self.attn._attn_shared_from_normed(x_attn)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn, inj_term=inj_term)
 
-        x_mlp_router = self.mlp_norm(u)
-        w_mlp = self.mlp_router(x_mlp_router, pre_normed=True)
-        x_mlp = x_mlp_router
+        x_mlp = self.mlp_norm(u)
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
 
         attn_mix = self.attn_post_mix_norm(attn_mix)
@@ -1981,7 +1981,8 @@ class Block(nn.Module):
                 self._attn_gate_call_track.append(ag)
             if attn_rg is not None:
                 self._attn_router_gate_call_track.append(attn_rg)
-            mlp_rg = getattr(self.mlp_router, "_router_gate_last_mean", None)
+            # iter 35: single pooled router — attn_rg == mlp_rg (same instance)
+            mlp_rg = attn_rg
             if mlp_rg is not None:
                 self._mlp_router_gate_call_track.append(mlp_rg)
             rg_vals = []
@@ -2202,7 +2203,7 @@ class GPT(nn.Module):
                  deq_backward: str = "revdeq", deq_bptt_k: int = 0,
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
-                 tie_attn_mlp_router: bool = False,  # iter 21: untied is the locked default
+                 tie_attn_mlp_router: bool = True,  # iter 35: always pooled (doc §4.3)
                  router_scoring: str = "linear",
                  attention_l2: bool = False,
                  l2_attn_gamma: float = 1.0,
@@ -2223,7 +2224,7 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                   tie_attn_mlp_router=tie_attn_mlp_router,
+                                   # iter 35: tie_attn_mlp_router removed; single pooled router always
                                    num_experts=self.num_experts,
                                    router_scoring=router_scoring,
                                    attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
@@ -2832,7 +2833,7 @@ def main() -> None:
         f" batch_tokens={args.train_batch_tokens} seq_len={args.train_seq_len}"
         f" refinements={args.num_refinements} refine_ramp_frac={args.num_refinements_ramp_frac}"
         f" ema={int(args.ema_enabled)} ema_decay={args.ema_decay:.4f}"
-        f" tie_router={int(args.tie_attn_mlp_router)}"
+        f" pooled_router=True"
     )
 
     # MODEL
@@ -2850,7 +2851,7 @@ def main() -> None:
         deq_backward=args.deq_backward, deq_bptt_k=args.deq_bptt_k,
         block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
-        tie_attn_mlp_router=args.tie_attn_mlp_router,
+        tie_attn_mlp_router=True,  # iter 35: always pooled
         num_experts=args.num_experts,
         router_scoring=args.router_scoring,
         attention_l2=args.attention_l2,
