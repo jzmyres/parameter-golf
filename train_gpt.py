@@ -181,7 +181,7 @@ class Hyperparameters:
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
     # power-iteration VJP. One boundary forward + one VJP per step.
-    lyapunov_coef = 0.0        # λ_jac: disabled (create_graph VJP crashes under DDP+compile; model converges naturally)
+    lyapunov_coef = 0.01       # λ_jac: weight of hinge penalty (small: ~1% of task loss)
     lyapunov_gamma = 0.9       # γ: target spectral radius (< 1)
     lyapunov_warmup_frac = 0.1 # ramp penalty from 0 over first 10% of steps
 
@@ -2296,6 +2296,72 @@ class GPT(nn.Module):
                 except Exception:
                     pass
 
+    @torch.compiler.disable
+    def _lyapunov_penalty(self, z: Tensor, x0: Tensor) -> tuple[Tensor, Tensor | None]:
+        """Compute Lyapunov spectral-radius penalty OUTSIDE compiled region.
+
+        Uses the SURROGATE LOSS pattern (create_graph=False everywhere):
+        1. VJP: v_next = J_{z*}^T v with create_graph=False
+        2. If ρ̂ = ‖v_next‖ > γ: surrogate = (f(z*) · v_dir).sum()
+           whose grad w.r.t. θ = J^T v_dir (spectral-radius gradient direction)
+        3. Update persistent power-iteration vector v_buf
+
+        Why this works: d/dθ[(f(z*) · v_dir).sum()] = Σ_i v_dir_i · df_i/dθ,
+        which pushes θ to shrink f's projection onto the dominant eigendirection
+        of J — exactly the spectral-radius gradient.
+
+        PRINCIPLE: Never use create_graph=True inside torch.compile regions.
+        torch.compile (AOTAutograd) does NOT support double backward.
+        Use surrogate losses with create_graph=False instead.
+        """
+        z_b = z.detach().requires_grad_(True)
+        with torch.enable_grad():
+            u_b = self.shared_block(z_b, x0.detach())
+
+        # Init or reinit persistent power-iteration vector
+        if self._lyapunov_v_buf is None or self._lyapunov_v_buf.shape != z_b.shape:
+            self._lyapunov_v_buf = F.normalize(
+                torch.randn_like(z_b).detach(), dim=-1, eps=1e-8
+            )
+        v = self._lyapunov_v_buf.detach()
+
+        # VJP: v_next = J^T v (create_graph=False — safe with compile+DDP)
+        v_next = torch.autograd.grad(
+            (u_b * v).sum(), z_b,
+            create_graph=False, retain_graph=True,
+        )[0]
+        rho_hat = v_next.float().norm()
+
+        # Update persistent direction with EMA smoothing (doc §4.2 Remark).
+        # EMA prevents oscillation when Jacobian structure shifts between steps.
+        with torch.no_grad():
+            v_next_f = v_next.float()
+            v_next_norm = v_next_f.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            # Degenerate check: if v_next is near-zero, reinit randomly
+            if v_next_norm.mean() < 1e-6:
+                self._lyapunov_v_buf = F.normalize(
+                    torch.randn_like(z_b).detach(), dim=-1, eps=1e-8
+                )
+            else:
+                v_next_normed = v_next_f / v_next_norm
+                mu = 0.9  # EMA momentum
+                v_old = self._lyapunov_v_buf.float()
+                v_ema = mu * v_old + (1.0 - mu) * v_next_normed
+                self._lyapunov_v_buf = F.normalize(v_ema, dim=-1, eps=1e-8).to(z.dtype)
+
+        if rho_hat <= self.lyapunov_gamma:
+            return rho_hat.detach(), None
+
+        # Surrogate loss: minimize |<f(z*), v_dir>| — shrinks f's projection
+        # onto the dominant eigendirection of J.  Use .abs() so gradient always
+        # pushes toward zero (raw inner product can be negative, causing
+        # gradient to flip direction and oscillate).
+        v_dir = (v_next / rho_hat.clamp(min=1e-8)).detach()
+        surrogate = (u_b * v_dir).sum().abs()  # u_b has grad_fn → params
+        # Scale by (ρ̂ - γ)/ρ̂ to match hinge loss gradient magnitude
+        scale = ((rho_hat - self.lyapunov_gamma) / rho_hat.clamp(min=1e-8)).detach()
+        return rho_hat.detach(), surrogate * scale
+
     def _run_backbone(self, x: Tensor) -> Tensor:
         x0 = x
         z = x
@@ -2371,47 +2437,18 @@ class GPT(nn.Module):
                 self._deq_residuals = [0.0]
 
         # iter 45 (opg_doc.tex §4): Lyapunov penalty at detached equilibrium.
-        # One boundary forward + one VJP to estimate ρ(J_{z*}).
-        # Warmup: ramp λ from 0 over lyapunov_warmup_frac of total steps.
+        # Uses SURROGATE LOSS pattern: no create_graph=True needed.
+        # Wrapped in @torch.compiler.disable to avoid graph interaction.
         self._lyapunov_loss = None
         lyap_step = getattr(self, "_lyapunov_step", 0)
         lyap_total = max(getattr(self, "_lyapunov_total_steps", 1), 1)
         lyap_warmup = int(lyap_total * self.lyapunov_warmup_frac)
         lyap_scale = min(lyap_step / max(lyap_warmup, 1), 1.0) if lyap_warmup > 0 else 1.0
         if self.training and self.lyapunov_coef > 0.0 and lyap_scale > 0.0:
-            z_b = z.detach().requires_grad_(True)
-            # Boundary forward with MATH SDPA backend — FlashAttention's
-            # backward doesn't support create_graph=True (no 2nd-order derivs).
-            # Also disable donated_buffer (torch.compile optimization that
-            # conflicts with create_graph=True / retain_graph=True).
-            import torch._functorch.config as _ftc
-            _prev_donated = _ftc.donated_buffer
-            _ftc.donated_buffer = False
-            from torch.nn.attention import sdpa_kernel, SDPBackend
-            with sdpa_kernel(SDPBackend.MATH):
-                u_b = self.shared_block(z_b, x0_refined)
-            # Persistent power-iteration vector
-            if self._lyapunov_v_buf is None or self._lyapunov_v_buf.shape != z_b.shape:
-                self._lyapunov_v_buf = F.normalize(
-                    torch.randn_like(z_b).detach(), dim=-1, eps=1e-8
-                )
-            v = self._lyapunov_v_buf.detach()  # stop-gradient on direction
-            # VJP: v_next = J^T v (create_graph=True so grads reach θ)
-            v_next = torch.autograd.grad(
-                (u_b * v).sum(), z_b, create_graph=True, retain_graph=True,
-            )[0]
-            rho_hat = v_next.float().norm()
-            self._lyapunov_rho_hat = float(rho_hat.detach().item())
-            # Hinge loss: penalize only when ρ̂ > γ (with warmup scale)
-            self._lyapunov_loss = lyap_scale * self.lyapunov_coef * F.relu(
-                rho_hat - self.lyapunov_gamma
-            )
-            # Update persistent direction (stop-gradient)
-            with torch.no_grad():
-                v_next_det = v_next.detach().float()
-                v_norm = v_next_det.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                self._lyapunov_v_buf = (v_next_det / v_norm).to(z.dtype)
-            _ftc.donated_buffer = _prev_donated
+            rho_hat, surrogate = self._lyapunov_penalty(z, x0_refined)
+            self._lyapunov_rho_hat = float(rho_hat.item())
+            if surrogate is not None:
+                self._lyapunov_loss = lyap_scale * self.lyapunov_coef * surrogate
 
         if self.training:
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:

@@ -635,6 +635,20 @@ Local stability allows multiple equilibria per input.
 This can be beneficial (implicit ``modes''), but can also introduce training noise if the solver hops basins.
 Warm starts and modest damping $\beta$ mitigate basin switching.
 
+\paragraph{Implementation principle: no \texttt{create\_graph=True} inside compiled regions.}
+\texttt{torch.compile} (AOTAutograd) does \textbf{not} support double backward / \texttt{create\_graph=True}.
+Attempting it causes donated-buffer conflicts or SIGSEGV under DDP.
+The Lyapunov penalty must therefore use a \textbf{surrogate loss} pattern:
+\begin{enumerate}[leftmargin=2em,itemsep=0.1em]
+  \item Compute the VJP $v_{\text{next}} = J_{z^\star}^\top v$ with \texttt{create\_graph=False}.
+  \item If $\|v_{\text{next}}\|_2 > \gamma$: define surrogate $S = (f_\theta(z^\star) \cdot \hat{v}_{\text{next}})^\top \mathbf{1}$,
+        where $\hat{v}_{\text{next}} = v_{\text{next}} / \|v_{\text{next}}\|$ is detached.
+  \item $\nabla_\theta S = J^\top \hat{v}_{\text{next}}$ w.r.t.\ $\theta$ (first-order only), which is
+        exactly the spectral-radius gradient direction.
+\end{enumerate}
+Wrap the entire computation in \texttt{@torch.compiler.disable} so it causes a single graph break
+(runs once per training step, negligible overhead). This pattern is DDP-safe and compile-safe.
+
 \appendix
 
 \section{Self-refinement loop (orthogonal; optional)}
