@@ -64,7 +64,7 @@ class TestFusedExpertMix(unittest.TestCase):
         # per-expert hidden (shape (N, E, R)) after leaky_relu².  Mirror that in
         # the explicit path so the parity check holds.
         B_, T_, _, _ = gate_h.shape
-        h_act = F.leaky_relu(gate_h, negative_slope=0.5).square() * fc_h  # [B,T,E,R]
+        h_act = F.leaky_relu(gate_h, negative_slope=0.5) * fc_h  # [B,T,E,R]
         h_flat = h_act.reshape(B_ * T_, mlp.num_experts, mlp.expert_rank)
         h_flat = mlp.hidden_post_norm(h_flat)
         h = h_flat.reshape(B_, T_, mlp.num_experts, mlp.expert_rank)

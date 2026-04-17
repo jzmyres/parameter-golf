@@ -1430,11 +1430,11 @@ class CausalSelfAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MLP with LeakyReLU(0.5)^2
+# MLP with LeakyReLU(0.5)
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
-    """LeakyReLU(0.5)^2-gated MLP expert bank."""
+    """LeakyReLU(0.5)-gated MLP expert bank (1-Lip activation, doc §6.2)."""
     def __init__(self, dim: int, mlp_mult: float, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
@@ -1474,7 +1474,7 @@ class MLP(nn.Module):
         Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h = F.leaky_relu(gate, negative_slope=0.5).square() * fc
+        h = F.leaky_relu(gate, negative_slope=0.5) * fc
         h = h.view(N, E, R)
         # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
         h = self.hidden_post_norm(h)
@@ -1866,7 +1866,7 @@ class Block(nn.Module):
         Fm = self.mlp.expert_fc.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h_mlp = F.leaky_relu(gate, negative_slope=0.5).square() * fc
+        h_mlp = F.leaky_relu(gate, negative_slope=0.5) * fc
         mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)
         down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).transpose(1, 2)  # (E, R, D)
         mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
