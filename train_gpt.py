@@ -1301,14 +1301,11 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
-                 attention_l2: bool = False, l2_attn_gamma: float = 1.0):
+                 **kwargs):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        # iter 36 (opg_doc.tex §6.6): L2-distance attention opt-in flag.
-        self.attention_l2 = bool(attention_l2)
-        self.l2_attn_gamma = float(l2_attn_gamma)
         self.num_experts = num_experts
         self.expert_rank = expert_rank if expert_rank > 0 else max(dim // max(num_experts, 1), 1)
         self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
@@ -1365,47 +1362,20 @@ class CausalSelfAttention(nn.Module):
         k_full = torch.cat([k_rope, k_nope], dim=-1)
         q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
 
-        if getattr(self, "attention_l2", False):
-            # iter 36 (opg_doc.tex §6.6): L2-distance attention via SDPA fast path.
-            #   a_tj ∝ exp(-γ ‖q_t − k_j‖²)
-            #       = exp(-γ‖q_t‖² + 2γ·q_t·k_j − γ‖k_j‖²)
-            # Key observation: q_rope, q_nope, k_rope, k_nope are RMS-normalized
-            # on the feature dim, so ‖q_t‖² = ‖k_j‖² = d_head for all (t, j).
-            # BOTH terms are constants w.r.t. j → cancel in softmax over j.
-            # Thus:
-            #   softmax_j(-γ‖q−k‖²) = softmax_j(2γ·q_t·k_j)
-            # which is standard SDPA with q'=√(2γ)·q, k'=√(2γ)·k and scale=1.0.
-            # Fully 1-Lipschitz under bounded Q, K (doc Prop 6.5); reuses the
-            # fused memory-efficient SDPA kernel with is_causal=True.
-            gamma = self.l2_attn_gamma
-            scale_qk = math.sqrt(2.0 * gamma)
-            q_l2 = q_full * scale_qk
-            k_l2 = k_full * scale_qk
-            try:
-                y = F.scaled_dot_product_attention(
-                    q_l2, k_l2, v, attn_mask=None, is_causal=True, scale=1.0,
-                    enable_gqa=(self.num_kv_heads != self.num_heads),
-                )
-            except TypeError:
-                k_use, v_use = k_l2, v
-                if self.num_kv_heads != self.num_heads:
-                    rep = self.num_heads // self.num_kv_heads
-                    k_use = k_l2.repeat_interleave(rep, dim=1)
-                    v_use = v.repeat_interleave(rep, dim=1)
-                y = F.scaled_dot_product_attention(q_l2, k_use, v_use, attn_mask=None, is_causal=True, scale=1.0)
-        else:
-            try:
-                y = F.scaled_dot_product_attention(
-                    q_full, k_full, v, attn_mask=None, is_causal=True,
-                    enable_gqa=(self.num_kv_heads != self.num_heads),
-                )
-            except TypeError:
-                k_use, v_use = k_full, v
-                if self.num_kv_heads != self.num_heads:
-                    rep = self.num_heads // self.num_kv_heads
-                    k_use = k_full.repeat_interleave(rep, dim=1)
-                    v_use = v.repeat_interleave(rep, dim=1)
-                y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
+        # iter 42 (opg_doc.tex §3.4 Lyapunov): standard FlashAttention SDPA.
+        # L2-distance attention removed — no longer needed without Lip constraints.
+        try:
+            y = F.scaled_dot_product_attention(
+                q_full, k_full, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        except TypeError:
+            k_use, v_use = k_full, v
+            if self.num_kv_heads != self.num_heads:
+                rep = self.num_heads // self.num_kv_heads
+                k_use = k_full.repeat_interleave(rep, dim=1)
+                v_use = v.repeat_interleave(rep, dim=1)
+            y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
 
         attn_gate_act = torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
         y = y * attn_gate_act
@@ -1733,8 +1703,7 @@ class Block(nn.Module):
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 8,
-                 router_scoring: str = "linear",
-                 attention_l2: bool = False, l2_attn_gamma: float = 1.0):
+                 router_scoring: str = "linear", **kwargs):
         super().__init__()
         # iter 41 (opg_doc.tex §3.2 Lyapunov revision): learnable RMSNorm on
         # shared state path h = RMSNorm(z + x_0).  Replaces iter 32's Π_R
@@ -1756,8 +1725,7 @@ class Block(nn.Module):
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
-                                         expert_rank=attn_expert_rank, router=self.router,
-                                         attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
+                                         expert_rank=attn_expert_rank, router=self.router)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # iter 41 (opg_doc.tex §3 Lyapunov revision): remove ALL hard
         # contraction constraints — no spectral-norm caps, no Π_R, no τ-shell,
