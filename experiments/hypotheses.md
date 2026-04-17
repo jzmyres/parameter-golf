@@ -247,6 +247,12 @@ Suggests WD_min ∝ β² (or some power law). Each β increment needs proportion
 **Test:** Iter 17 — small val_bpb win (-0.005) + 33% FP quality improvement. See H22 in OBSERVED.
 **Status:** Moved to OBSERVED as H22.
 
+### H34: Post-mix Π_R may be redundant under full 1-Lip certification — ABLATION REQUIRED
+**Claim:** The Phase 4.5 ablation (22-rm-attn-sdpa-post, 22-rm-hidden-post) showed removing post-non-linearity norms regressed K=128.  BUT that was conducted BEFORE the full 1-Lip certification chain (spectral norms on all expert banks, 1-Lip MLP activation, bounded router prototypes, Π_R on state inputs).  Under the certified design, expert outputs are naturally bounded: ‖expert_out‖ ≤ σ_max(W_out) · ‖hidden‖ ≤ 1 · R.  The weighted sum (softmax, sums to 1) is a convex combination of bounded vectors, also bounded by R.  So Δ_attn and Δ_ffn are theoretically bounded without an explicit Π_R.
+**Prediction:** If the certification is working as designed, removing post-mix norms should NOT regress K=128 Δ significantly (unlike the pre-cert ablation).  If it DOES regress, some component of the cert chain has a practical gap (e.g., bf16 precision eroding the spectral norm guarantee).
+**Test:** iter 39-rm-post-mix-norm (IMMEDIATELY after iter 35 promotes).
+**Status:** PROPOSED — queued, dependent on iter 35 landing.
+
 ### H16: Single-step diffusion CTP enriches embedding gradients
 **Claim:** Noisy soft-embed input + CTP denoising gives gradient to more embedding rows.
 **Test:** Queued (advanced training block)
@@ -504,11 +510,24 @@ the change is broken.
   | 36 L2-attention | perf drop | tune γ for attention sharpness; keep causal mask; try hybrid L2 + softmax convex combo |
   | 37 lipschitz-MLP | perf drop | relax ‖W^(1)‖·‖W^(2)‖ ≤ c with c>1; try GroupSort instead of LeakyReLU; widen hidden dim to recover capacity |
 
-- **Final-state check (after 37 lands):** run K-sweep to K=256+ and verify
+- **Final-state check (after 35 lands):** run K-sweep to K=256+ and verify
   monotone convergence to the Banach fixed point.  If achieved, the
   certified contraction arch is in place as the new permanent baseline.
 
-### Phase 6-contingent (optional, after iter 37 promotes):
+### Phase 6 post-cert ablation (IMMEDIATELY after iter 35 promotes):
+- **39-rm-post-mix-norm** (user direction 2026-04-16): remove `attn_post_mix_norm`
+  and `mlp_post_mix_norm` entirely.  With the full 1-Lip certification chain
+  now in place (spectral norms on all expert banks + 1-Lip activation +
+  bounded prototypes + Π_R on state inputs), expert outputs are naturally
+  bounded — the post-mix Π_R may be redundant.  **The Phase 4.5 ablation that
+  showed these norms were "load-bearing" (22-rm-attn-sdpa-post, 22-rm-hidden-post)
+  was conducted BEFORE 1-Lip certification.**  That conclusion MUST be
+  re-verified under the certified design.  If K=128 Δ stays ≤ 0.5 and
+  val_bpb regression ≤ 0.03: promote (simpler arch, fewer ops).  If it
+  regresses: the cert chain isn't sufficient alone, keep Π_R post-mix.
+  Update opg_doc.tex §4.4 to match the outcome.
+
+### Phase 6-contingent (optional, after post-cert ablation):
 - **30d-deeper-K**: add `deq_k_jitter_set=(4,8,16,24)` on certified arch — tests
   compounding generalization (cf. iter 28c's K=128 Δ=0.015).
 - **30e-TBPTT-deep**: `deq_bptt_k=8` + K∈{4,8,16,32}, compute-neutral vs baseline,
@@ -519,9 +538,9 @@ the change is broken.
   Per the appendix, each outer refinement re-solves $T_{x^{(r)}}$ to its own
   unique fixed point, so Banach still applies per-$r$; the detach on
   $x_0^{(r-1)}$ plus $\alpha\le 0.5$ bounds the outer gradient path.  Tests
-  whether outer-loop prediction-feedback helps task perf.  Depends on 37
+  whether outer-loop prediction-feedback helps task perf.  Depends on 35
   landing (so we measure the marginal effect on the fully-certified arch).
-  **Do NOT run before iter 37** — running on uncertified arch confounds
+  **Do NOT run before iter 35** — running on uncertified arch confounds
   refinement benefit with solver-quality noise.
 
 ### Phase 7+ (deferred): throughput unroll+compile, scaling-law grid, FSQ/rank sweeps
