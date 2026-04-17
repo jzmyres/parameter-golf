@@ -32,10 +32,10 @@ class TestRouterMatmulParity(unittest.TestCase):
         # Match the router's internal pre-processing (no pre_norm, fp32 path).
         x_n = x  # we'll pass pre_normed=True so no internal RMS norm
         p = r(x_n, pre_normed=True)
-        # Re-derive the expected logits via broadcast on the bounded prototypes.
+        # Re-derive the expected logits via broadcast on prototypes (unbounded under Lyapunov).
         with torch.no_grad():
-            c_bounded = r._prototype_ball(r.prototypes).float()
-        ref_route = _broadcast_l2_logits(x_n.float(), c_bounded, r.l2_gamma)
+            c = r.prototypes.float()
+        ref_route = _broadcast_l2_logits(x_n.float(), c, r.l2_gamma)
         ref_route = ref_route + r.expert_bias.float()
         gate_logits = F.logsigmoid(r.router_gate(x_n)).float()
         ref_p = torch.softmax(ref_route + gate_logits, dim=-1)
@@ -66,23 +66,8 @@ class TestRouterMatmulParity(unittest.TestCase):
                 f"{(row_sum - 1.0).abs().max().item()}",
             )
 
-    def test_prototype_ball_caps_norm(self) -> None:
-        """After the BallProjection, no prototype row exceeds radius √d."""
-        torch.manual_seed(3)
-        D, E = 16, 5
-        r = SoftDenseRouter(dim=D, num_experts=E, scoring="l2")
-        # Inflate prototypes so the projection actively clips them.
-        with torch.no_grad():
-            r.prototypes.normal_(std=5.0)
-        import math
-
-        R = math.sqrt(float(D))
-        c_bounded = r._prototype_ball(r.prototypes)
-        norms = c_bounded.norm(dim=-1)
-        self.assertTrue(
-            torch.all(norms <= R + 1e-4).item(),
-            f"prototype row norm exceeds R=√d: max norm={norms.max().item()}",
-        )
+    # test_prototype_ball_caps_norm removed: BallProjection on prototypes
+    # was for 1-Lip enforcement (Banach). Under Lyapunov, prototypes are unbounded.
 
 
 if __name__ == "__main__":

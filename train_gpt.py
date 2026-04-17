@@ -168,18 +168,13 @@ class Hyperparameters:
     router_bias_update = True
     router_bias_lr = 0.10
     router_bias_clip = 10.0
-    # iter 34A (opg_doc.tex §4.3 Option B): router scoring mode.
-    #   "linear" = legacy `W_r x_n + b + log σ(W_g x_n)` (iter 30-33b baseline)
-    #   "l2"     = `tanh(-γ‖x_n − c_j‖²)` with learnable prototypes c_j,
-    #              1-Lipschitz scoring (this iter).
-    router_scoring = "l2"  # iter 34B A/B resolved: L2+tanh wins val_bpb (1.9217 vs SIPS 1.9267); SIPS K-sweep tighter (0.030 vs 0.037) but loses on val_bpb primary
-    # iter 36 (opg_doc.tex §6.6): L2-distance attention in place of SDPA.
-    # a_tj = softmax(-γ · ‖q_t − k_j‖²) (causal). 1-Lipschitz under bounded Q,K.
-    attention_l2 = True
-    # γ = 1/(2·√d_head) ≈ 0.051 gives effective sharpness equivalent to
-    # SDPA's 1/√d scale.  Default γ=1.0 is ~20× sharper (near argmax) — too
-    # peaky for training; use the d_head-matched value.
-    l2_attn_gamma = 0.051  # for d_head=96 (model_dim=768, heads=8)
+    # Router scoring mode. L2-distance scoring with tanh works well empirically.
+    # Under Lyapunov stability, any scoring is fine (no Lip requirement).
+    router_scoring = "l2"
+    # Legacy L2-attention params (iter 42 removed L2-attention branch;
+    # these are kept for backward compat with GPT constructor but unused).
+    attention_l2 = False
+    l2_attn_gamma = 0.051
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
     # tie_attn_mlp_router removed in iter 35: single pooled router is MANDATORY (doc §4.3)
 
@@ -1101,11 +1096,7 @@ class SoftDenseRouter(nn.Module):
         with torch.no_grad():
             nn.init.normal_(self.prototypes, std=0.02)
         self.l2_gamma = 1.0
-        # Phase 6a.3 (review 10): bound prototypes to a fixed-radius ball so
-        # tanh(-γ‖·‖²) cannot saturate flat from an unbounded prototype.  The
-        # ball radius √d matches the expected norm of the RMS-normed router
-        # input (‖x_n‖ ≈ √d).  BallProjection is 1-Lipschitz.
-        self._prototype_ball = BallProjection(dim, R=math.sqrt(float(dim)))
+        # Lyapunov: no prototype bounding needed (was BallProjection for 1-Lip).
         self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32), persistent=True)
         # Input-dependent sigmoid gate on routing weights (iter 17, H14).
         # Init fully open: weight=0, bias=5.0 → sigmoid(5)≈0.993.
@@ -1174,8 +1165,7 @@ class SoftDenseRouter(nn.Module):
             # ‖x‖² + ‖c‖² − 2·x·c in bf16.
             leading = x_n.shape[:-1]
             x_flat_32 = x_n.reshape(-1, D).float()
-            c_bounded = self._prototype_ball(self.prototypes)
-            c_32 = c_bounded.float()
+            c_32 = self.prototypes.float()
             if self.scoring == "l2":
                 # ‖x − c‖² = ‖x‖² + ‖c‖² − 2·x·cᵀ  (fp32-safe GEMM path)
                 xc = x_flat_32 @ c_32.t()  # (N, E)
@@ -1366,8 +1356,10 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(kv_normed).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
 
-        q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
-        k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
+        # iter 45-cleanup: removed _rms_norm on Q/K (was for L2-attention
+        # norm-cancellation trick). Under standard SDPA, Q/K magnitude is
+        # handled by the 1/√d_head scale. NormedLinear pre-norm (kv_pre_norm,
+        # state_norm) provides activation conditioning.
 
         cos, sin = self.rotary(seqlen, x_n.device, q_rope.dtype)
         q_rope = apply_rotary_emb(q_rope, cos, sin)
@@ -1461,7 +1453,7 @@ class CausalSelfAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
-    """LeakyReLU(0.5)-gated MLP expert bank (1-Lip activation, doc §6.2)."""
+    """SwiGLU-gated MLP expert bank (doc §3.4)."""
     def __init__(self, dim: int, mlp_mult: float, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
@@ -2812,7 +2804,7 @@ def main() -> None:
 
     # Phase 6a.2 (review 3): seed u, v for every PerExpertSpectralNormCap so
     # σ estimates are meaningful on the first forward, not random.
-    refresh_spectral_norms(base_model)
+    # refresh_spectral_norms(base_model)  # no-op: spectral norm caps removed (iter 41)
 
     # Compile the DEQ iteration body for throughput.  Always enabled — the
     # ~1.6× real speedup (3.7× benchmark) is a free win on any backward mode
@@ -3121,7 +3113,7 @@ def main() -> None:
         # optimizer step so σ estimates track the freshly-updated W.  Never
         # inside `forward()` — that would break RevDEQ's determinism
         # requirement (Permanent protocol rule 4).
-        refresh_spectral_norms(base_model)
+        # refresh_spectral_norms(base_model)  # no-op: spectral norm caps removed (iter 41)
 
         if args.router_bias_update:
             seen: set[int] = set()
