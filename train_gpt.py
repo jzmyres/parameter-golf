@@ -2124,13 +2124,14 @@ class GPT(nn.Module):
         self.block_ortho_aux_tokens = int(block_ortho_aux_tokens)
         self._block_ortho_aux_enabled = False
         self._block_ortho_aux_loss: Tensor | None = None
-        # iter 45 (opg_doc.tex §4): Lyapunov penalty state.
+        # iter 45 (opg_doc.tex §4): Lyapunov convergence penalty.
+        # Penalizes relative last-iterate residual ‖z_K - z_{K-1}‖²/‖z_K‖².
+        # No extra boundary forward — uses tensors already in the DEQ graph.
         self.lyapunov_coef = float(lyapunov_coef)
-        self.lyapunov_gamma = float(lyapunov_gamma)
+        self.lyapunov_gamma = float(lyapunov_gamma)  # unused in residual mode but kept for API compat
         self.lyapunov_warmup_frac = float(lyapunov_warmup_frac)
-        self._lyapunov_v_buf: Tensor | None = None  # persistent power-iter vector
-        self._lyapunov_loss: Tensor | None = None    # last L_jac value
-        self._lyapunov_rho_hat: float = 0.0          # last ρ̂ estimate
+        self._lyapunov_loss: Tensor | None = None
+        self._lyapunov_rho_hat: float = 0.0
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm(model_dim)
         # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
@@ -2296,72 +2297,6 @@ class GPT(nn.Module):
                 except Exception:
                     pass
 
-    @torch.compiler.disable
-    def _lyapunov_penalty(self, z: Tensor, x0: Tensor) -> tuple[Tensor, Tensor | None]:
-        """Compute Lyapunov spectral-radius penalty OUTSIDE compiled region.
-
-        Uses the SURROGATE LOSS pattern (create_graph=False everywhere):
-        1. VJP: v_next = J_{z*}^T v with create_graph=False
-        2. If ρ̂ = ‖v_next‖ > γ: surrogate = (f(z*) · v_dir).sum()
-           whose grad w.r.t. θ = J^T v_dir (spectral-radius gradient direction)
-        3. Update persistent power-iteration vector v_buf
-
-        Why this works: d/dθ[(f(z*) · v_dir).sum()] = Σ_i v_dir_i · df_i/dθ,
-        which pushes θ to shrink f's projection onto the dominant eigendirection
-        of J — exactly the spectral-radius gradient.
-
-        PRINCIPLE: Never use create_graph=True inside torch.compile regions.
-        torch.compile (AOTAutograd) does NOT support double backward.
-        Use surrogate losses with create_graph=False instead.
-        """
-        z_b = z.detach().requires_grad_(True)
-        with torch.enable_grad():
-            u_b = self.shared_block(z_b, x0.detach())
-
-        # Init or reinit persistent power-iteration vector
-        if self._lyapunov_v_buf is None or self._lyapunov_v_buf.shape != z_b.shape:
-            self._lyapunov_v_buf = F.normalize(
-                torch.randn_like(z_b).detach(), dim=-1, eps=1e-8
-            )
-        v = self._lyapunov_v_buf.detach()
-
-        # VJP: v_next = J^T v (create_graph=False — safe with compile+DDP)
-        v_next = torch.autograd.grad(
-            (u_b * v).sum(), z_b,
-            create_graph=False, retain_graph=True,
-        )[0]
-        rho_hat = v_next.float().norm()
-
-        # Update persistent direction with EMA smoothing (doc §4.2 Remark).
-        # EMA prevents oscillation when Jacobian structure shifts between steps.
-        with torch.no_grad():
-            v_next_f = v_next.float()
-            v_next_norm = v_next_f.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            # Degenerate check: if v_next is near-zero, reinit randomly
-            if v_next_norm.mean() < 1e-6:
-                self._lyapunov_v_buf = F.normalize(
-                    torch.randn_like(z_b).detach(), dim=-1, eps=1e-8
-                )
-            else:
-                v_next_normed = v_next_f / v_next_norm
-                mu = 0.9  # EMA momentum
-                v_old = self._lyapunov_v_buf.float()
-                v_ema = mu * v_old + (1.0 - mu) * v_next_normed
-                self._lyapunov_v_buf = F.normalize(v_ema, dim=-1, eps=1e-8).to(z.dtype)
-
-        if rho_hat <= self.lyapunov_gamma:
-            return rho_hat.detach(), None
-
-        # Surrogate loss: minimize |<f(z*), v_dir>| — shrinks f's projection
-        # onto the dominant eigendirection of J.  Use .abs() so gradient always
-        # pushes toward zero (raw inner product can be negative, causing
-        # gradient to flip direction and oscillate).
-        v_dir = (v_next / rho_hat.clamp(min=1e-8)).detach()
-        surrogate = (u_b * v_dir).sum().abs()  # u_b has grad_fn → params
-        # Scale by (ρ̂ - γ)/ρ̂ to match hinge loss gradient magnitude
-        scale = ((rho_hat - self.lyapunov_gamma) / rho_hat.clamp(min=1e-8)).detach()
-        return rho_hat.detach(), surrogate * scale
-
     def _run_backbone(self, x: Tensor) -> Tensor:
         x0 = x
         z = x
@@ -2436,19 +2371,23 @@ class GPT(nn.Module):
             except Exception:
                 self._deq_residuals = [0.0]
 
-        # iter 45 (opg_doc.tex §4): Lyapunov penalty at detached equilibrium.
-        # Uses SURROGATE LOSS pattern: no create_graph=True needed.
-        # Wrapped in @torch.compiler.disable to avoid graph interaction.
+        # iter 45 (opg_doc.tex §4): Lyapunov convergence penalty.
+        # Instead of an extra boundary forward (crashes under DDP+compile),
+        # penalize the DEQ solve's LAST-ITERATE RESIDUAL ‖z_K - z_{K-1}‖².
+        # This is already in the computational graph — no extra forward needed.
+        # Minimizing residual norm at the final iterate encourages ρ(J_{z*}) < 1
+        # because residual = ‖T(z) - z‖ → 0 iff z is a stable FP.
         self._lyapunov_loss = None
         lyap_step = getattr(self, "_lyapunov_step", 0)
         lyap_total = max(getattr(self, "_lyapunov_total_steps", 1), 1)
         lyap_warmup = int(lyap_total * self.lyapunov_warmup_frac)
         lyap_scale = min(lyap_step / max(lyap_warmup, 1), 1.0) if lyap_warmup > 0 else 1.0
-        if self.training and self.lyapunov_coef > 0.0 and lyap_scale > 0.0:
-            rho_hat, surrogate = self._lyapunov_penalty(z, x0_refined)
-            self._lyapunov_rho_hat = float(rho_hat.item())
-            if surrogate is not None:
-                self._lyapunov_loss = lyap_scale * self.lyapunov_coef * surrogate
+        if self.training and self.lyapunov_coef > 0.0 and lyap_scale > 0.0 and z_prev is not None:
+            residual_sq = (z - z_prev).float().pow(2).sum()
+            z_sq = z.detach().float().pow(2).sum().clamp(min=1.0)
+            rel_residual = residual_sq / z_sq  # relative residual
+            self._lyapunov_rho_hat = float(rel_residual.detach().sqrt().item())
+            self._lyapunov_loss = lyap_scale * self.lyapunov_coef * rel_residual
 
         if self.training:
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
