@@ -2303,10 +2303,14 @@ class GPT(nn.Module):
             d = W.shape[1]
             flat_idx = topk_idx.reshape(B * T, K)
             flat_p = topk_probs.reshape(B * T, K)
-            # Review-9: vectorized weighted embedding (replaces chunk loop).
-            # F.embedding on the full flat index, then weighted sum over K.
-            emb = F.embedding(flat_idx, W)  # (B*T, K, d)
-            flat_out = (flat_p.unsqueeze(-1) * emb).sum(dim=1)  # (B*T, d)
+            # Chunked to avoid OOM: full (B*T, K, d) tensor is ~24 GiB at
+            # production batch size. chunk=512 keeps peak at ~6 MiB per chunk.
+            flat_out = W.new_empty((B * T, d))
+            chunk = 512
+            for s in range(0, B * T, chunk):
+                e = min(s + chunk, B * T)
+                emb = F.embedding(flat_idx[s:e], W)
+                flat_out[s:e] = (flat_p[s:e].unsqueeze(-1) * emb).sum(dim=1)
             soft_embed = flat_out.reshape(B, T, d)
             soft_embed = _rms_norm(soft_embed.to(dtype=z.dtype))
         return soft_embed
