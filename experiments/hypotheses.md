@@ -474,6 +474,7 @@ failure.
 | 37b | post-mix-norm-Π_R | Replace `attn_post_mix_norm` and `mlp_post_mix_norm` from RMSNorm → BallProjection(R=2√d). K=128 Δ spectacularly tight (0.003) but val_bpb regressed +0.069 uniformly. **RMSNorm's learnable scale provides capacity Π_R cannot.** | §4.1 | **REVERTED** | 1.9801 (+0.069 vs 37=1.9111) | 0.003 (best FP ever, but val_bpb fails gate) |
 | 39 | minimal-Π_R | Remove ALL RMSNorm inside T_x, 2×Π_R only (pre+post). Remove ½ factor. | §4.4 | **REVERTED** | 2.0295 (+0.115) | 0.001 |
 | 39b | **certified-contraction** | Homogeneous coord L2-attn (no Q/K rms_norm), exogenous τ(x_0)=τ_max·σ(f(b(x_0))), analytic τ_max=c/L_G, remove ½, R=√d_head. **PERFECT FP: K=128 Δ=0.0000.** But τ≈0.016 too small for val_bpb. P0 fixes (b3ef90e) make τ even smaller (0.0027). | §4.4-4.5 | **REVERTED** (val_bpb +0.22) | 2.1421 (+0.22 vs 35=1.9197) | **0.0000** (perfect FP — Banach validated) |
+| 40 | **orthogonal-experts** | Replace all `PerExpertSpectralNormCap` (σ_max ≤ 1) with `OrthogonalParametrization` (all σ = 1, exact isometry) via Newton-Schulz iteration.  Applied to 5 expert banks + inj_lin.  Stateless (no buffers), RevDEQ-safe.  Base: iter 35 code + Cayley swap. | §6.1 | **PENDING** (smoke test) | TBD | TBD |
 
 **Promotion rule — carry-forward on no-significant-degradation (user direction 2026-04-16):**
 

@@ -153,7 +153,8 @@ class TestExogenousInjectionChunkingInvariance(unittest.TestCase):
         x0 = torch.randn(4, 8, 16)
         with torch.no_grad():
             bx0 = blk._compute_b_x0(x0)
-            inj_term = blk.inj_lin(blk.attn_norm(x0)).to(dtype=x0.dtype)
+            from train_gpt import _rms_norm
+            inj_term = blk.inj_lin(_rms_norm(x0)).to(dtype=x0.dtype)
         self.assertTrue(
             torch.allclose(bx0 - inj_term, x0, atol=1e-5),
             "b(x_0) - U·rms_norm(x_0) must equal x_0",

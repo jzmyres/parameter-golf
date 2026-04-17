@@ -72,7 +72,7 @@ def _get_expert_diagnostics(model):
             if n_exp < 2:
                 continue
             # Flatten each expert's weights to a vector, compute pairwise cosine sim
-            groups = w.view(n_exp, -1)
+            groups = w.reshape(n_exp, -1)
             groups = groups / (groups.norm(dim=-1, keepdim=True) + 1e-8)
             cos = groups @ groups.T
             mask = ~torch.eye(n_exp, dtype=torch.bool, device=cos.device)

@@ -878,18 +878,125 @@ class SpectralNormCap(nn.Module):
         return W * scale
 
 
+class OrthogonalParametrization(nn.Module):
+    """Newton-Schulz orthogonal parametrization for 2D/3D weight tensors.
+
+    Projects W onto the Stiefel manifold so ALL singular values equal 1
+    (isometry).  For a tall (M≥N) matrix, the result satisfies W^T W = I_N;
+    for wide (M<N), W W^T = I_M.  3D tensors (E, M, N) are treated per-slice.
+
+    Replaces PerExpertSpectralNormCap (3D) and SpectralNormCap (2D).
+    **Stateless**: no buffers, no update_uv_() needed — inherently
+    RevDEQ-compatible (Permanent protocol rule 4).
+
+    Uses the quadratic Newton-Schulz iteration:
+        X_{k+1} = X_k @ (1.5·I - 0.5·X_k^T X_k)
+    Converges when all singular values of the scaled input are in (0, √3).
+    Initial scaling divides by σ_max (estimated via 3 power iterations) to
+    guarantee σ_max ≈ 1 before NS iteration — safe for high-condition matrices.
+    """
+
+    def __init__(self, weight_shape: torch.Size, n_iters: int = 20):
+        super().__init__()
+        self.n_iters = int(n_iters)
+        self.ndim = len(weight_shape)
+        assert self.ndim in (2, 3), f"expected 2D or 3D, got {weight_shape}"
+        # Cache: reuse within a DEQ solve (weights don't change between iters).
+        # Invalidated by refresh_orthogonal_cache() after each optimizer step.
+        self._cached: Tensor | None = None
+        self._cache_id: int | None = None  # data_ptr of the raw parameter
+
+    def forward(self, W: Tensor) -> Tensor:
+        # Cache hit: same raw parameter data → same orthogonalized output.
+        w_id = W.data_ptr()
+        if self._cache_id == w_id and self._cached is not None:
+            return self._cached
+        W32 = W.float()
+        if self.ndim == 3:
+            result = self._ortho_3d(W32).to(W.dtype)
+        else:
+            result = self._ortho_2d(W32).to(W.dtype)
+        self._cached = result
+        self._cache_id = w_id
+        return result
+
+    def invalidate_cache(self) -> None:
+        self._cached = None
+        self._cache_id = None
+
+    @staticmethod
+    def _sigma_max_3d(W: Tensor, n_iters: int = 3) -> Tensor:
+        """Estimate per-expert σ_max via power iteration. Returns (E, 1, 1).
+        Uses deterministic init (ones) — NOT torch.randn — so repeated calls
+        on the same W give identical results (RevDEQ requirement)."""
+        E, M, N = W.shape
+        u = torch.ones(E, M, 1, device=W.device, dtype=W.dtype)
+        u = F.normalize(u, dim=-2, eps=1e-12)
+        for _ in range(n_iters):
+            v = F.normalize(torch.bmm(W.transpose(-2, -1), u), dim=-2, eps=1e-12)
+            u = F.normalize(torch.bmm(W, v), dim=-2, eps=1e-12)
+        sigma = torch.bmm(u.transpose(-2, -1), torch.bmm(W, v)).abs()  # (E, 1, 1)
+        return sigma.clamp(min=1e-6)
+
+    @staticmethod
+    def _sigma_max_2d(W: Tensor, n_iters: int = 3) -> Tensor:
+        """Estimate σ_max via power iteration. Returns scalar.
+        Deterministic init (ones) for RevDEQ compatibility."""
+        M, N = W.shape
+        u = torch.ones(M, device=W.device, dtype=W.dtype)
+        u = F.normalize(u, dim=0, eps=1e-12)
+        for _ in range(n_iters):
+            v = F.normalize(W.t() @ u, dim=0, eps=1e-12)
+            u = F.normalize(W @ v, dim=0, eps=1e-12)
+        return (u @ W @ v).abs().clamp(min=1e-6)
+
+    def _ortho_3d(self, W: Tensor) -> Tensor:
+        E, M, N = W.shape
+        transposed = M < N
+        if transposed:
+            W = W.transpose(-2, -1)
+            M, N = N, M
+        # Scale by σ_max so largest singular value ≈ 1 (convergence guarantee).
+        sigma = self._sigma_max_3d(W)  # (E, 1, 1)
+        W = W / sigma
+        I = torch.eye(N, device=W.device, dtype=W.dtype).unsqueeze(0)  # (1, N, N)
+        for _ in range(self.n_iters):
+            WtW = torch.bmm(W.transpose(-2, -1), W)       # (E, N, N)
+            W = torch.bmm(W, 1.5 * I - 0.5 * WtW)        # (E, M, N)
+        if transposed:
+            W = W.transpose(-2, -1)
+        return W
+
+    def _ortho_2d(self, W: Tensor) -> Tensor:
+        M, N = W.shape
+        transposed = M < N
+        if transposed:
+            W = W.t()
+            M, N = N, M
+        sigma = self._sigma_max_2d(W)
+        W = W / sigma
+        I = torch.eye(N, device=W.device, dtype=W.dtype)
+        for _ in range(self.n_iters):
+            WtW = W.t() @ W                                # (N, N)
+            W = W @ (1.5 * I - 0.5 * WtW)                 # (M, N)
+        if transposed:
+            W = W.t()
+        return W
+
+
 _SPECTRAL_CAP_TYPES = (PerExpertSpectralNormCap, SpectralNormCap)
 
 
 def refresh_spectral_norms(model: nn.Module) -> None:
-    """Walk `model` and run one power iteration for every spectral-norm
-    cap parametrization (both 2D `SpectralNormCap` and 3D
-    `PerExpertSpectralNormCap`), refreshing `u`, `v` buffers so σ
-    estimates track `W` as training updates it.
+    """Walk `model` and refresh all weight parametrizations.
 
-    Call once right after model construction (so the first forward has
-    non-random u/v) and once per optimizer step (after `opt.step()`,
-    before the next forward).
+    For spectral-norm caps: run one power iteration to update u/v buffers.
+    For orthogonal parametrizations: invalidate the cache so the next
+    forward recomputes the orthogonalized weight (the optimizer may have
+    changed the raw parameter since last forward).
+
+    Call once right after model construction and once per optimizer step
+    (after `opt.step()`, before the next forward).
     """
     for mod in model.modules():
         plist_dict = getattr(mod, "parametrizations", None)
@@ -902,6 +1009,8 @@ def refresh_spectral_norms(model: nn.Module) -> None:
             for p in plist:
                 if isinstance(p, _SPECTRAL_CAP_TYPES):
                     p.update_uv_(W)
+                elif isinstance(p, OrthogonalParametrization):
+                    p.invalidate_cache()
 
 
 class CastedLinear(nn.Linear):
@@ -1103,18 +1212,10 @@ class SoftDenseRouter(nn.Module):
         # Input-dependent sigmoid gate on routing weights (iter 17, H14).
         # Init fully open: weight=0, bias=5.0 → sigmoid(5)≈0.993.
         # The model can learn to suppress specific experts per-token.
-        # P0-fix #4: router_gate FROZEN to constant open (weight=0, bias=5.0).
-        # The gate adds logsigmoid(W_g·x + b_g) to logits before softmax.
-        # An unconstrained W_g makes the router's total Lipschitz unbounded,
-        # breaking the τ_max = c/L_G contraction proof.  Freezing W_g=0
-        # makes the gate a constant bias (logsigmoid(5) ≈ -0.007) that
-        # doesn't affect router Lipschitz.
         self.router_gate = CastedLinear(dim, num_experts, bias=True)
         with torch.no_grad():
             self.router_gate.weight.zero_()
             self.router_gate.bias.fill_(5.0)
-        self.router_gate.weight.requires_grad_(False)
-        self.router_gate.bias.requires_grad_(False)
         self._router_gate_last_mean: float | None = None
         self._mean_share_last: Tensor | None = None
         self._balance_loss = None
@@ -1330,14 +1431,6 @@ class CausalSelfAttention(nn.Module):
         self.c_k_nope = CastedLinear(self.kv_latent_dim, num_kv_heads * self.nope_dim, bias=False)
         self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
         self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
-        # P0-fix #5: spectral-norm cap on all shared attention linear maps.
-        # opg_doc.tex §6.1 requires ‖W‖_2 ≤ 1 for L_attn bound to hold.
-        # Without this, L_attn = 1+4γR² is invalid (projections unbounded).
-        for _attn_lin in (self.c_q, self.c_kv_down, self.c_k_nope, self.c_v, self.c_k_rope):
-            torch.nn.utils.parametrize.register_parametrization(
-                _attn_lin, "weight",
-                SpectralNormCap(_attn_lin.weight.shape),
-            )
         self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         # Layout (E, D, R) matches repo tests/experiments. Computation uses
         # a transpose view to (E, R, D) so we can do batched GEMMs without
@@ -1346,14 +1439,7 @@ class CausalSelfAttention(nn.Module):
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_proj.data[e])
             nn.init.xavier_uniform_(self.expert_out.data[e])
-        # P0-fix #6: bound q_gain via sigmoid reparameterization.
-        # q_gain multiplies q_full, expanding the effective query radius.
-        # Unbounded q_gain makes L_attn = 1+4γ(q_gain·R)² unbounded.
-        # Fix: q_gain = q_gain_max * sigmoid(raw), where q_gain_max is a
-        # fixed hyperparameter included in the L_attn computation.
-        self.q_gain_max: float = float(qk_gain_init) * 2.0  # max = 2× init
-        _q_gain_raw_init = math.log(qk_gain_init / (self.q_gain_max - qk_gain_init + 1e-8))
-        self.q_gain_raw = nn.Parameter(torch.full((num_heads,), _q_gain_raw_init, dtype=torch.float32))
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
         # Gate bias init at 0 (mid-point sigmoid) per EXPERIENCE.md
         self.gate_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
@@ -1363,9 +1449,8 @@ class CausalSelfAttention(nn.Module):
         self._attn_gate_last_mean: float | None = None  # per-call attn gate mean
         # Phase 4.5 22-add-all: RMSNorm after gated SDPA (post-non-linearity).
         # Normalizes per-head attention output before the expert mix projection.
-        # iter 39b: attn_sdpa_post_norm REMOVED (RMSNorm not 1-Lip inside T_x)
+        self.attn_sdpa_post_norm = RMSNorm(dim)
 
-    @dynamo_disable
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         bsz, seqlen, dim = x_n.shape
         q_and_gate = self.c_q(x_n)
@@ -1378,9 +1463,8 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
 
-        # iter 39b: Q/K _rms_norm REMOVED — replaced by homogeneous coordinate
-        # L2-attention trick that absorbs ‖k‖² into the dot product.
-        # No normalization singularity, fully 1-Lip projections, exact L2 attn.
+        q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
+        k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
 
         cos, sin = self.rotary(seqlen, x_n.device, q_rope.dtype)
         q_rope = apply_rotary_emb(q_rope, cos, sin)
@@ -1388,62 +1472,36 @@ class CausalSelfAttention(nn.Module):
 
         q_full = torch.cat([q_rope, q_nope], dim=-1)
         k_full = torch.cat([k_rope, k_nope], dim=-1)
-        # P0-fix #6: bounded q_gain = q_gain_max * sigmoid(raw)
-        q_gain = self.q_gain_max * torch.sigmoid(self.q_gain_raw).to(dtype=q_full.dtype)
-        q_full = q_full * q_gain[None, :, None, None]
+        q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
 
         if getattr(self, "attention_l2", False):
-            # iter 39b: Homogeneous Coordinate L2-Attention
-            # Maps L2-distance attention into standard dot-product via D+1 augmentation:
-            #   Q_aug = [√(2γ)·q, √γ]
-            #   K_aug = [√(2γ)·k, -√γ·‖k‖²]
-            # Then ⟨Q_aug, K_aug⟩ = 2γ⟨q,k⟩ - γ‖k‖² = softmax_j(-γ‖q-k_j‖²)
-            # (the -γ‖q‖² term cancels in softmax over j).
-            # No Q/K normalization needed — ‖k‖² absorbed into the augmented dim.
-            # Flash attention works natively with hardware-aligned padding.
+            # iter 36 (opg_doc.tex §6.6): L2-distance attention via SDPA fast path.
+            #   a_tj ∝ exp(-γ ‖q_t − k_j‖²)
+            #       = exp(-γ‖q_t‖² + 2γ·q_t·k_j − γ‖k_j‖²)
+            # Key observation: q_rope, q_nope, k_rope, k_nope are RMS-normalized
+            # on the feature dim, so ‖q_t‖² = ‖k_j‖² = d_head for all (t, j).
+            # BOTH terms are constants w.r.t. j → cancel in softmax over j.
+            # Thus:
+            #   softmax_j(-γ‖q−k‖²) = softmax_j(2γ·q_t·k_j)
+            # which is standard SDPA with q'=√(2γ)·q, k'=√(2γ)·k and scale=1.0.
+            # Fully 1-Lipschitz under bounded Q, K (doc Prop 6.5); reuses the
+            # fused memory-efficient SDPA kernel with is_causal=True.
             gamma = self.l2_attn_gamma
-            sqrt_2g = math.sqrt(2.0 * gamma)
-            sqrt_g = math.sqrt(gamma)
-            D = q_full.shape[-1]
-            # Pad to next multiple of 8 for flash attention hardware alignment
-            aug_dim = D + 1
-            pad_len = (8 - aug_dim % 8) % 8
-            aug_total = aug_dim + pad_len
-
-            # Augment Q: [√(2γ)·q, √γ, 0...0]
-            # MUST use functional ops (cat+pad), NOT new_zeros+inplace fill.
-            # Inplace mutation of freshly-allocated tensors inside compiled
-            # graphs corrupts AOT autograd's alias tracker (Principle 7).
-            q_scaled = q_full * sqrt_2g
-            q_slack = q_full.new_full((*q_full.shape[:-1], 1), sqrt_g)
-            q_aug = torch.cat([q_scaled, q_slack], dim=-1)
-            if pad_len > 0:
-                q_aug = F.pad(q_aug, (0, pad_len))
-
-            # Augment K: [√(2γ)·k, -√γ·‖k‖², 0...0]
-            k_norm_sq = k_full.float().pow(2).sum(dim=-1, keepdim=True).to(k_full.dtype)
-            k_scaled = k_full * sqrt_2g
-            k_slack = -sqrt_g * k_norm_sq
-            k_aug = torch.cat([k_scaled, k_slack], dim=-1)
-            if pad_len > 0:
-                k_aug = F.pad(k_aug, (0, pad_len))
-
-            # Pad V to match augmented dim
-            v_aug = F.pad(v, (0, aug_total - v.shape[-1]))
-
+            scale_qk = math.sqrt(2.0 * gamma)
+            q_l2 = q_full * scale_qk
+            k_l2 = k_full * scale_qk
             try:
-                y_aug = F.scaled_dot_product_attention(
-                    q_aug, k_aug, v_aug, attn_mask=None, is_causal=True, scale=1.0,
+                y = F.scaled_dot_product_attention(
+                    q_l2, k_l2, v, attn_mask=None, is_causal=True, scale=1.0,
                     enable_gqa=(self.num_kv_heads != self.num_heads),
                 )
             except TypeError:
-                k_use, v_use = k_aug, v_aug
+                k_use, v_use = k_l2, v
                 if self.num_kv_heads != self.num_heads:
                     rep = self.num_heads // self.num_kv_heads
-                    k_use = k_aug.repeat_interleave(rep, dim=1)
-                    v_use = v_aug.repeat_interleave(rep, dim=1)
-                y_aug = F.scaled_dot_product_attention(q_aug, k_use, v_use, attn_mask=None, is_causal=True, scale=1.0)
-            y = y_aug[..., :v.shape[-1]]  # truncate padding
+                    k_use = k_l2.repeat_interleave(rep, dim=1)
+                    v_use = v.repeat_interleave(rep, dim=1)
+                y = F.scaled_dot_product_attention(q_l2, k_use, v_use, attn_mask=None, is_causal=True, scale=1.0)
         else:
             try:
                 y = F.scaled_dot_product_attention(
@@ -1464,7 +1522,7 @@ class CausalSelfAttention(nn.Module):
             self._attn_gate_last_mean = float(attn_gate_act.detach().float().mean().item())
         y_out = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         # Phase 4.5 22-add-all: RMSNorm after gated SDPA.
-        return y_out  # iter 39b: post-norm removed
+        return self.attn_sdpa_post_norm(y_out)
 
     def mix_experts_from_shared(self, y: Tensor, w: Tensor,
                                  *, inj_term: Tensor | None = None) -> Tensor:
@@ -1547,7 +1605,7 @@ class MLP(nn.Module):
         self._out_ortho_loss: Tensor | None = None
         # Phase 4.5 22-add-all: RMSNorm on per-expert hidden (after leaky_relu²).
         # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
-        # iter 39b: hidden_post_norm REMOVED (RMSNorm not 1-Lip inside T_x)
+        self.hidden_post_norm = RMSNorm(self.expert_rank)
 
     def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
                     inj_term: Tensor | None = None) -> Tensor:
@@ -1568,7 +1626,8 @@ class MLP(nn.Module):
         fc = x_flat @ Fm.t()
         h = F.leaky_relu(gate, negative_slope=0.5) * fc
         h = h.view(N, E, R)
-        # iter 39b: hidden_post_norm removed (not 1-Lip)
+        # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
+        h = self.hidden_post_norm(h)
         h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
@@ -1792,11 +1851,7 @@ class Block(nn.Module):
         # always.  Radius R = 2·√d ≈ 55.4 for dim=768 — large enough to act
         # as identity on typical hidden states (‖u‖≈√d·σ with σ≈1) while
         # bounding the rare norm-blowup case.
-        # iter 39b: R = √d_head (not 2√d_model).  Smaller R → tighter Lip(attn)
-        # bound → larger analytic τ → more useful contraction.
-        # L_attn = 1 + 4γR²; with R=√d_head≈9.8, γ=0.051: L_attn≈20.6.
-        _head_dim = dim // num_heads
-        _R_state = math.sqrt(float(_head_dim))
+        _R_state = 2.0 * math.sqrt(float(dim))
         self.attn_norm = BallProjection(dim, R=_R_state)
         self.mlp_norm = BallProjection(dim, R=_R_state)
         # iter 30 (opg_doc.tex §4.5 + user direction 2026-04-16): post_norm REMOVED.
@@ -1815,7 +1870,8 @@ class Block(nn.Module):
         # +0.069 (1.911→1.980).  RMSNorm's learnable scale provides
         # capacity that Π_R's hard clamp cannot.  Kept as RMSNorm;
         # iter 39 will test removing entirely.
-        # iter 39b: post-mix norms REMOVED (RMSNorm not 1-Lip inside T_x)
+        self.attn_post_mix_norm = RMSNorm(dim)
+        self.mlp_post_mix_norm = RMSNorm(dim)
         # iter 35 (opg_doc.tex §4.3, MANDATORY): single pooled router over
         # E_attn + E_mlp = 2E experts.  One softmax across the combined pool
         # forces per-token attention-vs-MLP budget allocation.  First E weights
@@ -1830,36 +1886,19 @@ class Block(nn.Module):
                                          expert_rank=attn_expert_rank, router=self.router,
                                          attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
-        # iter 33 (opg_doc.tex §6.1): per-expert spectral-norm cap on the
-        # dominant-spectral-path output matrices `expert_out` (attn) and
-        # `expert_down` (mlp).  These are raw nn.Parameter tensors of shape
-        # (E, D, R), so we register a custom per-expert parametrization that
-        # caps σ_max(W_e) ≤ 1 per-expert via 1 power iteration per forward.
-        # Starts narrow: only the OUTPUT projections; other expert weights
-        # (expert_proj, expert_gate, expert_fc) are deferred to iter 33b if
-        # this one lands cleanly.  The Lipschitz of the full expert path is
-        # bounded by σ_max(W_in) · Lip(nonlin) · σ_max(W_out), so capping
-        # W_out alone still provides a meaningful Lipschitz reduction.
-        torch.nn.utils.parametrize.register_parametrization(
-            self.attn, "expert_out",
-            PerExpertSpectralNormCap(self.attn.expert_out.shape),
-        )
-        torch.nn.utils.parametrize.register_parametrization(
-            self.attn, "expert_proj",
-            PerExpertSpectralNormCap(self.attn.expert_proj.shape),
-        )
-        torch.nn.utils.parametrize.register_parametrization(
-            self.mlp, "expert_gate",
-            PerExpertSpectralNormCap(self.mlp.expert_gate.shape),
-        )
-        torch.nn.utils.parametrize.register_parametrization(
-            self.mlp, "expert_fc",
-            PerExpertSpectralNormCap(self.mlp.expert_fc.shape),
-        )
-        torch.nn.utils.parametrize.register_parametrization(
-            self.mlp, "expert_down",
-            PerExpertSpectralNormCap(self.mlp.expert_down.shape),
-        )
+        # iter 40 (opg_doc.tex §6.1): orthogonal parametrization via
+        # Newton-Schulz iteration on ALL expert banks.  Forces every per-expert
+        # weight slice to have all singular values = 1 (isometry), making each
+        # expert exactly 1-Lipschitz.  Replaces iter 33's spectral-norm cap
+        # (σ_max ≤ 1) with exact orthogonality (σ = 1 for ALL singular values).
+        # Stateless — no buffers, inherently RevDEQ-compatible.
+        for name, mod in [("expert_out", self.attn), ("expert_proj", self.attn),
+                          ("expert_gate", self.mlp), ("expert_fc", self.mlp),
+                          ("expert_down", self.mlp)]:
+            torch.nn.utils.parametrize.register_parametrization(
+                mod, name,
+                OrthogonalParametrization(getattr(mod, name).shape),
+            )
         # Phase 5b iter 23C-gg-no-residual: gg_gate REMOVED and z residual
         # REMOVED.  New update form:
         #     raw_out = 0.5 * z2            (where z2 = attn_mix + mlp_mix)
@@ -1896,83 +1935,28 @@ class Block(nn.Module):
         self.inj_lin = CastedLinear(dim, dim, bias=False)  # U: learned adapter
         with torch.no_grad():
             nn.init.normal_(self.inj_lin.weight, std=0.02)
-        # iter 31 (opg_doc.tex §6.1): enforce ‖U‖_2 ≤ 1.  Uses our stateless
-        # SpectralNormCap (not PyTorch's built-in spectral_norm) because the
-        # built-in mutates u/v buffers during train-mode forward, breaking
-        # RevDEQ's determinism requirement.  Our version is stateless in
-        # forward(); update_uv_() is called once per opt step via
-        # refresh_spectral_norms() (Permanent protocol rule 4).
+        # iter 40 (opg_doc.tex §6.1): orthogonal U via Newton-Schulz.
+        # Exact isometry (all σ = 1) replaces iter 31's spectral-norm cap
+        # (σ_max ≤ 1).  Stateless — no buffers, RevDEQ-compatible.
         torch.nn.utils.parametrize.register_parametrization(
             self.inj_lin, "weight",
-            SpectralNormCap(self.inj_lin.weight.shape),
+            OrthogonalParametrization(self.inj_lin.weight.shape),
         )
         # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).  τ ∈ (0, τ_max]
         # via sigmoid-parameterized scalar; τ_max<1 guarantees strict contraction
         # (Banach → unique FP, global convergence).
-        # P0-fix #8: recompute L_G from actual implemented bounds.
-        # Named terms for each certified component:
-        _gamma = float(l2_attn_gamma) if attention_l2 else 1.0 / math.sqrt(float(_head_dim))
-        _q_gain_max = float(self.attn.q_gain_max)
-        _R_q = _q_gain_max * _R_state  # effective query radius (q_gain scales q)
-        # L_attn: attention expert Lip on bounded Q(radius _R_q), K(radius _R_state)
-        _L_attn = 1.0 + 4.0 * _gamma * (_R_q + _R_state) ** 2
-        # L_ffn: MLP expert Lip — gated product leaky_relu(gate)*fc on bounded
-        # inputs with spectral-normed weights.  Conservative: Lip ≤ 2R (product
-        # of two R-bounded signals each with Lip=1 linear + 1-Lip activation).
-        _L_ffn = 2.0 * _R_state
-        # L_expert_max: worst-case expert Lipschitz
-        _L_expert_max = max(_L_attn, _L_ffn)
-        # L_w: router Lipschitz.  With frozen router_gate (P0-fix #4),
-        # only L2-scoring contributes.  L2 logits: Lip ≤ 2γ(R_q+R_c).
-        # Softmax: ½-Lip.  Output in ℓ₂; convert to ℓ₁ via √E factor.
-        E_total = 2 * num_experts
-        _L_s = 2.0 * _gamma * 2.0 * _R_state  # L2-scoring logit Lip
-        _L_w_l2 = 0.5 * _L_s  # softmax ½-Lip
-        _L_w_l1 = math.sqrt(float(E_total)) * _L_w_l2  # ℓ₂ → ℓ₁ conversion
-        # B_tok: per-token output bound (expert outputs bounded by R via Π_R input + σ_max ≤ 1)
-        _B_tok = _R_state
-        # L_G: mixture Lip = L_expert_max + B_tok · L_w_l1
-        _L_G = _L_expert_max + _B_tok * _L_w_l1
-        _c = 0.95  # safety margin
-        self._tau_max: float = _c / _L_G
-        # Store named components for logging
-        self._L_G_parts = {
-            "L_attn": _L_attn, "L_ffn": _L_ffn, "L_expert_max": _L_expert_max,
-            "L_w_l1": _L_w_l1, "B_tok": _B_tok, "L_G": _L_G,
-            "tau_max": self._tau_max, "R": _R_state, "gamma": _gamma,
-            "q_gain_max": _q_gain_max,
-        }
-        # Input-dependent τ: τ(u) = τ_max · sigmoid(f(u)), capped at τ_max.
-        # Each token gets its own τ — more expressive within the contraction
-        # budget.  Max is analytically bounded → Banach guaranteed.
-        self.tau_gate = CastedLinear(dim, 1, bias=True)
-        with torch.no_grad():
-            self.tau_gate.weight.zero_()
-            # Init bias so sigmoid(bias) ≈ 0.5 → τ ≈ τ_max/2 initially
-            self.tau_gate.bias.fill_(0.0)
-        # Legacy compat
-        self.tau_param = nn.Parameter(torch.tensor(0.0), requires_grad=False)
+        self.tau_max: float = 0.9
+        self.tau_param = nn.Parameter(torch.tensor(-1.0))  # sigmoid(-1)≈0.27 → τ≈0.24 init
+        # Retain _inj_gate_last_mean attr name for logging compat (always 1.0 now)
         self._inj_gate_last_mean: float | None = None
 
     def _compute_b_x0(self, x0: Tensor) -> Tensor:
-        """Exogenous injection b(x_0) = x_0 + U·Π_R(x_0) (iter 39b, 1-Lip)."""
-        return x0 + self.inj_lin(self.attn_norm(x0)).to(dtype=x0.dtype)
+        """Exogenous injection b(x_0) = x_0 + U·rms_norm(x_0) (doc §4.2)."""
+        return x0 + self.inj_lin(_rms_norm(x0)).to(dtype=x0.dtype)
 
-    def _tau(self, x0_signal: Tensor | None = None) -> Tensor:
-        """Exogenous τ(x_0) = τ_max · sigmoid(f(x_0)), capped at τ_max.
-
-        CRITICAL: x0_signal must depend ONLY on x_0 (the exogenous input),
-        NOT on the solver state z.  If τ depended on z, the product rule
-        gives an unbudgeted ∇_z τ term that breaks the contraction proof.
-        With τ(x_0): ∇_z τ = 0, so Lip_z(T_x) = τ · L_G ≤ c < 1.
-
-        In Block.forward, pass b_x0 (which is a function of x_0 only).
-        Falls back to τ_max/2 if None (diagnostic calls)."""
-        if x0_signal is None:
-            return torch.tensor(self._tau_max * 0.5, device=self.tau_param.device)
-        # Per-token τ: (B, T, 1), exogenous w.r.t. z
-        tau = self._tau_max * torch.sigmoid(self.tau_gate(x0_signal))
-        return tau
+    def _tau(self) -> Tensor:
+        """τ = τ_max · sigmoid(tau_param) ∈ (0, τ_max). doc §4.5."""
+        return self.tau_max * torch.sigmoid(self.tau_param)
 
     @dynamo_disable
     def _record_gg_diag(self, gg_tok: Tensor) -> None:
@@ -2070,20 +2054,14 @@ class Block(nn.Module):
         x_mlp = self.mlp_norm(u)
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
 
-        # iter 39b: post-mix norms removed (not 1-Lip inside T_x)
+        attn_mix = self.attn_post_mix_norm(attn_mix)
+        mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
-        # iter 39b: G_θ = Σ w_e E_e(u) — exact convex combination from the
-        # pooled router (Σ w_e = 1).  The 0.5 was an artifact of split routers
-        # (each summing to 1 independently); with a single softmax it
-        # artificially halved capacity.
-        G = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
+        # G_θ: parallel mixture with the 0.5 stabilizing scale (doc §4.4).
+        G = 0.5 * (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
-        # iter 39b fix: τ depends on x_0 ONLY (exogenous), NOT on z.
-        # If τ depended on z (via u_proj = Π_R(z+b(x0))), the product rule
-        # gives ∇_z T_x = (G-b)⊗∇_z τ + τ·∇_z G, and the first "gradient
-        # leak" term is unbudgeted — breaks the contraction proof.
-        # With τ(x_0): ∇_z τ = 0, so Lip_z(T_x) = τ·L_G ≤ c < 1. QED.
-        tau = self._tau(b_x0).to(dtype=z_in.dtype)  # (B, T, 1), exogenous
+        # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).
+        tau = self._tau().to(dtype=z_in.dtype)
         raw_out = (1.0 - tau) * b_x0 + tau * G
 
         if _tracking:
