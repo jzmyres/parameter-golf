@@ -1342,6 +1342,7 @@ class CausalSelfAttention(nn.Module):
         # Normalizes per-head attention output before the expert mix projection.
         # iter 39b: attn_sdpa_post_norm REMOVED (RMSNorm not 1-Lip inside T_x)
 
+    @dynamo_disable
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         bsz, seqlen, dim = x_n.shape
         q_and_gate = self.c_q(x_n)
