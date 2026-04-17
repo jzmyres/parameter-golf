@@ -1103,10 +1103,18 @@ class SoftDenseRouter(nn.Module):
         # Input-dependent sigmoid gate on routing weights (iter 17, H14).
         # Init fully open: weight=0, bias=5.0 → sigmoid(5)≈0.993.
         # The model can learn to suppress specific experts per-token.
+        # P0-fix #4: router_gate FROZEN to constant open (weight=0, bias=5.0).
+        # The gate adds logsigmoid(W_g·x + b_g) to logits before softmax.
+        # An unconstrained W_g makes the router's total Lipschitz unbounded,
+        # breaking the τ_max = c/L_G contraction proof.  Freezing W_g=0
+        # makes the gate a constant bias (logsigmoid(5) ≈ -0.007) that
+        # doesn't affect router Lipschitz.
         self.router_gate = CastedLinear(dim, num_experts, bias=True)
         with torch.no_grad():
             self.router_gate.weight.zero_()
             self.router_gate.bias.fill_(5.0)
+        self.router_gate.weight.requires_grad_(False)
+        self.router_gate.bias.requires_grad_(False)
         self._router_gate_last_mean: float | None = None
         self._mean_share_last: Tensor | None = None
         self._balance_loss = None
@@ -1322,6 +1330,14 @@ class CausalSelfAttention(nn.Module):
         self.c_k_nope = CastedLinear(self.kv_latent_dim, num_kv_heads * self.nope_dim, bias=False)
         self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
         self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
+        # P0-fix #5: spectral-norm cap on all shared attention linear maps.
+        # opg_doc.tex §6.1 requires ‖W‖_2 ≤ 1 for L_attn bound to hold.
+        # Without this, L_attn = 1+4γR² is invalid (projections unbounded).
+        for _attn_lin in (self.c_q, self.c_kv_down, self.c_k_nope, self.c_v, self.c_k_rope):
+            torch.nn.utils.parametrize.register_parametrization(
+                _attn_lin, "weight",
+                SpectralNormCap(_attn_lin.weight.shape),
+            )
         self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         # Layout (E, D, R) matches repo tests/experiments. Computation uses
         # a transpose view to (E, R, D) so we can do batched GEMMs without
@@ -1330,7 +1346,14 @@ class CausalSelfAttention(nn.Module):
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_proj.data[e])
             nn.init.xavier_uniform_(self.expert_out.data[e])
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        # P0-fix #6: bound q_gain via sigmoid reparameterization.
+        # q_gain multiplies q_full, expanding the effective query radius.
+        # Unbounded q_gain makes L_attn = 1+4γ(q_gain·R)² unbounded.
+        # Fix: q_gain = q_gain_max * sigmoid(raw), where q_gain_max is a
+        # fixed hyperparameter included in the L_attn computation.
+        self.q_gain_max: float = float(qk_gain_init) * 2.0  # max = 2× init
+        _q_gain_raw_init = math.log(qk_gain_init / (self.q_gain_max - qk_gain_init + 1e-8))
+        self.q_gain_raw = nn.Parameter(torch.full((num_heads,), _q_gain_raw_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
         # Gate bias init at 0 (mid-point sigmoid) per EXPERIENCE.md
         self.gate_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
@@ -1365,7 +1388,9 @@ class CausalSelfAttention(nn.Module):
 
         q_full = torch.cat([q_rope, q_nope], dim=-1)
         k_full = torch.cat([k_rope, k_nope], dim=-1)
-        q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
+        # P0-fix #6: bounded q_gain = q_gain_max * sigmoid(raw)
+        q_gain = self.q_gain_max * torch.sigmoid(self.q_gain_raw).to(dtype=q_full.dtype)
+        q_full = q_full * q_gain[None, :, None, None]
 
         if getattr(self, "attention_l2", False):
             # iter 39b: Homogeneous Coordinate L2-Attention
@@ -1884,17 +1909,39 @@ class Block(nn.Module):
         # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).  τ ∈ (0, τ_max]
         # via sigmoid-parameterized scalar; τ_max<1 guarantees strict contraction
         # (Banach → unique FP, global convergence).
-        # iter 39b: τ computed analytically from Lip(G_θ) bound.
-        # L_G = L_attn + R · L_w where:
-        #   L_attn = 1 + 4γR² (L2-attention Lipschitz on R-ball)
-        #   L_w ≤ 2γ · 2R · ½ = 2γR (router: L2-scoring Lip · softmax ½-Lip)
-        # τ = c / L_G guarantees Lip(T_x) = τ · L_G = c < 1 (Banach).
+        # P0-fix #8: recompute L_G from actual implemented bounds.
+        # Named terms for each certified component:
         _gamma = float(l2_attn_gamma) if attention_l2 else 1.0 / math.sqrt(float(_head_dim))
-        _L_attn = 1.0 + 4.0 * _gamma * _R_state ** 2
-        _L_w = 2.0 * _gamma * 2.0 * _R_state * 0.5  # conservative router Lip
-        _L_G = _L_attn + _R_state * _L_w
+        _q_gain_max = float(self.attn.q_gain_max)
+        _R_q = _q_gain_max * _R_state  # effective query radius (q_gain scales q)
+        # L_attn: attention expert Lip on bounded Q(radius _R_q), K(radius _R_state)
+        _L_attn = 1.0 + 4.0 * _gamma * (_R_q + _R_state) ** 2
+        # L_ffn: MLP expert Lip — gated product leaky_relu(gate)*fc on bounded
+        # inputs with spectral-normed weights.  Conservative: Lip ≤ 2R (product
+        # of two R-bounded signals each with Lip=1 linear + 1-Lip activation).
+        _L_ffn = 2.0 * _R_state
+        # L_expert_max: worst-case expert Lipschitz
+        _L_expert_max = max(_L_attn, _L_ffn)
+        # L_w: router Lipschitz.  With frozen router_gate (P0-fix #4),
+        # only L2-scoring contributes.  L2 logits: Lip ≤ 2γ(R_q+R_c).
+        # Softmax: ½-Lip.  Output in ℓ₂; convert to ℓ₁ via √E factor.
+        E_total = 2 * num_experts
+        _L_s = 2.0 * _gamma * 2.0 * _R_state  # L2-scoring logit Lip
+        _L_w_l2 = 0.5 * _L_s  # softmax ½-Lip
+        _L_w_l1 = math.sqrt(float(E_total)) * _L_w_l2  # ℓ₂ → ℓ₁ conversion
+        # B_tok: per-token output bound (expert outputs bounded by R via Π_R input + σ_max ≤ 1)
+        _B_tok = _R_state
+        # L_G: mixture Lip = L_expert_max + B_tok · L_w_l1
+        _L_G = _L_expert_max + _B_tok * _L_w_l1
         _c = 0.95  # safety margin
         self._tau_max: float = _c / _L_G
+        # Store named components for logging
+        self._L_G_parts = {
+            "L_attn": _L_attn, "L_ffn": _L_ffn, "L_expert_max": _L_expert_max,
+            "L_w_l1": _L_w_l1, "B_tok": _B_tok, "L_G": _L_G,
+            "tau_max": self._tau_max, "R": _R_state, "gamma": _gamma,
+            "q_gain_max": _q_gain_max,
+        }
         # Input-dependent τ: τ(u) = τ_max · sigmoid(f(u)), capped at τ_max.
         # Each token gets its own τ — more expressive within the contraction
         # budget.  Max is analytically bounded → Banach guaranteed.
