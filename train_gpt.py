@@ -39,6 +39,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+# Disable donated_buffer globally — required for Lyapunov boundary VJP
+# (retain_graph=True conflicts with compiled donated buffers). Minor memory cost.
+import torch._functorch.config as _ftc_config
+_ftc_config.donated_buffer = False
 
 # ---------------------------------------------------------------------------
 # DIAGNOSTICS CONTROL
@@ -3055,9 +3059,8 @@ def main() -> None:
                     loss = model(x, y)
 
                 # iter 45 (opg_doc.tex §4): Lyapunov penalty OUTSIDE compiled graph.
-                # Single boundary forward on UNCOMPILED base_model.shared_block,
-                # with separate backward to avoid donated-buffer conflict.
-                lyap_loss_t = None
+                # Single boundary forward on UNCOMPILED base_model.shared_block.
+                # donated_buffer disabled globally (top of file) for compatibility.
                 lyap_coef = float(base_model.lyapunov_coef)
                 lyap_warmup = int(max(args.iterations, 1) * base_model.lyapunov_warmup_frac)
                 lyap_scale = min(step / max(lyap_warmup, 1), 1.0) if lyap_warmup > 0 else 1.0
@@ -3093,18 +3096,14 @@ def main() -> None:
                             v_ema = mu * v_buf.float() + (1.0 - mu) * (v_nf / v_nn)
                             base_model._lyapunov_v_buf = F.normalize(v_ema, dim=-1, eps=1e-8).to(z_star.dtype)
                     # Surrogate loss (if ρ̂ > γ): reuse u_b (retain_graph kept it alive)
-                    lyap_loss_t = None
                     if rho_hat.item() > gamma:
                         v_dir = (v_next.detach() / rho_hat.clamp(min=1e-8)).detach()
                         surrogate = (u_b * v_dir).sum().abs()
                         hinge_scale = (rho_hat.item() - gamma) / max(rho_hat.item(), 1e-8)
-                        lyap_loss_t = lyap_scale * lyap_coef * hinge_scale * surrogate
+                        loss = loss + lyap_scale * lyap_coef * hinge_scale * surrogate
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
-            # Lyapunov backward runs SEPARATELY after main backward.
-            if lyap_loss_t is not None:
-                (lyap_loss_t * grad_scale).backward()
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
