@@ -37,8 +37,13 @@ class TestFusedExpertMix(unittest.TestCase):
         proj = attn.expert_proj.to(dtype=y.dtype)  # [E,R,D]
         out = attn.expert_out.to(dtype=y.dtype)    # [E,D,R]
         h = torch.einsum("btd,erd->bter", y, proj)
+        h = h * w.unsqueeze(-1)  # weight before norm (matches fused path)
+        B_, T_ = h.shape[:2]
+        h_flat = h.reshape(B_ * T_, E, R)
+        h_flat = attn.expert_h_pre_norm(h_flat)  # NormedLinear pre-norm
+        h = h_flat.reshape(B_, T_, E, R)
         out_e = torch.einsum("bter,edr->bted", h, out)  # [B,T,E,D]
-        out_explicit = (w.unsqueeze(-1) * out_e).sum(dim=2)
+        out_explicit = out_e.sum(dim=2)
 
         self.assertTrue(torch.allclose(out_fused, out_explicit, atol=1e-5, rtol=1e-5))
 

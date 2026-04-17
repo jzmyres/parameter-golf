@@ -1323,6 +1323,10 @@ class CausalSelfAttention(nn.Module):
         with torch.no_grad():
             self.c_q.weight[dim:, :].zero_()
         self.c_kv_down = CastedLinear(dim, self.kv_latent_dim, bias=False)
+        # iter 43 (opg_doc.tex §3.2): NormedLinear pattern — learnable RMSNorm
+        # before every linear projection. kv_latent is output of c_kv_down
+        # (not pre-normed), so add a pre-norm before c_k_nope and c_v.
+        self.kv_pre_norm = RMSNorm(self.kv_latent_dim)
         self.c_k_nope = CastedLinear(self.kv_latent_dim, num_kv_heads * self.nope_dim, bias=False)
         self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
         self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
@@ -1331,6 +1335,9 @@ class CausalSelfAttention(nn.Module):
         # a transpose view to (E, R, D) so we can do batched GEMMs without
         # materializing a permuted copy each forward.
         self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
+        # iter 43 (NormedLinear): pre-norm before expert_out projection.
+        # Input to expert_out is h (expert hidden, shape (N, E, R)) — not pre-normed.
+        self.expert_h_pre_norm = RMSNorm(self.expert_rank)
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_proj.data[e])
             nn.init.xavier_uniform_(self.expert_out.data[e])
@@ -1354,8 +1361,9 @@ class CausalSelfAttention(nn.Module):
         q_rope, q_nope = q_raw[..., :self.rope_dim], q_raw[..., self.rope_dim:]
 
         kv_latent = self.c_kv_down(x_n)
-        k_nope = self.c_k_nope(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
-        v = self.c_v(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        kv_normed = self.kv_pre_norm(kv_latent)  # NormedLinear: pre-norm before K/V projections
+        k_nope = self.c_k_nope(kv_normed).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
+        v = self.c_v(kv_normed).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
 
         q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
@@ -1405,6 +1413,7 @@ class CausalSelfAttention(nn.Module):
         P = self.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, D)
         h = y_flat @ P.t()
         h = h.view(N, E, R) * w_flat.unsqueeze(-1)
+        h = self.expert_h_pre_norm(h)  # NormedLinear: pre-norm before expert_out
         # (E, D, R) -> (E, R, D) view (no copy); compute E independent GEMMs.
         O_T = self.expert_out.to(dtype=y_flat.dtype).transpose(1, 2)
         out_e = torch.bmm(h.transpose(0, 1), O_T)  # (E, N, D)
@@ -2381,7 +2390,11 @@ class GPT(nn.Module):
             z_b = z.detach().requires_grad_(True)
             # Boundary forward with MATH SDPA backend — FlashAttention's
             # backward doesn't support create_graph=True (no 2nd-order derivs).
-            # Math backend is slower but runs only ONCE per step (not K times).
+            # Also disable donated_buffer (torch.compile optimization that
+            # conflicts with create_graph=True / retain_graph=True).
+            import torch._functorch.config as _ftc
+            _prev_donated = _ftc.donated_buffer
+            _ftc.donated_buffer = False
             from torch.nn.attention import sdpa_kernel, SDPBackend
             with sdpa_kernel(SDPBackend.MATH):
                 u_b = self.shared_block(z_b, x0_refined)
@@ -2406,6 +2419,7 @@ class GPT(nn.Module):
                 v_next_det = v_next.detach().float()
                 v_norm = v_next_det.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                 self._lyapunov_v_buf = (v_next_det / v_norm).to(z.dtype)
+            _ftc.donated_buffer = _prev_donated
 
         if self.training:
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
