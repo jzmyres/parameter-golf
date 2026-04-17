@@ -31,13 +31,6 @@ class TestLyapunovArchDefaults(unittest.TestCase):
         self.assertTrue(hasattr(b, "state_norm"))
         self.assertIsInstance(b.state_norm, RMSNorm)
 
-    def test_no_ball_projection_on_state_path(self) -> None:
-        """Iter 41 removed BallProjection from the state normalization path.
-        (Router's internal _prototype_ball stays until iter 42.)"""
-        from train_gpt import BallProjection
-        b = _fresh_block()
-        self.assertNotIsInstance(b.state_norm, BallProjection)
-
     def test_no_spectral_norm_parametrization(self) -> None:
         """Iter 41 removed all spectral-norm caps from Block."""
         from torch.nn.utils import parametrize

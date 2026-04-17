@@ -356,11 +356,14 @@ L_jac   = lambda_jac * relu(rho_hat - gamma)
 v_buf = normalize(v_next.detach())            # or EMA-smoothed update (see Remark)
 \end{lstlisting}
 
-\begin{remark}[Why \texttt{create\_graph=True}]
+\begin{remark}[Why \texttt{create\_graph=True} (theoretical)]
 $L_{\text{jac}}$ must produce gradients w.r.t.\ parameters $\theta$.
 Since $v_{\text{next}}$ is itself a gradient w.r.t.\ $z_b$,
 backpropagating through it requires mixed second derivatives (one ``extra order''),
 but only for this \emph{single boundary evaluation}, not through the full trajectory.
+In practice, the implementation uses a single-forward surrogate that avoids
+\texttt{create\_graph=True} entirely---see Section~\ref{sec:practical} for the
+compile-safe variant actually used in code.
 \end{remark}
 
 \begin{remark}[Optional: few-step power iteration]
@@ -643,21 +646,23 @@ detached inputs inside the compiled forward corrupts cached tensor metadata (SIG
 The solution is a \textbf{two-forward} approach computed \textbf{outside} the compiled model forward,
 in the training loop after \texttt{loss = model(x, y)} and before \texttt{loss.backward()}:
 \begin{enumerate}[leftmargin=2em,itemsep=0.1em]
-  \item \textbf{Forward \#1 (VJP for $\hat\rho$):} Evaluate the \emph{uncompiled} block $T_\theta(z_b, x_0)$
+  \item \textbf{Forward \#1 (VJP for $\hat\rho$ + surrogate):} Evaluate the \emph{uncompiled} block $u = T_\theta(z_b, x_0)$
         with $z_b = z^\star_{\text{detached}}.\text{requires\_grad\_(True)}$.
-        Compute $v_{\text{next}} = J_{z^\star}^\top v$ via \texttt{autograd.grad(\ldots, create\_graph=False, retain\_graph=False)}.
-        This is fully compile-safe.  Update $v_{\text{buf}}$ with EMA smoothing.
-  \item \textbf{Forward \#2 (surrogate for $\nabla_\theta$):}  If $\hat\rho = \|v_{\text{next}}\| > \gamma$,
-        re-evaluate $u = T_\theta(z^\star_{\text{detached}}, x_0)$ (no \texttt{requires\_grad} on $z$, so gradient
-        flows to $\theta$ only).  Define surrogate $S = |u \cdot \hat{v}_{\text{next}}| \times (\hat\rho - \gamma)/\hat\rho$.
+        Compute $v_{\text{next}} = J_{z^\star}^\top v$ via \texttt{autograd.grad(\ldots, create\_graph=False, retain\_graph=True)}.
+        The \texttt{retain\_graph=True} keeps $u$'s computation graph alive for the surrogate below.
+        Update $v_{\text{buf}}$ with EMA smoothing (Frobenius-normalized, $\S$\ref{sec:notation}).
+  \item \textbf{Surrogate (reuses Forward \#1):}
+        Compute $\hat\rho = \|v_{\text{next}}\|_F$ and
+        $\text{scale}_t = \max(0, \hat\rho - \gamma) / \hat\rho$ as a pure-tensor hinge (no Python branching).
+        Define surrogate $S = |u \cdot \hat{v}_{\text{next}}| \times \text{scale}_t$.
         Add $\lambda_{\text{jac}} \cdot S$ to the loss before \texttt{backward()}.
-        $\nabla_\theta S = J^\top \hat{v}_{\text{next}}$ w.r.t.\ $\theta$ (first-order), which pushes $\theta$
-        to shrink $T_\theta$'s output projection onto the dominant eigendirection of $J$---the
-        spectral-radius gradient direction.
+        Since $u$'s graph was retained, $\nabla_\theta S = J^\top \hat{v}_{\text{next}}$ flows to $\theta$ (first-order),
+        pushing $\theta$ to shrink $T_\theta$'s output projection onto the dominant eigendirection.
 \end{enumerate}
-Both forwards run on the \emph{uncompiled} base model (outside the compiled graph), using only
-\texttt{create\_graph=False} and \texttt{retain\_graph=False}.  Cost: 2 extra block forwards per step
-($\approx 2/K$ of the DEQ solve, $\sim$17\% overhead at $K=12$).
+The single forward runs on the \emph{uncompiled} base model (outside the compiled graph) under
+\texttt{torch.compiler.disable()}, using \texttt{create\_graph=False} and \texttt{retain\_graph=True}.
+Cost: 1 extra block forward per step ($\approx 1/K$ of the DEQ solve, $\sim$8\% overhead at $K=12$).
+No \texttt{.item()} GPU$\to$CPU syncs: all control flow uses pure-tensor math.
 
 \paragraph{Theoretical guarantee (conditional).}
 The power iteration in Forward~\#1 correctly estimates $\rho(J_{z^\star})$ (amortized over training steps).

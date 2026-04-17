@@ -61,7 +61,6 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 |---|---|
 | matrix_lr | 0.022 |
 | scalar_lr | 0.02 |
-| router_lr | 0.005 |
 | tied_embed_lr | 0.03 |
 | embed_lr | 0.6 |
 | muon_momentum | 0.99 |
@@ -75,12 +74,13 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | Parameter | Value |
 |---|---|
 | router_scoring | l2 (L2-distance prototypes with tanh) |
-| attention_l2 | true (L2-distance attention via SDPA) |
-| l2_attn_gamma | 0.051 (matched to d_head=96) |
 | attn_expert_rank | 128 |
 | mlp_expert_rank | 192 |
 | bigram_vocab_size | 4096 |
 | bigram_dim | 128 |
+| lyapunov_coef | 0.01 (λ_jac: hinge penalty weight) |
+| lyapunov_gamma | 0.9 (target spectral radius threshold) |
+| lyapunov_warmup_frac | 0.1 (ramp over first 10% of wallclock) |
 
 ### Quantization & Techniques
 - int6 per-row quantization + zstd-22 compression
@@ -340,6 +340,15 @@ When replacing N independent modules with a single shared instance (e.g., `attn_
 3. Remove duplicate set/get operations on the same instance
 
 Rationale (incident from 2026-04-17 review): iter 35 pooled-router merge created module aliases (`attn_router` = `mlp_router` = `router`). The optimizer param filter still looked for `attn_router.router.weight` — a name PyTorch never generates for an alias. The router silently trained with Muon at 4.4x the intended LR and with weight decay, making `router_lr` a no-op. Same root cause as the 2026-04-15 incident: partial migration left stale references.
+
+### Hot-Path Sync Prohibition
+The training loop (gradient accumulation + optimizer step) MUST NOT contain any `.item()`, `.cpu()`, or Python-scalar branching on GPU tensors. All control flow must use pure-tensor math (e.g., `torch.relu`, `torch.where`). GPU→CPU syncs are only permitted at log sites (guarded by `will_log_train`).
+
+### Doc-Code Invariant
+When `opg_doc.tex` describes an algorithm and `train_gpt.py` implements a different (better) variant, the doc MUST note the deviation in a "Practical implementation" paragraph. The pseudocode represents the theoretical formulation; the implementation note is the source of truth for code.
+
+### Compile-Wrapper Write Rule
+All attribute writes to `base_model.shared_block` (or any potentially-compiled module) MUST go through `_unwrap_compiled_module()`. The pattern is: `sb = _unwrap_compiled_module(base_model.shared_block)` once per training-loop scope, then use `sb` for all reads/writes.
 
 ## Submission Process (when ready)
 1. Run 3 seeds (e.g., 42, 1337, 2024) on 8xH100

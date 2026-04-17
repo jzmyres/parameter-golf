@@ -89,11 +89,11 @@ def parse_log(logpath: str) -> dict:
     last_step_seen: int | None = None
 
     for line in lines:
-        m = re.search(r"^run_id:([\\w\\-\\.]+)", line)
+        m = re.search(r"^run_id:([\w\-.]+)", line)
         if m:
             data["run_id"] = m.group(1)
 
-        m = re.search(r"^config:\\s*(.*)$", line)
+        m = re.search(r"^config:\s*(.*)$", line)
         if m:
             data["config_line"] = m.group(1).strip()
             cfg: dict[str, str] = {}
@@ -133,7 +133,7 @@ def parse_log(logpath: str) -> dict:
             # Parse pre-clip gradient norm
             m_gn = re.search(rf"grad_norm:{_FLOAT}", line)
             data["grad_norm"].append(float(m_gn.group(1)) if m_gn else math.nan)
-            m_ggm = re.search(rf"\\bgg_mean:{_FLOAT}\\b", line)
+            m_ggm = re.search(rf"\bgg_mean:{_FLOAT}\b", line)
             data["gg_mean_train"].append(float(m_ggm.group(1)) if m_ggm else math.nan)
 
             # Train-time DEQ + expert diagnostics (optional). Missing values become NaN.
@@ -194,7 +194,7 @@ def parse_log(logpath: str) -> dict:
             data["val_steps"].append(step_i)
             data["val_loss"].append(float(m.group(2)))
             data["val_bpb"].append(float(m.group(3)))
-            m_ggm = re.search(rf"\\bgg_mean:{_FLOAT}\\b", line)
+            m_ggm = re.search(rf"\bgg_mean:{_FLOAT}\b", line)
             data["gg_mean"].append(float(m_ggm.group(1)) if m_ggm else math.nan)
             # Total training time is printed on val lines; use it as authoritative for summary.
             m_tt = re.search(rf"train_time:{_FLOAT}ms", line)

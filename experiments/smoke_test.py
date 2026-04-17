@@ -25,7 +25,9 @@ def _load_real_data(vocab_size, total_tokens=65536, seq=128):
     batch from this buffer to avoid overfitting on a fixed tiny set.
     """
     data_path = "./data/datasets/fineweb10B_sp1024/fineweb_train_000000.bin"
-    raw = np.fromfile(data_path, dtype=np.int16, count=total_tokens)
+    # Skip 256×int32 shard header (matches train_gpt.load_data_shard format).
+    header_bytes = 256 * 4
+    raw = np.fromfile(data_path, dtype='<u2', offset=header_bytes, count=total_tokens)
     tokens = torch.from_numpy(raw.astype(np.int64)).clamp(0, vocab_size - 1)
     return tokens.cuda()
 
@@ -92,9 +94,6 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
         deq_backward="revdeq",
         router_scoring=args.router_scoring,
-        attention_l2=args.attention_l2,
-        l2_attn_gamma=args.l2_attn_gamma,
-        tie_attn_mlp_router=True,  # iter 35: always pooled
         num_experts=args.num_experts,
     ).cuda()
 

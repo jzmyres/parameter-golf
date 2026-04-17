@@ -149,7 +149,6 @@ class Hyperparameters:
     embed_lr = 0.6
     matrix_lr = 0.022
     scalar_lr = 0.02
-    router_lr = 0.005
     muon_momentum = 0.99
     muon_backend_steps = 5
     muon_momentum_warmup_start = 0.92
@@ -175,12 +174,7 @@ class Hyperparameters:
     # Router scoring mode. L2-distance scoring with tanh works well empirically.
     # Under Lyapunov stability, any scoring is fine (no Lip requirement).
     router_scoring = "l2"
-    # Legacy L2-attention params (iter 42 removed L2-attention branch;
-    # these are kept for backward compat with GPT constructor but unused).
-    attention_l2 = False
-    l2_attn_gamma = 0.051
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
-    # tie_attn_mlp_router removed in iter 35: single pooled router is MANDATORY (doc §4.3)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
@@ -289,7 +283,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         raise SystemExit(f"Unknown args: {unknown}")
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
-                 "tie_attn_mlp_router", "swa_enabled", "ema_enabled"}
+                 "swa_enabled", "ema_enabled"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -429,7 +423,6 @@ class Muon(torch.optim.Optimizer):
                         g = g.reshape(orig_shape)
                     start, end = offsets[i]
                     updates_flat[start:end] = g.reshape(-1)
-            curr = 0  # still needed for the unpack loop below
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
             wd = group.get("weight_decay", 0.0)
@@ -559,7 +552,7 @@ eval_val = run_validation
 # QUANTIZATION (uniform INT6 + SDClip)
 # ---------------------------------------------------------------------------
 
-CONTROL_TENSOR_PATTERNS = ("gg_w", "gg_b", "q_gain", "gate_bias", "bigram.scale")
+CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale")
 FP16_KEEP_PATTERNS = ("tok_emb",)
 SDCLIP_K_MATRIX = 12.85
 SDCLIP_K_EMBED = 20.0
@@ -719,6 +712,7 @@ class DistributedTokenLoader:
         self.world_size = world_size
         self.device = device
         self.stream = TokenStream(pattern)
+        self._pinned_buf: Tensor | None = None  # pinned CPU staging buffer
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         denom = self.world_size * grad_accum_steps
@@ -734,8 +728,15 @@ class DistributedTokenLoader:
         self.stream.skip(self.rank * per_rank_span)
         local_u16 = self.stream.take(per_rank_span)  # CPU uint16 (memmap-backed)
         self.stream.skip((self.world_size - 1 - self.rank) * per_rank_span)
-        # Single fused op: CPU uint16 → GPU int64 (skips intermediate CPU int64 copy).
-        local = local_u16.to(self.device, dtype=torch.int64, non_blocking=True)
+        # Pinned memory staging: memmap→pinned copy is CPU-only; pinned→GPU
+        # with non_blocking=True is truly async (overlaps with compute).
+        if self._pinned_buf is None or self._pinned_buf.numel() < per_rank_span:
+            try:
+                self._pinned_buf = torch.empty(per_rank_span, dtype=torch.uint16, pin_memory=True)
+            except RuntimeError:
+                self._pinned_buf = torch.empty(per_rank_span, dtype=torch.uint16)
+        self._pinned_buf[:per_rank_span].copy_(local_u16)
+        local = self._pinned_buf[:per_rank_span].to(self.device, dtype=torch.int64, non_blocking=True)
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x, y
@@ -744,6 +745,12 @@ class DistributedTokenLoader:
 # ---------------------------------------------------------------------------
 # TRANSFORMER MODULES
 # ---------------------------------------------------------------------------
+
+def _frob_normalize(t: Tensor, eps: float = 1e-8) -> Tensor:
+    """Frobenius-normalize a tensor (flatten → unit-norm → reshape)."""
+    flat = t.reshape(-1)
+    return (flat / (flat.norm() + eps)).reshape(t.shape)
+
 
 def _rms_norm(x: Tensor, eps: float = 1e-6) -> Tensor:
     return F.rms_norm(x, (x.size(-1),), eps=eps)
@@ -767,147 +774,10 @@ class RMSNorm(nn.Module):
         return y
 
 
-class BallProjection(nn.Module):
-    """Per-token Euclidean ball projection Π_R(u) = u · min(1, R/‖u‖_2).
 
-    1-Lipschitz under Frobenius/ℓ2 norm (opg_doc.tex §4.1).  Unlike RMSNorm
-    (which normalizes to unit RMS, Lipschitz-unbounded near ‖u‖=0), this
-    projection ONLY shrinks vectors that exceed the ball of radius R; inside
-    the ball it acts as the identity.  Combined with bounded-domain 1-Lip
-    linear maps, it enables a certifiable contraction shell.
-
-    No learnable parameters — R is a fixed hyperparameter.
-    """
-    def __init__(self, dim: int, R: float):
-        super().__init__()
-        self.dim = int(dim)
-        self.R = float(R)
-
-    def forward(self, u: Tensor) -> Tensor:
-        # Per-token ℓ2 norm.  Compute in fp32 for numerical stability then
-        # cast the scale back to u.dtype (the forward is 1-Lipschitz for any
-        # positive eps added to norm — eps only matters when ‖u‖ → 0).
-        norm = u.float().pow(2).sum(dim=-1, keepdim=True).clamp_min(1e-12).sqrt_()
-        scale = (self.R / norm.clamp_min(self.R)).to(u.dtype)
-        return u * scale
-
-
-class PerExpertSpectralNormCap(nn.Module):
-    """Per-expert spectral-norm cap for tensors of shape (E, M, N).
-
-    Applies `W / max(1, σ_max(W_e))` to each per-expert slice W_e = W[e].
-    1-Lipschitz parametrization (opg_doc.tex §6.1) — uses 1 power iteration
-    per forward to estimate σ_max per expert.  Expert matrices in our MoE
-    banks (`expert_out`, `expert_down`, `expert_proj`, etc.) are raw
-    nn.Parameter tensors rather than nn.Linear, so PyTorch's built-in
-    `torch.nn.utils.parametrizations.spectral_norm` doesn't apply directly;
-    this class is the per-expert generalization.
-
-    Registered via `torch.nn.utils.parametrize.register_parametrization`.
-    """
-    def __init__(self, weight_shape: torch.Size, n_power_iters: int = 1):
-        super().__init__()
-        assert len(weight_shape) == 3, f"expected 3D (E,M,N), got {weight_shape}"
-        E, M, N = weight_shape
-        self.register_buffer("u", F.normalize(torch.randn(E, M), dim=-1), persistent=False)
-        self.register_buffer("v", F.normalize(torch.randn(E, N), dim=-1), persistent=False)
-        self.n_power_iters = int(n_power_iters)
-
-    @torch.no_grad()
-    def update_uv_(self, W: Tensor) -> None:
-        """Run power iteration against the current `W` and write `u`, `v`.
-
-        Call this once per optimizer step (before the next forward pass),
-        NEVER inside `forward()`.  `forward()` must be stateless so that
-        RevDEQ's O(1) backward reconstruction produces identical σ to the
-        original forward (see Permanent protocol rule 4 in
-        `experiments/hypotheses.md`).
-        """
-        W32 = W.detach().float()
-        u = self.u.detach().float().clone()
-        v = self.v.detach().float().clone()
-        for _ in range(self.n_power_iters):
-            v = F.normalize(torch.einsum("emn,em->en", W32, u), dim=-1, eps=1e-12)
-            u = F.normalize(torch.einsum("emn,en->em", W32, v), dim=-1, eps=1e-12)
-        self.u.copy_(u.to(dtype=self.u.dtype))
-        self.v.copy_(v.to(dtype=self.v.dtype))
-
-    def forward(self, W: Tensor) -> Tensor:
-        """Stateless σ estimate and scale.  Reads `self.u`, `self.v` but does
-        NOT mutate them — that's handled by `update_uv_()` called explicitly
-        once per optimizer step.  This keeps `f_theta` deterministic within
-        a DEQ solve, so RevDEQ's backward reconstruction reproduces σ
-        exactly (review item 3, Phase 6a.2)."""
-        W32 = W.float()
-        u = self.u.detach().float()
-        v = self.v.detach().float()
-        sigma = torch.einsum("em,emn,en->e", u, W32, v).abs()  # (E,)
-        scale = (1.0 / sigma.clamp(min=1.0)).to(W.dtype)
-        return W * scale.view(-1, 1, 1)
-
-
-class SpectralNormCap(nn.Module):
-    """Stateless spectral-norm cap for 2D weight matrices (M, N).
-
-    Same pattern as PerExpertSpectralNormCap but for standard nn.Linear
-    weights (e.g., Block.inj_lin).  forward() is stateless; update_uv_()
-    runs power iteration (called once per optimizer step via
-    refresh_spectral_norms).  Replaces PyTorch's built-in spectral_norm
-    which mutates buffers during train-mode forward — breaking RevDEQ's
-    determinism requirement (Permanent protocol rule 4).
-    """
-    def __init__(self, weight_shape: torch.Size, n_power_iters: int = 1):
-        super().__init__()
-        assert len(weight_shape) == 2, f"expected 2D (M,N), got {weight_shape}"
-        M, N = weight_shape
-        self.register_buffer("u", F.normalize(torch.randn(M), dim=0), persistent=False)
-        self.register_buffer("v", F.normalize(torch.randn(N), dim=0), persistent=False)
-        self.n_power_iters = int(n_power_iters)
-
-    @torch.no_grad()
-    def update_uv_(self, W: Tensor) -> None:
-        W32 = W.detach().float()
-        u = self.u.detach().float().clone()
-        v = self.v.detach().float().clone()
-        for _ in range(self.n_power_iters):
-            v = F.normalize(W32.t() @ u, dim=0, eps=1e-12)
-            u = F.normalize(W32 @ v, dim=0, eps=1e-12)
-        self.u.copy_(u.to(dtype=self.u.dtype))
-        self.v.copy_(v.to(dtype=self.v.dtype))
-
-    def forward(self, W: Tensor) -> Tensor:
-        W32 = W.float()
-        u = self.u.detach().float()
-        v = self.v.detach().float()
-        sigma = (u @ W32 @ v).abs()
-        scale = (1.0 / sigma.clamp(min=1.0)).to(W.dtype)
-        return W * scale
-
-
-_SPECTRAL_CAP_TYPES = (PerExpertSpectralNormCap, SpectralNormCap)
-
-
-def refresh_spectral_norms(model: nn.Module) -> None:
-    """Walk `model` and run one power iteration for every spectral-norm
-    cap parametrization (both 2D `SpectralNormCap` and 3D
-    `PerExpertSpectralNormCap`), refreshing `u`, `v` buffers so σ
-    estimates track `W` as training updates it.
-
-    Call once right after model construction (so the first forward has
-    non-random u/v) and once per optimizer step (after `opt.step()`,
-    before the next forward).
-    """
-    for mod in model.modules():
-        plist_dict = getattr(mod, "parametrizations", None)
-        if plist_dict is None:
-            continue
-        for plist in plist_dict.values():
-            W = getattr(plist, "original", None)
-            if W is None:
-                continue
-            for p in plist:
-                if isinstance(p, _SPECTRAL_CAP_TYPES):
-                    p.update_uv_(W)
+# BallProjection, PerExpertSpectralNormCap, SpectralNormCap, and
+# refresh_spectral_norms removed in iter 41 (Lyapunov replaced hard
+# spectral caps). See git history for reference implementations.
 
 
 class CastedLinear(nn.Linear):
@@ -1451,7 +1321,7 @@ class CausalSelfAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MLP with LeakyReLU(0.5)
+# MLP with SwiGLU
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
@@ -2085,10 +1955,7 @@ class GPT(nn.Module):
                  deq_backward: str = "revdeq", deq_bptt_k: int = 0,
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
-                 tie_attn_mlp_router: bool = True,  # iter 35: always pooled (doc §4.3)
                  router_scoring: str = "linear",
-                 attention_l2: bool = False,
-                 l2_attn_gamma: float = 1.0,
                  num_experts: int = 8,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -2109,7 +1976,6 @@ class GPT(nn.Module):
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
-                                   # iter 35: tie_attn_mlp_router removed; single pooled router always
                                    num_experts=self.num_experts,
                                    router_scoring=router_scoring,
                                    )
@@ -2133,7 +1999,7 @@ class GPT(nn.Module):
         self.lyapunov_warmup_frac = float(lyapunov_warmup_frac)
         self._lyapunov_v_buf: Tensor | None = None  # persistent power-iter vector (EMA)
         self._lyapunov_loss: Tensor | None = None
-        self._lyapunov_rho_hat: float = 0.0
+        self._lyapunov_rho_hat: float | Tensor = 0.0  # tensor in hot path; float at log time
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm(model_dim)
         # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
@@ -2752,11 +2618,8 @@ def main() -> None:
         deq_backward=args.deq_backward, deq_bptt_k=args.deq_bptt_k,
         block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
-        tie_attn_mlp_router=True,  # iter 35: always pooled
         num_experts=args.num_experts,
         router_scoring=args.router_scoring,
-        attention_l2=args.attention_l2,
-        l2_attn_gamma=args.l2_attn_gamma,
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
@@ -2766,10 +2629,6 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-
-    # Phase 6a.2 (review 3): seed u, v for every PerExpertSpectralNormCap so
-    # σ estimates are meaningful on the first forward, not random.
-    # refresh_spectral_norms(base_model)  # no-op: spectral norm caps removed (iter 41)
 
     # Compile the DEQ iteration body for throughput.  Always enabled — the
     # ~1.6× real speedup (3.7× benchmark) is a free win on any backward mode
@@ -2792,16 +2651,13 @@ def main() -> None:
 
     # OPTIMIZER SETUP
     block_named_params = list(base_model.shared_block.named_parameters())
-    router_params = [p for name, p in block_named_params
-                     if name.endswith("attn_router.router.weight") or name.endswith("mlp_router.router.weight")]
+    # All ndim >= 2 params (incl. router prototypes/weights) → Muon;
+    # All ndim < 2 params (incl. router_gate.bias) → AdamW scalar.
+    # No separate router optimizer — router params follow the standard split.
     matrix_params = [p for name, p in block_named_params
                      if p.ndim >= 2 and not any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
     scalar_params = [p for name, p in block_named_params
                      if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
-    if router_params:
-        router_set = {id(p) for p in router_params}
-        matrix_params = [p for p in matrix_params if id(p) not in router_set]
-        scalar_params = [p for p in scalar_params if id(p) not in router_set]
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
 
@@ -2829,14 +2685,7 @@ def main() -> None:
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
-    optimizer_router = None
-    if router_params:
-        optimizer_router = torch.optim.AdamW(
-            [{"params": router_params, "lr": float(args.router_lr), "base_lr": float(args.router_lr)}],
-            betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True)
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if optimizer_router is not None:
-        optimizers.append(optimizer_router)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -3009,19 +2858,14 @@ def main() -> None:
 
         late_frac = min(max((time_frac - 0.70) / 0.30, 0.0), 1.0)
         health_scale = 1.0 + 4.0 * float(late_frac)
-        try:
-            base_model.shared_block.attn_router.health_scale = float(health_scale)
-            base_model.shared_block.mlp_router.health_scale = float(health_scale)
-        except Exception:
-            pass
+        # Compile-wrapper-safe: always write through unwrapped module.
+        sb = _unwrap_compiled_module(base_model.shared_block)
+        sb.router.health_scale = float(health_scale)
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
-        if hasattr(base_model.shared_block, "_deq_recon_error_last_bwd"):
-            try:
-                base_model.shared_block._deq_recon_error_last_bwd = None
-            except Exception:
-                pass
+        if hasattr(sb, "_deq_recon_error_last_bwd"):
+            sb._deq_recon_error_last_bwd = None
 
         train_loss = torch.zeros((), device=device)
         next_step = step + 1
@@ -3049,9 +2893,6 @@ def main() -> None:
                 base_model._block_ortho_aux_enabled = False
                 base_model._block_ortho_aux_coef_scale = 1.0
                 base_model._block_ortho_aux_tokens_override = int(args.block_ortho_aux_tokens)
-                # iter 45: Lyapunov warmup state
-                base_model._lyapunov_step = step
-                base_model._lyapunov_total_steps = max(args.iterations, 1)
                 if args.block_ortho_aux_coef > 0.0 and micro_step == grad_accum_steps - 1:
                     base_model._block_ortho_aux_enabled = bool(
                         args.block_ortho_aux_every > 0 and (next_step % int(args.block_ortho_aux_every) == 0))
@@ -3059,48 +2900,53 @@ def main() -> None:
                     loss = model(x, y)
 
                 # iter 45 (opg_doc.tex §4): Lyapunov penalty OUTSIDE compiled graph.
-                # Single boundary forward on UNCOMPILED base_model.shared_block.
-                # donated_buffer disabled globally (top of file) for compatibility.
+                # Single boundary forward on the UNCOMPILED shared_block.
+                # Pure-tensor math — no .item() GPU-CPU syncs in hot path.
+                # Frobenius-normalized power iteration (doc §1.1 norm convention).
                 lyap_coef = float(base_model.lyapunov_coef)
-                lyap_warmup = int(max(args.iterations, 1) * base_model.lyapunov_warmup_frac)
-                lyap_scale = min(step / max(lyap_warmup, 1), 1.0) if lyap_warmup > 0 else 1.0
+                # Use wallclock time_frac for warmup (args.iterations is a 1e9 placeholder).
+                lyap_warmup_frac = float(base_model.lyapunov_warmup_frac)
+                lyap_scale = min(time_frac / max(lyap_warmup_frac, 1e-8), 1.0) if lyap_warmup_frac > 0 else 1.0
                 z_star = getattr(base_model, '_lyapunov_z_star', None)
                 x0_lyap = getattr(base_model, '_lyapunov_x0', None)
                 if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None:
-                    blk = base_model.shared_block
-                    # Init persistent vector
+                    # Reuse sb (unwrapped eager block) from health scaling scope above.
+                    blk = sb
+                    _lyap_eps = 1e-8
+                    # Init persistent vector — Frobenius-normalized (doc §1.1).
                     v_buf = getattr(base_model, '_lyapunov_v_buf', None)
                     if v_buf is None or v_buf.shape != z_star.shape:
-                        v_buf = F.normalize(torch.randn_like(z_star), dim=-1, eps=1e-8)
+                        v_buf = _frob_normalize(torch.randn_like(z_star), _lyap_eps)
                     v = v_buf.detach()
                     gamma = float(base_model.lyapunov_gamma)
                     # Single boundary forward (outside compiled graph → retain_graph safe)
                     z_b = z_star.detach().requires_grad_(True)
-                    u_b = blk(z_b, x0_lyap)
+                    with torch.compiler.disable():
+                        u_b = blk(z_b, x0_lyap)
                     # VJP: v_next = J^T v (power iteration step)
                     v_next = torch.autograd.grad(
                         (u_b * v).sum(), z_b,
                         create_graph=False, retain_graph=True,
                     )[0]
-                    rho_hat = v_next.detach().float().norm()
-                    base_model._lyapunov_rho_hat = float(rho_hat.item())
-                    # EMA update of persistent direction (doc §4.2 Remark)
+                    # ρ̂ = ‖v_next‖_F (Frobenius norm, doc §1.1). Pure tensor, no .item().
+                    rho_hat = v_next.detach().float().reshape(-1).norm()
+                    base_model._lyapunov_rho_hat = rho_hat  # tensor; materialize at log time
+                    # EMA update of persistent direction (doc §4.2 Remark).
+                    # Frobenius-normalized: flatten → normalize → reshape.
                     with torch.no_grad():
-                        v_nf = v_next.float()
-                        v_nn = v_nf.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                        if v_nn.mean() < 1e-6:
-                            base_model._lyapunov_v_buf = F.normalize(
-                                torch.randn_like(z_star), dim=-1, eps=1e-8)
+                        v_nf = v_next.float().reshape(-1)
+                        v_norm = v_nf.norm().clamp(min=_lyap_eps)
+                        if v_norm < 1e-6:
+                            base_model._lyapunov_v_buf = _frob_normalize(torch.randn_like(z_star), _lyap_eps)
                         else:
                             mu = 0.9
-                            v_ema = mu * v_buf.float() + (1.0 - mu) * (v_nf / v_nn)
-                            base_model._lyapunov_v_buf = F.normalize(v_ema, dim=-1, eps=1e-8).to(z_star.dtype)
-                    # Surrogate loss (if ρ̂ > γ): reuse u_b (retain_graph kept it alive)
-                    if rho_hat.item() > gamma:
-                        v_dir = (v_next.detach() / rho_hat.clamp(min=1e-8)).detach()
-                        surrogate = (u_b * v_dir).sum().abs()
-                        hinge_scale = (rho_hat.item() - gamma) / max(rho_hat.item(), 1e-8)
-                        loss = loss + lyap_scale * lyap_coef * hinge_scale * surrogate
+                            v_ema = mu * v_buf.float().reshape(-1) + (1.0 - mu) * (v_nf / v_norm)
+                            base_model._lyapunov_v_buf = _frob_normalize(v_ema.reshape(z_star.shape), _lyap_eps).to(z_star.dtype)
+                    # Surrogate loss: pure-tensor hinge (zero when ρ̂ ≤ γ, no branching).
+                    scale_t = torch.relu(rho_hat - gamma) / rho_hat.clamp(min=_lyap_eps)
+                    v_dir = (v_next.detach() / rho_hat.clamp(min=_lyap_eps)).detach()
+                    surrogate = (u_b * v_dir).sum().abs()
+                    loss = loss + lyap_scale * lyap_coef * scale_t * surrogate
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -3119,21 +2965,10 @@ def main() -> None:
             _preclip = 0.0
         for opt in optimizers:
             opt.step()
-        # Phase 6a.2 (review 3): refresh spectral-norm u/v after every
-        # optimizer step so σ estimates track the freshly-updated W.  Never
-        # inside `forward()` — that would break RevDEQ's determinism
-        # requirement (Permanent protocol rule 4).
-        # refresh_spectral_norms(base_model)  # no-op: spectral norm caps removed (iter 41)
 
         if args.router_bias_update:
-            seen: set[int] = set()
             bias_lr = float(args.router_bias_lr) * (1.0 + 4.0 * float(late_frac))
-            for r in [base_model.shared_block.attn.attn_router, base_model.shared_block.mlp.mlp_router]:
-                rid = id(r)
-                if rid in seen:
-                    continue
-                seen.add(rid)
-                r.bias_update(lr=bias_lr, clip=float(args.router_bias_clip), distributed=distributed)
+            sb.router.bias_update(lr=bias_lr, clip=float(args.router_bias_clip), distributed=distributed)
         zero_grad_all()
 
         if ema_state is not None and args.ema_update_every > 0 and (step % args.ema_update_every == 0):
