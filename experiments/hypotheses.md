@@ -667,6 +667,12 @@ a process bug, not a design choice.
    second time."  The principled fix for regularization losses is:
    compute them ONCE per step from the final forward pass's output
    (post-solve), not inside the DEQ loop (2K× per step).
+7. **torch.compile: no inplace mutation of freshly-allocated tensors.**
+   `new_zeros` + index assignment (`t[..., :D] = val`) inside a compiled
+   graph corrupts AOT autograd's alias tracker — produces garbage shape
+   dimensions.  Always use functional ops: `torch.cat` + `F.pad` instead.
+   This applies to any pattern where a tensor is allocated then partially
+   filled inside the compiled forward.
 6. **torch.compile: one compiled output, one backward consumer.**  When a
    compiled module produces a single tensor split into two backward
    paths, AOT autograd may fail.  Either (a) return pre-split outputs

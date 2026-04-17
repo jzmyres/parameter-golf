@@ -1385,15 +1385,22 @@ class CausalSelfAttention(nn.Module):
             aug_total = aug_dim + pad_len
 
             # Augment Q: [√(2γ)·q, √γ, 0...0]
-            q_aug = q_full.new_zeros(*q_full.shape[:-1], aug_total)
-            q_aug[..., :D] = q_full * sqrt_2g
-            q_aug[..., D] = sqrt_g
+            # MUST use functional ops (cat+pad), NOT new_zeros+inplace fill.
+            # Inplace mutation of freshly-allocated tensors inside compiled
+            # graphs corrupts AOT autograd's alias tracker (Principle 7).
+            q_scaled = q_full * sqrt_2g
+            q_slack = q_full.new_full((*q_full.shape[:-1], 1), sqrt_g)
+            q_aug = torch.cat([q_scaled, q_slack], dim=-1)
+            if pad_len > 0:
+                q_aug = F.pad(q_aug, (0, pad_len))
 
             # Augment K: [√(2γ)·k, -√γ·‖k‖², 0...0]
-            k_norm_sq = k_full.float().pow(2).sum(dim=-1).to(k_full.dtype)
-            k_aug = k_full.new_zeros(*k_full.shape[:-1], aug_total)
-            k_aug[..., :D] = k_full * sqrt_2g
-            k_aug[..., D] = -sqrt_g * k_norm_sq
+            k_norm_sq = k_full.float().pow(2).sum(dim=-1, keepdim=True).to(k_full.dtype)
+            k_scaled = k_full * sqrt_2g
+            k_slack = -sqrt_g * k_norm_sq
+            k_aug = torch.cat([k_scaled, k_slack], dim=-1)
+            if pad_len > 0:
+                k_aug = F.pad(k_aug, (0, pad_len))
 
             # Pad V to match augmented dim
             v_aug = F.pad(v, (0, aug_total - v.shape[-1]))
