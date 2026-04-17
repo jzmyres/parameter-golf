@@ -901,28 +901,12 @@ class OrthogonalParametrization(nn.Module):
         self.n_iters = int(n_iters)
         self.ndim = len(weight_shape)
         assert self.ndim in (2, 3), f"expected 2D or 3D, got {weight_shape}"
-        # Cache: reuse within a DEQ solve (weights don't change between iters).
-        # Invalidated by refresh_orthogonal_cache() after each optimizer step.
-        self._cached: Tensor | None = None
-        self._cache_id: int | None = None  # data_ptr of the raw parameter
 
     def forward(self, W: Tensor) -> Tensor:
-        # Cache hit: same raw parameter data → same orthogonalized output.
-        w_id = W.data_ptr()
-        if self._cache_id == w_id and self._cached is not None:
-            return self._cached
         W32 = W.float()
         if self.ndim == 3:
-            result = self._ortho_3d(W32).to(W.dtype)
-        else:
-            result = self._ortho_2d(W32).to(W.dtype)
-        self._cached = result
-        self._cache_id = w_id
-        return result
-
-    def invalidate_cache(self) -> None:
-        self._cached = None
-        self._cache_id = None
+            return self._ortho_3d(W32).to(W.dtype)
+        return self._ortho_2d(W32).to(W.dtype)
 
     @staticmethod
     def _sigma_max_3d(W: Tensor, n_iters: int = 3) -> Tensor:
@@ -1009,8 +993,7 @@ def refresh_spectral_norms(model: nn.Module) -> None:
             for p in plist:
                 if isinstance(p, _SPECTRAL_CAP_TYPES):
                     p.update_uv_(W)
-                elif isinstance(p, OrthogonalParametrization):
-                    p.invalidate_cache()
+                # OrthogonalParametrization is stateless — no refresh needed.
 
 
 class CastedLinear(nn.Linear):
