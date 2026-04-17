@@ -31,15 +31,17 @@ class TestContractionShellDefaults(unittest.TestCase):
         Small initial τ gives the model room to grow the shell weight during
         training without starting at the contraction boundary."""
         b = _fresh_block()
-        self.assertTrue(hasattr(b, "tau_param"))
-        self.assertTrue(hasattr(b, "tau_max"))
-        self.assertLess(b.tau_max, 1.0, "τ_max must be < 1 for strict contraction")
+        self.assertTrue(hasattr(b, "_tau_max"))
+        self.assertGreater(b._tau_max, 0.0, "τ_max must be > 0")
+        self.assertLess(b._tau_max, 1.0, "τ_max must be < 1 for strict contraction")
+        # Input-dependent τ: test with dummy input
+        u = torch.randn(2, 5, 32)
         with torch.no_grad():
-            tau = b._tau().item()
-        self.assertGreater(tau, 0.0)
-        self.assertLess(tau, b.tau_max)
-        expected = b.tau_max * torch.sigmoid(b.tau_param).item()
-        self.assertAlmostEqual(tau, expected, places=5)
+            tau = b._tau(u)
+        self.assertEqual(tuple(tau.shape), (2, 5, 1), "τ must be per-token (B,T,1)")
+        self.assertTrue(torch.all(tau > 0).item(), "τ must be positive")
+        self.assertTrue(torch.all(tau <= b._tau_max + 1e-6).item(),
+                        "τ must be ≤ τ_max for Banach guarantee")
 
     def test_inj_lin_is_spectrally_parameterized(self) -> None:
         """U in b(x_0) = x_0 + U·rms_norm(x_0) must be spectral-norm parametrized
@@ -61,7 +63,7 @@ class TestContractionShellDefaults(unittest.TestCase):
         x0 = torch.randn(2, 5, 32)
         with torch.no_grad():
             bx0 = b._compute_b_x0(x0)
-            inj_term = b.inj_lin(b.pre_proj(x0)).to(dtype=x0.dtype)
+            inj_term = b.inj_lin(b.attn_norm(x0)).to(dtype=x0.dtype)
         self.assertEqual(tuple(bx0.shape), tuple(x0.shape))
         self.assertTrue(
             torch.allclose(bx0 - inj_term, x0, atol=1e-5),

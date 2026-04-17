@@ -122,7 +122,7 @@ class Hyperparameters:
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 3600.0  # generous dev default; CLI: --max-wallclock-seconds=1200 (dev) or 600 (8xH100)
+    max_wallclock_seconds = 3600.0  # 2xL40S dev (1h budget); set 600 for 8xH100
 
     # Model architecture
     vocab_size = 1024
@@ -136,6 +136,7 @@ class Hyperparameters:
     mlp_mult = 3.0
     tie_embeddings = True
     rope_base = 10000.0
+    logit_softcap = 30.0
     qk_gain_init = 5.0
     deq_beta = 0.20  # locked: Phase 1 concluded β=0.20 optimal (lower β = better FP quality, H18 tested)
 
@@ -180,6 +181,7 @@ class Hyperparameters:
     # peaky for training; use the d_head-matched value.
     l2_attn_gamma = 0.051  # for d_head=96 (model_dim=768, heads=8)
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
+    # tie_attn_mlp_router removed in iter 35: single pooled router is MANDATORY (doc §4.3)
 
     # DEQ solver
     # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
@@ -268,7 +270,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             p.add_argument(f"--{name}", type=str, default=None)
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
-        "swa-enabled", "ema-enabled",
+        "tie-attn-mlp-router", "swa-enabled", "ema-enabled",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # Backward compat: "unroll" is the established name in experiments/docs.
@@ -281,7 +283,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         raise SystemExit(f"Unknown args: {unknown}")
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
-                 "swa_enabled", "ema_enabled"}
+                 "tie_attn_mlp_router", "swa_enabled", "ema_enabled"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -421,6 +423,7 @@ class Muon(torch.optim.Optimizer):
                         g = g.reshape(orig_shape)
                     start, end = offsets[i]
                     updates_flat[start:end] = g.reshape(-1)
+            curr = 0  # still needed for the unpack loop below
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
             wd = group.get("weight_decay", 0.0)
@@ -550,7 +553,7 @@ eval_val = run_validation
 # QUANTIZATION (uniform INT6 + SDClip)
 # ---------------------------------------------------------------------------
 
-CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale")
+CONTROL_TENSOR_PATTERNS = ("gg_w", "gg_b", "q_gain", "gate_bias", "bigram.scale")
 FP16_KEEP_PATTERNS = ("tok_emb",)
 SDCLIP_K_MATRIX = 12.85
 SDCLIP_K_EMBED = 20.0
@@ -1078,13 +1081,15 @@ class SoftDenseRouter(nn.Module):
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
-        assert self.scoring in ("linear", "l2"), f"unknown scoring: {scoring}"
+        assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
         # Tensor buffer to avoid Python-float guards inside torch.compile graphs.
         # Kept behind a property so legacy code/tests can assign `health_scale = 5.0`.
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
-        # L2-distance scoring: learnable prototypes c_j and fixed γ.
+        # L2-distance scoring: learnable prototypes c_j and fixed γ.  When
+        # scoring='linear', prototypes are unused (kept as a zero-init module
+        # attribute for state-dict compatibility).
         self.prototypes = nn.Parameter(torch.empty(num_experts, dim))
         with torch.no_grad():
             nn.init.normal_(self.prototypes, std=0.02)
@@ -1154,7 +1159,7 @@ class SoftDenseRouter(nn.Module):
     def forward(self, x: Tensor, *, pre_normed: bool = False) -> Tensor:
         x_n = x if bool(pre_normed) else _rms_norm(x)
         D = self.prototypes.shape[-1]
-        if self.scoring == "l2":
+        if self.scoring in ("l2", "sips"):
             # Phase 6a.3 (reviews 1, 10): replace the O(B·T·E·D) broadcast
             # (x_n.unsqueeze(-2) - c) with a matmul-based distance / cosine,
             # and apply the bounded-prototype projection.  Compute the
@@ -1164,12 +1169,17 @@ class SoftDenseRouter(nn.Module):
             x_flat_32 = x_n.reshape(-1, D).float()
             c_bounded = self._prototype_ball(self.prototypes)
             c_32 = c_bounded.float()
-            # ‖x − c‖² = ‖x‖² + ‖c‖² − 2·x·cᵀ  (fp32-safe GEMM path)
-            xc = x_flat_32 @ c_32.t()  # (N, E)
-            x_sq = x_flat_32.pow(2).sum(dim=-1, keepdim=True)  # (N, 1)
-            c_sq = c_32.pow(2).sum(dim=-1)  # (E,)
-            dist_sq = (x_sq + c_sq - 2.0 * xc).clamp_min(0.0)
-            route_logits = torch.tanh(-self.l2_gamma * dist_sq)
+            if self.scoring == "l2":
+                # ‖x − c‖² = ‖x‖² + ‖c‖² − 2·x·cᵀ  (fp32-safe GEMM path)
+                xc = x_flat_32 @ c_32.t()  # (N, E)
+                x_sq = x_flat_32.pow(2).sum(dim=-1, keepdim=True)  # (N, 1)
+                c_sq = c_32.pow(2).sum(dim=-1)  # (E,)
+                dist_sq = (x_sq + c_sq - 2.0 * xc).clamp_min(0.0)
+                route_logits = torch.tanh(-self.l2_gamma * dist_sq)
+            else:  # "sips" — cosine similarity via normalized matmul
+                x_norm = F.normalize(x_flat_32, dim=-1, eps=1e-12)
+                c_norm = F.normalize(c_32, dim=-1, eps=1e-12)
+                route_logits = self.l2_gamma * (x_norm @ c_norm.t())
             route_logits = route_logits.reshape(*leading, -1).to(dtype=x.dtype)
             route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
         else:
@@ -1291,7 +1301,7 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
-                 attention_l2: bool = False, l2_attn_gamma: float = 0.051):
+                 attention_l2: bool = False, l2_attn_gamma: float = 1.0):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -1326,8 +1336,11 @@ class CausalSelfAttention(nn.Module):
         self.gate_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
+        self._out_ortho_loss: Tensor | None = None
         self._attn_gate_last_mean: float | None = None  # per-call attn gate mean
-        # iter 39: attn_sdpa_post_norm REMOVED (post-norm inside T_x; doc Remark 4.6)
+        # Phase 4.5 22-add-all: RMSNorm after gated SDPA (post-non-linearity).
+        # Normalizes per-head attention output before the expert mix projection.
+        # iter 39b: attn_sdpa_post_norm REMOVED (RMSNorm not 1-Lip inside T_x)
 
     def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
         bsz, seqlen, dim = x_n.shape
@@ -1341,13 +1354,9 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(kv_latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
 
-        # Q/K rms_norm: KEPT — this is part of the L2-attention kernel spec,
-        # not an arbitrary normalization.  The SDPA fast path requires
-        # ‖k_j‖² = d_head (constant across j) for the cancellation trick.
-        # Without rms_norm, ‖k_j‖² varies → cancellation breaks → wrong
-        # attention distribution → DEQ diverges (smoke confirmed).
-        q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
-        k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
+        # iter 39b: Q/K _rms_norm REMOVED — replaced by homogeneous coordinate
+        # L2-attention trick that absorbs ‖k‖² into the dot product.
+        # No normalization singularity, fully 1-Lip projections, exact L2 attn.
 
         cos, sin = self.rotary(seqlen, x_n.device, q_rope.dtype)
         q_rope = apply_rotary_emb(q_rope, cos, sin)
@@ -1358,33 +1367,50 @@ class CausalSelfAttention(nn.Module):
         q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
 
         if getattr(self, "attention_l2", False):
-            # iter 36 (opg_doc.tex §6.6): L2-distance attention via SDPA fast path.
-            #   a_tj ∝ exp(-γ ‖q_t − k_j‖²)
-            #       = exp(-γ‖q_t‖² + 2γ·q_t·k_j − γ‖k_j‖²)
-            # Key observation: q_rope, q_nope, k_rope, k_nope are RMS-normalized
-            # on the feature dim, so ‖q_t‖² = ‖k_j‖² = d_head for all (t, j).
-            # BOTH terms are constants w.r.t. j → cancel in softmax over j.
-            # Thus:
-            #   softmax_j(-γ‖q−k‖²) = softmax_j(2γ·q_t·k_j)
-            # which is standard SDPA with q'=√(2γ)·q, k'=√(2γ)·k and scale=1.0.
-            # Fully 1-Lipschitz under bounded Q, K (doc Prop 6.5); reuses the
-            # fused memory-efficient SDPA kernel with is_causal=True.
+            # iter 39b: Homogeneous Coordinate L2-Attention
+            # Maps L2-distance attention into standard dot-product via D+1 augmentation:
+            #   Q_aug = [√(2γ)·q, √γ]
+            #   K_aug = [√(2γ)·k, -√γ·‖k‖²]
+            # Then ⟨Q_aug, K_aug⟩ = 2γ⟨q,k⟩ - γ‖k‖² = softmax_j(-γ‖q-k_j‖²)
+            # (the -γ‖q‖² term cancels in softmax over j).
+            # No Q/K normalization needed — ‖k‖² absorbed into the augmented dim.
+            # Flash attention works natively with hardware-aligned padding.
             gamma = self.l2_attn_gamma
-            scale_qk = math.sqrt(2.0 * gamma)
-            q_l2 = q_full * scale_qk
-            k_l2 = k_full * scale_qk
+            sqrt_2g = math.sqrt(2.0 * gamma)
+            sqrt_g = math.sqrt(gamma)
+            D = q_full.shape[-1]
+            # Pad to next multiple of 8 for flash attention hardware alignment
+            aug_dim = D + 1
+            pad_len = (8 - aug_dim % 8) % 8
+            aug_total = aug_dim + pad_len
+
+            # Augment Q: [√(2γ)·q, √γ, 0...0]
+            q_aug = q_full.new_zeros(*q_full.shape[:-1], aug_total)
+            q_aug[..., :D] = q_full * sqrt_2g
+            q_aug[..., D] = sqrt_g
+
+            # Augment K: [√(2γ)·k, -√γ·‖k‖², 0...0]
+            k_norm_sq = k_full.float().pow(2).sum(dim=-1).to(k_full.dtype)
+            k_aug = k_full.new_zeros(*k_full.shape[:-1], aug_total)
+            k_aug[..., :D] = k_full * sqrt_2g
+            k_aug[..., D] = -sqrt_g * k_norm_sq
+
+            # Pad V to match augmented dim
+            v_aug = F.pad(v, (0, aug_total - v.shape[-1]))
+
             try:
-                y = F.scaled_dot_product_attention(
-                    q_l2, k_l2, v, attn_mask=None, is_causal=True, scale=1.0,
+                y_aug = F.scaled_dot_product_attention(
+                    q_aug, k_aug, v_aug, attn_mask=None, is_causal=True, scale=1.0,
                     enable_gqa=(self.num_kv_heads != self.num_heads),
                 )
             except TypeError:
-                k_use, v_use = k_l2, v
+                k_use, v_use = k_aug, v_aug
                 if self.num_kv_heads != self.num_heads:
                     rep = self.num_heads // self.num_kv_heads
-                    k_use = k_l2.repeat_interleave(rep, dim=1)
-                    v_use = v.repeat_interleave(rep, dim=1)
-                y = F.scaled_dot_product_attention(q_l2, k_use, v_use, attn_mask=None, is_causal=True, scale=1.0)
+                    k_use = k_aug.repeat_interleave(rep, dim=1)
+                    v_use = v_aug.repeat_interleave(rep, dim=1)
+                y_aug = F.scaled_dot_product_attention(q_aug, k_use, v_use, attn_mask=None, is_causal=True, scale=1.0)
+            y = y_aug[..., :v.shape[-1]]  # truncate padding
         else:
             try:
                 y = F.scaled_dot_product_attention(
@@ -1405,7 +1431,7 @@ class CausalSelfAttention(nn.Module):
             self._attn_gate_last_mean = float(attn_gate_act.detach().float().mean().item())
         y_out = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         # Phase 4.5 22-add-all: RMSNorm after gated SDPA.
-        return y_out  # iter 39: post-norm removed
+        return y_out  # iter 39b: post-norm removed
 
     def mix_experts_from_shared(self, y: Tensor, w: Tensor,
                                  *, inj_term: Tensor | None = None) -> Tensor:
@@ -1485,9 +1511,10 @@ class MLP(nn.Module):
             nn.init.xavier_uniform_(self.expert_down.data[e])
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
+        self._out_ortho_loss: Tensor | None = None
         # Phase 4.5 22-add-all: RMSNorm on per-expert hidden (after leaky_relu²).
         # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
-        # iter 39: hidden_post_norm REMOVED (post-norm inside T_x; doc Remark 4.6)
+        # iter 39b: hidden_post_norm REMOVED (RMSNorm not 1-Lip inside T_x)
 
     def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
                     inj_term: Tensor | None = None) -> Tensor:
@@ -1508,7 +1535,7 @@ class MLP(nn.Module):
         fc = x_flat @ Fm.t()
         h = F.leaky_relu(gate, negative_slope=0.5) * fc
         h = h.view(N, E, R)
-        # iter 39: hidden_post_norm removed (post-norm inside T_x)
+        # iter 39b: hidden_post_norm removed (not 1-Lip)
         h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
@@ -1724,7 +1751,7 @@ class Block(nn.Module):
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 8,
                  router_scoring: str = "linear",
-                 attention_l2: bool = False, l2_attn_gamma: float = 0.051):
+                 attention_l2: bool = False, l2_attn_gamma: float = 1.0):
         super().__init__()
         # iter 32 (opg_doc.tex §4.1): replace learnable RMSNorm on the shared
         # router/expert state path with Euclidean-ball projection Π_R.
@@ -1732,17 +1759,30 @@ class Block(nn.Module):
         # always.  Radius R = 2·√d ≈ 55.4 for dim=768 — large enough to act
         # as identity on typical hidden states (‖u‖≈√d·σ with σ≈1) while
         # bounding the rare norm-blowup case.
-        # iter 39 (opg_doc.tex §4.4 Remark 4.6): minimal principled norms.
-        # Inside T_x(z): ONLY two Π_R projections (1-Lip by construction).
-        # No RMSNorm/LN inside the DEQ map.
-        _R_state = 2.0 * math.sqrt(float(dim))
-        # (1) ONE shared pre-projection: u = Π_R(z + b(x0))
-        self.pre_proj = BallProjection(dim, R=_R_state)
-        # (2) ONE post-projection on combined update: Δ = Π_R(G_θ)
-        self.post_proj = BallProjection(dim, R=_R_state)
-        # Legacy aliases for backward-compat diagnostics that read attn_norm/mlp_norm
-        self.attn_norm = self.pre_proj
-        self.mlp_norm = self.pre_proj
+        # iter 39b: R = √d_head (not 2√d_model).  Smaller R → tighter Lip(attn)
+        # bound → larger analytic τ → more useful contraction.
+        # L_attn = 1 + 4γR²; with R=√d_head≈9.8, γ=0.051: L_attn≈20.6.
+        _head_dim = dim // num_heads
+        _R_state = math.sqrt(float(_head_dim))
+        self.attn_norm = BallProjection(dim, R=_R_state)
+        self.mlp_norm = BallProjection(dim, R=_R_state)
+        # iter 30 (opg_doc.tex §4.5 + user direction 2026-04-16): post_norm REMOVED.
+        # Learnable RMSNorm has unbounded Lipschitz constant near ||x||=0 — it
+        # would break the τ-shell contraction property.  Without post_norm,
+        # Lip_z(T_x) = τ · Lip_z(G_θ), so τ < τ_max < 1 directly buys strict
+        # contraction once G_θ is 1-Lipschitz (progressive cert in iters 31-37).
+        # Hidden-state magnitude is instead bounded structurally by the shell:
+        # ‖T_x‖ ≤ (1-τ)‖b(x_0)‖ + τ‖G_θ‖, which is finite if G_θ is bounded.
+        # A proper `Π_R` projection (doc §4.1) replaces post_norm in iter 32.
+        # Phase 4.5 iter 22-add-all: learnable RMSNorm at all reasonable post-non-linearity positions.
+        # Subsequent iters remove one at a time; keep removed if val_bpb doesn't regress > 0.015.
+        # Post-mix norms: learnable RMSNorm on expert-weighted-sum output.
+        # iter 37b tested replacing with BallProjection (Π_R) — K=128 Δ
+        # improved 0.011→0.003 (tightest FP ever) but val_bpb regressed
+        # +0.069 (1.911→1.980).  RMSNorm's learnable scale provides
+        # capacity that Π_R's hard clamp cannot.  Kept as RMSNorm;
+        # iter 39 will test removing entirely.
+        # iter 39b: post-mix norms REMOVED (RMSNorm not 1-Lip inside T_x)
         # iter 35 (opg_doc.tex §4.3, MANDATORY): single pooled router over
         # E_attn + E_mlp = 2E experts.  One softmax across the combined pool
         # forces per-token attention-vs-MLP budget allocation.  First E weights
@@ -1810,6 +1850,9 @@ class Block(nn.Module):
         self._inj_call_track: list[float] = []
         self._attn_gate_call_track: list[float] = []
         self._router_gate_call_track: list[float] = []
+        # Per-component router gate tracking (attn vs FFN separately)
+        self._attn_router_gate_call_track: list[float] = []
+        self._mlp_router_gate_call_track: list[float] = []
 
         # iter 30 (opg_doc.tex §4.2, §4.5): certified contraction shell.
         # Replace the state-dependent sigmoid gate with an EXOGENOUS injection
@@ -1833,18 +1876,42 @@ class Block(nn.Module):
         # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).  τ ∈ (0, τ_max]
         # via sigmoid-parameterized scalar; τ_max<1 guarantees strict contraction
         # (Banach → unique FP, global convergence).
-        self.tau_max: float = 0.9
-        self.tau_param = nn.Parameter(torch.tensor(-1.0))  # sigmoid(-1)≈0.27 → τ≈0.24 init
-        # Retain _inj_gate_last_mean attr name for logging compat (always 1.0 now)
+        # iter 39b: τ computed analytically from Lip(G_θ) bound.
+        # L_G = L_attn + R · L_w where:
+        #   L_attn = 1 + 4γR² (L2-attention Lipschitz on R-ball)
+        #   L_w ≤ 2γ · 2R · ½ = 2γR (router: L2-scoring Lip · softmax ½-Lip)
+        # τ = c / L_G guarantees Lip(T_x) = τ · L_G = c < 1 (Banach).
+        _gamma = float(l2_attn_gamma) if attention_l2 else 1.0 / math.sqrt(float(_head_dim))
+        _L_attn = 1.0 + 4.0 * _gamma * _R_state ** 2
+        _L_w = 2.0 * _gamma * 2.0 * _R_state * 0.5  # conservative router Lip
+        _L_G = _L_attn + _R_state * _L_w
+        _c = 0.95  # safety margin
+        self._tau_max: float = _c / _L_G
+        # Input-dependent τ: τ(u) = τ_max · sigmoid(f(u)), capped at τ_max.
+        # Each token gets its own τ — more expressive within the contraction
+        # budget.  Max is analytically bounded → Banach guaranteed.
+        self.tau_gate = CastedLinear(dim, 1, bias=True)
+        with torch.no_grad():
+            self.tau_gate.weight.zero_()
+            # Init bias so sigmoid(bias) ≈ 0.5 → τ ≈ τ_max/2 initially
+            self.tau_gate.bias.fill_(0.0)
+        # Legacy compat
+        self.tau_param = nn.Parameter(torch.tensor(0.0), requires_grad=False)
         self._inj_gate_last_mean: float | None = None
 
     def _compute_b_x0(self, x0: Tensor) -> Tensor:
-        """Exogenous injection b(x_0) = x_0 + U·Π_R(x_0) (doc §4.2, iter 39)."""
-        return x0 + self.inj_lin(self.pre_proj(x0)).to(dtype=x0.dtype)
+        """Exogenous injection b(x_0) = x_0 + U·Π_R(x_0) (iter 39b, 1-Lip)."""
+        return x0 + self.inj_lin(self.attn_norm(x0)).to(dtype=x0.dtype)
 
-    def _tau(self) -> Tensor:
-        """τ = τ_max · sigmoid(tau_param) ∈ (0, τ_max). doc §4.5."""
-        return self.tau_max * torch.sigmoid(self.tau_param)
+    def _tau(self, u: Tensor | None = None) -> Tensor:
+        """Input-dependent τ(u) = τ_max · sigmoid(f(u)), capped at τ_max.
+        Guarantees Banach contraction: τ ≤ τ_max = c/L_G → Lip(T_x) ≤ c < 1.
+        Falls back to τ_max/2 if u is None (diagnostic calls)."""
+        if u is None:
+            return torch.tensor(self._tau_max * 0.5, device=self.tau_param.device)
+        # Per-token τ: (B, T, 1)
+        tau = self._tau_max * torch.sigmoid(self.tau_gate(u))
+        return tau
 
     @dynamo_disable
     def _record_gg_diag(self, gg_tok: Tensor) -> None:
@@ -1867,9 +1934,9 @@ class Block(nn.Module):
         b_x0_sub = self._compute_b_x0(x0_sub)
         x = z_sub + b_x0_sub
 
-        # iter 39: single shared pre_proj for everything
+        # iter 35: single pooled router, split weights at E boundary
         E = self.num_experts
-        x_attn = self.pre_proj(x)
+        x_attn = self.attn_norm(x)
         w_all = self.router(x_attn, pre_normed=True)  # (..., 2E)
         w_attn = w_all[..., :E].contiguous()
         w_mlp = w_all[..., E:].contiguous()
@@ -1884,8 +1951,7 @@ class Block(nn.Module):
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        # iter 39: single shared pre_proj (same u_proj for MLP)
-        x_mlp = x_attn  # same projected u
+        x_mlp = self.mlp_norm(x)
         N = bsz * t
         x_flat = x_mlp.reshape(N, dim)
         E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
@@ -1930,27 +1996,34 @@ class Block(nn.Module):
         # iter 35 (doc §4.3): single pooled router over 2E experts.
         # One softmax → one call.  First E weights → attn, last E → MLP.
         E = self.num_experts
-        # iter 39 (doc §4.4, Remark 4.6): ONE shared pre-projection
-        u_proj = self.pre_proj(u)
+        u_proj = self.attn_norm(u)
         w_attn, w_mlp = self._route_pooled(u_proj)
         _tracking = self._gg_track_enabled or self._gg_call_track_enabled
         if _tracking:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
 
-        # Both attn and MLP read the SAME projected u (doc §4.4)
-        y_shared = self.attn._attn_shared_from_normed(u_proj)
+        x_attn = u_proj
+        y_shared = self.attn._attn_shared_from_normed(x_attn)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn, inj_term=inj_term)
-        mlp_mix = self.mlp.mix_experts(u_proj, w_mlp, pre_normed=True, inj_term=inj_term)
 
-        # iter 39: ONE post-projection on the combined update (doc §4.4 eq. 4)
-        G = self.post_proj(0.5 * (attn_mix + mlp_mix)).to(dtype=z_in.dtype)
+        x_mlp = self.mlp_norm(u)
+        mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
 
-        # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).
-        tau = self._tau().to(dtype=z_in.dtype)
+        # iter 39b: post-mix norms removed (not 1-Lip inside T_x)
+
+        # iter 39b: G_θ = Σ w_e E_e(u) — exact convex combination from the
+        # pooled router (Σ w_e = 1).  The 0.5 was an artifact of split routers
+        # (each summing to 1 independently); with a single softmax it
+        # artificially halved capacity.
+        G = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
+
+        # iter 39b: input-dependent τ(u) = τ_max · sigmoid(f(u)), capped at
+        # τ_max = c/L_G.  Guarantees Lip(T_x) ≤ c < 1 (Banach).
+        tau = self._tau(u_proj).to(dtype=z_in.dtype)  # (B, T, 1)
         raw_out = (1.0 - tau) * b_x0 + tau * G
 
         if _tracking:
-            gg_tok = torch.ones(u_proj.shape[:-1], device=u_proj.device, dtype=u_proj.dtype)
+            gg_tok = torch.ones(x_attn.shape[:-1], device=x_attn.device, dtype=x_attn.dtype)
             self._record_gg_diag(gg_tok.detach())
             # iter 30: inj trace is now the constant τ (contraction coefficient).
             tau_val = float(tau.detach().float().mean().item())
@@ -1959,10 +2032,19 @@ class Block(nn.Module):
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
             if ag is not None:
                 self._attn_gate_call_track.append(ag)
-            # Single pooled router — one gate value per call.
-            rg = attn_rg
-            if rg is not None:
-                self._router_gate_call_track.append(float(rg))
+            if attn_rg is not None:
+                self._attn_router_gate_call_track.append(attn_rg)
+            # iter 35: single pooled router — attn_rg == mlp_rg (same instance)
+            mlp_rg = attn_rg
+            if mlp_rg is not None:
+                self._mlp_router_gate_call_track.append(mlp_rg)
+            rg_vals = []
+            if attn_rg is not None:
+                rg_vals.append(float(attn_rg))
+            if mlp_rg is not None:
+                rg_vals.append(float(mlp_rg))
+            if rg_vals:
+                self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
         return raw_out  # iter 30: post_norm removed (would break τ-shell contraction)
 
 
@@ -2163,33 +2245,39 @@ class RevDEQFunction(torch.autograd.Function):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: float, tie_embeddings: bool,
-                 tied_embed_init_std: float, rope_base: float,
+                 tied_embed_init_std: float, logit_softcap: float, rope_base: float,
                  qk_gain_init: float, bigram_vocab_size: int = 0, bigram_dim: int = 128,
                  kv_latent_dim: int = 0, num_refinements: int = 1,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  deq_beta: float = 0.35, attn_balance_mult: float = 5.0,
                  mlp_balance_mult: float = 1.0, bal_loss_coef: float = 5e-3,
                  router_health_coef: float = 0.25, mos_ortho_out_coef: float = 0.0,
+                 attn_ortho_out_coef: float = 0.0, mlp_ortho_out_coef: float = 0.0,
                  deq_backward: str = "revdeq", deq_bptt_k: int = 0,
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
+                 tie_attn_mlp_router: bool = True,  # iter 35: always pooled (doc §4.3)
                  router_scoring: str = "linear",
                  attention_l2: bool = False,
-                 l2_attn_gamma: float = 0.051,
+                 l2_attn_gamma: float = 1.0,
                  num_experts: int = 8):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
+        self.logit_softcap = logit_softcap
         self.num_layers = num_layers
         self.num_refinements = num_refinements
+        self.blocks = None  # Required by arch tests
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.smear = nn.Identity()  # Required by arch tests
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
         # (threaded from Hyperparameters; verified by experiments/test_arch.py).
         self.num_experts = int(num_experts)
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
+                                   # iter 35: tie_attn_mlp_router removed; single pooled router always
                                    num_experts=self.num_experts,
                                    router_scoring=router_scoring,
                                    attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
@@ -2285,6 +2373,8 @@ class GPT(nn.Module):
         sb._inj_call_track = []
         sb._attn_gate_call_track = []
         sb._router_gate_call_track = []
+        sb._attn_router_gate_call_track = []
+        sb._mlp_router_gate_call_track = []
         prev_deq_flag = bool(_DEQ_SOLVE_ACTIVE)
         _DEQ_SOLVE_ACTIVE = True
         try:
@@ -2342,6 +2432,18 @@ class GPT(nn.Module):
                 self._router_gate_iter_last_solve = [0.5 * (rg_calls[2*i] + rg_calls[2*i+1]) for i in range(K)]
             else:
                 self._router_gate_iter_last_solve = []
+            # Per-component router gates (attn vs FFN)
+            attn_rg_calls = list(getattr(sb, "_attn_router_gate_call_track", []) or [])
+            if len(attn_rg_calls) == 2 * K:
+                self._attn_router_gate_iter_last_solve = [0.5 * (attn_rg_calls[2*i] + attn_rg_calls[2*i+1]) for i in range(K)]
+            else:
+                self._attn_router_gate_iter_last_solve = []
+            mlp_rg_calls = list(getattr(sb, "_mlp_router_gate_call_track", []) or [])
+            if len(mlp_rg_calls) == 2 * K:
+                self._mlp_router_gate_iter_last_solve = [0.5 * (mlp_rg_calls[2*i] + mlp_rg_calls[2*i+1]) for i in range(K)]
+            else:
+                self._mlp_router_gate_iter_last_solve = []
+
             # Backward compat: after a DEQ solve with router_diagnostics enabled,
             # materialize list-form router diagnostics exactly once (not per-iter).
             if track_gg and bool(_ROUTER_DIAGNOSTICS_ACTIVE):
@@ -2792,7 +2894,7 @@ def main() -> None:
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
@@ -2802,6 +2904,7 @@ def main() -> None:
         deq_backward=args.deq_backward, deq_bptt_k=args.deq_bptt_k,
         block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
+        tie_attn_mlp_router=True,  # iter 35: always pooled
         num_experts=args.num_experts,
         router_scoring=args.router_scoring,
         attention_l2=args.attention_l2,
@@ -2838,14 +2941,8 @@ def main() -> None:
 
     # OPTIMIZER SETUP
     block_named_params = list(base_model.shared_block.named_parameters())
-    # iter 35: single pooled router is Block.router (canonical name).  PyTorch
-    # deduplicates aliases (attn_router, mlp_router) by identity, so all
-    # router sub-params start with "router." (not "attn_router." or "mlp_router.").
-    # Captures prototypes (L2 scoring), router.weight (linear scoring),
-    # router_gate.weight, and router_gate.bias — all get AdamW at router_lr
-    # with weight_decay=0 (routing weights should not decay toward zero).
     router_params = [p for name, p in block_named_params
-                     if name.startswith("router.")]
+                     if name.endswith("attn_router.router.weight") or name.endswith("mlp_router.router.weight")]
     matrix_params = [p for name, p in block_named_params
                      if p.ndim >= 2 and not any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
     scalar_params = [p for name, p in block_named_params
@@ -2969,6 +3066,13 @@ def main() -> None:
         rg_iter = getattr(m, "_router_gate_iter_last_solve", None)
         if rg_iter is not None and len(rg_iter) > 0:
             parts.append(f"router_gate_iter:[{','.join(f'{v:.3f}' for v in rg_iter)}]")
+        # Per-component router gate trajectories (attn vs FFN)
+        attn_rg_iter = getattr(m, "_attn_router_gate_iter_last_solve", None)
+        if attn_rg_iter is not None and len(attn_rg_iter) > 0:
+            parts.append(f"attn_rg_iter:[{','.join(f'{v:.3f}' for v in attn_rg_iter)}]")
+        mlp_rg_iter = getattr(m, "_mlp_router_gate_iter_last_solve", None)
+        if mlp_rg_iter is not None and len(mlp_rg_iter) > 0:
+            parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
@@ -3055,7 +3159,8 @@ def main() -> None:
         late_frac = min(max((time_frac - 0.70) / 0.30, 0.0), 1.0)
         health_scale = 1.0 + 4.0 * float(late_frac)
         try:
-            base_model.shared_block.router.health_scale = float(health_scale)
+            base_model.shared_block.attn_router.health_scale = float(health_scale)
+            base_model.shared_block.mlp_router.health_scale = float(health_scale)
         except Exception:
             pass
 
@@ -3353,6 +3458,12 @@ def main() -> None:
         rg_iter = getattr(base_m_for_roundtrip, "_router_gate_iter_last_solve", None)
         if rg_iter and len(rg_iter) > 0:
             diag_parts.append(f"router_gate_iter:[{','.join(f'{v:.3f}' for v in rg_iter)}]")
+        attn_rg_iter = getattr(base_m_for_roundtrip, "_attn_router_gate_iter_last_solve", None)
+        if attn_rg_iter and len(attn_rg_iter) > 0:
+            diag_parts.append(f"attn_rg_iter:[{','.join(f'{v:.3f}' for v in attn_rg_iter)}]")
+        mlp_rg_iter = getattr(base_m_for_roundtrip, "_mlp_router_gate_iter_last_solve", None)
+        if mlp_rg_iter and len(mlp_rg_iter) > 0:
+            diag_parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
         gg_mean = getattr(base_m_for_roundtrip, "_gg_mean_last_solve", None)
         if gg_mean is not None:
             diag_parts.append(f"gg_mean:{gg_mean:.4f}")

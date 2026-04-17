@@ -60,7 +60,7 @@ class TestFusedExpertMix(unittest.TestCase):
         x_n = _rms_norm(x)
         gate_h = torch.einsum("btd,esd->btes", x_n, mlp.expert_gate.to(dtype=x_n.dtype))
         fc_h = torch.einsum("btd,esd->btes", x_n, mlp.expert_fc.to(dtype=x_n.dtype))
-        # iter 39: hidden_post_norm removed — straight activation
+        # iter 39b: hidden_post_norm removed (not 1-Lip inside T_x)
         h = F.leaky_relu(gate_h, negative_slope=0.5) * fc_h  # [B,T,E,R]
         out_e = torch.einsum("btes,eds->bted", h, mlp.expert_down.to(dtype=x_n.dtype))
         out_explicit = (w.unsqueeze(-1) * out_e).sum(dim=2)
