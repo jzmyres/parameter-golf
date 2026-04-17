@@ -60,9 +60,14 @@ class TestFusedExpertMix(unittest.TestCase):
         x_n = _rms_norm(x)
         gate_h = torch.einsum("btd,esd->btes", x_n, mlp.expert_gate.to(dtype=x_n.dtype))
         fc_h = torch.einsum("btd,esd->btes", x_n, mlp.expert_fc.to(dtype=x_n.dtype))
-        h = F.leaky_relu(gate_h, negative_slope=0.5) * fc_h  # [B,T,E,R]
-        # iter 35 baseline: hidden_post_norm (RMSNorm on expert hidden dim) still present
-        h = mlp.hidden_post_norm(h)
+        # Phase 4.5 iter 22-add-all: fused path applies `hidden_post_norm` on the
+        # per-expert hidden (shape (N, E, R)) after leaky_relu².  Mirror that in
+        # the explicit path so the parity check holds.
+        B_, T_, _, _ = gate_h.shape
+        h_act = F.leaky_relu(gate_h, negative_slope=0.5) * fc_h  # [B,T,E,R]
+        h_flat = h_act.reshape(B_ * T_, mlp.num_experts, mlp.expert_rank)
+        h_flat = mlp.hidden_post_norm(h_flat)
+        h = h_flat.reshape(B_, T_, mlp.num_experts, mlp.expert_rank)
         out_e = torch.einsum("btes,eds->bted", h, mlp.expert_down.to(dtype=x_n.dtype))
         out_explicit = (w.unsqueeze(-1) * out_e).sum(dim=2)
 

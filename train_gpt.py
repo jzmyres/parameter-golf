@@ -878,109 +878,18 @@ class SpectralNormCap(nn.Module):
         return W * scale
 
 
-class OrthogonalParametrization(nn.Module):
-    """Newton-Schulz orthogonal parametrization for 2D/3D weight tensors.
-
-    Projects W onto the Stiefel manifold so ALL singular values equal 1
-    (isometry).  For a tall (M≥N) matrix, the result satisfies W^T W = I_N;
-    for wide (M<N), W W^T = I_M.  3D tensors (E, M, N) are treated per-slice.
-
-    Replaces PerExpertSpectralNormCap (3D) and SpectralNormCap (2D).
-    **Stateless**: no buffers, no update_uv_() needed — inherently
-    RevDEQ-compatible (Permanent protocol rule 4).
-
-    Uses the quadratic Newton-Schulz iteration:
-        X_{k+1} = X_k @ (1.5·I - 0.5·X_k^T X_k)
-    Converges when all singular values of the scaled input are in (0, √3).
-    Initial scaling divides by σ_max (estimated via 3 power iterations) to
-    guarantee σ_max ≈ 1 before NS iteration — safe for high-condition matrices.
-    """
-
-    def __init__(self, weight_shape: torch.Size, n_iters: int = 20):
-        super().__init__()
-        self.n_iters = int(n_iters)
-        self.ndim = len(weight_shape)
-        assert self.ndim in (2, 3), f"expected 2D or 3D, got {weight_shape}"
-
-    def forward(self, W: Tensor) -> Tensor:
-        W32 = W.float()
-        if self.ndim == 3:
-            return self._ortho_3d(W32).to(W.dtype)
-        return self._ortho_2d(W32).to(W.dtype)
-
-    @staticmethod
-    def _sigma_max_3d(W: Tensor, n_iters: int = 3) -> Tensor:
-        """Estimate per-expert σ_max via power iteration. Returns (E, 1, 1).
-        Uses deterministic init (ones) — NOT torch.randn — so repeated calls
-        on the same W give identical results (RevDEQ requirement)."""
-        E, M, N = W.shape
-        u = torch.ones(E, M, 1, device=W.device, dtype=W.dtype)
-        u = F.normalize(u, dim=-2, eps=1e-12)
-        for _ in range(n_iters):
-            v = F.normalize(torch.bmm(W.transpose(-2, -1), u), dim=-2, eps=1e-12)
-            u = F.normalize(torch.bmm(W, v), dim=-2, eps=1e-12)
-        sigma = torch.bmm(u.transpose(-2, -1), torch.bmm(W, v)).abs()  # (E, 1, 1)
-        return sigma.clamp(min=1e-6)
-
-    @staticmethod
-    def _sigma_max_2d(W: Tensor, n_iters: int = 3) -> Tensor:
-        """Estimate σ_max via power iteration. Returns scalar.
-        Deterministic init (ones) for RevDEQ compatibility."""
-        M, N = W.shape
-        u = torch.ones(M, device=W.device, dtype=W.dtype)
-        u = F.normalize(u, dim=0, eps=1e-12)
-        for _ in range(n_iters):
-            v = F.normalize(W.t() @ u, dim=0, eps=1e-12)
-            u = F.normalize(W @ v, dim=0, eps=1e-12)
-        return (u @ W @ v).abs().clamp(min=1e-6)
-
-    def _ortho_3d(self, W: Tensor) -> Tensor:
-        E, M, N = W.shape
-        transposed = M < N
-        if transposed:
-            W = W.transpose(-2, -1)
-            M, N = N, M
-        # Scale by σ_max so largest singular value ≈ 1 (convergence guarantee).
-        sigma = self._sigma_max_3d(W)  # (E, 1, 1)
-        W = W / sigma
-        I = torch.eye(N, device=W.device, dtype=W.dtype).unsqueeze(0)  # (1, N, N)
-        for _ in range(self.n_iters):
-            WtW = torch.bmm(W.transpose(-2, -1), W)       # (E, N, N)
-            W = torch.bmm(W, 1.5 * I - 0.5 * WtW)        # (E, M, N)
-        if transposed:
-            W = W.transpose(-2, -1)
-        return W
-
-    def _ortho_2d(self, W: Tensor) -> Tensor:
-        M, N = W.shape
-        transposed = M < N
-        if transposed:
-            W = W.t()
-            M, N = N, M
-        sigma = self._sigma_max_2d(W)
-        W = W / sigma
-        I = torch.eye(N, device=W.device, dtype=W.dtype)
-        for _ in range(self.n_iters):
-            WtW = W.t() @ W                                # (N, N)
-            W = W @ (1.5 * I - 0.5 * WtW)                 # (M, N)
-        if transposed:
-            W = W.t()
-        return W
-
-
 _SPECTRAL_CAP_TYPES = (PerExpertSpectralNormCap, SpectralNormCap)
 
 
 def refresh_spectral_norms(model: nn.Module) -> None:
-    """Walk `model` and refresh all weight parametrizations.
+    """Walk `model` and run one power iteration for every spectral-norm
+    cap parametrization (both 2D `SpectralNormCap` and 3D
+    `PerExpertSpectralNormCap`), refreshing `u`, `v` buffers so σ
+    estimates track `W` as training updates it.
 
-    For spectral-norm caps: run one power iteration to update u/v buffers.
-    For orthogonal parametrizations: invalidate the cache so the next
-    forward recomputes the orthogonalized weight (the optimizer may have
-    changed the raw parameter since last forward).
-
-    Call once right after model construction and once per optimizer step
-    (after `opt.step()`, before the next forward).
+    Call once right after model construction (so the first forward has
+    non-random u/v) and once per optimizer step (after `opt.step()`,
+    before the next forward).
     """
     for mod in model.modules():
         plist_dict = getattr(mod, "parametrizations", None)
@@ -993,7 +902,6 @@ def refresh_spectral_norms(model: nn.Module) -> None:
             for p in plist:
                 if isinstance(p, _SPECTRAL_CAP_TYPES):
                     p.update_uv_(W)
-                # OrthogonalParametrization is stateless — no refresh needed.
 
 
 class CastedLinear(nn.Linear):
@@ -1869,19 +1777,36 @@ class Block(nn.Module):
                                          expert_rank=attn_expert_rank, router=self.router,
                                          attention_l2=attention_l2, l2_attn_gamma=l2_attn_gamma)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
-        # iter 40 (opg_doc.tex §6.1): orthogonal parametrization via
-        # Newton-Schulz iteration on ALL expert banks.  Forces every per-expert
-        # weight slice to have all singular values = 1 (isometry), making each
-        # expert exactly 1-Lipschitz.  Replaces iter 33's spectral-norm cap
-        # (σ_max ≤ 1) with exact orthogonality (σ = 1 for ALL singular values).
-        # Stateless — no buffers, inherently RevDEQ-compatible.
-        for name, mod in [("expert_out", self.attn), ("expert_proj", self.attn),
-                          ("expert_gate", self.mlp), ("expert_fc", self.mlp),
-                          ("expert_down", self.mlp)]:
-            torch.nn.utils.parametrize.register_parametrization(
-                mod, name,
-                OrthogonalParametrization(getattr(mod, name).shape),
-            )
+        # iter 33 (opg_doc.tex §6.1): per-expert spectral-norm cap on the
+        # dominant-spectral-path output matrices `expert_out` (attn) and
+        # `expert_down` (mlp).  These are raw nn.Parameter tensors of shape
+        # (E, D, R), so we register a custom per-expert parametrization that
+        # caps σ_max(W_e) ≤ 1 per-expert via 1 power iteration per forward.
+        # Starts narrow: only the OUTPUT projections; other expert weights
+        # (expert_proj, expert_gate, expert_fc) are deferred to iter 33b if
+        # this one lands cleanly.  The Lipschitz of the full expert path is
+        # bounded by σ_max(W_in) · Lip(nonlin) · σ_max(W_out), so capping
+        # W_out alone still provides a meaningful Lipschitz reduction.
+        torch.nn.utils.parametrize.register_parametrization(
+            self.attn, "expert_out",
+            PerExpertSpectralNormCap(self.attn.expert_out.shape),
+        )
+        torch.nn.utils.parametrize.register_parametrization(
+            self.attn, "expert_proj",
+            PerExpertSpectralNormCap(self.attn.expert_proj.shape),
+        )
+        torch.nn.utils.parametrize.register_parametrization(
+            self.mlp, "expert_gate",
+            PerExpertSpectralNormCap(self.mlp.expert_gate.shape),
+        )
+        torch.nn.utils.parametrize.register_parametrization(
+            self.mlp, "expert_fc",
+            PerExpertSpectralNormCap(self.mlp.expert_fc.shape),
+        )
+        torch.nn.utils.parametrize.register_parametrization(
+            self.mlp, "expert_down",
+            PerExpertSpectralNormCap(self.mlp.expert_down.shape),
+        )
         # Phase 5b iter 23C-gg-no-residual: gg_gate REMOVED and z residual
         # REMOVED.  New update form:
         #     raw_out = 0.5 * z2            (where z2 = attn_mix + mlp_mix)
@@ -1918,12 +1843,15 @@ class Block(nn.Module):
         self.inj_lin = CastedLinear(dim, dim, bias=False)  # U: learned adapter
         with torch.no_grad():
             nn.init.normal_(self.inj_lin.weight, std=0.02)
-        # iter 40 (opg_doc.tex §6.1): orthogonal U via Newton-Schulz.
-        # Exact isometry (all σ = 1) replaces iter 31's spectral-norm cap
-        # (σ_max ≤ 1).  Stateless — no buffers, RevDEQ-compatible.
+        # iter 31 (opg_doc.tex §6.1): enforce ‖U‖_2 ≤ 1.  Uses our stateless
+        # SpectralNormCap (not PyTorch's built-in spectral_norm) because the
+        # built-in mutates u/v buffers during train-mode forward, breaking
+        # RevDEQ's determinism requirement.  Our version is stateless in
+        # forward(); update_uv_() is called once per opt step via
+        # refresh_spectral_norms() (Permanent protocol rule 4).
         torch.nn.utils.parametrize.register_parametrization(
             self.inj_lin, "weight",
-            OrthogonalParametrization(self.inj_lin.weight.shape),
+            SpectralNormCap(self.inj_lin.weight.shape),
         )
         # Contraction shell T_x(z) = (1-τ) b(x_0) + τ G_θ(z, x_0).  τ ∈ (0, τ_max]
         # via sigmoid-parameterized scalar; τ_max<1 guarantees strict contraction
@@ -1979,7 +1907,7 @@ class Block(nn.Module):
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
-        x_mlp = self.mlp_norm(x)
+        x_mlp = x_attn  # Review-4: reuse — same BallProjection on same input
         N = bsz * t
         x_flat = x_mlp.reshape(N, dim)
         E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
@@ -2034,7 +1962,9 @@ class Block(nn.Module):
         y_shared = self.attn._attn_shared_from_normed(x_attn)
         attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn, inj_term=inj_term)
 
-        x_mlp = self.mlp_norm(u)
+        # Review-4: reuse u_proj — attn_norm and mlp_norm are identical
+        # BallProjection(dim, R=2√d) on the same input u. One call suffices.
+        x_mlp = u_proj
         mlp_mix = self.mlp.mix_experts(x_mlp, w_mlp, pre_normed=True, inj_term=inj_term)
 
         attn_mix = self.attn_post_mix_norm(attn_mix)
@@ -2373,12 +2303,10 @@ class GPT(nn.Module):
             d = W.shape[1]
             flat_idx = topk_idx.reshape(B * T, K)
             flat_p = topk_probs.reshape(B * T, K)
-            flat_out = W.new_empty((B * T, d))
-            chunk = 512
-            for s in range(0, B * T, chunk):
-                e = min(s + chunk, B * T)
-                emb = F.embedding(flat_idx[s:e], W)
-                flat_out[s:e] = (flat_p[s:e].unsqueeze(-1) * emb).sum(dim=1)
+            # Review-9: vectorized weighted embedding (replaces chunk loop).
+            # F.embedding on the full flat index, then weighted sum over K.
+            emb = F.embedding(flat_idx, W)  # (B*T, K, d)
+            flat_out = (flat_p.unsqueeze(-1) * emb).sum(dim=1)  # (B*T, d)
             soft_embed = flat_out.reshape(B, T, d)
             soft_embed = _rms_norm(soft_embed.to(dtype=z.dtype))
         return soft_embed
@@ -2529,11 +2457,10 @@ class GPT(nn.Module):
         elif isinstance(abs_conv_t, torch.Tensor):
             self._deq_residual_t = abs_conv_t
 
-        # If diagnostics are enabled, compute the true residual ||z - f(z)||.
-        if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and z_prev is not None:
-            with torch.no_grad():
-                f_z_final = self.shared_block(z, x0_refined)
-                self._deq_residual_t = (z - f_z_final).float().norm().detach()
+        # Review-5: removed extra shared_block(z, x0_refined) call that ran a
+        # full block forward ONLY for residual diagnostics (~5-10% throughput).
+        # The last-iteration convergence ||z_K - z_{K-1}|| (abs_conv_t) is already
+        # a good proxy for ||z - T(z)|| and is available without extra compute.
 
         distributed = dist.is_available() and dist.is_initialized()
         is_master = (not distributed) or dist.get_rank() == 0

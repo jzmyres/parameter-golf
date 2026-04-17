@@ -148,12 +148,13 @@ class TestExogenousInjectionChunkingInvariance(unittest.TestCase):
         """Structural check: b(x_0) - U·rms_norm(x_0) == x_0.  Confirms the
         identity term '+ x_0' is literally in the formula so input-dependence
         cannot vanish if U collapses during training."""
+        from train_gpt import _rms_norm
+
         blk = self._fresh_block()
         blk.train(False)
         x0 = torch.randn(4, 8, 16)
         with torch.no_grad():
             bx0 = blk._compute_b_x0(x0)
-            from train_gpt import _rms_norm
             inj_term = blk.inj_lin(_rms_norm(x0)).to(dtype=x0.dtype)
         self.assertTrue(
             torch.allclose(bx0 - inj_term, x0, atol=1e-5),
