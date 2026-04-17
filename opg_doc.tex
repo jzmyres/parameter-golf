@@ -250,51 +250,84 @@ Compute dense mixtures:
   \Delta_{\text{attn}}(z,x_0) &= \sum_{e=1}^{E_{\text{attn}}} w^A_e(z,x_0)\,A_e(u(z,x_0)),\\
   \Delta_{\text{ffn}}(z,x_0)  &= \sum_{e=1}^{E_{\text{ffn}}}  w^M_e(z,x_0)\,M_e(u(z,x_0)).
 \end{align}
-Combine in parallel and apply a \textbf{single} output projection on the combined update
-(the $\tfrac12$ matches the stabilizing scale used in the current code):
+Since the router produces a single softmax over the combined pool $E=E_{\text{attn}}+E_{\text{ffn}}$,
+the update is the exact convex combination:
 \begin{equation}
   \label{eq:Gtheta}
-  G_\theta(z,x_0) := \Pi_R\!\left(\tfrac12\Big(\Delta_{\text{attn}}(z,x_0)+\Delta_{\text{ffn}}(z,x_0)\Big)\right).
+  G_\theta(z,x_0) := \sum_{e=1}^{E} w_e(z,x_0)\,E_e(u(z,x_0)).
 \end{equation}
+Note: no $\tfrac12$ factor --- the joint softmax already allocates the full unit budget
+across all experts.  The previous $\tfrac12$ was an artifact of separate per-component routers.
 
 \begin{remark}[Minimal principled norms: $\Pi_R$ inside $T_x$, normalization outside]
 \label{rem:norm_separation}
-\textbf{Inside} the DEQ fixed-point map $T_x(z)$ (i.e., inside the block forward),
-use \emph{only} non-expansive clamps $\Pi_R$, not learnable RMSNorm or LayerNorm.
+\textbf{Inside} the DEQ fixed-point map $T_x(z)$,
+use \emph{only} non-expansive clamps $\Pi_R$ and 1-Lipschitz operations.
+No learnable RMSNorm or LayerNorm (RMSNorm has Lip $= 1/\|x\| \to \infty$ at $\|x\|\to 0$).
 \textbf{Outside} the fixed-point map (embeddings, final output head), learnable
-normalizations may be kept for optimization without affecting the DEQ contraction guarantee.
+normalizations may be kept for optimization.
 
-Concretely, $T_x$ uses exactly \textbf{two} $\Pi_R$ projections:
-\begin{enumerate}[leftmargin=2em]
-  \item \textbf{Pre-projection} (shared input): $u = \Pi_R(z + b(x_0))$ feeds the same bounded
-        vector to routers \emph{and} all experts.
-  \item \textbf{Post-projection} (combined update): $G_\theta = \Pi_R(\tfrac12(\Delta_{\text{attn}} + \Delta_{\text{ffn}}))$.
-\end{enumerate}
-No other norms or clamps appear inside $T_x$.  Learnable norms (RMSNorm) are
-reserved for outside the solve: embedding normalization, the final output-head
-norm, and refinement soft-embedding normalization.
+Concretely, $T_x$ uses exactly \textbf{one} $\Pi_R$ pre-projection:
+$u = \Pi_R(z + b(x_0))$ with $R=\sqrt{d_{\text{head}}}$, feeding the same bounded vector to
+routers and all experts.  No post-norms appear inside $T_x$.
 
-\emph{Why not RMSNorm inside $T_x$?}  RMSNorm is \textbf{not} globally 1-Lipschitz
-(its Jacobian norm diverges as $\|x\|\to 0$).  Using it inside the fixed-point
-map complicates the contraction analysis.  $\Pi_R$ is 1-Lipschitz by
-construction for any $R>0$, giving the contraction guarantee ``for free.''
-
-\emph{Why not remove all clamps?}  Without $\Pi_R$, the bounded-domain assumptions
-that make routers, softmax, and attention well-behaved in bf16 are lost, and
-$\tau<1$ alone cannot reliably prevent saturation or magnitude blow-up unless
-strict operator-norm constraints are enforced \emph{everywhere} (more complex
-than two $\Pi_R$ projections).
+\emph{Why $R=\sqrt{d_{\text{head}}}$?}  This matches the expected per-feature magnitude
+of RMS-normalized vectors (which outside-$T_x$ norms produce), keeping the bounded-domain
+assumptions tight.  Smaller $R$ gives tighter $L_{\text{attn}} = 1 + 4\gamma R^2$ and thus
+larger analytic $\tau$ (more useful contraction).
 \end{remark}
 
-\subsection{Contractive wrapper (the map actually solved)}
+\subsection{Homogeneous Coordinate L2-Attention}
+\label{sec:homogeneous_attn}
+
+Standard L2-distance attention requires $\|k_j\|^2$ to be constant across $j$ for an efficient
+SDPA fast-path (the ``RMS-norm cancellation trick'').  Since RMSNorm is not 1-Lipschitz, we
+instead absorb the key-dependent term into an augmented dot product via the
+\textbf{homogeneous coordinate trick}:
+\[
+  Q_{\text{aug}} = [\sqrt{2\gamma}\,q,\;\sqrt{\gamma}],\qquad
+  K_{\text{aug}} = [\sqrt{2\gamma}\,k,\;-\sqrt{\gamma}\,\|k\|^2].
+\]
+Then $\langle Q_{\text{aug}}, K_{\text{aug}}\rangle = 2\gamma\langle q,k\rangle - \gamma\|k\|^2$,
+which (after the query-norm cancellation in softmax) gives \textbf{exact} L2-distance attention:
+$\mathrm{softmax}_j(-\gamma\|q-k_j\|^2)$.  The augmented vectors are padded to the next hardware
+stride (multiple of 8) for flash attention compatibility.  Values $V$ are zero-padded to match,
+and the output is truncated back to $d_{\text{head}}$.
+
+\subsection{Contractive wrapper with analytic $\tau$}
 \label{sec:Tx}
 
-Finally define
+Define
 \begin{equation}
   \label{eq:Tx}
-  T_x(z) := (1-\tau)\,b(x_0) + \tau\,G_\theta(z,x_0),
-  \qquad 0<\tau\le\tau_{\max}<1.
+  T_x(z) := (1-\tau(u))\,b(x_0) + \tau(u)\,G_\theta(z,x_0),
 \end{equation}
+where $\tau$ is \textbf{input-dependent} and \textbf{analytically bounded}:
+\[
+  \tau(u) = \tau_{\max}\cdot\sigma(f_\tau(u)),\qquad
+  \tau_{\max} = \frac{c}{L_G},\qquad c\in(0,1).
+\]
+Here $\sigma$ is the sigmoid function, $f_\tau$ is a learned linear projection, and $L_G$ is the
+analytic Lipschitz bound of $G_\theta$:
+\[
+  L_G = \underbrace{(1+4\gamma R^2)}_{L_{\text{attn}}} + R\cdot\underbrace{2\gamma R}_{L_w}.
+\]
+Since $\tau(u)\le\tau_{\max}$ always, we have
+$\mathrm{Lip}_z(T_x) \le \tau_{\max}\cdot L_G = c < 1$,
+giving a \textbf{rigorous Banach contraction guarantee} --- not empirical, not domain-dependent.
+
+\begin{remark}[Per-token modulation within the contraction budget]
+Making $\tau$ input-dependent lets the model allocate more update signal to tokens that need it
+(larger $\tau$, up to $\tau_{\max}$) and less to tokens already near the fixed point.
+The \emph{maximum} is analytically capped, so no token can break contraction.
+\end{remark}
+
+\begin{remark}[Implication for $\beta$ (RevDEQ relaxation)]
+With guaranteed $\mathrm{Lip}(T_x)\le c<1$, the RevDEQ solver's stability range is
+$0 < \beta < 2/(c+1)$.  For $c=0.95$: $\beta < 1.03$.  This means $\beta$ can be safely
+increased to $0.5$ or higher for faster convergence, whereas without the guarantee the solver
+required conservative $\beta=0.20$ to avoid instability.
+\end{remark}
 $\tau$ may be fixed, or predicted by a bounded head and then clamped by $\tau_{\max}$.
 
 \section{Module-by-module simplicity and 1-Lipschitz proof sketches}
