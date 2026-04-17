@@ -1351,15 +1351,13 @@ class CausalSelfAttention(nn.Module):
         q_rope, q_nope = q_raw[..., :self.rope_dim], q_raw[..., self.rope_dim:]
 
         kv_latent = self.c_kv_down(x_n)
-        kv_normed = self.kv_pre_norm(kv_latent)  # NormedLinear: pre-norm before K/V projections
+        kv_normed = self.kv_pre_norm(kv_latent)
         k_nope = self.c_k_nope(kv_normed).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
         v = self.c_v(kv_normed).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
 
-        # iter 45-cleanup: removed _rms_norm on Q/K (was for L2-attention
-        # norm-cancellation trick). Under standard SDPA, Q/K magnitude is
-        # handled by the 1/√d_head scale. NormedLinear pre-norm (kv_pre_norm,
-        # state_norm) provides activation conditioning.
+        q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
+        k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
 
         cos, sin = self.rotary(seqlen, x_n.device, q_rope.dtype)
         q_rope = apply_rotary_emb(q_rope, cos, sin)
@@ -3096,14 +3094,21 @@ def main() -> None:
                             v_ema = mu * v_buf.float() + (1.0 - mu) * (v_nf / v_nn)
                             base_model._lyapunov_v_buf = F.normalize(v_ema, dim=-1, eps=1e-8).to(z_star.dtype)
                     # Surrogate loss (if ρ̂ > γ): reuse u_b (retain_graph kept it alive)
+                    lyap_loss_t = None
                     if rho_hat.item() > gamma:
                         v_dir = (v_next.detach() / rho_hat.clamp(min=1e-8)).detach()
                         surrogate = (u_b * v_dir).sum().abs()
                         hinge_scale = (rho_hat.item() - gamma) / max(rho_hat.item(), 1e-8)
-                        loss = loss + lyap_scale * lyap_coef * hinge_scale * surrogate
+                        lyap_loss_t = lyap_scale * lyap_coef * hinge_scale * surrogate
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            # Lyapunov backward runs SEPARATELY after main backward.
+            # Avoids donated-buffer conflict: compiled backward (main loss)
+            # uses donated buffers, then surrogate backward accumulates
+            # gradients on shared params via separate (uncompiled) graph.
+            if lyap_loss_t is not None:
+                (lyap_loss_t * grad_scale).backward()
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
