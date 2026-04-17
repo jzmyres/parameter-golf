@@ -1196,21 +1196,27 @@ class SoftDenseRouter(nn.Module):
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._router_gate_last_mean = float(gate_logits.detach().exp().float().mean().item())
         if self.training:
-            reduce_dims = tuple(range(p.ndim - 1))
-            mean_share = p.mean(dim=reduce_dims)
-            target = torch.ones_like(mean_share) / self.num_experts
-            mse = F.mse_loss(mean_share, target)
-            lb = float(self.min_share_frac) / float(self.num_experts)
-            min_share_loss = torch.relu(mean_share.new_tensor(lb) - mean_share).pow(2).mean() if lb > 0.0 else mean_share.new_zeros(())
-            cv = mean_share.std() / mean_share.mean().clamp_min(1e-8)
-            cv_loss = torch.relu(cv - mean_share.new_tensor(self.cv_target)).pow(2) if self.cv_target > 0.0 else mean_share.new_zeros(())
-            hs = self._health_scale.to(dtype=min_share_loss.dtype)
-            self._balance_loss = mse
-            self._health_loss = (
-                float(self.min_share_loss_weight) * hs * min_share_loss
-                + float(self.cv_loss_weight) * hs * cv_loss
-            )
-            self._mean_share_last = mean_share.detach()
+            # Review 9: skip loss computation during DEQ sub-iterations.
+            # The router is called 2×K times per DEQ solve, but only the
+            # final _balance_loss/_health_loss values are collected by
+            # GPT._collect_routing_losses().  The reductions (mean/std)
+            # are pure overhead for intermediate iterations.
+            if not bool(_DEQ_SOLVE_ACTIVE):
+                reduce_dims = tuple(range(p.ndim - 1))
+                mean_share = p.mean(dim=reduce_dims)
+                target = torch.ones_like(mean_share) / self.num_experts
+                mse = F.mse_loss(mean_share, target)
+                lb = float(self.min_share_frac) / float(self.num_experts)
+                min_share_loss = torch.relu(mean_share.new_tensor(lb) - mean_share).pow(2).mean() if lb > 0.0 else mean_share.new_zeros(())
+                cv = mean_share.std() / mean_share.mean().clamp_min(1e-8)
+                cv_loss = torch.relu(cv - mean_share.new_tensor(self.cv_target)).pow(2) if self.cv_target > 0.0 else mean_share.new_zeros(())
+                hs = self._health_scale.to(dtype=min_share_loss.dtype)
+                self._balance_loss = mse
+                self._health_loss = (
+                    float(self.min_share_loss_weight) * hs * min_share_loss
+                    + float(self.cv_loss_weight) * hs * cv_loss
+                )
+                self._mean_share_last = mean_share.detach()
             with torch.no_grad():
                 if _should_diag(self.training):
                     self._record_diagnostics(p.detach(), reduce_dims)
