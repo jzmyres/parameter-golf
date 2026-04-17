@@ -466,6 +466,7 @@ failure.
 | 35 | **single-router (MANDATORY, doc §4.3)** | collapse attn/mlp routers into one `E=E_attn+E_mlp` pool; single softmax across combined pool; `w_attn = w[..., :E_a]`, `w_mlp = w[..., E_a:]` | §4.3 | queued (HARD CONSTRAINT) | — | — |
 | 36 | **L2-attention + Phase 6a fixes** | MLA+SDPA → L2 attention via SDPA fast path (RMS-norm cancellation trick, γ=0.051) + Phase 6a: deterministic spectral-norm, matmul router, fp32 softmax, bounded prototypes, SDPA fail-loud | §6.6 | **PROMOTED ★ (commit `9146d74`)** | **1.9167** (-0.005 vs 34A=1.9217) | **0.030** (tighter than baseline 0.037) |
 | 37 | **lipschitz-mlp** | Drop `.square()` from MLP activation: `leaky_relu(0.5)*fc` (1-Lip). 3% throughput gain (459 vs 447 steps). K=128 Δ collapsed 0.030→0.011 (2.7× tighter FP) | §6.2 | **PROMOTED ★ (commit `e3fa2eb`)** | **1.9111** (-0.006 vs 36=1.9167) | **0.011** (2.7× tighter than iter 36's 0.030) |
+| 37b | post-mix-norm-Π_R | Replace `attn_post_mix_norm` and `mlp_post_mix_norm` from RMSNorm → BallProjection(R=2√d). K=128 Δ spectacularly tight (0.003) but val_bpb regressed +0.069 uniformly. **RMSNorm's learnable scale provides capacity Π_R cannot.** | §4.1 | **REVERTED** | 1.9801 (+0.069 vs 37=1.9111) | 0.003 (best FP ever, but val_bpb fails gate) |
 
 **Promotion rule — carry-forward on no-significant-degradation (user direction 2026-04-16):**
 
