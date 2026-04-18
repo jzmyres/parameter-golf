@@ -3072,6 +3072,14 @@ def main() -> None:
         current_state = base_model.state_dict()
         ema_cast = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
         base_model.load_state_dict(ema_cast, strict=True)
+        del ema_state, ema_cast, current_state
+
+    # Free optimizer states + training buffers before post-training eval.
+    # Muon momentum + AdamW m/v can hold 2-3× model params in VRAM; freeing
+    # them prevents OOM during the 64-head roundtrip validation forward pass.
+    del optimizers, optimizer_tok, optimizer_muon, optimizer_scalar
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
 
     # Keep DDP alive through post-training validation so run_validation and
     # sliding_window_validation can shard the val set across both ranks.
