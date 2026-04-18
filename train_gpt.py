@@ -193,14 +193,14 @@ class Hyperparameters:
     # compile speedup (real ~1.6× with DDP) offsets much of the backward-mode
     # gap.  Stay on revdeq+compile until compile+unroll compatibility is
     # resolved (queued as follow-up investigation).
-    deq_backward = "revdeq"
+    deq_backward = "unroll"  # T-opt 8/10: unroll is ~2× faster (no reconstruction forwards)
     # iter 28-tbptt: Truncated BPTT. Backward reconstructs only the last
     # `deq_bptt_k` forward iterations; earlier iters contribute no gradient.
     # 0 (or >= num_layers) = full BPTT.  Rationale: for a contractive DEQ,
     # per-iter VJP magnitudes decay geometrically toward x0, so the last few
     # iters should dominate the total param gradient.  If the hypothesis
     # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
-    deq_bptt_k = 0  # iter 30: TBPTT disabled for clean contraction-shell test.
+    deq_bptt_k = 4  # T-opt 8/10: truncated BPTT — backprop through last 4 iters only (O(4) memory)
     # TBPTT investigation (28-28d) concluded; best point was 28c (val_bpb
     # 1.925, K=128 Δ=0.015 vs baseline 0.039).  Machinery retained in code
     # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
