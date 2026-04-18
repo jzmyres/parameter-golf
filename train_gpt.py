@@ -2909,8 +2909,14 @@ def main() -> None:
                 lyap_scale = min(time_frac / max(lyap_warmup_frac, 1e-8), 1.0) if lyap_warmup_frac > 0 else 1.0
                 z_star = getattr(base_model, '_lyapunov_z_star', None)
                 x0_lyap = getattr(base_model, '_lyapunov_x0', None)
-                if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None:
-                    # Reuse sb (unwrapped eager block) from health scaling scope above.
+                # T-opt 2/10: skip boundary forward when ρ̂ already below γ.
+                # Recheck every 10 steps to catch drift. Saves ~6% on stable steps.
+                prev_rho = float(getattr(base_model, '_lyapunov_rho_hat', 999.0)
+                                 if isinstance(getattr(base_model, '_lyapunov_rho_hat', None), (int, float))
+                                 else getattr(getattr(base_model, '_lyapunov_rho_hat', None), 'item', lambda: 999.0)())
+                lyap_gamma = float(base_model.lyapunov_gamma)
+                lyap_skip = (prev_rho < lyap_gamma * 0.95) and (step % 10 != 0)
+                if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
                     blk = sb
                     _lyap_eps = 1e-8
                     # Init persistent vector — Frobenius-normalized (doc §1.1).
