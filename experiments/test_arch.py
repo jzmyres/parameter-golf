@@ -46,8 +46,8 @@ def test_all_constraints():
     assert attn.num_experts == model.num_experts, (
         f"CSA must inherit num_experts from GPT, got {attn.num_experts} vs {model.num_experts}"
     )
-    assert hasattr(attn, 'c_kv_down'), "Must have KV compression (MLA)"
-    assert hasattr(attn, 'c_k_nope'), "Must have non-RoPE key decompress"
+    assert hasattr(attn, 'expert_kv_a'), "Must have per-expert KV (independent expert attn)"
+    assert hasattr(attn, 'expert_k_nope'), "Must have per-expert K_nope decompress (MLA)"
     assert hasattr(attn, 'c_k_rope'), "Must have decoupled RoPE key"
     assert hasattr(attn, 'attn_gate'), "Must have gated attention"
 

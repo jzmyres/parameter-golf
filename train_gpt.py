@@ -1166,7 +1166,19 @@ class SoftDenseRouter(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
-    """MLA with Gated Attention + expert bank."""
+    """Independent expert MLA: per-expert Q/K/V via full MLA pipeline.
+
+    Each expert has its own complete MLA pipeline:
+      1. Per-expert Q (low-rank): dim → rank → H*d_head + H (gate logits)
+      2. Per-expert KV compression (low-rank): dim → kv_rank → kv_latent
+      3. Per-expert KV decompression: kv_latent → K_nope, V (independent dicts)
+      4. Shared K_rope (position-dependent — same for all experts)
+
+    Expert index is packed into the head dimension (E×H query heads,
+    E×H_kv KV heads) for a single FlashAttention call.  GQA ratio is
+    H/H_kv (same as before).  KV cache stores E × kv_latent_dim per
+    position (2× more efficient than full K/V cache).
+    """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
@@ -1180,124 +1192,163 @@ class CausalSelfAttention(nn.Module):
         self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
         self.rope_dim = self.head_dim // 2
         self.nope_dim = self.head_dim - self.rope_dim
+        self.kv_rank = max(self.kv_latent_dim // 8, 32)
 
-        self.c_q = CastedLinear(dim, dim + num_heads, bias=False)
-        with torch.no_grad():
-            self.c_q.weight[dim:, :].zero_()
-        self.c_kv_down = CastedLinear(dim, self.kv_latent_dim, bias=False)
-        # iter 43 (opg_doc.tex §3.2): NormedLinear pattern — learnable RMSNorm
-        # before every linear projection. kv_latent is output of c_kv_down
-        # (not pre-normed), so add a pre-norm before c_k_nope and c_v.
-        self.kv_pre_norm = RMSNorm(self.kv_latent_dim)
-        self.c_k_nope = CastedLinear(self.kv_latent_dim, num_kv_heads * self.nope_dim, bias=False)
-        self.c_v = CastedLinear(self.kv_latent_dim, num_kv_heads * self.head_dim, bias=False)
-        self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
-        self.expert_proj = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
-        # Layout (E, D, R) matches repo tests/experiments. Computation uses
-        # a transpose view to (E, R, D) so we can do batched GEMMs without
-        # materializing a permuted copy each forward.
-        self.expert_out = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
-        # iter 43 (NormedLinear): pre-norm before expert_out projection.
-        # Input to expert_out is h (expert hidden, shape (N, E, R)) — not pre-normed.
-        self.expert_h_pre_norm = RMSNorm(self.expert_rank)
+        # Per-expert Q: low-rank dim → expert_rank → (H*d_head + H).
+        # The +H appended to Q output provides per-head gate logits (gated attn).
+        q_out_dim = num_heads * self.head_dim + num_heads
+        self.expert_q_down = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        self.expert_q_up = nn.Parameter(torch.empty(num_experts, q_out_dim, self.expert_rank))
         for e in range(num_experts):
-            nn.init.xavier_uniform_(self.expert_proj.data[e])
-            nn.init.xavier_uniform_(self.expert_out.data[e])
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+            nn.init.xavier_uniform_(self.expert_q_down.data[e])
+            # Zero-init the gate logit rows so gates start at sigmoid(0) = 0.5.
+            nn.init.xavier_uniform_(self.expert_q_up.data[e, :num_heads * self.head_dim, :])
+            self.expert_q_up.data[e, num_heads * self.head_dim:, :].zero_()
+
+        # Per-expert KV: low-rank dim → kv_rank → kv_latent_dim.
+        self.expert_kv_a = nn.Parameter(torch.empty(num_experts, self.kv_rank, dim))
+        self.expert_kv_b = nn.Parameter(torch.empty(num_experts, self.kv_latent_dim, self.kv_rank))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_kv_a.data[e])
+            nn.init.xavier_uniform_(self.expert_kv_b.data[e])
+
+        # Per-expert KV decompression from latent (full MLA per expert).
+        # Each expert has its own learned dictionary: kv_latent → K_nope, V.
+        self.kv_pre_norm = RMSNorm(self.kv_latent_dim)
+        self.expert_k_nope = nn.Parameter(
+            torch.empty(num_experts, num_kv_heads * self.nope_dim, self.kv_latent_dim))
+        self.expert_v = nn.Parameter(
+            torch.empty(num_experts, num_kv_heads * self.head_dim, self.kv_latent_dim))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_k_nope.data[e])
+            nn.init.xavier_uniform_(self.expert_v.data[e])
+
+        # Shared K_rope (position-dependent — same for all experts).
+        self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
+
+        # Per-expert-per-head gains and gates (E*H entries each).
+        self.q_gain = nn.Parameter(torch.full((num_experts * num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
-        # Gate bias init at 0 (mid-point sigmoid) per EXPERIENCE.md
-        self.gate_bias = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+        self.gate_bias = nn.Parameter(torch.zeros(num_experts * num_heads, dtype=torch.float32))
+
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
-        self._attn_gate_last_mean: float | None = None  # per-call attn gate mean
-        # Phase 4.5 22-add-all: RMSNorm after gated SDPA (post-non-linearity).
-        # Normalizes per-head attention output before the expert mix projection.
-        self.attn_sdpa_post_norm = RMSNorm(dim)
+        self._attn_gate_last_mean: float | None = None
 
-    def _attn_shared_from_normed(self, x_n: Tensor) -> Tensor:
-        bsz, seqlen, dim = x_n.shape
-        q_and_gate = self.c_q(x_n)
-        q_raw = q_and_gate[..., :dim].reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        gate_logits = q_and_gate[..., dim:].reshape(bsz, seqlen, self.num_heads, 1).transpose(1, 2)
-        q_rope, q_nope = q_raw[..., :self.rope_dim], q_raw[..., self.rope_dim:]
+    def forward_experts(self, x_n: Tensor) -> Tensor:
+        """Compute per-expert attention outputs via head-packed SDPA.
 
-        kv_latent = self.c_kv_down(x_n)
-        kv_normed = self.kv_pre_norm(kv_latent)
-        k_nope = self.c_k_nope(kv_normed).reshape(bsz, seqlen, self.num_kv_heads, self.nope_dim).transpose(1, 2)
-        v = self.c_v(kv_normed).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        k_rope = self.c_k_rope(x_n).reshape(bsz, seqlen, self.num_kv_heads, self.rope_dim).transpose(1, 2)
+        Args:
+            x_n: Normalized input (B, T, D).
 
+        Returns:
+            Per-expert attention outputs (B, T, E, D).
+        """
+        B, T, D = x_n.shape
+        E = self.num_experts
+        H, H_kv = self.num_heads, self.num_kv_heads
+        d = self.head_dim
+        R_q, R_kv = self.expert_rank, self.kv_rank
+        N = B * T
+        dtype = x_n.dtype
+
+        # --- Per-expert Q (low-rank) ---
+        x_flat = x_n.reshape(N, D)
+        # Down: (N, D) @ (E*R_q, D).T → (N, E*R_q) → (E, N, R_q)
+        q_down = self.expert_q_down.to(dtype=dtype)
+        q_h = (x_flat @ q_down.reshape(E * R_q, D).t()).view(N, E, R_q).permute(1, 0, 2)
+        # Up: (E, N, R_q) @ (E, R_q, H*d+H) → (E, N, H*d+H)
+        q_up = self.expert_q_up.to(dtype=dtype).transpose(1, 2)  # (E, R_q, H*d+H)
+        q_and_gate = torch.bmm(q_h, q_up)  # (E, N, H*d+H)
+
+        q_raw = q_and_gate[:, :, :H * d].reshape(E, B, T, H, d)
+        gate_logits = q_and_gate[:, :, H * d:].reshape(E, B, T, H, 1)
+
+        # Split Q into rope and nope parts: (E, B, T, H, ...)
+        q_rope = q_raw[..., :self.rope_dim]
+        q_nope = q_raw[..., self.rope_dim:]
         q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
+
+        # --- Per-expert KV (low-rank latent) ---
+        kv_a = self.expert_kv_a.to(dtype=dtype)
+        kv_b = self.expert_kv_b.to(dtype=dtype).transpose(1, 2)  # (E, R_kv, kv_lat)
+        # Down: (N, D) @ (E*R_kv, D).T → (E, N, R_kv)
+        kv_h = (x_flat @ kv_a.reshape(E * R_kv, D).t()).view(N, E, R_kv).permute(1, 0, 2)
+        # Up: (E, N, R_kv) @ (E, R_kv, kv_lat) → (E, N, kv_lat)
+        kv_latent = torch.bmm(kv_h, kv_b)  # (E, N, kv_lat)
+
+        # Pre-norm then per-expert MLA decompression: kv_latent → K_nope, V.
+        kv_normed = self.kv_pre_norm(kv_latent.reshape(E * N, self.kv_latent_dim))
+        kv_normed = kv_normed.reshape(E, N, self.kv_latent_dim)
+        # (E, N, kv_lat) @ (E, kv_lat, H_kv*nope) → (E, N, H_kv*nope)
+        ek = self.expert_k_nope.to(dtype=dtype)
+        ev = self.expert_v.to(dtype=dtype)
+        k_nope = torch.bmm(kv_normed, ek.transpose(1, 2)).reshape(E, B, T, H_kv, self.nope_dim)
+        v = torch.bmm(kv_normed, ev.transpose(1, 2)).reshape(E, B, T, H_kv, d)
+
+        # Shared K_rope (position only, same for all experts)
+        k_rope_shared = self.c_k_rope(x_n).reshape(B, T, H_kv, self.rope_dim)
+        # Expand for E experts: (1, B, T, H_kv, rope)
+        k_rope = k_rope_shared.unsqueeze(0).expand(E, -1, -1, -1, -1)
+
         k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
 
-        cos, sin = self.rotary(seqlen, x_n.device, q_rope.dtype)
-        q_rope = apply_rotary_emb(q_rope, cos, sin)
-        k_rope = apply_rotary_emb(k_rope, cos, sin)
+        # --- RoPE ---
+        cos, sin = self.rotary(T, x_n.device, q_rope.dtype)
+        # Pack (E, B, T, H, rope) → (B, E*H, T, rope) for apply_rotary_emb
+        q_rope_p = q_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, self.rope_dim)
+        q_rope_p = apply_rotary_emb(q_rope_p, cos, sin)
 
-        q_full = torch.cat([q_rope, q_nope], dim=-1)
-        k_full = torch.cat([k_rope, k_nope], dim=-1)
-        q_full = q_full * self.q_gain.to(dtype=q_full.dtype)[None, :, None, None]
+        k_rope_p = k_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, self.rope_dim)
+        k_rope_p = apply_rotary_emb(k_rope_p, cos, sin)
 
-        # iter 42 (opg_doc.tex §3.4 Lyapunov): standard FlashAttention SDPA.
-        # L2-distance attention removed — no longer needed without Lip constraints.
+        # --- Assemble full Q, K and apply gain ---
+        q_nope_p = q_nope.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, self.nope_dim)
+        q_full = torch.cat([q_rope_p, q_nope_p], dim=-1)  # (B, E*H, T, d)
+        q_full = q_full * self.q_gain.to(dtype=dtype)[None, :, None, None]
+
+        k_nope_p = k_nope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, self.nope_dim)
+        k_full = torch.cat([k_rope_p, k_nope_p], dim=-1)  # (B, E*H_kv, T, d)
+
+        v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
+
+        # --- Head-packed SDPA (one FlashAttention call for all experts) ---
         try:
             y = F.scaled_dot_product_attention(
-                q_full, k_full, v, attn_mask=None, is_causal=True,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
+                q_full, k_full, v_full, attn_mask=None, is_causal=True,
+                enable_gqa=(H_kv != H),
             )
         except TypeError:
-            k_use, v_use = k_full, v
-            if self.num_kv_heads != self.num_heads:
-                rep = self.num_heads // self.num_kv_heads
+            k_use, v_use = k_full, v_full
+            if H_kv != H:
+                rep = H // H_kv
                 k_use = k_full.repeat_interleave(rep, dim=1)
-                v_use = v.repeat_interleave(rep, dim=1)
+                v_use = v_full.repeat_interleave(rep, dim=1)
             y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
 
-        attn_gate_act = torch.sigmoid(gate_logits.to(dtype=y.dtype) + self.gate_bias[None, :, None, None].to(y.dtype))
-        y = y * attn_gate_act
+        # --- Gated attention ---
+        gate_logits_p = gate_logits.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, 1)
+        gate_act = torch.sigmoid(
+            gate_logits_p.to(dtype=y.dtype)
+            + self.gate_bias.to(dtype=y.dtype)[None, :, None, None]
+        )
+        y = y * gate_act
+
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
-            self._attn_gate_last_mean = float(attn_gate_act.detach().float().mean().item())
-        y_out = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        # Phase 4.5 22-add-all: RMSNorm after gated SDPA.
-        return self.attn_sdpa_post_norm(y_out)
+            self._attn_gate_last_mean = float(gate_act.detach().float().mean().item())
 
-    def mix_experts_from_shared(self, y: Tensor, w: Tensor,
-                                 *, inj_term: Tensor | None = None) -> Tensor:
-        # Per-expert injection path. Built for iter 27b-pos-expert-out (called
-        # with inj_term=g_inj·x0). iter 27d passes inj_term=None — the path is
-        # preserved as live infra for future Phase 5e-1 / 5e-2 sweeps.
-        B, T, D = y.shape
-        E, R = self.num_experts, self.expert_rank
-        N = B * T
-        y_flat = y.reshape(N, D)
-        w_flat = w.reshape(N, E).to(dtype=y_flat.dtype)
-        P = self.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, D)
-        h = y_flat @ P.t()
-        h = h.view(N, E, R) * w_flat.unsqueeze(-1)
-        h = self.expert_h_pre_norm(h)  # NormedLinear: pre-norm before expert_out
-        # (E, D, R) -> (E, R, D) view (no copy); compute E independent GEMMs.
-        O_T = self.expert_out.to(dtype=y_flat.dtype).transpose(1, 2)
-        out_e = torch.bmm(h.transpose(0, 1), O_T)  # (E, N, D)
-        # Distribute inj_term across experts: total summed contribution is
-        # inj_term (E × inj_term/E). Disabled in iter 27d; kept for 5e sweeps.
-        if inj_term is not None:
-            inj_flat = inj_term.reshape(N, D).to(dtype=out_e.dtype) / float(E)
-            out_e = out_e + inj_flat.unsqueeze(0)
-        out = out_e.sum(dim=0)  # (N, D)
+        # --- Reshape to per-expert outputs ---
+        # y: (B, E*H, T, d) → (B, E, H, T, d) → (B, T, E, H*d) = (B, T, E, D)
+        y = y.reshape(B, E, H, T, d).permute(0, 3, 1, 2, 4).reshape(B, T, E, D)
 
+        # Per-expert orthogonality diagnostic
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
-                mu_h = h.reshape(B * T, E, R).mean(dim=0).to(dtype=torch.float32)
-                out_T = self.expert_out.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
-                mu_out = torch.einsum("er,erd->ed", mu_h, out_T)
-                # Max pairwise |cos| across ALL expert pairs — flags
-                # near-duplicates (|cos| > 0.9 = two experts are effectively
-                # the same).  Used by the post-int6 hard assertion; ≤ 0.9 is
-                # the structural capacity check.
+                mu_out = y.detach().float().mean(dim=(0, 1))  # (E, D)
                 self._out_ortho_cos_sim = float(max_pairwise_abs_cosine(mu_out).item())
 
-        return out.reshape(B, T, D)
+        return y
 
     def forward(self, x: Tensor) -> Tensor:
         raise RuntimeError("Use Block.forward()")
@@ -1639,26 +1690,16 @@ class Block(nn.Module):
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
-        # iter 41: mirror forward's h = RMSNorm(z + x_0)
         x = z_sub + x0_sub
         h = self.state_norm(x)
 
-        # iter 35: single pooled router, split weights at E boundary
-        E = self.num_experts
-        w_all = self.router(h, pre_normed=True)  # (..., 2E)
-        w_attn = w_all[..., :E].contiguous()
-        w_mlp = w_all[..., E:].contiguous()
-        y_shared = self.attn._attn_shared_from_normed(h)
-        R = self.attn.expert_rank
-        y_flat = y_shared.reshape(bsz * t, dim)
-        P = self.attn.expert_proj.to(dtype=y_flat.dtype).reshape(E * R, dim)
-        hp = y_flat @ P.t()
-        mu_h = hp.reshape(bsz * t, E, R).mean(dim=0).to(dtype=torch.float32)
-        out_T = self.attn.expert_out.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
-        mu_attn = torch.einsum("er,erd->ed", mu_h, out_T)
+        # Attention ortho: per-expert outputs from independent expert SDPA.
+        attn_expert_out = self.attn.forward_experts(h)  # (B, t, E, D)
+        mu_attn = attn_expert_out.detach().float().mean(dim=(0, 1))  # (E, D)
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
-        attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
+        # MLP ortho (unchanged: compute mean expert outputs via existing path).
+        E = self.num_experts
         N = bsz * t
         x_flat = h.reshape(N, dim)
         E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
@@ -1707,9 +1748,9 @@ class Block(nn.Module):
         if _tracking:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
 
-        # Attention experts
-        y_shared = self.attn._attn_shared_from_normed(h)
-        attn_mix = self.attn.mix_experts_from_shared(y_shared, w_attn)
+        # Independent expert attention: per-expert Q/K/V → head-packed SDPA.
+        attn_expert_out = self.attn.forward_experts(h)  # (B, T, E, D)
+        attn_mix = (attn_expert_out * w_attn.unsqueeze(-1)).sum(dim=2)  # (B, T, D)
         attn_mix = self.attn_post_mix_norm(attn_mix)
 
         # MLP experts
@@ -2018,9 +2059,8 @@ class GPT(nn.Module):
                     if ".proj." in name or name.endswith(".proj"):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * self.num_layers))
-        with torch.no_grad():
-            dim = self.tok_emb.embedding_dim
-            self.shared_block.attn.c_q.weight[dim:, :].zero_()
+        # Gate logits are zero-initialized in CausalSelfAttention.__init__
+        # (expert_q_up gate rows zeroed → sigmoid(0) = 0.5 at init).
         self.mos_head.init_from_embedding(self.tok_emb.weight.data)
 
     def _get_soft_embedding(self, z: Tensor, topk: int = 64) -> Tensor:
@@ -2674,9 +2714,8 @@ def main() -> None:
 
     optimizer_tok = torch.optim.AdamW(tok_params, betas=(args.beta1, args.beta2),
                                        eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
-    # expert_out and expert_down use (E, D, R) (out-proj matrices D×R).
-    # Other expert banks use (E, R, D). Muon handles both via the last-2-dims
-    # NS preconditioner; no special transpose param group is needed.
+    # Expert banks use (E, R, D) or (E, D, R) layouts. Muon handles both via
+    # the last-2-dims NS preconditioner; no special transpose param group needed.
     optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum,
                           backend_steps=args.muon_backend_steps, weight_decay=args.weight_decay)
     for group in optimizer_muon.param_groups:

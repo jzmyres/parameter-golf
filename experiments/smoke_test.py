@@ -68,7 +68,7 @@ def _get_expert_diagnostics(model):
     with torch.no_grad():
         for name, w in [
             ("mlp", model.shared_block.mlp.expert_fc.float()),
-            ("attn", model.shared_block.attn.expert_proj.float()),
+            ("attn", model.shared_block.attn.expert_q_down.float()),
         ]:
             n_exp = w.shape[0]
             if n_exp < 2:

@@ -35,8 +35,8 @@ class TestLyapunovArchDefaults(unittest.TestCase):
         """Iter 41 removed all spectral-norm caps from Block."""
         from torch.nn.utils import parametrize
         b = _fresh_block()
-        # Check expert banks are NOT parametrized
-        for name in ["expert_out", "expert_proj"]:
+        # Check attention expert banks are NOT parametrized
+        for name in ["expert_q_down", "expert_q_up", "expert_kv_a", "expert_kv_b"]:
             self.assertFalse(
                 parametrize.is_parametrized(b.attn, name),
                 f"attn.{name} still has spectral norm parametrization",
