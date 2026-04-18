@@ -2687,17 +2687,17 @@ def main() -> None:
             log0(f"compiled shared_block (dynamic=False, {_gpu_mem_gb:.0f} GB GPU)")
         except Exception as e:
             log0(f"shared_block compile failed ({e}), falling back to sub-module compile")
-    # Sub-module compile: forward_experts + mix_experts.  Works with revdeq
-    # because the VJP backward is a single block.forward call (no autograd
-    # chaining across iterations).  2× attn + 1.5× MLP speedup, ~2 GB workspace.
+    # Compile block.forward METHOD (not the module) to fuse router→attn→MLP.
+    # Compiling the method avoids DDP graph expansion that caused the ~40 GB
+    # workspace OOM with torch.compile(module).  Works with revdeq because
+    # the VJP backward is a single block.forward call.  1.97× speedup, 4.4 GB.
     if not hasattr(base_model.shared_block, '_orig_module'):  # not already full-compiled
         sb = base_model.shared_block
         try:
-            sb.attn.forward_experts = torch.compile(sb.attn.forward_experts, dynamic=False)
-            sb.mlp.mix_experts = torch.compile(sb.mlp.mix_experts, dynamic=False)
-            log0("compiled forward_experts + mix_experts (2× attn, 1.5× MLP)")
+            sb.forward = torch.compile(sb.forward, dynamic=False)
+            log0("compiled block.forward (1.97× speedup, fused router→attn→MLP)")
         except Exception as e:
-            log0(f"sub-module compile failed ({e}), running eager")
+            log0(f"block.forward compile failed ({e}), running eager")
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False,
