@@ -3189,9 +3189,13 @@ def main() -> None:
             }, f)
 
         log0("roundtrip_verification:start")
-        # T-opt 16: reset dynamo before roundtrip to prevent infinite
-        # recompilation after load_state_dict invalidates compiled guards.
+        # T-opt 16: run roundtrip + K-sweep in eager mode (no torch.compile).
+        # load_state_dict invalidates compiled guards, causing 13-53 min
+        # recompilation hangs. Roundtrip/K-sweep are one-time diagnostics —
+        # eager is fine. torch._dynamo.reset() clears cached graphs, and
+        # torch._dynamo.config.disable = True prevents any new compilation.
         torch._dynamo.reset()
+        torch._dynamo.config.disable = True
         if _COMPRESSOR == "zstd":
             dctx = zstandard.ZstdDecompressor()
             decompressed = dctx.decompress(compressed)
