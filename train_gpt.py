@@ -2485,13 +2485,12 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     # Base grad_accum: 8 global microsteps / world_size (so per-rank microstep
     # count is modest).  When deq_backward="unroll" we store K-step activations
-    # per microstep, so bump grad_accum 8× to keep per-microstep batch small
-    # enough to fit in 48 GB L40S per rank WITH compiled sub-modules.
-    # (64-head independent expert MLA + compile overhead needs ~2 GB headroom;
-    # 8× gives B=4 micro-batch vs B=8 at 4×, freeing ~1.5 GB.)
+    # per microstep, so bump grad_accum 4× to keep per-microstep batch small
+    # enough to fit in 48 GB L40S per rank.  revdeq's O(1) backward memory
+    # means the base grad_accum is fine.
     _base_grad_accum = max(1, math.ceil(8 / world_size))
     if getattr(args, "deq_backward", "revdeq") == "unroll":
-        grad_accum_steps = _base_grad_accum * 8
+        grad_accum_steps = _base_grad_accum * 4
     else:
         grad_accum_steps = _base_grad_accum
     global_seqs = args.train_batch_tokens // args.train_seq_len
