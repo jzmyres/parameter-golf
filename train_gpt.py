@@ -166,7 +166,7 @@ class Hyperparameters:
     bal_loss_coef = 5e-3
     router_health_coef = 0.25
     block_ortho_aux_coef = 0.1  # partial restore from 0 (H32 was too aggressive — attn/mlp ortho drifted to 0.82, near the 0.9 gate fail). 0.1 keeps gradient pressure without dominating, preserves H32's "loss shouldn't chase gates" spirit while keeping experts apart.
-    block_ortho_aux_every = 4
+    block_ortho_aux_every = 8  # T-opt 4/10: reduce frequency (ortho drifts slowly)
     block_ortho_aux_tokens = 64
     router_bias_update = True
     router_bias_lr = 0.10
