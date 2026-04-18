@@ -2643,7 +2643,8 @@ def main() -> None:
             log0(f"shared_block compile failed ({e}), running eager")
 
     model: nn.Module = (
-        DDP(base_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
+        DDP(base_model, device_ids=[local_rank], broadcast_buffers=False,
+            find_unused_parameters=(args.deq_backward == "unroll" and args.deq_bptt_k > 0))
         if distributed else base_model
     )
 
