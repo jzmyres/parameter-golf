@@ -2665,21 +2665,22 @@ def main() -> None:
     # compile+DDP (grad_fn tracking issues); resolving that is queued.
     if distributed and getattr(args, "deq_backward", "revdeq") == "unroll":
         log0("skipping torch.compile(shared_block): deq_backward=unroll is incompatible with compile+DDP")
-        # Compile forward_experts independently — the attention forward is a pure
-        # function with no graph breaks, so it compiles even when the full block
-        # can't.  2× speedup from fusing permute+contiguous+rms_norm chains.
+        # Compile forward_experts + mix_experts independently — these pure
+        # functions have no graph breaks, so they compile even when the full
+        # block can't (unroll+DDP bug).  Fuses permute+rms_norm chains.
         # Guard: skip compile if VRAM headroom < 2 GB (compile overhead ~700 MB).
         try:
             sb = base_model.shared_block
             free_mb = (torch.cuda.get_device_properties(device).total_mem
                        - torch.cuda.memory_allocated(device)) / (1024 ** 2)
             if free_mb < 2048:
-                log0(f"skipping forward_experts compile: only {free_mb:.0f} MB free (need ~2 GB headroom)")
+                log0(f"skipping sub-module compile: only {free_mb:.0f} MB free (need ~2 GB headroom)")
             elif not hasattr(sb, '_orig_module'):
                 sb.attn.forward_experts = torch.compile(sb.attn.forward_experts, dynamic=False)
-                log0("compiled forward_experts for throughput (2x attention speedup)")
+                sb.mlp.mix_experts = torch.compile(sb.mlp.mix_experts, dynamic=False)
+                log0("compiled forward_experts + mix_experts (attn 2x, MLP 1.5x speedup)")
         except Exception as e:
-            log0(f"forward_experts compile failed ({e}), running eager attention")
+            log0(f"sub-module compile failed ({e}), running eager")
     else:
         try:
             base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
