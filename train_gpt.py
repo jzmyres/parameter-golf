@@ -39,10 +39,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-# Disable donated_buffer globally — required for Lyapunov boundary VJP
-# (retain_graph=True conflicts with compiled donated buffers). Minor memory cost.
-import torch._functorch.config as _ftc_config
-_ftc_config.donated_buffer = False
+# donated_buffer left ENABLED (default). Lyapunov uses two-forward approach
+# with retain_graph=False to avoid conflict with compiled donated buffers.
 
 # ---------------------------------------------------------------------------
 # DIAGNOSTICS CONTROL
@@ -2925,20 +2923,18 @@ def main() -> None:
                         v_buf = _frob_normalize(torch.randn_like(z_star), _lyap_eps)
                     v = v_buf.detach()
                     gamma = float(base_model.lyapunov_gamma)
-                    # Single boundary forward on unwrapped eager block (blk = sb).
-                    # Already outside compiled graph — no torch.compiler.disable needed.
+                    # T-opt 7: TWO-FORWARD approach with retain_graph=FALSE.
+                    # Enables donated_buffer (10-20% compile throughput gain).
+                    # Forward #1: VJP for ρ̂ (consumes graph, frees memory)
                     z_b = z_star.detach().requires_grad_(True)
-                    u_b = blk(z_b, x0_lyap)
-                    # VJP: v_next = J^T v (power iteration step)
+                    u_b1 = blk(z_b, x0_lyap)
                     v_next = torch.autograd.grad(
-                        (u_b * v).sum(), z_b,
-                        create_graph=False, retain_graph=True,
+                        (u_b1 * v).sum(), z_b,
+                        create_graph=False, retain_graph=False,
                     )[0]
-                    # ρ̂ = ‖v_next‖_F (Frobenius norm, doc §1.1). Pure tensor, no .item().
                     rho_hat = v_next.detach().float().reshape(-1).norm()
-                    base_model._lyapunov_rho_hat = rho_hat  # tensor; materialize at log time
-                    # EMA update of persistent direction (doc §4.2 Remark).
-                    # Frobenius-normalized: flatten → normalize → reshape.
+                    base_model._lyapunov_rho_hat = rho_hat
+                    # EMA update (doc §4.2)
                     with torch.no_grad():
                         v_nf = v_next.float().reshape(-1)
                         v_norm = v_nf.norm().clamp(min=_lyap_eps)
@@ -2948,11 +2944,14 @@ def main() -> None:
                             mu = 0.9
                             v_ema = mu * v_buf.float().reshape(-1) + (1.0 - mu) * (v_nf / v_norm)
                             base_model._lyapunov_v_buf = _frob_normalize(v_ema.reshape(z_star.shape), _lyap_eps).to(z_star.dtype)
-                    # Surrogate loss: pure-tensor hinge (zero when ρ̂ ≤ γ, no branching).
+                    # Forward #2: surrogate loss (only if ρ̂ > γ)
                     scale_t = torch.relu(rho_hat - gamma) / rho_hat.clamp(min=_lyap_eps)
-                    v_dir = (v_next.detach() / rho_hat.clamp(min=_lyap_eps)).detach()
-                    surrogate = (u_b * v_dir).sum().abs()
-                    loss = loss + lyap_scale * lyap_coef * scale_t * surrogate
+                    if scale_t.item() > 0:
+                        v_dir = (v_next.detach() / rho_hat.clamp(min=_lyap_eps)).detach()
+                        z_b2 = z_star.detach()  # no requires_grad — grad flows to θ only
+                        u_b2 = blk(z_b2, x0_lyap)
+                        surrogate = (u_b2 * v_dir).sum().abs()
+                        loss = loss + lyap_scale * lyap_coef * scale_t.detach() * surrogate
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
