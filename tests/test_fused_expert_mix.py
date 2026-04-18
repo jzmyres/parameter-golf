@@ -124,7 +124,9 @@ class TestMLPFusedExpertMix(unittest.TestCase):
         B_, T_, _, _ = gate_h.shape
         h_act = F.silu(gate_h) * fc_h  # [B,T,E,R]  — SwiGLU
         h_flat = h_act.reshape(B_ * T_, mlp.num_experts, mlp.expert_rank)
-        h_flat = mlp.hidden_post_norm(h_flat)
+        # Per-expert RMSNorm (matches fused path)
+        h_rms = h_flat.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
+        h_flat = h_flat * h_rms * mlp.hidden_norm_weight.to(dtype=h_flat.dtype)
         h = h_flat.reshape(B_, T_, mlp.num_experts, mlp.expert_rank)
         out_e = torch.einsum("btes,eds->bted", h, mlp.expert_down.to(dtype=x_n.dtype))
         out_explicit = (w.unsqueeze(-1) * out_e).sum(dim=2)

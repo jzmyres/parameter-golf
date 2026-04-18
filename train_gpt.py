@@ -1219,8 +1219,8 @@ class CausalSelfAttention(nn.Module):
             nn.init.xavier_uniform_(self.expert_kv_b.data[e])
 
         # Per-expert KV decompression from latent (full MLA per expert).
-        # Each expert has its own learned dictionary: kv_latent → K_nope, V.
-        self.kv_pre_norm = RMSNorm(self.kv_latent_dim)
+        # Per-expert learned RMSNorm scale — no shared weights in the expert path.
+        self.kv_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_latent_dim))
         self.expert_k_nope = nn.Parameter(
             torch.empty(num_experts, num_kv_heads * self.nope_dim, self.kv_latent_dim))
         self.expert_v = nn.Parameter(
@@ -1229,8 +1229,25 @@ class CausalSelfAttention(nn.Module):
             nn.init.xavier_uniform_(self.expert_k_nope.data[e])
             nn.init.xavier_uniform_(self.expert_v.data[e])
 
-        # Shared K_rope (position-dependent — same for all experts).
-        self.c_k_rope = CastedLinear(dim, num_kv_heads * self.rope_dim, bias=False)
+        # Per-expert K_rope: low-rank dim → rank_kr → H_kv*rope_dim.
+        # Position-dependent but per-expert — each expert attends to positions
+        # differently.  Low-rank (rank=32) keeps params manageable.
+        self.kr_rank = max(num_kv_heads * self.rope_dim // 6, 16)
+        self.expert_kr_a = nn.Parameter(torch.empty(num_experts, self.kr_rank, dim))
+        self.expert_kr_b = nn.Parameter(
+            torch.empty(num_experts, num_kv_heads * self.rope_dim, self.kr_rank))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_kr_a.data[e])
+            nn.init.xavier_uniform_(self.expert_kr_b.data[e])
+
+        # Per-expert output projection Wo: low-rank D → rank_wo → D.
+        # Mixes heads per expert (DeepSeek MLA Wo equivalent).
+        self.wo_rank = max(dim // 12, 32)
+        self.expert_wo_down = nn.Parameter(torch.empty(num_experts, self.wo_rank, dim))
+        self.expert_wo_up = nn.Parameter(torch.empty(num_experts, dim, self.wo_rank))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_wo_down.data[e])
+            nn.init.xavier_uniform_(self.expert_wo_up.data[e])
 
         # Per-expert-per-head gains and gates (E*H entries each).
         self.q_gain = nn.Parameter(torch.full((num_experts * num_heads,), qk_gain_init, dtype=torch.float32))
@@ -1280,16 +1297,22 @@ class CausalSelfAttention(nn.Module):
         kv_latent = torch.bmm(kv_h, kv_b)  # (E, N, kv_lat)
 
         # Per-expert MLA decompress: kv_latent → K_nope, V
-        kv_normed = self.kv_pre_norm(kv_latent.reshape(E * N, self.kv_latent_dim))
-        kv_normed = kv_normed.reshape(E, N, self.kv_latent_dim)
+        # Per-expert RMSNorm (no shared learned weights across experts)
+        kv_flat = kv_latent.reshape(E * N, self.kv_latent_dim)
+        kv_rms = kv_flat.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
+        kv_normed = (kv_flat * kv_rms).reshape(E, N, self.kv_latent_dim)
+        kv_normed = kv_normed * self.kv_norm_weight.to(dtype=dtype).unsqueeze(1)  # (E, 1, kv_lat)
         ek = self.expert_k_nope.to(dtype=dtype)
         ev = self.expert_v.to(dtype=dtype)
         k_nope = torch.bmm(kv_normed, ek.transpose(1, 2)).reshape(E, B, T, H_kv, self.nope_dim)
         v = torch.bmm(kv_normed, ev.transpose(1, 2)).reshape(E, B, T, H_kv, d)
 
-        # Shared K_rope (position only, same for all experts)
-        k_rope_shared = self.c_k_rope(x_n).reshape(B, T, 1, H_kv, self.rope_dim)
-        k_rope = k_rope_shared.expand(-1, -1, E, -1, -1)  # lazy expand, no copy
+        # Per-expert K_rope (low-rank): each expert has independent position attention
+        kr_a = self.expert_kr_a.to(dtype=dtype)
+        kr_b = self.expert_kr_b.to(dtype=dtype).transpose(1, 2)
+        kr_h = (x_flat @ kr_a.reshape(E * self.kr_rank, D).t()).view(N, E, self.kr_rank).permute(1, 0, 2)
+        k_rope_raw = torch.bmm(kr_h, kr_b)  # (E, N, H_kv*rope)
+        k_rope = k_rope_raw.reshape(E, B, T, H_kv, self.rope_dim)
 
         k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
 
@@ -1336,8 +1359,15 @@ class CausalSelfAttention(nn.Module):
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._attn_gate_last_mean = float(gate_act.detach().float().mean().item())
 
-        # --- Reshape to per-expert outputs ---
-        y = y.reshape(B, E, H, T, d).permute(0, 3, 1, 2, 4).reshape(B, T, E, D)
+        # --- Per-expert output projection Wo (low-rank, mixes heads) ---
+        y = y.reshape(B, E, H, T, d).permute(0, 3, 1, 2, 4).reshape(B * T, E, D)
+        # (E, N, D) → down (E, N, rank_wo) → up (E, N, D)
+        wo_d = self.expert_wo_down.to(dtype=y.dtype)
+        wo_u = self.expert_wo_up.to(dtype=y.dtype).transpose(1, 2)  # (E, rank_wo, D)
+        y_e = y.permute(1, 0, 2)  # (E, N, D)
+        y_h = torch.bmm(y_e, wo_d.transpose(1, 2))  # (E, N, rank_wo)
+        y_out = torch.bmm(y_h, wo_u)  # (E, N, D)
+        y = y_out.permute(1, 0, 2).reshape(B, T, E, D)
 
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
@@ -1389,9 +1419,9 @@ class MLP(nn.Module):
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
-        # Phase 4.5 22-add-all: RMSNorm on per-expert hidden (after leaky_relu²).
-        # Shape: (N, E, R) → normalize over R.  Weight shape (R,).
-        self.hidden_post_norm = RMSNorm(self.expert_rank)
+        # Per-expert RMSNorm on hidden — no shared learned weights across experts.
+        # Shape: (E, R) scale weight, applied after normalization.
+        self.hidden_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
 
     def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
                     inj_term: Tensor | None = None) -> Tensor:
@@ -1412,8 +1442,9 @@ class MLP(nn.Module):
         fc = x_flat @ Fm.t()
         h = F.silu(gate) * fc
         h = h.view(N, E, R)
-        # Phase 4.5 22-add-all: RMSNorm on hidden after leaky_relu² (post-non-linearity).
-        h = self.hidden_post_norm(h)
+        # Per-expert RMSNorm (no shared weights across experts)
+        h_rms = h.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
+        h = h * h_rms * self.hidden_norm_weight.to(dtype=h.dtype)  # (E, R) broadcasts over (N, E, R)
         h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)

@@ -48,7 +48,7 @@ def test_all_constraints():
     )
     assert hasattr(attn, 'expert_kv_a'), "Must have per-expert KV (independent expert attn)"
     assert hasattr(attn, 'expert_k_nope'), "Must have per-expert K_nope decompress (MLA)"
-    assert hasattr(attn, 'c_k_rope'), "Must have decoupled RoPE key"
+    assert hasattr(attn, 'expert_kr_a'), "Must have per-expert K_rope (independent experts)"
     assert hasattr(attn, 'attn_gate'), "Must have gated attention"
 
     # Check constraint #2: Soft Dense Routing (Dense MoE)
