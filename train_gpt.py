@@ -115,6 +115,7 @@ class Hyperparameters:
     seed = 42
 
     val_batch_size = 524_288
+    val_micro_batch_seqs = 8  # cap val micro-batch to match training (B=8), prevents OOM with 64 heads
     val_loss_every = 200
     train_log_every = 100
     auto_plot_on_val = True
@@ -191,8 +192,9 @@ class Hyperparameters:
     # Net: revdeq+compile > unroll+eager on 64-head independent expert MLA.
     # "revdeq" on H100 (80 GB): enables torch.compile → 45% block speedup.
     # "unroll" on L40S (44 GB): compile doesn't fit, but 2K calls < 4K calls.
-    # Auto-selected at runtime based on GPU memory (see main()).
-    deq_backward = "auto"
+    # RevDEQ OOMs on L40S with 64-head attention even at B=8 (43.7/44.4 GB).
+    # Unroll+TBPTT(4) is the only config that fits on L40S.
+    deq_backward = "unroll"
     # iter 28-tbptt: Truncated BPTT. Backward reconstructs only the last
     # `deq_bptt_k` forward iterations; earlier iters contribute no gradient.
     # 0 (or >= num_layers) = full BPTT.  Rationale: for a contractive DEQ,
@@ -481,6 +483,11 @@ def run_validation(args, model, rank, world_size, device, grad_accum_steps,
     iterations; when None (default) uses args.deq_k_eval."""
     local_batch_tokens = args.val_batch_size // world_size
     local_batch_seqs = max(1, local_batch_tokens // args.train_seq_len)
+    # Cap val micro-batch to match training micro-batch. Without this,
+    # val runs at B=128 which OOMs with 64-head independent expert MLA.
+    _val_cap = getattr(args, "val_micro_batch_seqs", 0)
+    if _val_cap > 0:
+        local_batch_seqs = min(local_batch_seqs, _val_cap)
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     if full_validation or args.eval_batch_seqs <= 0:
         global_seqs = total_seqs
@@ -2488,8 +2495,11 @@ def main() -> None:
     # enough to fit in 48 GB L40S per rank.  revdeq's O(1) backward memory
     # means the base grad_accum is fine.
     _base_grad_accum = max(1, math.ceil(8 / world_size))
-    # 64-head independent expert MLA needs small micro-batch on L40S (44 GB)
-    # regardless of backward mode — torch.compile workspace is ~40 GB.
+    # Note: grad_accum is computed BEFORE auto-select resolves "auto" to a
+    # concrete mode, so use the default (no multiplier) for revdeq/auto.
+    # unroll needs 4× due to O(K) autograd memory; revdeq is O(1).
+    # 64-head independent expert MLA at B=8 uses ~43 GB on L40S regardless of
+    # backward mode. Keep grad_accum 4× for all modes to ensure B=8 micro-batch.
     grad_accum_steps = _base_grad_accum * 4
     global_seqs = args.train_batch_tokens // args.train_seq_len
     while grad_accum_steps > 1 and global_seqs < world_size * grad_accum_steps:
@@ -2666,7 +2676,7 @@ def main() -> None:
             log0(f"auto-selected deq_backward=revdeq ({_gpu_mem_gb:.0f} GB GPU → compile enabled)")
         else:
             args.deq_backward = "unroll"
-            log0(f"auto-selected deq_backward=unroll ({_gpu_mem_gb:.0f} GB GPU → eager, compile needs ≥60 GB)")
+            log0(f"auto-selected deq_backward=unroll ({_gpu_mem_gb:.0f} GB GPU)")
 
     if _gpu_mem_gb < 60:
         log0(f"skipping torch.compile: GPU has {_gpu_mem_gb:.0f} GB (64-head compile needs ~60 GB)")
