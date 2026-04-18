@@ -2485,12 +2485,13 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     # Base grad_accum: 8 global microsteps / world_size (so per-rank microstep
     # count is modest).  When deq_backward="unroll" we store K-step activations
-    # per microstep, so bump grad_accum 4× to keep per-microstep batch small
-    # enough to fit in 48 GB L40S per rank.  revdeq's O(1) backward memory
-    # means the base grad_accum is fine.
+    # per microstep, so bump grad_accum 8× to keep per-microstep batch small
+    # enough to fit in 48 GB L40S per rank WITH compiled sub-modules.
+    # (64-head independent expert MLA + compile overhead needs ~2 GB headroom;
+    # 8× gives B=4 micro-batch vs B=8 at 4×, freeing ~1.5 GB.)
     _base_grad_accum = max(1, math.ceil(8 / world_size))
     if getattr(args, "deq_backward", "revdeq") == "unroll":
-        grad_accum_steps = _base_grad_accum * 4
+        grad_accum_steps = _base_grad_accum * 8
     else:
         grad_accum_steps = _base_grad_accum
     global_seqs = args.train_batch_tokens // args.train_seq_len
@@ -2665,22 +2666,9 @@ def main() -> None:
     # compile+DDP (grad_fn tracking issues); resolving that is queued.
     if distributed and getattr(args, "deq_backward", "revdeq") == "unroll":
         log0("skipping torch.compile(shared_block): deq_backward=unroll is incompatible with compile+DDP")
-        # Compile forward_experts + mix_experts independently — these pure
-        # functions have no graph breaks, so they compile even when the full
-        # block can't (unroll+DDP bug).  Fuses permute+rms_norm chains.
-        # Guard: skip compile if VRAM headroom < 2 GB (compile overhead ~700 MB).
-        try:
-            sb = base_model.shared_block
-            free_mb = (torch.cuda.get_device_properties(device).total_mem
-                       - torch.cuda.memory_allocated(device)) / (1024 ** 2)
-            if free_mb < 2048:
-                log0(f"skipping sub-module compile: only {free_mb:.0f} MB free (need ~2 GB headroom)")
-            elif not hasattr(sb, '_orig_module'):
-                sb.attn.forward_experts = torch.compile(sb.attn.forward_experts, dynamic=False)
-                sb.mlp.mix_experts = torch.compile(sb.mlp.mix_experts, dynamic=False)
-                log0("compiled forward_experts + mix_experts (attn 2x, MLP 1.5x speedup)")
-        except Exception as e:
-            log0(f"sub-module compile failed ({e}), running eager")
+        # Sub-module compile (forward_experts, mix_experts) also fails with
+        # unroll backward — compiled ops break autograd graph chaining across
+        # sequential DEQ iterations.  Stay eager for unroll mode.
     else:
         try:
             base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
