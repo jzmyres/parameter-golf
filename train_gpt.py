@@ -2253,11 +2253,10 @@ class GPT(nn.Module):
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
                 max_tokens = int(getattr(self, "_block_ortho_aux_tokens_override", self.block_ortho_aux_tokens))
                 attn_o, mlp_o = self.shared_block.ortho_aux(z, x0_refined, max_tokens=max_tokens)
-                try:
-                    self.shared_block.attn._out_ortho_cos_sim = float(attn_o.detach().float().item())
-                    self.shared_block.mlp._out_ortho_cos_sim = float(mlp_o.detach().float().item())
-                except Exception:
-                    pass
+                # T-opt 15: defer .item() to log time — store GPU tensors only.
+                # Hot-path sync prohibition: no .item()/.cpu() in forward/backward.
+                self.shared_block.attn._out_ortho_cos_sim_t = attn_o.detach()
+                self.shared_block.mlp._out_ortho_cos_sim_t = mlp_o.detach()
                 thr = 0.20
                 attn_b = F.relu(attn_o - thr).pow(2)
                 mlp_b = F.relu(mlp_o - thr).pow(2)
@@ -2837,7 +2836,13 @@ def main() -> None:
                     if cv is not None:
                         parts.append(f"{prefix}_cv:{cv:.4f}")
             for attr, label in [("attn", "attn_ortho"), ("mlp", "mlp_ortho")]:
-                v = getattr(getattr(m.shared_block, attr, None), "_out_ortho_cos_sim", None)
+                comp = getattr(m.shared_block, attr, None)
+                # T-opt 15: prefer GPU tensor (no sync until .item() here at log site).
+                v_t = getattr(comp, "_out_ortho_cos_sim_t", None)
+                if isinstance(v_t, torch.Tensor):
+                    v = float(v_t.float().item())
+                else:
+                    v = getattr(comp, "_out_ortho_cos_sim", None)
                 if v is not None:
                     parts.append(f"{label}:{float(v):.4f}")
         if hasattr(m, "mos_head"):
@@ -3220,6 +3225,10 @@ def main() -> None:
     # is exploiting a specific iteration count rather than a true fixed point.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
     log0("k_sweep:start")
+    # T-opt 15: Reset dynamo before K-sweep to prevent recompilation storm.
+    # Different K values change iteration counts, triggering dynamo guards
+    # that cause recompile_limit hits → stall one rank → NCCL timeout.
+    torch._dynamo.reset()
     k_sweep_values = [4, 8, 16, 32, 64, 128]  # geometric doubling to K=128; fast eval keeps total sweep <5 min
     k_sweep_results: dict[int, float] = {}
     for k_eval in k_sweep_values:
