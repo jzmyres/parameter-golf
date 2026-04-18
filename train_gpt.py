@@ -834,7 +834,11 @@ class Rotary(nn.Module):
                 self._refresh_cache(seq_len, device)
             if not torch.is_inference_mode_enabled() and self._cos_cached is not None and self._cos_cached.is_inference():
                 self._refresh_cache(seq_len, device)
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+        # .clone() prevents "inference tensors cannot be saved for backward"
+        # when cache was populated under inference_mode (e.g., eval warmup).
+        cos = self._cos_cached.to(dtype=dtype).clone()
+        sin = self._sin_cached.to(dtype=dtype).clone()
+        return cos, sin
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
