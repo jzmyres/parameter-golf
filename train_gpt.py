@@ -2919,10 +2919,10 @@ def main() -> None:
                         v_buf = _frob_normalize(torch.randn_like(z_star), _lyap_eps)
                     v = v_buf.detach()
                     gamma = float(base_model.lyapunov_gamma)
-                    # Single boundary forward (outside compiled graph → retain_graph safe)
+                    # Single boundary forward on unwrapped eager block (blk = sb).
+                    # Already outside compiled graph — no torch.compiler.disable needed.
                     z_b = z_star.detach().requires_grad_(True)
-                    with torch.compiler.disable():
-                        u_b = blk(z_b, x0_lyap)
+                    u_b = blk(z_b, x0_lyap)
                     # VJP: v_next = J^T v (power iteration step)
                     v_next = torch.autograd.grad(
                         (u_b * v).sum(), z_b,
