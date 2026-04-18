@@ -125,7 +125,7 @@ class Hyperparameters:
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 3600.0  # 2xL40S dev (1h budget); set 600 for 8xH100
+    max_wallclock_seconds = 7200.0  # 2xL40S dev (2h for fair step-count comparison); set 600 for 8xH100
 
     # Model architecture
     vocab_size = 1024
@@ -3473,12 +3473,24 @@ def main() -> None:
     if len(k_sweep_results) >= 2:
         ks_sorted = sorted(k_sweep_results.items())
         best_bpb = min(v for _, v in ks_sorted)
+        # Gross degradation gate: any K>=16 shouldn't be 0.1+ worse than best
         worst_high_k = max(v for k, v in ks_sorted if k >= 16) if any(k >= 16 for k, _ in ks_sorted) else None
         if worst_high_k is not None and worst_high_k - best_bpb > 0.1:
             _failures.append(
                 f"K-sweep degradation: best={best_bpb:.4f} worst_k>=16={worst_high_k:.4f} "
-                f"(Δ={worst_high_k - best_bpb:.4f} > 0.1 — gross FP quality loss at deep K, see H23)"
+                f"(Δ={worst_high_k - best_bpb:.4f} > 0.1 — gross FP quality loss at deep K)"
             )
+        # True FP gate: K=64 and K=128 must not degrade from min val_bpb.
+        # A true fixed point converges monotonically — higher K should equal
+        # or improve quality.  Threshold 0.02 allows bf16 noise.
+        for k_check in [64, 128]:
+            if k_check in k_sweep_results:
+                delta = k_sweep_results[k_check] - best_bpb
+                if delta > 0.02:
+                    _failures.append(
+                        f"K={k_check}_degradation: bpb={k_sweep_results[k_check]:.4f} "
+                        f"vs best={best_bpb:.4f} (Δ={delta:.4f} > 0.02 — not a true FP)"
+                    )
 
     # 5. Iter convergence: relative convergence must be small at highest K.
     # DDP-reduce the rank-local conv_rel so the assertion sees the global mean

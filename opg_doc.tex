@@ -708,6 +708,31 @@ The surrogate gradient is a first-order approximation to $\nabla_\theta \rho$---
 second derivatives), but strongly correlated.  The guarantee holds \emph{conditional} on runtime verification
 that the penalty successfully drives $\hat\rho < \gamma$ on the training distribution, which is logged every step.
 
+\subsection{True fixed-point validation (K-sweep)}
+\label{sec:ksweep}
+
+A model with a \emph{true} fixed point must satisfy: increasing solver iterations $K$ should not degrade
+output quality.  Formally, if $z^\star_K$ is the solver output after $K$ iterations, then
+$\mathrm{val\_bpb}(z^\star_K)$ should be monotonically non-increasing as $K$ grows (up to numerical noise).
+
+\paragraph{K-sweep protocol.}
+After training, the quantized model is evaluated at $K\in\{4,8,16,32,64,128\}$.
+Two gates are checked:
+\begin{enumerate}[leftmargin=2em,itemsep=0.25em]
+  \item \textbf{Gross degradation}: $\max_{K\ge 16} \mathrm{bpb}_K - \min_K \mathrm{bpb}_K \le 0.1$.
+  \item \textbf{Deep-K non-degradation}: for $K\in\{64,128\}$, $\mathrm{bpb}_K - \min_K \mathrm{bpb}_K \le 0.02$.
+\end{enumerate}
+Gate~2 is the \emph{true FP test}: a model that exploits a specific iteration count (e.g.\ $K=12$)
+but degrades at $K=64$ or $K=128$ is not converging to a fixed point---it is merely fitting
+the solver trajectory length.  The 0.02 threshold accounts for bf16 numerical noise.
+
+\paragraph{Fair comparison across configs.}
+When comparing architectures with different throughput (e.g.\ $A$ runs $N$ steps in time $T$
+while $B$ runs $N/2$ steps in the same $T$), quality must be compared at \textbf{equal step count},
+not equal wall-clock.  A larger model with more parameters per expert needs proportionally more
+gradient steps to converge.  The wall-clock budget matters for competition submission, but for
+\emph{architectural comparison}, step-matched evaluation is the correct protocol.
+
 \appendix
 
 \section{Self-refinement loop (orthogonal; optional)}

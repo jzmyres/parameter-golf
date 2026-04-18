@@ -35,7 +35,10 @@ Challenge: March 18 – April 30, 2026. Prize: $1M in OpenAI compute credits.
 
 ## Training Budget
 - **8xH100 SXM (competition)**: 600 seconds (10 min) — original competition constraint
-- **2xL40S (dev)**: 1200 seconds (20 min) — relaxed for development hardware
+- **2xL40S (dev)**: 7200 seconds (2h) — extended for fair step-count comparison across configs
+- **Fair comparison principle**: when configs have different throughput, compare at equal STEP COUNT
+  (not wall-clock). A larger model needs proportionally more steps. Wall-clock matters for
+  competition submission; step count matters for architectural comparison.
 
 ## Current Architecture (single source of truth: `train_gpt.py` `Hyperparameters`)
 The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you edit one, edit the other in the same commit (see "Config Single-Source-of-Truth" under Development Practices).
