@@ -166,7 +166,7 @@ class Hyperparameters:
     bal_loss_coef = 5e-3
     router_health_coef = 0.25
     block_ortho_aux_coef = 0.1  # partial restore from 0 (H32 was too aggressive — attn/mlp ortho drifted to 0.82, near the 0.9 gate fail). 0.1 keeps gradient pressure without dominating, preserves H32's "loss shouldn't chase gates" spirit while keeping experts apart.
-    block_ortho_aux_every = 8  # T-opt 4/10: reduce frequency (ortho drifts slowly)
+    block_ortho_aux_every = 4  # T-opt 4 REVERTED: reducing to 8 caused ortho drift (0.24→0.54)
     block_ortho_aux_tokens = 64
     router_bias_update = True
     router_bias_lr = 0.10
@@ -212,7 +212,7 @@ class Hyperparameters:
     deq_k_min = 4
     deq_k_max = 16  # iter 30: reset to baseline for clean Phase 6 comparison
     deq_k_step = 4
-    deq_k_jitter_set = (4, 8, 12)  # T-opt 1/10: reduce max K from 16→12 (~4% throughput gain)
+    deq_k_jitter_set = (4, 6, 10)  # T-opt 5/10: lower avg K (β=0.30 converges faster → fewer iters needed)
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
