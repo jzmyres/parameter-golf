@@ -182,18 +182,17 @@ class Hyperparameters:
     lyapunov_warmup_frac = 0.1 # ramp penalty from 0 over first 10% of steps
 
     # DEQ solver
-    # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
-    # Benchmark at batch=8/seq=1024 (WITHOUT compile on either side): unroll
-    # is 3.21× faster (358 ms vs 1151 ms).  However, torch.compile + DDP +
-    # unrolled autograd hits two separate compile/DDP interaction bugs:
-    #   - dynamic=False → loss.requires_grad=False (grad_fn broken)
-    #   - dynamic=True  → dynamo backend crash in KV attention module
-    # revdeq+compile is the current best (val_bpb=1.705) — the 3.7× benchmark
-    # compile speedup (real ~1.6× with DDP) offsets much of the backward-mode
-    # gap.  Stay on revdeq+compile until compile+unroll compatibility is
-    # resolved (queued as follow-up investigation).
-    deq_backward = "unroll"  # T-opt 8/10: unroll is ~2× faster (no reconstruction forwards)
+    #   Enables torch.compile(shared_block) → 45% block speedup from fused
+    #   permute+rms_norm kernels.  3 forwards per DEQ iter (fwd+reconstruct).
+    # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
+    #   2 forwards per DEQ iter but CANNOT compile (breaks autograd chaining).
+    #   Also needs 4× grad_accum for VRAM, reducing effective throughput.
+    # Net: revdeq+compile > unroll+eager on 64-head independent expert MLA.
+    # "revdeq" on H100 (80 GB): enables torch.compile → 45% block speedup.
+    # "unroll" on L40S (44 GB): compile doesn't fit, but 2K calls < 4K calls.
+    # Auto-selected at runtime based on GPU memory (see main()).
+    deq_backward = "auto"
     # iter 28-tbptt: Truncated BPTT. Backward reconstructs only the last
     # `deq_bptt_k` forward iterations; earlier iters contribute no gradient.
     # 0 (or >= num_layers) = full BPTT.  Rationale: for a contractive DEQ,
@@ -2489,10 +2488,9 @@ def main() -> None:
     # enough to fit in 48 GB L40S per rank.  revdeq's O(1) backward memory
     # means the base grad_accum is fine.
     _base_grad_accum = max(1, math.ceil(8 / world_size))
-    if getattr(args, "deq_backward", "revdeq") == "unroll":
-        grad_accum_steps = _base_grad_accum * 4
-    else:
-        grad_accum_steps = _base_grad_accum
+    # 64-head independent expert MLA needs small micro-batch on L40S (44 GB)
+    # regardless of backward mode — torch.compile workspace is ~40 GB.
+    grad_accum_steps = _base_grad_accum * 4
     global_seqs = args.train_batch_tokens // args.train_seq_len
     while grad_accum_steps > 1 and global_seqs < world_size * grad_accum_steps:
         grad_accum_steps -= 1
@@ -2658,20 +2656,26 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # Compile the DEQ iteration body for throughput.  Always enabled — the
-    # ~1.6× real speedup (3.7× benchmark) is a free win on any backward mode
-    # that supports it.  RevDEQ does (custom autograd.Function wraps the
-    # compiled inner call as one op).  Unroll currently does NOT work with
-    # compile+DDP (grad_fn tracking issues); resolving that is queued.
-    if distributed and getattr(args, "deq_backward", "revdeq") == "unroll":
-        log0("skipping torch.compile(shared_block): deq_backward=unroll is incompatible with compile+DDP")
-        # Sub-module compile (forward_experts, mix_experts) also fails with
-        # unroll backward — compiled ops break autograd graph chaining across
-        # sequential DEQ iterations.  Stay eager for unroll mode.
+    # Auto-select backward mode based on GPU memory:
+    #   H100 (80 GB): revdeq + torch.compile → 45% block speedup (fused kernels)
+    #   L40S (44 GB): unroll + eager (compile needs ~40 GB workspace, doesn't fit)
+    _gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    if args.deq_backward == "auto":
+        if _gpu_mem_gb >= 60:
+            args.deq_backward = "revdeq"
+            log0(f"auto-selected deq_backward=revdeq ({_gpu_mem_gb:.0f} GB GPU → compile enabled)")
+        else:
+            args.deq_backward = "unroll"
+            log0(f"auto-selected deq_backward=unroll ({_gpu_mem_gb:.0f} GB GPU → eager, compile needs ≥60 GB)")
+
+    if _gpu_mem_gb < 60:
+        log0(f"skipping torch.compile: GPU has {_gpu_mem_gb:.0f} GB (64-head compile needs ~60 GB)")
+    elif distributed and args.deq_backward == "unroll":
+        log0("skipping torch.compile: unroll is incompatible with compile+DDP")
     else:
         try:
             base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
-            log0(f"compiled shared_block for throughput (dynamic=False, deq_backward={args.deq_backward})")
+            log0(f"compiled shared_block (dynamic=False, deq_backward={args.deq_backward})")
         except Exception as e:
             log0(f"shared_block compile failed ({e}), running eager")
 
