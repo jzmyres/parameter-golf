@@ -1171,18 +1171,18 @@ class SoftDenseRouter(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
-    """Independent expert MLA: per-expert Q/K/V via full MLA pipeline.
+    """Fully independent expert MLA: per-expert Q/K/V/K_rope/Wo.
 
-    Each expert has its own complete MLA pipeline:
+    Each expert has its own complete MLA pipeline with zero shared params:
       1. Per-expert Q (low-rank): dim → rank → H*d_head + H (gate logits)
       2. Per-expert KV compression (low-rank): dim → kv_rank → kv_latent
-      3. Per-expert KV decompression: kv_latent → K_nope, V (independent dicts)
-      4. Shared K_rope (position-dependent — same for all experts)
+      3. Per-expert KV decompression: per-expert RMSNorm + kv_latent → K_nope, V
+      4. Per-expert K_rope (low-rank): dim → kr_rank → H_kv*rope_dim
+      5. Per-expert Wo (low-rank): D → wo_rank → D (mixes heads per expert)
 
     Expert index is packed into the head dimension (E×H query heads,
     E×H_kv KV heads) for a single FlashAttention call.  GQA ratio is
-    H/H_kv (same as before).  KV cache stores E × kv_latent_dim per
-    position (2× more efficient than full K/V cache).
+    H/H_kv (same as before).
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
@@ -2782,26 +2782,50 @@ def main() -> None:
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
         parts: list[str] = []
         if hasattr(m, "shared_block"):
+            # Dedup routers by id — pooled router is aliased as attn_router AND
+            # mlp_router.  Log pooled 2E usage once, then per-type normalized halves.
+            seen_routers: set[int] = set()
             for prefix, router in (("attn", getattr(m.shared_block.attn, "attn_router", None)),
                                    ("mlp", getattr(m.shared_block.mlp, "mlp_router", None))):
-                # Recording is GPU-only; materialize the Python-list view once
-                # here (at log time) rather than per-forward.  One .cpu() sync
-                # per router per log instead of K per DEQ solve.
-                if router is not None and hasattr(router, "_materialize_diag_lists"):
+                if router is None or id(router) in seen_routers:
+                    continue
+                seen_routers.add(id(router))
+                if hasattr(router, "_materialize_diag_lists"):
                     router._materialize_diag_lists()
-                ok = router is not None and getattr(router, "_expert_usage", None) is not None
+                ok = getattr(router, "_expert_usage", None) is not None
                 if ok and require_step_match and getattr(router, "_diag_step", None) != step:
                     ok = False
                 if not ok:
                     continue
-                usage_str = ",".join(f"{u:.3f}" for u in router._expert_usage)
-                parts.append(f"{prefix}_usage:[{usage_str}]")
-                ent = getattr(router, "_expert_entropy", None)
-                if ent is not None:
-                    parts.append(f"{prefix}_entropy:{ent:.4f}")
-                cv = getattr(router, "_expert_balance_cv", None)
-                if cv is not None:
-                    parts.append(f"{prefix}_cv:{cv:.4f}")
+                usage = router._expert_usage
+                usage_str = ",".join(f"{u:.3f}" for u in usage)
+                E = m.shared_block.num_experts
+                # Pooled 2E router: split into attn (first E) and mlp (last E)
+                if len(usage) == 2 * E:
+                    attn_half = usage[:E]
+                    mlp_half = usage[E:]
+                    attn_sum = sum(attn_half) or 1e-8
+                    mlp_sum = sum(mlp_half) or 1e-8
+                    attn_norm = [u / attn_sum for u in attn_half]
+                    mlp_norm = [u / mlp_sum for u in mlp_half]
+                    parts.append(f"attn_usage:[{','.join(f'{u:.3f}' for u in attn_norm)}]")
+                    parts.append(f"mlp_usage:[{','.join(f'{u:.3f}' for u in mlp_norm)}]")
+                    ent = getattr(router, "_expert_entropy", None)
+                    if ent is not None:
+                        parts.append(f"attn_entropy:{ent:.4f}")
+                        parts.append(f"mlp_entropy:{ent:.4f}")
+                    cv = getattr(router, "_expert_balance_cv", None)
+                    if cv is not None:
+                        parts.append(f"attn_cv:{cv:.4f}")
+                        parts.append(f"mlp_cv:{cv:.4f}")
+                else:
+                    parts.append(f"{prefix}_usage:[{usage_str}]")
+                    ent = getattr(router, "_expert_entropy", None)
+                    if ent is not None:
+                        parts.append(f"{prefix}_entropy:{ent:.4f}")
+                    cv = getattr(router, "_expert_balance_cv", None)
+                    if cv is not None:
+                        parts.append(f"{prefix}_cv:{cv:.4f}")
             for attr, label in [("attn", "attn_ortho"), ("mlp", "mlp_ortho")]:
                 v = getattr(getattr(m.shared_block, attr, None), "_out_ortho_cos_sim", None)
                 if v is not None:
@@ -3304,13 +3328,26 @@ def main() -> None:
             return None
         return (value / n).detach().cpu().tolist()
 
-    # 1. Expert health per routed component (DDP-global).  Hard requirements:
-    #      min_share ≥ 0.6 / E   (weakest expert gets ≥60% of its fair share)
-    #      balance_cv ≤ 0.20     (mean-share dispersion across experts)
-    #      ortho     ≤ 0.20     (max-mean |cos| — worst expert's similarity)
-    #
-    # Covers all four routed components: attn, mlp, mos_ctp, mos_ntp.  The
-    # project spec requires all four to pass the same health bar.
+    # Helpers for splitting pooled-router usage into per-type normalized halves.
+    def _split_pool_usage_gpu(router, E, half):
+        gpu = getattr(router, "_expert_usage_gpu", None)
+        if gpu is None:
+            return None
+        h = gpu[:E] if half == 0 else gpu[E:]
+        return h / h.sum().clamp(min=1e-8)  # normalize within type
+
+    def _split_pool_usage_list(router, E, half):
+        lst = getattr(router, "_expert_usage", None)
+        if lst is None:
+            return None
+        h = lst[:E] if half == 0 else lst[E:]
+        s = sum(h) or 1e-8
+        return [u / s for u in h]
+
+    # 1. Expert health per routed component (DDP-global).
+    # Min-share: ≥ 0.6/E per type (normalized within each type — weakest
+    # expert gets ≥60% of its fair share).  Ortho: max-pairwise |cos| ≤ 0.5
+    # (stricter than near-duplicate 0.9, catches correlated experts).
     shared_block = base_m_for_roundtrip.shared_block
     mos_head = getattr(base_m_for_roundtrip, "mos_head", None)
 
@@ -3338,19 +3375,40 @@ def main() -> None:
             return None
 
     # Each spec: (prefix, num_experts, usage_gpu_getter, usage_list_getter, ortho_getter).
-    # Usage is preferentially read as a GPU tensor (populated on every rank,
-    # no per-forward cpu sync) falling back to the list if only master set it.
+    # Dedup pooled router by id — attn_router and mlp_router are aliases.
+    # For pooled router (2E experts), split usage into halves and check each
+    # type independently with normalized per-type shares.
     check_specs = []
     attn_router = getattr(shared_block.attn, "attn_router", None)
     mlp_router = getattr(shared_block.mlp, "mlp_router", None)
-    if attn_router is not None:
-        check_specs.append((
-            "attn", int(attn_router.num_experts),
-            lambda: getattr(attn_router, "_expert_usage_gpu", None),
-            lambda: getattr(attn_router, "_expert_usage", None),
-            lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None),
-        ))
-    if mlp_router is not None:
+    E = shared_block.num_experts
+    _seen_router_ids: set[int] = set()
+    if attn_router is not None and id(attn_router) not in _seen_router_ids:
+        _seen_router_ids.add(id(attn_router))
+        is_pooled = int(attn_router.num_experts) == 2 * E
+        if is_pooled:
+            # Pooled router: check per-type normalized halves
+            check_specs.append((
+                "attn", E,
+                lambda: _split_pool_usage_gpu(attn_router, E, half=0),
+                lambda: _split_pool_usage_list(attn_router, E, half=0),
+                lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None),
+            ))
+            check_specs.append((
+                "mlp", E,
+                lambda: _split_pool_usage_gpu(attn_router, E, half=1),
+                lambda: _split_pool_usage_list(attn_router, E, half=1),
+                lambda: getattr(shared_block.mlp, "_out_ortho_cos_sim", None),
+            ))
+        else:
+            check_specs.append((
+                "attn", int(attn_router.num_experts),
+                lambda: getattr(attn_router, "_expert_usage_gpu", None),
+                lambda: getattr(attn_router, "_expert_usage", None),
+                lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None),
+            ))
+    if mlp_router is not None and id(mlp_router) not in _seen_router_ids:
+        _seen_router_ids.add(id(mlp_router))
         check_specs.append((
             "mlp", int(mlp_router.num_experts),
             lambda: getattr(mlp_router, "_expert_usage_gpu", None),
@@ -3392,20 +3450,18 @@ def main() -> None:
             # is effectively unlearned weights being carried in the artifact —
             # wasted capacity — and routing has collapsed onto the others.
             min_share = float(min(usage))
-            if min_share < 0.01:
+            threshold = 0.6 / max(n_exp, 1)
+            if min_share < threshold:
                 _failures.append(
-                    f"{prefix}_min_share={min_share:.4f} < 0.01 "
-                    f"(dead expert — one of {n_exp} has <1% usage; routing collapsed)"
+                    f"{prefix}_min_share={min_share:.4f} < {threshold:.4f} "
+                    f"(expert below 60% of fair share 1/{n_exp})"
                 )
-        # Expert orthogonality: max-pairwise |cos| ≤ 0.9 — flags any single
-        # pair of near-duplicate experts.  Weaker than the old max-mean gate
-        # but targets the true structural failure: two experts with
-        # |cos|>0.9 are effectively the same expert (wasted capacity).
-        # Load-balance / soft routing is handled by training balance_loss.
+        # Expert orthogonality: max-pairwise |cos| ≤ 0.5 — catches correlated
+        # expert pairs, not just near-duplicates (0.9 was too lenient).
         ortho = _ddp_mean_scalar(ortho_getter())
-        if ortho is not None and ortho > 0.9:
+        if ortho is not None and ortho > 0.5:
             _failures.append(
-                f"{prefix}_ortho={ortho:.4f} > 0.9 (max pairwise |cos| — near-duplicate experts)"
+                f"{prefix}_ortho={ortho:.4f} > 0.5 (max pairwise |cos| — correlated experts)"
             )
 
     # 2. FP convergence: K-sweep degradation gate.  Threshold 0.1 catches gross

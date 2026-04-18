@@ -160,6 +160,42 @@ We define $T_\theta$ to be transformer-like and fully expressive:
 \textbf{no ball projections}, \textbf{no spectral-norm constraints}, and \textbf{standard SDPA attention}.
 Stability is handled by \emph{training-time} Lyapunov regularization (Section~\ref{sec:algorithm}) rather than hard architectural clamps.
 
+\subsection{Current model configuration}
+\label{sec:config}
+
+\paragraph{Architecture.}
+\begin{center}\small
+\begin{tabular}{ll|ll}
+\toprule
+\texttt{model\_dim} & 768 & \texttt{num\_experts} & 8 \\
+\texttt{num\_heads} & 8 & \texttt{num\_kv\_heads} & 4 \\
+\texttt{attn\_expert\_rank} & 128 & \texttt{mlp\_expert\_rank} & 192 \\
+\texttt{kv\_latent\_dim} & 384 & \texttt{kv\_rank} & 48 \\
+\texttt{kr\_rank} (K\_rope) & 32 & \texttt{wo\_rank} (Wo) & 64 \\
+\texttt{mlp\_mult} & 3.0 & \texttt{vocab\_size} & 1024 \\
+\texttt{train\_seq\_len} & 2048 & \texttt{train\_batch\_tokens} & 524{,}288 \\
+\texttt{deq\_beta} & 0.50 & \texttt{num\_layers} (max K) & 12 \\
+\texttt{deq\_backward} & revdeq (auto) & \texttt{deq\_bptt\_k} & 4 \\
+\texttt{num\_refinements} & 1 & \texttt{tie\_embeddings} & yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Lyapunov regularization.}
+$\lambda_{\text{jac}}=0.01$, $\gamma=0.9$, warmup fraction~$=0.1$.
+
+\paragraph{Optimizer.}
+Matrix params use Muon ($\text{lr}=0.022$, momentum$=0.99$, NS steps$=5$, WD$=1.08$).
+Scalar params and routing weights use AdamW ($\text{lr}=0.02$, $\beta_1=0.85$, $\beta_2=0.90$).
+Gradient clipping at $\|\nabla\|=0.3$.
+
+\paragraph{Expert independence invariant.}
+Every expert is \textbf{fully independent}: zero shared trainable parameters
+within the expert computation path.  Knowing one expert's weights tells you
+nothing about any other expert.  Only the router (which routes \emph{to} experts)
+and non-learned operations (RoPE tables, activation functions) are shared.
+Total model parameters: $\sim$12.8M ($\sim$5 MB at int6 + zstd-22).
+
 \subsection{Input embedding}
 We retain the existing embedding stack:
 \begin{equation}
@@ -204,20 +240,22 @@ We maintain dense routing over a combined expert pool $E = E_{\text{attn}} + E_{
 (Any of the existing router score parameterizations---dot-product, SIPS, etc.---can be used here.
 We no longer require a Lipschitz-controlled router; stability is handled by the Lyapunov penalty.)
 
-\paragraph{Attention experts (FlashAttention MLA + SDPA).}
-For attention expert $e$:
+\paragraph{Attention experts (fully independent per-expert MLA).}
+Each attention expert $e$ has its \textbf{own complete MLA pipeline with zero shared parameters}:
+\begin{enumerate}[leftmargin=2em,itemsep=0.1em]
+  \item \textbf{Per-expert Q} (low-rank): $Q_e = W^{Q,\text{up}}_e \cdot W^{Q,\text{down}}_e \cdot h$,
+    output dimension $H \times d_{\text{head}} + H$ (gate logits appended).
+  \item \textbf{Per-expert KV compression} (low-rank): $\ell_e = W^{KV,\text{up}}_e \cdot W^{KV,\text{down}}_e \cdot h$,
+    followed by per-expert RMSNorm (learned scale $g_e$, not shared across experts).
+  \item \textbf{Per-expert KV decompression}: $K^{\text{nope}}_e = W^{K}_e \cdot \ell_e$, $V_e = W^{V}_e \cdot \ell_e$
+    (independent dictionaries, not shared).
+  \item \textbf{Per-expert $K^{\text{rope}}$} (low-rank): $K^{\text{rope}}_e = W^{\text{kr,up}}_e \cdot W^{\text{kr,down}}_e \cdot h$.
+  \item \textbf{Per-expert output projection $W^O_e$} (low-rank): mixes heads independently per expert.
+\end{enumerate}
+All $E$ experts are packed into the head dimension ($E \times H$ query heads, $E \times H_{\text{kv}}$ KV heads)
+for a \textbf{single FlashAttention/SDPA call}. GQA ratio $H/H_{\text{kv}}$ is preserved. After SDPA, per-expert-per-head sigmoid gates are applied, then the low-rank output projection $W^O_e$:
 \[
-  Q_e = \mathrm{NormedLinear}(h;W^Q_e,b^Q_e,g^Q_e),\quad
-  K_e = \mathrm{NormedLinear}(h;W^K_e,b^K_e,g^K_e),\quad
-  V_e = \mathrm{NormedLinear}(h;W^V_e,b^V_e,g^V_e).
-\]
-Apply RoPE to $Q_e,K_e$ (orthogonal) and compute causal scaled dot-product attention using a FlashAttention/SDPA kernel:
-\[
-  O_e = \mathrm{SDPA}(Q_e,K_e,V_e)\quad\text{(causal)}.
-\]
-Optionally apply MLA-style head gates (as in current code), then output-project:
-\[
-  A_e(h) = \mathrm{NormedLinear}(O_e;W^O_e,b^O_e,g^O_e).
+  A_e(h) = W^{O,\text{up}}_e \cdot W^{O,\text{down}}_e \cdot \big(\sigma(g_e)\odot \mathrm{SDPA}(Q_e,K_e,V_e)\big).
 \]
 
 \paragraph{MLP experts (dense MoE, SwiGLU/GELU).}
