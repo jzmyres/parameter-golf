@@ -142,7 +142,7 @@ class Hyperparameters:
     rope_base = 10000.0
     logit_softcap = 30.0
     qk_gain_init = 5.0
-    deq_beta = 0.30  # T-opt 3/10: raise from 0.20 (Lyapunov guarantees stability for β∈(0,1], doc Prop 4.4)
+    deq_beta = 0.50  # T-opt 6/10: β=0.5 (Lyapunov guarantees stability for β∈(0,1], doc Prop 4.4)
 
     # Optimizer
     tied_embed_lr = 0.03
