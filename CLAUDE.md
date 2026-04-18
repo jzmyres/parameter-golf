@@ -53,7 +53,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | train_batch_tokens | 524,288 |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
-| deq_beta | 0.20 |
+| deq_beta | 0.50 |
 | num_refinements | 1 |
 
 ### Optimizer
@@ -223,6 +223,16 @@ When proposing architecture improvements:
 - **Full-dim low-rank experts**: every expert operates on the FULL model hidden dimension.
   Use low-rank matrices (dim→rank→dim) to control parameter count.
   Do NOT partition dimensions across experts (no `expert_size = dim // num_experts`).
+- **Expert independence (HARD CONSTRAINT)**: every expert must be fully independent —
+  **zero shared trainable parameters** within the expert computation path. Knowing one
+  expert's weights must tell you nothing about any other expert. Specifically:
+  - All projections (Q, K, V, Wo, gate, fc, down) must be per-expert
+  - All learned norms (RMSNorm scale weights) must be per-expert
+  - Only the **router** (which routes TO experts, not inside them) and **non-learned
+    operations** (RoPE cos/sin tables, activation functions) may be shared
+  - When adding a new parameter to the expert path, it MUST have shape `(E, ...)`.
+    A `grep -n` for shared `nn.Module` or `nn.Parameter` without `E` in the expert
+    forward should find nothing.
 - **Attn/MLP routing**: pure softmax (SoftDenseRouter)
 - **MoS routing (exception)**: pure softmax only (convex combination summing to 1), NO sigmoid gates.
   Per Mixtape paper ("Breaking the Softmax Bottleneck Efficiently", NeurIPS 2019).
@@ -234,18 +244,22 @@ When proposing architecture improvements:
   - **Expert orthogonality**: |cos_sim| between expert weight groups → 0 (not ±1)
 - Fully differentiable, no discrete routing decisions
 
-### 3. Multi-head Latent Attention (MLA) with Gated Attention
+### 3. Per-Expert MLA (Multi-head Latent Attention) with Gated Attention
 - Paper (MLA): DeepSeek-V2 (arxiv:2405.04434)
 - Paper (Gated Attn): "Gated Attention for Large Language Models" (arxiv:2505.06708)
   - Repo: https://github.com/YuchuanTian/GatedAttn (NeurIPS 2025 Best Paper)
-- Low-rank KV compression: project to latent space, cache compressed, decompress on-the-fly
+- **Each expert has its own complete MLA pipeline** (no shared params — see constraint #2):
+  - Per-expert Q: low-rank `dim → expert_rank → H*d_head + H` (gate logits appended)
+  - Per-expert KV compression: low-rank `dim → kv_rank → kv_latent_dim`
+  - Per-expert KV decompression: per-expert RMSNorm + per-expert `kv_latent → K_nope, V`
+  - Per-expert K_rope: low-rank `dim → kr_rank → H_kv*rope_dim`
+  - Per-expert Wo: low-rank output projection `D → wo_rank → D` (mixes heads per expert)
+- **Head-packed SDPA**: expert index extends head dimension (E×H query heads,
+  E×H_kv KV heads) for a single FlashAttention call. GQA ratio H/H_kv preserved.
 - Decoupled RoPE: split heads into RoPE and non-RoPE components
-- **Gated Attention**: query-dependent per-head sigmoid gate after SDPA
-  - Gate logits from expanded Q projection: `c_q outputs dim + num_heads`
-  - Each token gets its own gate value per head (NOT a fixed scalar)
-  - The paper claims: (1) mitigates attention sinks, (2) enables larger LR, (3) improves stability
-  - **Test these claims** — verify the gate position (after SDPA, before output proj) improves perf
-  - If a different gate position works better, document the finding
+- **Gated Attention**: query-dependent per-expert-per-head sigmoid gate after SDPA
+  - Gate logits from per-expert Q projection (appended to Q output)
+  - Each token gets its own gate value per head per expert
 
 ### 4. FSQ (Finite Scalar Quantization) in MoS Head
 - Paper: FSQ (arxiv:2309.15505)
