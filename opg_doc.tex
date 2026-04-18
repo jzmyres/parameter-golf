@@ -230,15 +230,29 @@ Unlike hard spectral constraints or $\Pi_R$ projections, this does not cap repre
 Let $u = z + x_0$ be the combined state+input view.
 Compute a shared normalized representation $h = \mathrm{RMSNorm}(u)$.
 
-\paragraph{Router.}
-We maintain dense routing over a combined expert pool $E = E_{\text{attn}} + E_{\text{mlp}}$:
-\[
-  q = \mathrm{NormedLinear}(h;W_r,b_r,g_r),\qquad
-  s = q K_r^\top,\qquad
-  w = \mathrm{softmax}(s)\in\Delta^{E-1}.
-\]
-(Any of the existing router score parameterizations---dot-product, SIPS, etc.---can be used here.
-We no longer require a Lipschitz-controlled router; stability is handled by the Lyapunov penalty.)
+\paragraph{Router with un-normalized sigmoid gate.}
+We maintain dense routing over a combined expert pool $E = E_{\text{attn}} + E_{\text{mlp}}$
+with a \textbf{per-expert sigmoid gate that is NOT renormalized}:
+\begin{align}
+  w_{\text{alloc}} &= \mathrm{softmax}(\text{score}(h, K_r)) \in \Delta^{E-1}, \label{eq:router_alloc}\\
+  g &= \sigma(W_g\,h + b_g) \in [0,1]^E, \label{eq:router_gate}\\
+  w &= w_{\text{alloc}} \odot g, \qquad \sum_j w_j \le 1. \label{eq:router_final}
+\end{align}
+The softmax in \eqref{eq:router_alloc} allocates relative budget across experts (sums to 1).
+The sigmoid gate in \eqref{eq:router_gate} independently scales each expert's contribution.
+Crucially, the product in \eqref{eq:router_final} is \textbf{not renormalized}: the total expert
+weight $\sum_j w_j$ can be strictly less than 1.
+
+\begin{remark}[Why un-normalized is more expressive]
+When the gate suppresses all experts ($g\to 0$), the mixture $\Delta_\theta(z,x_0)\to 0$ and
+$T_\theta(z,x_0)\to x_0$.  This gives the model a ``do nothing'' mode for tokens already
+near equilibrium, which is semantically meaningful for DEQ: the solver can recognize convergence
+token-by-token.  Forcing $\sum w_j=1$ (as the previous logit-space formulation did) removes
+this degree of freedom.
+\end{remark}
+
+(Any scoring parameterization---L2 distance with $\tanh$, dot-product, SIPS---can be used
+for computing the route logits in \eqref{eq:router_alloc}.)
 
 \paragraph{Attention experts (fully independent per-expert MLA).}
 Each attention expert $e$ has its \textbf{own complete MLA pipeline with zero shared parameters}:
