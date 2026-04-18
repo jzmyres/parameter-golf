@@ -236,10 +236,12 @@ When proposing architecture improvements:
   - When adding a new parameter to the expert path, it MUST have shape `(E, ...)`.
     A `grep -n` for shared `nn.Module` or `nn.Parameter` without `E` in the expert
     forward should find nothing.
-- **Attn/MLP routing**: pure softmax (SoftDenseRouter)
-- **MoS routing (exception)**: pure softmax only (convex combination summing to 1), NO sigmoid gates.
+- **Attn/MLP routing**: softmax allocation × sigmoid gate (SoftDenseRouter).
+  Weights sum to ≤ 1 (NOT renormalized). The sigmoid gate allows the model to
+  globally suppress the expert mixture for tokens already near equilibrium
+  (`T(z,x0) ≈ x0` when all gates close). More expressive than forcing sum=1.
+- **MoS routing**: pure softmax (convex combination summing to 1).
   Per Mixtape paper ("Breaking the Softmax Bottleneck Efficiently", NeurIPS 2019).
-  The softmax bottleneck is broken by the mixture of softmaxes itself, not by gating.
 - **Applied to ALL components**: attention output, MLP hidden, MoS output heads
 - **Regularization** (per-token sparsity + global balance + orthogonality):
   - **Per-token sparsity**: L1 on routing weights (each token concentrates on fewer experts)

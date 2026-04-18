@@ -1059,16 +1059,15 @@ class SoftDenseRouter(nn.Module):
         else:
             # Linear scoring (iter 30-33b baseline).
             route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
-        # Gate in logit space: softmax(a + log_sigmoid(b)) is mathematically
-        # identical to softmax(a)*sigmoid(b)/renorm, but stays "pure softmax"
-        # and avoids explicit renormalization.  Phase 6a.3 (review 2):
-        # compute the softmax in fp32 for stability (bf16 softmax has rare
-        # NaN edge cases and degenerate routing under extreme inputs).
-        gate_logits = F.logsigmoid(self.router_gate(x_n))
-        logits_sum = (route_logits + gate_logits).float()
-        p = torch.softmax(logits_sum, dim=-1).to(dtype=x.dtype)
+        # Sigmoid gate: softmax(route_logits) * sigmoid(gate_logits).
+        # NOT renormalized — total weight can be < 1, allowing the model to
+        # suppress the entire expert mixture for tokens already near equilibrium.
+        # This is more expressive than folding into logit space (which forces sum=1).
+        p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
+        gate_act = torch.sigmoid(self.router_gate(x_n).float())
+        p = (p_alloc * gate_act).to(dtype=x.dtype)
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
-            self._router_gate_last_mean = float(gate_logits.detach().exp().float().mean().item())
+            self._router_gate_last_mean = float(gate_act.detach().mean().item())
         if self.training:
             reduce_dims = tuple(range(p.ndim - 1))
             mean_share = p.mean(dim=reduce_dims)
@@ -1551,31 +1550,33 @@ class MoSHead(nn.Module):
     def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
                       A_spec: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         N = x.shape[0]
+        E_s, E_p = A_shared.shape[0], A_spec.shape[0]
+        E = E_s + E_p
         x = _rms_norm(x)
-        alpha = F.softmax(gate(x).float(), dim=-1)
-        log_w = alpha.clamp(min=1e-8).log()
-        log_p_unnorm = x.new_full((N, self.vocab_size), -torch.inf, dtype=torch.float32)
-        mu_groups: list[Tensor] = []
-        for e in range(self.num_shared):
-            t = x.to(A_shared.dtype) @ A_shared[e]
-            mu_groups.append(t.float().mean(dim=0))
-            u = self._fsq(t)
-            logits = u.to(B.dtype) @ B.t()
-            log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, e:e+1] + F.log_softmax(logits.float(), dim=-1))
-        for e in range(self.num_specialized):
-            t = x.to(A_spec.dtype) @ A_spec[e]
-            mu_groups.append(t.float().mean(dim=0))
-            u = self._fsq(t)
-            logits = u.to(B.dtype) @ B.t()
-            idx = self.num_shared + e
-            log_p_unnorm = torch.logaddexp(log_p_unnorm, log_w[:, idx:idx+1] + F.log_softmax(logits.float(), dim=-1))
+        alpha = F.softmax(gate(x).float(), dim=-1)  # (N, E)
+        log_w = alpha.clamp(min=1e-8).log()          # (N, E)
+
+        # Vectorized: concat all A matrices → single batched GEMM
+        A_all = torch.cat([A_shared, A_spec], dim=0)  # (E, D, R)
+        # (N, D) @ (E, D, R) → (E, N, R) via batched matmul
+        x_e = x.to(A_all.dtype)
+        A_flat = A_all.reshape(E * self.rank, self.d_model)
+        t_all = (x_e @ A_flat.t()).view(N, E, self.rank)  # (N, E, R)
+
+        # Ortho diagnostic from mean expert projections
+        mu_groups = t_all.float().mean(dim=0)  # (E, R)
+        ortho_out = max_mean_abs_offdiag_cosine(mu_groups) if E >= 2 else x.new_zeros(())
+
+        # FSQ + logits: (N, E, R) → FSQ → (N, E, R) @ B.T → (N, E, V)
+        u_all = self._fsq(t_all)
+        logits_all = (u_all.to(B.dtype) @ B.t()).float()  # (N, E, V)
+
+        # Mixture of softmaxes in log space (vectorized logaddexp)
+        log_p_experts = F.log_softmax(logits_all, dim=-1)  # (N, E, V)
+        log_p_weighted = log_w.unsqueeze(-1) + log_p_experts  # (N, E, V)
+        log_p_unnorm = torch.logsumexp(log_p_weighted, dim=1)  # (N, V)
         log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
-        # LOSS term uses max-mean for smoother gradient (every pair contributes).
-        # The assertion-time GATE separately uses max-pairwise (≤ 0.9 threshold)
-        # for clean duplicate detection.  iter 21-retry-2 confirmed empirically:
-        # using max-pairwise as the loss gives sparse gradients (only worst pair
-        # updates per step), degrading val_bpb 1.67 → 1.88 vs the max-mean loss.
-        ortho_out = max_mean_abs_offdiag_cosine(torch.stack(mu_groups, dim=0)) if len(mu_groups) >= 2 else x.new_zeros(())
+
         return log_p, alpha, ortho_out
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:

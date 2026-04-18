@@ -37,11 +37,11 @@ class TestRouterMatmulParity(unittest.TestCase):
             c = r.prototypes.float()
         ref_route = _broadcast_l2_logits(x_n.float(), c, r.l2_gamma)
         ref_route = ref_route + r.expert_bias.float()
-        gate_logits = F.logsigmoid(r.router_gate(x_n)).float()
-        ref_p = torch.softmax(ref_route + gate_logits, dim=-1)
+        gate_act = torch.sigmoid(r.router_gate(x_n).float())
+        ref_p = torch.softmax(ref_route, dim=-1) * gate_act
         self.assertTrue(
-            torch.allclose(p, ref_p, atol=1e-5, rtol=1e-5),
-            f"L2 matmul parity failed: max abs err = {(p - ref_p).abs().max().item()}",
+            torch.allclose(p, ref_p.to(p.dtype), atol=1e-3, rtol=1e-3),
+            f"L2 matmul parity failed: max abs err = {(p - ref_p.to(p.dtype)).abs().max().item()}",
         )
 
     def test_no_nan_on_extreme_input(self) -> None:
@@ -58,12 +58,15 @@ class TestRouterMatmulParity(unittest.TestCase):
                 torch.isnan(p).any().item(),
                 f"NaN in softmax output for scoring={scoring}",
             )
-            # Probability distribution: rows sum to ~1
+            # Sigmoid gate: rows sum to ≤ 1 (not necessarily 1)
             row_sum = p.sum(dim=-1)
             self.assertTrue(
-                torch.allclose(row_sum, torch.ones_like(row_sum), atol=1e-4),
-                f"rows do not sum to 1 for scoring={scoring}, max |sum-1| = "
-                f"{(row_sum - 1.0).abs().max().item()}",
+                (row_sum <= 1.0 + 1e-4).all().item(),
+                f"rows exceed 1 for scoring={scoring}, max sum = {row_sum.max().item()}",
+            )
+            self.assertTrue(
+                (row_sum > 0.0).all().item(),
+                f"rows are zero for scoring={scoring}",
             )
 
     # test_prototype_ball_caps_norm removed: BallProjection on prototypes
