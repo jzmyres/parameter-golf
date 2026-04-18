@@ -2,7 +2,7 @@
 
 `torch.compile` wraps a module in an `OptimizedModule` whose attribute writes
 may or may not propagate to the original module.  Code that toggles
-diagnostic flags (e.g., `_gg_track_enabled`) must always land on the underlying
+diagnostic flags (e.g., `_diag_track_enabled`) must always land on the underlying
 module so log-site readers can observe them.  This test keeps that
 contract honest in both eager and compiled modes.
 """

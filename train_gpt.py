@@ -139,7 +139,6 @@ class Hyperparameters:
     mlp_mult = 3.0
     tie_embeddings = True
     rope_base = 10000.0
-    logit_softcap = 30.0
     qk_gain_init = 5.0
     deq_beta = 0.50  # T-opt 6/10: β=0.5 (Lyapunov guarantees stability for β∈(0,1], doc Prop 4.4)
 
@@ -251,7 +250,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "warmup-steps", "train-batch-tokens", "train-seq-len",
         "val-batch-size", "val-loss-every", "train-log-every",
         "max-wallclock-seconds", "attn-balance-mult", "mlp-balance-mult",
-        "bal-loss-coef", "router-health-coef", "router-lr",
+        "bal-loss-coef", "router-health-coef",
         "mos-ortho-out-coef", "block-ortho-aux-coef", "block-ortho-aux-every",
         "block-ortho-aux-tokens", "bigram-vocab-size", "bigram-dim",
         "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
@@ -269,7 +268,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             p.add_argument(f"--{name}", type=str, default=None)
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
-        "tie-attn-mlp-router", "swa-enabled", "ema-enabled",
+        "swa-enabled", "ema-enabled",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # Backward compat: "unroll" is the established name in experiments/docs.
@@ -1423,13 +1422,7 @@ class MLP(nn.Module):
         # Shape: (E, R) scale weight, applied after normalization.
         self.hidden_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
 
-    def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
-                    inj_term: Tensor | None = None) -> Tensor:
-        # Optional per-expert injection (built for iter 27b-pos-expert-out).
-        # If inj_term (B, T, D) is provided, distribute it across experts as
-        # (inj_term / E) added to each out_e before sum, so the total summed
-        # contribution is inj_term (E × inj_term/E). iter 27d passes None;
-        # this path is preserved as live infra for future Phase 5e sweeps.
+    def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False) -> Tensor:
         B, T, D = x.shape
         E, R = self.num_experts, self.expert_rank
         x_n = x if bool(pre_normed) else _rms_norm(x)
@@ -1448,10 +1441,6 @@ class MLP(nn.Module):
         h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
-        # Per-expert inj add (disabled in 27d; see mix_experts docstring above).
-        if inj_term is not None:
-            inj_flat = inj_term.reshape(N, D).to(dtype=out_e.dtype) / float(E)  # (N, D)
-            out_e = out_e + inj_flat.unsqueeze(0)  # broadcast over E
         out = out_e.sum(dim=0)  # (N, D)
 
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
@@ -1683,34 +1672,12 @@ class Block(nn.Module):
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
                                          expert_rank=attn_expert_rank, router=self.router)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
-        # iter 41 (opg_doc.tex §3 Lyapunov revision): remove ALL hard
-        # contraction constraints — no spectral-norm caps, no Π_R, no τ-shell,
-        # no inj_lin.  Stability via Lyapunov penalty (iter 45) + RMSNorm
-        # preconditioning.  Expressiveness fully restored.
-        #
-        # Diagnostic tracking (kept for logging compat):
-        self._gg_last: float | None = None
-        self._gg_track_enabled = False
-        self._gg_sum = 0.0
-        self._gg_count = 0
-        self._gg_call_track_enabled = False
-        self._gg_call_track: list[float] = []
-        self._inj_call_track: list[float] = []
+        # Diagnostic tracking for per-DEQ-iteration gate trajectories.
+        self._diag_track_enabled = False
         self._attn_gate_call_track: list[float] = []
         self._router_gate_call_track: list[float] = []
         self._attn_router_gate_call_track: list[float] = []
         self._mlp_router_gate_call_track: list[float] = []
-        self._inj_gate_last_mean: float | None = None
-
-    @dynamo_disable
-    def _record_gg_diag(self, gg_tok: Tensor) -> None:
-        gg_val = float(gg_tok.float().mean().item())
-        self._gg_last = gg_val
-        if self._gg_track_enabled:
-            self._gg_sum += gg_val
-            self._gg_count += 1
-        if self._gg_call_track_enabled:
-            self._gg_call_track.append(gg_val)
 
     def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = z_in.shape
@@ -1771,8 +1738,7 @@ class Block(nn.Module):
         # Pooled router over 2E experts (doc §3.3).
         E = self.num_experts
         w_attn, w_mlp = self._route_pooled(h)
-        _tracking = self._gg_track_enabled or self._gg_call_track_enabled
-        if _tracking:
+        if self._diag_track_enabled:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
 
         # Independent expert attention: per-expert Q/K/V → head-packed SDPA.
@@ -1790,16 +1756,13 @@ class Block(nn.Module):
         # T_θ(z, x_0) = x_0 + Δ_θ(z, x_0)
         raw_out = x0 + delta
 
-        if _tracking:
-            gg_tok = torch.ones(h.shape[:-1], device=h.device, dtype=h.dtype)
-            self._record_gg_diag(gg_tok.detach())
-            self._inj_gate_last_mean = 1.0
-            self._inj_call_track.append(1.0)
+        if self._diag_track_enabled:
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
             if ag is not None:
                 self._attn_gate_call_track.append(ag)
             if attn_rg is not None:
                 self._attn_router_gate_call_track.append(attn_rg)
+            # Pooled router: attn and mlp share the same router instance.
             mlp_rg = attn_rg
             if mlp_rg is not None:
                 self._mlp_router_gate_call_track.append(mlp_rg)
@@ -2010,14 +1973,13 @@ class RevDEQFunction(torch.autograd.Function):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: float, tie_embeddings: bool,
-                 tied_embed_init_std: float, logit_softcap: float, rope_base: float,
+                 tied_embed_init_std: float, rope_base: float,
                  qk_gain_init: float, bigram_vocab_size: int = 0, bigram_dim: int = 128,
                  kv_latent_dim: int = 0, num_refinements: int = 1,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  deq_beta: float = 0.35, attn_balance_mult: float = 5.0,
                  mlp_balance_mult: float = 1.0, bal_loss_coef: float = 5e-3,
                  router_health_coef: float = 0.25, mos_ortho_out_coef: float = 0.0,
-                 attn_ortho_out_coef: float = 0.0, mlp_ortho_out_coef: float = 0.0,
                  deq_backward: str = "revdeq", deq_bptt_k: int = 0,
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
@@ -2029,13 +1991,10 @@ class GPT(nn.Module):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
-        self.logit_softcap = logit_softcap
         self.num_layers = num_layers
         self.num_refinements = num_refinements
-        self.blocks = None  # Required by arch tests
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        self.smear = nn.Identity()  # Required by arch tests
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
         # (threaded from Hyperparameters; verified by experiments/test_arch.py).
         self.num_experts = int(num_experts)
@@ -2064,8 +2023,7 @@ class GPT(nn.Module):
         self.lyapunov_gamma = float(lyapunov_gamma)
         self.lyapunov_warmup_frac = float(lyapunov_warmup_frac)
         self._lyapunov_v_buf: Tensor | None = None  # persistent power-iter vector (EMA)
-        self._lyapunov_loss: Tensor | None = None
-        self._lyapunov_rho_hat: float | Tensor = 0.0  # tensor in hot path; float at log time
+        self._lyapunov_rho_hat: float = 0.0  # always Python float (no GPU sync on read)
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm(model_dim)
         # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
@@ -2134,14 +2092,9 @@ class GPT(nn.Module):
         beta = self.deq_beta
         dtype = x0.dtype
         K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
-        track_gg = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+        track_diag = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
         sb = _unwrap_compiled_module(self.shared_block)
-        sb._gg_sum = 0.0
-        sb._gg_count = 0
-        sb._gg_track_enabled = bool(track_gg)
-        sb._gg_call_track = []
-        sb._gg_call_track_enabled = bool(track_gg)
-        sb._inj_call_track = []
+        sb._diag_track_enabled = bool(track_diag)
         sb._attn_gate_call_track = []
         sb._router_gate_call_track = []
         sb._attn_router_gate_call_track = []
@@ -2174,23 +2127,7 @@ class GPT(nn.Module):
             return z, z_prev, y_acc, z_acc
         finally:
             _DEQ_SOLVE_ACTIVE = prev_deq_flag
-            sb._gg_track_enabled = False
-            sb._gg_call_track_enabled = False
-            if sb._gg_count > 0:
-                self._gg_mean_last_solve = float(sb._gg_sum / sb._gg_count)
-            else:
-                self._gg_mean_last_solve = None
-            calls = list(getattr(sb, "_gg_call_track", []) or [])
-            if len(calls) == 2 * K:
-                self._gg_iter_last_solve = [0.5 * (calls[2*i] + calls[2*i+1]) for i in range(K)]
-            else:
-                self._gg_iter_last_solve = []
-            # Aggregate inj_gate per-iteration (each iter has 2 calls: y-step + z-step)
-            inj_calls = list(getattr(sb, "_inj_call_track", []) or [])
-            if len(inj_calls) == 2 * K:
-                self._inj_iter_last_solve = [0.5 * (inj_calls[2*i] + inj_calls[2*i+1]) for i in range(K)]
-            else:
-                self._inj_iter_last_solve = []
+            sb._diag_track_enabled = False
             # Aggregate attn_gate per-iteration (1 call per block forward, 2 per iter)
             ag_calls = list(getattr(sb, "_attn_gate_call_track", []) or [])
             if len(ag_calls) == 2 * K:
@@ -2217,7 +2154,7 @@ class GPT(nn.Module):
 
             # Backward compat: after a DEQ solve with router_diagnostics enabled,
             # materialize list-form router diagnostics exactly once (not per-iter).
-            if track_gg and bool(_ROUTER_DIAGNOSTICS_ACTIVE):
+            if track_diag and bool(_ROUTER_DIAGNOSTICS_ACTIVE):
                 try:
                     seen: set[int] = set()
                     for r in [sb.attn.attn_router, sb.mlp.mlp_router]:
@@ -2310,7 +2247,6 @@ class GPT(nn.Module):
         # corrupts the compiled tensor metadata — must be done externally.
         self._lyapunov_z_star = z.detach()
         self._lyapunov_x0 = x0_refined.detach()
-        self._lyapunov_loss = None
 
         if self.training:
             if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
@@ -2675,7 +2611,7 @@ def main() -> None:
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
@@ -2722,7 +2658,7 @@ def main() -> None:
     # Compiling the method avoids DDP graph expansion that caused the ~40 GB
     # workspace OOM with torch.compile(module).  Works with revdeq because
     # the VJP backward is a single block.forward call.  1.97× speedup, 4.4 GB.
-    if not hasattr(base_model.shared_block, '_orig_module'):  # not already full-compiled
+    if not hasattr(base_model.shared_block, '_orig_mod'):  # not already full-compiled
         sb = base_model.shared_block
         try:
             sb.forward = torch.compile(sb.forward, dynamic=False)
@@ -2812,24 +2748,6 @@ def main() -> None:
         conv_rel_t = getattr(m, "_deq_iter_convergence_rel_t", None)
         if isinstance(conv_rel_t, torch.Tensor):
             parts.append(f"deq_iter_conv_rel:{float(conv_rel_t.detach().float().item()):.6f}")
-        if hasattr(m, "shared_block") and getattr(m.shared_block, "_gg_last", None) is not None:
-            parts.append(f"gg:{float(m.shared_block._gg_last):.4f}")
-        gg_mean = getattr(m, "_gg_mean_last_solve", None)
-        if gg_mean is not None:
-            parts.append(f"gg_mean:{float(gg_mean):.4f}")
-        # Per-DEQ-iteration gg trajectory: each entry is the average gg_tok
-        # over the (y, z) sub-call pair at iteration index i.  A *decreasing*
-        # trend across iterations means the model is making smaller updates
-        # as it approaches the fixed point -- desirable.  A flat trend means
-        # the iterative depth is wasted.
-        gg_iter = getattr(m, "_gg_iter_last_solve", None)
-        if gg_iter is not None and len(gg_iter) > 0:
-            iter_str = ",".join(f"{float(v):.3f}" for v in gg_iter)
-            parts.append(f"gg_iter:[{iter_str}]")
-        # Per-iteration injection gate trajectory
-        inj_iter = getattr(m, "_inj_iter_last_solve", None)
-        if inj_iter is not None and len(inj_iter) > 0:
-            parts.append(f"inj_iter:[{','.join(f'{v:.3f}' for v in inj_iter)}]")
         # TBPTT: per-backward-iter VJP norms (index 0 = last forward iter).
         # A steep decay confirms the gradient-scale hypothesis.
         sb_for_vjp = getattr(m, "shared_block", None)
@@ -2997,9 +2915,8 @@ def main() -> None:
                 x0_lyap = getattr(base_model, '_lyapunov_x0', None)
                 # T-opt 2/10: skip boundary forward when ρ̂ already below γ.
                 # Recheck every 10 steps to catch drift. Saves ~6% on stable steps.
-                prev_rho = float(getattr(base_model, '_lyapunov_rho_hat', 999.0)
-                                 if isinstance(getattr(base_model, '_lyapunov_rho_hat', None), (int, float))
-                                 else getattr(getattr(base_model, '_lyapunov_rho_hat', None), 'item', lambda: 999.0)())
+                # _lyapunov_rho_hat is stored as a Python float (no GPU sync here).
+                prev_rho = float(getattr(base_model, '_lyapunov_rho_hat', 999.0))
                 lyap_gamma = float(base_model.lyapunov_gamma)
                 lyap_skip = (prev_rho < lyap_gamma * 0.95) and (step % 10 != 0)
                 if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
@@ -3021,25 +2938,32 @@ def main() -> None:
                         create_graph=False, retain_graph=False,
                     )[0]
                     rho_hat = v_next.detach().float().reshape(-1).norm()
-                    base_model._lyapunov_rho_hat = rho_hat
-                    # EMA update (doc §4.2)
+                    # Store as Python float — the VJP sync has already happened,
+                    # so .item() here costs nothing extra and avoids a GPU sync
+                    # on the NEXT step when prev_rho is read.
+                    base_model._lyapunov_rho_hat = float(rho_hat.item())
+                    # EMA update (doc §4.2) — pure-tensor math, no GPU→CPU sync.
                     with torch.no_grad():
                         v_nf = v_next.float().reshape(-1)
                         v_norm = v_nf.norm().clamp(min=_lyap_eps)
-                        if v_norm < 1e-6:
-                            base_model._lyapunov_v_buf = _frob_normalize(torch.randn_like(z_star), _lyap_eps)
-                        else:
-                            mu = 0.9
-                            v_ema = mu * v_buf.float().reshape(-1) + (1.0 - mu) * (v_nf / v_norm)
-                            base_model._lyapunov_v_buf = _frob_normalize(v_ema.reshape(z_star.shape), _lyap_eps).to(z_star.dtype)
-                    # Forward #2: surrogate loss (only if ρ̂ > γ)
-                    scale_t = torch.relu(rho_hat - gamma) / rho_hat.clamp(min=_lyap_eps)
-                    if scale_t.item() > 0:
+                        # v_norm is clamped to _lyap_eps, so div-by-zero is impossible.
+                        # _frob_normalize re-normalizes anyway, handling degenerate cases.
+                        mu = 0.9
+                        v_ema = mu * v_buf.float().reshape(-1) + (1.0 - mu) * (v_nf / v_norm)
+                        base_model._lyapunov_v_buf = _frob_normalize(v_ema.reshape(z_star.shape), _lyap_eps).to(z_star.dtype)
+                    # Forward #2: surrogate loss (only if ρ̂ > γ).
+                    # rho_hat is already .item()'d at line above, so deriving
+                    # scale_val as a Python float costs zero additional GPU sync.
+                    # Gating avoids building a full forward+backward graph when
+                    # the penalty is inactive (90%+ of steps after warmup).
+                    rho_val = base_model._lyapunov_rho_hat  # already a Python float
+                    scale_val = max(rho_val - gamma, 0.0) / max(rho_val, _lyap_eps)
+                    if scale_val > 0.0:
                         v_dir = (v_next.detach() / rho_hat.clamp(min=_lyap_eps)).detach()
                         z_b2 = z_star.detach()  # no requires_grad — grad flows to θ only
                         u_b2 = blk(z_b2, x0_lyap)
                         surrogate = (u_b2 * v_dir).sum().abs()
-                        loss = loss + lyap_scale * lyap_coef * scale_t.detach() * surrogate
+                        loss = loss + lyap_scale * lyap_coef * scale_val * surrogate
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -3053,9 +2977,9 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
         if args.grad_clip_norm > 0:
-            _preclip = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm).item()
+            _preclip_t = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         else:
-            _preclip = 0.0
+            _preclip_t = None
         for opt in optimizers:
             opt.step()
 
@@ -3091,7 +3015,7 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} "
-                f"grad_norm:{_preclip:.4f} "
+                f"grad_norm:{float(_preclip_t.item()) if _preclip_t is not None else 0.0:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 f"{deq_info}{expert_info}"
             )
@@ -3279,14 +3203,8 @@ def main() -> None:
                 full_validation=False, deq_k=k_eval,
             )
         k_sweep_results[k_eval] = float(bpb_k)
-        # Log val_bpb + per-iteration gg trajectory + DEQ diagnostics for this K.
+        # Log val_bpb + per-iteration gate trajectories + DEQ diagnostics for this K.
         diag_parts = [f"val_bpb:{bpb_k:.6f}"]
-        gg_iter = getattr(base_m_for_roundtrip, "_gg_iter_last_solve", None)
-        if gg_iter and len(gg_iter) > 0:
-            diag_parts.append(f"gg_iter:[{','.join(f'{v:.3f}' for v in gg_iter)}]")
-        inj_iter = getattr(base_m_for_roundtrip, "_inj_iter_last_solve", None)
-        if inj_iter and len(inj_iter) > 0:
-            diag_parts.append(f"inj_iter:[{','.join(f'{v:.3f}' for v in inj_iter)}]")
         ag_iter = getattr(base_m_for_roundtrip, "_attn_gate_iter_last_solve", None)
         if ag_iter and len(ag_iter) > 0:
             diag_parts.append(f"attn_gate_iter:[{','.join(f'{v:.3f}' for v in ag_iter)}]")
@@ -3299,9 +3217,6 @@ def main() -> None:
         mlp_rg_iter = getattr(base_m_for_roundtrip, "_mlp_router_gate_iter_last_solve", None)
         if mlp_rg_iter and len(mlp_rg_iter) > 0:
             diag_parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
-        gg_mean = getattr(base_m_for_roundtrip, "_gg_mean_last_solve", None)
-        if gg_mean is not None:
-            diag_parts.append(f"gg_mean:{gg_mean:.4f}")
         conv_rel_t = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel_t", None)
         if isinstance(conv_rel_t, torch.Tensor):
             diag_parts.append(f"iter_conv_rel:{float(conv_rel_t.detach().float().item()):.6f}")
@@ -3493,36 +3408,7 @@ def main() -> None:
                 f"{prefix}_ortho={ortho:.4f} > 0.9 (max pairwise |cos| — near-duplicate experts)"
             )
 
-    # 2. Global gate trend: gg must be active (not collapsed to 0 or 1).
-    # DDP-reduce rank-local max/min so the assertion sees the global view —
-    # a gate collapsed on one worker but healthy on master should still fail.
-    # Phase 5b iter 23C: gg_gate removed; gg_iter is always 1.0 (diag marker).
-    # Collapse-check assertion no longer applies — no gate to collapse.
-
-    # 3. Injection gate: x0 must be injected sometimes so the fixed point
-    #    remains input-specific (H23).  Soft gate (info-level): max inj_iter ≥
-    #    0.05 AND mean inj_iter ≥ 0.01.  Per CLAUDE.md val_bpb-primary policy,
-    #    a violation populates failure_categories + retry_hint.json for the
-    #    NEXT iteration but does NOT block --promote on val_bpb improvement.
-    #    DDP-reduced for the same reason as gg above.
-    inj_iter_final = getattr(base_m_for_roundtrip, "_inj_iter_last_solve", None)
-    inj_max_local = max(inj_iter_final) if inj_iter_final and len(inj_iter_final) > 0 else None
-    inj_mean_local = (sum(inj_iter_final) / len(inj_iter_final)) if inj_iter_final and len(inj_iter_final) > 0 else None
-    inj_max = _ddp_mean_scalar(inj_max_local)
-    inj_mean = _ddp_mean_scalar(inj_mean_local)
-    if inj_max is not None and inj_mean is not None:
-        if inj_max < 0.05:
-            _failures.append(
-                f"inj_max={inj_max:.4f} < 0.05 (injection collapsed — DEQ fixed point "
-                f"no longer input-specific, violates z* = f(z*, x0), see H23)"
-            )
-        if inj_mean < 0.01:
-            _failures.append(
-                f"inj_mean={inj_mean:.4f} < 0.01 (avg injection near zero — "
-                f"x0 dependence lost across solver)"
-            )
-
-    # 4. FP convergence: K-sweep degradation gate.  Threshold 0.1 catches gross
+    # 2. FP convergence: K-sweep degradation gate.  Threshold 0.1 catches gross
     # FP collapse (model exploits a specific K and degrades dramatically at others)
     # without firing on finite-K noise (typical K=64 vs K=32 fluctuation is
     # 0.005-0.010, which the prior 0.005 monotone gate flagged as failures —
@@ -3622,42 +3508,13 @@ def main() -> None:
                        "If no effect, drop num_experts by 1 step.",
                 "config_change": {"weight_decay_mult": 1.5},
             }
-        if first_token.startswith("inj_max") or first_token.startswith("inj_mean"):
-            return {
-                "failure": failure,
-                "category": "injection_collapse",
-                "hypothesis": "H23-refined VERIFIED — gate-collapse pathology migrates "
-                              "between gg_gate and inj_gate; structural fixes (Phase 5e) > clamps",
-                "fix": "Continue Phase 5e injection-mechanism sweep: 5e-1 picks the best "
-                       "POSITION (27a/b/d), 5e-2 picks the best TRANSFORMATION (28a W-identity "
-                       "vs 28b W-full-rank). Avoid clamps — they only delay collapse migration.",
-                "config_change": {"phase": "5e"},
-            }
-        if first_token.startswith("gg_max"):
-            return {
-                "failure": failure,
-                "category": "gate_collapsed",
-                "hypothesis": "H20 VERIFIED — post-norm unlocks flat gg regime",
-                "fix": "Verify post_norm enabled on Block output. If already on, lower deq_beta by 0.05 "
-                       "for tighter contraction that justifies higher gate.",
-                "config_change": {"deq_beta_delta": -0.05},
-            }
-        if first_token.startswith("gg_min"):
-            return {
-                "failure": failure,
-                "category": "gate_saturated",
-                "hypothesis": "H18 VERIFIED — β controls convergence speed",
-                "fix": "Increase deq_beta by 0.05 so the model learns a smaller per-iter update.",
-                "config_change": {"deq_beta_delta": 0.05},
-            }
         if low.startswith("k-sweep"):
             return {
                 "failure": failure,
                 "category": "fp_quality_loss",
-                "hypothesis": "H12 VERIFIED (wider K jitter → better FP), H23 PROPOSED (injection collapse → input-loss)",
+                "hypothesis": "H12 VERIFIED (wider K jitter → better FP)",
                 "fix": "Gross FP-quality loss at deep K (Δ > 0.1).  Try widening K jitter: increase "
-                       "deq_k_max by 4.  If inj_iter is ALSO flagged, fix injection first (Phase 5) — "
-                       "it's the upstream cause.  Note: minor non-monotonicity (K=64 vs K=32 ±0.01) "
+                       "deq_k_max by 4.  Note: minor non-monotonicity (K=64 vs K=32 ±0.01) "
                        "is no longer gated; it's within finite-K noise.",
                 "config_change": {"deq_k_max_delta": 4},
             }

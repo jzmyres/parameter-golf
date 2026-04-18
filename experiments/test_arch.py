@@ -12,7 +12,7 @@ def _make_model(**overrides):
     defaults = dict(
         vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
         num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
-        tied_embed_init_std=0.005, logit_softcap=30.0, rope_base=10000.0,
+        tied_embed_init_std=0.005, rope_base=10000.0,
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
         kv_latent_dim=0, num_refinements=1,
     )

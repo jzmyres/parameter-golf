@@ -11,7 +11,8 @@ from train_gpt import Block
 
 
 class TestGateInits(unittest.TestCase):
-    def test_block_global_gate_init_midpoint(self):
+    def test_block_attn_gate_bias_init_zero(self):
+        """Attention gate biases start at 0 → sigmoid(0) = 0.5 (midpoint)."""
         torch.manual_seed(0)
         b = Block(
             dim=64,
@@ -21,12 +22,9 @@ class TestGateInits(unittest.TestCase):
             rope_base=1000.0,
             qk_gain_init=1.5,
         )
-        # Global gate should start unsaturated to preserve gradients.
-        self.assertTrue(hasattr(b, "gg_gate"))
-        self.assertIsNotNone(getattr(b.gg_gate, "bias", None))
-        self.assertAlmostEqual(float(b.gg_gate.bias.detach().float().mean().item()), 0.0, places=6)
+        self.assertTrue(hasattr(b.attn, "gate_bias"))
+        self.assertAlmostEqual(float(b.attn.gate_bias.detach().float().mean().item()), 0.0, places=6)
 
 
 if __name__ == "__main__":
     unittest.main()
-

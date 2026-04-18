@@ -143,7 +143,7 @@ def main():
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         num_experts=args.num_experts, attn_expert_rank=128, mlp_expert_rank=192,
-        rope_base=args.rope_base, logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         router_scoring=args.router_scoring,
         tie_embeddings=args.tie_embeddings,

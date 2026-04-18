@@ -346,6 +346,9 @@ When a feature is removed (e.g., gg_gate, SmearGate, tie_attn_mlp_router), the S
 2. Remove ALL doc references (CLAUDE.md tables, comments saying "removed")
 3. Update ALL tests that assert on the removed feature
 4. `grep -rn` for the removed name across the entire codebase — if any match remains, it's incomplete
+5. Remove ALL tracking infrastructure (fields, methods, aggregation, prescriptions) that recorded values for the removed feature — constant-valued tracking is dead code too
+
+Rationale (incident from 2026-04-18 review): gg_gate and inj_lin were removed but their tracking infrastructure survived (~100 lines), recording constant 1.0 values with zero diagnostic signal. Tautological validation checks on always-1.0 values could never fire.
 
 ### Module Alias Audit Rule
 When replacing N independent modules with a single shared instance (e.g., `attn_router` + `mlp_router` → single `router`):
@@ -357,6 +360,10 @@ Rationale (incident from 2026-04-17 review): iter 35 pooled-router merge created
 
 ### Hot-Path Sync Prohibition
 The training loop (gradient accumulation + optimizer step) MUST NOT contain any `.item()`, `.cpu()`, or Python-scalar branching on GPU tensors. All control flow must use pure-tensor math (e.g., `torch.relu`, `torch.where`). GPU→CPU syncs are only permitted at log sites (guarded by `will_log_train`).
+
+**Verification**: Before committing any training-loop code (especially Lyapunov/regularization): `grep -n '\.item()\|\.cpu()' train_gpt.py` and verify ZERO hits between the `for micro_step` and `train_loss /= grad_accum_steps` lines. Comments claiming "no .item()" are not sufficient — automated grep is the source of truth.
+
+Rationale (incident from 2026-04-18 review): Lyapunov penalty code at line 3037 had a comment "Pure-tensor math — no .item() GPU-CPU syncs" immediately followed by `if scale_t.item() > 0:`. Three more `.item()` syncs were found in the same block. Comments lie, code doesn't.
 
 ### Doc-Code Invariant
 When `opg_doc.tex` describes an algorithm and `train_gpt.py` implements a different (better) variant, the doc MUST note the deviation in a "Practical implementation" paragraph. The pseudocode represents the theoretical formulation; the implementation note is the source of truth for code.
