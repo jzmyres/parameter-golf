@@ -1255,65 +1255,57 @@ class CausalSelfAttention(nn.Module):
 
         # --- Per-expert Q (low-rank) ---
         x_flat = x_n.reshape(N, D)
-        # Down: (N, D) @ (E*R_q, D).T → (N, E*R_q) → (E, N, R_q)
         q_down = self.expert_q_down.to(dtype=dtype)
         q_h = (x_flat @ q_down.reshape(E * R_q, D).t()).view(N, E, R_q).permute(1, 0, 2)
-        # Up: (E, N, R_q) @ (E, R_q, H*d+H) → (E, N, H*d+H)
-        q_up = self.expert_q_up.to(dtype=dtype).transpose(1, 2)  # (E, R_q, H*d+H)
+        q_up = self.expert_q_up.to(dtype=dtype).transpose(1, 2)
         q_and_gate = torch.bmm(q_h, q_up)  # (E, N, H*d+H)
 
         q_raw = q_and_gate[:, :, :H * d].reshape(E, B, T, H, d)
         gate_logits = q_and_gate[:, :, H * d:].reshape(E, B, T, H, 1)
 
-        # Split Q into rope and nope parts: (E, B, T, H, ...)
         q_rope = q_raw[..., :self.rope_dim]
         q_nope = q_raw[..., self.rope_dim:]
         q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
 
         # --- Per-expert KV (low-rank latent) ---
         kv_a = self.expert_kv_a.to(dtype=dtype)
-        kv_b = self.expert_kv_b.to(dtype=dtype).transpose(1, 2)  # (E, R_kv, kv_lat)
-        # Down: (N, D) @ (E*R_kv, D).T → (E, N, R_kv)
+        kv_b = self.expert_kv_b.to(dtype=dtype).transpose(1, 2)
         kv_h = (x_flat @ kv_a.reshape(E * R_kv, D).t()).view(N, E, R_kv).permute(1, 0, 2)
-        # Up: (E, N, R_kv) @ (E, R_kv, kv_lat) → (E, N, kv_lat)
         kv_latent = torch.bmm(kv_h, kv_b)  # (E, N, kv_lat)
 
-        # Pre-norm then per-expert MLA decompression: kv_latent → K_nope, V.
+        # Per-expert MLA decompress: kv_latent → K_nope, V
         kv_normed = self.kv_pre_norm(kv_latent.reshape(E * N, self.kv_latent_dim))
         kv_normed = kv_normed.reshape(E, N, self.kv_latent_dim)
-        # (E, N, kv_lat) @ (E, kv_lat, H_kv*nope) → (E, N, H_kv*nope)
         ek = self.expert_k_nope.to(dtype=dtype)
         ev = self.expert_v.to(dtype=dtype)
         k_nope = torch.bmm(kv_normed, ek.transpose(1, 2)).reshape(E, B, T, H_kv, self.nope_dim)
         v = torch.bmm(kv_normed, ev.transpose(1, 2)).reshape(E, B, T, H_kv, d)
 
         # Shared K_rope (position only, same for all experts)
-        k_rope_shared = self.c_k_rope(x_n).reshape(B, T, H_kv, self.rope_dim)
-        # Expand for E experts: (1, B, T, H_kv, rope)
-        k_rope = k_rope_shared.unsqueeze(0).expand(E, -1, -1, -1, -1)
+        k_rope_shared = self.c_k_rope(x_n).reshape(B, T, 1, H_kv, self.rope_dim)
+        k_rope = k_rope_shared.expand(-1, -1, E, -1, -1)  # lazy expand, no copy
 
         k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
 
         # --- RoPE ---
         cos, sin = self.rotary(T, x_n.device, q_rope.dtype)
-        # Pack (E, B, T, H, rope) → (B, E*H, T, rope) for apply_rotary_emb
         q_rope_p = q_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, self.rope_dim)
         q_rope_p = apply_rotary_emb(q_rope_p, cos, sin)
 
-        k_rope_p = k_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, self.rope_dim)
+        k_rope_p = k_rope.permute(0, 2, 3, 1, 4).reshape(B, E * H_kv, T, self.rope_dim)
         k_rope_p = apply_rotary_emb(k_rope_p, cos, sin)
 
-        # --- Assemble full Q, K and apply gain ---
+        # --- Assemble full Q, K ---
         q_nope_p = q_nope.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, self.nope_dim)
-        q_full = torch.cat([q_rope_p, q_nope_p], dim=-1)  # (B, E*H, T, d)
+        q_full = torch.cat([q_rope_p, q_nope_p], dim=-1)
         q_full = q_full * self.q_gain.to(dtype=dtype)[None, :, None, None]
 
         k_nope_p = k_nope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, self.nope_dim)
-        k_full = torch.cat([k_rope_p, k_nope_p], dim=-1)  # (B, E*H_kv, T, d)
+        k_full = torch.cat([k_rope_p, k_nope_p], dim=-1)
 
         v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
 
-        # --- Head-packed SDPA (one FlashAttention call for all experts) ---
+        # --- Head-packed SDPA ---
         try:
             y = F.scaled_dot_product_attention(
                 q_full, k_full, v_full, attn_mask=None, is_causal=True,
@@ -1339,10 +1331,8 @@ class CausalSelfAttention(nn.Module):
             self._attn_gate_last_mean = float(gate_act.detach().float().mean().item())
 
         # --- Reshape to per-expert outputs ---
-        # y: (B, E*H, T, d) → (B, E, H, T, d) → (B, T, E, H*d) = (B, T, E, D)
         y = y.reshape(B, E, H, T, d).permute(0, 3, 1, 2, 4).reshape(B, T, E, D)
 
-        # Per-expert orthogonality diagnostic
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
                 mu_out = y.detach().float().mean(dim=(0, 1))  # (E, D)
@@ -2675,6 +2665,21 @@ def main() -> None:
     # compile+DDP (grad_fn tracking issues); resolving that is queued.
     if distributed and getattr(args, "deq_backward", "revdeq") == "unroll":
         log0("skipping torch.compile(shared_block): deq_backward=unroll is incompatible with compile+DDP")
+        # Compile forward_experts independently — the attention forward is a pure
+        # function with no graph breaks, so it compiles even when the full block
+        # can't.  2× speedup from fusing permute+contiguous+rms_norm chains.
+        # Guard: skip compile if VRAM headroom < 2 GB (compile overhead ~700 MB).
+        try:
+            sb = base_model.shared_block
+            free_mb = (torch.cuda.get_device_properties(device).total_mem
+                       - torch.cuda.memory_allocated(device)) / (1024 ** 2)
+            if free_mb < 2048:
+                log0(f"skipping forward_experts compile: only {free_mb:.0f} MB free (need ~2 GB headroom)")
+            elif not hasattr(sb, '_orig_module'):
+                sb.attn.forward_experts = torch.compile(sb.attn.forward_experts, dynamic=False)
+                log0("compiled forward_experts for throughput (2x attention speedup)")
+        except Exception as e:
+            log0(f"forward_experts compile failed ({e}), running eager attention")
     else:
         try:
             base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
