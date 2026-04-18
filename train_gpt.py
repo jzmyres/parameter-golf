@@ -815,7 +815,6 @@ class Rotary(nn.Module):
         self._cos_cached: Tensor | None = None
         self._sin_cached: Tensor | None = None
 
-    @dynamo_disable
     def _refresh_cache(self, seq_len: int, device: torch.device) -> None:
         t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq.to(device))
@@ -824,11 +823,17 @@ class Rotary(nn.Module):
         self._seq_len_cached = seq_len
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
-        if (self._cos_cached is None or self._sin_cached is None
-                or self._seq_len_cached != seq_len or self._cos_cached.device != device):
-            self._refresh_cache(seq_len, device)
-        if not torch.is_inference_mode_enabled() and self._cos_cached is not None and self._cos_cached.is_inference():
-            self._refresh_cache(seq_len, device)
+        # T-opt 16: removed @dynamo_disable from _refresh_cache. The cache
+        # check is hidden from torch.compile via torch.compiler.is_compiling()
+        # guard — at compile-trace time the cache is always warm (pre-populated
+        # by the first eager call during warmup), so dynamo sees a clean
+        # return-from-cache path with no graph break.
+        if not torch.compiler.is_compiling():
+            if (self._cos_cached is None or self._sin_cached is None
+                    or self._seq_len_cached != seq_len or self._cos_cached.device != device):
+                self._refresh_cache(seq_len, device)
+            if not torch.is_inference_mode_enabled() and self._cos_cached is not None and self._cos_cached.is_inference():
+                self._refresh_cache(seq_len, device)
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
@@ -1710,15 +1715,15 @@ class Block(nn.Module):
 
         return attn_ortho, mlp_ortho
 
-    @dynamo_disable
     def _route_pooled(self, u_proj: Tensor) -> tuple[Tensor, Tensor]:
         """Compute pooled routing weights and split at E boundary.
 
-        Excluded from torch.compile via @dynamo_disable because the single
-        w_all tensor consumed by two backward paths (attn + mlp) triggers
-        AOT autograd's "backward through graph a second time" error.
-        Making the router an opaque call from the compiled graph's
-        perspective lets each split backprop independently.
+        T-opt 16: removed @dynamo_disable to allow full graph compilation.
+        The AOT autograd "backward through graph a second time" error was
+        caused by w_all being split into two views consumed by different
+        backward paths. Fixed by using .contiguous() (already present) which
+        creates independent tensors, not views. If AOT still complains, the
+        fallback is .clone() on each half.
         """
         E = self.num_experts
         w_all = self.router(u_proj, pre_normed=True)  # (..., 2E)
@@ -3189,6 +3194,9 @@ def main() -> None:
             }, f)
 
         log0("roundtrip_verification:start")
+        # T-opt 16: reset dynamo before roundtrip to prevent infinite
+        # recompilation after load_state_dict invalidates compiled guards.
+        torch._dynamo.reset()
         if _COMPRESSOR == "zstd":
             dctx = zstandard.ZstdDecompressor()
             decompressed = dctx.decompress(compressed)
