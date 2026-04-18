@@ -190,11 +190,11 @@ class Hyperparameters:
     #   2 forwards per DEQ iter but CANNOT compile (breaks autograd chaining).
     #   Also needs 4× grad_accum for VRAM, reducing effective throughput.
     # Net: revdeq+compile > unroll+eager on 64-head independent expert MLA.
-    # "revdeq" on H100 (80 GB): enables torch.compile → 45% block speedup.
-    # "unroll" on L40S (44 GB): compile doesn't fit, but 2K calls < 4K calls.
-    # RevDEQ OOMs on L40S with 64-head attention even at B=8 (43.7/44.4 GB).
-    # Unroll+TBPTT(4) is the only config that fits on L40S.
-    deq_backward = "unroll"
+    # RevDEQ is the default: O(1) backward memory (4.4 GB peak at B=8) vs
+    # unroll's O(K) autograd graph (43.7 GB, OOMs on L40S with 64 heads).
+    # Sub-module compile (forward_experts + mix_experts) gives 2× attn + 1.5×
+    # MLP speedup.  Full shared_block compile needs ≥60 GB (H100 only).
+    deq_backward = "revdeq"
     # iter 28-tbptt: Truncated BPTT. Backward reconstructs only the last
     # `deq_bptt_k` forward iterations; earlier iters contribute no gradient.
     # 0 (or >= num_layers) = full BPTT.  Rationale: for a contractive DEQ,
@@ -2495,12 +2495,12 @@ def main() -> None:
     # enough to fit in 48 GB L40S per rank.  revdeq's O(1) backward memory
     # means the base grad_accum is fine.
     _base_grad_accum = max(1, math.ceil(8 / world_size))
-    # Note: grad_accum is computed BEFORE auto-select resolves "auto" to a
-    # concrete mode, so use the default (no multiplier) for revdeq/auto.
-    # unroll needs 4× due to O(K) autograd memory; revdeq is O(1).
-    # 64-head independent expert MLA at B=8 uses ~43 GB on L40S regardless of
-    # backward mode. Keep grad_accum 4× for all modes to ensure B=8 micro-batch.
-    grad_accum_steps = _base_grad_accum * 4
+    # RevDEQ O(1) backward memory (peak 4.4 GB at B=8) → use base grad_accum.
+    # Unroll O(K) stores full autograd graph (43+ GB) → needs 4× to shrink B.
+    if getattr(args, "deq_backward", "revdeq") == "unroll":
+        grad_accum_steps = _base_grad_accum * 4
+    else:
+        grad_accum_steps = _base_grad_accum
     global_seqs = args.train_batch_tokens // args.train_seq_len
     while grad_accum_steps > 1 and global_seqs < world_size * grad_accum_steps:
         grad_accum_steps -= 1
@@ -2678,16 +2678,26 @@ def main() -> None:
             args.deq_backward = "unroll"
             log0(f"auto-selected deq_backward=unroll ({_gpu_mem_gb:.0f} GB GPU)")
 
-    if _gpu_mem_gb < 60:
-        log0(f"skipping torch.compile: GPU has {_gpu_mem_gb:.0f} GB (64-head compile needs ~60 GB)")
-    elif distributed and args.deq_backward == "unroll":
+    if distributed and args.deq_backward == "unroll":
         log0("skipping torch.compile: unroll is incompatible with compile+DDP")
-    else:
+    elif _gpu_mem_gb >= 60:
+        # H100 (80 GB): compile full shared_block (maximum fusion)
         try:
             base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
-            log0(f"compiled shared_block (dynamic=False, deq_backward={args.deq_backward})")
+            log0(f"compiled shared_block (dynamic=False, {_gpu_mem_gb:.0f} GB GPU)")
         except Exception as e:
-            log0(f"shared_block compile failed ({e}), running eager")
+            log0(f"shared_block compile failed ({e}), falling back to sub-module compile")
+    # Sub-module compile: forward_experts + mix_experts.  Works with revdeq
+    # because the VJP backward is a single block.forward call (no autograd
+    # chaining across iterations).  2× attn + 1.5× MLP speedup, ~2 GB workspace.
+    if not hasattr(base_model.shared_block, '_orig_module'):  # not already full-compiled
+        sb = base_model.shared_block
+        try:
+            sb.attn.forward_experts = torch.compile(sb.attn.forward_experts, dynamic=False)
+            sb.mlp.mix_experts = torch.compile(sb.mlp.mix_experts, dynamic=False)
+            log0("compiled forward_experts + mix_experts (2× attn, 1.5× MLP)")
+        except Exception as e:
+            log0(f"sub-module compile failed ({e}), running eager")
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False,
