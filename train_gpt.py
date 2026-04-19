@@ -115,7 +115,7 @@ class Hyperparameters:
     seed = 42
 
     val_batch_size = 524_288
-    val_micro_batch_seqs = 8  # cap val micro-batch to match training (B=8), prevents OOM with 64 heads
+    val_micro_batch_seqs = 0  # T-opt 17: 0 = derive from training micro-batch (same B as training)
     val_loss_every = 200
     train_log_every = 100
     auto_plot_on_val = True
@@ -482,11 +482,17 @@ def run_validation(args, model, rank, world_size, device, grad_accum_steps,
     iterations; when None (default) uses args.deq_k_eval."""
     local_batch_tokens = args.val_batch_size // world_size
     local_batch_seqs = max(1, local_batch_tokens // args.train_seq_len)
-    # Cap val micro-batch to match training micro-batch. Without this,
-    # val runs at B=128 which OOMs with 64-head independent expert MLA.
+    # T-opt 17: cap val micro-batch to training micro-batch for robustness.
+    # When val_micro_batch_seqs=0, derive from training config (same B).
+    # Eval uses inference_mode (no backward), so same B is always safe.
     _val_cap = getattr(args, "val_micro_batch_seqs", 0)
     if _val_cap > 0:
         local_batch_seqs = min(local_batch_seqs, _val_cap)
+    else:
+        # Derive: train_batch_tokens / seq_len / (world_size * grad_accum)
+        _train_seqs = args.train_batch_tokens // args.train_seq_len
+        _train_micro = max(1, _train_seqs // (world_size * grad_accum_steps))
+        local_batch_seqs = min(local_batch_seqs, _train_micro)
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     if full_validation or args.eval_batch_seqs <= 0:
         global_seqs = total_seqs
@@ -3192,12 +3198,12 @@ def main() -> None:
 
         log0("roundtrip_verification:start")
         # T-opt 16: run roundtrip + K-sweep in eager mode (no torch.compile).
-        # load_state_dict invalidates compiled guards, causing 13-53 min
-        # recompilation hangs. Roundtrip/K-sweep are one-time diagnostics —
-        # eager is fine. torch._dynamo.reset() clears cached graphs, and
-        # torch._dynamo.config.disable = True prevents any new compilation.
+        # T-opt 17: reset dynamo, load int6 weights, then recompile fresh.
+        # Previous approach (disable compile entirely) made roundtrip slow.
+        # Previous bug: reusing stale compiled graph after load_state_dict
+        # caused 13-53 min recompilation hangs. Fix: reset BEFORE load,
+        # then compile AFTER load on the clean model.
         torch._dynamo.reset()
-        torch._dynamo.config.disable = True
         if _COMPRESSOR == "zstd":
             dctx = zstandard.ZstdDecompressor()
             decompressed = dctx.decompress(compressed)
@@ -3218,13 +3224,22 @@ def main() -> None:
             dist.broadcast(b.data, src=0)
         dist.barrier()
 
+    # T-opt 17: recompile block.forward + MoS head on the freshly-loaded
+    # int6 model. The dynamo reset above cleared stale guards, so this
+    # is a clean compilation (no guard invalidation hang). Fast eval +
+    # compile gives max throughput for roundtrip + K-sweep.
+    sb_rt = _unwrap_compiled_module(base_model.shared_block)
+    sb_rt.forward = torch.compile(sb_rt.forward, dynamic=False)
+    if hasattr(base_model, "mos_head"):
+        base_model.mos_head.forward = torch.compile(base_model.mos_head.forward, dynamic=False)
+
     # All ranks: roundtrip validation sharded across the val set via DDP.
     base_m_for_roundtrip = base_model
     base_m_for_roundtrip._deq_k_override = int(args.deq_k_eval)
     val_loss_q, val_bpb_q = run_validation(
         args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        full_validation=True,
+        full_validation=True,  # full val for accurate roundtrip bpb measurement
     )
     log0(f"roundtrip_verification:done val_loss:{val_loss_q:.4f} val_bpb:{val_bpb_q:.6f}")
 
