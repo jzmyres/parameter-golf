@@ -328,6 +328,33 @@ All other norms inside T_x REMOVED (Q/K norms, hidden_post_norm, sdpa_post_norm)
 **Reference:** Simplified from SSM/Mamba-2 proposal; ELM (ICLR 2026) identity-init finding.
 **Risk:** Medium — adds parameters (compete with 16MB budget), may not help at short training.
 
+### H40: Removing K=4 from jitter set improves deep-K quality — PROPOSED
+**Claim:** K=4 in the jitter set {4,6,10} trains the model to produce useful output in only 4 DEQ iterations. This "shallow convergence" pressure conflicts with deep-K quality (K=64/128), where the model should keep refining. Removing K=4 → {6,10} forces a minimum of 6 iterations, training deeper fixed-point structure.
+**Mechanism:** At K=4 the model learns to "settle" early — gates close, updates vanish by iter 4. This learned early-convergence behavior persists at eval-time K=16/64/128, limiting how much the model benefits from additional iterations. By guaranteeing K≥6, the model must learn to do useful work through at least 6 steps.
+**Evidence:** K=2 curriculum (iter 53) created permanent quality deficit (+0.058-0.122 train_loss gap). If K=2 is catastrophic, K=4 may be mildly harmful. K jitter H12 was VERIFIED with {4,8,12,16}; the benefit came from *breadth* of jitter, but the *floor* was never tested.
+**Test:** Iter 59 — change deq_k_jitter_set from (4,6,10) to (6,10). Compare val_bpb and K-sweep quality.
+**Risk:** Low — K=6 is still shallow enough for fast steps. Throughput may improve slightly (K=4 steps are cheapest but also least useful for training signal).
+**Status:** PROPOSED
+
+### H41: Higher K_max in jitter set improves fixed-point quality — PROPOSED
+**Claim:** The current K_max=10 means the model never trains beyond 10 iterations. At eval K=16 (and K-sweep K=64/128), it extrapolates beyond training distribution. Including K=16 in the jitter set trains the model to benefit from deeper solver runs.
+**Mechanism:** Training at K=16 provides gradient signal for what happens at deeper iterations. The model learns to keep the Jacobian contractive at later iterations (not just the first 10), improving FP quality at all deep-K eval points.
+**Evidence:** H12 showed wider K jitter improves K-sweep (125× improvement in K=8→K=16 gap). Current set {4,6,10} never reaches K=16, yet we evaluate at K=16. The K=8→K=64 residual gap (+0.009 at iter 13) could shrink further with deeper training-time K.
+**Test:** Iter 60 — change deq_k_jitter_set from (6,10) to (6,10,16). Compare K-sweep quality at K=64/128.
+**Risk:** Medium — K=16 steps cost 60% more wall-clock than K=10. Fewer total steps per run. Net effect depends on whether per-step quality gain outweighs step count loss.
+**Status:** PROPOSED
+
+### H42: MLA block pre-conditioning gives better z0 than conv1d — PROPOSED
+**Claim:** An MLA attention block run ONCE before the DEQ loop gives z0 full-sequence context, placing it closer to z* than a conv1d(k=4) which only captures local temporal patterns. Since MLA is already implemented, this reuses existing infrastructure.
+**Mechanism:** x0 = MLA_precond(tok_emb + bigram). Single attention pass → z0 has global context → DEQ solver starts closer to fixed point → fewer effective iterations needed.
+**Comparison:** Conv1d(k=4) captures 4-token local context. MLA captures full-sequence attention context. Both run ONCE outside the DEQ loop, so overhead is 1/K of per-iteration cost.
+**Trade-offs:**
+- MLA: more expensive (~20ms compiled for one block), adds parameters (expert Q/K/V/O projections), but maximally expressive z0.
+- Conv1d: cheaper (~1ms), minimal parameters (k×dim), but only local context.
+- Could share the DEQ block's MLA weights (zero new params) or use a smaller dedicated MLA.
+**Risk:** Additional VRAM for pre-conditioning attention. Parameter budget may be tight with a separate MLA block.
+**Status:** PROPOSED
+
 ### H27: Injection from refinement soft-embed during DEQ solve
 **Claim:** Currently `x0_refined` (soft embedding from prior refinement step) only initializes `z0`. Injecting it during the DEQ solve (as a second input signal alongside raw `x0`) gives the solver access to denoised context throughout.
 **Mechanism:** `x = z_in + g_inj * x0 + g_ref * x0_refined` with a separate gate for the refinement signal. At refinement step 0 (no prior prediction), `x0_refined = x0` so it reduces to current behavior.
@@ -523,15 +550,18 @@ failure.
 |---|---|---|---|---|---|---|
 | 48 | β=0.7 fixed | Higher β for faster convergence | H36 | **FAILED** (high recon_err, worker crash) | — | — |
 | 49 | β jitter {0.3,0.5,0.7} | Per-step β sampling (K-jitter analog) | H35 ✅ | **KEPT** (K128 Δ=0.000, 8× tighter) | 2.1149 | **0.000** |
-| 50 | Hutchinson Jacobian reg | Replace Lyapunov power-iter with random VJP | Bai 2021 | **RUNNING** (1.5hr) | TBD | TBD |
-| 51 | DeepSeek shared expert | 1 shared + 7 routed (always-on universal expert) | H37 | Queued | — | — |
-| 52 | KV latent subspace ortho | Penalize off-diag ||W_i^T W_j||_F on KV down-proj | H38 | Queued | — | — |
-| 53 | K curriculum | Shallow K early → deep K late | DEQ practices | Queued | — | — |
-| 54 | Avg FP warm start | Init z0 from previous batch z* | Efficient DEQ 2025 | Queued | — | — |
-| 55 | Denoising regularization | ||f(z*+ε,x0) - z*||² post-convergence | HyDRA 2026 | Queued | — | — |
+| 50 | Hutchinson Jacobian reg | Replace Lyapunov power-iter with random VJP | Bai 2021 | **KEPT** (smoother contraction) | 1.8673 | 0.000 |
+| 51 | DeepSeek shared expert | 1 shared + 7 routed (always-on universal expert) | H37 | **KEPT** (-0.009 val_bpb) | 1.8651 | 0.000 |
+| 52 | KV latent subspace ortho | Penalize off-diag cosine on KV down-proj | H38 | **PROMOTED ★** (baseline) | 1.8651 | 0.000 |
+| 53 | K curriculum | Shallow K early → deep K late | DEQ practices | **REVERTED** (K=2 too aggressive, permanent deficit) | 1.875 | — |
+| 54 | Avg FP warm start | Init z0 from previous batch z* | Efficient DEQ 2025 | **REVERTED** (neutral, +0.002) | 1.867 | — |
+| 55 | Denoising regularization | ||f(z*+ε,x0) - z*||² post-convergence | HyDRA 2026 | **PROMOTED ★** (val_bpb -0.042, near-perfect FP) | 1.8236 | +0.0004 |
 | 56 | Causal conv1d pre-conditioning | Conv1d(k=4) before DEQ for temporal z0 | H39 (simplified SSM) | Queued | — | — |
 | 57 | Anderson accel (eval only) | 2-8× eval speedup, K-sweep quality | arXiv:2410.19460 | Queued | — | — |
 | 58 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 59 | K jitter: drop K=4 | Remove K=4 from {4,6,10} → {6,10}. Shallow K trains model to converge early, reducing deep-K quality | H40 | Queued | — | — |
+| 60 | K jitter: raise K_max | Raise set to {6,10,16} or {8,12,16}. Higher K_max forces model to benefit from deeper solver | H41 | Queued | — | — |
+| 61 | MLA block pre-conditioning | Replace conv1d with MLA attention block for z0 init (full-seq context vs local k=4) | H42 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
