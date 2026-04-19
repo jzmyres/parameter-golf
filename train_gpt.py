@@ -117,7 +117,7 @@ class Hyperparameters:
     val_batch_size = 524_288
     val_micro_batch_seqs = 0  # T-opt 17: 0 = derive from training micro-batch (same B as training)
     val_loss_every = 200
-    train_log_every = 100
+    train_log_every = 10  # log every 10 steps (~85s at 8.5s/step) for better progress visibility
     auto_plot_on_val = True
 
     iterations = 1_000_000_000  # governed by wallclock
