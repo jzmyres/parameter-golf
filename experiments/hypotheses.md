@@ -295,6 +295,39 @@ All other norms inside T_x REMOVED (Q/K norms, hidden_post_norm, sdpa_post_norm)
 **Compatibility:** Fully compatible with RevDEQ (see "Key insight"). Also compatible with Muon optimizer (operates on gradients, unaffected by forward-time lattice projection).
 **Test:** Queued for late-stage exploration (after Phase 5 injection work + Phase 4.5/4.6). Could potentially replace int6+zstd entirely.
 
+### H35: β jitter improves K=128 extrapolation — VERIFIED (2026-04-19)
+**Claim:** Training at varying β per step forces the model to learn solver-agnostic convergence.
+**Test:** Iter 49 — sample β from {0.3, 0.5, 0.7} per step (like K-jitter H12).
+**Evidence:** K=128 Δ collapsed from 0.008 (fixed β=0.5) to **0.000** (β jitter). val_bpb unchanged (2.1149 both). Near-perfect FP convergence across all K.
+**Status:** ✅ VERIFIED — β jitter is now permanent (like K-jitter).
+**Implication:** H30 confirmed. β jitter and K-jitter are complementary regularizers — both should remain active.
+
+### H36: Fixed β=0.7 breaks RevDEQ reconstruction — VERIFIED (2026-04-19)
+**Claim:** Higher β amplifies RevDEQ reconstruction error via 1/(1-β) factor.
+**Test:** Iter 48 — fixed β=0.7 (was 0.5).
+**Evidence:** deq_recon_err=1.205 (vs 0.886 at β=0.5). Workers crashed silently after step 100. Reconstruction divides by (1-β)=0.3, amplifying errors 3.33× vs 2× at β=0.5.
+**Status:** ✅ VERIFIED — fixed high β is incompatible with RevDEQ. β jitter (H35) is the safe approach.
+
+### H37: DeepSeek shared expert improves expert specialization — PROPOSED
+**Claim:** Dedicating 1-2 of 8 experts as always-on (g=1, bypass routing) offloads universal patterns, freeing routed experts for specialization.
+**Mechanism:** T_θ = x0 + E_shared(h) + Σ w_j E_routed_j(h). Shared expert handles common transformations every iteration; routed experts specialize.
+**Expected:** Lower attn_ortho (better expert diversity), potentially better val_bpb from more efficient capacity allocation.
+**Reference:** DeepSeek-V3 (arXiv:2401.06066)
+**Risk:** Low — routing-only change, zero param increase, easily reversible.
+
+### H38: KV latent subspace orthogonalization — PROPOSED
+**Claim:** Penalizing off-diagonal Frobenius norms of expert KV down-projection interaction matrix guarantees distinct latent subspaces.
+**Mechanism:** G_ij = ||W_i^T W_j||_F for i≠j; penalty = ||G_offdiag||²_F. Forces expert KV compressions to be orthogonal in weight space.
+**Expected:** Structural guarantee of expert diversity (vs current output-level ortho which depends on input distribution).
+**Risk:** Low — training-time penalty only, no inference cost.
+
+### H39: Causal conv1d pre-conditioning improves z0 quality — PROPOSED
+**Claim:** A lightweight causal conv1d (kernel=4) after embedding provides local temporal context, placing z0 closer to the fixed point and reducing effective K needed.
+**Mechanism:** x0 = RMSNorm(conv1d(tok_emb + bigram)). Runs OUTSIDE DEQ loop, one-time per forward.
+**Expected:** Faster DEQ convergence (fewer iterations to reach ε tolerance). Could enable reducing K_max.
+**Reference:** Simplified from SSM/Mamba-2 proposal; ELM (ICLR 2026) identity-init finding.
+**Risk:** Medium — adds parameters (compete with 16MB budget), may not help at short training.
+
 ### H27: Injection from refinement soft-embed during DEQ solve
 **Claim:** Currently `x0_refined` (soft embedding from prior refinement step) only initializes `z0`. Injecting it during the DEQ solve (as a second input signal alongside raw `x0`) gives the solver access to denoised context throughout.
 **Mechanism:** `x = z_in + g_inj * x0 + g_ref * x0_refined` with a separate gate for the refinement signal. At refinement step 0 (no prior prediction), `x0_refined = x0` so it reduces to current behavior.
@@ -479,6 +512,28 @@ failure.
 | 45 | **lyapunov-full** | Full doc alignment: SwiGLU + standard SDPA + NormedLinear (kv_pre_norm, expert_h_pre_norm) + Lyapunov boundary VJP penalty (surrogate loss, EMA μ=0.9, outside compiled graph, donated_buffer=False). Q/K rms_norm restored (removing crashes AOTAutograd). **Best val_bpb yet.** | §3-4 (Lyapunov) | **PROMOTED ★ (commit `2d71a79`)** | **2.1376** (fast@200, -0.03 vs baseline) | TBD |
 | 46 | **independent-expert-MLA** | Replace shared SDPA + expert output banks with full per-expert MLA pipeline: per-expert low-rank Q (dim→rank→H*d+H), per-expert low-rank KV compression (dim→kv_rank→kv_latent), per-expert KV decompression (kv_latent→K_nope,V — independent dicts), shared K_rope. Head-packed SDPA with E×H=64 Q heads, E×H_kv=32 KV heads, single FlashAttention call. Net -440K params. **Massive val_bpb improvement.** OOM during roundtrip verification (43GB/44.4GB VRAM) — tech debt. | §3.4 | **PROMOTED ★ (commit `cb6fd63`)** | **1.7806** (-0.357 vs iter45=2.1376, -16.7%) | TBD |
 | 47 | **fully-independent-experts** | Zero shared trainable params in expert path: per-expert K_rope (low-rank kr_rank=32), per-expert KV/MLP norm weights, per-expert Wo output proj (low-rank wo_rank=64). RevDEQ default + block.forward compile (2× speedup). Diagnostics fixed: pooled router dedup, per-type min_share=0.6/E, ortho gate=0.5. K-sweep true FP gate (K=64,128 non-degradation). +1.04M params. Step-matched at 709 steps (2h wallclock). Peak VRAM 22.3 GB (vs 42.9 GB with unroll). Expert independence is HARD CONSTRAINT. | §2,§3 | **PROMOTED ★ (commit `b1565a7`)** | **1.8243** (709 steps, +0.044 vs iter46@722 steps) | TBD |
+
+### Phase 9: DEQ Architecture Improvements (2026-04-19 — ACTIVE)
+
+**Sources:** DEQ literature survey (Bai 2021, Efficient DEQ 2025, HyDRA 2026, DeltaDEQ NeurIPS 2024, ELM ICLR 2026) + user proposals (DeepSeek shared expert, SSM pre-conditioning, KV latent ortho).
+
+**Training budget:** 1.5hr wallclock (5400s) for convergence. Post-warmup step_avg ~8,500ms.
+
+| # | Iter | Change | Hypothesis | Status | val_bpb | K=128 Δ |
+|---|---|---|---|---|---|---|
+| 48 | β=0.7 fixed | Higher β for faster convergence | H36 | **FAILED** (high recon_err, worker crash) | — | — |
+| 49 | β jitter {0.3,0.5,0.7} | Per-step β sampling (K-jitter analog) | H35 ✅ | **KEPT** (K128 Δ=0.000, 8× tighter) | 2.1149 | **0.000** |
+| 50 | Hutchinson Jacobian reg | Replace Lyapunov power-iter with random VJP | Bai 2021 | **RUNNING** (1.5hr) | TBD | TBD |
+| 51 | DeepSeek shared expert | 1 shared + 7 routed (always-on universal expert) | H37 | Queued | — | — |
+| 52 | KV latent subspace ortho | Penalize off-diag ||W_i^T W_j||_F on KV down-proj | H38 | Queued | — | — |
+| 53 | K curriculum | Shallow K early → deep K late | DEQ practices | Queued | — | — |
+| 54 | Avg FP warm start | Init z0 from previous batch z* | Efficient DEQ 2025 | Queued | — | — |
+| 55 | Denoising regularization | ||f(z*+ε,x0) - z*||² post-convergence | HyDRA 2026 | Queued | — | — |
+| 56 | Causal conv1d pre-conditioning | Conv1d(k=4) before DEQ for temporal z0 | H39 (simplified SSM) | Queued | — | — |
+| 57 | Anderson accel (eval only) | 2-8× eval speedup, K-sweep quality | arXiv:2410.19460 | Queued | — | — |
+| 58 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+
+**Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
 **Promotion rule — carry-forward on no-significant-degradation (user direction 2026-04-16):**
 
