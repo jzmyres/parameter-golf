@@ -3197,13 +3197,12 @@ def main() -> None:
             }, f)
 
         log0("roundtrip_verification:start")
-        # T-opt 16: run roundtrip + K-sweep in eager mode (no torch.compile).
-        # T-opt 17: reset dynamo, load int6 weights, then recompile fresh.
-        # Previous approach (disable compile entirely) made roundtrip slow.
-        # Previous bug: reusing stale compiled graph after load_state_dict
-        # caused 13-53 min recompilation hangs. Fix: reset BEFORE load,
-        # then compile AFTER load on the clean model.
+        # T-opt 17: run roundtrip + K-sweep in EAGER mode. torch.compile
+        # after load_state_dict crashes silently (inductor segfault — tested
+        # stale-guard reuse, compile-fresh, and dynamo.config.disable).
+        # Eager with B=64 val batches is reliable and fast enough.
         torch._dynamo.reset()
+        torch._dynamo.config.disable = True
         if _COMPRESSOR == "zstd":
             dctx = zstandard.ZstdDecompressor()
             decompressed = dctx.decompress(compressed)
@@ -3224,14 +3223,10 @@ def main() -> None:
             dist.broadcast(b.data, src=0)
         dist.barrier()
 
-    # T-opt 17: recompile block.forward + MoS head on the freshly-loaded
-    # int6 model. The dynamo reset above cleared stale guards, so this
-    # is a clean compilation (no guard invalidation hang). Fast eval +
-    # compile gives max throughput for roundtrip + K-sweep.
-    sb_rt = _unwrap_compiled_module(base_model.shared_block)
-    sb_rt.forward = torch.compile(sb_rt.forward, dynamic=False)
-    if hasattr(base_model, "mos_head"):
-        base_model.mos_head.forward = torch.compile(base_model.mos_head.forward, dynamic=False)
+    # T-opt 17: run roundtrip + K-sweep in eager mode. torch.compile after
+    # load_state_dict crashes silently during inductor compilation (both
+    # stale-guard reuse and compile-fresh approaches fail). Eager mode is
+    # reliable and fast enough with B=64 val batches for a one-time diagnostic.
 
     # All ranks: roundtrip validation sharded across the val set via DDP.
     base_m_for_roundtrip = base_model
