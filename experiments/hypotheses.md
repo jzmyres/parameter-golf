@@ -379,6 +379,13 @@ If r=192 and H_r=4 heads per expert, that's 32 query heads total — single Flas
 **Difference from current low-rank:** Current design uses low-rank WITHIN each linear layer
 (D→rank→D), but attention and MLP intermediate tensors are still D-dimensional. This
 proposal puts the entire expert computation in a lower dimension.
+**Unlocks model_dim scaling:** With expert compute at dim r (independent of D), increasing
+model_dim from 768→1024 costs only +33% on down/up projections (linear matmuls) while
+SDPA and MLP costs stay constant. Net: ~33% more mixing expressiveness at negligible
+throughput degradation. Binding constraint becomes 16MB artifact budget, not compute.
+**Pre-conditioning residual:** All pre-conditioning variants (conv1d, MLA, low-rank experts)
+MUST preserve residual to raw token embedding: x0 = precond(x) + x. The raw embedding
+is the identity signal that x0 falls back to when pre-conditioning is unhelpful.
 **Risk:** Medium — significant architectural change. Head-packed SDPA needs validation at
 smaller head dim. Per-expert expressiveness decreases (compensated by aggregate rank).
 **Status:** PROPOSED
@@ -590,7 +597,8 @@ failure.
 | 59 | K jitter: raise K_max to 32 | {6,10,32} with TBPTT=4. Deep K trains true FP; TBPTT keeps backward O(4) | H41 | Queued | — | — |
 | 60 | Full-rank MLA pre-cond | Replace conv1d with full MLA block for z0 (DeepSeek non-MoE layer) | H42 | Queued | — | — |
 | 61 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
-| 62 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 62 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 61) | — | — |
+| 63 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
