@@ -2616,30 +2616,11 @@ def main() -> None:
     k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max, k_rng,
                                     step=int(args.deq_k_step),
                                     values=list(_k_jitter_set) if _k_jitter_set else None)
-    # Phase 9 iter 53: K curriculum — shallow early, deep late.
-    # Early training: model is far from any useful FP, deep K wastes compute.
-    # Late training: deeper K refines FP quality for better convergence.
-    _k_curriculum_samplers = {
-        "early": KShuffleBagSampler(2, 6, random.Random(args.seed + 100), values=[2, 4, 6]),
-        "mid":   k_sampler,  # reuse default {4, 6, 10}
-        "late":  KShuffleBagSampler(6, 16, random.Random(args.seed + 200), values=[6, 10, 16]),
-    }
-    _k_curriculum_enabled = True  # iter 53
 
-    def deq_k_for_step(step_i: int, time_frac: float = 0.0) -> int:
+    def deq_k_for_step(step_i: int) -> int:
         k = 0
         if rank == 0:
-            if not args.deq_k_jitter:
-                k = int(args.deq_k_max)
-            elif _k_curriculum_enabled:
-                if time_frac < 0.30:
-                    k = int(_k_curriculum_samplers["early"].sample())
-                elif time_frac < 0.70:
-                    k = int(_k_curriculum_samplers["mid"].sample())
-                else:
-                    k = int(_k_curriculum_samplers["late"].sample())
-            else:
-                k = int(k_sampler.sample())
+            k = int(k_sampler.sample()) if args.deq_k_jitter else int(args.deq_k_max)
         if distributed:
             k_t = torch.tensor([k], device=device, dtype=torch.int64)
             dist.broadcast(k_t, src=0)
@@ -2999,7 +2980,7 @@ def main() -> None:
             args.train_log_every > 0
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
-        base_model._deq_k_override = deq_k_for_step(next_step, time_frac=time_frac)
+        base_model._deq_k_override = deq_k_for_step(next_step)
         # Phase 9 iter 49: β jitter — set per-step β (same for all micro-steps).
         base_model.deq_beta = deq_beta_for_step(next_step)
 
