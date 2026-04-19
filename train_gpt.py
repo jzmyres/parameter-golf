@@ -183,6 +183,11 @@ class Hyperparameters:
     lyapunov_coef = 0.01       # λ_jac: weight of hinge penalty (small: ~1% of task loss)
     lyapunov_gamma = 0.9       # γ: target spectral radius (< 1)
     lyapunov_warmup_frac = 0.05 # T-opt 20: shorter warmup (10%→5%) — penalty near zero during warmup anyway
+    # Phase 9 iter 55: Denoising regularization (HyDRA 2026, Efficient DEQ 2025).
+    # ||f(z*+ε, x0) - z*||² penalizes contraction failure at finite perturbation.
+    # Complements Hutchinson (which penalizes ||J||²_F at infinitesimal scale).
+    denoising_coef = 0.01      # weight of denoising loss
+    denoising_noise_std = 0.01 # σ: Gaussian noise scale added to z*
 
     # DEQ solver
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
@@ -3047,6 +3052,20 @@ def main() -> None:
                         u_b2 = blk(z_b2, x0_lyap)
                         surrogate = (u_b2 * v_dir).sum().abs()
                         loss = loss + lyap_scale * lyap_coef * scale_val * surrogate
+
+                # Phase 9 iter 55: Denoising regularization (HyDRA 2026).
+                # ||f(z*+ε, x0) - z*||² at finite perturbation complements
+                # Hutchinson's infinitesimal Jacobian penalty. If contraction
+                # holds, one step from z*+ε should land closer to z*.
+                dn_coef = float(args.denoising_coef)
+                if dn_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
+                    blk_dn = sb
+                    dn_std = float(args.denoising_noise_std)
+                    eps_noise = torch.randn_like(z_star) * dn_std
+                    z_noisy = z_star.detach() + eps_noise
+                    f_noisy = blk_dn(z_noisy, x0_lyap)
+                    dn_loss = (f_noisy - z_star.detach()).float().pow(2).mean()
+                    loss = loss + lyap_scale * dn_coef * dn_loss
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
