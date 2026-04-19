@@ -2992,10 +2992,8 @@ def main() -> None:
                 lyap_skip = micro_step < grad_accum_steps - 1  # only last micro-step
                 if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
                     blk = sb
-                    # Random Rademacher probe vector (±1, unbiased Hutchinson estimator)
+                    # Hutchinson-Frobenius: random Rademacher probe (±1)
                     v_hutch = torch.randint(0, 2, z_star.shape, device=z_star.device, dtype=z_star.dtype) * 2.0 - 1.0
-                    # Forward #1: VJP for Hutchinson estimate (no create_graph —
-                    # torch.compile doesn't support double backward)
                     z_b = z_star.detach().requires_grad_(True)
                     u_b = blk(z_b, x0_lyap)
                     jvp = torch.autograd.grad(
@@ -3003,15 +3001,19 @@ def main() -> None:
                         create_graph=False, retain_graph=False,
                     )[0]
                     # ||J^T v||² / dim ≈ ||J||²_F / dim (Hutchinson estimator)
-                    jac_frob_sq_per_dim = jvp.detach().float().pow(2).mean()
-                    gamma_sq = float(base_model.lyapunov_gamma) ** 2
-                    rho_est = float(jac_frob_sq_per_dim.sqrt().item())
-                    base_model._lyapunov_rho_hat = rho_est
-                    # Surrogate loss: forward #2 with v_dir (same pattern as old Lyapunov)
-                    scale_val = max(rho_est - float(base_model.lyapunov_gamma), 0.0) / max(rho_est, 1e-8)
+                    rho_sample = float(jvp.detach().float().pow(2).mean().sqrt().item())
+                    # EMA smoothing to reduce variance of random probe estimates.
+                    # Without this, noisy high estimates trigger large surrogate
+                    # losses that destabilize training (observed: silent crash).
+                    prev_rho = float(getattr(base_model, '_lyapunov_rho_hat', rho_sample))
+                    rho_ema = 0.9 * prev_rho + 0.1 * rho_sample
+                    base_model._lyapunov_rho_hat = rho_ema
+                    # Surrogate loss only when EMA(ρ̂) > γ (stable signal)
+                    gamma = float(base_model.lyapunov_gamma)
+                    scale_val = max(rho_ema - gamma, 0.0) / max(rho_ema, 1e-8)
                     if scale_val > 0.0:
                         v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
-                        z_b2 = z_star.detach()  # no requires_grad — grad flows to θ only
+                        z_b2 = z_star.detach()
                         u_b2 = blk(z_b2, x0_lyap)
                         surrogate = (u_b2 * v_dir).sum().abs()
                         loss = loss + lyap_scale * lyap_coef * scale_val * surrogate
