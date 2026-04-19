@@ -336,12 +336,13 @@ All other norms inside T_x REMOVED (Q/K norms, hidden_post_norm, sdpa_post_norm)
 **Risk:** Low — K=6 is still shallow enough for fast steps. Throughput may improve slightly (K=4 steps are cheapest but also least useful for training signal).
 **Status:** PROPOSED
 
-### H41: Higher K_max in jitter set improves fixed-point quality — PROPOSED
-**Claim:** The current K_max=10 means the model never trains beyond 10 iterations. At eval K=16 (and K-sweep K=64/128), it extrapolates beyond training distribution. Including K=16 in the jitter set trains the model to benefit from deeper solver runs.
-**Mechanism:** Training at K=16 provides gradient signal for what happens at deeper iterations. The model learns to keep the Jacobian contractive at later iterations (not just the first 10), improving FP quality at all deep-K eval points.
-**Evidence:** H12 showed wider K jitter improves K-sweep (125× improvement in K=8→K=16 gap). Current set {4,6,10} never reaches K=16, yet we evaluate at K=16. The K=8→K=64 residual gap (+0.009 at iter 13) could shrink further with deeper training-time K.
-**Test:** Iter 60 — change deq_k_jitter_set from (6,10) to (6,10,16). Compare K-sweep quality at K=64/128.
-**Risk:** Medium — K=16 steps cost 60% more wall-clock than K=10. Fewer total steps per run. Net effect depends on whether per-step quality gain outweighs step count loss.
+### H41: K=32 in jitter set with TBPTT trains true FP — PROPOSED
+**Claim:** The current K_max=10 means the model never trains beyond 10 iterations. At eval K=16+ it extrapolates beyond training distribution. Including K=32 in the jitter set trains the model to optimize the true fixed point, not partial convergence states.
+**Mechanism:** TBPTT (deq_bptt_k=4) decouples backward cost from forward K: backward always unrolls only the last 4 iterations regardless of K. So K=32 forward costs 32×2=64 block forwards (~1280ms), but backward costs the same 4 VJPs as K=6. Sampled 1/3 of the time in jitter set {6,10,32}, amortized overhead is ~3% per step — negligible.
+**Key insight:** At K=32 the model is close to true z*. The TBPTT gradient flows through the last 4 of those 32 iterations, giving the optimizer direct signal about what the Jacobian looks like NEAR the fixed point. Without K=32, the optimizer only sees Jacobian behavior at iterations 1-10 — far from z*.
+**Evidence:** H12 showed wider K jitter improves K-sweep (125× improvement). Iter 55 K-sweep shows K8→K128 Δ=+0.0004 — a residual training-distribution bias. K=32 in the jitter set should eliminate this by making deep-K states part of the training distribution.
+**Test:** Iter 59 — change deq_k_jitter_set from (6,10) to (6,10,32). Compare K-sweep quality at K=64/128.
+**Risk:** Low — TBPTT keeps backward cost constant. Only forward cost increases for K=32 samples.
 **Status:** PROPOSED
 
 ### H42: MLA block pre-conditioning gives better z0 than conv1d — PROPOSED
@@ -558,10 +559,10 @@ failure.
 | 55 | Denoising regularization | ||f(z*+ε,x0) - z*||² post-convergence | HyDRA 2026 | **PROMOTED ★** (val_bpb -0.042, near-perfect FP) | 1.8236 | +0.0004 |
 | 56 | Causal conv1d pre-conditioning | Conv1d(k=4) before DEQ for temporal z0 | H39 (simplified SSM) | Queued | — | — |
 | 57 | Anderson accel (eval only) | 2-8× eval speedup, K-sweep quality | arXiv:2410.19460 | Queued | — | — |
-| 58 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
-| 59 | K jitter: drop K=4 | Remove K=4 from {4,6,10} → {6,10}. Shallow K trains model to converge early, reducing deep-K quality | H40 | Queued | — | — |
-| 60 | K jitter: raise K_max | Raise set to {6,10,16} or {8,12,16}. Higher K_max forces model to benefit from deeper solver | H41 | Queued | — | — |
-| 61 | MLA block pre-conditioning | Replace conv1d with MLA attention block for z0 init (full-seq context vs local k=4) | H42 | Queued | — | — |
+| 58 | K jitter: drop K=4 | Remove K=4 from {4,6,10} → {6,10}. Shallow K biases model toward early convergence | H40 | Queued | — | — |
+| 59 | K jitter: raise K_max to 32 | {6,10,32} with TBPTT=4. Deep K trains true FP; TBPTT keeps backward O(4) | H41 | Queued | — | — |
+| 60 | MLA block pre-conditioning | Replace conv1d with MLA attention block for z0 init (full-seq context vs local k=4) | H42 | Queued | — | — |
+| 61 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
