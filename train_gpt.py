@@ -1731,6 +1731,16 @@ class Block(nn.Module):
         mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
         mlp_ortho = mean_abs_offdiag_cosine(mu_mlp)
 
+        # Phase 9 iter 52: KV latent subspace orthogonalization.
+        # Penalize off-diagonal cosine similarity of KV down-projection weights.
+        # Forces expert KV compressions to span distinct subspaces.
+        # Weight-space penalty (structural) vs output-space penalty (input-dependent).
+        kv_a = self.attn.expert_kv_a.float()  # (E, kv_rank, dim)
+        kv_flat = kv_a.reshape(kv_a.shape[0], -1)  # (E, kv_rank*dim)
+        kv_subspace_ortho = mean_abs_offdiag_cosine(kv_flat)
+        # Blend: 50% output-level ortho + 50% weight-level KV subspace ortho
+        attn_ortho = 0.5 * attn_ortho + 0.5 * kv_subspace_ortho
+
         return attn_ortho, mlp_ortho
 
     def _route_pooled(self, u_proj: Tensor) -> tuple[Tensor, Tensor]:
