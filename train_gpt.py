@@ -164,7 +164,7 @@ class Hyperparameters:
     bal_loss_coef = 5e-3
     router_health_coef = 0.25
     block_ortho_aux_coef = 0.1  # partial restore from 0 (H32 was too aggressive — attn/mlp ortho drifted to 0.82, near the 0.9 gate fail). 0.1 keeps gradient pressure without dominating, preserves H32's "loss shouldn't chase gates" spirit while keeping experts apart.
-    block_ortho_aux_every = 4  # T-opt 4 REVERTED: reducing to 8 caused ortho drift (0.24→0.54)
+    block_ortho_aux_every = 8  # T-opt 19: double interval (4→8) to halve ortho_aux cost
     block_ortho_aux_tokens = 64
     router_bias_update = True
     router_bias_lr = 0.10
@@ -179,7 +179,7 @@ class Hyperparameters:
     # power-iteration VJP. One boundary forward + one VJP per step.
     lyapunov_coef = 0.01       # λ_jac: weight of hinge penalty (small: ~1% of task loss)
     lyapunov_gamma = 0.9       # γ: target spectral radius (< 1)
-    lyapunov_warmup_frac = 0.1 # ramp penalty from 0 over first 10% of steps
+    lyapunov_warmup_frac = 0.05 # T-opt 20: shorter warmup (10%→5%) — penalty near zero during warmup anyway
 
     # DEQ solver
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
@@ -2685,7 +2685,8 @@ def main() -> None:
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False,
-            find_unused_parameters=(args.deq_backward == "unroll" and args.deq_bptt_k > 0))
+            find_unused_parameters=(args.deq_backward == "unroll" and args.deq_bptt_k > 0),
+            bucket_cap_mb=50)  # T-opt 22: larger buckets → fewer all_reduce calls (~10M params fit in 1 bucket)
         if distributed else base_model
     )
 
@@ -2965,7 +2966,7 @@ def main() -> None:
                 # T-opt 14: only run Lyapunov on last micro-step (saves 3/4 of boundary forwards).
                 prev_rho = float(getattr(base_model, '_lyapunov_rho_hat', 999.0))
                 lyap_gamma = float(base_model.lyapunov_gamma)
-                lyap_skip = (prev_rho < lyap_gamma * 0.95) and (step % 10 != 0)
+                lyap_skip = (prev_rho < lyap_gamma * 0.90) and (step % 50 != 0)  # T-opt 18+21: recheck every 50 steps (was 10), wider skip margin (0.90 vs 0.95)
                 lyap_skip = lyap_skip or (micro_step < grad_accum_steps - 1)
                 if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
                     blk = sb

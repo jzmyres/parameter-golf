@@ -83,7 +83,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | bigram_dim | 128 |
 | lyapunov_coef | 0.01 (λ_jac: hinge penalty weight) |
 | lyapunov_gamma | 0.9 (target spectral radius threshold) |
-| lyapunov_warmup_frac | 0.1 (ramp over first 10% of wallclock) |
+| lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
 
 ### Quantization & Techniques
 - int6 per-row quantization + zstd-22 compression
