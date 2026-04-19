@@ -345,15 +345,23 @@ All other norms inside T_x REMOVED (Q/K norms, hidden_post_norm, sdpa_post_norm)
 **Risk:** Low — TBPTT keeps backward cost constant. Only forward cost increases for K=32 samples.
 **Status:** PROPOSED
 
-### H42: MLA block pre-conditioning gives better z0 than conv1d — PROPOSED
-**Claim:** An MLA attention block run ONCE before the DEQ loop gives z0 full-sequence context, placing it closer to z* than a conv1d(k=4) which only captures local temporal patterns. Since MLA is already implemented, this reuses existing infrastructure.
-**Mechanism:** x0 = MLA_precond(tok_emb + bigram). Single attention pass → z0 has global context → DEQ solver starts closer to fixed point → fewer effective iterations needed.
-**Comparison:** Conv1d(k=4) captures 4-token local context. MLA captures full-sequence attention context. Both run ONCE outside the DEQ loop, so overhead is 1/K of per-iteration cost.
-**Trade-offs:**
-- MLA: more expensive (~20ms compiled for one block), adds parameters (expert Q/K/V/O projections), but maximally expressive z0.
-- Conv1d: cheaper (~1ms), minimal parameters (k×dim), but only local context.
-- Could share the DEQ block's MLA weights (zero new params) or use a smaller dedicated MLA.
-**Risk:** Additional VRAM for pre-conditioning attention. Parameter budget may be tight with a separate MLA block.
+### H42: Low-rank expert pre-conditioning gives better z0 than conv1d — PROPOSED
+**Claim:** A lightweight per-expert low-rank projector (D→r→D, routed) run ONCE before
+the DEQ loop gives z0 per-token expert-specialized transformation, placing it closer to z*.
+More expressive than depthwise conv1d (which is channel-independent) and much cheaper than
+a full MLA block.
+**Mechanism:** Each of E experts has independent down(D→r) + up(r→D) projections.
+Router allocates tokens to experts. Output: x0 = x + Σ w_i · up_i(act(down_i(x))).
+Zero-init up projections → identity at start (residual connection).
+**Advantages over alternatives:**
+- vs conv1d: Expert-specialized per-token transforms (not just local temporal context).
+  Could combine with conv1d for both spatial + expert diversity.
+- vs full MLA: ~8× cheaper (~2ms vs ~20ms), ~6× fewer params (~786K vs ~5M).
+  Pre-conditioning doesn't need full attention — the DEQ loop provides that.
+- vs full shared_block reuse: No attention KV cache or FlashAttention workspace.
+  Avoids doubling VRAM for attention.
+**Params:** 8 experts × 2 × D × r = 8 × 2 × 768 × 64 = 786K params (~7% of model).
+**Risk:** Low — zero-init residual makes it a no-op at start. RevDEQ-safe (outside solver).
 **Status:** PROPOSED
 
 ### H27: Injection from refinement soft-embed during DEQ solve
@@ -561,7 +569,7 @@ failure.
 | 57 | Anderson accel (eval only) | 2-8× eval speedup, K-sweep quality | arXiv:2410.19460 | Queued | — | — |
 | 58 | K jitter: drop K=4 | Remove K=4 from {4,6,10} → {6,10}. Shallow K biases model toward early convergence | H40 | Queued | — | — |
 | 59 | K jitter: raise K_max to 32 | {6,10,32} with TBPTT=4. Deep K trains true FP; TBPTT keeps backward O(4) | H41 | Queued | — | — |
-| 60 | MLA block pre-conditioning | Replace conv1d with MLA attention block for z0 init (full-seq context vs local k=4) | H42 | Queued | — | — |
+| 60 | Low-rank expert pre-cond | Replace conv1d with routed low-rank experts (D→r→D, ~786K params) for z0 | H42 | Queued | — | — |
 | 61 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
