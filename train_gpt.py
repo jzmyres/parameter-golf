@@ -3234,7 +3234,7 @@ def main() -> None:
     val_loss_q, val_bpb_q = run_validation(
         args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        full_validation=True,  # full val for accurate roundtrip bpb measurement
+        full_validation=False,  # fast eval for roundtrip sanity check (eager mode is 4× slower)
     )
     log0(f"roundtrip_verification:done val_loss:{val_loss_q:.4f} val_bpb:{val_bpb_q:.6f}")
 
