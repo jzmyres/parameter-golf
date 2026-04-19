@@ -188,6 +188,10 @@ class Hyperparameters:
     # Complements Hutchinson (which penalizes ||J||²_F at infinitesimal scale).
     denoising_coef = 0.01      # weight of denoising loss
     denoising_noise_std = 0.01 # σ: Gaussian noise scale added to z*
+    # Phase 9 iter 56: Causal conv1d pre-conditioning (H39).
+    # Gives z0 local temporal context before entering DEQ loop.
+    # Runs ONCE outside the solver — cost amortized over K iterations.
+    precond_conv_kernel = 4    # 0 = disabled; >0 = causal conv1d kernel size
 
     # DEQ solver
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
@@ -2029,7 +2033,8 @@ class GPT(nn.Module):
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
-                 lyapunov_warmup_frac: float = 0.1):
+                 lyapunov_warmup_frac: float = 0.1,
+                 precond_conv_kernel: int = 0):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
@@ -2070,6 +2075,14 @@ class GPT(nn.Module):
         self._lyapunov_rho_hat: float = 0.0  # always Python float (no GPU sync on read)
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm(model_dim)
+        # Phase 9 iter 56: causal conv1d pre-conditioning for z0.
+        precond_k = int(precond_conv_kernel)
+        if precond_k > 0:
+            self.precond_conv = nn.Conv1d(model_dim, model_dim, kernel_size=precond_k,
+                                          padding=precond_k - 1, groups=model_dim, bias=False)
+            nn.init.zeros_(self.precond_conv.weight)  # identity at init (residual)
+        else:
+            self.precond_conv = None
         # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
         # the parameter-free `_rms_norm` in _encode.  Tests if the learnable
         # weight there was doing useful work.  Keep removed if val_bpb
@@ -2313,6 +2326,12 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         # Phase 4.5 22-rm-embed-post: back to parameter-free _rms_norm here.
         x = _rms_norm(x)
+        # Phase 9 iter 56: causal conv1d pre-conditioning.
+        # Gives z0 local temporal context (k=4 tokens) before DEQ loop.
+        # Residual connection: x = x + conv(x), zero-init → identity at start.
+        if self.precond_conv is not None:
+            # (B, T, D) → (B, D, T) → conv1d → truncate to causal → (B, T, D)
+            x = x + self.precond_conv(x.transpose(1, 2))[:, :, :x.shape[1]].transpose(1, 2)
         x = self._run_backbone(x)
         return self.final_norm(x)
 
@@ -2695,6 +2714,7 @@ def main() -> None:
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
+        precond_conv_kernel=args.precond_conv_kernel,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
