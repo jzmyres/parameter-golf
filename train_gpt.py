@@ -2994,21 +2994,27 @@ def main() -> None:
                     blk = sb
                     # Random Rademacher probe vector (±1, unbiased Hutchinson estimator)
                     v_hutch = torch.randint(0, 2, z_star.shape, device=z_star.device, dtype=z_star.dtype) * 2.0 - 1.0
+                    # Forward #1: VJP for Hutchinson estimate (no create_graph —
+                    # torch.compile doesn't support double backward)
                     z_b = z_star.detach().requires_grad_(True)
                     u_b = blk(z_b, x0_lyap)
-                    # VJP: J^T v — single backward through one block forward
                     jvp = torch.autograd.grad(
                         (u_b * v_hutch).sum(), z_b,
-                        create_graph=True, retain_graph=False,
+                        create_graph=False, retain_graph=False,
                     )[0]
-                    # ||J^T v||² / ||v||² ≈ ||J||²_F / dim (Hutchinson estimator)
-                    # Penalize when this exceeds γ² (contraction requires ||J||_F < γ√dim)
-                    jac_frob_sq = jvp.float().pow(2).sum() / max(float(v_hutch.numel()), 1.0)
+                    # ||J^T v||² / dim ≈ ||J||²_F / dim (Hutchinson estimator)
+                    jac_frob_sq_per_dim = jvp.detach().float().pow(2).mean()
                     gamma_sq = float(base_model.lyapunov_gamma) ** 2
-                    hutchinson_loss = torch.relu(jac_frob_sq - gamma_sq)
-                    loss = loss + lyap_scale * lyap_coef * hutchinson_loss
-                    # Log ρ̂ estimate for diagnostics (no extra sync — reuse jvp)
-                    base_model._lyapunov_rho_hat = float(jac_frob_sq.detach().sqrt().item())
+                    rho_est = float(jac_frob_sq_per_dim.sqrt().item())
+                    base_model._lyapunov_rho_hat = rho_est
+                    # Surrogate loss: forward #2 with v_dir (same pattern as old Lyapunov)
+                    scale_val = max(rho_est - float(base_model.lyapunov_gamma), 0.0) / max(rho_est, 1e-8)
+                    if scale_val > 0.0:
+                        v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
+                        z_b2 = z_star.detach()  # no requires_grad — grad flows to θ only
+                        u_b2 = blk(z_b2, x0_lyap)
+                        surrogate = (u_b2 * v_dir).sum().abs()
+                        loss = loss + lyap_scale * lyap_coef * scale_val * surrogate
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
