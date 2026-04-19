@@ -2978,68 +2978,37 @@ def main() -> None:
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
 
-                # iter 45 (opg_doc.tex §4): Lyapunov penalty OUTSIDE compiled graph.
-                # Single boundary forward on the UNCOMPILED shared_block.
-                # Pure-tensor math — no .item() GPU-CPU syncs in hot path.
-                # Frobenius-normalized power iteration (doc §1.1 norm convention).
+                # Phase 9 iter 50: Hutchinson-Frobenius Jacobian regularization.
+                # Replaces power-iteration Lyapunov (iter 45) with a simpler
+                # Hutchinson trace estimator: ||J^T v||² ≈ ||J||²_F for random v.
+                # ONE forward + ONE VJP (vs TWO forwards for old Lyapunov).
+                # All eigenvalues regularized, not just the largest.
+                # Ref: Bai et al., "Stabilizing Equilibrium Models" (arXiv:2106.14342)
                 lyap_coef = float(base_model.lyapunov_coef)
-                # Use wallclock time_frac for warmup (args.iterations is a 1e9 placeholder).
                 lyap_warmup_frac = float(base_model.lyapunov_warmup_frac)
                 lyap_scale = min(time_frac / max(lyap_warmup_frac, 1e-8), 1.0) if lyap_warmup_frac > 0 else 1.0
                 z_star = getattr(base_model, '_lyapunov_z_star', None)
                 x0_lyap = getattr(base_model, '_lyapunov_x0', None)
-                # T-opt 2/10: skip boundary forward when ρ̂ already below γ.
-                # Recheck every 10 steps to catch drift. Saves ~6% on stable steps.
-                # T-opt 14: only run Lyapunov on last micro-step (saves 3/4 of boundary forwards).
-                prev_rho = float(getattr(base_model, '_lyapunov_rho_hat', 999.0))
-                lyap_gamma = float(base_model.lyapunov_gamma)
-                lyap_skip = (prev_rho < lyap_gamma * 0.90) and (step % 50 != 0)  # T-opt 18+21: recheck every 50 steps (was 10), wider skip margin (0.90 vs 0.95)
-                lyap_skip = lyap_skip or (micro_step < grad_accum_steps - 1)
+                lyap_skip = micro_step < grad_accum_steps - 1  # only last micro-step
                 if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
                     blk = sb
-                    _lyap_eps = 1e-8
-                    # Init persistent vector — Frobenius-normalized (doc §1.1).
-                    v_buf = getattr(base_model, '_lyapunov_v_buf', None)
-                    if v_buf is None or v_buf.shape != z_star.shape:
-                        v_buf = _frob_normalize(torch.randn_like(z_star), _lyap_eps)
-                    v = v_buf.detach()
-                    gamma = float(base_model.lyapunov_gamma)
-                    # T-opt 7: TWO-FORWARD approach with retain_graph=FALSE.
-                    # Enables donated_buffer (10-20% compile throughput gain).
-                    # Forward #1: VJP for ρ̂ (consumes graph, frees memory)
+                    # Random Rademacher probe vector (±1, unbiased Hutchinson estimator)
+                    v_hutch = torch.randint(0, 2, z_star.shape, device=z_star.device, dtype=z_star.dtype) * 2.0 - 1.0
                     z_b = z_star.detach().requires_grad_(True)
-                    u_b1 = blk(z_b, x0_lyap)
-                    v_next = torch.autograd.grad(
-                        (u_b1 * v).sum(), z_b,
-                        create_graph=False, retain_graph=False,
+                    u_b = blk(z_b, x0_lyap)
+                    # VJP: J^T v — single backward through one block forward
+                    jvp = torch.autograd.grad(
+                        (u_b * v_hutch).sum(), z_b,
+                        create_graph=True, retain_graph=False,
                     )[0]
-                    rho_hat = v_next.detach().float().reshape(-1).norm()
-                    # Store as Python float — the VJP sync has already happened,
-                    # so .item() here costs nothing extra and avoids a GPU sync
-                    # on the NEXT step when prev_rho is read.
-                    base_model._lyapunov_rho_hat = float(rho_hat.item())
-                    # EMA update (doc §4.2) — pure-tensor math, no GPU→CPU sync.
-                    with torch.no_grad():
-                        v_nf = v_next.float().reshape(-1)
-                        v_norm = v_nf.norm().clamp(min=_lyap_eps)
-                        # v_norm is clamped to _lyap_eps, so div-by-zero is impossible.
-                        # _frob_normalize re-normalizes anyway, handling degenerate cases.
-                        mu = 0.9
-                        v_ema = mu * v_buf.float().reshape(-1) + (1.0 - mu) * (v_nf / v_norm)
-                        base_model._lyapunov_v_buf = _frob_normalize(v_ema.reshape(z_star.shape), _lyap_eps).to(z_star.dtype)
-                    # Forward #2: surrogate loss (only if ρ̂ > γ).
-                    # rho_hat is already .item()'d at line above, so deriving
-                    # scale_val as a Python float costs zero additional GPU sync.
-                    # Gating avoids building a full forward+backward graph when
-                    # the penalty is inactive (90%+ of steps after warmup).
-                    rho_val = base_model._lyapunov_rho_hat  # already a Python float
-                    scale_val = max(rho_val - gamma, 0.0) / max(rho_val, _lyap_eps)
-                    if scale_val > 0.0:
-                        v_dir = (v_next.detach() / rho_hat.clamp(min=_lyap_eps)).detach()
-                        z_b2 = z_star.detach()  # no requires_grad — grad flows to θ only
-                        u_b2 = blk(z_b2, x0_lyap)
-                        surrogate = (u_b2 * v_dir).sum().abs()
-                        loss = loss + lyap_scale * lyap_coef * scale_val * surrogate
+                    # ||J^T v||² / ||v||² ≈ ||J||²_F / dim (Hutchinson estimator)
+                    # Penalize when this exceeds γ² (contraction requires ||J||_F < γ√dim)
+                    jac_frob_sq = jvp.float().pow(2).sum() / max(float(v_hutch.numel()), 1.0)
+                    gamma_sq = float(base_model.lyapunov_gamma) ** 2
+                    hutchinson_loss = torch.relu(jac_frob_sq - gamma_sq)
+                    loss = loss + lyap_scale * lyap_coef * hutchinson_loss
+                    # Log ρ̂ estimate for diagnostics (no extra sync — reuse jvp)
+                    base_model._lyapunov_rho_hat = float(jac_frob_sq.detach().sqrt().item())
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
