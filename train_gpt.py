@@ -136,6 +136,7 @@ class Hyperparameters:
     model_dim = 768  # optimal: dim sweep showed 768 > 896 > 1024 (expert rank more valuable than shared attn width)
     num_heads = 8
     num_experts = 8  # H5: single source for attn + mlp expert banks (CLAUDE.md SSOT)
+    num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
     mlp_mult = 3.0
     tie_embeddings = True
     rope_base = 10000.0
@@ -1429,13 +1430,13 @@ class MLP(nn.Module):
         # Shape: (E, R) scale weight, applied after normalization.
         self.hidden_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
 
-    def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False) -> Tensor:
+    def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
+                    num_shared: int = 0) -> Tensor:
         B, T, D = x.shape
         E, R = self.num_experts, self.expert_rank
         x_n = x if bool(pre_normed) else _rms_norm(x)
         N = B * T
         x_flat = x_n.reshape(N, D)
-        w_flat = w.reshape(N, E).to(dtype=x_flat.dtype)
         G = self.expert_gate.to(dtype=x_flat.dtype).reshape(E * R, D)
         Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)
         gate = x_flat @ G.t()
@@ -1445,7 +1446,19 @@ class MLP(nn.Module):
         # Per-expert RMSNorm (no shared weights across experts)
         h_rms = h.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
         h = h * h_rms * self.hidden_norm_weight.to(dtype=h.dtype)  # (E, R) broadcasts over (N, E, R)
-        h = h * w_flat.unsqueeze(-1)
+        # Phase 9 iter 51: shared experts (always-on) + routed experts
+        S = int(num_shared)
+        if S > 0:
+            num_routed = E - S
+            # Shared: mean of first S experts (no routing weight)
+            h_shared = h[:, :S, :]  # (N, S, R)
+            # Routed: weighted by router output
+            w_flat = w.reshape(N, num_routed).to(dtype=h.dtype)
+            h_routed = h[:, S:, :] * w_flat.unsqueeze(-1)  # (N, num_routed, R)
+            h = torch.cat([h_shared, h_routed], dim=1)  # (N, E, R)
+        else:
+            w_flat = w.reshape(N, E).to(dtype=x_flat.dtype)
+            h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
         out = out_e.sum(dim=0)  # (N, D)
@@ -1656,24 +1669,20 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 num_experts: int = 8,
+                 num_experts: int = 8, num_shared_experts: int = 0,
                  router_scoring: str = "linear", **kwargs):
         super().__init__()
-        # iter 41 (opg_doc.tex §3.2 Lyapunov revision): learnable RMSNorm on
-        # shared state path h = RMSNorm(z + x_0).  Replaces iter 32's Π_R
-        # BallProjection — Lyapunov stability via soft regularization, not
-        # hard architectural clamps.  Single shared norm for both attn + MLP.
         self.state_norm = RMSNorm(dim)
-        # Post-mix norms: learnable RMSNorm on expert-weighted-sum output.
-        # Provides capacity (iter 37b showed +0.069 regression from removing).
         self.attn_post_mix_norm = RMSNorm(dim)
         self.mlp_post_mix_norm = RMSNorm(dim)
-        # iter 35 (opg_doc.tex §4.3, MANDATORY): single pooled router over
-        # E_attn + E_mlp = 2E experts.  One softmax across the combined pool
-        # forces per-token attention-vs-MLP budget allocation.  First E weights
-        # go to attention experts, last E to MLP experts.
+        # Phase 9 iter 51 (DeepSeek shared expert): first num_shared_experts
+        # experts are always-on (bypass routing). Remaining are routed.
+        # T_θ = x0 + Σ E_shared(h) + Σ w_j E_routed_j(h)
         self.num_experts = num_experts
-        self.router = SoftDenseRouter(dim, 2 * num_experts, min_share_loss_weight=10.0,
+        self.num_shared_experts = int(num_shared_experts)
+        num_routed = num_experts - self.num_shared_experts
+        # Router only covers routed experts (not shared).
+        self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=10.0,
                                       cv_loss_weight=2.0, scoring=router_scoring)
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
@@ -1719,47 +1728,49 @@ class Block(nn.Module):
         return attn_ortho, mlp_ortho
 
     def _route_pooled(self, u_proj: Tensor) -> tuple[Tensor, Tensor]:
-        """Compute pooled routing weights and split at E boundary.
+        """Compute pooled routing weights for ROUTED experts only.
 
-        T-opt 16: removed @dynamo_disable to allow full graph compilation.
-        The AOT autograd "backward through graph a second time" error was
-        caused by w_all being split into two views consumed by different
-        backward paths. Fixed by using .contiguous() (already present) which
-        creates independent tensors, not views. If AOT still complains, the
-        fallback is .clone() on each half.
+        Returns (w_attn, w_mlp) each of shape (..., num_routed).
+        Shared experts (indices 0:num_shared) bypass routing entirely.
         """
-        E = self.num_experts
-        w_all = self.router(u_proj, pre_normed=True)  # (..., 2E)
-        return w_all[..., :E].contiguous(), w_all[..., E:].contiguous()
+        num_routed = self.num_experts - self.num_shared_experts
+        w_all = self.router(u_proj, pre_normed=True)  # (..., 2*num_routed)
+        return w_all[..., :num_routed].contiguous(), w_all[..., num_routed:].contiguous()
 
     def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # iter 41 (opg_doc.tex §3.5, Lyapunov revision):
-        #   h = RMSNorm(z + x_0)                       — shared normalized representation
-        #   Δ_θ(z, x_0) = Σ w_j E_j(h)                — dense mixture (weights sum to 1)
-        #   T_θ(z, x_0) = x_0 + Δ_θ(z, x_0)           — expressive, unclamped
-        #
-        # No Π_R, no spectral-norm caps, no τ-shell, no inj_lin.
-        # Stability via Lyapunov penalty (iter 45) on ρ(J_{z*}).
-        # x_0 injection prevents input-independent attractors structurally.
+        # Phase 9 iter 51 (DeepSeek shared expert):
+        #   h = RMSNorm(z + x_0)
+        #   Δ_shared = Σ E_shared_j(h)                 — always-on experts (no routing)
+        #   Δ_routed = Σ w_j E_routed_j(h)             — routed experts
+        #   T_θ(z, x_0) = x_0 + Δ_shared + Δ_routed
         u = z_in + x0
         h = self.state_norm(u)                   # h = RMSNorm(z + x_0)
 
-        # Pooled router over 2E experts (doc §3.3).
         E = self.num_experts
+        S = self.num_shared_experts
+        # Route only the non-shared experts.
         w_attn, w_mlp = self._route_pooled(h)
         if self._diag_track_enabled:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
 
-        # Independent expert attention: per-expert Q/K/V → head-packed SDPA.
+        # All experts compute (shared + routed produce outputs together).
         attn_expert_out = self.attn.forward_experts(h)  # (B, T, E, D)
-        attn_mix = (attn_expert_out * w_attn.unsqueeze(-1)).sum(dim=2)  # (B, T, D)
+        if S > 0:
+            # Shared experts: always-on (mean of shared outputs, no routing).
+            attn_shared = attn_expert_out[:, :, :S, :].mean(dim=2)  # (B, T, D)
+            # Routed experts: weighted by router.
+            attn_routed = (attn_expert_out[:, :, S:, :] * w_attn.unsqueeze(-1)).sum(dim=2)
+            attn_mix = attn_shared + attn_routed
+        else:
+            attn_mix = (attn_expert_out * w_attn.unsqueeze(-1)).sum(dim=2)
         attn_mix = self.attn_post_mix_norm(attn_mix)
 
-        # MLP experts
-        mlp_mix = self.mlp.mix_experts(h, w_mlp, pre_normed=True)
+        # MLP experts (same split: shared always-on + routed)
+        mlp_mix = self.mlp.mix_experts(h, w_mlp, pre_normed=True,
+                                        num_shared=S)
         mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
-        # Dense mixture Δ = attn_mix + mlp_mix (router weights sum to 1).
+        # Dense mixture Δ = attn_mix + mlp_mix.
         delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
         # T_θ(z, x_0) = x_0 + Δ_θ(z, x_0)
@@ -1993,7 +2004,7 @@ class GPT(nn.Module):
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
                  router_scoring: str = "linear",
-                 num_experts: int = 8,
+                 num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
                  lyapunov_warmup_frac: float = 0.1):
@@ -2007,10 +2018,12 @@ class GPT(nn.Module):
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
         # (threaded from Hyperparameters; verified by experiments/test_arch.py).
         self.num_experts = int(num_experts)
+        self.num_shared_experts = int(num_shared_experts)
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
                                    num_experts=self.num_experts,
+                                   num_shared_experts=self.num_shared_experts,
                                    router_scoring=router_scoring,
                                    )
         self.deq_beta = float(deq_beta)
@@ -2655,7 +2668,7 @@ def main() -> None:
         deq_backward=args.deq_backward, deq_bptt_k=args.deq_bptt_k,
         block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
-        num_experts=args.num_experts,
+        num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
