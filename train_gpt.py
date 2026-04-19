@@ -2217,6 +2217,15 @@ class GPT(nn.Module):
         x0_refined = x0
         self._block_ortho_aux_loss = None
 
+        # Phase 9 iter 54: avg FP warm start. Blend z_init with the mean
+        # converged z* from the previous batch. The mean z* captures the
+        # "average equilibrium offset" from input embeddings — a better
+        # starting point than raw x0. RevDEQ-safe: only changes z_init.
+        _prev_z_mean = getattr(self, "_prev_z_star_mean", None)
+        if self.training and _prev_z_mean is not None and _prev_z_mean.shape[-1] == x.shape[-1]:
+            # Blend: 80% current embedding + 20% previous equilibrium mean
+            z = 0.8 * x + 0.2 * _prev_z_mean.detach()
+
         for r in range(1 + self.num_refinements):
             if r > 0:
                 new_soft_embed = self._get_soft_embedding(z)
@@ -2244,6 +2253,11 @@ class GPT(nn.Module):
             z_norm_t = z.detach().float().norm().clamp_min(1.0).detach()
             self._deq_iter_convergence_t = abs_conv_t
             self._deq_iter_convergence_rel_t = (abs_conv_t / z_norm_t).detach()
+
+        # Phase 9 iter 54: store mean z* for warm start on next batch.
+        # Mean over batch+seq dims → (D,) — position-independent.
+        if self.training:
+            self._prev_z_star_mean = z.detach().mean(dim=(0, 1), keepdim=False)
 
         proxy_t = getattr(self.shared_block, "_deq_residual_proxy_t", None)
         if isinstance(proxy_t, torch.Tensor):
