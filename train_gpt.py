@@ -140,7 +140,7 @@ class Hyperparameters:
     tie_embeddings = True
     rope_base = 10000.0
     qk_gain_init = 5.0
-    deq_beta = 0.50  # T-opt 6/10: β=0.5 (Lyapunov guarantees stability for β∈(0,1], doc Prop 4.4)
+    deq_beta = 0.70  # Phase 9 iter 48: test higher β for faster convergence (H18: higher β = faster but different FP)
 
     # Optimizer
     tied_embed_lr = 0.03
