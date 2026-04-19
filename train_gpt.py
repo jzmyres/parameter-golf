@@ -140,7 +140,9 @@ class Hyperparameters:
     tie_embeddings = True
     rope_base = 10000.0
     qk_gain_init = 5.0
-    deq_beta = 0.70  # Phase 9 iter 48: test higher β for faster convergence (H18: higher β = faster but different FP)
+    deq_beta = 0.50  # Phase 9: β=0.7 caused high recon_err (1.2 vs 0.88) → RevDEQ unstable. Keep 0.5.
+    deq_beta_jitter = True   # Phase 9 iter 49: sample β from {0.3, 0.5, 0.7} per step (like K-jitter)
+    deq_beta_jitter_set = (0.3, 0.5, 0.7)  # β values to sample from
 
     # Optimizer
     tied_embed_lr = 0.03
@@ -2595,6 +2597,29 @@ def main() -> None:
             k = int(k_t.item())
         return int(k)
 
+    # Phase 9 iter 49: β jitter — sample β per step (like K-jitter, H30).
+    # Forces model to be robust across solver dynamics. RevDEQ-safe because
+    # β is constant within each step (all iterations use the same β).
+    _beta_jitter_set = getattr(args, "deq_beta_jitter_set", None)
+    _beta_bag: list[float] = []
+    _beta_rng = random.Random(42 + 7)  # separate RNG from K-jitter
+
+    def deq_beta_for_step(step_i: int) -> float:
+        if not getattr(args, "deq_beta_jitter", False):
+            return float(args.deq_beta)
+        nonlocal _beta_bag
+        b = 0.0
+        if rank == 0:
+            if not _beta_bag:
+                _beta_bag = list(_beta_jitter_set) if _beta_jitter_set else [0.3, 0.5, 0.7]
+                _beta_rng.shuffle(_beta_bag)
+            b = float(_beta_bag.pop())
+        if distributed:
+            b_t = torch.tensor([b], device=device, dtype=torch.float32)
+            dist.broadcast(b_t, src=0)
+            b = float(b_t.item())
+        return b
+
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(f"VOCAB_SIZE={args.vocab_size} != tokenizer vocab={int(sp.vocab_size())}")
@@ -2926,6 +2951,8 @@ def main() -> None:
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
         base_model._deq_k_override = deq_k_for_step(next_step)
+        # Phase 9 iter 49: β jitter — set per-step β (same for all micro-steps).
+        base_model.deq_beta = deq_beta_for_step(next_step)
 
         # Refinement gating: enable after ramp_frac of wallclock
         ramp_frac = float(getattr(args, "num_refinements_ramp_frac", 0.85))
