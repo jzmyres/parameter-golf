@@ -415,6 +415,54 @@ Expert capacity controlled by single knob: r (the expert subspace dimension).
 explode params (768²=590K per expert per layer).
 **Status:** PROPOSED
 
+### H45: Independent-weight MLA pre-conditioning block — PROPOSED
+**Claim:** The pre-conditioning block for z0 must have INDEPENDENT weights from the DEQ
+shared block. Reusing shared_block weights makes the pre-conditioning pass equivalent to
+K+1 DEQ iterations — not a fundamentally different computation. An independent block
+provides qualitatively different z0 context (like DeepSeek-V3's non-MoE layers).
+**Mechanism:** A separate Block instance with its own parameters, run ONCE before the DEQ
+solver: `z_init = precond_block(x0, x0)`. Same architecture as shared_block (MLA + MLP +
+routing) but independent weights. Residual: z_init already contains x0 via T(z,x0)=x0+Δ.
+**Cost:** ~5M params (doubles the block), ~20ms compiled per forward (amortized over K).
+At 11M current params, this nearly doubles the model — may need rank reduction to fit 16MB.
+**Alternative:** Smaller independent block (e.g., half rank, fewer experts) as compromise.
+**Risk:** High param cost. May need to reduce DEQ block rank to compensate.
+**Status:** PROPOSED
+
+### H46: Exponential-distribution K sampling for DEQ jitter — PROPOSED
+**Claim:** Instead of uniform sampling from a fixed set {4,6,10}, sample K from an
+exponential distribution with low mean (e.g., λ=1/8, mean K=8). This gives:
+- **Most steps at low K** (cheap, maintains step count throughput)
+- **Occasional high K** (K=20-40, provides deep FP training signal)
+- **Rare very deep K** (K=60+, trains near-true FP, but only ~2% of steps)
+**Why better than fixed set {4,6,10,32}:** Iter 59 showed K=32 at 25% sampling rate
+cost -24% steps. With exponential sampling, K>20 might only be sampled ~10% of the time,
+and K>32 only ~5%. The deep-K training signal is still present but amortized over many
+more cheap steps. Continuous distribution also avoids the "mode" artifacts of a discrete set.
+**Implementation:** `K = max(4, min(64, int(np.random.exponential(scale=8))))` per step.
+Round to even for RevDEQ compatibility. TBPTT=4 keeps backward cost constant.
+**Expected throughput:** mean K≈8 (same as current avg of {4,6,10}), but with a heavy tail
+providing occasional deep-K signal. Step count should match baseline (~747 steps).
+**Risk:** Low — no structural change, just K sampling strategy. Easy to tune scale parameter.
+**Status:** PROPOSED
+
+### H47: Scale up number of experts — PROPOSED
+**Claim:** More experts (16, 32) at same or reduced rank improves routing diversity and
+model capacity. Currently 8 experts (7 routed + 1 shared). Scaling to 16-32 experts gives
+better coverage of the input space.
+**With H43 (low-dim experts):** Each expert computes at dim r, so adding experts costs
+only the down/up projections (2×D×r per expert) plus small r-dim internal weights. Going
+from 8→16 experts at r=128 adds ~2×768×128×8 = 1.6M params (15% of model). Throughput
+stays similar if head-packed SDPA can handle 16×H heads.
+**Without H43:** At current full-dim, 16 experts at rank 128/192 was tested in iter 15
+(stable, no collapse at WD=0.72) but throughput penalty dominated (11.6s/step). Low-dim
+experts (H43) would make this affordable.
+**Evidence:** Iter 15 confirmed 12 experts stable at WD=0.72. Iter 3a3 confirmed 8 experts
+balanced. The scaling law is: more experts = better IF per-expert compute is cheap enough.
+**Risk:** Head-packed SDPA with 16×8=128 query heads may hit FlashAttention limits.
+Routing balance harder with more experts (higher balance loss needed).
+**Status:** PROPOSED
+
 ### H27: Injection from refinement soft-embed during DEQ solve
 **Claim:** Currently `x0_refined` (soft embedding from prior refinement step) only initializes `z0`. Injecting it during the DEQ solve (as a second input signal alongside raw `x0`) gives the solver access to denoised context throughout.
 **Mechanism:** `x = z_in + g_inj * x0 + g_ref * x0_refined` with a separate gate for the refinement signal. At refinement step 0 (no prior prediction), `x0_refined = x0` so it reduces to current behavior.
@@ -617,14 +665,16 @@ failure.
 | 54 | Avg FP warm start | Init z0 from previous batch z* | Efficient DEQ 2025 | **REVERTED** (neutral, +0.002) | 1.867 | — |
 | 55 | Denoising regularization | ||f(z*+ε,x0) - z*||² post-convergence | HyDRA 2026 | **PROMOTED ★** (val_bpb -0.042, near-perfect FP) | 1.8236 | +0.0004 |
 | 56 | Causal conv1d pre-conditioning | Conv1d(k=4) before DEQ for temporal z0 | H39 | **REVERTED** (+0.008, conv1d didn't help) | 1.8311 | -0.006 |
-| 57 | Anderson accel (eval only) | 2-8× eval speedup, K-sweep quality | arXiv:2410.19460 | Queued | — | — |
+| 57 | Anderson accel (eval only) | 2-8× eval speedup, K-sweep quality | arXiv:2410.19460 | **DEFERRED** (K-sweep already near-perfect Δ=0.0004) | — | — |
 | 58 | K jitter: drop K=4 | Remove K=4 from {4,6,10} → {6,10} | H40 | **REVERTED** (+0.009, fewer steps outweighed tighter FP) | 1.8329 | +0.0003 |
 | 59 | K jitter: add K=32 | {4,6,10,32} with TBPTT=4. Deep K without removing cheap K | H41 | **REVERTED** (+0.050, -24% steps dominated. K32 optimal in sweep though!) | 1.8733 | +0.0002 |
-| 60 | Full-rank MLA pre-cond | Replace conv1d with full MLA block for z0 (DeepSeek non-MoE layer) | H42 | Queued | — | — |
-| 61 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
-| 62 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r is cheap + expressive) | H44 | Queued (after 61) | — | — |
-| 63 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 62) | — | — |
-| 64 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 60 | Independent MLA pre-cond | Separate Block with own weights for z0 (NOT shared_block reuse) | H45 | Queued | — | — |
+| 61 | Exponential K sampling | K ~ Exp(mean=8), clamped [4,64]. Heavy tail for rare deep K | H46 | Queued | — | — |
+| 62 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
+| 63 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 62) | — | — |
+| 64 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued | — | — |
+| 65 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 63) | — | — |
+| 66 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
