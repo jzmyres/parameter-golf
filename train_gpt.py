@@ -1709,6 +1709,9 @@ class Block(nn.Module):
         self._router_gate_call_track: list[float] = []
         self._attn_router_gate_call_track: list[float] = []
         self._mlp_router_gate_call_track: list[float] = []
+        # Per-expert routing weight per iteration (shows if experts specialize across iters)
+        self._attn_expert_weights_per_iter: list[list[float]] = []  # [iter][expert] mean weight
+        self._mlp_expert_weights_per_iter: list[list[float]] = []
 
     def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = z_in.shape
@@ -1775,6 +1778,12 @@ class Block(nn.Module):
         w_attn, w_mlp = self._route_pooled(h)
         if self._diag_track_enabled:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
+            # Track per-expert mean routing weights (shows specialization across iters)
+            with torch.no_grad():
+                self._attn_expert_weights_per_iter.append(
+                    [float(w_attn[..., i].mean().item()) for i in range(w_attn.shape[-1])])
+                self._mlp_expert_weights_per_iter.append(
+                    [float(w_mlp[..., i].mean().item()) for i in range(w_mlp.shape[-1])])
 
         # All experts compute outputs together (shared + routed).
         attn_expert_out = self.attn.forward_experts(h)  # (B, T, E, D)
@@ -2197,6 +2206,17 @@ class GPT(nn.Module):
                 self._mlp_router_gate_iter_last_solve = [0.5 * (mlp_rg_calls[2*i] + mlp_rg_calls[2*i+1]) for i in range(K)]
             else:
                 self._mlp_router_gate_iter_last_solve = []
+
+            # Per-expert routing weights per iteration (2 calls per iter: y-update, z-update)
+            attn_ew = list(getattr(sb, "_attn_expert_weights_per_iter", []) or [])
+            if len(attn_ew) == 2 * K:
+                self._attn_expert_weights_iter = [
+                    [0.5 * (attn_ew[2*i][j] + attn_ew[2*i+1][j]) for j in range(len(attn_ew[0]))]
+                    for i in range(K)]
+            else:
+                self._attn_expert_weights_iter = []
+            sb._attn_expert_weights_per_iter = []
+            sb._mlp_expert_weights_per_iter = []
 
             # Backward compat: after a DEQ solve with router_diagnostics enabled,
             # materialize list-form router diagnostics exactly once (not per-iter).
@@ -2857,6 +2877,16 @@ def main() -> None:
         mlp_rg_iter = getattr(m, "_mlp_router_gate_iter_last_solve", None)
         if mlp_rg_iter is not None and len(mlp_rg_iter) > 0:
             parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
+        # Per-expert routing weights per iteration (shows expert specialization across iters)
+        ew_iter = getattr(m, "_attn_expert_weights_iter", None)
+        if ew_iter is not None and len(ew_iter) > 0:
+            # Log std across iterations per expert (high std = specialist, low = uniform)
+            import numpy as _np
+            ew_arr = _np.array(ew_iter)  # (K, E)
+            iter_std = ew_arr.std(axis=0)  # per-expert std across iters
+            iter_range = ew_arr.max(axis=0) - ew_arr.min(axis=0)  # per-expert range
+            parts.append(f"expert_iter_std:[{','.join(f'{v:.4f}' for v in iter_std)}]")
+            parts.append(f"expert_iter_range:[{','.join(f'{v:.4f}' for v in iter_range)}]")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
