@@ -424,10 +424,14 @@ provides qualitatively different z0 context (like DeepSeek-V3's non-MoE layers).
 parameters and standard residual connection: `x0 = precond_block(emb) + emb`. The output
 of pre-conditioning becomes the x0 input to the DEQ solver. The residual ensures the raw
 embedding signal is always preserved.
+**Core insight:** The pre-conditioning creates a **dynamic, context-aware embedding** rather
+than a static one. Currently x0 = tok_emb + bigram — each token's x0 depends only on its
+identity. The DEQ solver must discover ALL inter-token relationships through iterations.
+With MLA pre-conditioning, x0 already encodes full-sequence attention context. The DEQ
+solver iterates on a richer input, focusing on deeper structure rather than basic context.
 **Architecture:** Same structure as a standard transformer attention block (not necessarily
-MoE). Could be a single-expert MLA block (no routing) or a smaller MoE block. The key
-property is INDEPENDENT weights — the pre-conditioning learns a different transform than
-the DEQ iteration function T_θ.
+MoE). Could be a single-expert MLA block (no routing) or a smaller MoE block. Independent
+weights because it solves a different problem (context building) than T_θ (FP refinement).
 **Cost:** ~2-5M params depending on rank/expert config. ~10-20ms compiled per forward
 (amortized over K DEQ iterations). At 11M current params, budget is tight — may need
 rank reduction or fewer experts in the DEQ block to compensate.
