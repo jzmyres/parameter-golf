@@ -219,12 +219,6 @@ class Hyperparameters:
     deq_k_max = 16  # iter 30: reset to baseline for clean Phase 6 comparison
     deq_k_step = 4
     deq_k_jitter_set = (4, 6, 10)  # T-opt 5/10: lower avg K (β=0.30 converges faster → fewer iters needed)
-    # Phase 9 iter 61: exponential K sampling (H46). Replaces shuffle bag.
-    # K ~ Exp(mean=deq_k_exp_mean) + deq_k_min, clamped to [deq_k_min, deq_k_exp_max].
-    # Most steps cheap (K~4-8), rare deep K (K=20-40) for FP training signal.
-    deq_k_exp_sampling = True
-    deq_k_exp_mean = 6       # exponential scale parameter (added to k_min=4 → effective mean ~10)
-    deq_k_exp_max = 48       # maximum K clamp (rare, ~1% of samples)
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
@@ -2631,19 +2625,7 @@ def main() -> None:
     def deq_k_for_step(step_i: int) -> int:
         k = 0
         if rank == 0:
-            if getattr(args, 'deq_k_exp_sampling', False) and args.deq_k_jitter:
-                # Phase 9 iter 61 (H46): exponential K sampling.
-                # K = k_min + Exp(mean), clamped to [k_min, k_exp_max], rounded to even.
-                raw = k_rng.expovariate(1.0 / float(args.deq_k_exp_mean))
-                k = int(args.deq_k_min) + int(raw)
-                k = min(k, int(args.deq_k_exp_max))
-                k = max(k, int(args.deq_k_min))
-                # Round to nearest even for RevDEQ coupled-state symmetry.
-                k = max(2, (k + 1) // 2 * 2)
-            elif args.deq_k_jitter:
-                k = int(k_sampler.sample())
-            else:
-                k = int(args.deq_k_max)
+            k = int(k_sampler.sample()) if args.deq_k_jitter else int(args.deq_k_max)
         if distributed:
             k_t = torch.tensor([k], device=device, dtype=torch.int64)
             dist.broadcast(k_t, src=0)
