@@ -616,10 +616,10 @@ failure.
 | 53 | K curriculum | Shallow K early → deep K late | DEQ practices | **REVERTED** (K=2 too aggressive, permanent deficit) | 1.875 | — |
 | 54 | Avg FP warm start | Init z0 from previous batch z* | Efficient DEQ 2025 | **REVERTED** (neutral, +0.002) | 1.867 | — |
 | 55 | Denoising regularization | ||f(z*+ε,x0) - z*||² post-convergence | HyDRA 2026 | **PROMOTED ★** (val_bpb -0.042, near-perfect FP) | 1.8236 | +0.0004 |
-| 56 | Causal conv1d pre-conditioning | Conv1d(k=4) before DEQ for temporal z0 | H39 | **REVERTED** (+0.008, conv1d didn't help) | 1.8311 | -0.006 |
+| 56 | Causal conv1d pre-conditioning | Conv1d(k=4) before DEQ for temporal z0 | H39 (simplified SSM) | Queued | — | — |
 | 57 | Anderson accel (eval only) | 2-8× eval speedup, K-sweep quality | arXiv:2410.19460 | Queued | — | — |
-| 58 | K jitter: drop K=4 | Remove K=4 from {4,6,10} → {6,10} | H40 | **REVERTED** (+0.009, fewer steps outweighed tighter FP) | 1.8329 | +0.0003 |
-| 59 | K jitter: add K=32 | {4,6,10,32} with TBPTT=4. Add deep K without removing cheap K=4 | H41 | Queued | — | — |
+| 58 | K jitter: drop K=4 | Remove K=4 from {4,6,10} → {6,10}. Shallow K biases model toward early convergence | H40 | Queued | — | — |
+| 59 | K jitter: raise K_max to 32 | {6,10,32} with TBPTT=4. Deep K trains true FP; TBPTT keeps backward O(4) | H41 | Queued | — | — |
 | 60 | Full-rank MLA pre-cond | Replace conv1d with full MLA block for z0 (DeepSeek non-MoE layer) | H42 | Queued | — | — |
 | 61 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
 | 62 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r is cheap + expressive) | H44 | Queued (after 61) | — | — |
