@@ -218,7 +218,7 @@ class Hyperparameters:
     deq_k_min = 4
     deq_k_max = 16  # iter 30: reset to baseline for clean Phase 6 comparison
     deq_k_step = 4
-    deq_k_jitter_set = (6, 10)  # Phase 9 iter 58: drop K=4 (H40: shallow K biases model toward early convergence)
+    deq_k_jitter_set = (4, 6, 10)  # T-opt 5/10: lower avg K (β=0.30 converges faster → fewer iters needed)
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
