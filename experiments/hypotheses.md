@@ -748,7 +748,7 @@ failure.
 | 64 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 63) | — | — |
 | 65 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued | — | — |
 | 66 | Parcae negative diagonal | Replace β with per-dim learned A=Diag(-exp(a)), guaranteed ρ<1 | H48 | Queued | — | — |
-| 67 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (72KB total). Each iter slightly different | H49 | Queued | — | — |
+| 67 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (98K params). Each iter specializes | H49 | **PROMOTED ★** (val_bpb -0.002, per-step quality better) | 1.8149 | +0.001 |
 | 68 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
 | 69 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward, 43% faster, 76% more steps | H51 | **REVERTED** (+0.021 post-quant, fast only +0.013) | 1.8396 | -0.002 (K128 best!) |
 | 69b | Reduce TBPTT 4→2 | 2-step backward: 29% faster, 40% more steps (1049 vs 747) | H51 | **PROMOTED ★** (val_bpb -0.001, 30% throughput gain) | 1.8169 | +0.002 |
