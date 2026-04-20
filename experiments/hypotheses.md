@@ -750,7 +750,7 @@ failure.
 | 66 | Parcae negative diagonal | Replace β with per-dim learned A=Diag(-exp(a)), guaranteed ρ<1 | H48 | Queued | — | — |
 | 67 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (72KB total). Each iter slightly different | H49 | Queued | — | — |
 | 68 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
-| 69 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward may suffice for well-converged FP | H51 | Queued | — | — |
+| 69 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward, 43% faster, 76% more steps | H51 | **REVERTED** (+0.021 post-quant, fast only +0.013. Try TBPTT=2 next) | 1.8396 | -0.002 (K128 best!) |
 | 70 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 64) | — | — |
 | 71 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
