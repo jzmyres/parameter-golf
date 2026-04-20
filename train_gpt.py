@@ -2542,6 +2542,9 @@ def main() -> None:
     # RevDEQ O(1) backward memory peaks at 38 GB (80% of 48 GB L40S) with B=64.
     # 16% throughput gain from fewer micro-steps + better GPU utilization.
     _base_grad_accum = max(1, math.ceil(4 / world_size))
+    # k_rope permute fix (64ac616) changed attention layout → Hutchinson VJP
+    # FlashAttention backward needs more VRAM. Double grad_accum to halve B.
+    _base_grad_accum *= 2
     # Unroll O(K) stores full autograd graph (43+ GB) → needs 8× to shrink B.
     if getattr(args, "deq_backward", "revdeq") == "unroll":
         grad_accum_steps = _base_grad_accum * 8
