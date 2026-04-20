@@ -743,7 +743,7 @@ failure.
 | 59 | K jitter: add K=32 | {4,6,10,32} with TBPTT=4. Deep K without removing cheap K | H41 | **REVERTED** (+0.050, -24% steps dominated. K32 optimal in sweep though!) | 1.8733 | +0.0002 |
 | 60 | Independent MLA pre-cond | Separate Block (1 expert, rank 128/192) for dynamic x0 | H45 | **REVERTED** (+0.036, DEQ attention already builds context) | 1.8593 | +0.003 |
 | 61 | Exponential K sampling | K ~ Exp(mean=6)+4, clamped [4,48]. Heavy tail for rare deep K | H46 | **REVERTED** (+0.020, -13% steps from higher avg K) | 1.8437 | +0.0006 |
-| 62 | Disable FSQ quantization | Keep low-rank MoS projection but remove FSQ level discretization | H53 | Queued | — | — |
+| 62 | Disable FSQ quantization | Keep low-rank MoS projection but remove FSQ level discretization | H53 | **PROMOTED ★** (val_bpb -0.005, zero overhead) | 1.8183 | +0.0008 |
 | 63 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
 | 64 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 63) | — | — |
 | 65 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued | — | — |
