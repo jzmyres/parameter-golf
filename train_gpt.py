@@ -172,9 +172,11 @@ class Hyperparameters:
     router_bias_update = True
     router_bias_lr = 0.10
     router_bias_clip = 10.0
-    # Router scoring mode. L2-distance scoring with tanh works well empirically.
-    # Under Lyapunov stability, any scoring is fine (no Lip requirement).
-    router_scoring = "l2"
+    # Phase 9 iter 70: switch L2→linear dot-product routing for effective depth.
+    # L2+tanh logits are insensitive to directional z_k changes between DEQ iters
+    # (expert_iter_std≈0). Linear dot-product captures rotation → different expert
+    # mixtures across iterations → effective depth > 1.
+    router_scoring = "linear"
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
