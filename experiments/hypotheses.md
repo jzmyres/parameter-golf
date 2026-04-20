@@ -420,13 +420,18 @@ explode params (768²=590K per expert per layer).
 shared block. Reusing shared_block weights makes the pre-conditioning pass equivalent to
 K+1 DEQ iterations — not a fundamentally different computation. An independent block
 provides qualitatively different z0 context (like DeepSeek-V3's non-MoE layers).
-**Mechanism:** A separate Block instance with its own parameters, run ONCE before the DEQ
-solver: `z_init = precond_block(x0, x0)`. Same architecture as shared_block (MLA + MLP +
-routing) but independent weights. Residual: z_init already contains x0 via T(z,x0)=x0+Δ.
-**Cost:** ~5M params (doubles the block), ~20ms compiled per forward (amortized over K).
-At 11M current params, this nearly doubles the model — may need rank reduction to fit 16MB.
-**Alternative:** Smaller independent block (e.g., half rank, fewer experts) as compromise.
-**Risk:** High param cost. May need to reduce DEQ block rank to compensate.
+**Mechanism:** A separate Block instance (DeepSeek-style MLA attention block) with its own
+parameters and standard residual connection: `x0 = precond_block(emb) + emb`. The output
+of pre-conditioning becomes the x0 input to the DEQ solver. The residual ensures the raw
+embedding signal is always preserved.
+**Architecture:** Same structure as a standard transformer attention block (not necessarily
+MoE). Could be a single-expert MLA block (no routing) or a smaller MoE block. The key
+property is INDEPENDENT weights — the pre-conditioning learns a different transform than
+the DEQ iteration function T_θ.
+**Cost:** ~2-5M params depending on rank/expert config. ~10-20ms compiled per forward
+(amortized over K DEQ iterations). At 11M current params, budget is tight — may need
+rank reduction or fewer experts in the DEQ block to compensate.
+**Risk:** High param cost. May need to reduce DEQ block rank to fit 16MB.
 **Status:** PROPOSED
 
 ### H46: Exponential-distribution K sampling for DEQ jitter — PROPOSED
