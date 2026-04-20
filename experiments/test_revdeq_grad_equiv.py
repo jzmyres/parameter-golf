@@ -52,7 +52,7 @@ class TestRevDEQGradEquivalence(unittest.TestCase):
 
         # Path A: RevDEQ custom backward
         params = tuple(p for p in f.parameters() if p.requires_grad)
-        z_term, _ = RevDEQFunction.apply(f, x0, z0, beta, k, *params)
+        z_term, _ = RevDEQFunction.apply(f, x0, z0, beta, k, 0, *params)
         loss = (z_term ** 2).mean()
         loss.backward()
 

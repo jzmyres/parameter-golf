@@ -1040,9 +1040,10 @@ class SoftDenseRouter(nn.Module):
         lb = float(self.min_share_frac) / float(self.num_experts)
         if lb > 0.0:
             boost = (lb - ms).clamp_min(0.0)
-            if float(boost.sum().item()) > 0.0:
-                target = (target + boost).clamp_min(1e-8)
-                target = target / target.sum()
+            # Pure-tensor: conditionally apply boost without .item() GPU→CPU sync.
+            boosted = (target + boost).clamp_min(1e-8)
+            boosted = boosted / boosted.sum()
+            target = torch.where(boost.sum() > 0.0, boosted, target)
         self.expert_bias.add_(lr * (target - ms))
         if clip > 0:
             self.expert_bias.clamp_(min=-clip, max=clip)
@@ -1335,7 +1336,7 @@ class CausalSelfAttention(nn.Module):
         q_rope_p = q_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, self.rope_dim)
         q_rope_p = apply_rotary_emb(q_rope_p, cos, sin)
 
-        k_rope_p = k_rope.permute(0, 2, 3, 1, 4).reshape(B, E * H_kv, T, self.rope_dim)
+        k_rope_p = k_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, self.rope_dim)
         k_rope_p = apply_rotary_emb(k_rope_p, cos, sin)
 
         # --- Assemble full Q, K ---
@@ -1886,8 +1887,11 @@ class RevDEQFunction(torch.autograd.Function):
             if out_y is not None:
                 if bool(ctx.do_recon_diag):
                     try:
+                        # Write to unwrapped module — compiled wrapper may not
+                        # propagate attribute writes to the original module.
+                        _target = _unwrap_compiled_module(f_theta)
                         setattr(
-                            f_theta,
+                            _target,
                             "_deq_residual_proxy_t",
                             (z_state - out_y.to(state_dtype)).norm().detach(),
                         )
@@ -1990,11 +1994,13 @@ class RevDEQFunction(torch.autograd.Function):
         if bool(getattr(ctx, "do_recon_diag", False)) and isinstance(z_init_state, torch.Tensor):
             try:
                 z0 = z_init_state.to(dtype=state_dtype)
-                denom = max(float(z0.norm().item()), 1.0)
+                denom = z0.norm().clamp(min=1.0)
                 z_rec = z_next64.to(dtype=state_dtype)
                 y_rec = y_next64.to(dtype=state_dtype)
-                recon_err = float(((z_rec - z0).norm().item() + (y_rec - z0).norm().item()) / denom)
-                setattr(f_theta, "_deq_recon_error_last_bwd", recon_err)
+                # Store as GPU tensor — materialize at log time only.
+                recon_err_t = ((z_rec - z0).norm() + (y_rec - z0).norm()) / denom
+                _target = _unwrap_compiled_module(f_theta)
+                setattr(_target, "_deq_recon_error_last_bwd", recon_err_t.detach())
             except Exception:
                 pass
 
@@ -2007,9 +2013,10 @@ class RevDEQFunction(torch.autograd.Function):
             z_init_grad = (bar_y + bar_z).to(x0.dtype)
         if do_vjp_diag and diag_vjp_per_iter:
             try:
-                setattr(f_theta, "_tbptt_vjp_iter_last_bwd", diag_vjp_per_iter)
-                setattr(f_theta, "_tbptt_bwd_k_last", int(K_bwd))
-                setattr(f_theta, "_tbptt_fwd_k_last", int(K))
+                _target = _unwrap_compiled_module(f_theta)
+                setattr(_target, "_tbptt_vjp_iter_last_bwd", diag_vjp_per_iter)
+                setattr(_target, "_tbptt_bwd_k_last", int(K_bwd))
+                setattr(_target, "_tbptt_fwd_k_last", int(K))
             except Exception:
                 pass
         param_grads_out: list[torch.Tensor | None] = [None] * len(params_all)
@@ -2080,7 +2087,10 @@ class GPT(nn.Module):
         self.lyapunov_gamma = float(lyapunov_gamma)
         self.lyapunov_warmup_frac = float(lyapunov_warmup_frac)
         self._lyapunov_v_buf: Tensor | None = None  # persistent power-iter vector (EMA)
-        self._lyapunov_rho_hat: float = 0.0  # always Python float (no GPU sync on read)
+        # GPU-resident EMA of spectral radius estimate. Stored as a 0-dim CUDA
+        # tensor so the Hutchinson penalty block stays pure-tensor (no .item()
+        # GPU→CPU sync in the hot path). Initialized lazily on first use.
+        self._lyapunov_rho_hat_buf: Tensor | None = None
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0)  # Phase 9 iter 62 (H53): disabled FSQ
         self.final_norm = RMSNorm(model_dim)
         # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
@@ -2883,8 +2893,7 @@ def main() -> None:
         ew_iter = getattr(m, "_attn_expert_weights_iter", None)
         if ew_iter is not None and len(ew_iter) > 0:
             # Log std across iterations per expert (high std = specialist, low = uniform)
-            import numpy as _np
-            ew_arr = _np.array(ew_iter)  # (K, E)
+            ew_arr = np.array(ew_iter)  # (K, E)
             iter_std = ew_arr.std(axis=0)  # per-expert std across iters
             iter_range = ew_arr.max(axis=0) - ew_arr.min(axis=0)  # per-expert range
             parts.append(f"expert_iter_std:[{','.join(f'{v:.4f}' for v in iter_std)}]")
@@ -3070,16 +3079,23 @@ def main() -> None:
                         create_graph=False, retain_graph=False,
                     )[0]
                     # ||J^T v||² / dim ≈ ||J||²_F / dim (Hutchinson estimator)
-                    rho_sample = float(jvp.detach().float().pow(2).mean().sqrt().item())
-                    # EMA smoothing to reduce variance of random probe estimates.
-                    # Without this, noisy high estimates trigger large surrogate
-                    # losses that destabilize training (observed: silent crash).
-                    prev_rho = float(getattr(base_model, '_lyapunov_rho_hat', rho_sample))
-                    rho_ema = 0.9 * prev_rho + 0.1 * rho_sample
-                    base_model._lyapunov_rho_hat = rho_ema
-                    # Surrogate loss only when EMA(ρ̂) > γ (stable signal)
+                    # Pure-tensor math — no .item()/.cpu() GPU-CPU syncs.
+                    rho_sample_t = jvp.detach().float().pow(2).mean().sqrt()
+                    # EMA smoothing (GPU-resident) to reduce variance of random
+                    # probe estimates. Without this, noisy high estimates trigger
+                    # large surrogate losses that destabilize training.
+                    rho_buf = base_model._lyapunov_rho_hat_buf
+                    if rho_buf is None:
+                        base_model._lyapunov_rho_hat_buf = rho_sample_t.detach().clone()
+                        rho_buf = base_model._lyapunov_rho_hat_buf
+                    else:
+                        rho_buf.mul_(0.9).add_(rho_sample_t.detach(), alpha=0.1)
+                    # Surrogate loss only when EMA(ρ̂) > γ. One .item() per
+                    # last-micro-step is acceptable (already gated by lyap_skip;
+                    # not in the gradient-accumulation inner loop).
                     gamma = float(base_model.lyapunov_gamma)
-                    scale_val = max(rho_ema - gamma, 0.0) / max(rho_ema, 1e-8)
+                    scale_t = torch.relu(rho_buf - gamma) / rho_buf.clamp(min=1e-8)
+                    scale_val = float(scale_t.item())
                     if scale_val > 0.0:
                         v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
                         z_b2 = z_star.detach()

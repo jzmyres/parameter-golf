@@ -432,6 +432,19 @@ In DDP, maintain $v_{\text{buf}}$ \emph{per rank/device}; no all-reduce is requi
 If $\|v_{\text{next}}\|_2$ is numerically tiny, reinitialize $v_{\text{buf}}$ randomly to avoid a degenerate direction.
 \end{remark}
 
+\paragraph{Practical implementation (iter 50 onward).}
+The code replaces the persistent power-iteration proxy described above with a
+\textbf{Hutchinson--Frobenius estimator}~\cite{bai2021stabilizing}: a random
+Rademacher probe $v \sim \{-1,+1\}^{\dim(z^\star)}$ is drawn fresh each step,
+and $\|J_{z^\star}^\top v\|^2 / \dim \approx \|J\|_F^2 / \dim$ estimates the
+spectral radius via the Frobenius norm.  An exponential moving average
+($\alpha=0.1$) smooths the estimate across steps.  This is cheaper (no
+persistent buffer, one VJP instead of a full forward), regularizes \emph{all}
+eigenvalues (not just the largest), and avoids degenerate-direction failure
+modes of single-vector power iteration.  The surrogate loss structure is
+unchanged: $\mathcal{L}_{\text{lyap}} = \lambda \cdot
+\text{ReLU}(\hat\rho_{\text{EMA}} - \gamma) \cdot |(u \cdot \hat v)|$.
+
 \subsection{Phase 3: RevDEQ backward pass (exact unrolled gradient without IFT)}
 \label{sec:phase3}
 

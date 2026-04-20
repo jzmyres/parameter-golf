@@ -51,12 +51,14 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | num_heads | 8 |
 | num_kv_heads | 4 |
 | num_experts | 8 |
+| num_shared_experts | 1 (DeepSeek shared expert, always-on with sigmoid gate) |
 | mlp_mult | 3.0 (hidden = 768 × 3 / num_experts via low-rank experts) |
 | train_seq_len | 2048 |
 | train_batch_tokens | 524,288 |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
 | deq_beta | 0.50 |
+| deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
 | num_refinements | 1 |
 
 ### Optimizer
@@ -76,14 +78,18 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 ### Routing & Expert Ranks
 | Parameter | Value |
 |---|---|
-| router_scoring | l2 (L2-distance prototypes with tanh) |
+| router_scoring | linear (dot-product logits, iter 70) |
 | attn_expert_rank | 128 |
 | mlp_expert_rank | 192 |
 | bigram_vocab_size | 4096 |
 | bigram_dim | 128 |
-| lyapunov_coef | 0.01 (λ_jac: hinge penalty weight) |
+| deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step) |
+| deq_k_jitter_set | (4, 6, 10) (DEQ iteration counts sampled per step) |
+| lyapunov_coef | 0.01 (λ_jac: Hutchinson-Frobenius penalty weight) |
 | lyapunov_gamma | 0.9 (target spectral radius threshold) |
 | lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
+| denoising_coef | 0.01 (HyDRA denoising regularization weight) |
+| denoising_noise_std | 0.01 (Gaussian noise σ for denoising penalty) |
 
 ### Quantization & Techniques
 - int6 per-row quantization + zstd-22 compression
@@ -271,6 +277,7 @@ When proposing architecture improvements:
 - Apply FSQ via STE in an intermediate projection space within the MoS output head
 - Rank is flexible — tune as long as 16MB artifact size is met
 - With V=1024, even full-rank projections are affordable (~917K params = 3.5MB fp16)
+- **Currently disabled** (iter 62, H53): `fsq_levels=0` bypasses FSQ — the low-rank MoS projection alone is sufficient within the 16MB budget. Code machinery retained for potential re-enabling.
 
 ### 5. Diffusion-AR (Autoregressive + Iterative Refinement)
 - Reference: `/home/mzhong4/work/research/tsu/WIP-TSU/code/model.py`
@@ -283,7 +290,7 @@ When proposing architecture improvements:
   - **CTP (Current Token Prediction)**: predict current token (denoising)
   - **NTP (Next Token Prediction)**: predict next token (standard AR)
   - MoS with shared experts + specialized experts per head
-  - CTP weight scales with num_refinements: `0.1 × num_refinements`
+  - CTP weight: `0.05 × num_refinements × refine_strength` where `refine_strength = min(refine_alpha / 0.5, 1.0)`. The alpha-dependent scaling reduces CTP influence when refinement soft-embedding is weak.
     (at refinement 0, input is clean one-hot — nothing to denoise)
   - All experts trainable (no frozen expert), xavier init (no SVD bias)
   - Track and plot CTP and NTP losses separately
@@ -344,6 +351,13 @@ Rules:
 4. **`opg_doc.tex` §2.1 and the "Current SOTA"/"working baseline" lines are dated artifacts**. A PR that mutates `Block.forward`, the DEQ equation, or the promoted baseline MUST update these in the same commit, or open a `TODO(paper)` ticket noting the divergence.
 
 Rationale (incident from 2026-04-15 review): five drift defects shipped together — a stale 27b comment in iter 27d code, CLAUDE.md's config table two phases behind real code, `num_experts` hardcoded in three classes, a test silently relaxed from `== 6` to `>= 2`, and `opg_doc.tex` describing a removed `gg_gate`. All five share one root cause: configuration was duplicated across files with no single source of truth, so each editor only updated the file in front of them. This subsection codifies the fix.
+
+### Permutation Consistency Audit Rule
+When multiple tensors of identical shape undergo `permute()+reshape()` to the same target layout (e.g., `(E,B,T,H,d)` → `(B,E*H,T,d)`), ALL must use identical permutation indices. Before committing any attention/expert tensor reshaping code:
+```bash
+grep -n 'permute(' train_gpt.py | grep -v '#'
+```
+Verify all groups of related permutes use the same index tuple. A single outlier is almost certainly a bug (cf. k_rope permute incident, commit ec1048b).
 
 ### Dead Code Audit Rule
 When a feature is removed (e.g., gg_gate, SmearGate, tie_attn_mlp_router), the SAME commit must:

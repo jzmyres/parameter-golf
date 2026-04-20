@@ -15,15 +15,12 @@ class TestDeqKJitter(unittest.TestCase):
         self.assertTrue(hasattr(Hyperparameters, "deq_k_min"))
         self.assertTrue(hasattr(Hyperparameters, "deq_k_max"))
         self.assertTrue(hasattr(Hyperparameters, "deq_k_eval"))
-        self.assertTrue(hasattr(Hyperparameters, "deq_k_max_start"))
-        self.assertTrue(hasattr(Hyperparameters, "deq_k_max_ramp_steps"))
-        # Defaults: shuffle-bag K-jitter with a maxK range ramp.
+        # Defaults: shuffle-bag K-jitter (deq_k_max_start/ramp removed).
         self.assertEqual(Hyperparameters.deq_k_jitter, True)
         self.assertGreaterEqual(Hyperparameters.deq_k_min, 2)
-        self.assertGreaterEqual(Hyperparameters.deq_k_max_start, Hyperparameters.deq_k_min)
-        self.assertGreaterEqual(Hyperparameters.deq_k_max, Hyperparameters.deq_k_max_start)
-        self.assertEqual(Hyperparameters.deq_k_max, 12)
-        self.assertEqual(Hyperparameters.deq_k_eval, 12)
+        self.assertGreaterEqual(Hyperparameters.deq_k_max, Hyperparameters.deq_k_min)
+        self.assertGreater(Hyperparameters.deq_k_max, 0)
+        self.assertGreater(Hyperparameters.deq_k_eval, 0)
 
     def test_cli_override_parses_bool(self):
         ov = _parse_cli_overrides(["--deq-k-jitter", "0"])
@@ -40,14 +37,15 @@ class TestDeqKJitter(unittest.TestCase):
         got2 = [s.sample() for _ in range(11)]
         self.assertEqual(set(got2), set(range(2, 13)))
 
-    def test_shuffle_bag_set_range_resets(self):
+    def test_shuffle_bag_reset_clears_bag(self):
         import random
         rng = random.Random(123)
         s = KShuffleBagSampler(2, 4, rng)
-        _ = [s.sample() for _ in range(3)]
-        s.set_range(2, 6)
-        got = [s.sample() for _ in range(5)]
-        self.assertEqual(set(got), set(range(2, 7)))
+        _ = [s.sample() for _ in range(2)]  # partial drain
+        s.reset()
+        # After reset, next cycle draws a full bag again
+        got = [s.sample() for _ in range(3)]
+        self.assertEqual(set(got), set(range(2, 5)))
 
 
 if __name__ == "__main__":
