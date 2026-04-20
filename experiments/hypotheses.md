@@ -748,12 +748,16 @@ failure.
 | 64 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 63) | — | — |
 | 65 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued | — | — |
 | 66 | Parcae negative diagonal | Replace β with per-dim learned A=Diag(-exp(a)), guaranteed ρ<1 | H48 | Queued | — | — |
-| 67 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (98K params). Each iter specializes | H49 | **PROMOTED ★** (val_bpb -0.002, per-step quality better) | 1.8149 | +0.001 |
+| 67 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (98K params). Each iter specializes | H49 | **REVERTED** (not principled, doesn't generalize to K>16) | 1.8149 | +0.001 |
 | 68 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
 | 69 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward, 43% faster, 76% more steps | H51 | **REVERTED** (+0.021 post-quant, fast only +0.013) | 1.8396 | -0.002 (K128 best!) |
 | 69b | Reduce TBPTT 4→2 | 2-step backward: 29% faster, 40% more steps (1049 vs 747) | H51 | **PROMOTED ★** (val_bpb -0.001, 30% throughput gain) | 1.8169 | +0.002 |
 | 70 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 64) | — | — |
-| 71 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 71 | Reduce weight_decay 1.08→0.3 | WD=1.08 is biggest expressiveness killer. Pair with stronger balance loss | H54 | Queued | — | — |
+| 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale (no norm) | H55 | Queued | — | — |
+| 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | Queued | — | — |
+| 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | Queued | — | — |
+| 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
