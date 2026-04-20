@@ -472,6 +472,49 @@ balanced. The scaling law is: more experts = better IF per-expert compute is che
 Routing balance harder with more experts (higher balance loss needed).
 **Status:** PROPOSED
 
+### H48: Parcae negative diagonal injection (guaranteed contraction) — PROPOSED
+**Source:** "Parcae: Scaling Laws For Stable Looped Language Models" (arXiv:2604.12946, April 2026)
+**Claim:** Replace scalar β with per-dimension learned `A = Diag(-exp(a))` and step size dt.
+Update: `z_{n+1} = exp(dt·A)·z_n + (I-exp(dt·A))·f(z_n, x0)`. Since -exp(a) < 0 always,
+exp(dt·A) has all eigenvalues in (0,1) → spectral radius < 1 by construction.
+**Why high ROI:**
+- Eliminates need for Hutchinson AND denoising regularization (guaranteed stability)
+- Net code REDUCTION (~60 lines removed, ~30 added)
+- Per-dimension learned damping → more expressive than scalar β
+- Parcae 770M matches 1.3B standard transformer
+**RevDEQ compatibility:** Need to verify reversibility with diagonal parameterization.
+The reverse step z_prev = (z - (I-exp(dt·A))·f(y)) / exp(dt·A) is still algebraically
+exact since exp(dt·A) is diagonal and invertible (all entries > 0).
+**Risk:** Medium — changes the core solver dynamics. Needs careful integration with β jitter.
+**Status:** PROPOSED
+
+### H49: Per-iteration LoRA adapters — PROPOSED
+**Source:** "Relaxed Recursive Transformers" (ICLR 2025, arXiv:2410.20672)
+**Claim:** Add tiny rank-4 LoRA offsets (B_i·A_i) per DEQ iteration to shared block's key
+projections. Each iteration gets slightly different behavior while maintaining weight sharing.
+**Params:** 12 iterations × rank-4 × 768 × 2 matrices = 73,728 params (~0.7% of model).
+**Why high ROI:**
+- Current DEQ: all iterations use IDENTICAL weights → limited depth utilization
+- Per-iter LoRA: each iteration can specialize (early: coarse features, late: fine details)
+- Tiny parameter cost, negligible throughput overhead
+- Recursive Gemma 1B with LoRA outperforms TinyLlama 1.1B
+**Risk:** May interfere with fixed-point convergence if LoRA offsets too large.
+Init with small scale (1e-3) to start near identity.
+**Status:** PROPOSED
+
+### H50: DeltaDEQ dimension skipping — PROPOSED
+**Source:** "DeltaDEQ: Exploiting Heterogeneous Convergence" (NeurIPS 2024)
+**Code:** github.com/ZuowenWang0000/Delta-Deep-Equilibrium-Models
+**Claim:** Track per-dimension convergence δ_d = |z_new[d] - z_old[d]|. Skip recomputation
+for dimensions where δ_d < ε in later iterations. Many dimensions converge by iter 4-5.
+**Why high ROI:**
+- 20-40% wall-clock speedup with <0.01 bpb cost
+- With MoE, could skip entire expert evaluations when routing weights stabilize
+- Only affects forward pass (backward uses TBPTT on last 4 iters, all dims)
+**Risk:** Sparse ops may not play well with torch.compile. RevDEQ backward needs all dims
+for reconstruction. May only be applicable to forward, not backward.
+**Status:** PROPOSED
+
 ### H27: Injection from refinement soft-embed during DEQ solve
 **Claim:** Currently `x0_refined` (soft embedding from prior refinement step) only initializes `z0`. Injecting it during the DEQ solve (as a second input signal alongside raw `x0`) gives the solver access to denoised context throughout.
 **Mechanism:** `x = z_in + g_inj * x0 + g_ref * x0_refined` with a separate gate for the refinement signal. At refinement step 0 (no prior prediction), `x0_refined = x0` so it reduces to current behavior.
@@ -682,8 +725,11 @@ failure.
 | 62 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
 | 63 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 62) | — | — |
 | 64 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued | — | — |
-| 65 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 63) | — | — |
-| 66 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 65 | Parcae negative diagonal | Replace β with per-dim learned A=Diag(-exp(a)), guaranteed ρ<1 | H48 | Queued | — | — |
+| 66 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (72KB total). Each iter slightly different | H49 | Queued | — | — |
+| 67 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
+| 68 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 63) | — | — |
+| 69 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
