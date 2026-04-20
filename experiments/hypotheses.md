@@ -720,7 +720,7 @@ failure.
 | 57 | Anderson accel (eval only) | 2-8× eval speedup, K-sweep quality | arXiv:2410.19460 | **DEFERRED** (K-sweep already near-perfect Δ=0.0004) | — | — |
 | 58 | K jitter: drop K=4 | Remove K=4 from {4,6,10} → {6,10} | H40 | **REVERTED** (+0.009, fewer steps outweighed tighter FP) | 1.8329 | +0.0003 |
 | 59 | K jitter: add K=32 | {4,6,10,32} with TBPTT=4. Deep K without removing cheap K | H41 | **REVERTED** (+0.050, -24% steps dominated. K32 optimal in sweep though!) | 1.8733 | +0.0002 |
-| 60 | Independent MLA pre-cond | Separate Block with own weights for z0 (NOT shared_block reuse) | H45 | Queued | — | — |
+| 60 | Independent MLA pre-cond | Separate Block (1 expert, rank 128/192) for dynamic x0 | H45 | **REVERTED** (+0.036, DEQ attention already builds context) | 1.8593 | +0.003 |
 | 61 | Exponential K sampling | K ~ Exp(mean=8), clamped [4,64]. Heavy tail for rare deep K | H46 | Queued | — | — |
 | 62 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
 | 63 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 62) | — | — |
