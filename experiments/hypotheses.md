@@ -515,6 +515,27 @@ for dimensions where δ_d < ε in later iterations. Many dimensions converge by 
 for reconstruction. May only be applicable to forward, not backward.
 **Status:** PROPOSED
 
+### H53: Disable FSQ quantization, keep low-rank MoS projection — PROPOSED
+**Claim:** FSQ (Finite Scalar Quantization) applies level discretization via STE in the
+MoS head's intermediate projection. The STE gradient approximation (round in forward,
+pass-through in backward) introduces a gradient mismatch that may hurt training quality.
+The low-rank projection alone (without quantization) provides sufficient parameter
+compression for the 16MB artifact budget.
+**Mechanism:** Set `fsq_levels=0` (or bypass the FSQ quantize step) in MoSHead while
+keeping the low-rank projection. The projection still maps through a bottleneck rank
+for compression, but values are continuous (not discretized to finite levels).
+**Why it might help:**
+- STE gradient bias: round(x) has zero gradient almost everywhere, STE uses identity
+  gradient as approximation. This mismatch accumulates over training.
+- The low-rank projection already compresses the weight representation. FSQ on top of
+  low-rank may be over-constraining.
+- At int6 quantization for the artifact, the final weights are already discretized.
+  FSQ during training adds a SECOND quantization step that's redundant.
+**Risk:** Low — if FSQ helps quantization robustness, val_bpb may slightly increase.
+But the quant gap (pre-quant vs post-quant) has been tiny (0.002-0.008) in recent iters,
+suggesting FSQ's quantization-awareness isn't needed.
+**Status:** PROPOSED
+
 ### H27: Injection from refinement soft-embed during DEQ solve
 **Claim:** Currently `x0_refined` (soft embedding from prior refinement step) only initializes `z0`. Injecting it during the DEQ solve (as a second input signal alongside raw `x0`) gives the solver access to denoised context throughout.
 **Mechanism:** `x = z_in + g_inj * x0 + g_ref * x0_refined` with a separate gate for the refinement signal. At refinement step 0 (no prior prediction), `x0_refined = x0` so it reduces to current behavior.
@@ -722,15 +743,16 @@ failure.
 | 59 | K jitter: add K=32 | {4,6,10,32} with TBPTT=4. Deep K without removing cheap K | H41 | **REVERTED** (+0.050, -24% steps dominated. K32 optimal in sweep though!) | 1.8733 | +0.0002 |
 | 60 | Independent MLA pre-cond | Separate Block (1 expert, rank 128/192) for dynamic x0 | H45 | **REVERTED** (+0.036, DEQ attention already builds context) | 1.8593 | +0.003 |
 | 61 | Exponential K sampling | K ~ Exp(mean=8), clamped [4,64]. Heavy tail for rare deep K | H46 | Queued | — | — |
-| 62 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
-| 63 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 62) | — | — |
-| 64 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued | — | — |
-| 65 | Parcae negative diagonal | Replace β with per-dim learned A=Diag(-exp(a)), guaranteed ρ<1 | H48 | Queued | — | — |
-| 66 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (72KB total). Each iter slightly different | H49 | Queued | — | — |
-| 67 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
-| 68 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward may suffice for well-converged FP | H51 | Queued | — | — |
-| 69 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 63) | — | — |
-| 70 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 62 | Disable FSQ quantization | Keep low-rank MoS projection but remove FSQ level discretization | H53 | Queued | — | — |
+| 63 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
+| 64 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 63) | — | — |
+| 65 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued | — | — |
+| 66 | Parcae negative diagonal | Replace β with per-dim learned A=Diag(-exp(a)), guaranteed ρ<1 | H48 | Queued | — | — |
+| 67 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (72KB total). Each iter slightly different | H49 | Queued | — | — |
+| 68 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
+| 69 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward may suffice for well-converged FP | H51 | Queued | — | — |
+| 70 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 64) | — | — |
+| 71 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
