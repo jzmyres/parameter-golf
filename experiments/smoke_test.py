@@ -84,8 +84,6 @@ def _get_expert_diagnostics(model):
 
 def smoke_test(num_steps: int = 300, eval_every: int = 50):
     args = Hyperparameters()
-    # Build model with ALL Hyperparameters fields — must match main() construction
-    # to catch OOM, compile errors, and shape mismatches before long training runs.
     model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
@@ -94,26 +92,10 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
-        deq_backward="revdeq", deq_bptt_k=args.deq_bptt_k,
-        block_ortho_aux_coef=args.block_ortho_aux_coef,
-        block_ortho_aux_every=args.block_ortho_aux_every,
-        block_ortho_aux_tokens=args.block_ortho_aux_tokens,
+        deq_backward="revdeq",
         router_scoring=args.router_scoring,
-        num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
-        lyapunov_coef=args.lyapunov_coef,
-        lyapunov_gamma=args.lyapunov_gamma,
-        lyapunov_warmup_frac=args.lyapunov_warmup_frac,
-        precond_block_enabled=args.precond_block_enabled,
-        precond_num_experts=args.precond_num_experts,
-        precond_attn_rank=args.precond_attn_rank,
-        precond_mlp_rank=args.precond_mlp_rank,
+        num_experts=args.num_experts,
     ).cuda()
-    # Compile block.forward like main() does — catches compile errors early.
-    try:
-        model.shared_block.forward = torch.compile(model.shared_block.forward)
-        print(f"  smoke: compiled block.forward")
-    except Exception as e:
-        print(f"  smoke: compile skipped ({e})")
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     losses, ntp_losses, ctp_losses = [], [], []
@@ -210,13 +192,9 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         print("FAIL: reconstruction error missing in RevDEQ mode")
         ok = False
     else:
-        # Absolute ceiling for compiled block.forward + RevDEQ:
-        # torch.compile fuses ops with different bf16 rounding than eager mode.
-        # RevDEQ reconstruction sees different numerics → recon_err ~2-5 is normal
-        # for compiled training (verified: baseline iter 55 trained at recon_err ~4
-        # and achieved val_bpb=1.8236). Only flag catastrophic breakdown (>20).
-        if any(e > 20.0 for e in recon_errors):
-            print(f"FAIL: reconstruction error > 20.0 (got {max(recon_errors):.2e}) — reversibility broken")
+        # Absolute ceiling: > 1e-1 means reversibility is clearly broken even for bf16.
+        if any(e > 1e-1 for e in recon_errors):
+            print(f"FAIL: reconstruction error > 1e-1 (got {max(recon_errors):.2e}) — reversibility broken")
             ok = False
 
         # Divergence check: last > 5x first means recon is growing unboundedly.

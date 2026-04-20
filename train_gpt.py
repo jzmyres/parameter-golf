@@ -192,9 +192,9 @@ class Hyperparameters:
     # Creates dynamic context-aware embedding for DEQ. Separate weights from DEQ block.
     # x0 = precond_block(emb, emb) + emb (residual to raw embedding).
     precond_block_enabled = True
-    precond_num_experts = 1       # single expert — no routing overhead for pre-conditioning
-    precond_attn_rank = 128       # match DEQ block's attn rank
-    precond_mlp_rank = 192        # match DEQ block's MLP rank
+    precond_num_experts = 4       # fewer experts than DEQ block (lightweight)
+    precond_attn_rank = 64        # lower rank for pre-conditioning
+    precond_mlp_rank = 96         # lower rank for pre-conditioning
 
     # DEQ solver
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
@@ -2538,10 +2538,6 @@ def main() -> None:
     # RevDEQ O(1) backward memory peaks at 38 GB (80% of 48 GB L40S) with B=64.
     # 16% throughput gain from fewer micro-steps + better GPU utilization.
     _base_grad_accum = max(1, math.ceil(4 / world_size))
-    # Precond block stores full autograd activations. Combined with Hutchinson
-    # VJP's FlashAttention backward, OOMs at B=32 on L40S. Double grad_accum.
-    if getattr(args, "precond_block_enabled", False):
-        _base_grad_accum *= 2
     # Unroll O(K) stores full autograd graph (43+ GB) → needs 8× to shrink B.
     if getattr(args, "deq_backward", "revdeq") == "unroll":
         grad_accum_steps = _base_grad_accum * 8
@@ -2773,14 +2769,6 @@ def main() -> None:
         except Exception as e:
             log0(f"block.forward compile failed ({e}), running eager")
 
-    # Compile precond block forward (same architecture as shared_block, same compile approach).
-    if base_model.precond_block is not None:
-        try:
-            base_model.precond_block.forward = torch.compile(base_model.precond_block.forward, dynamic=False)
-            log0("compiled precond_block.forward")
-        except Exception as e:
-            log0(f"precond_block compile failed ({e}), running eager")
-
     # Compile MoS head forward (5.45× speedup: 34.7ms → 6.4ms at B=32).
     # Called once per micro-step (not inside DEQ loop), no chaining issue.
     try:
@@ -2791,8 +2779,7 @@ def main() -> None:
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False,
-            find_unused_parameters=(args.deq_backward == "unroll" and args.deq_bptt_k > 0)
-                or args.precond_block_enabled,
+            find_unused_parameters=(args.deq_backward == "unroll" and args.deq_bptt_k > 0),
             bucket_cap_mb=50)  # T-opt 22: larger buckets → fewer all_reduce calls (~10M params fit in 1 bucket)
         if distributed else base_model
     )

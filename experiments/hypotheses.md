@@ -515,24 +515,6 @@ for dimensions where δ_d < ε in later iterations. Many dimensions converge by 
 for reconstruction. May only be applicable to forward, not backward.
 **Status:** PROPOSED
 
-### H52: Full transformer pre-conditioning (MLA + FFN) — PROPOSED
-**Claim:** Iter 60's pre-conditioning block uses the existing Block architecture which
-already includes both MLA attention AND MLP/FFN. However, if iter 60 uses MLA-only (no FFN),
-adding FFN creates a complete DeepSeek-style transformer layer for pre-conditioning.
-**Mechanism:** The Block.forward already computes: `delta = attn_mix + mlp_mix`, then
-`output = x0 + delta`. So iter 60's Block already includes FFN (MLP experts). Iter 70
-tests whether the FFN component is doing useful work by comparing:
-- Iter 60 result (full Block = MLA + FFN)  
-- Ablation: MLA-only pre-conditioning (attention without FFN)
-If iter 60 improves val_bpb, iter 70 verifies the FFN contribution. If the FFN adds
-meaningful nonlinear transformation to the dynamic embedding, keep it. If MLA attention
-alone suffices (linear mixing of token representations), the FFN params could be
-reallocated elsewhere.
-**Note:** Current iter 60 implementation already uses the full Block (MLA + FFN + routing).
-Iter 70 would be an ablation to test FFN-only or MLA-only variants if iter 60 succeeds.
-If iter 60 fails, iter 70 tests the alternative decomposition.
-**Status:** PROPOSED
-
 ### H27: Injection from refinement soft-embed during DEQ solve
 **Claim:** Currently `x0_refined` (soft embedding from prior refinement step) only initializes `z0`. Injecting it during the DEQ solve (as a second input signal alongside raw `x0`) gives the solver access to denoised context throughout.
 **Mechanism:** `x = z_in + g_inj * x0 + g_ref * x0_refined` with a separate gate for the refinement signal. At refinement step 0 (no prior prediction), `x0_refined = x0` so it reduces to current behavior.
@@ -748,8 +730,7 @@ failure.
 | 67 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
 | 68 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward may suffice for well-converged FP | H51 | Queued | — | — |
 | 69 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 63) | — | — |
-| 70 | Full transformer pre-cond | Add FFN to MLA pre-cond output (full DeepSeek block: MLA+FFN) | H52 | Queued (after 60) | — | — |
-| 71 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 70 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
