@@ -1572,6 +1572,8 @@ class MoSHead(nn.Module):
             return float(max_pairwise_abs_cosine(groups).item())
 
     def _fsq(self, x: Tensor) -> Tensor:
+        if self.fsq_levels <= 1:
+            return x  # Phase 9 iter 62 (H53): disabled FSQ, keep low-rank only
         return _fsq_ste(x, self.fsq_levels, self.training)
 
     def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
@@ -2068,7 +2070,7 @@ class GPT(nn.Module):
         self.lyapunov_warmup_frac = float(lyapunov_warmup_frac)
         self._lyapunov_v_buf: Tensor | None = None  # persistent power-iter vector (EMA)
         self._lyapunov_rho_hat: float = 0.0  # always Python float (no GPU sync on read)
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0)  # Phase 9 iter 62 (H53): disabled FSQ
         self.final_norm = RMSNorm(model_dim)
         # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
         # the parameter-free `_rms_norm` in _encode.  Tests if the learnable
