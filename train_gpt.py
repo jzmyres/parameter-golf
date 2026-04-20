@@ -1703,6 +1703,18 @@ class Block(nn.Module):
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
                                          expert_rank=attn_expert_rank, router=self.router)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
+        # Phase 9 iter 67 (H49): per-iteration LoRA adapters.
+        # Each DEQ iteration gets a tiny rank-4 offset: delta_lora = B_k @ (A_k @ h).
+        # Allows each iteration to specialize without breaking weight sharing.
+        # _iter_lora_idx set by the DEQ solver to indicate current iteration.
+        self.iter_lora_max_k = 16  # max iterations supported (K>16 reuses last LoRA)
+        lora_r = 4
+        self.iter_lora_A = nn.Parameter(torch.zeros(self.iter_lora_max_k, lora_r, dim))
+        self.iter_lora_B = nn.Parameter(torch.zeros(self.iter_lora_max_k, dim, lora_r))
+        # Zero-init both → identity at start (no LoRA contribution).
+        # Use register_buffer for the index tensor — avoids torch.compile
+        # recompilation from integer attribute guards.
+        self.register_buffer('_iter_lora_idx_t', torch.zeros((), dtype=torch.long), persistent=False)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
         self._attn_gate_call_track: list[float] = []
@@ -1797,6 +1809,14 @@ class Block(nn.Module):
         # Dense mixture Δ = attn_mix + mlp_mix.
         delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
+        # Phase 9 iter 67 (H49): per-iteration LoRA offset.
+        # Each DEQ iteration k applies: delta += B_k @ (A_k @ h)
+        # Use tensor indexing (not Python int) to avoid torch.compile recompilation.
+        k_idx = torch.clamp(self._iter_lora_idx_t, 0, self.iter_lora_max_k - 1)
+        A_k = self.iter_lora_A[k_idx]  # (lora_r, dim)
+        B_k = self.iter_lora_B[k_idx]  # (dim, lora_r)
+        delta = delta + (h @ A_k.t() @ B_k.t())  # (B, T, dim)
+
         # T_θ(z, x_0) = x_0 + Δ_θ(z, x_0)
         raw_out = x0 + delta
 
@@ -1858,8 +1878,9 @@ class RevDEQFunction(torch.autograd.Function):
 
         with torch.no_grad():
             out_y = None
-            for _ in range(K):
+            for _iter_idx in range(K):
                 z_prev_state = z_state
+                f_theta._iter_lora_idx_t.fill_(_iter_idx)  # Phase 9 iter 67: per-iteration LoRA index
                 y_acc = y_state.to(acc_dtype) * beta_inv
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
                     out_z = f_theta(z_state.to(compute_dtype), x0)
@@ -1925,7 +1946,9 @@ class RevDEQFunction(torch.autograd.Function):
         diag_vjp_per_iter: list[tuple[float, float]] = []
         do_vjp_diag = bool(getattr(ctx, "do_recon_diag", False))
 
-        for _ in range(K_bwd):
+        for _bwd_idx in range(K_bwd):
+            # Phase 9 iter 67: set per-iteration LoRA index (reverse order)
+            f_theta._iter_lora_idx_t.fill_(K - 1 - _bwd_idx)
             y_local = y_next64.detach().to(compute_dtype).requires_grad_()
             x_local = x0.detach().to(x0.dtype).requires_grad_()
             with torch.enable_grad():
@@ -2162,8 +2185,9 @@ class GPT(nn.Module):
             z_acc = z_init.to(acc_dtype)
             z = z_init
             z_prev = z
-            for _ in range(K):
+            for _unroll_idx in range(K):
                 z_prev = z
+                f_theta._iter_lora_idx_t.fill_(_unroll_idx)
                 f_z = f_theta(z, x0)
                 y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
                 y = y_acc.to(dtype)
