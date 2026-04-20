@@ -188,13 +188,6 @@ class Hyperparameters:
     # Complements Hutchinson (which penalizes ||J||²_F at infinitesimal scale).
     denoising_coef = 0.01      # weight of denoising loss
     denoising_noise_std = 0.01 # σ: Gaussian noise scale added to z*
-    # Phase 9 iter 60: Independent MLA pre-conditioning block (H45).
-    # Creates dynamic context-aware embedding for DEQ. Separate weights from DEQ block.
-    # x0 = precond_block(emb, emb) + emb (residual to raw embedding).
-    precond_block_enabled = True
-    precond_num_experts = 4       # fewer experts than DEQ block (lightweight)
-    precond_attn_rank = 64        # lower rank for pre-conditioning
-    precond_mlp_rank = 96         # lower rank for pre-conditioning
 
     # DEQ solver
     # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
@@ -2036,11 +2029,7 @@ class GPT(nn.Module):
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
-                 lyapunov_warmup_frac: float = 0.1,
-                 precond_block_enabled: bool = False,
-                 precond_num_experts: int = 4,
-                 precond_attn_rank: int = 64,
-                 precond_mlp_rank: int = 96):
+                 lyapunov_warmup_frac: float = 0.1):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
@@ -2081,19 +2070,6 @@ class GPT(nn.Module):
         self._lyapunov_rho_hat: float = 0.0  # always Python float (no GPU sync on read)
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)
         self.final_norm = RMSNorm(model_dim)
-        # Phase 9 iter 60: independent MLA pre-conditioning block (H45).
-        # Creates dynamic context-aware embedding for DEQ. Separate weights.
-        if precond_block_enabled:
-            pc_e = int(precond_num_experts)
-            pc_ar = int(precond_attn_rank)
-            pc_mr = int(precond_mlp_rank)
-            self.precond_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
-                                       rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
-                                       attn_expert_rank=pc_ar, mlp_expert_rank=pc_mr,
-                                       num_experts=pc_e, num_shared_experts=0,
-                                       router_scoring=router_scoring)
-        else:
-            self.precond_block = None
         # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
         # the parameter-free `_rms_norm` in _encode.  Tests if the learnable
         # weight there was doing useful work.  Keep removed if val_bpb
@@ -2337,12 +2313,6 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         # Phase 4.5 22-rm-embed-post: back to parameter-free _rms_norm here.
         x = _rms_norm(x)
-        # Phase 9 iter 60: independent MLA pre-conditioning (H45).
-        # Creates dynamic context-aware x0 for DEQ. Residual to raw embedding.
-        # precond_block.forward(z, x0) = x0 + Δ(z, x0), so with z=x, x0=x:
-        # output = x + Δ(x, x) — already has residual by T_θ construction.
-        if self.precond_block is not None:
-            x = self.precond_block(x, x)
         x = self._run_backbone(x)
         return self.final_norm(x)
 
@@ -2725,10 +2695,6 @@ def main() -> None:
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
-        precond_block_enabled=args.precond_block_enabled,
-        precond_num_experts=args.precond_num_experts,
-        precond_attn_rank=args.precond_attn_rank,
-        precond_mlp_rank=args.precond_mlp_rank,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
