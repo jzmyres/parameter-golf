@@ -390,6 +390,31 @@ is the identity signal that x0 falls back to when pre-conditioning is unhelpful.
 smaller head dim. Per-expert expressiveness decreases (compensated by aggregate rank).
 **Status:** PROPOSED
 
+### H44: Full-rank expert internals at dim r (remove low-rank factorization) — PROPOSED
+**Claim:** With H43 moving expert computation to dim r, low-rank factorization inside
+experts becomes unnecessary. Expert linear layers should be full-rank at dim r instead
+of factored (r→rank→output). This is simultaneously simpler, more expressive, and faster.
+**Current design (low-rank at D=768):**
+```
+Q: x(768) → A(768×128) → B(128×out)   # two matmuls, rank=128, params=768×128+128×out
+```
+**Proposed (full-rank at r=192):**
+```
+x(768) → down(768×192) → z(192) → W(192×out)   # one matmul, full rank=192, params=192×out
+```
+**Three simultaneous wins:**
+1. **More expressive**: full rank 192 > artificially limited rank 128. No information
+   bottleneck within the expert.
+2. **Fewer FLOPs**: one matmul instead of two per layer. Fewer kernel launches, better
+   GPU utilization. With torch.compile, fusing one large GEMM > two small GEMMs.
+3. **Fewer params**: 192×192=37K vs 768×128+128×192=123K per expert Q. The small
+   dimension r naturally controls params — the factorization was redundant.
+**Simplifies hyperparameters:** `attn_expert_rank` and `mlp_expert_rank` become unnecessary.
+Expert capacity controlled by single knob: r (the expert subspace dimension).
+**Depends on:** H43 (low-dim expert computation). Without H43, full-rank at D=768 would
+explode params (768²=590K per expert per layer).
+**Status:** PROPOSED
+
 ### H27: Injection from refinement soft-embed during DEQ solve
 **Claim:** Currently `x0_refined` (soft embedding from prior refinement step) only initializes `z0`. Injecting it during the DEQ solve (as a second input signal alongside raw `x0`) gives the solver access to denoised context throughout.
 **Mechanism:** `x = z_in + g_inj * x0 + g_ref * x0_refined` with a separate gate for the refinement signal. At refinement step 0 (no prior prediction), `x0_refined = x0` so it reduces to current behavior.
@@ -597,8 +622,9 @@ failure.
 | 59 | K jitter: raise K_max to 32 | {6,10,32} with TBPTT=4. Deep K trains true FP; TBPTT keeps backward O(4) | H41 | Queued | — | — |
 | 60 | Full-rank MLA pre-cond | Replace conv1d with full MLA block for z0 (DeepSeek non-MoE layer) | H42 | Queued | — | — |
 | 61 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
-| 62 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 61) | — | — |
-| 63 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 62 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r is cheap + expressive) | H44 | Queued (after 61) | — | — |
+| 63 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 62) | — | — |
+| 64 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
