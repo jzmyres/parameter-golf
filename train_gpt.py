@@ -183,7 +183,7 @@ class Hyperparameters:
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
     # power-iteration VJP. One boundary forward + one VJP per step.
     lyapunov_coef = 0.01       # λ_jac: weight of hinge penalty (small: ~1% of task loss)
-    lyapunov_gamma = 0.9       # γ: target spectral radius (< 1)
+    lyapunov_gamma = 0.97      # iter 74b: raise from 0.9 — preserve faster warmup observed at γ=0.95 (H57)
     lyapunov_warmup_frac = 0.05 # T-opt 20: shorter warmup (10%→5%) — penalty near zero during warmup anyway
     # Phase 9 iter 55: Denoising regularization (HyDRA 2026, Efficient DEQ 2025).
     # ||f(z*+ε, x0) - z*||² penalizes contraction failure at finite perturbation.
