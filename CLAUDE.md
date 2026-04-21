@@ -86,7 +86,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step) |
 | deq_k_jitter_set | (4, 6, 10) (DEQ iteration counts sampled per step) |
 | lyapunov_coef | 0.01 (λ_jac: Hutchinson-Frobenius penalty weight) |
-| lyapunov_gamma | 0.9 (target spectral radius threshold) |
+| lyapunov_gamma | 0.97 (target spectral radius threshold) |
 | lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
 | denoising_coef | 0.01 (HyDRA denoising regularization weight) |
 | denoising_noise_std | 0.01 (Gaussian noise σ for denoising penalty) |

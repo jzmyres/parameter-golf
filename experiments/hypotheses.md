@@ -764,12 +764,22 @@ failure.
 | 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | **PROMOTED ★** (val_bpb -0.003, every K improved, zero-cost change) | 1.5225 | +0.009 |
 | 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | **REVERTED** (wash: +0.0005, γ=0.9→0.95 has no measurable effect. Penalty too small at λ=0.01) | 1.5230 | +0.010 |
 | 71g | Learnable RMSNorm everywhere | Q/K norms + embed + MoS + bigram (removed soft_embed_norm: DDP unused param) | project constraint | **PROMOTED ★** (val_bpb -0.005, 10% faster, K128 Δ=0.009) | 1.5254 | +0.009 |
+| 74b | Lyapunov γ 0.9→0.97 | Push warmup advantage further (γ=0.95 was -0.012@200) | H57 | **PROMOTED ★** (val_bpb -0.008, every K improved -0.006 to -0.008, K8 breaks 1.50) | 1.5150 | +0.008 |
+| 74c | WD 0.30→0.01 | Test floor — quant gap may shrink with learnable norms | H54 | Queued | — | — |
+| 74d | Remove β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5} for reversibility (3.3× recon amp) | H58 | Queued | — | — |
+| 74e | Restore squared gate leaky_relu(0.5)² | Phase 6 remnant: original activation was more expressive | L9 | Queued | — | — |
+| 74f | Independent shared gates (attn vs mlp) | Fix 1-dim shared gate → 2-dim for independent control | arch | Queued | — | — |
+| 74g | Remove x0 residual: T_θ = Δ(z,x0) | More expressive FP equation (x0 still enters via state_norm) | arch | Queued | — | — |
+| 74h | Remove attn_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
+| 74i | Remove mlp_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
+| 74j | Remove state_norm: h = z + x0 | Redundant with downstream per-output norms? | arch | Queued | — | — |
+| 74k | Remove bigram proj_norm | Redundant with embed_norm downstream | arch | Queued | — | — |
 | 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
-| 76 | Self-refinement (num_refinements=1) | Enable refinement: predict→soft_embed→re-solve | H16 | Queued | — | — |
 | 77 | Residual injection (x0 - z error signal) | Inject corrective error instead of raw x0 | H25 | Queued | — | — |
 | 78 | FSQ-based weight QAT | STE on ALL weight matrices (close 0.029 quant gap) | H28 | Queued | — | — |
 | 79 | Per-iteration injection schedule | K separate learned injection strengths | H24 | Queued | — | — |
 | 80 | Refinement soft-embed injection during DEQ | Inject x0_refined as second signal alongside x0 | H27 | Queued | — | — |
+| 76 | Self-refinement (num_refinements=1) | Enable refinement: predict→soft_embed→re-solve (moved to end) | H16 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
