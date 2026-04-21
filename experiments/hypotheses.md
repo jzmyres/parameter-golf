@@ -757,6 +757,7 @@ failure.
 | 71 | Reduce weight_decay 1.08→0.3 | WD=1.08 was biggest expressiveness killer | H54 | **PROMOTED ★** (val_bpb -0.263!!! Largest single improvement ever) | 1.5302 | +0.007 |
 | 71b | Reduce weight_decay 0.30→0.10 | Further WD reduction if 0.30 improves | H54 | Queued (after 71) | — | — |
 | 71c | Reduce weight_decay 0.10→0.01 | Near-zero WD if 0.10 improves. Lyapunov is sole contraction source | H54 | Queued (after 71b) | — | — |
+| 71d | Drop β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5}. β=0.7 causes 3.3× recon amplification with low WD | H58 | Queued (after WD sweep) | — | — |
 | 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale (no norm) | H55 | Queued | — | — |
 | 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | Queued | — | — |
 | 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | Queued | — | — |
