@@ -760,7 +760,7 @@ failure.
 | 71d | Drop β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5} | H58 | **REVERTED** (+0.044, less jitter diversity hurt more than recon fix helped) | 1.5744 | +0.017 |
 | 71e | Re-enable FSQ, no bounding | FSQ with round+STE but NO tanh bounding (tanh causes saturation) | H59 | Queued (after 71d) | — | — |
 | 71f | FSQ with clamp(-1,1) | If no-bound fails, test hard clamp instead of tanh (no saturation) | H59 | Queued (after 71e) | — | — |
-| 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale (no norm) | H55 | Queued | — | — |
+| 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale | H55 | **REVERTED** (+0.024 val_bpb, K128 Δ=0.001 tightest ever but val regressed) | 1.5495 | +0.001 |
 | 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | Queued | — | — |
 | 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | Queued | — | — |
 | 71g | Learnable RMSNorm everywhere | Q/K norms + embed + MoS + bigram (removed soft_embed_norm: DDP unused param) | project constraint | **PROMOTED ★** (val_bpb -0.005, 10% faster, K128 Δ=0.009) | 1.5254 | +0.009 |

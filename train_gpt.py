@@ -157,7 +157,7 @@ class Hyperparameters:
     beta1 = 0.85
     beta2 = 0.90
     adam_eps = 1e-8
-    grad_clip_norm = 0.3
+    grad_clip_norm = 1.0  # iter 73: relax from 0.3 — Lyapunov provides soft contraction (H56)
     weight_decay = 0.30  # Phase 9 iter 71: reduce from 1.08 (arch review: biggest expressiveness killer). Lyapunov+denoising provide contraction; WD was redundant.
     tied_embed_init_std = 0.005
 
