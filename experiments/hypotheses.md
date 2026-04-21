@@ -763,7 +763,7 @@ failure.
 | 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale (no norm) | H55 | Queued | — | — |
 | 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | Queued | — | — |
 | 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | Queued | — | — |
-| 71g | Learnable RMSNorm everywhere | Q/K norms + embed + MoS + bigram (removed soft_embed_norm: DDP unused param) | project constraint | **TRAINING** | — | — |
+| 71g | Learnable RMSNorm everywhere | Q/K norms + embed + MoS + bigram (removed soft_embed_norm: DDP unused param) | project constraint | **PROMOTED ★** (val_bpb -0.005, 10% faster, K128 Δ=0.009) | 1.5254 | +0.009 |
 | 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 | 76 | Self-refinement (num_refinements=1) | Enable refinement: predict→soft_embed→re-solve | H16 | Queued | — | — |
 | 77 | Residual injection (x0 - z error signal) | Inject corrective error instead of raw x0 | H25 | Queued | — | — |
