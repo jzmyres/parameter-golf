@@ -2093,7 +2093,6 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm(model_dim)
         # Phase 9 iter 71g: ALL norms learnable (project constraint).
         self.embed_norm = RMSNorm(model_dim)
-        self.soft_embed_norm = RMSNorm(model_dim)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -2148,7 +2147,7 @@ class GPT(nn.Module):
                 emb = F.embedding(flat_idx[s:e], W)
                 flat_out[s:e] = (flat_p[s:e].unsqueeze(-1) * emb).sum(dim=1)
             soft_embed = flat_out.reshape(B, T, d)
-            soft_embed = self.soft_embed_norm(soft_embed.to(dtype=z.dtype))
+            soft_embed = soft_embed.to(dtype=z.dtype)
         return soft_embed
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):

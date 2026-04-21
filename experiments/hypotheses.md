@@ -763,7 +763,13 @@ failure.
 | 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale (no norm) | H55 | Queued | — | — |
 | 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | Queued | — | — |
 | 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | Queued | — | — |
+| 71g | Learnable RMSNorm everywhere | Q/K norms + embed + MoS + bigram (removed soft_embed_norm: DDP unused param) | project constraint | **TRAINING** | — | — |
 | 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 76 | Self-refinement (num_refinements=1) | Enable refinement: predict→soft_embed→re-solve | H16 | Queued | — | — |
+| 77 | Residual injection (x0 - z error signal) | Inject corrective error instead of raw x0 | H25 | Queued | — | — |
+| 78 | FSQ-based weight QAT | STE on ALL weight matrices (close 0.029 quant gap) | H28 | Queued | — | — |
+| 79 | Per-iteration injection schedule | K separate learned injection strengths | H24 | Queued | — | — |
+| 80 | Refinement soft-embed injection during DEQ | Inject x0_refined as second signal alongside x0 | H27 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
