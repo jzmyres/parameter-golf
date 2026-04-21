@@ -1682,8 +1682,10 @@ class Block(nn.Module):
                  router_scoring: str = "linear", **kwargs):
         super().__init__()
         self.state_norm = RMSNorm(dim)
-        self.attn_post_mix_norm = RMSNorm(dim)
-        self.mlp_post_mix_norm = RMSNorm(dim)
+        # Iter 72: replace post-mix RMSNorm with learned scalar scale.
+        # RMSNorm normalizes direction AND scales — scalar preserves direction.
+        self.attn_post_mix_scale = nn.Parameter(torch.ones(dim))
+        self.mlp_post_mix_scale = nn.Parameter(torch.ones(dim))
         # Phase 9 iter 51 (DeepSeek shared expert): first num_shared_experts
         # experts are always-on with per-token sigmoid gate (like routed experts).
         # T_θ = x0 + g_s·E_shared(h) + Σ w_j E_routed_j(h)
@@ -1797,12 +1799,12 @@ class Block(nn.Module):
             attn_mix = attn_shared + attn_routed
         else:
             attn_mix = (attn_expert_out * w_attn.unsqueeze(-1)).sum(dim=2)
-        attn_mix = self.attn_post_mix_norm(attn_mix)
+        attn_mix = attn_mix * self.attn_post_mix_scale
 
         # MLP experts (same split: shared gated + routed)
         mlp_mix = self.mlp.mix_experts(h, w_mlp, pre_normed=True,
                                         num_shared=S, shared_gate=g_s if S > 0 else None)
-        mlp_mix = self.mlp_post_mix_norm(mlp_mix)
+        mlp_mix = mlp_mix * self.mlp_post_mix_scale
 
         # Dense mixture Δ = attn_mix + mlp_mix.
         delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
