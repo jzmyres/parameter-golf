@@ -1503,12 +1503,13 @@ class MLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 def _fsq_ste(x: Tensor, num_levels: int, training: bool) -> Tensor:
-    x_bounded = torch.tanh(x)
-    step = 2.0 / (num_levels - 1)
+    # No bounding (iter 71e): quantize raw values without tanh saturation.
+    # Levels are centered at integers: round to nearest int, clamp to [-L, L] where L = (num_levels-1)//2.
+    half = (num_levels - 1) // 2
     if training:
-        x_q = torch.round(x_bounded / step) * step
-        return x_bounded + (x_q - x_bounded).detach()
-    return torch.round(x_bounded / step) * step
+        x_q = torch.clamp(torch.round(x), -half, half)
+        return x + (x_q - x).detach()  # STE: forward uses quantized, backward uses identity
+    return torch.clamp(torch.round(x), -half, half)
 
 
 # ---------------------------------------------------------------------------
@@ -2089,7 +2090,7 @@ class GPT(nn.Module):
         # tensor so the Hutchinson penalty block stays pure-tensor (no .item()
         # GPU→CPU sync in the hot path). Initialized lazily on first use.
         self._lyapunov_rho_hat_buf: Tensor | None = None
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0)  # Phase 9 iter 62 (H53): disabled FSQ
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=8)  # Phase 9 iter 71e: re-enable FSQ, no-bounding (H59)
         self.final_norm = RMSNorm(model_dim)
         # Phase 9 iter 71g: ALL norms learnable (project constraint).
         self.embed_norm = RMSNorm(model_dim)
