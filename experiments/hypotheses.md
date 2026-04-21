@@ -755,7 +755,8 @@ failure.
 | 70 | L2→softmax routing | Replace L2+tanh logits with linear dot-product (standard MoE) | H54 | **PROMOTED ★** (val_bpb -0.024, expert_iter_range 20× higher) | 1.7934 | +0.001 |
 | 70 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 64) | — | — |
 | 71 | Reduce weight_decay 1.08→0.3 | WD=1.08 is biggest expressiveness killer. Pair with stronger balance loss | H54 | Queued | — | — |
-| 71b | Reduce weight_decay 0.30→0.10 | Further WD reduction if 0.30 improves. Test near-minimal WD | H54 | Queued (after 71) | — | — |
+| 71b | Reduce weight_decay 0.30→0.10 | Further WD reduction if 0.30 improves | H54 | Queued (after 71) | — | — |
+| 71c | Reduce weight_decay 0.10→0.01 | Near-zero WD if 0.10 improves. Lyapunov is sole contraction source | H54 | Queued (after 71b) | — | — |
 | 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale (no norm) | H55 | Queued | — | — |
 | 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | Queued | — | — |
 | 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | Queued | — | — |
