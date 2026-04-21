@@ -757,7 +757,7 @@ failure.
 | 71 | Reduce weight_decay 1.08→0.3 | WD=1.08 was biggest expressiveness killer | H54 | **PROMOTED ★** (val_bpb -0.263!!! Largest single improvement ever) | 1.5302 | +0.007 |
 | 71b | Reduce weight_decay 0.30→0.10 | Further WD reduction — better fast but worse post-quant | H54 | **REVERTED** (+0.051 post-quant, quant gap 0.047 vs 0.029. WD=0.30 optimal) | 1.5810 | +0.014 |
 | 71c | ~~Reduce weight_decay 0.10→0.01~~ | ~~Cancelled: WD=0.10 already regresses post-quant~~ | H54 | CANCELLED | — | — |
-| 71d | Drop β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5}. β=0.7 causes 3.3× recon amplification with low WD | H58 | **RUNNING** | — | — |
+| 71d | Drop β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5} | H58 | **REVERTED** (+0.044, less jitter diversity hurt more than recon fix helped) | 1.5744 | +0.017 |
 | 71e | Re-enable FSQ, no bounding | FSQ with round+STE but NO tanh bounding (tanh causes saturation) | H59 | Queued (after 71d) | — | — |
 | 71f | FSQ with clamp(-1,1) | If no-bound fails, test hard clamp instead of tanh (no saturation) | H59 | Queued (after 71e) | — | — |
 | 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale (no norm) | H55 | Queued | — | — |
