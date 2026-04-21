@@ -762,7 +762,7 @@ failure.
 | 71f | FSQ with clamp(-1,1) | If no-bound fails, test hard clamp instead of tanh (no saturation) | H59 | Queued (after 71e) | — | — |
 | 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale | H55 | **REVERTED** (+0.024 val_bpb, K128 Δ=0.001 tightest ever but val regressed) | 1.5495 | +0.001 |
 | 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | **PROMOTED ★** (val_bpb -0.003, every K improved, zero-cost change) | 1.5225 | +0.009 |
-| 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | Queued | — | — |
+| 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | **REVERTED** (wash: +0.0005, γ=0.9→0.95 has no measurable effect. Penalty too small at λ=0.01) | 1.5230 | +0.010 |
 | 71g | Learnable RMSNorm everywhere | Q/K norms + embed + MoS + bigram (removed soft_embed_norm: DDP unused param) | project constraint | **PROMOTED ★** (val_bpb -0.005, 10% faster, K128 Δ=0.009) | 1.5254 | +0.009 |
 | 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 | 76 | Self-refinement (num_refinements=1) | Enable refinement: predict→soft_embed→re-solve | H16 | Queued | — | — |
