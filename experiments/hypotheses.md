@@ -751,7 +751,8 @@ failure.
 | 67 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (98K params). Each iter specializes | H49 | **REVERTED** (not principled, doesn't generalize to K>16) | 1.8149 | +0.001 |
 | 68 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
 | 69 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward, 43% faster, 76% more steps | H51 | **REVERTED** (+0.021 post-quant, fast only +0.013) | 1.8396 | -0.002 (K128 best!) |
-| 69b | Reduce TBPTT 4→2 | 2-step backward: 29% faster, 40% more steps (1049 vs 747) | H51 | **PROMOTED ★** (val_bpb -0.001, 30% throughput gain) | 1.8169 | +0.002 |
+| 69b | Reduce TBPTT 4→2 | 2-step backward: 29% faster, 40% more steps (1049 vs 747) | H51 | **KEPT** (val_bpb -0.001, 30% throughput gain) | 1.8169 | +0.002 |
+| 70 | L2→softmax routing | Replace L2+tanh logits with linear dot-product (standard MoE) | H54 | **PROMOTED ★** (val_bpb -0.024, expert_iter_range 20× higher) | 1.7934 | +0.001 |
 | 70 | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | Queued (after 64) | — | — |
 | 71 | Reduce weight_decay 1.08→0.3 | WD=1.08 is biggest expressiveness killer. Pair with stronger balance loss | H54 | Queued | — | — |
 | 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale (no norm) | H55 | Queued | — | — |
