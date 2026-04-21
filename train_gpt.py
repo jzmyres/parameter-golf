@@ -771,26 +771,17 @@ def _frob_normalize(t: Tensor, eps: float = 1e-8) -> Tensor:
     return (flat / (flat.norm() + eps)).reshape(t.shape)
 
 
-def _rms_norm(x: Tensor, eps: float = 1e-6) -> Tensor:
-    return F.rms_norm(x, (x.size(-1),), eps=eps)
-
-
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, *, affine: bool = True):
+    """Learnable RMSNorm. ALL norms in the model MUST use this class (project constraint)."""
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = int(dim)
         self.eps = eps
-        if affine:
-            self.weight = nn.Parameter(torch.ones(self.dim, dtype=torch.float32))
-        else:
-            self.register_parameter("weight", None)
+        self.weight = nn.Parameter(torch.ones(self.dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        y = _rms_norm(x, self.eps)
-        w = getattr(self, "weight", None)
-        if isinstance(w, torch.Tensor):
-            return y * w.to(dtype=y.dtype)
-        return y
+        y = F.rms_norm(x, (x.size(-1),), eps=self.eps)
+        return y * self.weight.to(dtype=y.dtype)
 
 
 
@@ -930,6 +921,7 @@ class BigramHashEmbedding(nn.Module):
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
+        self.proj_norm = RMSNorm(bigram_dim) if self.proj is not None else None  # ALL norms learnable
         self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
 
     def bigram_hash(self, tokens: Tensor) -> Tensor:
@@ -943,7 +935,7 @@ class BigramHashEmbedding(nn.Module):
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(self.bigram_hash(token_ids))
         if self.proj is not None:
-            h = self.proj(_rms_norm(h))
+            h = self.proj(self.proj_norm(h))
         return h * self.scale.to(dtype=h.dtype)
 
 
@@ -1048,8 +1040,8 @@ class SoftDenseRouter(nn.Module):
         if clip > 0:
             self.expert_bias.clamp_(min=-clip, max=clip)
 
-    def forward(self, x: Tensor, *, pre_normed: bool = False) -> Tensor:
-        x_n = x if bool(pre_normed) else _rms_norm(x)
+    def forward(self, x: Tensor, *, pre_normed: bool = True) -> Tensor:
+        x_n = x  # Always pre-normed by state_norm upstream
         D = self.prototypes.shape[-1]
         if self.scoring in ("l2", "sips"):
             # Phase 6a.3 (reviews 1, 10): replace the O(B·T·E·D) broadcast
@@ -1270,6 +1262,11 @@ class CausalSelfAttention(nn.Module):
         self.gate_bias = nn.Parameter(torch.zeros(num_experts * num_heads, dtype=torch.float32))
 
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
+        # Phase 9 iter 71g: learnable pre-RMSNorm for Q/K components.
+        self.q_norm = RMSNorm(self.nope_dim)  # q_nope dim
+        self.k_norm = RMSNorm(self.nope_dim)  # k_nope dim
+        self.q_rope_norm = RMSNorm(self.rope_dim)
+        self.k_rope_norm = RMSNorm(self.rope_dim)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
         self._attn_gate_last_mean: float | None = None
@@ -1303,7 +1300,7 @@ class CausalSelfAttention(nn.Module):
 
         q_rope = q_raw[..., :self.rope_dim]
         q_nope = q_raw[..., self.rope_dim:]
-        q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
+        q_rope, q_nope = self.q_rope_norm(q_rope), self.q_norm(q_nope)
 
         # --- Per-expert KV (low-rank latent) ---
         kv_a = self.expert_kv_a.to(dtype=dtype)
@@ -1329,7 +1326,7 @@ class CausalSelfAttention(nn.Module):
         k_rope_raw = torch.bmm(kr_h, kr_b)  # (E, N, H_kv*rope)
         k_rope = k_rope_raw.reshape(E, B, T, H_kv, self.rope_dim)
 
-        k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
+        k_rope, k_nope = self.k_rope_norm(k_rope), self.k_norm(k_nope)
 
         # --- RoPE ---
         cos, sin = self.rotary(T, x_n.device, q_rope.dtype)
@@ -1442,7 +1439,7 @@ class MLP(nn.Module):
                     num_shared: int = 0, shared_gate: Tensor | None = None) -> Tensor:
         B, T, D = x.shape
         E, R = self.num_experts, self.expert_rank
-        x_n = x if bool(pre_normed) else _rms_norm(x)
+        x_n = x  # Always pre-normed by state_norm upstream
         N = B * T
         x_flat = x_n.reshape(N, D)
         G = self.expert_gate.to(dtype=x_flat.dtype).reshape(E * R, D)
@@ -1528,6 +1525,7 @@ class MoSHead(nn.Module):
         self.rank = rank
         self.num_shared = num_shared
         self.num_specialized = num_specialized
+        self.input_norm = RMSNorm(d_model)  # ALL norms learnable (project constraint)
         self.num_experts = num_shared + num_specialized
         self.fsq_levels = fsq_levels
         self.gate_ctp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
@@ -1584,7 +1582,7 @@ class MoSHead(nn.Module):
         N = x.shape[0]
         E_s, E_p = A_shared.shape[0], A_spec.shape[0]
         E = E_s + E_p
-        x = _rms_norm(x)
+        x = self.input_norm(x)
         alpha = F.softmax(gate(x).float(), dim=-1)  # (N, E)
         log_w = alpha.clamp(min=1e-8).log()          # (N, E)
 
@@ -2093,10 +2091,9 @@ class GPT(nn.Module):
         self._lyapunov_rho_hat_buf: Tensor | None = None
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0)  # Phase 9 iter 62 (H53): disabled FSQ
         self.final_norm = RMSNorm(model_dim)
-        # Phase 4.5 22-rm-embed-post: removed `embed_post_norm` — reverted to
-        # the parameter-free `_rms_norm` in _encode.  Tests if the learnable
-        # weight there was doing useful work.  Keep removed if val_bpb
-        # doesn't regress > 0.015 vs 22-add-all baseline (1.891).
+        # Phase 9 iter 71g: ALL norms learnable (project constraint).
+        self.embed_norm = RMSNorm(model_dim)
+        self.soft_embed_norm = RMSNorm(model_dim)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -2151,7 +2148,7 @@ class GPT(nn.Module):
                 emb = F.embedding(flat_idx[s:e], W)
                 flat_out[s:e] = (flat_p[s:e].unsqueeze(-1) * emb).sum(dim=1)
             soft_embed = flat_out.reshape(B, T, d)
-            soft_embed = _rms_norm(soft_embed.to(dtype=z.dtype))
+            soft_embed = self.soft_embed_norm(soft_embed.to(dtype=z.dtype))
         return soft_embed
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
@@ -2345,8 +2342,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        # Phase 4.5 22-rm-embed-post: back to parameter-free _rms_norm here.
-        x = _rms_norm(x)
+        # Phase 9 iter 71g: learnable embed norm.
+        x = self.embed_norm(x)
         x = self._run_backbone(x)
         return self.final_norm(x)
 
