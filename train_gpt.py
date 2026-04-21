@@ -158,7 +158,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 0.3
-    weight_decay = 0.30  # Phase 9 iter 71: reduce from 1.08 (arch review: biggest expressiveness killer). Lyapunov+denoising provide contraction; WD was redundant.
+    weight_decay = 0.10  # Phase 9 iter 71b: further reduce from 0.30. Testing WD floor.
     tied_embed_init_std = 0.005
 
     # Routing
