@@ -1683,7 +1683,7 @@ class Block(nn.Module):
         super().__init__()
         self.state_norm = RMSNorm(dim)
         self.attn_post_mix_norm = RMSNorm(dim)
-        # Iter 74i: remove mlp_post_mix_norm (bisect — attn norm confirmed load-bearing in 74h)
+        self.mlp_post_mix_norm = RMSNorm(dim)
         # Phase 9 iter 51 (DeepSeek shared expert): first num_shared_experts
         # experts are always-on with per-token sigmoid gate (like routed experts).
         # T_θ = x0 + g_s·E_shared(h) + Σ w_j E_routed_j(h)
@@ -1802,7 +1802,7 @@ class Block(nn.Module):
         # MLP experts (same split: shared gated + routed)
         mlp_mix = self.mlp.mix_experts(h, w_mlp, pre_normed=True,
                                         num_shared=S, shared_gate=g_s if S > 0 else None)
-        # mlp_post_mix_norm removed (iter 74i bisect)
+        mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
         # Dense mixture Δ = attn_mix + mlp_mix.
         delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)

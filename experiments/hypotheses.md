@@ -770,7 +770,7 @@ failure.
 | 74e | Restore squared gate leaky_relu(0.5)² | Phase 6 remnant: original activation was more expressive | L9 | Queued | — | — |
 | 74f | Independent shared gates (attn vs mlp) | Fix 1-dim shared gate → 2-dim for independent control | arch | Queued | — | — |
 | 74g | Remove x0 residual: T_θ = Δ(z,x0) | More expressive FP equation (x0 still enters via state_norm) | arch | Queued | — | — |
-| 74h | Remove attn_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | **REVERTED** (+0.034, attn norm IS load-bearing — accounts for most of iter 72's regression) | 1.5488 | — |
+| 74h | Remove attn_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
 | 74i | Remove mlp_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
 | 74j | Remove state_norm: h = z + x0 | Redundant with downstream per-output norms? | arch | Queued | — | — |
 | 74k | Remove bigram proj_norm | Redundant with embed_norm downstream | arch | Queued | — | — |
