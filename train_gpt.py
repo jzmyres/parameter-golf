@@ -1690,11 +1690,8 @@ class Block(nn.Module):
         self.num_experts = num_experts
         self.num_shared_experts = int(num_shared_experts)
         num_routed = num_experts - self.num_shared_experts
-        # Sigmoid gate for shared experts (per-token modulation, matches router design)
-        if self.num_shared_experts > 0:
-            self.shared_gate = nn.Linear(dim, self.num_shared_experts, bias=True)
-            nn.init.zeros_(self.shared_gate.weight)
-            nn.init.constant_(self.shared_gate.bias, 1.0)  # init near-open
+        # Iter 74l: shared experts always contribute with weight=1 (no gate).
+        # DeepSeek-V3 style: shared expert is unconditionally always-on.
         # Router only covers routed experts (not shared).
         self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=10.0,
                                       cv_loss_weight=2.0, scoring=router_scoring)
@@ -1789,9 +1786,8 @@ class Block(nn.Module):
         # All experts compute outputs together (shared + routed).
         attn_expert_out = self.attn.forward_experts(h)  # (B, T, E, D)
         if S > 0:
-            # Shared: direct sum with per-token sigmoid gate (no .mean() overhead)
-            g_s = torch.sigmoid(self.shared_gate(h))  # (B, T, S)
-            attn_shared = (attn_expert_out[:, :, :S, :] * g_s.unsqueeze(-1)).sum(dim=2)
+            # Iter 74l: shared experts always contribute with weight=1 (no gate)
+            attn_shared = attn_expert_out[:, :, :S, :].sum(dim=2)
             # Routed: weighted by router
             attn_routed = (attn_expert_out[:, :, S:, :] * w_attn.unsqueeze(-1)).sum(dim=2)
             attn_mix = attn_shared + attn_routed
@@ -1799,9 +1795,11 @@ class Block(nn.Module):
             attn_mix = (attn_expert_out * w_attn.unsqueeze(-1)).sum(dim=2)
         attn_mix = self.attn_post_mix_norm(attn_mix)
 
-        # MLP experts (same split: shared gated + routed)
+        # MLP experts (same split: shared always-on + routed)
+        # Iter 74l: pass ones as shared gate (weight=1 always)
+        _g_s_ones = torch.ones(h.shape[0], h.shape[1], S, device=h.device, dtype=h.dtype) if S > 0 else None
         mlp_mix = self.mlp.mix_experts(h, w_mlp, pre_normed=True,
-                                        num_shared=S, shared_gate=g_s if S > 0 else None)
+                                        num_shared=S, shared_gate=_g_s_ones)
         mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
         # Dense mixture Δ = attn_mix + mlp_mix.
