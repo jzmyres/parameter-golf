@@ -775,14 +775,14 @@ failure.
 | 74j | Remove state_norm | Pre-expert RMSNorm on z+x0 | arch | **REVERTED** (+0.199@400, catastrophic. state_norm IS load-bearing) | 1.8878@400 | — |
 | 74k | Remove bigram proj_norm | Bigram pre-projection RMSNorm | arch | **REVERTED** (+0.174@400, bigram norm also load-bearing. ALL norms essential) | 1.8636@400 | — |
 | 74l | Remove shared expert gate (always=1) | DeepSeek-V3 style unconditional shared expert | arch | **REVERTED** (+0.020, shared gate provides useful per-token modulation) | 1.5346 | — |
-| 75 | ~~ELM identity init~~ | ~~SKIP: doesn't apply cleanly to SwiGLU + low-rank experts~~ | ICLR 2026 | SKIPPED | — | — |
-| 77 | ~~Residual injection (x0-z)~~ | ~~SKIP: iter 18 tested lerp→additive = wash. Math shows degenerate (z+(x0-z)=x0)~~ | H25 | SKIPPED | — | — |
-| 78 | ~~FSQ weight QAT~~ | ~~SKIP: STE noise harmful (H15 REFUTED), quant gap only 0.029~~ | H28 | SKIPPED | — | — |
-| 79 | ~~Per-iter injection~~ | ~~SKIP: violates RevDEQ weight sharing (f must be identical across iters)~~ | H24 | SKIPPED | — | — |
-| 80 | ~~Refinement inject during DEQ~~ | ~~SKIP: changes Block.forward signature, breaks RevDEQ weight sharing~~ | H27 | SKIPPED | — | — |
-| 76 | ~~Self-refinement~~ | ~~SKIP: already active in baseline (num_refinements=1, ramp_frac=0.85)~~ | H16 | SKIPPED (already active) | — | — |
-| 66 | ~~Parcae negative diagonal~~ | ~~SKIP: "guaranteed contraction" overstated — still needs Lyapunov. Per-dim α can't learn through RevDEQ~~ | H48 | SKIPPED | — | — |
-| 68 | ~~DeltaDEQ dim skipping~~ | ~~SKIP: incompatible with torch.compile + RevDEQ exact reversibility~~ | H50 | SKIPPED | — | — |
+| 75 | ELM identity init | Expert weights init near identity for faster convergence | ICLR 2026 | Queued | — | — |
+| 77 | Residual injection (lerp: (1-g)z + g·x0) | Replace additive z+x0 with learned lerp | H25 | Queued | — | — |
+| 78 | FSQ weight QAT | STE on ALL weight matrices to close quant gap | H28 | Queued | — | — |
+| 79 | Per-iter injection schedule | Learned per-iter x0 injection scaling (RevDEQ-compatible) | H24 | Queued | — | — |
+| 80 | Refinement inject during DEQ | Inject x0_refined alongside x0 in Block.forward | H27 | Queued | — | — |
+| 76 | Self-refinement ramp 0.85→0.50 | Enable refinement earlier (currently only last 15%) | H16 | Queued | — | — |
+| 66 | Parcae negative diagonal | Per-dim learned damping: α=exp(-exp(a)·dt), guaranteed α∈(0,1) | H48 | Queued | — | — |
+| 68 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
