@@ -773,7 +773,7 @@ failure.
 | 74h | Remove attn_post_mix_norm only | Bisect iter 72 | H55 | **REVERTED** (+0.034, attn norm IS load-bearing) | 1.5488 | — |
 | 74i | Remove mlp_post_mix_norm only | Bisect iter 72 | H55 | **REVERTED** (+0.029, mlp norm ALSO load-bearing. Both essential) | 1.5436 | — |
 | 74j | Remove state_norm | Pre-expert RMSNorm on z+x0 | arch | **REVERTED** (+0.199@400, catastrophic. state_norm IS load-bearing) | 1.8878@400 | — |
-| 74k | Remove bigram proj_norm | Bigram projection norm | arch | Queued | — | — |
+| 74k | Remove bigram proj_norm | Bigram pre-projection RMSNorm | arch | **REVERTED** (+0.174@400, bigram norm also load-bearing. ALL norms essential) | 1.8636@400 | — |
 | 74l | Remove shared expert gate (always=1) | DeepSeek-V3 style unconditional shared expert | arch | **REVERTED** (+0.020, shared gate provides useful per-token modulation) | 1.5346 | — |
 | 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 | 77 | ~~Residual injection (x0-z)~~ | ~~SKIP: iter 18 tested lerp→additive = wash. Math shows degenerate (z+(x0-z)=x0)~~ | H25 | SKIPPED | — | — |
