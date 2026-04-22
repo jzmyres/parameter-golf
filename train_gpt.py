@@ -1682,7 +1682,7 @@ class Block(nn.Module):
                  router_scoring: str = "linear", **kwargs):
         super().__init__()
         self.state_norm = RMSNorm(dim)
-        self.attn_post_mix_norm = RMSNorm(dim)
+        # Iter 74h: remove attn_post_mix_norm (bisect iter 72 which removed both)
         self.mlp_post_mix_norm = RMSNorm(dim)
         # Phase 9 iter 51 (DeepSeek shared expert): first num_shared_experts
         # experts are always-on with per-token sigmoid gate (like routed experts).
@@ -1797,7 +1797,7 @@ class Block(nn.Module):
             attn_mix = attn_shared + attn_routed
         else:
             attn_mix = (attn_expert_out * w_attn.unsqueeze(-1)).sum(dim=2)
-        attn_mix = self.attn_post_mix_norm(attn_mix)
+        # attn_post_mix_norm removed (iter 74h bisect)
 
         # MLP experts (same split: shared gated + routed)
         mlp_mix = self.mlp.mix_experts(h, w_mlp, pre_normed=True,

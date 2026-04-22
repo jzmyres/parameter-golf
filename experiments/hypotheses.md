@@ -769,7 +769,7 @@ failure.
 | 74d | Remove β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5} for reversibility (3.3× recon amp) | H58 | Queued | — | — |
 | 74e | Restore squared gate leaky_relu(0.5)² | Phase 6 remnant: original activation was more expressive | L9 | Queued | — | — |
 | 74f | Independent shared gates (attn vs mlp) | Fix 1-dim shared gate → 2-dim for independent control | arch | Queued | — | — |
-| 74g | Remove x0 residual: T_θ = Δ(z,x0) | More expressive FP equation (x0 still enters via state_norm) | arch | Queued | — | — |
+| 74g | Remove x0 residual: T_θ = Δ(z,x0) | More expressive FP equation (x0 still enters via state_norm) | arch | **REVERTED** (+0.039 post-quant, +0.090@600. x0 skip is structural: init bias + gradient path + magnitude anchor) | 1.5542 | — |
 | 74h | Remove attn_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
 | 74i | Remove mlp_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
 | 74j | Remove state_norm: h = z + x0 | Redundant with downstream per-output norms? | arch | Queued | — | — |
