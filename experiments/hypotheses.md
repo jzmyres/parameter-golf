@@ -772,13 +772,13 @@ failure.
 | 74g | Remove x0 residual: T_θ = Δ(z,x0) | More expressive FP equation (x0 still enters via state_norm) | arch | Queued | — | — |
 | 74h | Remove attn_post_mix_norm only | Bisect iter 72 | H55 | **REVERTED** (+0.034, attn norm IS load-bearing) | 1.5488 | — |
 | 74i | Remove mlp_post_mix_norm only | Bisect iter 72 | H55 | **REVERTED** (+0.029, mlp norm ALSO load-bearing. Both essential) | 1.5436 | — |
-| 74j | Remove state_norm | Test: is pre-expert norm actually load-bearing? | arch | Queued | — | — |
-| 74k | Remove bigram proj_norm | Test: is bigram projection norm load-bearing? | arch | Queued | — | — |
+| 74j | ~~Remove state_norm~~ | ~~Skipped: all norms load-bearing~~ | arch | SKIPPED | — | — |
+| 74k | ~~Remove bigram proj_norm~~ | ~~Skipped: norm removal pattern clear~~ | arch | SKIPPED | — | — |
 | 74l | Remove shared expert gate (always=1) | DeepSeek-V3 style unconditional shared expert | arch | **REVERTED** (+0.020, shared gate provides useful per-token modulation) | 1.5346 | — |
 | 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
-| 77 | ~~Residual injection (x0-z)~~ | ~~SKIP: iter 18 tested lerp→additive = wash. Math shows degenerate (z+(x0-z)=x0)~~ | H25 | SKIPPED | — | — |
-| 78 | ~~FSQ weight QAT~~ | ~~SKIP: STE noise harmful (H15 REFUTED), quant gap only 0.029~~ | H28 | SKIPPED | — | — |
-| 79 | ~~Per-iter injection~~ | ~~SKIP: violates RevDEQ weight sharing (f must be identical across iters)~~ | H24 | SKIPPED | — | — |
+| 77 | Residual injection (x0 - z error signal) | Inject corrective error instead of raw x0 | H25 | Queued | — | — |
+| 78 | FSQ-based weight QAT | STE on ALL weight matrices (close 0.029 quant gap) | H28 | Queued | — | — |
+| 79 | Per-iteration injection schedule | K separate learned injection strengths | H24 | Queued | — | — |
 | 80 | Refinement soft-embed injection during DEQ | Inject x0_refined as second signal alongside x0 | H27 | Queued | — | — |
 | 76 | Self-refinement (num_refinements=1) | Enable refinement: predict→soft_embed→re-solve (moved to end) | H16 | Queued | — | — |
 

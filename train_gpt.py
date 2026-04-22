@@ -1681,8 +1681,7 @@ class Block(nn.Module):
                  num_experts: int = 8, num_shared_experts: int = 0,
                  router_scoring: str = "linear", **kwargs):
         super().__init__()
-        # Phase 9 iter 74j: TESTING removal of state_norm (pre-expert RMSNorm on z+x0)
-        # self.state_norm = RMSNorm(dim)  # REMOVED for ablation
+        self.state_norm = RMSNorm(dim)
         self.attn_post_mix_norm = RMSNorm(dim)
         self.mlp_post_mix_norm = RMSNorm(dim)
         # Phase 9 iter 51 (DeepSeek shared expert): first num_shared_experts
@@ -1721,7 +1720,7 @@ class Block(nn.Module):
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
         x = z_sub + x0_sub
-        h = x  # iter 74j: removed state_norm
+        h = self.state_norm(x)
 
         # Attention ortho: per-expert outputs from independent expert SDPA.
         attn_expert_out = self.attn.forward_experts(h)  # (B, t, E, D)
@@ -1772,7 +1771,7 @@ class Block(nn.Module):
         #   Δ_routed = Σ w_j E_routed_j(h)             — routed experts
         #   T_θ(z, x_0) = x_0 + Δ_shared + Δ_routed
         u = z_in + x0
-        h = u                                    # iter 74j: removed state_norm
+        h = self.state_norm(u)                   # h = RMSNorm(z + x_0)
 
         E = self.num_experts
         S = self.num_shared_experts
