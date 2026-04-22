@@ -771,9 +771,9 @@ failure.
 | 74f | Independent shared gates (attn vs mlp) | Fix 1-dim shared gate → 2-dim for independent control | arch | Queued | — | — |
 | 74g | Remove x0 residual: T_θ = Δ(z,x0) | More expressive FP equation (x0 still enters via state_norm) | arch | Queued | — | — |
 | 74h | Remove attn_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
-| 74i | Remove mlp_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | **REVERTED** (+0.029, mlp norm ALSO load-bearing. BOTH norms essential independently) | 1.5436 | — |
-| 74j | ~~Remove state_norm~~ | ~~Skipped: all DEQ-path norms confirmed load-bearing (74h+74i+72)~~ | arch | SKIPPED | — | — |
-| 74k | ~~Remove bigram proj_norm~~ | ~~Skipped: norm removal pattern clear~~ | arch | SKIPPED | — | — |
+| 74i | Remove mlp_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
+| 74j | Remove state_norm: h = z + x0 | Redundant with downstream per-output norms? | arch | Queued | — | — |
+| 74k | Remove bigram proj_norm | Redundant with embed_norm downstream | arch | Queued | — | — |
 | 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
 | 77 | Residual injection (x0 - z error signal) | Inject corrective error instead of raw x0 | H25 | Queued | — | — |
 | 78 | FSQ-based weight QAT | STE on ALL weight matrices (close 0.029 quant gap) | H28 | Queued | — | — |
