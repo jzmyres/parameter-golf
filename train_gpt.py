@@ -1807,8 +1807,9 @@ class Block(nn.Module):
         # Dense mixture Δ = attn_mix + mlp_mix.
         delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
-        # T_θ(z, x_0) = x_0 + Δ_θ(z, x_0)
-        raw_out = x0 + delta
+        # Iter 74g: T_θ(z, x_0) = Δ_θ(z, x_0) — no x0 residual.
+        # x0 still enters via h = state_norm(z + x0). More expressive FP equation.
+        raw_out = delta
 
         if self._diag_track_enabled:
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
