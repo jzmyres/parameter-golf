@@ -775,12 +775,14 @@ failure.
 | 74j | Remove state_norm | Pre-expert RMSNorm on z+x0 | arch | **REVERTED** (+0.199@400, catastrophic. state_norm IS load-bearing) | 1.8878@400 | — |
 | 74k | Remove bigram proj_norm | Bigram pre-projection RMSNorm | arch | **REVERTED** (+0.174@400, bigram norm also load-bearing. ALL norms essential) | 1.8636@400 | — |
 | 74l | Remove shared expert gate (always=1) | DeepSeek-V3 style unconditional shared expert | arch | **REVERTED** (+0.020, shared gate provides useful per-token modulation) | 1.5346 | — |
-| 75 | ELM identity init | Expert weights init near identity | ICLR 2026 | Queued | — | — |
+| 75 | ~~ELM identity init~~ | ~~SKIP: doesn't apply cleanly to SwiGLU + low-rank experts~~ | ICLR 2026 | SKIPPED | — | — |
 | 77 | ~~Residual injection (x0-z)~~ | ~~SKIP: iter 18 tested lerp→additive = wash. Math shows degenerate (z+(x0-z)=x0)~~ | H25 | SKIPPED | — | — |
 | 78 | ~~FSQ weight QAT~~ | ~~SKIP: STE noise harmful (H15 REFUTED), quant gap only 0.029~~ | H28 | SKIPPED | — | — |
 | 79 | ~~Per-iter injection~~ | ~~SKIP: violates RevDEQ weight sharing (f must be identical across iters)~~ | H24 | SKIPPED | — | — |
-| 80 | Refinement soft-embed injection during DEQ | Inject x0_refined as second signal alongside x0 | H27 | Queued | — | — |
-| 76 | Self-refinement (num_refinements=1) | Enable refinement: predict→soft_embed→re-solve (moved to end) | H16 | Queued | — | — |
+| 80 | ~~Refinement inject during DEQ~~ | ~~SKIP: changes Block.forward signature, breaks RevDEQ weight sharing~~ | H27 | SKIPPED | — | — |
+| 76 | ~~Self-refinement~~ | ~~SKIP: already active in baseline (num_refinements=1, ramp_frac=0.85)~~ | H16 | SKIPPED (already active) | — | — |
+| 66 | ~~Parcae negative diagonal~~ | ~~SKIP: "guaranteed contraction" overstated — still needs Lyapunov. Per-dim α can't learn through RevDEQ~~ | H48 | SKIPPED | — | — |
+| 68 | ~~DeltaDEQ dim skipping~~ | ~~SKIP: incompatible with torch.compile + RevDEQ exact reversibility~~ | H50 | SKIPPED | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
