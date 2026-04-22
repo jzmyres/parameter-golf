@@ -766,8 +766,8 @@ failure.
 | 71g | Learnable RMSNorm everywhere | Q/K norms + embed + MoS + bigram (removed soft_embed_norm: DDP unused param) | project constraint | **PROMOTED ★** (val_bpb -0.005, 10% faster, K128 Δ=0.009) | 1.5254 | +0.009 |
 | 74b | Lyapunov γ 0.9→0.97 | Push warmup advantage further (γ=0.95 was -0.012@200) | H57 | **PROMOTED ★** (val_bpb -0.008, every K improved -0.006 to -0.008, K8 breaks 1.50) | 1.5150 | +0.008 |
 | 74c | WD 0.30→0.01 | Test floor — quant gap may shrink with learnable norms | H54 | Queued | — | — |
-| 74d | Remove β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5} for reversibility (3.3× recon amp) | H58 | **REVERTED** (+0.025, confirmed 2nd time: jitter diversity > recon quality) | 1.5399 | — |
-| 74e | Restore squared gate leaky_relu(0.5)² | Phase 6 remnant: original activation was more expressive | L9 | **SMOKE FAIL** (diverges: squared gate expansive, breaks DEQ convergence. SwiGLU stays.) | — | — |
+| 74d | Remove β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5} for reversibility (3.3× recon amp) | H58 | Queued | — | — |
+| 74e | Restore squared gate leaky_relu(0.5)² | Phase 6 remnant: original activation was more expressive | L9 | Queued | — | — |
 | 74f | Independent shared gates (attn vs mlp) | Fix 1-dim shared gate → 2-dim for independent control | arch | Queued | — | — |
 | 74g | Remove x0 residual: T_θ = Δ(z,x0) | More expressive FP equation (x0 still enters via state_norm) | arch | Queued | — | — |
 | 74h | Remove attn_post_mix_norm only | Bisect iter 72: which post-mix norm is load-bearing? | H55 | Queued | — | — |
