@@ -921,7 +921,8 @@ class BigramHashEmbedding(nn.Module):
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
-        self.proj_norm = RMSNorm(bigram_dim) if self.proj is not None else None  # ALL norms learnable
+        # Phase 9 iter 74k: TESTING removal of proj_norm (bigram pre-projection norm)
+        # self.proj_norm = RMSNorm(bigram_dim)  # REMOVED for ablation
         self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
 
     def bigram_hash(self, tokens: Tensor) -> Tensor:
@@ -935,7 +936,7 @@ class BigramHashEmbedding(nn.Module):
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(self.bigram_hash(token_ids))
         if self.proj is not None:
-            h = self.proj(self.proj_norm(h))
+            h = self.proj(h)  # iter 74k: removed proj_norm
         return h * self.scale.to(dtype=h.dtype)
 
 
