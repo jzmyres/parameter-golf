@@ -143,7 +143,7 @@ class Hyperparameters:
     qk_gain_init = 5.0
     deq_beta = 0.50  # Phase 9: β=0.7 caused high recon_err (1.2 vs 0.88) → RevDEQ unstable. Keep 0.5.
     deq_beta_jitter = True   # Phase 9 iter 49: sample β from {0.3, 0.5, 0.7} per step (like K-jitter)
-    deq_beta_jitter_set = (0.3, 0.5)  # iter 74d: remove β=0.7 for reversibility (3.3× recon amplification via 1/(1-β))
+    deq_beta_jitter_set = (0.3, 0.5, 0.7)  # β values to sample from
 
     # Optimizer
     tied_embed_lr = 0.03
