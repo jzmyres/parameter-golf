@@ -775,14 +775,19 @@ failure.
 | 74j | Remove state_norm | Pre-expert RMSNorm on z+x0 | arch | **REVERTED** (+0.199@400, catastrophic. state_norm IS load-bearing) | 1.8878@400 | — |
 | 74k | Remove bigram proj_norm | Bigram pre-projection RMSNorm | arch | **REVERTED** (+0.174@400, bigram norm also load-bearing. ALL norms essential) | 1.8636@400 | — |
 | 74l | Remove shared expert gate (always=1) | DeepSeek-V3 style unconditional shared expert | arch | **REVERTED** (+0.020, shared gate provides useful per-token modulation) | 1.5346 | — |
-| 75 | ELM identity init | Expert weights init near identity for faster convergence | ICLR 2026 | Queued | — | — |
-| 77 | Residual injection (lerp: (1-g)z + g·x0) | Replace additive z+x0 with learned lerp | H25 | Queued | — | — |
-| 78 | FSQ weight QAT | STE on ALL weight matrices to close quant gap | H28 | Queued | — | — |
-| 79 | Per-iter injection schedule | Learned per-iter x0 injection scaling (RevDEQ-compatible) | H24 | Queued | — | — |
-| 80 | Refinement inject during DEQ | Inject x0_refined alongside x0 in Block.forward | H27 | Queued | — | — |
-| 76 | Self-refinement ramp 0.85→0.50 | Enable refinement earlier (currently only last 15%) | H16 | Queued | — | — |
-| 66 | Parcae negative diagonal | Per-dim learned damping: α=exp(-exp(a)·dt), guaranteed α∈(0,1) | H48 | Queued | — | — |
-| 68 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
+| 75 | ELM identity init | Zero-init Wo + MLP down_proj → T_θ≈x0 at init | ELM ICLR26 | Queued | — | — |
+| 77 | ~~Residual injection (lerp)~~ | ~~REMOVED: gate g→0 kills input dependence, unprincipled~~ | H25 | REMOVED | — | — |
+| 76 | Simulated refinement (input corruption) | Corrupt one-hot→soft dist, single solve, CTP denoises | H16 | Queued | — | — |
+| 78 | FSQ symmetric levels + L2 | Unconstrained hidden + L2 penalty + round(h)∈{-8..8} 17-level STE | H28/H59 | Queued | — | — |
+| 66a | Parcae per-dim Ā (tied B̄=1-Ā) | x_{t+1}=Ā·x_t+(1-Ā)·f(x_t,x0), Ā=exp(Δ·(-exp(log_a)))∈(0,1) | H48/Parcae | Queued | — | — |
+| 66b | Parcae: remove Lyapunov | Structural ρ(Ā)<1 replaces Hutchinson penalty | H48 | Queued (after 66a) | — | — |
+| 66c | Parcae: remove denoising reg | Per-dim damping replaces denoising regularization | H48 | Queued (after 66b) | — | — |
+| 66d | Parcae: separate B̄ (full ZOH) | B̄=A⁻¹(Ā-I)·b, independent from Ā. More expressive FP | H48 | Queued (after 66c) | — | — |
+| 79 | Per-iter depth embeddings | iter_embed∈R^{K_max×dim}, zero-init, u=z+x0+embed[k] | H24 | Queued | — | — |
+| 80 | ~~Refinement inject during DEQ~~ | ~~REMOVED: raw x0 already blended into x0_refined~~ | H27 | REMOVED | — | — |
+| 68 | ~~DeltaDEQ dim skipping~~ | ~~REMOVED: non-bottleneck, breaks compile, K-jitter handles~~ | H50 | REMOVED | — | — |
+| 63 | Full-rank low-dim experts (merged 63+64) | down(D→r), full-rank attn+MLP at r, up(r→D) per expert | H43/H44 | Queued | — | — |
+| 65 | Scale to 16-32 experts | More experts at cheap per-expert dim r | H47 | Queued (after 63) | — | — |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
