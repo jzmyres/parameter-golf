@@ -120,12 +120,12 @@ class Hyperparameters:
     train_log_every = 10  # log every 10 steps (~85s at 8.5s/step) for better progress visibility
     auto_plot_on_val = True
 
-    iterations = 1_000_000_000  # governed by wallclock
+    iterations = 1065  # Phase 9: fixed step count for fair arch comparison (baseline ran 1065 steps in 7200s)
     warmdown_frac = 0.72  # fraction of total steps for warmdown
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 7200.0  # 2xL40S dev (2h for fair step-count comparison); set 600 for 8xH100
+    max_wallclock_seconds = 0  # disabled: step-count governs training (time_frac = step/iterations)
 
     # Model architecture
     vocab_size = 1024
