@@ -778,7 +778,8 @@ failure.
 | 75 | ELM identity init (zero) | Zero-init expert outputs → T_θ≈x0 at init | ELM ICLR26 | **REVERTED** (+0.119@600, zero kills expert diversity) | 1.6988@600 | — |
 | 75b | ELM small-scale init (rescue 1) | Normal(0,0.02) expert outputs | ELM ICLR26 | **REVERTED** (+0.157@400, even worse — under-scaled gradients) | 1.8464@400 | — |
 | 77 | ~~Residual injection (lerp)~~ | ~~REMOVED: gate g→0 kills input dependence, unprincipled~~ | H25 | REMOVED | — | — |
-| 76 | Simulated refinement (input corruption) | Corrupt one-hot→soft dist, single solve, CTP denoises | H16 | Queued | — | — |
+| 76 | Simulated refinement (mean-emb ε=0.1) | Corrupt x0 = (1-ε)·tok + ε·mean_emb | H16 | **REVERTED** (+0.161@400, mean_emb≈0 reduces magnitude) | 1.8497@400 | — |
+| 76b | Simulated refinement rescue (Gaussian ε=0.01) | Additive Gaussian noise corruption | H16 | **REVERTED** (+0.112 final, noise hurts NTP without CTP payoff) | 1.6273 | +0.005 |
 | 78 | FSQ symmetric levels + L2 | Unconstrained hidden + L2 penalty + round(h)∈{-8..8} 17-level STE | H28/H59 | Queued | — | — |
 | 66a | Parcae per-dim Ā (tied B̄=1-Ā) | x_{t+1}=Ā·x_t+(1-Ā)·f(x_t,x0), Ā=exp(Δ·(-exp(log_a)))∈(0,1) | H48/Parcae | Queued | — | — |
 | 66b | Parcae: remove Lyapunov | Structural ρ(Ā)<1 replaces Hutchinson penalty | H48 | Queued (after 66a) | — | — |
