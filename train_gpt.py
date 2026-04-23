@@ -148,7 +148,7 @@ class Hyperparameters:
     # Replaces scalar β with per-dim Ā = exp(Δ·(-exp(log_a))) ∈ (0,1), β = 1-Ā.
     # When active, supersedes deq_beta / deq_beta_jitter.
     use_parcae = True
-    parcae_init_a_bar = 0.7  # initial Ā per dim (0.7 → β=0.3, conservative start)
+    parcae_init_a_bar = 0.9  # initial Ā per dim (0.9 → β=0.1 for stable RevDEQ reconstruction)
     parcae_lr = 0.002  # 10× slower than scalar_lr — Parcae params control DEQ mixing, must evolve slowly
 
     # Optimizer
