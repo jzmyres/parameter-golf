@@ -144,6 +144,12 @@ class Hyperparameters:
     deq_beta = 0.50  # Phase 9: β=0.7 caused high recon_err (1.2 vs 0.88) → RevDEQ unstable. Keep 0.5.
     deq_beta_jitter = True   # Phase 9 iter 49: sample β from {0.3, 0.5, 0.7} per step (like K-jitter)
     deq_beta_jitter_set = (0.3, 0.5, 0.7)  # β values to sample from
+    # Phase 9 iter 66a: Parcae per-dim learned damping (arXiv:2604.12946).
+    # Replaces scalar β with per-dim Ā = exp(Δ·(-exp(log_a))) ∈ (0,1), β = 1-Ā.
+    # When active, supersedes deq_beta / deq_beta_jitter.
+    use_parcae = True
+    parcae_init_a_bar = 0.7  # initial Ā per dim (0.7 → β=0.3, tested sweet spot)
+    parcae_lr = 0.002  # 10× slower than scalar_lr — Parcae params control DEQ mixing
 
     # Optimizer
     tied_embed_lr = 0.03
@@ -1858,7 +1864,15 @@ class RevDEQFunction(torch.autograd.Function):
         state_dtype = torch.float32
         compute_dtype = z_init.dtype
         device_type = x0.device.type
-        beta_inv = 1.0 - beta
+        # Support both scalar and tensor (per-dim Parcae) beta.
+        # Track whether upstream graph needs grad_beta (for Parcae learning).
+        ctx.beta_requires_grad = isinstance(beta, torch.Tensor) and beta.requires_grad
+        ctx.beta_input_dtype = beta.dtype if isinstance(beta, torch.Tensor) else None
+        if isinstance(beta, torch.Tensor):
+            beta = beta.detach().to(torch.float64)
+            beta_inv = 1.0 - beta
+        else:
+            beta_inv = 1.0 - beta
         ctx.do_recon_diag = bool(_ROUTER_DIAGNOSTICS_ACTIVE)
 
         y_state = z_init.to(state_dtype)
@@ -1899,8 +1913,9 @@ class RevDEQFunction(torch.autograd.Function):
         ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(), z_prev_state.detach())
         ctx.z_init_state = z_init_state
         ctx.f_theta = f_theta
-        ctx.beta = beta
-        ctx.beta_inv = beta_inv
+        # Store as fp64 tensors for backward precision.
+        ctx.beta = beta if isinstance(beta, torch.Tensor) else torch.tensor(beta, dtype=torch.float64)
+        ctx.beta_inv = beta_inv if isinstance(beta_inv, torch.Tensor) else torch.tensor(beta_inv, dtype=torch.float64)
         ctx.K = K
         ctx.bptt_k = int(bptt_k) if bptt_k else 0
         ctx.compute_dtype = compute_dtype
@@ -1929,6 +1944,12 @@ class RevDEQFunction(torch.autograd.Function):
         cur_param_grads_req: list[torch.Tensor | None] = [None] * len(params_req)
         cur_x_grad = torch.zeros_like(x0, dtype=torch.float32)
 
+        # Phase 9 iter 66a: accumulate dL/dβ for Parcae gradient flow.
+        beta_requires_grad = ctx.beta_requires_grad
+        grad_beta: torch.Tensor | None = None
+        if beta_requires_grad:
+            grad_beta = torch.zeros_like(beta)  # (D,) in fp64
+
         y_next64 = y_terminal.to(acc_dtype)
         z_next64 = z_terminal.to(acc_dtype)
 
@@ -1945,6 +1966,12 @@ class RevDEQFunction(torch.autograd.Function):
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
                     out_y = f_theta(y_local, x_local)
             z_n64 = (z_next64 - out_y.detach().to(acc_dtype) * beta) / beta_inv
+
+            # Parcae β gradient from z update: ∂z_{k+1}/∂β = f(y_{k+1}) - z_k
+            if grad_beta is not None:
+                innovation_z = out_y.detach().to(acc_dtype) - z_n64
+                grad_beta += (bar_z.to(acc_dtype) * innovation_z).sum(dim=(0, 1))
+
             grad_seed_y = (beta * bar_z).to(out_y.dtype)
             grads_y = torch.autograd.grad(out_y, (y_local, x_local, *params_req),
                                           grad_outputs=grad_seed_y, allow_unused=True)
@@ -1957,6 +1984,12 @@ class RevDEQFunction(torch.autograd.Function):
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
                     out_z = f_theta(z_local, x_local2)
             y_n64 = (y_next64 - out_z.detach().to(acc_dtype) * beta) / beta_inv
+
+            # Parcae β gradient from y update: ∂y_{k+1}/∂β = f(z_k) - y_k
+            if grad_beta is not None:
+                innovation_y = out_z.detach().to(acc_dtype) - y_n64
+                grad_beta += (bar_y_acc.to(acc_dtype) * innovation_y).sum(dim=(0, 1))
+
             grad_seed_z = (beta * bar_y_acc).to(out_z.dtype)
             grads_z = torch.autograd.grad(out_z, (z_local, x_local2, *params_req),
                                           grad_outputs=grad_seed_z, allow_unused=True)
@@ -2023,7 +2056,10 @@ class RevDEQFunction(torch.autograd.Function):
             if g is None:
                 continue
             param_grads_out[all_idx] = g.to(dtype=params_all[all_idx].dtype)
-        return (None, cur_x_grad.to(x0.dtype), z_init_grad, None, None, None, *param_grads_out)
+        # grad_beta: (D,) gradient for Parcae β, or None for scalar β.
+        # Autograd chain-rules from here through β = 1-exp(Δ·(-exp(log_a))) to parcae params.
+        grad_beta_out = grad_beta.to(ctx.beta_input_dtype) if grad_beta is not None else None
+        return (None, cur_x_grad.to(x0.dtype), z_init_grad, grad_beta_out, None, None, *param_grads_out)
 
 
 # ---------------------------------------------------------------------------
@@ -2047,7 +2083,9 @@ class GPT(nn.Module):
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
-                 lyapunov_warmup_frac: float = 0.1):
+                 lyapunov_warmup_frac: float = 0.1,
+                 use_parcae: bool = True,
+                 parcae_init_a_bar: float = 0.7):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
@@ -2067,6 +2105,13 @@ class GPT(nn.Module):
                                    router_scoring=router_scoring,
                                    )
         self.deq_beta = float(deq_beta)
+        # Phase 9 iter 66a: Parcae per-dim damping (arXiv:2604.12946).
+        # Gradient flows: loss → RevDEQFunction.backward(grad_beta) → autograd → parcae params.
+        self.use_parcae = bool(use_parcae)
+        if self.use_parcae:
+            log_a_init = math.log(math.log(1.0 / float(parcae_init_a_bar)))
+            self.parcae_log_a = nn.Parameter(torch.full((model_dim,), log_a_init))
+            self.parcae_delta = nn.Parameter(torch.ones(model_dim))
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
         self.bal_loss_coef = float(bal_loss_coef)
@@ -2152,7 +2197,15 @@ class GPT(nn.Module):
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
         global _DEQ_SOLVE_ACTIVE
-        beta = self.deq_beta
+        # Phase 9 iter 66a: Parcae per-dim damping replaces scalar β.
+        # Beta carries grad so RevDEQFunction.backward can return grad_beta,
+        # which autograd chain-rules to parcae_log_a and parcae_delta.
+        if self.use_parcae:
+            a_bar = torch.exp(self.parcae_delta * (-torch.exp(self.parcae_log_a)))
+            a_bar = a_bar.clamp(min=0.1)  # RevDEQ reversibility: reconstruction divides by Ā
+            beta = 1.0 - a_bar  # per-dim β, shape (D,), requires_grad=True
+        else:
+            beta = self.deq_beta
         dtype = x0.dtype
         K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
         track_diag = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
@@ -2728,6 +2781,8 @@ def main() -> None:
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
+        use_parcae=args.use_parcae,
+        parcae_init_a_bar=args.parcae_init_a_bar,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -2819,6 +2874,13 @@ def main() -> None:
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    # Phase 9 iter 66a: Parcae separate optimizer — NO weight decay, slow LR.
+    if base_model.use_parcae:
+        parcae_params = [base_model.parcae_log_a, base_model.parcae_delta]
+        optimizer_parcae = torch.optim.AdamW(
+            [{"params": parcae_params, "lr": args.parcae_lr, "base_lr": args.parcae_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True)
+        optimizers.append(optimizer_parcae)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -3028,8 +3090,9 @@ def main() -> None:
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
         base_model._deq_k_override = deq_k_for_step(next_step)
-        # Phase 9 iter 49: β jitter — set per-step β (same for all micro-steps).
-        base_model.deq_beta = deq_beta_for_step(next_step)
+        # Scalar β jitter only when Parcae is disabled (Parcae supersedes scalar β).
+        if not base_model.use_parcae:
+            base_model.deq_beta = deq_beta_for_step(next_step)
 
         # Refinement gating: enable after ramp_frac of wallclock
         ramp_frac = float(getattr(args, "num_refinements_ramp_frac", 0.85))
