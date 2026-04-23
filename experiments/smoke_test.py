@@ -94,9 +94,12 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
         deq_backward="revdeq",
+        deq_bptt_k=0,  # Full BPTT for recon checking (actual training uses args.deq_bptt_k)
         router_scoring=args.router_scoring,
         num_experts=args.num_experts,
         num_shared_experts=args.num_shared_experts,
+        use_parcae=args.use_parcae,
+        parcae_init_a_bar=getattr(args, "parcae_init_a_bar", 0.9),
     ).cuda()
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)

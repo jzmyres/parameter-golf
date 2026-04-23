@@ -57,7 +57,9 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | train_batch_tokens | 524,288 |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
-| deq_beta | 0.50 |
+| deq_beta | 0.50 (fallback when use_parcae=False) |
+| use_parcae | True (per-dim learned damping, supersedes deq_beta/deq_beta_jitter) |
+| parcae_init_a_bar | 0.9 (initial Ā per dim → β=0.1, stable reconstruction) |
 | deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
 | num_refinements | 1 |
 
@@ -83,7 +85,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | mlp_expert_rank | 192 |
 | bigram_vocab_size | 4096 |
 | bigram_dim | 128 |
-| deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step) |
+| deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step; inactive when use_parcae=True) |
 | deq_k_jitter_set | (4, 6, 10) (DEQ iteration counts sampled per step) |
 | lyapunov_coef | 0.01 (λ_jac: Hutchinson-Frobenius penalty weight) |
 | lyapunov_gamma | 0.97 (target spectral radius threshold) |
@@ -386,6 +388,15 @@ Rationale (incident from 2026-04-18 review): Lyapunov penalty code at line 3037 
 
 ### Doc-Code Invariant
 When `opg_doc.tex` describes an algorithm and `train_gpt.py` implements a different (better) variant, the doc MUST note the deviation in a "Practical implementation" paragraph. The pseudocode represents the theoretical formulation; the implementation note is the source of truth for code.
+
+### Gradient Connectivity Audit Rule
+When adding new `nn.Parameter`s that participate in a custom `autograd.Function` (like `RevDEQFunction`):
+1. Verify the parameters either (a) appear in the `*params` tuple passed to `.apply()` with matching gradients in `backward()`, or (b) connect to `.apply()` through an upstream computation graph (e.g., Parcae β is computed from params, passed as a tensor arg, and `backward()` returns `grad_beta` which autograd chain-rules to the leaf params).
+2. Verify no `.detach()` or `torch.no_grad()` severs the path between loss and the new parameters.
+3. Test with `assert param.grad is not None` after one training step.
+4. For DDP: every `nn.Parameter` must either receive a gradient or be excluded from the module (use `register_buffer` for non-learned tensors). Unused parameters cause `RuntimeError: Expected to have finished reduction`.
+
+Rationale (incident from 2026-04-23): Parcae damping params were triply detached (`.detach()` + `torch.no_grad()` + `.detach()`) and not in `*params`. DDP crashed because the unused `nn.Parameter`s never received gradients.
 
 ### Compile-Wrapper Write Rule
 All attribute writes to `base_model.shared_block` (or any potentially-compiled module) MUST go through `_unwrap_compiled_module()`. The pattern is: `sb = _unwrap_compiled_module(base_model.shared_block)` once per training-loop scope, then use `sb` for all reads/writes.
