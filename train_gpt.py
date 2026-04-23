@@ -1858,12 +1858,7 @@ class RevDEQFunction(torch.autograd.Function):
         state_dtype = torch.float32
         compute_dtype = z_init.dtype
         device_type = x0.device.type
-        # Support both scalar and tensor (per-dim Parcae) beta.
-        if isinstance(beta, torch.Tensor):
-            beta = beta.detach().to(torch.float64)  # (D,) in fp64 for exact accumulators
-            beta_inv = 1.0 - beta
-        else:
-            beta_inv = 1.0 - beta
+        beta_inv = 1.0 - beta
         ctx.do_recon_diag = bool(_ROUTER_DIAGNOSTICS_ACTIVE)
 
         y_state = z_init.to(state_dtype)
@@ -1904,9 +1899,8 @@ class RevDEQFunction(torch.autograd.Function):
         ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(), z_prev_state.detach())
         ctx.z_init_state = z_init_state
         ctx.f_theta = f_theta
-        # Store beta/beta_inv as fp64 tensors for backward reconstruction precision.
-        ctx.beta = beta if isinstance(beta, torch.Tensor) else torch.tensor(beta, dtype=torch.float64)
-        ctx.beta_inv = beta_inv if isinstance(beta_inv, torch.Tensor) else torch.tensor(beta_inv, dtype=torch.float64)
+        ctx.beta = beta
+        ctx.beta_inv = beta_inv
         ctx.K = K
         ctx.bptt_k = int(bptt_k) if bptt_k else 0
         ctx.compute_dtype = compute_dtype
@@ -2073,14 +2067,6 @@ class GPT(nn.Module):
                                    router_scoring=router_scoring,
                                    )
         self.deq_beta = float(deq_beta)
-        # Phase 9 iter 66a: Parcae per-dim damping.
-        # Ā = exp(Δ_p · (-exp(log_a))), Ā ∈ (0,1) by construction.
-        # Init: Ā ≈ 0.5 → log_a = ln(ln(2)) ≈ -0.3665, Δ_p = 1.0
-        # NOT nn.Parameter — stored as plain tensors to avoid DDP unused-param crash
-        # (parcae params are detached in _deq_solve, so never produce gradients in forward).
-        # Optimized via separate optimizer group created in training loop.
-        import math
-        self.use_parcae = False  # toggled by training loop
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
         self.bal_loss_coef = float(bal_loss_coef)
@@ -2166,18 +2152,7 @@ class GPT(nn.Module):
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
         global _DEQ_SOLVE_ACTIVE
-        # Phase 9 iter 66a: Parcae per-dim damping replaces scalar β.
-        if getattr(self, "use_parcae", False):
-            with torch.no_grad():
-                a_bar = torch.exp(self.parcae_delta.detach() * (-torch.exp(self.parcae_log_a.detach())))
-                # Clamp Ā ≥ 0.1 for RevDEQ reversibility (reconstruction divides by Ā).
-                # Ā→0 means β→1 → div-by-zero. At Ā=0.1, amplification = 10×.
-                # Upper bound: Ā→1 (β→0) is safe — just no update on that dim.
-                # Parcae exp(neg) never reaches 1.0, so no upper clamp needed.
-                a_bar = a_bar.clamp(min=0.1)
-            beta = (1.0 - a_bar).detach()  # per-dim "beta" = 1 - Ā, detached
-        else:
-            beta = self.deq_beta
+        beta = self.deq_beta
         dtype = x0.dtype
         K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
         track_diag = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
@@ -2831,16 +2806,6 @@ def main() -> None:
     mos_params = [mos.A_shared, mos.A_ctp, mos.A_ntp, mos.B_denoise, mos.B_NTP,
                   mos.gate_ctp.weight, mos.gate_ctp.bias, mos.gate_ntp.weight, mos.gate_ntp.bias]
     scalar_params.extend(mos_params)
-    # Phase 9 iter 66a: Parcae params — plain tensors (not nn.Parameter) to avoid DDP crash.
-    # Created here, stored on base_model, optimized with AdamW (scalar_lr per paper Table 20).
-    import math as _math
-    base_model.parcae_log_a = torch.full((args.model_dim,), _math.log(_math.log(2.0)),
-                                          device=device, dtype=torch.float32, requires_grad=False)
-    base_model.parcae_delta = torch.ones(args.model_dim, device=device, dtype=torch.float32,
-                                          requires_grad=False)
-    # Note: parcae params are NOT optimized (detached in _deq_solve, no gradient flow).
-    # They provide fixed per-dim damping at init (Ā ≈ 0.5). Learning requires TBPTT gradient
-    # flow (iter 66a-r3 rescue) or auxiliary loss on Ā distribution.
 
     optimizer_tok = torch.optim.AdamW(tok_params, betas=(args.beta1, args.beta2),
                                        eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
@@ -3066,9 +3031,7 @@ def main() -> None:
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
         base_model._deq_k_override = deq_k_for_step(next_step)
-        # Phase 9 iter 66a: Parcae per-dim damping replaces scalar β jitter.
-        base_model.use_parcae = True
-        # Keep scalar beta as fallback (used if use_parcae=False).
+        # Phase 9 iter 49: β jitter — set per-step β (same for all micro-steps).
         base_model.deq_beta = deq_beta_for_step(next_step)
 
         # Refinement gating: enable after ramp_frac of wallclock
