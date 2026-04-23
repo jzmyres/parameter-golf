@@ -2262,6 +2262,13 @@ class GPT(nn.Module):
                 z = x0_refined
             else:
                 x0_refined = x0
+                # Phase 9 iter 76b: simulated refinement (rescue, ε=0.01).
+                # Corrupt embedding with additive Gaussian noise (not mean-emb).
+                corr = float(getattr(self, "_refine_corruption", 0.0))
+                if self.training and corr > 0:
+                    noise = torch.randn_like(x0) * corr
+                    x0_refined = x0 + noise
+                    z = x0_refined
 
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
             self._deq_z_init_last = z.detach()
@@ -2397,7 +2404,9 @@ class GPT(nn.Module):
             self._ctp_loss = 0.0
         refine_alpha = float(getattr(self, "_refine_mix_alpha", 0.5))
         refine_strength = min(max(refine_alpha / 0.5, 0.0), 1.0)
-        ctp_weight = 0.05 * self.num_refinements * refine_strength
+        # Phase 9 iter 76b: CTP from refinement + corruption (max of both).
+        corr = float(getattr(self, "_refine_corruption", 0.0))
+        ctp_weight = 0.05 * max(self.num_refinements * refine_strength, min(corr / 0.01, 1.0))
 
         mos_ortho_loss = torch.tensor(0.0, device=ntp_loss.device)
         if getattr(self.mos_head, "_ctp_ortho_out", None) is not None and getattr(self.mos_head, "_ntp_ortho_out", None) is not None:
@@ -3039,6 +3048,9 @@ def main() -> None:
             base_model._refine_mix_alpha = 0.5 * float(prog)
         else:
             base_model._refine_mix_alpha = 0.5 if base_model.num_refinements > 0 else 0.0
+
+        # Phase 9 iter 76b: simulated refinement corruption (ε=0.01, ramp over 80%).
+        base_model._refine_corruption = 0.01 * min(time_frac / 0.8, 1.0)
 
         for micro_step in range(grad_accum_steps):
             if distributed:
