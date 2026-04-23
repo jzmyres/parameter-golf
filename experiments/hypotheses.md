@@ -782,7 +782,9 @@ failure.
 | 76b | Simulated refinement rescue (Gaussian ε=0.01) | Additive Gaussian noise corruption | H16 | **REVERTED** (+0.112 final, noise hurts NTP without CTP payoff) | 1.6273 | +0.005 |
 | 78 | FSQ symmetric [-8,8] + L2 | 17-level STE on MoS projection, unconstrained + L2=0.01 | H28/H59 | **REVERTED** (+0.181@400, STE noise accumulates despite L2) | 1.8701@400 | — |
 | 66a | Parcae+noWD (combined) | Per-dim Ā + no WD on 1D params | H48/Parcae | **REVERTED** (+0.063, caught up @600 but widened late. Bisecting) | 1.5779 | +0.013 |
-| 66a-b | No-WD-on-1D bisect | weight_decay=0 for all 1D params (without Parcae) | optimizer | Queued | — | — |
+| 66a-b | No-WD-on-1D bisect | weight_decay=0 for all 1D params (without Parcae) | optimizer | **REVERTED** (+0.140@400, WD on 1D IS beneficial in DEQ) | 1.8295@400 | — |
+| 81 | Double max K jitter | K jitter {4,6,10}→{8,12,20} — deeper solver, better FP quality | solver | Queued | — | — |
+| 82 | Stochastic TBPTT + doubled | TBPTT fixed 2→jitter {2,3,4}, richer backward signal | solver | Queued | — | — |
 | 66b | Parcae: remove Lyapunov | Structural ρ(Ā)<1 replaces Hutchinson penalty | H48 | Queued (after 66a) | — | — |
 | 66c | Parcae: remove denoising reg | Per-dim damping replaces denoising regularization | H48 | Queued (after 66b) | — | — |
 | 66d | Parcae: separate B̄ (full ZOH) | B̄=A⁻¹(Ā-I)·b, independent from Ā. More expressive FP | H48 | Queued (after 66c) | — | — |
