@@ -2880,9 +2880,12 @@ def main() -> None:
                           backend_steps=args.muon_backend_steps, weight_decay=args.weight_decay)
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    # All 1D params (norms, biases, gates, routing) — NO weight decay.
+    # WD on these shrinks γ→0 (kills norms), biases→0 (loses learned offsets).
+    # WD is only principled on 2D weight matrices (Muon group).
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
+        betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True)
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if parcae_param_list:
         optimizer_parcae = torch.optim.AdamW(

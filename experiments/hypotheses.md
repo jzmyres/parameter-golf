@@ -789,6 +789,8 @@ failure.
 | 80 | ~~Refinement inject during DEQ~~ | ~~REMOVED: raw x0 already blended into x0_refined~~ | H27 | REMOVED | — | — |
 | 68 | ~~DeltaDEQ dim skipping~~ | ~~REMOVED: non-bottleneck, breaks compile, K-jitter handles~~ | H50 | REMOVED | — | — |
 | 66e | Parcae: remove x0 skip in T_θ | T_θ=Δ only (Ā retention replaces x0 skip). More expressive FP | H48 | Queued (after 66a) | — | — |
+| 81 | Double max K jitter | K jitter {4,6,10}→{8,12,20} — deeper solver, better FP quality | solver | Queued | — | — |
+| 82 | Stochastic TBPTT + doubled | TBPTT fixed 2→jitter {2,3,4}, richer backward signal | solver | Queued | — | — |
 | 63 | Full-rank low-dim experts (merged 63+64) | down(D→r), full-rank attn+MLP at r, up(r→D) per expert | H43/H44 | Queued | — | — |
 | 65 | Scale to 16-32 experts | More experts at cheap per-expert dim r | H47 | Queued (after 63) | — | — |
 
