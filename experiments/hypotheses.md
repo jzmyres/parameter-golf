@@ -775,8 +775,7 @@ failure.
 | 74j | Remove state_norm | Pre-expert RMSNorm on z+x0 | arch | **REVERTED** (+0.199@400, catastrophic. state_norm IS load-bearing) | 1.8878@400 | — |
 | 74k | Remove bigram proj_norm | Bigram pre-projection RMSNorm | arch | **REVERTED** (+0.174@400, bigram norm also load-bearing. ALL norms essential) | 1.8636@400 | — |
 | 74l | Remove shared expert gate (always=1) | DeepSeek-V3 style unconditional shared expert | arch | **REVERTED** (+0.020, shared gate provides useful per-token modulation) | 1.5346 | — |
-| 75 | ELM identity init (zero) | Zero-init expert outputs → T_θ≈x0 at init | ELM ICLR26 | **REVERTED** (+0.119@600, zero kills expert diversity) | 1.6988@600 | — |
-| 75b | ELM small-scale init (rescue) | Normal(0,0.02) expert outputs — near-identity + diversity | ELM ICLR26 | Queued | — | — |
+| 75 | ELM identity init | Zero-init Wo + MLP down_proj → T_θ≈x0 at init | ELM ICLR26 | Queued | — | — |
 | 77 | ~~Residual injection (lerp)~~ | ~~REMOVED: gate g→0 kills input dependence, unprincipled~~ | H25 | REMOVED | — | — |
 | 76 | Simulated refinement (input corruption) | Corrupt one-hot→soft dist, single solve, CTP denoises | H16 | Queued | — | — |
 | 78 | FSQ symmetric levels + L2 | Unconstrained hidden + L2 penalty + round(h)∈{-8..8} 17-level STE | H28/H59 | Queued | — | — |
