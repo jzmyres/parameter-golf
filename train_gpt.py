@@ -2262,14 +2262,6 @@ class GPT(nn.Module):
                 z = x0_refined
             else:
                 x0_refined = x0
-                # Phase 9 iter 76: simulated refinement via input corruption.
-                # Corrupt one-hot embedding → soft distribution (label smoothing).
-                # CTP trains denoising from step 1 without extra DEQ solves.
-                corr = float(getattr(self, "_refine_corruption", 0.0))
-                if self.training and corr > 0:
-                    mean_emb = self.tok_emb.weight.data.mean(dim=0)
-                    x0_refined = (1.0 - corr) * x0 + corr * mean_emb.to(dtype=x0.dtype)
-                    z = x0_refined
 
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
             self._deq_z_init_last = z.detach()
@@ -2405,10 +2397,7 @@ class GPT(nn.Module):
             self._ctp_loss = 0.0
         refine_alpha = float(getattr(self, "_refine_mix_alpha", 0.5))
         refine_strength = min(max(refine_alpha / 0.5, 0.0), 1.0)
-        # Phase 9 iter 76: CTP weight from refinement + corruption.
-        # Corruption provides CTP signal from step 1; refinement adds at ramp.
-        corr = float(getattr(self, "_refine_corruption", 0.0))
-        ctp_weight = 0.05 * max(self.num_refinements * refine_strength, corr / 0.1)
+        ctp_weight = 0.05 * self.num_refinements * refine_strength
 
         mos_ortho_loss = torch.tensor(0.0, device=ntp_loss.device)
         if getattr(self.mos_head, "_ctp_ortho_out", None) is not None and getattr(self.mos_head, "_ntp_ortho_out", None) is not None:
@@ -3050,10 +3039,6 @@ def main() -> None:
             base_model._refine_mix_alpha = 0.5 * float(prog)
         else:
             base_model._refine_mix_alpha = 0.5 if base_model.num_refinements > 0 else 0.0
-
-        # Phase 9 iter 76: simulated refinement corruption (ramp 0→0.1 over training).
-        # Provides CTP denoising signal from step 1 without extra DEQ solves.
-        base_model._refine_corruption = 0.1 * min(time_frac / 0.5, 1.0)
 
         for micro_step in range(grad_accum_steps):
             if distributed:
