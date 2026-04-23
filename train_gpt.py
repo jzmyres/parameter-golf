@@ -1511,16 +1511,6 @@ def _fsq_ste(x: Tensor, num_levels: int, training: bool) -> Tensor:
     return torch.round(x_bounded / step) * step
 
 
-def _fsq_symmetric_ste(x: Tensor, max_level: int = 8, training: bool = True) -> Tensor:
-    """Phase 9 iter 78: symmetric FSQ with unconstrained input + STE.
-    Levels: {-max_level, ..., 0, ..., max_level} = 2*max_level+1 levels.
-    No tanh bounding — L2 loss on x keeps magnitudes reasonable."""
-    x_q = x.round().clamp(-max_level, max_level)
-    if training:
-        return x + (x_q - x).detach()  # STE: forward quantized, backward identity
-    return x_q
-
-
 # ---------------------------------------------------------------------------
 # MoS HEAD (CTP + NTP)
 # ---------------------------------------------------------------------------
@@ -1583,12 +1573,8 @@ class MoSHead(nn.Module):
             return float(max_pairwise_abs_cosine(groups).item())
 
     def _fsq(self, x: Tensor) -> Tensor:
-        if self.fsq_levels <= 0:
-            return x  # Phase 9 iter 62 (H53): disabled FSQ
-        if self.fsq_levels == 17:
-            # Phase 9 iter 78: symmetric FSQ [-8,8], 17 levels, unconstrained + L2
-            self._fsq_l2_loss = 0.01 * x.float().pow(2).mean()
-            return _fsq_symmetric_ste(x, max_level=8, training=self.training)
+        if self.fsq_levels <= 1:
+            return x  # Phase 9 iter 62 (H53): disabled FSQ, keep low-rank only
         return _fsq_ste(x, self.fsq_levels, self.training)
 
     def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
@@ -2103,7 +2089,7 @@ class GPT(nn.Module):
         # tensor so the Hutchinson penalty block stays pure-tensor (no .item()
         # GPU→CPU sync in the hot path). Initialized lazily on first use.
         self._lyapunov_rho_hat_buf: Tensor | None = None
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=17)  # Phase 9 iter 78: symmetric FSQ [-8,8]
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0)  # Phase 9 iter 62 (H53): disabled FSQ
         self.final_norm = RMSNorm(model_dim)
         # Phase 9 iter 71g: ALL norms learnable (project constraint).
         self.embed_norm = RMSNorm(model_dim)
@@ -2426,10 +2412,6 @@ class GPT(nn.Module):
         # iter 45: Lyapunov penalty added externally in training loop
         # (outside compiled forward to avoid tensor metadata corruption).
 
-        # Phase 9 iter 78: FSQ L2 regularization (keeps projections near integer grid)
-        fsq_l2 = getattr(self.mos_head, "_fsq_l2_loss", None)
-        fsq_l2_loss = fsq_l2 if isinstance(fsq_l2, torch.Tensor) else torch.tensor(0.0, device=ntp_loss.device)
-
         return (
             ntp_loss
             + ctp_weight * ctp_loss
@@ -2437,7 +2419,6 @@ class GPT(nn.Module):
             + self.router_health_coef * health_loss
             + self.mos_ortho_out_coef * mos_ortho_loss
             + eff_block_ortho_coef * block_ortho_aux
-            + fsq_l2_loss
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
