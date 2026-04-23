@@ -1254,7 +1254,9 @@ class CausalSelfAttention(nn.Module):
         self.expert_wo_up = nn.Parameter(torch.empty(num_experts, dim, self.wo_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_wo_down.data[e])
-            nn.init.xavier_uniform_(self.expert_wo_up.data[e])
+            # Phase 9 iter 75 (ELM identity init): zero-init output projection
+            # so initial expert output ≈ 0 → T_θ(z,x0) ≈ x0 at init.
+            nn.init.zeros_(self.expert_wo_up.data[e])
 
         # Per-expert-per-head gains and gates (E*H entries each).
         self.q_gain = nn.Parameter(torch.full((num_experts * num_heads,), qk_gain_init, dtype=torch.float32))
@@ -1427,7 +1429,9 @@ class MLP(nn.Module):
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_gate.data[e])
             nn.init.xavier_uniform_(self.expert_fc.data[e])
-            nn.init.xavier_uniform_(self.expert_down.data[e])
+            # Phase 9 iter 75 (ELM identity init): zero-init MLP output projection
+            # so initial expert output ≈ 0 → T_θ(z,x0) ≈ x0 at init.
+            nn.init.zeros_(self.expert_down.data[e])
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
