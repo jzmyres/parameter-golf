@@ -542,6 +542,30 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H61: GLU-style LeakyReLU(0.5)² MLP activation (iter 83) — REFUTED ✗ (2026-04-24)
+
+**Claim:** Replacing SwiGLU (`F.silu(gate) * fc`) with GLU-style LeakyReLU² (`F.leaky_relu(gate, 0.5).square() * fc`) in `MLP.mix_experts` should improve val_bpb, analogous to the SOTA leaderboard config (abaybektursun 1.1194) which uses LeakyReLU².
+
+**Test:** iter 83 — one-line swap at both MLP activation sites (L1599 training path, L1958 Block.forward diagnostic). Commit `8c7a33f`. A/B against iter 94 baseline (c2eff43, val_bpb int6=1.5952).
+
+**Result:** REFUTED.
+
+| Metric | Iter 94 (SwiGLU) | Iter 83 (LeakyReLU²) | Δ |
+|---|---|---|---|
+| val_bpb fast | 1.5777 | 1.5895 | +0.0118 |
+| val_bpb int6 | **1.5952** | **1.6076** | **+0.0124** |
+| K-sweep k128 | 1.5966 | 1.6093 | +0.0127 |
+| K=8→K=128 Δ | +0.0073 | +0.0087 | +0.0014 (widened) |
+| artifact bytes | 6,007,121 | 6,090,865 | +83,744 |
+
+Mid-training val_bpb trajectory flipped sign: iter 83 was ahead at step 200 (1.9641 vs 1.9782), matched at 400 (1.7474 vs 1.7486), then FELL BEHIND from step 600 onward (1.6831 vs 1.6590). The early-training advantage was likely the sharper-gradient benefit of `leaky²` during the unstable warmup phase; once the model settled, the smooth `silu` gating provided better inductive bias for the MoE experts' convex combinations.
+
+**Why it's different from SOTA leaderboard success:** The SOTA abaybektursun config uses a *non-gated* FFN — `F.linear(x, up_w) → leaky_relu(0.5) → square → F.linear(down_w)`. That's a single `up` projection with the squared activation acting as the nonlinearity. Our MoE layout has two parallel projections per expert (`expert_gate` + `expert_fc`) multiplied GLU-style. The GLU product of two projections already provides rich nonlinearity via the multiplication; swapping silu for leaky² on the gate side evidently disrupts the balance without the compensating bottleneck structure of the non-gated form.
+
+**Status:** ✗ REFUTED. Reverted at commit `34ef98d` — train_gpt.py restored to iter 94 SwiGLU. The SOTA-faithful non-gated variant (which would require dropping `expert_fc` entirely) is reserved as a potential follow-up under the Group D architectural rewrite — it's a larger refactor than Group A should contain.
+
+**Implication:** For our per-expert GLU layout, SwiGLU is the better activation. A LeakyReLU² variant would need to come *with* the structural change to non-gated form (single up-projection) to replicate the SOTA pattern, not as a drop-in activation swap.
+
 ### H60: Disable CTP head entirely (iter 94) — PROMOTED ★ (2026-04-24)
 
 **Claim:** Under the iter 66b landscape (Parcae per-dim Ā/B̄ input injection, learnable prenorm scales everywhere, WD=0.30), the dual-head MoS (CTP + NTP) is net-neutral-to-beneficial when collapsed to NTP-only. Removing the CTP parameter banks (`gate_ctp`, `gate_ctp_norm_weight`, `ctp_a_norm_weight`, `A_ctp_shared`, `A_ctp`, `B_denoise`, `ctp_rank_norm_weight`) and skipping the CTP loss + inference mixing frees ~1.38M parameters (~10.9%) without hurting val_bpb.
@@ -889,7 +913,7 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
 | **94** | new | Disable CTP entirely (NTP-only). Add `Hyperparameters.use_ctp = True` guard; when False, `MoSLowRankOutputHead.forward` returns only `log_p_ntp`, `GPT.forward` skips `ctp_loss` computation at L2760-2781, and CTP-specific `nn.Parameter` banks (`gate_ctp`, `gate_ctp_norm_weight`, `A_ctp_shared`, `A_ctp`, `ctp_a_norm_weight`, `ctp_rank_norm_weight`, `B_denoise`) are NOT allocated. **PROMOTED ★ (commit `c2eff43`)** — int6 Δ=+0.0026 (≤0.03 ✓), K8→K128 Δ tightened +0.0103→+0.0073, artifact -592 KB (-9.0%), params -1.38M (-10.9%). See H60. |
-| **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` (GLU-style: `leaky(gate,0.5)² * fc`) | Leaderboard-SOTA technique (abaybektursun 1.1194). Banach constraint forcing its removal is gone (Lyapunov replaces it). Lowest risk / highest upside-density item on the queue. NOTE: GLU variant (our MoE layout has expert_gate + expert_fc + expert_down); the SOTA FFN is non-gated `leaky²(up(x)) → down`. If iter 83 GLU-style promotes, queue iter 83b as a faithful-SOTA refactor dropping `expert_fc`. |
+| **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` (GLU-style: `leaky(gate,0.5)² * fc`) | **REVERTED ✗ (commit `34ef98d`)** — int6 regression +0.0124 vs iter 94 (1.6076 vs 1.5952), artifact +84 KB, K-sweep slightly widened (K=8→K=128 Δ: +0.0073 → +0.0087). Technically within the ≤0.03 carry-forward band, but the change delivers *no* offsetting benefit (no param savings, no FP-quality tightening, no artifact saving) — it is a pure regression under the iter 94 NTP-only + Parcae landscape. The SOTA abaybektursun 1.1194 leaderboard config used a *non-gated* `leaky²(up(x)) → down` FFN; our MoE has `expert_gate + expert_fc + expert_down`, so the GLU-with-leaky² variant tested here is a hybrid that apparently pulls worse than SwiGLU in our architecture. See H61. (A full SOTA-faithful non-gated expert rewrite is still open as a possible follow-up, but blocked behind the Group D architectural rewrites.) |
 | **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | Trivial; fixes an accidental symmetry. Independent of 83 — can run in parallel if hardware permits. |
 | **85** | 82 | Stochastic TBPTT `{2,3,4}` | One-knob change matching the K-jitter principle (H12 VERIFIED). Known-class trade-off. |
 | **93** | new | Remove bigram embed (`bigram_vocab_size 4096 → 0`) | Frees ~1 MB of artifact budget (4096 × 128 × 2 bytes FP16 + 128 × 768 proj). BigramHash was added in iter 6 under a very different architecture (pre-DEQ, pre-experts). Under the current iter 66b landscape (learnable norms, Parcae B̄ input injection, expert banks), it may be redundant — the DEQ's x₀ re-injection already carries token-pair information through iterations. Clean one-line ablation; `GPT.__init__` already handles `bigram_vocab_size == 0` via `if bigram_vocab_size > 0` guard at L2345. If val_bpb stays within 0.03, the freed budget compounds into iter 90–92's arch scale-up. |
