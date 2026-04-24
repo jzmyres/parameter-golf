@@ -97,6 +97,7 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         router_scoring=args.router_scoring,
         num_experts=args.num_experts,
         num_shared_experts=args.num_shared_experts,
+        use_ctp=args.use_ctp,
     ).cuda()
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)

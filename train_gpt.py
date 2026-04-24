@@ -173,6 +173,13 @@ class Hyperparameters:
     num_heads = 8
     num_experts = 8  # H5: single source for attn + mlp expert banks (CLAUDE.md SSOT)
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
+    # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
+    # emits NTP log-probs; CTP param banks (gate_ctp, A_ctp_shared, A_ctp,
+    # B_denoise, ctp_*_norm_weight) are not allocated, CTP loss is skipped, and
+    # the refinement soft-embedding mix uses p_ntp only. Tests whether the
+    # dual-head denoising gradient is still load-bearing under iter 66b's
+    # Parcae + learnable-norm landscape.
+    use_ctp = False
     mlp_mult = 3.0
     tie_embeddings = True
     rope_base = 10000.0
@@ -320,7 +327,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             p.add_argument(f"--{name}", type=str, default=None)
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
-        "swa-enabled", "ema-enabled",
+        "swa-enabled", "ema-enabled", "use-ctp",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # Backward compat: "unroll" is the established name in experiments/docs.
@@ -333,7 +340,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         raise SystemExit(f"Unknown args: {unknown}")
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
-                 "swa_enabled", "ema_enabled"}
+                 "swa_enabled", "ema_enabled", "use_ctp"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -1589,7 +1596,7 @@ class MLP(nn.Module):
         ).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h = F.leaky_relu(gate, 0.5).square() * fc
+        h = F.silu(gate) * fc
         h = h.view(N, E, R)
         # Per-expert RMSNorm (no shared weights across experts)
         h_rms = h.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
@@ -1659,9 +1666,16 @@ def _fsq_ste(x: Tensor, num_levels: int, training: bool) -> Tensor:
 # ---------------------------------------------------------------------------
 
 class MoSHead(nn.Module):
-    """Mixture-of-Softmaxes dual head with FSQ."""
+    """Mixture-of-Softmaxes dual head with FSQ.
+
+    Iter 94: when `use_ctp=False`, the CTP head's parameter banks are not
+    allocated; `forward()` returns `(log_p_ntp, log_p_ntp)` and the CTP-side
+    balance / ortho diagnostics stay at identity defaults. This is the clean
+    one-variable ablation of dual-head MoS.
+    """
     def __init__(self, d_model: int, vocab_size: int, rank: int = 256,
-                 num_shared: int = 2, num_specialized: int = 1, fsq_levels: int = 8):
+                 num_shared: int = 2, num_specialized: int = 1, fsq_levels: int = 8,
+                 use_ctp: bool = True):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
@@ -1670,20 +1684,22 @@ class MoSHead(nn.Module):
         self.num_specialized = num_specialized
         self.num_experts = num_shared + num_specialized
         self.fsq_levels = fsq_levels
-        self.gate_ctp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
+        self.use_ctp = bool(use_ctp)
         self.gate_ntp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
-        self.gate_ctp_norm_weight = nn.Parameter(torch.ones(d_model))
         self.gate_ntp_norm_weight = nn.Parameter(torch.ones(d_model))
-        self.ctp_a_norm_weight = nn.Parameter(torch.ones(self.num_experts, d_model))
         self.ntp_a_norm_weight = nn.Parameter(torch.ones(self.num_experts, d_model))
-        self.A_ctp_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
         self.A_ntp_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
-        self.A_ctp = nn.Parameter(torch.empty(num_specialized, d_model, rank))
         self.A_ntp = nn.Parameter(torch.empty(num_specialized, d_model, rank))
-        self.B_denoise = nn.Parameter(torch.empty(self.num_experts, vocab_size, rank))
         self.B_NTP = nn.Parameter(torch.empty(self.num_experts, vocab_size, rank))
-        self.ctp_rank_norm_weight = nn.Parameter(torch.ones(self.num_experts, rank))
         self.ntp_rank_norm_weight = nn.Parameter(torch.ones(self.num_experts, rank))
+        if self.use_ctp:
+            self.gate_ctp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
+            self.gate_ctp_norm_weight = nn.Parameter(torch.ones(d_model))
+            self.ctp_a_norm_weight = nn.Parameter(torch.ones(self.num_experts, d_model))
+            self.A_ctp_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
+            self.A_ctp = nn.Parameter(torch.empty(num_specialized, d_model, rank))
+            self.B_denoise = nn.Parameter(torch.empty(self.num_experts, vocab_size, rank))
+            self.ctp_rank_norm_weight = nn.Parameter(torch.ones(self.num_experts, rank))
         self._diag_step: int | None = None
         self._ctp_ortho_out: Tensor | None = None
         self._ntp_ortho_out: Tensor | None = None
@@ -1695,13 +1711,18 @@ class MoSHead(nn.Module):
         self._init_params()
 
     def _init_params(self):
-        for gate in [self.gate_ctp, self.gate_ntp]:
+        gates = [self.gate_ntp] + ([self.gate_ctp] if self.use_ctp else [])
+        for gate in gates:
             nn.init.normal_(gate.weight, std=0.01)
             nn.init.zeros_(gate.bias)
-        for A in [self.A_ctp_shared, self.A_ntp_shared, self.A_ctp, self.A_ntp]:
+        A_mats = [self.A_ntp_shared, self.A_ntp]
+        if self.use_ctp:
+            A_mats += [self.A_ctp_shared, self.A_ctp]
+        for A in A_mats:
             for e in range(A.shape[0]):
                 nn.init.xavier_uniform_(A.data[e])
-        for B in [self.B_denoise, self.B_NTP]:
+        B_mats = [self.B_NTP] + ([self.B_denoise] if self.use_ctp else [])
+        for B in B_mats:
             for e in range(B.shape[0]):
                 nn.init.xavier_uniform_(B.data[e])
 
@@ -1716,6 +1737,8 @@ class MoSHead(nn.Module):
         #   - LOSS: max_mean (smoother gradient, every pair contributes)
         #   - GATE: max_pairwise (clean duplicate detection at threshold 0.9)
         if self.num_shared + self.num_specialized < 2:
+            return 0.0
+        if head == "ctp" and not self.use_ctp:
             return 0.0
         A_shared = self.A_ctp_shared if head == "ctp" else self.A_ntp_shared
         A_spec = self.A_ctp if head == "ctp" else self.A_ntp
@@ -1775,16 +1798,24 @@ class MoSHead(nn.Module):
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         orig_shape = h.shape[:-1]
         x = h.reshape(-1, self.d_model)
-        log_p_d, alpha_d, ortho_ctp = self._head_forward(
-            x, self.gate_ctp, self.gate_ctp_norm_weight,
-            self.A_ctp_shared, self.A_ctp, self.ctp_a_norm_weight,
-            self.B_denoise, self.ctp_rank_norm_weight,
-        )
         log_p_n, alpha_n, ortho_ntp = self._head_forward(
             x, self.gate_ntp, self.gate_ntp_norm_weight,
             self.A_ntp_shared, self.A_ntp, self.ntp_a_norm_weight,
             self.B_NTP, self.ntp_rank_norm_weight,
         )
+        if self.use_ctp:
+            log_p_d, alpha_d, ortho_ctp = self._head_forward(
+                x, self.gate_ctp, self.gate_ctp_norm_weight,
+                self.A_ctp_shared, self.A_ctp, self.ctp_a_norm_weight,
+                self.B_denoise, self.ctp_rank_norm_weight,
+            )
+        else:
+            # NTP-only: alias CTP outputs to NTP for API compatibility.
+            # Downstream GPT.forward zeros ctp_loss/ctp_weight, and the
+            # refinement path uses p_ntp only (see _get_soft_embedding).
+            log_p_d = log_p_n
+            alpha_d = alpha_n
+            ortho_ctp = x.new_zeros(())
         self._ctp_ortho_out = ortho_ctp
         self._ntp_ortho_out = ortho_ntp
         distributed = dist.is_available() and dist.is_initialized()
@@ -1792,7 +1823,8 @@ class MoSHead(nn.Module):
 
         if self.training:
             bal = torch.tensor(0.0, device=x.device)
-            for alpha_soft in [alpha_d, alpha_n]:
+            alphas = [alpha_n] if not self.use_ctp else [alpha_d, alpha_n]
+            for alpha_soft in alphas:
                 mean_a = alpha_soft.mean(dim=0)
                 target = torch.ones_like(mean_a) / alpha_soft.shape[-1]
                 bal = bal + F.mse_loss(mean_a, target)
@@ -2335,8 +2367,10 @@ class GPT(nn.Module):
                  lyapunov_gamma: float = 0.9,
                  lyapunov_warmup_frac: float = 0.1,
                  use_parcae: bool = True,
-                 parcae_init_a_bar: float = 0.7):
+                 parcae_init_a_bar: float = 0.7,
+                 use_ctp: bool = True):
         super().__init__()
+        self.use_ctp = bool(use_ctp)
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.num_layers = num_layers
@@ -2410,7 +2444,7 @@ class GPT(nn.Module):
         # tensor so the Hutchinson penalty block stays pure-tensor (no .item()
         # GPU→CPU sync in the hot path). Initialized lazily on first use.
         self._lyapunov_rho_hat_buf: Tensor | None = None
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0)  # Phase 9 iter 62 (H53): disabled FSQ
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0, use_ctp=self.use_ctp)  # Phase 9 iter 62 (H53): disabled FSQ. Iter 94: use_ctp threads through to skip CTP.
         self.final_norm = RMSNorm(model_dim)
         # Embedding/final norms remain learnable shared scales outside T_theta.
         self.embed_norm = RMSNorm(model_dim)
@@ -2498,10 +2532,13 @@ class GPT(nn.Module):
             torch.clear_autocast_cache()
 
             log_p_ntp_shifted = torch.cat([log_p_ntp[:, :1], log_p_ntp[:, :-1]], dim=1)
-            p_ctp = _logp_to_prob(log_p_ctp)
             p_ntp = _logp_to_prob(log_p_ntp_shifted)
-            p_mix = 0.5 * (p_ctp + p_ntp)
-            p_mix[:, 0] = p_ctp[:, 0]
+            if self.use_ctp:
+                p_ctp = _logp_to_prob(log_p_ctp)
+                p_mix = 0.5 * (p_ctp + p_ntp)
+                p_mix[:, 0] = p_ctp[:, 0]
+            else:
+                p_mix = p_ntp
             p_mix = torch.nan_to_num(p_mix, nan=0.0, posinf=0.0, neginf=0.0)
 
             k = min(int(topk), int(p_mix.shape[-1]))
@@ -2760,7 +2797,10 @@ class GPT(nn.Module):
         log_p_ctp, log_p_ntp = self.mos_head(x)
         V = self.tok_emb.num_embeddings
         ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
-        ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
+        if self.use_ctp:
+            ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
+        else:
+            ctp_loss = torch.tensor(0.0, device=ntp_loss.device)
         bal_loss, health_loss = self._collect_routing_losses(ntp_loss.device)
         self._ntp_loss_t = ntp_loss.detach()
         self._ctp_loss_t = ctp_loss.detach()
@@ -2778,7 +2818,7 @@ class GPT(nn.Module):
             self._ctp_loss = 0.0
         refine_alpha = float(getattr(self, "_refine_mix_alpha", 0.5))
         refine_strength = min(max(refine_alpha / 0.5, 0.0), 1.0)
-        ctp_weight = 0.05 * self.num_refinements * refine_strength
+        ctp_weight = (0.05 * self.num_refinements * refine_strength) if self.use_ctp else 0.0
 
         mos_ortho_loss = torch.tensor(0.0, device=ntp_loss.device)
         if getattr(self.mos_head, "_ctp_ortho_out", None) is not None and getattr(self.mos_head, "_ntp_ortho_out", None) is not None:
@@ -2935,14 +2975,16 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
             scalar_params.append(base_model.bigram.proj_norm.weight)
 
     mos = base_model.mos_head
-    mos_params = [mos.A_ctp_shared, mos.A_ntp_shared, mos.A_ctp, mos.A_ntp,
-                  mos.B_denoise, mos.B_NTP, mos.ctp_rank_norm_weight,
-                  mos.ntp_rank_norm_weight, mos.gate_ctp_norm_weight,
-                  mos.gate_ntp_norm_weight, mos.ctp_a_norm_weight,
+    mos_params = [mos.A_ntp_shared, mos.A_ntp, mos.B_NTP,
+                  mos.ntp_rank_norm_weight, mos.gate_ntp_norm_weight,
                   mos.ntp_a_norm_weight,
-                  mos.gate_ctp.weight,
-                  mos.gate_ctp.bias, mos.gate_ntp.weight, mos.gate_ntp.bias,
+                  mos.gate_ntp.weight, mos.gate_ntp.bias,
                   ]
+    if mos.use_ctp:
+        mos_params += [mos.A_ctp_shared, mos.A_ctp, mos.B_denoise,
+                       mos.ctp_rank_norm_weight, mos.gate_ctp_norm_weight,
+                       mos.ctp_a_norm_weight,
+                       mos.gate_ctp.weight, mos.gate_ctp.bias]
     scalar_params.extend(mos_params)
     scalar_params.append(base_model.final_norm.weight)
     scalar_params.append(base_model.embed_norm.weight)
@@ -3201,6 +3243,7 @@ def main() -> None:
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
         use_parcae=args.use_parcae,
         parcae_init_a_bar=args.parcae_init_a_bar,
+        use_ctp=args.use_ctp,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
