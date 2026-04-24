@@ -824,28 +824,47 @@ failure.
 | 66c | ~~Parcae: remove denoising reg~~ **→ RENAMED iter 89** | After iter 88 lands, test whether Parcae's per-dim Ā makes the HyDRA denoising penalty redundant. | H48 | **Queued — iter 89 (after 88)** (renumbered from `66c` for the same reason) | — | — |
 | 66d | ~~Parcae: separate B̄ (full ZOH)~~ | ~~B̄=A⁻¹(Ā-I)·b, independent from Ā~~ | H48 | ~~SUPERSEDED~~ by iter 66b (committed: `B̄ = Δ·B` Mamba-ZOH approximation, independent of Ā except through shared Δ. See H58). | — | — |
 | 66e | ~~Parcae: remove x0 skip in T_θ~~ | ~~T_θ=Δ only (Ā retention replaces x0 skip)~~ | H48 | ~~SUPERSEDED~~ by iter 66b (Parcae-faithful `T_θ = B̄⊙RMSNorm_learn(x₀) + Δ` — the `B̄` injection is an *expressive* replacement for the `x0` skip, not a removal. See H58). | — | — |
-| 79 | Per-iter depth embeddings | iter_embed∈R^{K_max×dim}, zero-init, u=z+x0+embed[k] | H24 | Queued (deferred — breaks strict-DEQ invariant; needs user approval before running) | — | — |
+| 79 | ~~Per-iter depth embeddings~~ | ~~iter_embed∈R^{K_max×dim}, zero-init, u=z+x0+embed[k]~~ | H24 | ~~REMOVED~~ — not principled: DEQ theory requires the fixed-point map T_θ to be *iteration-invariant* so the K→∞ limit is well-defined (Banach / Parcae-ZOH both assume a single map iterated indefinitely). Per-iteration embeddings make T_θ = T_θ(k) depend on k, destroying the fixed-point premise; K-sweep extrapolation (the existing `K=128` eval gate) ceases to be meaningful. This is a shared-weight K-layer transformer, not a DEQ. | — | — |
 | 80 | ~~Refinement inject during DEQ~~ | ~~REMOVED: raw x0 already blended into x0_refined~~ | H27 | REMOVED | — | — |
 | 68 | ~~DeltaDEQ dim skipping~~ | ~~REMOVED: non-bottleneck, breaks compile, K-jitter handles~~ | H50 | REMOVED | — | — |
-| 63 | Full-rank low-dim experts (merged 63+64) | down(D→r), full-rank attn+MLP at r, up(r→D) per expert | H43/H44 | Queued (major rewrite; defer until simpler wins above are exhausted) | — | — |
-| 65 | Scale to 16-32 experts | More experts at cheap per-expert dim r | H47 | Queued (after 63 — standalone blows 16MB budget) | — | — |
+| 63 | Full-rank low-dim experts (merged 63+64) | down(D→r), full-rank attn+MLP at r, up(r→D) per expert | H43/H44 | **Queued — iter 90 (after 89)**; major rewrite (2-3 iters) but principled + on-queue | — | — |
+| 65 | Scale to 16-32 experts | More experts at cheap per-expert dim r | H47 | **Queued — iter 91 (after 90)**; requires low-dim experts from iter 90 to fit the 16MB budget | — | — |
+| 70d | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | **Queued — iter 92 (after 90)**; complements iter 91, same low-dim-experts dependency | — | — |
 
 ### Next up — recommended ordering after iter 66b
 
-Current baseline is iter 74b (val_bpb 1.5150) with iter 66b (Parcae-paper-faithful DEQ input injection, H58) just committed and awaiting A/B validation. Run ordering chosen for (i) independence between consecutive changes, (ii) low-risk first, (iii) re-ablation of legacy loss terms last:
+Current baseline is iter 74b (val_bpb 1.5150) with iter 66b (Parcae-paper-faithful DEQ input injection, H58) just committed and awaiting A/B validation. Run ordering chosen for (i) low-risk → higher-risk, (ii) activation / gate / schedule tweaks before legacy-loss ablations, (iii) architectural scale-up last (depends on predecessors).
+
+#### Group A — low-risk quick wins (run first)
 
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
 | **66b A/B** | — | Validate iter 66b vs iter 74b on ≥200 dev steps | Predecessor of everything below; Parcae-faithful injection must first be either promoted or reverted based on val_bpb. |
 | **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` | Leaderboard-SOTA technique (abaybektursun 1.1194). Banach constraint forcing its removal is gone (Lyapunov replaces it). Lowest risk / highest upside-density item on the queue. |
-| **84** | 74f | Independent attn/mlp shared gates | Trivial; fixes an accidental symmetry. Independent of 83 — can run in parallel if hardware permits. |
+| **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | Trivial; fixes an accidental symmetry. Independent of 83 — can run in parallel if hardware permits. |
 | **85** | 82 | Stochastic TBPTT `{2,3,4}` | One-knob change matching the K-jitter principle (H12 VERIFIED). Known-class trade-off. |
+
+#### Group B — medium-risk schedule + regularization tuning
+
+| New # | Old # | One-line | Rationale |
+|---|---|---|---|
 | **86** | 74c | WD 0.30 → 0.01 re-test | Revisit under iter 71g (learnable norms everywhere) + iter 66b (Parcae B̄) landscape; both absorb some of what iter 71b showed WD was providing on non-norm paths. |
-| **87** | 81 | K-jitter `{8,12,20}` | Risky (iter 59 replay in a milder form). Run only if 83-86 land cleanly — the throughput budget has to accommodate ~10-15% fewer steps/s. |
-| **88** | old 66b | Remove Lyapunov penalty | Legacy-loss ablation: does Parcae's per-dim Ā make the Hutchinson λ_jac penalty redundant? Renumbered to avoid collision with committed iter 66b. |
-| **89** | old 66c | Remove denoising regularization | Same principle as 88 for the HyDRA denoising term. Run sequentially after 88. |
-| 79 | — | Per-iter depth embeddings | *Holds open a philosophical question*: adding iter-specific state turns the weight-tied DEQ into a shared-weight K-layer transformer. Run only after user approves the paradigm relaxation. |
-| 63 / 65 / model_dim bump | — | Full-rank low-dim experts + expert-count scale-up + D=1024 | Multi-iter architectural push (2-3 iters each). Defer until 83-89 signals are in. |
+| **87** | 81 | K-jitter `{4,6,10} → {8,12,20}` | Iter 59 replay in milder form. Run only if 83-86 land cleanly — throughput budget has to accommodate ~10-15% fewer steps/s. |
+
+#### Group C — legacy-loss ablations (after Parcae is validated)
+
+| New # | Old # | One-line | Rationale |
+|---|---|---|---|
+| **88** | old 66b queue | Remove Lyapunov Hutchinson penalty (λ_jac) | Does Parcae's per-dim Ā make the λ_jac term redundant? Clean one-variable ablation; renumbered to avoid collision with committed iter 66b. |
+| **89** | old 66c queue | Remove HyDRA denoising regularization | Same principle as 88 for the denoising term. Sequential after 88. |
+
+#### Group D — architectural scale-up (high-lift push; 2-3 iters each, interdependent)
+
+| New # | Old # | One-line | Rationale |
+|---|---|---|---|
+| **90** | 63-merged | Full-rank low-dim experts: `down(D→r) → full-rank attn+MLP at r → up(r→D)` per expert | H43 + H44. Replaces current low-rank factorization with explicit dim-reduction + full-rank expert compute. Precondition for 91 and 92 — without it, scaling experts or D blows the 16 MB artifact budget. |
+| **91** | 65 | Scale experts 8 → 16-32 at cheap per-expert dim r | H47. Router-diversity scaling becomes affordable once experts are low-dim (iter 90). |
+| **92** | 70-dup | model_dim 768 → 1024 under low-dim experts | H43. D now scales cheaply because only down/up projections grow with D (expert internals remain at r). |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
