@@ -100,7 +100,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | router_scoring | linear (dot-product logits, iter 70) |
 | attn_expert_rank | 128 |
 | mlp_expert_rank | 192 |
-| bigram_vocab_size | 4096 |
+| bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
 | deq_k_jitter_set | (4, 6, 10) (DEQ iteration counts sampled per step) |

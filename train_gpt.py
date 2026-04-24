@@ -284,7 +284,15 @@ class Hyperparameters:
     # 2026-03-20 SmearGate uses 4096×128).  Frees ~13.1M params for the
     # transformer body.  The freed capacity enables model_dim increase in
     # iter 7 and mlp_mult increase in iter 8.
-    bigram_vocab_size = 4096
+    # Iter 93 (2026-04-24): disable BigramHash. Added in iter 6 under a very
+    # different architecture (pre-DEQ, pre-experts, no Parcae B̄ input
+    # injection). Under the current iter 85 baseline (NTP-only + learnable
+    # norms everywhere + Parcae input forcing + split shared gates + TBPTT
+    # jitter), the DEQ's x₀ re-injection already carries token-pair
+    # information. Setting to 0 frees ~1 MB of artifact budget (4096 × 128
+    # × 2 B + 128 × 768 proj) that can compound into iter 90–92's arch
+    # scale-up. GPT.__init__ already guards `if bigram_vocab_size > 0`.
+    bigram_vocab_size = 0
     bigram_dim = 128
     kv_latent_dim = 0  # auto: dim//2
     # optimal: rank 128/192 at dim=768, 8 experts
