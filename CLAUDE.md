@@ -77,6 +77,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | parcae_reversibility_floor | 0.1 (correctness constant — Ā ≥ this bound for RevDEQ backward safety, NOT a tuning knob) |
 | deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
 | num_refinements | 1 |
+| use_ctp | False (iter 94: CTP head disabled — NTP-only; CTP param banks not allocated) |
 
 ### Optimizer
 | Parameter | Value |
@@ -330,14 +331,24 @@ When proposing architecture improvements:
   - Step 1+: predict from z* → build soft embedding → DEQ solve with x₀ + soft_embed
   - Soft embedding: average CTP[i] and NTP[i-1] logits, top-k sparse embed, EMA blending
   - `num_refinements` controls how many predict→refine cycles (default: 1)
-- **Dual-head MoS prediction** (REQUIRED):
-  - **CTP (Current Token Prediction)**: predict current token (denoising)
-  - **NTP (Next Token Prediction)**: predict next token (standard AR)
-  - MoS with shared experts + specialized experts per head
-  - CTP weight: `0.05 × num_refinements × refine_strength` where `refine_strength = min(refine_alpha / 0.5, 1.0)`. The alpha-dependent scaling reduces CTP influence when refinement soft-embedding is weak.
-    (at refinement 0, input is clean one-hot — nothing to denoise)
-  - All experts trainable (no frozen expert), xavier init (no SVD bias)
-  - Track and plot CTP and NTP losses separately
+- **NTP-only MoS prediction** (iter 94, 2026-04-24): the dual-head CTP+NTP
+  design was ablated. `Hyperparameters.use_ctp = False` is the baseline.
+  CTP param banks (`gate_ctp`, `gate_ctp_norm_weight`, `ctp_a_norm_weight`,
+  `A_ctp_shared`, `A_ctp`, `B_denoise`, `ctp_rank_norm_weight`) are not
+  allocated; `MoSHead.forward` returns `(log_p_ntp, log_p_ntp)` when
+  disabled; `GPT.forward` sets `ctp_loss = 0`; `_get_soft_embedding`
+  uses `p_mix = p_ntp` during refinement. Promoted at iter 94 — int6
+  val_bpb 1.5952 vs baseline (iter 66b) 1.5926, K=8→K=128 Δ tightened
+  from +0.0103 to +0.0073, artifact -592 KB (-9.0%), params -1.38M
+  (-10.9%). See H60 in experiments/hypotheses.md.
+  - The refinement soft-embedding in `_get_soft_embedding` now uses
+    `p_ntp` only (no CTP mixing); the refinement mechanism still
+    operates through the DEQ solve — what was removed is the CTP
+    output-head parameter banks and its auxiliary loss gradient.
+  - NTP MoS head still uses 2 shared + 1 specialized expert, xavier
+    init, rank=256.
+  - Historical (pre-iter-94) dual-head design: preserved behind
+    `--use-ctp=1` CLI flag for A/B re-testing if needed.
 
 ### 6. Parameter Golf Hard Constraints (ENFORCED)
 - Artifact size <= 16,000,000 bytes (code + compressed model)

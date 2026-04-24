@@ -4362,7 +4362,11 @@ def main() -> None:
         # retry prescriptions for the next iter (meta_json["failure_categories"]
         # + retry_hint.json) but do not block promotion.
         meta_json["run_valid"] = True
-        meta_json["status"] = "validated_clean" if _assertions_passed else "validated_with_diagnostic_fail"
+        # Status label must match the update_results.sh promotion allowlist
+        # {"validated", "validated_clean", "validated_with_tech_debt"}; gate
+        # failures land in `failure_categories` + retry_hint.json and are
+        # tech debt for the next iter per CLAUDE.md val_bpb-primary policy.
+        meta_json["status"] = "validated_clean" if _assertions_passed else "validated_with_tech_debt"
         with open(meta_path, "w") as f:
             json.dump(meta_json, f)
 

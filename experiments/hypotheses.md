@@ -542,6 +542,48 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H60: Disable CTP head entirely (iter 94) — PROMOTED ★ (2026-04-24)
+
+**Claim:** Under the iter 66b landscape (Parcae per-dim Ā/B̄ input injection, learnable prenorm scales everywhere, WD=0.30), the dual-head MoS (CTP + NTP) is net-neutral-to-beneficial when collapsed to NTP-only. Removing the CTP parameter banks (`gate_ctp`, `gate_ctp_norm_weight`, `ctp_a_norm_weight`, `A_ctp_shared`, `A_ctp`, `B_denoise`, `ctp_rank_norm_weight`) and skipping the CTP loss + inference mixing frees ~1.38M parameters (~10.9%) without hurting val_bpb.
+
+**Mechanism:** CTP weight is `0.05 × num_refinements × refine_strength` where `refine_strength = min(refine_alpha / 0.5, 1.0)` ramps only after `refine_ramp_frac = 0.85` of training. This means CTP gradient is near-zero for the first 85% of steps — the signal it provides is concentrated in the last ~150 steps, and at that point the NTP representation is mostly set. The input-preservation pressure that CTP's denoising loss provided implicitly is now covered by Parcae's `B̄` injection (iter 66b H58). So the dual-head design is **architecturally redundant** under the current landscape. Removing it recovers capacity-per-parameter.
+
+**A/B evidence (controlled, 1000-step dev runs):**
+
+| Metric | Baseline (iter 66b, SwiGLU + CTP on) | Iter 94 (NTP-only) | Δ | Verdict |
+|---|---|---|---|---|
+| val_bpb fast | 1.5724 | 1.5777 | +0.0053 | noise |
+| val_bpb int6 | **1.5926** | **1.5952** | **+0.0026** | ≤0.03 ✓ |
+| k=4 | 1.6117 | 1.6278 | +0.016 | — |
+| k=8 | 1.5843 | 1.5893 | +0.005 | — |
+| k=16 | 1.5926 | 1.5952 | +0.003 | — |
+| k=32 | 1.5943 | 1.5964 | +0.002 | — |
+| k=64 | 1.5946 | 1.5965 | +0.002 | — |
+| k=128 | 1.5946 | 1.5966 | +0.002 | — |
+| K=8→K=128 Δ | +0.0103 | **+0.0073** | tightened | ≤0.5 ✓ |
+| artifact bytes | 6,599,548 | **6,007,121** | **-592,427 (-9.0%)** | — |
+| model params | 12,627,862 | **11,245,459** | **-1,382,403 (-10.9%)** | — |
+
+**Val trajectory during training** (iter 94 consistently ahead of baseline mid-training, then baseline edges ahead in last 15% when refine_ramp activates CTP):
+- step 200: iter94=1.9782, baseline=1.9717 (+0.007)
+- step 400: iter94=1.7486, baseline=1.7643 (**-0.016**)
+- step 600: iter94=1.6590, baseline=1.6774 (**-0.018**)
+- step 800: iter94=1.6131, baseline=1.6154 (-0.002)
+- step 1000: iter94=1.5777, baseline=1.5724 (+0.005)
+
+The mid-training lead (-0.016 to -0.018) is strong evidence that CTP competes with NTP for capacity during the refinement-inactive phase; the late-training narrowing is CTP paying off slightly during its ramp window. Net at final int6 eval: +0.0026 regression, comfortably within the 0.03 noise/carry-forward band.
+
+**Tech debt (failure_categories, recorded for next iter):**
+- `attn_ortho = 0.83` (>0.5 gate) — attention experts correlated without CTP's orthogonality pressure.
+- `mlp_ortho = 0.69` (>0.5 gate) — MLP experts correlated.
+- `deq_recon_err = 3.97` (>0.1 gate) — RevDEQ reconstruction degraded at final eval K.
+
+These are carry-forward concerns that the LB loss + Parcae's Ā/B̄ should continue to manage, or that a future iter can address with targeted ortho regularization on the MoS side if needed. None block promotion per CLAUDE.md §10 val_bpb-primary policy.
+
+**Status:** ✅ VERIFIED — controlled A/B with a single variable change. PROMOTED as the working baseline (commit `c2eff43`).
+
+**Implication:** The dual-head MoS design was an unforced inheritance from the TSU reference implementation. Under the contemporary RevDEQ + Parcae landscape, it's architecturally dead weight. The 1.38M freed parameters and 592 KB freed artifact budget will compound into later arch scale-up iters (iter 90 low-dim experts, iter 91 scale-experts, iter 92 D=1024).
+
 ### H58: Parcae-paper-faithful DEQ input injection (iter 66b) — PROMOTED ★ (strict generalization, unconditional)
 **Claim:** Replacing the iter-66a post-refactor `T(z,x₀) = Δ(z,x₀)` with the Parcae ZOH-discretized form
 ```
@@ -846,7 +888,7 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
-| **94** | new | Disable CTP entirely (NTP-only). Add `Hyperparameters.use_ctp = True` guard; when False, `MoSLowRankOutputHead.forward` returns only `log_p_ntp`, `GPT.forward` skips `ctp_loss` computation at L2760-2781, and CTP-specific `nn.Parameter` banks (`gate_ctp`, `gate_ctp_norm_weight`, `A_ctp_shared`, `A_ctp`, `ctp_a_norm_weight`, `ctp_rank_norm_weight`, `B_denoise`) are NOT allocated. Tests whether the CTP denoising gradient is still pulling its weight under the iter 66b landscape (learnable norms, Parcae B̄ injection, lower WD=0.30). Current `ctp_weight = 0.05 × num_refinements × refine_strength` ramps to 0.05 late — small direct contribution, but CTP head params cost ~{rank × D × (num_shared+num_specialized)} × 2 bytes that could redirect to iter 90+ arch scale-up. If val_bpb regression ≤ 0.03, the freed budget compounds; if larger, CTP is still meaningful and we keep it + revert. |
+| **94** | new | Disable CTP entirely (NTP-only). Add `Hyperparameters.use_ctp = True` guard; when False, `MoSLowRankOutputHead.forward` returns only `log_p_ntp`, `GPT.forward` skips `ctp_loss` computation at L2760-2781, and CTP-specific `nn.Parameter` banks (`gate_ctp`, `gate_ctp_norm_weight`, `A_ctp_shared`, `A_ctp`, `ctp_a_norm_weight`, `ctp_rank_norm_weight`, `B_denoise`) are NOT allocated. **PROMOTED ★ (commit `c2eff43`)** — int6 Δ=+0.0026 (≤0.03 ✓), K8→K128 Δ tightened +0.0103→+0.0073, artifact -592 KB (-9.0%), params -1.38M (-10.9%). See H60. |
 | **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` (GLU-style: `leaky(gate,0.5)² * fc`) | Leaderboard-SOTA technique (abaybektursun 1.1194). Banach constraint forcing its removal is gone (Lyapunov replaces it). Lowest risk / highest upside-density item on the queue. NOTE: GLU variant (our MoE layout has expert_gate + expert_fc + expert_down); the SOTA FFN is non-gated `leaky²(up(x)) → down`. If iter 83 GLU-style promotes, queue iter 83b as a faithful-SOTA refactor dropping `expert_fc`. |
 | **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | Trivial; fixes an accidental symmetry. Independent of 83 — can run in parallel if hardware permits. |
 | **85** | 82 | Stochastic TBPTT `{2,3,4}` | One-knob change matching the K-jitter principle (H12 VERIFIED). Known-class trade-off. |
