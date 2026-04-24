@@ -542,6 +542,36 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H64: Disable BigramHash (iter 93) — PROMOTED ★ (2026-04-24)
+
+**Claim:** BigramHash (4096-entry, 128-dim) was added in iter 6 under a very different architecture (pre-DEQ, pre-experts, no Parcae B̄ input injection, no learnable norms). Under the current iter 85 baseline — which now carries token-pair information through (a) the DEQ's x₀ re-injection at every iteration, (b) Parcae's `B̄ ⊙ RMSNorm(x₀)` additive injection at the fixed point, and (c) learnable prenorm scales on every projection — the BigramHash path is architecturally redundant and disabling it frees ~1 MB of artifact budget for the Group D arch scale-up.
+
+**Test:** iter 93 — one-variable change `Hyperparameters.bigram_vocab_size = 4096 → 0`. `GPT.__init__` at L2345 already guards `self.bigram = BigramHashEmbedding(...) if bigram_vocab_size > 0 else None`, and `GPT.forward` at L2723-2724 guards `if self.bigram is not None: x = x + self.bigram(input_ids)`, so the ablation is pure path-drop with zero code churn. Commit `66ce88e`.
+
+**Result:** PROMOTED.
+
+| Metric | Iter 85 baseline | Iter 93 | Δ |
+|---|---|---|---|
+| val_bpb fast | 1.5707 | 1.5725 | +0.0018 (noise) |
+| val_bpb int6 | **1.5898** | **1.5921** | **+0.0023** (≤0.03 ✓) |
+| k=4 | 1.5936 | 1.5995 | +0.006 |
+| k=8 | 1.5809 | 1.5834 | +0.003 |
+| k=16 | 1.5898 | 1.5921 | +0.002 |
+| k=32 | 1.5919 | 1.5940 | +0.002 |
+| k=64 | 1.5923 | 1.5943 | +0.002 |
+| k=128 | 1.5923 | 1.5945 | +0.002 |
+| K=8→K=128 Δ | +0.0114 | **+0.0111** | tightened |
+| artifact bytes | 6,068,145 | **5,737,459** | **-330,686 (-5.4%) ★** |
+| params | 11,246,996 | **10,624,275** | **-622,721 (-5.5%) ★** |
+
+**Mid-training surprise:** val_bpb trajectory inverted. Iter 93 was +0.08 at step 200 (early regression as expected — BigramHash is an early-training aid), then −0.044 at step 400, −0.056 at step 600, −0.020 at step 800, finally +0.002 at step 1000. The transformer body's gradient re-flowed through the freed ~600K params once the initial warmup passed, and iter 93 held a mid-training lead that barely closed at the end. This pattern is consistent with H64: the DEQ's x₀ re-injection + Parcae's B̄ provide the token-pair signal BigramHash was providing, so the model only "misses" BigramHash during the short warmup when the transformer body is still untrained.
+
+**Budget freed for Group D:** -622 K params + -330 KB artifact = substantial headroom for iter 90–92 (low-dim experts / 16-32 experts / D=1024 scale-up). Combined with iter 94's -1.38 M params, the cumulative Group A savings are ~**2 M params (−15% of iter 66b baseline)** — enough to absorb a material expert-bank or model-dim increase.
+
+**Status:** ✅ VERIFIED. PROMOTED as new baseline (commit `66ce88e`). The combined H60 + H64 "budget-freeing Group A" arc has now returned ~2 M params to the transformer body's scale-up budget.
+
+**Implication:** BigramHash was dead weight under the modern landscape. Iter 93's finding generalizes: architectural features added in early iters (pre-Parcae, pre-learnable-norms) should be re-audited because the main path may now carry the signal that the auxiliary path was compensating for. Next candidates for the same audit: Lyapunov penalty (iter 88) and HyDRA denoising (iter 89).
+
 ### H63: Stochastic TBPTT (iter 85) — PROMOTED ★ (2026-04-24, narrow margin)
 
 **Claim:** Analogous to K-jitter (H12 VERIFIED), sampling `deq_bptt_k` per step from `{2, 3, 4}` should force the model to be robust across gradient-truncation depths and tighten K-sweep FP quality. Prior iter 28-series (fixed k=4, k=8, k=12) showed deeper TBPTT REGRESSED val_bpb, but that was a fixed-depth specialization issue — jitter over a narrower range tests the broader hypothesis.
@@ -977,7 +1007,7 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 | **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` (GLU-style: `leaky(gate,0.5)² * fc`) | **REVERTED ✗ (commit `34ef98d`)** — int6 regression +0.0124 vs iter 94 (1.6076 vs 1.5952), artifact +84 KB, K-sweep slightly widened (K=8→K=128 Δ: +0.0073 → +0.0087). Technically within the ≤0.03 carry-forward band, but the change delivers *no* offsetting benefit (no param savings, no FP-quality tightening, no artifact saving) — it is a pure regression under the iter 94 NTP-only + Parcae landscape. The SOTA abaybektursun 1.1194 leaderboard config used a *non-gated* `leaky²(up(x)) → down` FFN; our MoE has `expert_gate + expert_fc + expert_down`, so the GLU-with-leaky² variant tested here is a hybrid that apparently pulls worse than SwiGLU in our architecture. See H61. (A full SOTA-faithful non-gated expert rewrite is still open as a possible follow-up, but blocked behind the Group D architectural rewrites.) |
 | **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | **PROMOTED ★ (commit `6494a50`)** — int6 Δ=**-0.0108** (improvement!), every K-sweep point improved (k=4 by -0.042), K=8→K=128 widened negligibly (+0.003, still ≪0.5), artifact +68 KB (+1.1%). `shared_gate_std` grew 0 → 0.17, confirming the two gates took meaningfully different values. See H62. |
 | **85** | 82 | Stochastic TBPTT `{2,3,4}` | **PROMOTED ★ (commit `b18dc55`)** — int6 regression +0.0054 (within threshold), K=8→K=128 Δ tightened +0.0131→+0.0114, artifact -7 KB. Cost: step_avg +21% (from deeper avg backward). See H63. Reconsider for wallclock-constrained submission config. |
-| **93** | new | Remove bigram embed (`bigram_vocab_size 4096 → 0`) | Frees ~1 MB of artifact budget (4096 × 128 × 2 bytes FP16 + 128 × 768 proj). BigramHash was added in iter 6 under a very different architecture (pre-DEQ, pre-experts). Under the current iter 66b landscape (learnable norms, Parcae B̄ input injection, expert banks), it may be redundant — the DEQ's x₀ re-injection already carries token-pair information through iterations. Clean one-line ablation; `GPT.__init__` already handles `bigram_vocab_size == 0` via `if bigram_vocab_size > 0` guard at L2345. If val_bpb stays within 0.03, the freed budget compounds into iter 90–92's arch scale-up. |
+| **93** | new | Remove bigram embed (`bigram_vocab_size 4096 → 0`) | **PROMOTED ★ (commit `66ce88e`)** — int6 Δ=+0.0023 (≤0.03), K=8→K=128 tightened +0.0114→+0.0111, artifact **-330 KB (-5.4%)**, params **-622K (-5.5%)**. See H64. Mid-training early regression (+0.08 @ step 200) fully reversed by step 400 (-0.044). |
 
 #### Group B — medium-risk schedule + regularization tuning
 
