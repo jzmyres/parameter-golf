@@ -1589,7 +1589,7 @@ class MLP(nn.Module):
         ).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h = F.silu(gate) * fc
+        h = F.leaky_relu(gate, 0.5).square() * fc
         h = h.view(N, E, R)
         # Per-expert RMSNorm (no shared weights across experts)
         h_rms = h.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
