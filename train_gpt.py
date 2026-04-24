@@ -1897,12 +1897,21 @@ class Block(nn.Module):
         self.num_experts = num_experts
         self.num_shared_experts = int(num_shared_experts)
         num_routed = num_experts - self.num_shared_experts
-        # Sigmoid gate for shared experts (per-token modulation, matches router design)
+        # Iter 84 (2026-04-24): independent shared-expert sigmoid gates for
+        # attention and MLP paths.  Previously a single `shared_gate` produced
+        # one (B,T,S) gate applied to BOTH the attention shared expert and the
+        # MLP shared expert — an accidental symmetry forcing the two paths to
+        # open/close together.  Splitting the gates lets each path learn its
+        # own modulation (trivial param cost: 2 × num_shared_experts × dim +
+        # 2 × num_shared_experts bias + 2 × dim for the prenorm scales).
         if self.num_shared_experts > 0:
-            self.shared_gate = nn.Linear(dim, self.num_shared_experts, bias=True)
-            self.shared_gate_norm_weight = nn.Parameter(torch.ones(dim))
-            nn.init.zeros_(self.shared_gate.weight)
-            nn.init.constant_(self.shared_gate.bias, 1.0)  # init near-open
+            self.shared_gate_attn = nn.Linear(dim, self.num_shared_experts, bias=True)
+            self.shared_gate_mlp = nn.Linear(dim, self.num_shared_experts, bias=True)
+            self.shared_gate_norm_weight_attn = nn.Parameter(torch.ones(dim))
+            self.shared_gate_norm_weight_mlp = nn.Parameter(torch.ones(dim))
+            for g in (self.shared_gate_attn, self.shared_gate_mlp):
+                nn.init.zeros_(g.weight)
+                nn.init.constant_(g.bias, 1.0)  # init near-open (matches pre-iter-84)
         # Router only covers routed experts (not shared).
         self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=10.0,
                                       cv_loss_weight=2.0, scoring=router_scoring,
@@ -2005,12 +2014,14 @@ class Block(nn.Module):
         # All experts compute outputs together (shared + routed).
         attn_expert_out = self.attn.forward_experts(h)  # (B, T, E, D)
         if S > 0:
-            # Shared: direct sum with per-token sigmoid gate (no .mean() overhead)
-            h_shared_gate = h * self.shared_gate_norm_weight.to(dtype=h.dtype)
-            g_s = torch.sigmoid(self.shared_gate(h_shared_gate))  # (B, T, S)
+            # Iter 84: independent per-path sigmoid gates for attn vs mlp.
+            h_shared_gate_attn = h * self.shared_gate_norm_weight_attn.to(dtype=h.dtype)
+            h_shared_gate_mlp = h * self.shared_gate_norm_weight_mlp.to(dtype=h.dtype)
+            g_s_attn = torch.sigmoid(self.shared_gate_attn(h_shared_gate_attn))  # (B, T, S)
+            g_s_mlp = torch.sigmoid(self.shared_gate_mlp(h_shared_gate_mlp))      # (B, T, S)
             if _should_diag(self.training):
                 with torch.no_grad():
-                    g_sf = g_s.detach().float()
+                    g_sf = torch.cat([g_s_attn.detach().float(), g_s_mlp.detach().float()], dim=-1)
                     self._shared_gate_mean = float(g_sf.mean().item())
                     self._shared_gate_min = float(g_sf.min().item())
                     self._shared_gate_std = float(g_sf.std(unbiased=False).item())
@@ -2020,11 +2031,12 @@ class Block(nn.Module):
                 self._shared_gate_min = None
                 self._shared_gate_std = None
                 self._shared_gate_diag_step = None
-            attn_shared = (attn_expert_out[:, :, :S, :] * g_s.unsqueeze(-1)).sum(dim=2)
+            attn_shared = (attn_expert_out[:, :, :S, :] * g_s_attn.unsqueeze(-1)).sum(dim=2)
             # Routed: weighted by router
             attn_routed = (attn_expert_out[:, :, S:, :] * w_attn.unsqueeze(-1)).sum(dim=2)
             attn_mix = attn_shared + attn_routed
         else:
+            g_s_mlp = None
             self._shared_gate_mean = None
             self._shared_gate_min = None
             self._shared_gate_std = None
@@ -2035,7 +2047,7 @@ class Block(nn.Module):
         # MLP experts (same split: shared gated + routed).
         # h is already parameter-free RMS-normalized above, which mix_experts assumes.
         mlp_mix = self.mlp.mix_experts(h, w_mlp,
-                                        num_shared=S, shared_gate=g_s if S > 0 else None)
+                                        num_shared=S, shared_gate=g_s_mlp if S > 0 else None)
         mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
         # Dense mixture Δ = attn_mix + mlp_mix.
