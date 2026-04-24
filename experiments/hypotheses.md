@@ -779,12 +779,12 @@ failure.
 | 60 | Independent MLA pre-cond | Separate Block (1 expert, rank 128/192) for dynamic x0 | H45 | **REVERTED** (+0.036, DEQ attention already builds context) | 1.8593 | +0.003 |
 | 61 | Exponential K sampling | K ~ Exp(mean=6)+4, clamped [4,48]. Heavy tail for rare deep K | H46 | **REVERTED** (+0.020, -13% steps from higher avg K) | 1.8437 | +0.0006 |
 | 62 | Disable FSQ quantization | Keep low-rank MoS projection but remove FSQ level discretization | H53 | **PROMOTED ★** (val_bpb -0.005, zero overhead) | 1.8183 | +0.0008 |
-| 63 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued | — | — |
-| 64 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (after 63) | — | — |
-| 65 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued | — | — |
-| 66 | Parcae negative diagonal | Replace β with per-dim learned A=Diag(-exp(a)), guaranteed ρ<1 | H48 | Queued | — | — |
+| 63 | Low-dim expert computation | Each expert: D→r, compute at r, r→D, mix in D-space | H43 | Queued (see merged 63+64 row below) | — | — |
+| 64 | Full-rank expert internals | Remove low-rank factorization inside experts (full rank at dim r) | H44 | Queued (merged into 63 below) | — | — |
+| 65 | Scale up experts (16-32) | More experts at same/reduced rank for routing diversity | H47 | Queued (duplicated below) | — | — |
+| 66 | ~~Parcae negative diagonal~~ | ~~Replace β with per-dim learned A=Diag(-exp(a))~~ | H48 | ~~DONE~~ — landed as iter 66a (tied B̄=1−Ā) then generalized in iter 66b (independent B̄=Δ·B, Mamba-ZOH). See H58. | — | — |
 | 67 | Per-iteration LoRA | Rank-4 LoRA per DEQ iter (98K params). Each iter specializes | H49 | **REVERTED** (not principled, doesn't generalize to K>16) | 1.8149 | +0.001 |
-| 68 | DeltaDEQ dim skipping | Track per-dim convergence, skip converged dims in later iters | H50 | Queued | — | — |
+| 68 | ~~DeltaDEQ dim skipping~~ | ~~Track per-dim convergence, skip converged dims in later iters~~ | H50 | ~~REMOVED~~ — forward is already compiled/hardware-bound (20ms), dynamic per-dim masking breaks `torch.compile`, and K-jitter already provides coarse-grained "early-stop" at the whole-tensor level. (Duplicated in deferred-row below.) | — | — |
 | 69 | Reduce TBPTT 4→1 | Phantom gradient: 1-step backward, 43% faster, 76% more steps | H51 | **REVERTED** (+0.021 post-quant, fast only +0.013) | 1.8396 | -0.002 (K128 best!) |
 | 69b | Reduce TBPTT 4→2 | 2-step backward: 29% faster, 40% more steps (1049 vs 747) | H51 | **KEPT** (val_bpb -0.001, 30% throughput gain) | 1.8169 | +0.002 |
 | 70 | L2→softmax routing | Replace L2+tanh logits with linear dot-product (standard MoE) | H54 | **PROMOTED ★** (val_bpb -0.024, expert_iter_range 20× higher) | 1.7934 | +0.001 |
@@ -793,18 +793,18 @@ failure.
 | 71b | Reduce weight_decay 0.30→0.10 | Further WD reduction — better fast but worse post-quant | H54 | **REVERTED** (+0.051 post-quant, quant gap 0.047 vs 0.029. WD=0.30 optimal) | 1.5810 | +0.014 |
 | 71c | ~~Reduce weight_decay 0.10→0.01~~ | ~~Cancelled: WD=0.10 already regresses post-quant~~ | H54 | CANCELLED | — | — |
 | 71d | Drop β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5} | H58 | **REVERTED** (+0.044, less jitter diversity hurt more than recon fix helped) | 1.5744 | +0.017 |
-| 71e | Re-enable FSQ, no bounding | FSQ with round+STE but NO tanh bounding (tanh causes saturation) | H59 | Queued (after 71d) | — | — |
-| 71f | FSQ with clamp(-1,1) | If no-bound fails, test hard clamp instead of tanh (no saturation) | H59 | Queued (after 71e) | — | — |
+| 71e | ~~Re-enable FSQ, no bounding~~ | ~~FSQ with round+STE but NO tanh bounding~~ | H59 | ~~DROPPED~~ (iter 78 already tested unbounded FSQ + L2 at +0.181@400 — unbounded STE noise accumulates; iter 62's `fsq_levels=0` stands) | — | — |
+| 71f | ~~FSQ with clamp(-1,1)~~ | ~~Hard clamp instead of tanh~~ | H59 | ~~DROPPED~~ (iter 78's result generalizes: STE noise through the MoS rank bottleneck is the root cause, not the specific saturating transform) | — | — |
 | 72 | Remove post-mix RMSNorm | Replace attn/mlp_post_mix_norm with learned scalar scale | H55 | **REVERTED** (+0.024 val_bpb, K128 Δ=0.001 tightest ever but val regressed) | 1.5495 | +0.001 |
 | 73 | Relax grad_clip 0.3→1.0 | Aggressive clip slows learning. Lyapunov provides soft contraction | H56 | **PROMOTED ★** (val_bpb -0.003, every K improved, zero-cost change) | 1.5225 | +0.009 |
 | 74 | Raise Lyapunov γ 0.9→0.95 | Allow ρ(J) closer to 1 for more expressive state changes | H57 | **REVERTED** (wash: +0.0005, γ=0.9→0.95 has no measurable effect. Penalty too small at λ=0.01) | 1.5230 | +0.010 |
 | 71g | Learnable RMSNorm everywhere | Q/K norms + embed + MoS + bigram (removed soft_embed_norm: DDP unused param) | project constraint | **PROMOTED ★** (val_bpb -0.005, 10% faster, K128 Δ=0.009) | 1.5254 | +0.009 |
 | 74b | Lyapunov γ 0.9→0.97 | Push warmup advantage further (γ=0.95 was -0.012@200) | H57 | **PROMOTED ★** (val_bpb -0.008, every K improved -0.006 to -0.008, K8 breaks 1.50) | 1.5150 | +0.008 |
-| 74c | WD 0.30→0.01 | Test floor — quant gap may shrink with learnable norms | H54 | Queued | — | — |
-| 74d | Remove β=0.7 from jitter | {0.3,0.5,0.7}→{0.3,0.5} for reversibility (3.3× recon amp) | H58 | Queued | — | — |
-| 74e | Restore squared gate leaky_relu(0.5)² | Phase 6 remnant: original activation was more expressive | L9 | Queued | — | — |
-| 74f | Independent shared gates (attn vs mlp) | Fix 1-dim shared gate → 2-dim for independent control | arch | Queued | — | — |
-| 74g | Remove x0 residual: T_θ = Δ(z,x0) | More expressive FP equation (x0 still enters via state_norm) | arch | Queued | — | — |
+| 74c | WD 0.30→0.01 | Test floor — quant gap may shrink with learnable norms (iter 71g) + Parcae B̄ (iter 66b) both absorb some of the regularization pressure WD was carrying | H54 | **Queued — iter 86 (after 83/84/85)** | — | — |
+| 74d | ~~Remove β=0.7 from jitter~~ | ~~{0.3,0.5,0.7}→{0.3,0.5}~~ | H58 | ~~DROPPED~~ (iter 71d already tested and reverted at +0.044; also moot under iter 66b: β is per-dim from Parcae Ā when `use_parcae=True`, the scalar jitter set is a fallback only) | — | — |
+| 74e | Restore squared gate leaky_relu(0.5)² | Phase 6 remnant: original activation was more expressive; Banach-contraction constraint that forced the drop is gone in Phase 9 (Lyapunov replaces it) | L9 | **Queued — iter 83 (next up)** | — | — |
+| 74f | Independent shared gates (attn vs mlp) | Fix 1-dim shared gate → 2-dim for independent control | arch | **Queued — iter 84 (after 83)** | — | — |
+| 74g | ~~Remove x0 residual: T_θ = Δ(z,x0)~~ | ~~More expressive FP equation~~ | arch | ~~SUPERSEDED~~ by iter 66b (`T_θ = B̄ ⊙ RMSNorm_learn(x₀) + Δ`; Parcae-faithful injection, see H58). | — | — |
 | 74h | Remove attn_post_mix_norm only | Bisect iter 72 | H55 | **REVERTED** (+0.034, attn norm IS load-bearing) | 1.5488 | — |
 | 74i | Remove mlp_post_mix_norm only | Bisect iter 72 | H55 | **REVERTED** (+0.029, mlp norm ALSO load-bearing. Both essential) | 1.5436 | — |
 | 74j | Remove state_norm | Pre-expert RMSNorm on z+x0 | arch | **REVERTED** (+0.199@400, catastrophic. state_norm IS load-bearing) | 1.8878@400 | — |
@@ -818,17 +818,34 @@ failure.
 | 78 | FSQ symmetric [-8,8] + L2 | 17-level STE on MoS projection, unconstrained + L2=0.01 | H28/H59 | **REVERTED** (+0.181@400, STE noise accumulates despite L2) | 1.8701@400 | — |
 | 66a | Parcae+noWD (combined) | Per-dim Ā + no WD on 1D params | H48/Parcae | **REVERTED** (+0.063, caught up @600 but widened late. Bisecting) | 1.5779 | +0.013 |
 | 66a-b | No-WD-on-1D bisect | weight_decay=0 for all 1D params (without Parcae) | optimizer | **REVERTED** (+0.140@400, WD on 1D IS beneficial in DEQ) | 1.8295@400 | — |
-| 81 | Double max K jitter | K jitter {4,6,10}→{8,12,20} — deeper solver, better FP quality | solver | Queued | — | — |
-| 82 | Stochastic TBPTT + doubled | TBPTT fixed 2→jitter {2,3,4}, richer backward signal | solver | Queued | — | — |
-| 66b | Parcae: remove Lyapunov | Structural ρ(Ā)<1 replaces Hutchinson penalty | H48 | Queued (after 66a) | — | — |
-| 66c | Parcae: remove denoising reg | Per-dim damping replaces denoising regularization | H48 | Queued (after 66b) | — | — |
-| 66d | Parcae: separate B̄ (full ZOH) | B̄=A⁻¹(Ā-I)·b, independent from Ā. More expressive FP | H48 | Queued (after 66c) | — | — |
-| 79 | Per-iter depth embeddings | iter_embed∈R^{K_max×dim}, zero-init, u=z+x0+embed[k] | H24 | Queued | — | — |
+| 81 | Double max K jitter | K jitter {4,6,10}→{8,12,20} — deeper solver, better FP quality | solver | **Queued — iter 87 (after 86); risky (iter 59's replay)** | — | — |
+| 82 | Stochastic TBPTT + doubled | TBPTT fixed 2→jitter {2,3,4}, richer backward signal | solver | **Queued — iter 85 (after 84)** | — | — |
+| 66b | ~~Parcae: remove Lyapunov~~ **→ RENAMED iter 88** | After iter 66b-Parcae-faithful lands, test whether Parcae's per-dim Ā makes the Hutchinson λ_jac penalty redundant. | H48 | **Queued — iter 88** (after 85/86; `66b` name collides with the committed iter 66b Parcae-paper-faithful injection, renumbered) | — | — |
+| 66c | ~~Parcae: remove denoising reg~~ **→ RENAMED iter 89** | After iter 88 lands, test whether Parcae's per-dim Ā makes the HyDRA denoising penalty redundant. | H48 | **Queued — iter 89 (after 88)** (renumbered from `66c` for the same reason) | — | — |
+| 66d | ~~Parcae: separate B̄ (full ZOH)~~ | ~~B̄=A⁻¹(Ā-I)·b, independent from Ā~~ | H48 | ~~SUPERSEDED~~ by iter 66b (committed: `B̄ = Δ·B` Mamba-ZOH approximation, independent of Ā except through shared Δ. See H58). | — | — |
+| 66e | ~~Parcae: remove x0 skip in T_θ~~ | ~~T_θ=Δ only (Ā retention replaces x0 skip)~~ | H48 | ~~SUPERSEDED~~ by iter 66b (Parcae-faithful `T_θ = B̄⊙RMSNorm_learn(x₀) + Δ` — the `B̄` injection is an *expressive* replacement for the `x0` skip, not a removal. See H58). | — | — |
+| 79 | Per-iter depth embeddings | iter_embed∈R^{K_max×dim}, zero-init, u=z+x0+embed[k] | H24 | Queued (deferred — breaks strict-DEQ invariant; needs user approval before running) | — | — |
 | 80 | ~~Refinement inject during DEQ~~ | ~~REMOVED: raw x0 already blended into x0_refined~~ | H27 | REMOVED | — | — |
 | 68 | ~~DeltaDEQ dim skipping~~ | ~~REMOVED: non-bottleneck, breaks compile, K-jitter handles~~ | H50 | REMOVED | — | — |
-| 66e | Parcae: remove x0 skip in T_θ | T_θ=Δ only (Ā retention replaces x0 skip). More expressive FP | H48 | Queued (after 66a) | — | — |
-| 63 | Full-rank low-dim experts (merged 63+64) | down(D→r), full-rank attn+MLP at r, up(r→D) per expert | H43/H44 | Queued | — | — |
-| 65 | Scale to 16-32 experts | More experts at cheap per-expert dim r | H47 | Queued (after 63) | — | — |
+| 63 | Full-rank low-dim experts (merged 63+64) | down(D→r), full-rank attn+MLP at r, up(r→D) per expert | H43/H44 | Queued (major rewrite; defer until simpler wins above are exhausted) | — | — |
+| 65 | Scale to 16-32 experts | More experts at cheap per-expert dim r | H47 | Queued (after 63 — standalone blows 16MB budget) | — | — |
+
+### Next up — recommended ordering after iter 66b
+
+Current baseline is iter 74b (val_bpb 1.5150) with iter 66b (Parcae-paper-faithful DEQ input injection, H58) just committed and awaiting A/B validation. Run ordering chosen for (i) independence between consecutive changes, (ii) low-risk first, (iii) re-ablation of legacy loss terms last:
+
+| New # | Old # | One-line | Rationale |
+|---|---|---|---|
+| **66b A/B** | — | Validate iter 66b vs iter 74b on ≥200 dev steps | Predecessor of everything below; Parcae-faithful injection must first be either promoted or reverted based on val_bpb. |
+| **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` | Leaderboard-SOTA technique (abaybektursun 1.1194). Banach constraint forcing its removal is gone (Lyapunov replaces it). Lowest risk / highest upside-density item on the queue. |
+| **84** | 74f | Independent attn/mlp shared gates | Trivial; fixes an accidental symmetry. Independent of 83 — can run in parallel if hardware permits. |
+| **85** | 82 | Stochastic TBPTT `{2,3,4}` | One-knob change matching the K-jitter principle (H12 VERIFIED). Known-class trade-off. |
+| **86** | 74c | WD 0.30 → 0.01 re-test | Revisit under iter 71g (learnable norms everywhere) + iter 66b (Parcae B̄) landscape; both absorb some of what iter 71b showed WD was providing on non-norm paths. |
+| **87** | 81 | K-jitter `{8,12,20}` | Risky (iter 59 replay in a milder form). Run only if 83-86 land cleanly — the throughput budget has to accommodate ~10-15% fewer steps/s. |
+| **88** | old 66b | Remove Lyapunov penalty | Legacy-loss ablation: does Parcae's per-dim Ā make the Hutchinson λ_jac penalty redundant? Renumbered to avoid collision with committed iter 66b. |
+| **89** | old 66c | Remove denoising regularization | Same principle as 88 for the HyDRA denoising term. Run sequentially after 88. |
+| 79 | — | Per-iter depth embeddings | *Holds open a philosophical question*: adding iter-specific state turns the weight-tied DEQ into a shared-weight K-layer transformer. Run only after user approves the paradigm relaxation. |
+| 63 / 65 / model_dim bump | — | Full-rank low-dim experts + expert-count scale-up + D=1024 | Multi-iter architectural push (2-3 iters each). Defer until 83-89 signals are in. |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
