@@ -1824,6 +1824,14 @@ class Block(nn.Module):
         self.state_norm = RMSNorm(dim)
         self.attn_post_mix_norm = RMSNorm(dim)
         self.mlp_post_mix_norm = RMSNorm(dim)
+        # Phase 9 iter 66b: Parcae-paper-faithful input injection.
+        # T_θ(z, x₀) = B̄ ⊙ RMSNorm_learn(x₀) + Δ_experts(z, x₀)
+        # Shared scale across experts (x₀ is the DEQ input seen by all experts;
+        # the per-expert invariant applies inside the expert path, not here).
+        # B̄ is threaded in by GPT._deq_solve as `_parcae_b_bar`; if unset
+        # (e.g. a direct Block() invocation in a unit test), fall back to ones.
+        self.x0_inject_norm_weight = nn.Parameter(torch.ones(dim))
+        self._parcae_b_bar: Tensor | None = None
         # Phase 9 iter 51 (DeepSeek shared expert): first num_shared_experts
         # experts are always-on with per-token sigmoid gate (like routed experts).
         # T_θ = g_s·E_shared(h) + Σ w_j E_routed_j(h)
@@ -1971,10 +1979,20 @@ class Block(nn.Module):
         # Dense mixture Δ = attn_mix + mlp_mix.
         delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
-        # T_θ(z, x_0) = Δ_θ(z, x_0).  The direct output-side x0 residual is
-        # intentionally absent so the fixed point must be carried by the
-        # learned expert dynamics, while x0 remains available as conditioning.
-        raw_out = delta
+        # Parcae-paper-faithful input injection (iter 66b):
+        #   T_θ(z, x_0) = B̄ ⊙ RMSNorm_learn(x_0) + Δ_θ(z, x_0)
+        # B̄ = Δ · B is threaded in by GPT._deq_solve as `_parcae_b_bar`.
+        # At the fixed point (β = 1 − Ā in the solver, Ā cancels):
+        #   y* = B̄ ⊙ RMSNorm_learn(x_0) + Δ*
+        # If B̄ is None (direct Block() call outside a DEQ solve, e.g. unit
+        # tests), use ones(D) so the block still runs as a sanity path —
+        # explicit sentinel rather than a silent zero.
+        x0_rms_scale = x0.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
+        x0_rms = x0 * x0_rms_scale * self.x0_inject_norm_weight.to(x0.dtype)
+        b_bar = self._parcae_b_bar
+        if b_bar is not None:
+            x0_rms = b_bar.to(x0_rms.dtype) * x0_rms
+        raw_out = x0_rms.to(dtype=z_in.dtype) + delta
 
         if self._diag_track_enabled:
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
@@ -2265,27 +2283,39 @@ class GPT(nn.Module):
                                    router_scoring=router_scoring,
                                    )
         self.deq_beta = float(deq_beta)
-        # Phase 9 iter 66a: Parcae per-dim damping (arXiv:2604.12946).
-        # Gradient flows: loss → RevDEQFunction.backward(grad_beta) → autograd → parcae params.
+        # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
+        # independent input gain (arXiv:2604.12946, Mamba-style ZOH).
+        #   Δ  = softplus(parcae_raw_delta) + ε_min       (step size)
+        #   A  = -(softplus(parcae_raw_a)   + ε_min)      (decay, < 0)
+        #   B  =   softplus(parcae_raw_b)   + ε_min       (input gain, > 0)
+        #   Ā_core = exp(Δ · A)                           (paper form, in (0,1))
+        #   Ā = ε_rev + (1 − ε_rev) · Ā_core              (RevDEQ safety)
+        #   B̄ = Δ · B                                     (paper form, no floor)
+        #   β = 1 − Ā                                     (solver blend, tied to Ā)
+        # Gradient flows: loss → RevDEQFunction.backward(grad_beta) → autograd
+        # → parcae_raw_a, parcae_raw_delta, parcae_raw_b (via Block.forward).
         self.use_parcae = bool(use_parcae)
-        self.parcae_min_a_bar = 0.1
-        self.parcae_decay_floor = 1e-4
+        # ε_min: softplus lower bound; prevents exact-zero Δ, |A|, B at init.
         self.parcae_min_rate = 1e-3
+        # ε_rev: CORRECTNESS CONSTANT — NOT a tuning knob. RevDEQ backward
+        # reconstructs via y_n ← (y_{n+1} − β·T)/(1 − β) where (1 − β) = Ā.
+        # Error amplifies by 1/Ā per backward step, so over K iterations the
+        # worst-case bound is (1/Ā)^K · ε_fp64. For K=num_layers=12 and fp64
+        # (ε_fp64 ≈ 1e-15), Ā ≥ 0.1 keeps backward error ≤ 10^12 · 1e-15 = 1e-3,
+        # which the smoke-test tolerance (1e-1) expects. Smaller ε_rev
+        # compounds per-iteration error through K backward steps — not safe.
+        # Changing it requires updating the reversibility contract test +
+        # smoke-test tolerance together.
+        self.parcae_reversibility_floor = 0.1
         if self.use_parcae:
-            def _inv_softplus(y: float) -> float:
-                return math.log(math.expm1(max(float(y), 1e-12)))
-
-            min_a = float(self.parcae_min_a_bar)
-            floor = float(self.parcae_decay_floor)
-            init_a = min(max(float(parcae_init_a_bar), min_a + 1e-6), 1.0 - 1e-6)
-            target_decay = (init_a - min_a) / max(1.0 - min_a, 1e-8)
-            target_decay = min(max(target_decay, floor + 1e-6), 1.0 - 1e-6)
-            exp_decay_target = (target_decay - floor) / max(1.0 - floor, 1e-8)
-            rate_init = -math.log(exp_decay_target)
-            raw_delta_init = _inv_softplus(1.0 - float(self.parcae_min_rate))
-            raw_rate_init = _inv_softplus(rate_init - float(self.parcae_min_rate))
-            self.parcae_raw_a = nn.Parameter(torch.full((model_dim,), raw_rate_init))
+            # Init raw params so Ā₀ ≈ parcae_init_a_bar and B̄₀ ≈ 1 − Ā₀,
+            # giving continuity with iter 66a's tied β = 1 − Ā at step 0.
+            raw_a_init, raw_delta_init, raw_b_init = self._parcae_init_raw_values(
+                float(parcae_init_a_bar)
+            )
+            self.parcae_raw_a = nn.Parameter(torch.full((model_dim,), raw_a_init))
             self.parcae_raw_delta = nn.Parameter(torch.full((model_dim,), raw_delta_init))
+            self.parcae_raw_b = nn.Parameter(torch.full((model_dim,), raw_b_init))
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
         self.bal_loss_coef = float(bal_loss_coef)
@@ -2314,13 +2344,56 @@ class GPT(nn.Module):
         self.embed_norm = RMSNorm(model_dim)
         self._init_weights()
 
+    def _parcae_init_raw_values(self, init_a_bar: float) -> tuple[float, float, float]:
+        """Invert the paper forms to choose raw params at initialization.
+
+        Picks Δ₀, |A|₀, B₀ so that Ā₀ ≈ init_a_bar and B̄₀ ≈ 1 − init_a_bar.
+        Returns raw values that pass through softplus+ε_min to recover the
+        targets exactly (modulo the safety ε_min offset on |A| and B).
+        """
+        eps_min = float(self.parcae_min_rate)
+        eps_rev = float(self.parcae_reversibility_floor)
+
+        def inv_softplus(y: float) -> float:
+            return math.log(math.expm1(max(float(y), 1e-12)))
+
+        # Δ₀ = 1 (unit step) via softplus(raw_delta) + ε_min = 1.
+        raw_delta_init = inv_softplus(1.0 - eps_min)
+        delta0 = 1.0
+
+        # Ā₀ = ε_rev + (1 − ε_rev) · exp(Δ₀ · A₀).  Solve for |A|₀:
+        #   exp(−Δ₀·|A|₀) = (init_a_bar − ε_rev) / (1 − ε_rev)
+        clamped_a = min(max(float(init_a_bar), eps_rev + 1e-6), 1.0 - 1e-6)
+        a_bar_core = (clamped_a - eps_rev) / max(1.0 - eps_rev, 1e-8)
+        a_mag = -math.log(a_bar_core) / delta0  # |A|₀
+        raw_a_init = inv_softplus(max(a_mag - eps_min, 1e-8))
+
+        # B̄₀ = Δ₀ · B₀ ≈ 1 − Ā₀ (continuity with iter 66a's tied β = 1 − Ā).
+        b_mag = max((1.0 - clamped_a) / delta0, eps_min + 1e-8)
+        raw_b_init = inv_softplus(b_mag - eps_min)
+        return raw_a_init, raw_delta_init, raw_b_init
+
+    def _parcae_delta(self) -> Tensor:
+        # Δ = softplus(raw_delta) + ε_min — shared by Ā and B̄.
+        return F.softplus(self.parcae_raw_delta.float()) + float(self.parcae_min_rate)
+
     def _parcae_a_bar(self) -> Tensor:
-        delta = F.softplus(self.parcae_raw_delta.float()) + float(self.parcae_min_rate)
-        rate = F.softplus(self.parcae_raw_a.float()) + float(self.parcae_min_rate)
-        decay = torch.exp(-(delta * rate))
-        floor = float(self.parcae_decay_floor)
-        min_a = float(self.parcae_min_a_bar)
-        return min_a + (1.0 - min_a) * (floor + (1.0 - floor) * decay)
+        # Paper form Ā_core = exp(Δ · A) with A = -(softplus(raw_a) + ε_min),
+        # rescaled to (ε_rev, 1) for RevDEQ reversibility (β = 1 − Ā ≤ 1 − ε_rev,
+        # so the backward reconstruction denominator never approaches zero).
+        delta = self._parcae_delta()
+        a_mag = F.softplus(self.parcae_raw_a.float()) + float(self.parcae_min_rate)
+        a_bar_core = torch.exp(-(delta * a_mag))
+        eps_rev = float(self.parcae_reversibility_floor)
+        return eps_rev + (1.0 - eps_rev) * a_bar_core
+
+    def _parcae_b_bar(self) -> Tensor:
+        # Pure paper form B̄ = Δ · B (Mamba ZOH). No floor — B̄ never appears
+        # in the solver reconstruction, only inside T(z, x₀), so reversibility
+        # does not constrain it and adding a floor would silently bias training.
+        delta = self._parcae_delta()
+        b_mag = F.softplus(self.parcae_raw_b.float()) + float(self.parcae_min_rate)
+        return delta * b_mag
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -2379,19 +2452,25 @@ class GPT(nn.Module):
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
         global _DEQ_SOLVE_ACTIVE
-        # Phase 9 iter 66a: Parcae per-dim damping replaces scalar β.
-        # Beta carries grad so RevDEQFunction.backward can return grad_beta,
-        # which autograd chain-rules to parcae_raw_a and parcae_raw_delta.
+        # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping + Parcae input gain.
+        #   β = 1 − Ā  (solver blend, carries grad → parcae_raw_a / raw_delta)
+        #   B̄ = Δ · B (Block.forward input gain, carries grad → parcae_raw_b / raw_delta)
         if self.use_parcae:
-            a_bar = self._parcae_a_bar()  # bounded in (parcae_min_a_bar, 1)
+            a_bar = self._parcae_a_bar()  # bounded in (parcae_reversibility_floor, 1)
             beta = 1.0 - a_bar  # per-dim β, shape (D,), requires_grad=True
+            b_bar = self._parcae_b_bar()  # per-dim B̄ for Block.forward input injection
         else:
             beta = self.deq_beta
+            b_bar = None
         dtype = x0.dtype
         K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
         track_diag = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
         sb = _unwrap_compiled_module(self.shared_block)
         sb._diag_track_enabled = bool(track_diag)
+        # Thread Parcae B̄ onto the unwrapped block so Block.forward can apply
+        # T(z,x₀) = B̄ ⊙ RMSNorm_learn(x₀) + Δ.  Cleared in the finally below
+        # so direct Block invocations (e.g. from tests) fall back to ones(dim).
+        sb._parcae_b_bar = b_bar
         sb._attn_gate_call_track = []
         sb._router_gate_call_track = []
         sb._attn_router_gate_call_track = []
@@ -2425,6 +2504,13 @@ class GPT(nn.Module):
         finally:
             _DEQ_SOLVE_ACTIVE = prev_deq_flag
             sb._diag_track_enabled = False
+            # NOTE: do NOT clear sb._parcae_b_bar here. RevDEQFunction.apply
+            # returns immediately but its backward runs later (after loss.backward),
+            # and the backward re-runs Block.forward for reconstruction — which
+            # must use the same B̄ that forward used, or reversibility breaks.
+            # The next _deq_solve call overwrites _parcae_b_bar; direct Block()
+            # calls in tests can set it to None explicitly if they want the
+            # ones(dim) fallback.
             # Aggregate attn_gate per-iteration (1 call per block forward, 2 per iter)
             ag_calls = list(getattr(sb, "_attn_gate_call_track", []) or [])
             if len(ag_calls) == 2 * K:
@@ -2799,7 +2885,11 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
 
     parcae_params: list[nn.Parameter] = []
     if getattr(base_model, "use_parcae", False):
-        parcae_params = [base_model.parcae_raw_a, base_model.parcae_raw_delta]
+        parcae_params = [
+            base_model.parcae_raw_a,
+            base_model.parcae_raw_delta,
+            base_model.parcae_raw_b,   # iter 66b: independent Parcae input gain
+        ]
 
     _assert_optimizer_param_coverage(base_model, [
         ("token", _flatten_param_groups(tok_params)),

@@ -542,6 +542,41 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H58: Parcae-paper-faithful DEQ input injection (iter 66b) — PROPOSED
+**Claim:** Replacing the iter-66a post-refactor `T(z,x₀) = Δ(z,x₀)` with the Parcae ZOH-discretized form
+```
+T(z, x₀) = B̄ ⊙ RMSNorm_learn(x₀) + Δ(z, x₀)
+```
+where Ā and B̄ share *only* the per-dim step size Δ (otherwise independent), preserves input information at the equilibrium without creating the pre-iter-66a unconditional `T = x₀ + Δ` shortcut. Improves val_bpb vs iter 66a because the post-diff `T = Δ` form loses input information if experts collapse, while iter 66a-pre `T = x₀ + Δ` was unconditional.
+
+**Parametrization (paper-faithful + RevDEQ safety):**
+- `Δ = softplus(parcae_raw_delta) + ε_min` (step size, shared by Ā and B̄)
+- `A = −(softplus(parcae_raw_a) + ε_min)` ← independent of B
+- `B = softplus(parcae_raw_b) + ε_min` ← independent of A, NEW in iter 66b
+- `Ā = ε_rev + (1 − ε_rev) · exp(Δ·A)`, with `ε_rev = parcae_reversibility_floor = 0.1` (correctness constant for RevDEQ backward, NOT a tuning knob)
+- `B̄ = Δ · B` (no floor — B̄ never in solver reconstruction)
+- `β = 1 − Ā` (solver blend unchanged from iter 66a)
+
+**Fixed point (Ā cancels):** `y* = B̄ ⊙ RMSNorm_learn(x₀) + Δ*`.
+
+**Mechanism:**
+- Iter 66a tied `B̄ = 1 − Ā`, collapsing Parcae's two per-dim degrees of freedom (persistence via Ā + input forcing via B̄) into one. Iter 66b restores paper-faithful independence.
+- The new `x0_inject_norm_weight: nn.Parameter(torch.ones(dim))` on `Block` is the learnable pre-RMSNorm scale for x₀ inside the injection term. Shared across experts (x₀ is the DEQ input seen by all experts; the per-expert invariant applies strictly inside the expert path, not here) and routed to AdamW via `CONTROL_TENSOR_PATTERNS += "norm_weight"` (covered in commit 1).
+
+**Predicted effect:** At least parity with iter 66a val_bpb; likely improvement because the expressive degree of freedom returns.
+
+**Test design:** ≥200-step dev run vs. iter 66a baseline, all other hyperparameters fixed. Init `parcae_raw_b` so `B̄₀ ≈ 1 − Ā₀ = 0.3` → step-0 effective dynamics match iter 66a.
+
+**Known confounds:**
+- Iter 66b also drops iter 66a's compound Ā wrapper (`min_a + (1−min_a)(floor + (1−floor)·decay)`) in favor of the paper form `Ā = ε_rev + (1−ε_rev)·exp(Δ·A)`. If val_bpb regresses the next bisect is:
+  (a) keep iter 66a's compound wrapper on Ā + independent B̄ → isolates B̄-decoupling
+  (b) paper-Ā with ε_rev floor + tied B̄ = 1−Ā → isolates Ā-parametrization
+- `CONTROL_TENSOR_PATTERNS += "norm_weight"` from commit 1 already migrated two pre-existing norm banks from Muon→AdamW — any val_bpb delta could also contain this carryover.
+
+**Reversibility sanity:** `experiments/test_arch.py::test_revdeq_reconstruction_at_a_bar_floor` asserts reconstruction stays finite (not NaN/Inf) when raw_a is driven to the ε_rev saturation; smoke-test recon_err stays ≤ 1e-1 under normal Ā training ranges. Full details in the new CLAUDE.md §RevDEQ Reversibility Floor Rule.
+
+**Related:** H56 (Lyapunov), H57 (γ=0.95); iter 66a (tied Parcae). Doc: `opg_doc.tex` §sec:parcae_params + §sec:algorithm describe the combined RevDEQ+Parcae setup.
+
 ---
 
 ## Completed Iterations

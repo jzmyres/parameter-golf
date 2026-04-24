@@ -162,19 +162,67 @@ def test_shared_bypass_gate_diagnostics_are_separate():
     assert len(router._expert_usage) == 2 * num_routed
 
 
-def test_parcae_a_bar_is_bounded_by_construction():
+def test_parcae_a_bar_has_reversibility_safety_margin():
+    """Ā ∈ [ε_rev, 1) for any finite raw values → RevDEQ recon always safe.
+
+    At extreme raw values Ā_core = exp(Δ·A) saturates to 0 or 1, so the
+    rescaled Ā saturates to ε_rev or 1 − (1 − ε_rev) · ε_min ≈ 1. The
+    reversibility denominator (1 − β) = Ā stays ≥ ε_rev by construction.
+    """
+    model = _make_model(use_parcae=True)
+    eps_rev = float(model.parcae_reversibility_floor)
+    with torch.no_grad():
+        for raw_val in (-100.0, -10.0, 0.0, 10.0, 100.0):
+            model.parcae_raw_a.fill_(raw_val)
+            model.parcae_raw_delta.fill_(raw_val)
+            a_bar = model._parcae_a_bar()
+            assert torch.all(a_bar >= eps_rev), f"Ā < ε_rev at raw={raw_val}"
+            assert torch.all(a_bar < 1.0), f"Ā ≥ 1 at raw={raw_val}"
+
+
+def test_parcae_b_bar_is_strictly_positive():
+    """B̄ = Δ · B > 0 for any finite raw values (no reversibility floor)."""
     model = _make_model(use_parcae=True)
     with torch.no_grad():
-        model.parcae_raw_delta.fill_(-100.0)
-        low_rate_a_bar = model._parcae_a_bar()
-        model.parcae_raw_delta.fill_(100.0)
-        high_rate_a_bar = model._parcae_a_bar()
+        for raw_val in (-100.0, -10.0, 0.0, 10.0, 100.0):
+            model.parcae_raw_b.fill_(raw_val)
+            model.parcae_raw_delta.fill_(raw_val)
+            b_bar = model._parcae_b_bar()
+            assert torch.all(b_bar > 0.0), f"B̄ ≤ 0 at raw={raw_val}"
 
-    min_a = model.parcae_min_a_bar
-    assert torch.all(low_rate_a_bar > min_a)
-    assert torch.all(low_rate_a_bar < 1.0)
-    assert torch.all(high_rate_a_bar > min_a)
-    assert torch.all(high_rate_a_bar < 1.0)
+
+def test_parcae_ab_share_only_delta():
+    """Perturbing raw_a ⇒ b_bar unchanged; raw_b ⇒ a_bar unchanged; raw_delta ⇒ both change."""
+    model = _make_model(use_parcae=True)
+    with torch.no_grad():
+        a0, b0 = model._parcae_a_bar().clone(), model._parcae_b_bar().clone()
+        model.parcae_raw_a.add_(1.0)
+        assert torch.allclose(model._parcae_b_bar(), b0), "raw_a leaks into b_bar"
+        assert not torch.allclose(model._parcae_a_bar(), a0), "raw_a does not move a_bar"
+        model.parcae_raw_a.sub_(1.0)
+
+        model.parcae_raw_b.add_(1.0)
+        assert torch.allclose(model._parcae_a_bar(), a0), "raw_b leaks into a_bar"
+        assert not torch.allclose(model._parcae_b_bar(), b0), "raw_b does not move b_bar"
+        model.parcae_raw_b.sub_(1.0)
+
+        model.parcae_raw_delta.add_(1.0)
+        assert not torch.allclose(model._parcae_a_bar(), a0), "raw_delta does not move a_bar"
+        assert not torch.allclose(model._parcae_b_bar(), b0), "raw_delta does not move b_bar"
+
+
+def test_parcae_init_recovers_target_a_bar():
+    """At step 0, Ā ≈ parcae_init_a_bar and B̄ ≈ 1 − Ā (continuity with iter 66a)."""
+    import torch
+    target = 0.7
+    model = _make_model(use_parcae=True, parcae_init_a_bar=target)
+    with torch.no_grad():
+        a_bar = model._parcae_a_bar()
+        b_bar = model._parcae_b_bar()
+    assert torch.allclose(a_bar, torch.full_like(a_bar, target), atol=1e-3), \
+        f"Ā₀={a_bar.mean():.4f}, expected ≈ {target}"
+    assert torch.allclose(b_bar, torch.full_like(b_bar, 1.0 - target), atol=1e-3), \
+        f"B̄₀={b_bar.mean():.4f}, expected ≈ {1.0 - target}"
 
 
 def test_revdeq_convergence():
@@ -228,12 +276,66 @@ def test_revdeq_reversibility():
     print("PASS: RevDEQ reversibility verification works")
 
 
+def test_revdeq_reconstruction_at_a_bar_floor():
+    """Reversibility holds when Parcae pushes Ā to its ε_rev floor.
+
+    Drives raw_a to +100 so |A| saturates softplus → Δ·|A| large → Ā_core
+    underflows to 0 → Ā = ε_rev (the solver-β denominator floor). Keeps
+    raw_delta / raw_b at init so B̄ stays moderate (B̄ is paper-faithful
+    unbounded; this test isolates the Ā-reversibility axis). The RevDEQ
+    backward reconstruction must stay within the normal tolerance regime.
+
+    Note: reconstruction error compounds as (1/Ā)^K across K backward steps,
+    so ε_rev is sized to keep the worst-case amplification tractable in fp64.
+    """
+    model = _make_model(bigram_vocab_size=0, deq_backward="revdeq")
+    eps_rev = float(model.parcae_reversibility_floor)
+    with torch.no_grad():
+        model.parcae_raw_a.fill_(100.0)  # → Ā saturates to ε_rev
+        a_bar = model._parcae_a_bar()
+    assert torch.all(a_bar <= eps_rev + 0.01), f"expected Ā at floor, got {a_bar.mean():.4f}"
+
+    dev = _get_device()
+    x = torch.randint(0, 1024, (1, 16), device=dev)
+    y = torch.randint(0, 1024, (1, 16), device=dev)
+
+    from train_gpt import router_diagnostics
+    with router_diagnostics(True, step_tag=0):
+        if dev.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+        else:
+            loss = model(x, y)
+    loss.backward()
+
+    recon = getattr(model.shared_block, "_deq_recon_error_last_bwd", None)
+    assert recon is not None, "Expected recon diagnostic even at Ā=ε_rev"
+    recon_f = float(recon)
+    # Correctness claim: ε_rev prevents the backward from hitting division by
+    # zero / overflow / NaN. Recon accuracy (< 1) holds in the normal training
+    # regime where Ā ≈ 0.7 — NOT at the saturated floor, where worst-case
+    # amplification is (1/ε_rev)^K = 10^12 and even fp64 cannot guarantee
+    # sub-unit error. The point of the floor is: training-loop math stays
+    # well-defined. Actual training recon is covered by test_revdeq_reversibility.
+    import math as _math
+    assert _math.isfinite(recon_f), f"recon is NaN/Inf at Ā=ε_rev: {recon_f!r}"
+    # Finite but possibly large at the extreme. An extremely loose upper bound
+    # (1e12) just catches catastrophic overflow, not per-iter error.
+    assert recon_f < 1e12, f"recon overflowed at Ā=ε_rev: {recon_f:.3e}"
+    print(f"Ā-floor reconstruction error (extreme regime, finite): {recon_f:.3e}")
+    print("PASS: RevDEQ reversibility at Ā=ε_rev stays finite")
+
+
 if __name__ == "__main__":
     test_all_constraints()
     test_expert_path_parameters_are_expert_independent()
     test_prenorm_forward_shapes_are_unchanged()
     test_shared_bypass_gate_diagnostics_are_separate()
-    test_parcae_a_bar_is_bounded_by_construction()
+    test_parcae_a_bar_has_reversibility_safety_margin()
+    test_parcae_b_bar_is_strictly_positive()
+    test_parcae_ab_share_only_delta()
+    test_parcae_init_recovers_target_a_bar()
     test_revdeq_convergence()
     test_revdeq_reversibility()
+    test_revdeq_reconstruction_at_a_bar_floor()
     print("\nAll tests passed!")

@@ -66,8 +66,14 @@ class TestOptimizerCoverage(unittest.TestCase):
             "mos_head.input_norm.weight",
             "final_norm.weight",
             "embed_norm.weight",
+            # iter 66b: Parcae-paper-faithful input gain + per-dim input norm.
+            "parcae_raw_a",
+            "parcae_raw_delta",
+            "parcae_raw_b",
+            "shared_block.x0_inject_norm_weight",
         ]:
-            self.assertIn(id(named[name]), grouped_ids)
+            self.assertIn(id(named[name]), grouped_ids,
+                          f"{name} missing from optimizer groups")
 
 
 if __name__ == "__main__":

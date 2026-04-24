@@ -158,7 +158,11 @@ This does \emph{not} guarantee global uniqueness: multiple equilibria may exist,
 
 We define $T_\theta$ to be transformer-like and fully expressive:
 \textbf{no ball projections}, \textbf{no spectral-norm constraints}, and \textbf{standard SDPA attention}.
-Stability is handled by \emph{training-time} Lyapunov regularization (Section~\ref{sec:algorithm}) rather than hard architectural clamps.
+Stability is handled by a \emph{combination} of \emph{training-time} Lyapunov
+regularization (Section~\ref{sec:algorithm}) and \emph{per-dim Parcae damping}
+inside the RevDEQ solver (Section~\ref{sec:parcae_params}); we do not use
+hard architectural clamps. RevDEQ, Parcae, and the Lyapunov penalty together
+form the training algorithm described in Section~\ref{sec:algorithm}.
 
 \subsection{Current model configuration}
 \label{sec:config}
@@ -176,6 +180,7 @@ Stability is handled by \emph{training-time} Lyapunov regularization (Section~\r
 \texttt{train\_seq\_len} & 2048 & \texttt{train\_batch\_tokens} & 524{,}288 \\
 \texttt{deq\_beta} & 0.50 (fallback) & \texttt{num\_layers} (max K) & 12 \\
 \texttt{use\_parcae} & true & \texttt{parcae\_init\_a\_bar} & 0.7 \\
+\texttt{parcae\_init\_b\_bar} & 0.3 (paired with init\_a\_bar) & \texttt{parcae\_reversibility\_floor} ($\varepsilon_{\text{rev}}$) & 0.1 (correctness) \\
 \texttt{deq\_backward} & revdeq (auto) & \texttt{deq\_bptt\_k} & 2 \\
 \texttt{num\_refinements} & 1 & \texttt{tie\_embeddings} & yes \\
 \bottomrule
@@ -188,6 +193,8 @@ $\lambda_{\text{jac}}=0.01$, $\gamma=0.97$, warmup fraction~$=0.05$.
 \paragraph{Optimizer.}
 Matrix params use Muon ($\text{lr}=0.022$, momentum$=0.99$, NS steps$=5$, WD$=0.30$).
 Scalar params and routing weights use AdamW ($\text{lr}=0.02$, $\beta_1=0.85$, $\beta_2=0.90$).
+Parcae params (\texttt{parcae\_raw\_a}, \texttt{parcae\_raw\_delta},
+\texttt{parcae\_raw\_b}) share \texttt{parcae\_lr}$=0.002$ with WD$=0$.
 Gradient clipping at $\|\nabla\|=1.0$.
 
 \paragraph{Expert independence invariant.}
@@ -303,54 +310,142 @@ Compute the dense mixture:
   \qquad h = \mathrm{RMSNorm}(z+x_0).
 \end{equation}
 
-\paragraph{Fixed-point map (expressive, unclamped).}
+\paragraph{Fixed-point map (Parcae-paper-faithful input injection).}
 We define the equilibrium map as:
 \begin{equation}
   \label{eq:Tx_new}
-  T_\theta(z,x_0) := \Delta_\theta(z,x_0).
+  T_\theta(z,x_0) := \bar{B} \odot \mathrm{RMSNorm}_{\text{learn}}(x_0) + \Delta_\theta(z,x_0),
 \end{equation}
-This map is fully expressive (no $\Pi_R$, no $\|W\|_2$ constraints) and uses standard SDPA attention.
-Stability is enforced \emph{only} at the reached equilibrium using the Lyapunov penalty.
+where $\bar{B}\in\mathbb{R}^D$ is the Parcae ZOH-discretized input gain
+(Section~\ref{sec:parcae_params} below) and $\mathrm{RMSNorm}_{\text{learn}}$
+is a per-model-dim learnable scale.  This map is fully expressive (no $\Pi_R$,
+no $\|W\|_2$ constraints) and uses standard SDPA attention.  Stability is
+enforced \emph{only} at the reached equilibrium using the Lyapunov penalty.
 
-\begin{remark}[Input conditioning without an output shortcut]
-Input-dependence is structural because $x_0$ enters every expert and router through
-$h=\mathrm{RMSNorm}(z+x_0)$.  We deliberately avoid adding $x_0$ again at the output:
-an unconditional output residual can create a shortcut fixed point and hide whether the learned
-expert dynamics actually carry the equilibrium representation.  The implementation therefore
-uses $x_0$ as conditioning, not as an output-side residual injection.
+\begin{remark}[Input conditioning via Parcae ZOH, not unconditional residual]
+Input-dependence enters $T_\theta$ through two channels:
+(i) structurally via $h=\mathrm{RMSNorm}(z+x_0)$ inside every expert/router, and
+(ii) explicitly via the $\bar{B}\odot\mathrm{RMSNorm}_{\text{learn}}(x_0)$ term,
+which the Parcae reparametrization can learn to attenuate \emph{per dimension}
+through $\bar{B}$. We deliberately avoid adding an \emph{unconditional} $x_0$
+residual (the pre-iter-66a form $T_\theta = x_0 + \Delta_\theta$): that creates
+a shortcut fixed point regardless of what the expert dynamics learn. The
+Parcae form keeps input injection explicit and bounded by a learned gate,
+preserving input-dependence while giving the network a zero-injection mode
+per dimension when $\bar{B}_d \to 0$.
 \end{remark}
 
-\section{RevDEQ solver and the efficient Lyapunov-regularized training algorithm}
+\subsection{Parcae per-dim damping and input gain}
+\label{sec:parcae_params}
+
+The DEQ solver uses \emph{Parcae} per-dim damping (Mamba-style
+zero-order-hold discretization), with all positive parameters produced by
+softplus reparametrizations and $\varepsilon_{\min}=10^{-3}$ for
+gradient-flow safety at init:
+\begin{align}
+  \Delta &= \mathrm{softplus}(\text{parcae\_raw\_delta}) + \varepsilon_{\min}, \\
+  A &= -\bigl(\mathrm{softplus}(\text{parcae\_raw\_a}) + \varepsilon_{\min}\bigr), \\
+  B &= \mathrm{softplus}(\text{parcae\_raw\_b}) + \varepsilon_{\min}, \\
+  \bar A_{\text{core}} &= \exp(\Delta \cdot A), \\
+  \bar A &= \varepsilon_{\text{rev}} + (1-\varepsilon_{\text{rev}})\,\bar A_{\text{core}}
+        \ \in\ (\varepsilon_{\text{rev}},\,1), \\
+  \bar B &= \Delta \cdot B \ \in\ (0,\,\infty).
+\end{align}
+The per-dim solver blend is $\beta = 1 - \bar A$. Critically, $\bar A$ and
+$\bar B$ share \emph{only} the step size $\Delta$: they are otherwise
+independent learnable signals encoding
+\emph{``how persistent is this dimension''} ($\bar A$) and
+\emph{``how much input forcing enters this dimension''} ($\bar B$).
+The tied form $\bar B = 1 - \bar A$ of iter 66a collapsed these two degrees
+of freedom into one and is strictly less expressive.
+
+\begin{remark}[RevDEQ reversibility floor $\varepsilon_{\text{rev}}$]
+The RevDEQ backward (Section~\ref{sec:revdeq_backward_combined}) reconstructs
+$y_n \leftarrow (y_{n+1} - \beta \odot T_\theta)/(1-\beta)$ where
+$(1-\beta) = \bar A$. Division by a near-zero denominator is a
+\emph{correctness} hazard, not a modeling choice: we therefore lower-bound
+$\bar A$ by a fixed constant $\varepsilon_{\text{rev}}=0.1$. Chosen so that
+the worst-case $K$-step backward amplification $(1/\bar A)^K$ for $K=12$
+stays tractable in fp64 ($10^{12}\times 10^{-15} = 10^{-3}$). The floor is
+not a tunable knob; changing it requires updating the reversibility
+contract test (\texttt{experiments/test\_arch.py::test\_revdeq\_reconstruction\_at\_a\_bar\_floor})
+and the smoke-test tolerance together. $\bar B$ carries no floor: it does
+not appear in the backward reconstruction.
+\end{remark}
+
+\section{Combined RevDEQ + Parcae + Lyapunov training algorithm}
 \label{sec:algorithm}
 
-This section presents the robust training algorithm requested:
-an efficient \textbf{RevDEQ + Lyapunov} procedure that
-(i) uses RevDEQ for the deep unrolled trajectory, and
-(ii) computes a stability penalty using only a \textbf{single} VJP at the detached equilibrium boundary.
+This section presents the training algorithm as a single, coherent system:
+\begin{enumerate}[leftmargin=2em,itemsep=0.1em]
+  \item \textbf{RevDEQ solver} for the deep unrolled trajectory, using
+        \textbf{Parcae per-dim damping} $(\bar A, \beta=1-\bar A)$ as the
+        solver's state-retention coefficient and the \textbf{Parcae input gain}
+        $\bar B$ as the ZOH-discretized input coefficient inside $T_\theta$
+        (equation~\ref{eq:Tx_new}).  $\bar A$ and $\bar B$ share only the
+        per-dim step size $\Delta$; they are otherwise independent learnable
+        signals, trained end-to-end through RevDEQ's reversible backward.
+  \item A \textbf{Lyapunov penalty} at the detached equilibrium boundary,
+        computed with only a \textbf{single} VJP per training step, that
+        encourages $\rho(J_{z^\star})<\gamma$ without a trajectory-length
+        memory cost.
+  \item A \textbf{RevDEQ reversibility floor} $\varepsilon_{\text{rev}}$ on
+        $\bar A$ (correctness constant, not a knob) that keeps the backward
+        reconstruction $y_n \leftarrow (y_{n+1}-\beta T)/(1-\beta)$ numerically
+        well-defined regardless of what Parcae learns for $A$. No such floor
+        is imposed on $\bar B$ because it does not appear in the backward
+        reconstruction.
+\end{enumerate}
+Phases below describe each component in order. Phase 1 is the RevDEQ
+\emph{forward} under Parcae damping/injection; Phase 2 is the Lyapunov
+penalty; Phase 3 is the RevDEQ \emph{backward} that reconstructs the
+trajectory and emits gradients w.r.t.\ every learnable Parcae parameter.
 
 \subsection{Phase 1: RevDEQ forward pass (locating an equilibrium)}
 \label{sec:phase1}
 
-RevDEQ maintains two coupled states $y_k$ and $z_k$ and applies $T_\theta$ twice per step:
+RevDEQ maintains two coupled states $y_k$ and $z_k$ and applies $T_\theta$ twice per step.
+With the per-dim Parcae blend $\beta = 1 - \bar A \in (0, 1-\varepsilon_{\text{rev}})$
+and $T_\theta$ from \eqref{eq:Tx_new}:
 \begin{align}
-  y_{k+1} &= (1-\beta)\,y_k + \beta\, T_\theta(z_k,x_0),\\
-  z_{k+1} &= (1-\beta)\,z_k + \beta\, T_\theta(y_{k+1},x_0),
+  y_{k+1} &= \bar A \odot y_k + \beta \odot T_\theta(z_k,x_0),\\
+  z_{k+1} &= \bar A \odot z_k + \beta \odot T_\theta(y_{k+1},x_0),
 \end{align}
-initialized with $y_0=z_0=x_0$ (warm start), and run for $K$ steps or until convergence.
+initialized with $y_0=z_0=x_0$ (warm start) and run for $K$ steps or until convergence.
+The $\odot$ emphasises that $\bar A$ and $\beta$ are \emph{per-dim} vectors tied to
+the Parcae parameters $(\text{raw\_a}, \text{raw\_delta})$, while $\bar B$ (the
+Parcae \emph{input gain}) lives inside $T_\theta$ and does not appear in the
+solver update.
+
+\paragraph{Fixed point.}  At equilibrium $(y^\star, z^\star) = (z^\star, z^\star)$,
+and $\bar A$ cancels from both sides, giving
+\begin{equation}
+  \label{eq:fp_combined}
+  z^\star = \bar B \odot \mathrm{RMSNorm}_{\text{learn}}(x_0) + \Delta_\theta(z^\star, x_0).
+\end{equation}
+Input-dependence is thus explicit in the equilibrium via $\bar B$ and implicit
+via $\Delta_\theta$; neither is unconditional.
 
 \begin{lstlisting}
 Inputs: token IDs x [B,T], targets y [B,T]
-Hyperparams: K_max, beta in (0,1], eps_tol
+Hyperparams: K_max, eps_tol
+Parcae params: parcae_raw_a, parcae_raw_delta, parcae_raw_b, x0_inject_norm_weight
 
 # 1) Embed input
 x0 = rms_norm( Emb(x) + BigramHashEmb(x) )  # optional BigramHashEmb
 
-# 2) RevDEQ solve (forward)
+# 2) Compute per-dim Parcae coefficients once per step.
+delta_  = softplus(parcae_raw_delta) + eps_min      # (D,)
+a_bar   = eps_rev + (1-eps_rev) * exp(delta_ * -(softplus(parcae_raw_a) + eps_min))
+b_bar   = delta_ * (softplus(parcae_raw_b) + eps_min)
+beta    = 1 - a_bar                                  # per-dim solver blend
+
+# 3) RevDEQ solve (forward) with block T_theta using b_bar internally.
 y_state = x0
 z_state = x0
 for k in 0..K_max-1:
-    y_next = (1-beta)*y_state + beta*T_theta(z_state, x0)
-    z_next = (1-beta)*z_state + beta*T_theta(y_next,  x0)
+    y_next = a_bar * y_state + beta * T_theta(z_state, x0; b_bar, x0_inject_norm_weight)
+    z_next = a_bar * z_state + beta * T_theta(y_next,  x0; b_bar, x0_inject_norm_weight)
     if ||z_next - z_state||_2 < eps_tol:
         break
     y_state, z_state = y_next, z_next
@@ -459,6 +554,7 @@ unchanged: $\mathcal{L}_{\text{lyap}} = \lambda \cdot
 
 \subsection{Phase 3: RevDEQ backward pass (exact unrolled gradient without IFT)}
 \label{sec:phase3}
+\label{sec:revdeq_backward_combined}
 
 Let $L_{\text{task}}$ be the task loss computed from the equilibrium representation (Section~\ref{sec:head}).
 The total objective is:
@@ -466,27 +562,52 @@ The total objective is:
   L_{\text{total}} = L_{\text{task}}(z^\star) + L_{\text{jac}}(z^\star).
 \]
 
-RevDEQ provides a reversible backward pass:
-during the forward pass we discard intermediate states,
-and during the backward pass we reconstruct the trajectory in reverse and accumulate gradients
-without implicit-function-theorem (IFT) linear solves.
+RevDEQ provides a reversible backward pass: during the forward pass we discard
+intermediate states, and during the backward pass we reconstruct the trajectory in
+reverse and accumulate gradients without implicit-function-theorem (IFT) linear
+solves. Reconstruction inverts the Phase-1 update per dimension:
+\[
+  y_n \;=\; (\,y_{n+1} - \beta \odot T_\theta(z_{n-1},x_0)\,) \;/\; (1-\beta),
+  \qquad (1-\beta) = \bar A \ge \varepsilon_{\text{rev}}.
+\]
+The reversibility floor on $\bar A$ (Section~\ref{sec:parcae_params})
+guarantees a non-zero denominator; all Parcae parameters
+$(\text{raw\_a}, \text{raw\_delta}, \text{raw\_b})$ receive gradients from
+this reverse pass because $T_\theta$ and $\beta$ both depend on them:
+\begin{itemize}[leftmargin=2em,itemsep=0.1em]
+  \item $\beta = 1-\bar A$ — grads flow back to \texttt{parcae\_raw\_a} and
+        \texttt{parcae\_raw\_delta} through the solver's convex-combination
+        coefficient in every iteration.
+  \item $\bar B$ inside $T_\theta$ — grads flow back to
+        \texttt{parcae\_raw\_b} and \texttt{parcae\_raw\_delta} through the
+        $\bar B\odot\mathrm{RMSNorm}_{\text{learn}}(x_0)$ term
+        (equation~\ref{eq:Tx_new}) during each re-evaluation of $T_\theta$
+        in the reverse pass.
+\end{itemize}
 
 \begin{lstlisting}
 # 3) Total loss and backward
 L_task  = TaskLoss(Head(RMSNorm(z_star_detached)), y)
 L_total = L_task + L_jac
 
-# Backprop rule:
-# - gradient of L_jac flows through boundary graph (u, v_next)
-# - gradient of L_task flows through RevDEQ's reversible backward that reconstructs the trajectory
+# RevDEQ's custom autograd.Function inverts Phase 1:
+#   y_n = (y_{n+1} - beta * T_theta(z_{n-1}, x0)) / (1 - beta)
+# with (1 - beta) = a_bar >= eps_rev (reversibility floor).
+# Gradients are accumulated into:
+#   - block params (theta), via re-evaluation of T_theta at each reverse step
+#   - parcae_raw_a, parcae_raw_delta, parcae_raw_b, x0_inject_norm_weight
+#     (via beta and b_bar chaining)
+#   - L_jac path (boundary graph reaches theta directly)
 backward(L_total)
 \end{lstlisting}
 
 \begin{remark}[Correctness note]
-The exact algebra for inverting the RevDEQ leapfrog updates depends on the specific reversible block design.
-Conceptually, RevDEQ reconstructs $(y_k,z_k)$ in reverse using the known forward equations and recomputation of $T_\theta$.
-The key property is \emph{O(1)} memory in the forward pass and \emph{exact} gradients, without IFT matrix inversion.
-See \cite{revdeq} for the full reversible derivation.
+The exact algebra for inverting the RevDEQ leapfrog updates depends on the
+specific reversible block design. Conceptually, RevDEQ reconstructs
+$(y_k,z_k)$ in reverse using the known forward equations and recomputation
+of $T_\theta$ (including the Parcae $\bar B$ injection). The key property is
+\emph{O(1)} memory in the forward pass and \emph{exact} gradients, without
+IFT matrix inversion. See \cite{revdeq} for the full reversible derivation.
 \end{remark}
 
 \section{Lyapunov stability guarantee for fixed-point convergence}

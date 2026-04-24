@@ -67,8 +67,10 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | vocab_size | 1024 |
 | tie_embeddings | yes |
 | deq_beta | 0.50 (fallback when `use_parcae=False`) |
-| use_parcae | True (per-dim damping; supersedes scalar beta/jitter when active) |
-| parcae_init_a_bar | 0.7 |
+| use_parcae | True (per-dim Ā and B̄; supersedes scalar beta/jitter when active) |
+| parcae_init_a_bar | 0.7 (initial Ā per dim; β₀ = 1-Ā₀ = 0.3) |
+| parcae_init_b_bar | 0.3 (B̄₀ ≈ 1-Ā₀ at step 0; iter 66b continuity with iter 66a) |
+| parcae_reversibility_floor | 0.1 (correctness constant — Ā ≥ this bound for RevDEQ backward safety, NOT a tuning knob) |
 | deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
 | num_refinements | 1 |
 
@@ -79,7 +81,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | scalar_lr | 0.02 |
 | tied_embed_lr | 0.03 |
 | embed_lr | 0.6 |
-| parcae_lr | 0.002 |
+| parcae_lr | 0.002 (applied to `parcae_raw_a`, `parcae_raw_delta`, `parcae_raw_b`) |
 | muon_momentum | 0.99 |
 | muon_momentum_warmup_start | 0.92 |
 | muon_momentum_warmup_steps | 800 |
@@ -368,7 +370,30 @@ Rules:
 Rationale (incident from 2026-04-15 review): five drift defects shipped together — a stale 27b comment in iter 27d code, CLAUDE.md's config table two phases behind real code, `num_experts` hardcoded in three classes, a test silently relaxed from `== 6` to `>= 2`, and `opg_doc.tex` describing a removed `gg_gate`. All five share one root cause: configuration was duplicated across files with no single source of truth, so each editor only updated the file in front of them. This subsection codifies the fix.
 
 ### DEQ Input Conditioning Rule
-The DEQ block may use `x0` to condition expert/router computation, currently through `h = RMSNorm(z + x0)`, but must not add an unconditional output-side `x0` residual unless an explicit ablation re-establishes it. Output residual injection can create shortcut fixed points and hide whether the learned dynamics carry the equilibrium representation. Any change to this equation must update `train_gpt.py`, `opg_doc.tex`, and a regression test that forces expert outputs to zero and verifies the block does not return `x0`.
+The DEQ block may add an output-side `x0` term only if it is scaled by a learnable, per-dim coefficient derived from the Parcae ZOH discretization (`B̄ = Δ·B`, softplus-reparametrized). Unconditional residuals like `T = x0 + Δ` are prohibited: they create shortcut fixed points regardless of what the expert dynamics learn. The current form implemented in `Block.forward` (iter 66b) is:
+```
+T_θ(z, x_0) = B̄ ⊙ RMSNorm_learn(x_0) + Δ(z, x_0)
+```
+where `B̄` is independent of the solver's `β = 1 − Ā` except through the shared per-dim step size Δ. Any change to this equation must update `train_gpt.py`, `opg_doc.tex` §eq:Tx_new, and the regression tests in `tests/test_gate_init_defaults.py` (`test_zero_expert_delta_returns_b_bar_times_norm_x0` and `test_direct_block_without_b_bar_uses_ones_fallback`) in the same commit.
+
+### RevDEQ Reversibility Floor Rule
+Any per-dim coefficient that divides the RevDEQ backward reconstruction MUST be lower-bounded by a correctness constant documented as such in code. The RevDEQ reverse step is:
+```
+y_n = (y_{n+1} − β ⊙ T_θ(z_{n-1}, x_0)) / (1 − β)
+```
+where `(1 − β) = Ā`. Worst-case backward-amplification per iteration is `1/Ā`, so over `K = num_layers` backward steps the error bound scales as `(1/Ā)^K · ε_fp64`. For `K = 12` and fp64 (ε ≈ 1e-15), `Ā ≥ 0.1` keeps the bound at `10^12 · 1e-15 = 1e-3`, which smoke-test tolerances (1e-1) expect. We therefore enforce:
+```
+Ā = ε_rev + (1 − ε_rev) · exp(Δ·A),      ε_rev = parcae_reversibility_floor = 0.1
+```
+`ε_rev` is NOT a tuning knob. Changing it requires updating in the same commit:
+1. `GPT.parcae_reversibility_floor` in `train_gpt.py`.
+2. The reversibility contract test in `experiments/test_arch.py::test_revdeq_reconstruction_at_a_bar_floor`.
+3. The smoke-test tolerance in `experiments/smoke_test.py`.
+4. The `opg_doc.tex` §Parcae-params remark that cites the specific value.
+
+Coefficients that do NOT appear in the backward reconstruction (notably `B̄`, which lives inside `T_θ` and never in the `(y_{n+1} − β·T)/(1−β)` step) MUST NOT carry a floor. `B̄ = Δ·B` stays paper-faithful unbounded — adding a floor silently biases training away from the paper's Mamba-ZOH form.
+
+Rationale (iter 66b pre-commit review): iter 66a's `min_a_bar = 0.1` was the value with the right safety margin for `K = 12` DEQ iterations in fp64; the post-diff refactor bundled it with an extra `decay_floor`/`min_rate` compound wrapper that made Ā non-paper-faithful. Iter 66b strips the compound wrapper and retains only the single `ε_rev` floor — explicitly a correctness constant.
 
 ### Permutation Consistency Audit Rule
 When multiple tensors of identical shape undergo `permute()+reshape()` to the same target layout (e.g., `(E,B,T,H,d)` → `(B,E*H,T,d)`), ALL must use identical permutation indices. Before committing any attention/expert tensor reshaping code:
