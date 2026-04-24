@@ -542,6 +542,35 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H62: Independent attn/mlp shared-expert sigmoid gates (iter 84) — PROMOTED ★ (2026-04-24)
+
+**Claim:** Block.shared_gate was a single `nn.Linear(dim, num_shared_experts)` producing ONE sigmoid gate applied to BOTH the attention shared-expert output and the MLP shared-expert output. This accidental symmetry forced the two paths to open/close together. Splitting it into `shared_gate_attn` + `shared_gate_mlp` (each with its own prenorm scale) lets each path learn its own modulation and should improve val_bpb at negligible param cost.
+
+**Test:** Iter 84 — controlled A/B on iter 94 baseline. One change: Block.__init__ now allocates two `nn.Linear(dim, num_shared_experts, bias=True)` modules (`shared_gate_attn`, `shared_gate_mlp`) each with its own `shared_gate_norm_weight_{attn,mlp}` parameter. Block.forward computes `g_s_attn` and `g_s_mlp` separately and threads each to its respective expert bank. Commit `6494a50`. Param cost: +1,537 (+0.014%).
+
+**Result:** PROMOTED.
+
+| Metric | Iter 94 baseline | Iter 84 | Δ |
+|---|---|---|---|
+| val_bpb fast (k16) | 1.5777 | **1.5653** | **-0.0124** |
+| val_bpb int6 (k16) | 1.5952 | **1.5844** | **-0.0108** |
+| k=4 | 1.6278 | 1.5854 | -0.0424 |
+| k=8 | 1.5843 | 1.5742 | -0.0101 |
+| k=16 | 1.5926 | 1.5844 | -0.0082 |
+| k=32 | 1.5943 | 1.5867 | -0.0076 |
+| k=64 | 1.5946 | 1.5872 | -0.0074 |
+| k=128 | 1.5966 | 1.5873 | -0.0093 |
+| K=8→K=128 Δ | +0.0103 | +0.0131 | +0.003 (tiny widen, still ≪ 0.5) |
+| artifact bytes | 6,007,121 | 6,074,999 | +67,878 (+1.1%) |
+
+**Every K-sweep point improved.** Mid-training val_bpb lead widened monotonically: step 200 −0.013, step 400 −0.039, step 600 −0.028, step 800 −0.013, step 1000 −0.012. The k=4 improvement is particularly large (−0.042) — the shallower the DEQ solve, the more the per-path shared gate matters because the routed-expert mixture hasn't had time to compensate.
+
+**Confirmation that gates actually diverged:** `shared_gate_std` (stdev across the concatenation of the two (B, T, S) gates) grew from **0.0000 at step 0 → 0.17 at step 200 → 0.14 at step 800**. If the model hadn't wanted the new DoF, the two gates would have stayed identical and `shared_gate_std` would have stayed at 0 (same init). The 0.14–0.17 range shows the attn and mlp gates each found their own preferred opening.
+
+**Status:** ✅ VERIFIED. PROMOTED as new baseline (commit `6494a50`).
+
+**Implication:** The pre-iter-84 architecture had a cheap structural flaw (shared gate) that was silently coupling attn-shared and mlp-shared modulation. Fixing it gives a clean −0.011 int6 win for ~0.01% param cost. This pattern (trivial param cost, fixes accidental symmetry) is the model of the Group A iterations. Recommend auditing remaining "shared" modules for similar accidental couplings.
+
 ### H61: GLU-style LeakyReLU(0.5)² MLP activation (iter 83) — REFUTED ✗ (2026-04-24)
 
 **Claim:** Replacing SwiGLU (`F.silu(gate) * fc`) with GLU-style LeakyReLU² (`F.leaky_relu(gate, 0.5).square() * fc`) in `MLP.mix_experts` should improve val_bpb, analogous to the SOTA leaderboard config (abaybektursun 1.1194) which uses LeakyReLU².
@@ -914,7 +943,7 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 |---|---|---|---|
 | **94** | new | Disable CTP entirely (NTP-only). Add `Hyperparameters.use_ctp = True` guard; when False, `MoSLowRankOutputHead.forward` returns only `log_p_ntp`, `GPT.forward` skips `ctp_loss` computation at L2760-2781, and CTP-specific `nn.Parameter` banks (`gate_ctp`, `gate_ctp_norm_weight`, `A_ctp_shared`, `A_ctp`, `ctp_a_norm_weight`, `ctp_rank_norm_weight`, `B_denoise`) are NOT allocated. **PROMOTED ★ (commit `c2eff43`)** — int6 Δ=+0.0026 (≤0.03 ✓), K8→K128 Δ tightened +0.0103→+0.0073, artifact -592 KB (-9.0%), params -1.38M (-10.9%). See H60. |
 | **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` (GLU-style: `leaky(gate,0.5)² * fc`) | **REVERTED ✗ (commit `34ef98d`)** — int6 regression +0.0124 vs iter 94 (1.6076 vs 1.5952), artifact +84 KB, K-sweep slightly widened (K=8→K=128 Δ: +0.0073 → +0.0087). Technically within the ≤0.03 carry-forward band, but the change delivers *no* offsetting benefit (no param savings, no FP-quality tightening, no artifact saving) — it is a pure regression under the iter 94 NTP-only + Parcae landscape. The SOTA abaybektursun 1.1194 leaderboard config used a *non-gated* `leaky²(up(x)) → down` FFN; our MoE has `expert_gate + expert_fc + expert_down`, so the GLU-with-leaky² variant tested here is a hybrid that apparently pulls worse than SwiGLU in our architecture. See H61. (A full SOTA-faithful non-gated expert rewrite is still open as a possible follow-up, but blocked behind the Group D architectural rewrites.) |
-| **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | Trivial; fixes an accidental symmetry. Independent of 83 — can run in parallel if hardware permits. |
+| **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | **PROMOTED ★ (commit `6494a50`)** — int6 Δ=**-0.0108** (improvement!), every K-sweep point improved (k=4 by -0.042), K=8→K=128 widened negligibly (+0.003, still ≪0.5), artifact +68 KB (+1.1%). `shared_gate_std` grew 0 → 0.17, confirming the two gates took meaningfully different values. See H62. |
 | **85** | 82 | Stochastic TBPTT `{2,3,4}` | One-knob change matching the K-jitter principle (H12 VERIFIED). Known-class trade-off. |
 | **93** | new | Remove bigram embed (`bigram_vocab_size 4096 → 0`) | Frees ~1 MB of artifact budget (4096 × 128 × 2 bytes FP16 + 128 × 768 proj). BigramHash was added in iter 6 under a very different architecture (pre-DEQ, pre-experts). Under the current iter 66b landscape (learnable norms, Parcae B̄ input injection, expert banks), it may be redundant — the DEQ's x₀ re-injection already carries token-pair information through iterations. Clean one-line ablation; `GPT.__init__` already handles `bigram_vocab_size == 0` via `if bigram_vocab_size > 0` guard at L2345. If val_bpb stays within 0.03, the freed budget compounds into iter 90–92's arch scale-up. |
 
