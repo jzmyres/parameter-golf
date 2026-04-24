@@ -1,8 +1,10 @@
 """Tests for Block construction defaults under the iter 41+ Lyapunov architecture.
 
 Iter 41 replaced the Banach contraction shell (τ, Π_R, spectral norms) with
-a fully expressive T_θ(z,x₀) = x₀ + Δ_θ(z,x₀). Stability via Lyapunov
-penalty (iter 45), not hard architectural constraints.
+a fully expressive learned map. The current block uses
+T_θ(z,x₀) = Δ_θ(z,x₀): x₀ conditions the experts through RMSNorm(z+x₀),
+but is not directly injected at the output. Stability via Lyapunov penalty
+(iter 45), not hard architectural constraints.
 """
 import os
 import sys
@@ -53,16 +55,36 @@ class TestLyapunovArchDefaults(unittest.TestCase):
         self.assertFalse(hasattr(b, "tau_param"), "tau_param should be removed")
         self.assertFalse(hasattr(b, "inj_lin"), "inj_lin should be removed")
 
-    def test_forward_is_x0_plus_delta(self) -> None:
-        """T_θ(z, x₀) = x₀ + Δ_θ(z, x₀). When Δ≈0 (fresh init), output ≈ x₀."""
+    def test_forward_returns_delta_not_x0_residual(self) -> None:
+        """T_θ(z, x₀) = Δ_θ(z, x₀); x₀ is conditioning, not output residual."""
         b = _fresh_block(dim=32)
         b.train(False)
         z = torch.zeros(2, 5, 32)  # zero state
         x0 = torch.randn(2, 5, 32)
         with torch.no_grad():
             out = b(z, x0)
-        # At init, delta should be small, so out ≈ x0 (not exact due to expert init)
         self.assertEqual(tuple(out.shape), tuple(x0.shape))
+
+    def test_zero_expert_delta_does_not_return_x0(self) -> None:
+        """If expert outputs are zero, the block output is zero rather than x₀."""
+        b = _fresh_block(dim=32)
+        b.train(False)
+        z = torch.randn(2, 5, 32)
+        x0 = torch.randn(2, 5, 32)
+
+        def zero_attn(h):
+            return h.new_zeros(*h.shape[:-1], b.num_experts, h.shape[-1])
+
+        def zero_mlp(h, w, *, num_shared=0, shared_gate=None):
+            return h.new_zeros(h.shape)
+
+        b.attn.forward_experts = zero_attn
+        b.mlp.mix_experts = zero_mlp
+
+        with torch.no_grad():
+            out = b(z, x0)
+
+        self.assertTrue(torch.allclose(out, torch.zeros_like(out), atol=0.0, rtol=0.0))
 
 
 if __name__ == "__main__":

@@ -51,16 +51,52 @@ _DEQ_SOLVE_ACTIVE = False
 
 
 def _unwrap_compiled_module(m: nn.Module) -> nn.Module:
-    """Return the original module when `m` is a `torch.compile` wrapper.
+    """Return the semantic owner behind compile/DDP-style wrappers.
 
     `torch.compile(nn.Module)` returns a wrapper (e.g., OptimizedModule) whose
-    `forward` dispatches into the original module. Attribute *writes* against
-    the wrapper do not reliably affect the original module, so any code that
-    toggles module-local flags (gate/diagnostics tracking) should write to the
-    unwrapped module.
+    `forward` dispatches into the original module. DDP/DataParallel wrappers
+    similarly store the underlying module on `.module`. Attribute writes
+    against wrappers do not reliably affect the owner, so code that toggles
+    module-local flags or eval knobs must write to the fully unwrapped module.
     """
-    orig = getattr(m, "_orig_mod", None)
-    return orig if isinstance(orig, nn.Module) else m
+    cur = m
+    seen: set[int] = set()
+    while isinstance(cur, nn.Module):
+        cur_id = id(cur)
+        if cur_id in seen:
+            break
+        seen.add(cur_id)
+
+        orig = getattr(cur, "_orig_mod", None)
+        if isinstance(orig, nn.Module) and orig is not cur:
+            cur = orig
+            continue
+
+        wrapped = getattr(cur, "module", None)
+        if isinstance(wrapped, nn.Module) and wrapped is not cur:
+            cur = wrapped
+            continue
+
+        break
+    return cur
+
+
+@contextlib.contextmanager
+def _temporary_deq_k_override(model: nn.Module, k: int):
+    base_m = _unwrap_compiled_module(model)
+    missing = object()
+    prev_k = getattr(base_m, "_deq_k_override", missing)
+    base_m._deq_k_override = int(k)
+    try:
+        yield base_m
+    finally:
+        if prev_k is missing:
+            try:
+                delattr(base_m, "_deq_k_override")
+            except AttributeError:
+                pass
+        else:
+            base_m._deq_k_override = prev_k
 
 
 def dynamo_disable(fn):
@@ -125,7 +161,7 @@ class Hyperparameters:
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 0  # disabled: step-count governs training (time_frac = step/iterations)
+    max_wallclock_seconds = 600  # competition hard cap; use CLI override for step-matched dev runs
 
     # Model architecture
     vocab_size = 1024
@@ -519,54 +555,54 @@ def run_validation(args, model, rank, world_size, device, grad_accum_steps,
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    # `model.train(...)` is called on the outer (possibly wrapped) module on
+    # purpose: PyTorch cascades training-mode to all children via
+    # `self.children()`, so toggling the wrapper toggles the underlying GPT.
+    # `_unwrap_compiled_module(model)` is only used for attribute *writes*
+    # (e.g. `_deq_k_override`), which must reach the semantic owner.
+    was_training = bool(model.training)
     model.train(False)
-    base_m = model.module if hasattr(model, "module") else model
-    prev_k = getattr(base_m, "_deq_k_override", None)
+    base_m = _unwrap_compiled_module(model)
     k = int(deq_k if deq_k is not None else getattr(args, "deq_k_eval", base_m.num_layers))
-    base_m._deq_k_override = k
-    with torch.inference_mode():
-        for batch_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_end = min(batch_start + local_batch_seqs, seq_end)
-            raw_start = batch_start * args.train_seq_len
-            raw_end = batch_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                _ = model(x, y)
-            loss_t = getattr(base_m, "_ntp_loss_t", None)
-            if isinstance(loss_t, torch.Tensor):
-                batch_loss = loss_t.detach().to(device=device, dtype=torch.float64)
-            else:
-                batch_loss = torch.tensor(
-                    float(getattr(base_m, "_ntp_loss", 0.0)),
-                    device=device,
-                    dtype=torch.float64,
-                )
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    if prev_k is None:
-        try:
-            delattr(base_m, "_deq_k_override")
-        except Exception:
-            base_m._deq_k_override = 0
-    else:
-        base_m._deq_k_override = prev_k
-    model.train()
-    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+    try:
+        with _temporary_deq_k_override(base_m, k):
+            with torch.inference_mode():
+                for batch_start in range(seq_start, seq_end, local_batch_seqs):
+                    batch_end = min(batch_start + local_batch_seqs, seq_end)
+                    raw_start = batch_start * args.train_seq_len
+                    raw_end = batch_end * args.train_seq_len + 1
+                    local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                    x = local[:-1].reshape(-1, args.train_seq_len)
+                    y = local[1:].reshape(-1, args.train_seq_len)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        _ = model(x, y)
+                    loss_t = getattr(base_m, "_ntp_loss_t", None)
+                    if isinstance(loss_t, torch.Tensor):
+                        batch_loss = loss_t.detach().to(device=device, dtype=torch.float64)
+                    else:
+                        batch_loss = torch.tensor(
+                            float(getattr(base_m, "_ntp_loss", 0.0)),
+                            device=device,
+                            dtype=torch.float64,
+                        )
+                    batch_token_count = float(y.numel())
+                    val_loss_sum += batch_loss * batch_token_count
+                    val_token_count += batch_token_count
+                    prev_ids = x.reshape(-1)
+                    tgt_ids = y.reshape(-1)
+                    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                    token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                    val_byte_count += token_bytes.to(torch.float64).sum()
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+                dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+            val_loss = val_loss_sum / val_token_count
+            bits_per_token = val_loss.item() / math.log(2.0)
+            tokens_per_byte = val_token_count.item() / val_byte_count.item()
+            return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+    finally:
+        model.train(was_training)
 
 
 # Backwards-compatible alias used by smoke_test.py and other callers
@@ -577,7 +613,7 @@ eval_val = run_validation
 # QUANTIZATION (uniform INT6 + SDClip)
 # ---------------------------------------------------------------------------
 
-CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale")
+CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale", "norm_weight")
 FP16_KEEP_PATTERNS = ("tok_emb",)
 SDCLIP_K_MATRIX = 12.85
 SDCLIP_K_EMBED = 20.0
@@ -966,7 +1002,7 @@ class SoftDenseRouter(nn.Module):
     def __init__(self, dim: int, num_experts: int, *,
                  min_share_frac: float = 0.6, cv_target: float = 0.20,
                  min_share_loss_weight: float = 1.0, cv_loss_weight: float = 0.10,
-                 scoring: str = "linear"):
+                 scoring: str = "linear", health_slices: tuple[int, ...] | None = None):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
@@ -975,6 +1011,9 @@ class SoftDenseRouter(nn.Module):
         self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
         assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
+        self.health_slices = tuple(int(v) for v in (health_slices or (num_experts,)))
+        if sum(self.health_slices) != int(num_experts) or any(v <= 0 for v in self.health_slices):
+            raise ValueError(f"health_slices={self.health_slices} must partition {num_experts} experts")
         # Tensor buffer to avoid Python-float guards inside torch.compile graphs.
         # Kept behind a property so legacy code/tests can assign `health_scale = 5.0`.
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
@@ -1004,13 +1043,64 @@ class SoftDenseRouter(nn.Module):
         self._expert_entropy = None
         self._expert_sparsity = None
         self._expert_balance_cv = None
+        self._expert_total_mass = None
         # GPU-resident views used by DDP reductions — populated by
         # _record_diagnostics on every rank during eval, avoiding per-forward
         # cpu() syncs on non-master ranks.
         self._expert_usage_gpu: Tensor | None = None
         self._expert_entropy_gpu: Tensor | None = None
         self._expert_balance_cv_gpu: Tensor | None = None
+        self._expert_total_mass_gpu: Tensor | None = None
         self._diag_step: int | None = None
+
+    def _component_ranges(self) -> list[tuple[int, int]]:
+        out = []
+        start = 0
+        for width in self.health_slices:
+            end = start + int(width)
+            out.append((start, end))
+            start = end
+        return out
+
+    def _normalized_component_shares(self, mean_mass: Tensor) -> Tensor:
+        chunks = []
+        for start, end in self._component_ranges():
+            mass = mean_mass[..., start:end]
+            chunks.append(mass / mass.sum(dim=-1, keepdim=True).clamp_min(1e-8))
+        return torch.cat(chunks, dim=-1)
+
+    def _component_uniform_target(self, ref: Tensor) -> Tensor:
+        chunks = []
+        for start, end in self._component_ranges():
+            width = max(end - start, 1)
+            chunks.append(torch.full_like(ref[..., start:end], 1.0 / float(width)))
+        return torch.cat(chunks, dim=-1)
+
+    def _component_health_losses(self, mean_mass: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        bal = mean_mass.new_zeros(())
+        min_loss = mean_mass.new_zeros(())
+        cv_loss = mean_mass.new_zeros(())
+        n = float(len(self.health_slices))
+        for start, end in self._component_ranges():
+            width = max(end - start, 1)
+            share = mean_mass[..., start:end]
+            share = share / share.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            target = torch.full_like(share, 1.0 / float(width))
+            bal = bal + F.mse_loss(share, target)
+            lb = float(self.min_share_frac) / float(width)
+            if lb > 0.0:
+                min_loss = min_loss + torch.relu(share.new_tensor(lb) - share).pow(2).mean()
+            if self.cv_target > 0.0:
+                cv = share.std(dim=-1, unbiased=False) / share.mean(dim=-1).clamp_min(1e-8)
+                cv_loss = cv_loss + torch.relu(cv - share.new_tensor(self.cv_target)).pow(2).mean()
+        return bal / n, min_loss / n, cv_loss / n
+
+    def _component_balance_cv(self, share: Tensor) -> Tensor:
+        vals = []
+        for start, end in self._component_ranges():
+            s = share[..., start:end]
+            vals.append(s.std(dim=-1, unbiased=False) / s.mean(dim=-1).clamp_min(1e-8))
+        return torch.stack(vals).mean()
 
     @property
     def health_scale(self) -> float:
@@ -1034,13 +1124,13 @@ class SoftDenseRouter(nn.Module):
             ms = ms.clone()
             dist.all_reduce(ms, op=dist.ReduceOp.SUM)
             ms /= float(dist.get_world_size())
-        target = torch.full_like(ms, 1.0 / float(self.num_experts))
-        lb = float(self.min_share_frac) / float(self.num_experts)
-        if lb > 0.0:
-            boost = (lb - ms).clamp_min(0.0)
+        target = self._component_uniform_target(ms)
+        lb_vec = self._component_uniform_target(ms) * float(self.min_share_frac)
+        if self.min_share_frac > 0.0:
+            boost = (lb_vec - ms).clamp_min(0.0)
             # Pure-tensor: conditionally apply boost without .item() GPU→CPU sync.
             boosted = (target + boost).clamp_min(1e-8)
-            boosted = boosted / boosted.sum()
+            boosted = self._normalized_component_shares(boosted)
             target = torch.where(boost.sum() > 0.0, boosted, target)
         self.expert_bias.add_(lr * (target - ms))
         if clip > 0:
@@ -1085,13 +1175,9 @@ class SoftDenseRouter(nn.Module):
             self._router_gate_last_mean = float(gate_act.detach().mean().item())
         if self.training:
             reduce_dims = tuple(range(p.ndim - 1))
-            mean_share = p.mean(dim=reduce_dims)
-            target = torch.ones_like(mean_share) / self.num_experts
-            mse = F.mse_loss(mean_share, target)
-            lb = float(self.min_share_frac) / float(self.num_experts)
-            min_share_loss = torch.relu(mean_share.new_tensor(lb) - mean_share).pow(2).mean() if lb > 0.0 else mean_share.new_zeros(())
-            cv = mean_share.std() / mean_share.mean().clamp_min(1e-8)
-            cv_loss = torch.relu(cv - mean_share.new_tensor(self.cv_target)).pow(2) if self.cv_target > 0.0 else mean_share.new_zeros(())
+            mean_mass = p.mean(dim=reduce_dims)
+            mean_share = self._normalized_component_shares(mean_mass.float()).to(dtype=mean_mass.dtype)
+            mse, min_share_loss, cv_loss = self._component_health_losses(mean_mass.float())
             hs = self._health_scale.to(dtype=min_share_loss.dtype)
             self._balance_loss = mse
             self._health_loss = (
@@ -1121,29 +1207,32 @@ class SoftDenseRouter(nn.Module):
                     self._expert_entropy = None
                     self._expert_sparsity = None
                     self._expert_balance_cv = None
+                    self._expert_total_mass = None
                     self._expert_usage_gpu = None
                     self._expert_entropy_gpu = None
                     self._expert_balance_cv_gpu = None
+                    self._expert_total_mass_gpu = None
                     self._diag_step = None
         return p
 
     @dynamo_disable
-    def _record_diagnostics(self, share: Tensor, reduce_dims: tuple[int, ...]) -> None:
+    def _record_diagnostics(self, routed_mass: Tensor, reduce_dims: tuple[int, ...]) -> None:
         # GPU-only recording — no .cpu()/.item() sync on any rank during the
         # forward pass.  Both usage + CV stay as detached GPU tensors; master
         # additionally keeps the per-token entropy GPU tensor for log time.
         # The Python list/float views used by format_expert_info are
         # materialized lazily via _materialize_diag_lists(), which should be
         # called exactly once per log site (not per forward).
-        mean_mass = share.mean(dim=reduce_dims)
-        self._expert_usage_gpu = mean_mass.float().detach()
-        self._expert_balance_cv_gpu = (
-            mean_mass.std() / mean_mass.mean().clamp_min(1e-8)
-        ).detach()
+        mean_mass = routed_mass.mean(dim=reduce_dims).float()
+        mean_share = self._normalized_component_shares(mean_mass)
+        self._expert_usage_gpu = mean_share.detach()
+        self._expert_balance_cv_gpu = self._component_balance_cv(mean_share).detach()
+        self._expert_total_mass_gpu = mean_mass.sum().detach()
         distributed = dist.is_available() and dist.is_initialized()
         is_master = (not distributed) or dist.get_rank() == 0
         if is_master:
-            per_token_ent = -(share * (share + 1e-8).log()).sum(-1)
+            token_share = routed_mass.float() / routed_mass.float().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            per_token_ent = -(token_share * (token_share + 1e-8).log()).sum(-1)
             self._expert_entropy_gpu = per_token_ent.mean().detach()
         else:
             self._expert_entropy_gpu = None
@@ -1153,6 +1242,7 @@ class SoftDenseRouter(nn.Module):
         self._expert_entropy = None
         self._expert_sparsity = None
         self._expert_balance_cv = None
+        self._expert_total_mass = None
         self._diag_step = _ROUTER_DIAGNOSTICS_STEP
 
         # Do not materialize list-form diagnostics here: this function can be
@@ -1174,6 +1264,8 @@ class SoftDenseRouter(nn.Module):
         self._expert_usage = self._expert_usage_gpu.detach().float().cpu().tolist()
         if self._expert_balance_cv_gpu is not None:
             self._expert_balance_cv = float(self._expert_balance_cv_gpu.item())
+        if self._expert_total_mass_gpu is not None:
+            self._expert_total_mass = float(self._expert_total_mass_gpu.item())
         if self._expert_entropy_gpu is not None:
             ent = float(self._expert_entropy_gpu.item())
             self._expert_entropy = ent
@@ -1218,6 +1310,7 @@ class CausalSelfAttention(nn.Module):
         q_out_dim = num_heads * self.head_dim + num_heads
         self.expert_q_down = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         self.expert_q_up = nn.Parameter(torch.empty(num_experts, q_out_dim, self.expert_rank))
+        self.q_up_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_q_down.data[e])
             # Zero-init the gate logit rows so gates start at sigmoid(0) = 0.5.
@@ -1227,6 +1320,7 @@ class CausalSelfAttention(nn.Module):
         # Per-expert KV: low-rank dim → kv_rank → kv_latent_dim.
         self.expert_kv_a = nn.Parameter(torch.empty(num_experts, self.kv_rank, dim))
         self.expert_kv_b = nn.Parameter(torch.empty(num_experts, self.kv_latent_dim, self.kv_rank))
+        self.kv_b_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_kv_a.data[e])
             nn.init.xavier_uniform_(self.expert_kv_b.data[e])
@@ -1249,6 +1343,7 @@ class CausalSelfAttention(nn.Module):
         self.expert_kr_a = nn.Parameter(torch.empty(num_experts, self.kr_rank, dim))
         self.expert_kr_b = nn.Parameter(
             torch.empty(num_experts, num_kv_heads * self.rope_dim, self.kr_rank))
+        self.kr_b_norm_weight = nn.Parameter(torch.ones(num_experts, self.kr_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_kr_a.data[e])
             nn.init.xavier_uniform_(self.expert_kr_b.data[e])
@@ -1258,6 +1353,8 @@ class CausalSelfAttention(nn.Module):
         self.wo_rank = max(dim // 12, 32)
         self.expert_wo_down = nn.Parameter(torch.empty(num_experts, self.wo_rank, dim))
         self.expert_wo_up = nn.Parameter(torch.empty(num_experts, dim, self.wo_rank))
+        self.wo_down_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
+        self.wo_up_norm_weight = nn.Parameter(torch.ones(num_experts, self.wo_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_wo_down.data[e])
             nn.init.xavier_uniform_(self.expert_wo_up.data[e])
@@ -1268,14 +1365,23 @@ class CausalSelfAttention(nn.Module):
         self.gate_bias = nn.Parameter(torch.zeros(num_experts * num_heads, dtype=torch.float32))
 
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
-        # Phase 9 iter 71g: learnable pre-RMSNorm for Q/K components.
-        self.q_norm = RMSNorm(self.nope_dim)  # q_nope dim
-        self.k_norm = RMSNorm(self.nope_dim)  # k_nope dim
-        self.q_rope_norm = RMSNorm(self.rope_dim)
-        self.k_rope_norm = RMSNorm(self.rope_dim)
+        # Per-expert learned pre-RMS scales for Q/K components. RMS math is
+        # shared and parameter-free; every learned scale stays expert-local.
+        self.q_rope_norm_weight = nn.Parameter(torch.ones(num_experts, self.rope_dim))
+        self.q_nope_norm_weight = nn.Parameter(torch.ones(num_experts, self.nope_dim))
+        self.k_rope_norm_weight = nn.Parameter(torch.ones(num_experts, self.rope_dim))
+        self.k_nope_norm_weight = nn.Parameter(torch.ones(num_experts, self.nope_dim))
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
         self._attn_gate_last_mean: float | None = None
+
+    @staticmethod
+    def _rms_scale(x: Tensor, weight: Tensor, *, expert_dim: int = 0, eps: float = 1e-6) -> Tensor:
+        y = x * x.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+        shape = [1] * y.ndim
+        shape[expert_dim] = weight.shape[0]
+        shape[-1] = weight.shape[-1]
+        return y * weight.to(dtype=y.dtype).reshape(*shape)
 
     def forward_experts(self, x_n: Tensor) -> Tensor:
         """Compute per-expert attention outputs via head-packed SDPA.
@@ -1298,6 +1404,7 @@ class CausalSelfAttention(nn.Module):
         x_flat = x_n.reshape(N, D)
         q_down = self.expert_q_down.to(dtype=dtype)
         q_h = (x_flat @ q_down.reshape(E * R_q, D).t()).view(N, E, R_q).permute(1, 0, 2)
+        q_h = self._rms_scale(q_h, self.q_up_norm_weight)
         q_up = self.expert_q_up.to(dtype=dtype).transpose(1, 2)
         q_and_gate = torch.bmm(q_h, q_up)  # (E, N, H*d+H)
 
@@ -1306,12 +1413,14 @@ class CausalSelfAttention(nn.Module):
 
         q_rope = q_raw[..., :self.rope_dim]
         q_nope = q_raw[..., self.rope_dim:]
-        q_rope, q_nope = self.q_rope_norm(q_rope), self.q_norm(q_nope)
+        q_rope = self._rms_scale(q_rope, self.q_rope_norm_weight)
+        q_nope = self._rms_scale(q_nope, self.q_nope_norm_weight)
 
         # --- Per-expert KV (low-rank latent) ---
         kv_a = self.expert_kv_a.to(dtype=dtype)
         kv_b = self.expert_kv_b.to(dtype=dtype).transpose(1, 2)
         kv_h = (x_flat @ kv_a.reshape(E * R_kv, D).t()).view(N, E, R_kv).permute(1, 0, 2)
+        kv_h = self._rms_scale(kv_h, self.kv_b_norm_weight)
         kv_latent = torch.bmm(kv_h, kv_b)  # (E, N, kv_lat)
 
         # Per-expert MLA decompress: kv_latent → K_nope, V
@@ -1329,10 +1438,12 @@ class CausalSelfAttention(nn.Module):
         kr_a = self.expert_kr_a.to(dtype=dtype)
         kr_b = self.expert_kr_b.to(dtype=dtype).transpose(1, 2)
         kr_h = (x_flat @ kr_a.reshape(E * self.kr_rank, D).t()).view(N, E, self.kr_rank).permute(1, 0, 2)
+        kr_h = self._rms_scale(kr_h, self.kr_b_norm_weight)
         k_rope_raw = torch.bmm(kr_h, kr_b)  # (E, N, H_kv*rope)
         k_rope = k_rope_raw.reshape(E, B, T, H_kv, self.rope_dim)
 
-        k_rope, k_nope = self.k_rope_norm(k_rope), self.k_norm(k_nope)
+        k_rope = self._rms_scale(k_rope, self.k_rope_norm_weight)
+        k_nope = self._rms_scale(k_nope, self.k_nope_norm_weight)
 
         # --- RoPE ---
         cos, sin = self.rotary(T, x_n.device, q_rope.dtype)
@@ -1383,7 +1494,9 @@ class CausalSelfAttention(nn.Module):
         wo_d = self.expert_wo_down.to(dtype=y.dtype)
         wo_u = self.expert_wo_up.to(dtype=y.dtype).transpose(1, 2)  # (E, rank_wo, D)
         y_e = y.permute(1, 0, 2)  # (E, N, D)
+        y_e = self._rms_scale(y_e, self.wo_down_norm_weight)
         y_h = torch.bmm(y_e, wo_d.transpose(1, 2))  # (E, N, rank_wo)
+        y_h = self._rms_scale(y_h, self.wo_up_norm_weight)
         y_out = torch.bmm(y_h, wo_u)  # (E, N, D)
         y = y_out.permute(1, 0, 2).reshape(B, T, E, D)
 
@@ -1441,13 +1554,13 @@ class MLP(nn.Module):
         # Shape: (E, R) scale weight, applied after normalization.
         self.hidden_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
 
-    def mix_experts(self, x: Tensor, w: Tensor, *, pre_normed: bool = False,
+    def mix_experts(self, x: Tensor, w: Tensor, *,
                     num_shared: int = 0, shared_gate: Tensor | None = None) -> Tensor:
+        # Caller must pass x already normed by the Block's state_norm.
         B, T, D = x.shape
         E, R = self.num_experts, self.expert_rank
-        x_n = x  # Always pre-normed by state_norm upstream
         N = B * T
-        x_flat = x_n.reshape(N, D)
+        x_flat = x.reshape(N, D)
         G = self.expert_gate.to(dtype=x_flat.dtype).reshape(E * R, D)
         Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)
         gate = x_flat @ G.t()
@@ -1536,11 +1649,14 @@ class MoSHead(nn.Module):
         self.fsq_levels = fsq_levels
         self.gate_ctp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
         self.gate_ntp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
-        self.A_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
+        self.A_ctp_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
+        self.A_ntp_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
         self.A_ctp = nn.Parameter(torch.empty(num_specialized, d_model, rank))
         self.A_ntp = nn.Parameter(torch.empty(num_specialized, d_model, rank))
-        self.B_denoise = nn.Parameter(torch.empty(vocab_size, rank))
-        self.B_NTP = nn.Parameter(torch.empty(vocab_size, rank))
+        self.B_denoise = nn.Parameter(torch.empty(self.num_experts, vocab_size, rank))
+        self.B_NTP = nn.Parameter(torch.empty(self.num_experts, vocab_size, rank))
+        self.ctp_rank_norm_weight = nn.Parameter(torch.ones(self.num_experts, rank))
+        self.ntp_rank_norm_weight = nn.Parameter(torch.ones(self.num_experts, rank))
         self._diag_step: int | None = None
         self._ctp_ortho_out: Tensor | None = None
         self._ntp_ortho_out: Tensor | None = None
@@ -1555,11 +1671,12 @@ class MoSHead(nn.Module):
         for gate in [self.gate_ctp, self.gate_ntp]:
             nn.init.normal_(gate.weight, std=0.01)
             nn.init.zeros_(gate.bias)
-        for A in [self.A_shared, self.A_ctp, self.A_ntp]:
+        for A in [self.A_ctp_shared, self.A_ntp_shared, self.A_ctp, self.A_ntp]:
             for e in range(A.shape[0]):
                 nn.init.xavier_uniform_(A.data[e])
-        nn.init.xavier_uniform_(self.B_denoise)
-        nn.init.xavier_uniform_(self.B_NTP)
+        for B in [self.B_denoise, self.B_NTP]:
+            for e in range(B.shape[0]):
+                nn.init.xavier_uniform_(B.data[e])
 
     def init_from_embedding(self, embed_weight: Tensor):
         pass  # No SVD init; xavier from scratch
@@ -1573,9 +1690,10 @@ class MoSHead(nn.Module):
         #   - GATE: max_pairwise (clean duplicate detection at threshold 0.9)
         if self.num_shared + self.num_specialized < 2:
             return 0.0
+        A_shared = self.A_ctp_shared if head == "ctp" else self.A_ntp_shared
         A_spec = self.A_ctp if head == "ctp" else self.A_ntp
         with torch.no_grad():
-            groups = torch.cat([self.A_shared, A_spec], dim=0).float().reshape(self.num_shared + self.num_specialized, -1)
+            groups = torch.cat([A_shared, A_spec], dim=0).float().reshape(self.num_shared + self.num_specialized, -1)
             return float(max_pairwise_abs_cosine(groups).item())
 
     def _fsq(self, x: Tensor) -> Tensor:
@@ -1583,8 +1701,15 @@ class MoSHead(nn.Module):
             return x  # Phase 9 iter 62 (H53): disabled FSQ, keep low-rank only
         return _fsq_ste(x, self.fsq_levels, self.training)
 
+    def _project_A(self, x: Tensor, A_all: Tensor) -> Tensor:
+        E = A_all.shape[0]
+        # A_all is stored as (E, D, R). Flatten as (E*R, D) so each
+        # contiguous rank row matches einsum("nd,edr->ner").
+        A_flat = A_all.permute(0, 2, 1).reshape(E * self.rank, self.d_model)
+        return (x.to(A_all.dtype) @ A_flat.t()).view(x.shape[0], E, self.rank)
+
     def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
-                      A_spec: Tensor, B: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+                      A_spec: Tensor, B: Tensor, rank_norm_weight: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         N = x.shape[0]
         E_s, E_p = A_shared.shape[0], A_spec.shape[0]
         E = E_s + E_p
@@ -1594,18 +1719,21 @@ class MoSHead(nn.Module):
 
         # Vectorized: concat all A matrices → single batched GEMM
         A_all = torch.cat([A_shared, A_spec], dim=0)  # (E, D, R)
-        # (N, D) @ (E, D, R) → (E, N, R) via batched matmul
-        x_e = x.to(A_all.dtype)
-        A_flat = A_all.reshape(E * self.rank, self.d_model)
-        t_all = (x_e @ A_flat.t()).view(N, E, self.rank)  # (N, E, R)
+        t_all = self._project_A(x, A_all)  # (N, E, R)
 
         # Ortho diagnostic from mean expert projections
         mu_groups = t_all.float().mean(dim=0)  # (E, R)
         ortho_out = max_mean_abs_offdiag_cosine(mu_groups) if E >= 2 else x.new_zeros(())
 
-        # FSQ + logits: (N, E, R) → FSQ → (N, E, R) @ B.T → (N, E, V)
+        # FSQ + per-expert rank prenorm + logits:
+        # (N, E, R) → FSQ/RMS → per-expert B → (N, E, V)
         u_all = self._fsq(t_all)
-        logits_all = (u_all.to(B.dtype) @ B.t()).float()  # (N, E, V)
+        u_rms = u_all.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
+        u_all = u_all * u_rms * rank_norm_weight.to(dtype=u_all.dtype).unsqueeze(0)
+        logits_all = torch.bmm(
+            u_all.permute(1, 0, 2).to(B.dtype),
+            B.transpose(1, 2),
+        ).permute(1, 0, 2).float()  # (N, E, V)
 
         # Mixture of softmaxes in log space (vectorized logaddexp)
         log_p_experts = F.log_softmax(logits_all, dim=-1)  # (N, E, V)
@@ -1618,8 +1746,14 @@ class MoSHead(nn.Module):
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         orig_shape = h.shape[:-1]
         x = h.reshape(-1, self.d_model)
-        log_p_d, alpha_d, ortho_ctp = self._head_forward(x, self.gate_ctp, self.A_shared, self.A_ctp, self.B_denoise)
-        log_p_n, alpha_n, ortho_ntp = self._head_forward(x, self.gate_ntp, self.A_shared, self.A_ntp, self.B_NTP)
+        log_p_d, alpha_d, ortho_ctp = self._head_forward(
+            x, self.gate_ctp, self.A_ctp_shared, self.A_ctp, self.B_denoise,
+            self.ctp_rank_norm_weight,
+        )
+        log_p_n, alpha_n, ortho_ntp = self._head_forward(
+            x, self.gate_ntp, self.A_ntp_shared, self.A_ntp, self.B_NTP,
+            self.ntp_rank_norm_weight,
+        )
         self._ctp_ortho_out = ortho_ctp
         self._ntp_ortho_out = ortho_ntp
         distributed = dist.is_available() and dist.is_initialized()
@@ -1692,7 +1826,7 @@ class Block(nn.Module):
         self.mlp_post_mix_norm = RMSNorm(dim)
         # Phase 9 iter 51 (DeepSeek shared expert): first num_shared_experts
         # experts are always-on with per-token sigmoid gate (like routed experts).
-        # T_θ = x0 + g_s·E_shared(h) + Σ w_j E_routed_j(h)
+        # T_θ = g_s·E_shared(h) + Σ w_j E_routed_j(h)
         self.num_experts = num_experts
         self.num_shared_experts = int(num_shared_experts)
         num_routed = num_experts - self.num_shared_experts
@@ -1703,7 +1837,8 @@ class Block(nn.Module):
             nn.init.constant_(self.shared_gate.bias, 1.0)  # init near-open
         # Router only covers routed experts (not shared).
         self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=10.0,
-                                      cv_loss_weight=2.0, scoring=router_scoring)
+                                      cv_loss_weight=2.0, scoring=router_scoring,
+                                      health_slices=(num_routed, num_routed))
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -1719,6 +1854,10 @@ class Block(nn.Module):
         # Per-expert routing weight per iteration (shows if experts specialize across iters)
         self._attn_expert_weights_per_iter: list[list[float]] = []  # [iter][expert] mean weight
         self._mlp_expert_weights_per_iter: list[list[float]] = []
+        self._shared_gate_mean: float | None = None
+        self._shared_gate_min: float | None = None
+        self._shared_gate_std: float | None = None
+        self._shared_gate_diag_step: int | None = None
 
     def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> tuple[Tensor, Tensor]:
         bsz, seqlen, dim = z_in.shape
@@ -1775,7 +1914,9 @@ class Block(nn.Module):
         #   h = RMSNorm(z + x_0)
         #   Δ_shared = Σ E_shared_j(h)                 — always-on experts (no routing)
         #   Δ_routed = Σ w_j E_routed_j(h)             — routed experts
-        #   T_θ(z, x_0) = x_0 + Δ_shared + Δ_routed
+        #   T_θ(z, x_0) = Δ_shared + Δ_routed
+        # x0 conditions the expert/router computation via z + x0, but is not
+        # directly injected into the output map.
         u = z_in + x0
         h = self.state_norm(u)                   # h = RMSNorm(z + x_0)
 
@@ -1797,24 +1938,43 @@ class Block(nn.Module):
         if S > 0:
             # Shared: direct sum with per-token sigmoid gate (no .mean() overhead)
             g_s = torch.sigmoid(self.shared_gate(h))  # (B, T, S)
+            if _should_diag(self.training):
+                with torch.no_grad():
+                    g_sf = g_s.detach().float()
+                    self._shared_gate_mean = float(g_sf.mean().item())
+                    self._shared_gate_min = float(g_sf.min().item())
+                    self._shared_gate_std = float(g_sf.std(unbiased=False).item())
+                    self._shared_gate_diag_step = _ROUTER_DIAGNOSTICS_STEP
+            else:
+                self._shared_gate_mean = None
+                self._shared_gate_min = None
+                self._shared_gate_std = None
+                self._shared_gate_diag_step = None
             attn_shared = (attn_expert_out[:, :, :S, :] * g_s.unsqueeze(-1)).sum(dim=2)
             # Routed: weighted by router
             attn_routed = (attn_expert_out[:, :, S:, :] * w_attn.unsqueeze(-1)).sum(dim=2)
             attn_mix = attn_shared + attn_routed
         else:
+            self._shared_gate_mean = None
+            self._shared_gate_min = None
+            self._shared_gate_std = None
+            self._shared_gate_diag_step = None
             attn_mix = (attn_expert_out * w_attn.unsqueeze(-1)).sum(dim=2)
         attn_mix = self.attn_post_mix_norm(attn_mix)
 
-        # MLP experts (same split: shared gated + routed)
-        mlp_mix = self.mlp.mix_experts(h, w_mlp, pre_normed=True,
+        # MLP experts (same split: shared gated + routed).
+        # h is already state_norm-normalized above, which mix_experts assumes.
+        mlp_mix = self.mlp.mix_experts(h, w_mlp,
                                         num_shared=S, shared_gate=g_s if S > 0 else None)
         mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
         # Dense mixture Δ = attn_mix + mlp_mix.
         delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
-        # T_θ(z, x_0) = x_0 + Δ_θ(z, x_0)
-        raw_out = x0 + delta
+        # T_θ(z, x_0) = Δ_θ(z, x_0).  The direct output-side x0 residual is
+        # intentionally absent so the fixed point must be carried by the
+        # learned expert dynamics, while x0 remains available as conditioning.
+        raw_out = delta
 
         if self._diag_track_enabled:
             ag = getattr(self.attn, "_attn_gate_last_mean", None)
@@ -2108,10 +2268,24 @@ class GPT(nn.Module):
         # Phase 9 iter 66a: Parcae per-dim damping (arXiv:2604.12946).
         # Gradient flows: loss → RevDEQFunction.backward(grad_beta) → autograd → parcae params.
         self.use_parcae = bool(use_parcae)
+        self.parcae_min_a_bar = 0.1
+        self.parcae_decay_floor = 1e-4
+        self.parcae_min_rate = 1e-3
         if self.use_parcae:
-            log_a_init = math.log(math.log(1.0 / float(parcae_init_a_bar)))
-            self.parcae_log_a = nn.Parameter(torch.full((model_dim,), log_a_init))
-            self.parcae_delta = nn.Parameter(torch.ones(model_dim))
+            def _inv_softplus(y: float) -> float:
+                return math.log(math.expm1(max(float(y), 1e-12)))
+
+            min_a = float(self.parcae_min_a_bar)
+            floor = float(self.parcae_decay_floor)
+            init_a = min(max(float(parcae_init_a_bar), min_a + 1e-6), 1.0 - 1e-6)
+            target_decay = (init_a - min_a) / max(1.0 - min_a, 1e-8)
+            target_decay = min(max(target_decay, floor + 1e-6), 1.0 - 1e-6)
+            exp_decay_target = (target_decay - floor) / max(1.0 - floor, 1e-8)
+            rate_init = -math.log(exp_decay_target)
+            raw_delta_init = _inv_softplus(1.0 - float(self.parcae_min_rate))
+            raw_rate_init = _inv_softplus(rate_init - float(self.parcae_min_rate))
+            self.parcae_raw_a = nn.Parameter(torch.full((model_dim,), raw_rate_init))
+            self.parcae_raw_delta = nn.Parameter(torch.full((model_dim,), raw_delta_init))
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
         self.bal_loss_coef = float(bal_loss_coef)
@@ -2139,6 +2313,14 @@ class GPT(nn.Module):
         # Phase 9 iter 71g: ALL norms learnable (project constraint).
         self.embed_norm = RMSNorm(model_dim)
         self._init_weights()
+
+    def _parcae_a_bar(self) -> Tensor:
+        delta = F.softplus(self.parcae_raw_delta.float()) + float(self.parcae_min_rate)
+        rate = F.softplus(self.parcae_raw_a.float()) + float(self.parcae_min_rate)
+        decay = torch.exp(-(delta * rate))
+        floor = float(self.parcae_decay_floor)
+        min_a = float(self.parcae_min_a_bar)
+        return min_a + (1.0 - min_a) * (floor + (1.0 - floor) * decay)
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -2199,10 +2381,9 @@ class GPT(nn.Module):
         global _DEQ_SOLVE_ACTIVE
         # Phase 9 iter 66a: Parcae per-dim damping replaces scalar β.
         # Beta carries grad so RevDEQFunction.backward can return grad_beta,
-        # which autograd chain-rules to parcae_log_a and parcae_delta.
+        # which autograd chain-rules to parcae_raw_a and parcae_raw_delta.
         if self.use_parcae:
-            a_bar = torch.exp(self.parcae_delta * (-torch.exp(self.parcae_log_a)))
-            a_bar = a_bar.clamp(min=0.1)  # RevDEQ reversibility: reconstruction divides by Ā
+            a_bar = self._parcae_a_bar()  # bounded in (parcae_min_a_bar, 1)
             beta = 1.0 - a_bar  # per-dim β, shape (D,), requires_grad=True
         else:
             beta = self.deq_beta
@@ -2546,6 +2727,89 @@ def sliding_window_validation(args, base_model, rank, world_size, device, val_to
 eval_val_sliding = sliding_window_validation
 
 
+def _flatten_param_groups(groups: list[dict[str, object]]) -> list[nn.Parameter]:
+    params: list[nn.Parameter] = []
+    for group in groups:
+        for p in group.get("params", []):
+            if isinstance(p, nn.Parameter):
+                params.append(p)
+    return params
+
+
+def _assert_optimizer_param_coverage(model: nn.Module,
+                                     named_groups: list[tuple[str, list[nn.Parameter]]]) -> None:
+    seen: dict[int, str] = {}
+    duplicates: list[str] = []
+    for group_name, params in named_groups:
+        for p in params:
+            if not isinstance(p, nn.Parameter) or not p.requires_grad:
+                continue
+            pid = id(p)
+            if pid in seen:
+                duplicates.append(f"{group_name} duplicates {seen[pid]}")
+            else:
+                seen[pid] = group_name
+    missing = [
+        f"{name}{tuple(p.shape)}"
+        for name, p in model.named_parameters()
+        if p.requires_grad and id(p) not in seen
+    ]
+    if missing or duplicates:
+        msg_parts = []
+        if missing:
+            msg_parts.append("missing trainable params: " + ", ".join(missing))
+        if duplicates:
+            msg_parts.append("duplicate trainable params: " + ", ".join(duplicates))
+        raise RuntimeError("Optimizer parameter coverage error: " + "; ".join(msg_parts))
+
+
+def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
+    list[dict[str, object]], list[nn.Parameter], list[nn.Parameter], list[nn.Parameter]
+]:
+    sb = _unwrap_compiled_module(base_model.shared_block)
+    block_named_params = list(sb.named_parameters())
+    # All ndim >= 2 block params (incl. router prototypes/weights) -> Muon;
+    # all ndim < 2 / control params -> AdamW scalar.
+    matrix_params = [p for name, p in block_named_params
+                     if p.ndim >= 2 and not any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
+    scalar_params = [p for name, p in block_named_params
+                     if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
+
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    tok_params: list[dict[str, object]] = [
+        {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}
+    ]
+    if base_model.bigram is not None:
+        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        scalar_params.append(base_model.bigram.scale)
+        if base_model.bigram.proj is not None:
+            matrix_params.append(base_model.bigram.proj.weight)
+        if base_model.bigram.proj_norm is not None:
+            scalar_params.append(base_model.bigram.proj_norm.weight)
+
+    mos = base_model.mos_head
+    mos_params = [mos.A_ctp_shared, mos.A_ntp_shared, mos.A_ctp, mos.A_ntp,
+                  mos.B_denoise, mos.B_NTP, mos.ctp_rank_norm_weight,
+                  mos.ntp_rank_norm_weight, mos.gate_ctp.weight,
+                  mos.gate_ctp.bias, mos.gate_ntp.weight, mos.gate_ntp.bias,
+                  mos.input_norm.weight]
+    scalar_params.extend(mos_params)
+    scalar_params.append(base_model.final_norm.weight)
+    scalar_params.append(base_model.embed_norm.weight)
+
+    parcae_params: list[nn.Parameter] = []
+    if getattr(base_model, "use_parcae", False):
+        parcae_params = [base_model.parcae_raw_a, base_model.parcae_raw_delta]
+
+    _assert_optimizer_param_coverage(base_model, [
+        ("token", _flatten_param_groups(tok_params)),
+        ("matrix", matrix_params),
+        ("scalar", scalar_params),
+        ("parcae", parcae_params),
+    ])
+    return tok_params, matrix_params, scalar_params, parcae_params
+
+
 # ---------------------------------------------------------------------------
 # TRAINING
 # ---------------------------------------------------------------------------
@@ -2839,28 +3103,7 @@ def main() -> None:
     )
 
     # OPTIMIZER SETUP
-    block_named_params = list(base_model.shared_block.named_parameters())
-    # All ndim >= 2 params (incl. router prototypes/weights) → Muon;
-    # All ndim < 2 params (incl. router_gate.bias) → AdamW scalar.
-    # No separate router optimizer — router params follow the standard split.
-    matrix_params = [p for name, p in block_named_params
-                     if p.ndim >= 2 and not any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
-    scalar_params = [p for name, p in block_named_params
-                     if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
-    if base_model.bigram is not None:
-        scalar_params.append(base_model.bigram.scale)
-
-    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
-    if base_model.bigram is not None:
-        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.bigram.proj is not None:
-            matrix_params.append(base_model.bigram.proj.weight)
-
-    mos = base_model.mos_head
-    mos_params = [mos.A_shared, mos.A_ctp, mos.A_ntp, mos.B_denoise, mos.B_NTP,
-                  mos.gate_ctp.weight, mos.gate_ctp.bias, mos.gate_ntp.weight, mos.gate_ntp.bias]
-    scalar_params.extend(mos_params)
+    tok_params, matrix_params, scalar_params, parcae_params = _build_optimizer_param_lists(base_model, args)
 
     optimizer_tok = torch.optim.AdamW(tok_params, betas=(args.beta1, args.beta2),
                                        eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
@@ -2876,7 +3119,6 @@ def main() -> None:
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
     # Phase 9 iter 66a: Parcae separate optimizer — NO weight decay, slow LR.
     if base_model.use_parcae:
-        parcae_params = [base_model.parcae_log_a, base_model.parcae_delta]
         optimizer_parcae = torch.optim.AdamW(
             [{"params": parcae_params, "lr": args.parcae_lr, "base_lr": args.parcae_lr}],
             betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True)
@@ -2982,10 +3224,12 @@ def main() -> None:
                 usage = router._expert_usage
                 usage_str = ",".join(f"{u:.3f}" for u in usage)
                 E = m.shared_block.num_experts
-                # Pooled 2E router: split into attn (first E) and mlp (last E)
-                if len(usage) == 2 * E:
-                    attn_half = usage[:E]
-                    mlp_half = usage[E:]
+                R = E - int(getattr(m.shared_block, "num_shared_experts", 0))
+                # Pooled 2R router: split into attn (first R) and mlp (last R).
+                # Shared bypass experts are tracked separately via shared_gate_*.
+                if len(usage) == 2 * R:
+                    attn_half = usage[:R]
+                    mlp_half = usage[R:]
                     attn_sum = sum(attn_half) or 1e-8
                     mlp_sum = sum(mlp_half) or 1e-8
                     attn_norm = [u / attn_sum for u in attn_half]
@@ -3000,6 +3244,9 @@ def main() -> None:
                     if cv is not None:
                         parts.append(f"attn_cv:{cv:.4f}")
                         parts.append(f"mlp_cv:{cv:.4f}")
+                    total_mass = getattr(router, "_expert_total_mass", None)
+                    if total_mass is not None:
+                        parts.append(f"router_mass:{float(total_mass):.4f}")
                 else:
                     parts.append(f"{prefix}_usage:[{usage_str}]")
                     ent = getattr(router, "_expert_entropy", None)
@@ -3008,6 +3255,19 @@ def main() -> None:
                     cv = getattr(router, "_expert_balance_cv", None)
                     if cv is not None:
                         parts.append(f"{prefix}_cv:{cv:.4f}")
+                    total_mass = getattr(router, "_expert_total_mass", None)
+                    if total_mass is not None:
+                        parts.append(f"{prefix}_mass:{float(total_mass):.4f}")
+            sg_mean = getattr(m.shared_block, "_shared_gate_mean", None)
+            sg_step = getattr(m.shared_block, "_shared_gate_diag_step", None)
+            if sg_mean is not None and (not require_step_match or sg_step == step):
+                sg_min = getattr(m.shared_block, "_shared_gate_min", None)
+                sg_std = getattr(m.shared_block, "_shared_gate_std", None)
+                parts.append(f"shared_gate_mean:{float(sg_mean):.4f}")
+                if sg_min is not None:
+                    parts.append(f"shared_gate_min:{float(sg_min):.4f}")
+                if sg_std is not None:
+                    parts.append(f"shared_gate_std:{float(sg_std):.4f}")
             for attr, label in [("attn", "attn_ortho"), ("mlp", "mlp_ortho")]:
                 comp = getattr(m.shared_block, attr, None)
                 # T-opt 15: prefer GPU tensor (no sync until .item() here at log site).
@@ -3141,7 +3401,7 @@ def main() -> None:
                         create_graph=False, retain_graph=False,
                     )[0]
                     # ||J^T v||² / dim ≈ ||J||²_F / dim (Hutchinson estimator)
-                    # Pure-tensor math — no .item()/.cpu() GPU-CPU syncs.
+                    # Pure-tensor math; keep GPU scalars on device in this block.
                     rho_sample_t = jvp.detach().float().pow(2).mean().sqrt()
                     # EMA smoothing (GPU-resident) to reduce variance of random
                     # probe estimates. Without this, noisy high estimates trigger
@@ -3152,18 +3412,15 @@ def main() -> None:
                         rho_buf = base_model._lyapunov_rho_hat_buf
                     else:
                         rho_buf.mul_(0.9).add_(rho_sample_t.detach(), alpha=0.1)
-                    # Surrogate loss only when EMA(ρ̂) > γ. One .item() per
-                    # last-micro-step is acceptable (already gated by lyap_skip;
-                    # not in the gradient-accumulation inner loop).
+                    # Surrogate is tensor-gated, avoiding GPU→CPU sync in the
+                    # gradient hot path.
                     gamma = float(base_model.lyapunov_gamma)
-                    scale_t = torch.relu(rho_buf - gamma) / rho_buf.clamp(min=1e-8)
-                    scale_val = float(scale_t.item())
-                    if scale_val > 0.0:
-                        v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
-                        z_b2 = z_star.detach()
-                        u_b2 = blk(z_b2, x0_lyap)
-                        surrogate = (u_b2 * v_dir).sum().abs()
-                        loss = loss + lyap_scale * lyap_coef * scale_val * surrogate
+                    scale_t = (torch.relu(rho_buf - gamma) / rho_buf.clamp(min=1e-8)).detach()
+                    v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
+                    z_b2 = z_star.detach()
+                    u_b2 = blk(z_b2, x0_lyap)
+                    surrogate = (u_b2 * v_dir).sum().abs()
+                    loss = loss + lyap_scale * lyap_coef * scale_t.to(dtype=surrogate.dtype) * surrogate
 
                 # Phase 9 iter 55: Denoising regularization (HyDRA 2026).
                 # ||f(z*+ε, x0) - z*||² at finite perturbation complements
@@ -3581,28 +3838,30 @@ def main() -> None:
 
     # Each spec: (prefix, num_experts, usage_gpu_getter, usage_list_getter, ortho_getter).
     # Dedup pooled router by id — attn_router and mlp_router are aliases.
-    # For pooled router (2E experts), split usage into halves and check each
-    # type independently with normalized per-type shares.
+    # For pooled router (2R routed experts), split usage into halves and check
+    # each type independently with normalized per-type routed shares. Shared
+    # bypass gates are separate diagnostics, not hidden routed usage.
     check_specs = []
     attn_router = getattr(shared_block.attn, "attn_router", None)
     mlp_router = getattr(shared_block.mlp, "mlp_router", None)
     E = shared_block.num_experts
+    R = E - int(getattr(shared_block, "num_shared_experts", 0))
     _seen_router_ids: set[int] = set()
     if attn_router is not None and id(attn_router) not in _seen_router_ids:
         _seen_router_ids.add(id(attn_router))
-        is_pooled = int(attn_router.num_experts) == 2 * E
+        is_pooled = int(attn_router.num_experts) == 2 * R
         if is_pooled:
             # Pooled router: check per-type normalized halves
             check_specs.append((
-                "attn", E,
-                lambda: _split_pool_usage_gpu(attn_router, E, half=0),
-                lambda: _split_pool_usage_list(attn_router, E, half=0),
+                "attn", R,
+                lambda: _split_pool_usage_gpu(attn_router, R, half=0),
+                lambda: _split_pool_usage_list(attn_router, R, half=0),
                 lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None),
             ))
             check_specs.append((
-                "mlp", E,
-                lambda: _split_pool_usage_gpu(attn_router, E, half=1),
-                lambda: _split_pool_usage_list(attn_router, E, half=1),
+                "mlp", R,
+                lambda: _split_pool_usage_gpu(attn_router, R, half=1),
+                lambda: _split_pool_usage_list(attn_router, R, half=1),
                 lambda: getattr(shared_block.mlp, "_out_ortho_cos_sim", None),
             ))
         else:
@@ -3818,10 +4077,8 @@ def main() -> None:
         }
 
     if _failures:
-        # NEW POLICY (val_bpb-primary): gate failures DO NOT block promotion.
-        # They're tracked as tech debt for the next iteration's prescription.
-        # Promotion is gated on val_bpb improvement only (per CLAUDE.md L127-138).
-        log0("⚠ POST-INT6 HARD GATE FAILURES — tech debt, will be addressed by next iter's prescription")
+        # POST-INT6 diagnostics are final guardrails and retry prescriptions.
+        log0("POST-INT6 DIAGNOSTIC GATE FAILURES — retry prescription follows")
         prescriptions = [_prescribe(f) for f in _failures]
         log0(f"  {len(_failures)} failure(s):")
         for p in prescriptions:
@@ -3860,15 +4117,12 @@ def main() -> None:
             with open(meta_path, "r") as f:
                 meta_json = json.load(f)
             meta_json["failure_categories"] = [p["category"] for p in prescriptions]
-            meta_json["gate_status"] = "tech_debt"  # promoted but with known issues
+            meta_json["gate_status"] = "diagnostic_fail"
             with open(meta_path, "w") as f:
                 json.dump(meta_json, f)
-    # Under val_bpb-primary policy, "passed" means "completed" (val_bpb is the
-    # promotion criterion).  Gate failures are tech debt, not blockers.
-    # _assertions_passed remains True iff there were zero failures (clean run).
     _assertions_passed = not _failures
     if not _failures:
-        log0("✓ POST-INT6 HEALTH: all hard gates passed (no dead experts, expert ortho, gate trend, injection, FP convergence, reversibility)")
+        log0("POST-INT6 HEALTH: all diagnostic gates passed (no dead experts, expert ortho, gate trend, injection, FP convergence, reversibility)")
         if master_process:
             retry_hint_path = Path("experiments/weights/current") / "retry_hint.json"
             if retry_hint_path.exists():
@@ -3896,12 +4150,13 @@ def main() -> None:
         with open(meta_path, "r") as f:
             meta_json = json.load(f)
         meta_json["val_bpb"] = val_bpb_q
-        # NEW POLICY (val_bpb-primary): run_valid=true whenever val_bpb is
+        # POLICY (val_bpb-primary): run_valid=true whenever val_bpb is
         # written, regardless of gate failures.  Promotion criterion is val_bpb
-        # improvement + 16MB budget; gate failures are tech debt for the next
-        # iter (tracked via meta_json["failure_categories"] + retry_hint.json).
+        # improvement + 16MB budget; diagnostic-gate failures are recorded as
+        # retry prescriptions for the next iter (meta_json["failure_categories"]
+        # + retry_hint.json) but do not block promotion.
         meta_json["run_valid"] = True
-        meta_json["status"] = "validated_clean" if _assertions_passed else "validated_with_tech_debt"
+        meta_json["status"] = "validated_clean" if _assertions_passed else "validated_with_diagnostic_fail"
         with open(meta_path, "w") as f:
             json.dump(meta_json, f)
 

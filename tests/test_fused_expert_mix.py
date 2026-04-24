@@ -104,7 +104,7 @@ class TestIndependentExpertAttention(unittest.TestCase):
 
 class TestMLPFusedExpertMix(unittest.TestCase):
     def test_mlp_fused_mix_matches_explicit(self) -> None:
-        from train_gpt import MLP, _rms_norm
+        from train_gpt import MLP
 
         torch.manual_seed(0)
         B, T, D = 2, 7, 16
@@ -118,7 +118,7 @@ class TestMLPFusedExpertMix(unittest.TestCase):
 
         out_fused = mlp.mix_experts(x, w)
 
-        x_n = _rms_norm(x)
+        x_n = x
         gate_h = torch.einsum("btd,esd->btes", x_n, mlp.expert_gate.to(dtype=x_n.dtype))
         fc_h = torch.einsum("btd,esd->btes", x_n, mlp.expert_fc.to(dtype=x_n.dtype))
         B_, T_, _, _ = gate_h.shape

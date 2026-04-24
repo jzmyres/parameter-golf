@@ -2,9 +2,13 @@
 
 Covers:
 - SoftDenseRouter._materialize_diag_lists: lazy, idempotent, respects GPU source
+- Block.forward output shape under the current T_θ semantics
 
-The old b(x_0) chunking-invariance tests were for the Banach contraction shell
-(iter 30). Iter 41 replaced that with T_θ = x₀ + Δ — no inj_lin, no b(x_0).
+The post-iter-41 block map is T_θ(z, x₀) = Δ_θ(z, x₀); iter 66b extends this
+to T_θ(z, x₀) = B̄ ⊙ RMSNorm_learn(x₀) + Δ_θ(z, x₀) (Parcae-paper-faithful
+input injection). The "output must include x₀" invariant is enforced by
+tests/test_gate_init_defaults.py::test_zero_expert_delta_does_not_return_x0
+(iter 66a) and its iter 66b successor.
 """
 import os
 import sys
@@ -77,20 +81,6 @@ class TestBlockForwardShape(unittest.TestCase):
         with torch.no_grad():
             out = blk(z, x0)
         self.assertEqual(tuple(out.shape), (B, T, D))
-
-    def test_forward_includes_x0(self):
-        """T_θ = x₀ + Δ: output should include x₀ component."""
-        import torch.nn.functional as F
-        blk = self._fresh_block()
-        z = torch.zeros(2, 3, 16)
-        x0 = torch.randn(2, 3, 16) * 10.0  # large x0
-        with torch.no_grad():
-            out = blk(z, x0)
-        # With large x0 and zero z, output should have significant x0 component
-        cos_sim = F.cosine_similarity(out.flatten(), x0.flatten(), dim=0)
-        self.assertGreater(cos_sim.item(), 0.5,
-                           "Output should have significant x0 component")
-
 
 if __name__ == "__main__":
     unittest.main()

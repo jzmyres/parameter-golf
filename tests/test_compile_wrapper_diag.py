@@ -15,7 +15,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt import _unwrap_compiled_module  # noqa: E402
+from train_gpt import _temporary_deq_k_override, _unwrap_compiled_module  # noqa: E402
 
 
 class _TinyModule(nn.Module):
@@ -26,6 +26,24 @@ class _TinyModule(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin(x)
+
+
+class _FakeDDP(nn.Module):
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.module(x)
+
+
+class _FakeCompileWrapper(nn.Module):
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self._orig_mod = module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._orig_mod(x)
 
 
 class TestUnwrapCompiledModule(unittest.TestCase):
@@ -53,6 +71,37 @@ class TestUnwrapCompiledModule(unittest.TestCase):
         underlying = _unwrap_compiled_module(mc)
         underlying._diag_flag = True
         self.assertTrue(m._diag_flag)
+
+    def test_unwraps_ddp_over_compiled_wrapper_stack(self):
+        m = _TinyModule()
+        wrapped = _FakeDDP(_FakeCompileWrapper(m))
+        self.assertIs(_unwrap_compiled_module(wrapped), m)
+
+    def test_unwraps_compiled_over_ddp_wrapper_stack(self):
+        m = _TinyModule()
+        wrapped = _FakeCompileWrapper(_FakeDDP(m))
+        self.assertIs(_unwrap_compiled_module(wrapped), m)
+
+    def test_temporary_deq_k_override_restores_missing_attr(self):
+        m = _TinyModule()
+        wrapped = _FakeDDP(_FakeCompileWrapper(m))
+        self.assertFalse(hasattr(m, "_deq_k_override"))
+
+        with _temporary_deq_k_override(wrapped, 17) as underlying:
+            self.assertIs(underlying, m)
+            self.assertEqual(m._deq_k_override, 17)
+
+        self.assertFalse(hasattr(m, "_deq_k_override"))
+
+    def test_temporary_deq_k_override_restores_previous_attr(self):
+        m = _TinyModule()
+        m._deq_k_override = 5
+        wrapped = _FakeCompileWrapper(_FakeDDP(m))
+
+        with _temporary_deq_k_override(wrapped, 23):
+            self.assertEqual(m._deq_k_override, 23)
+
+        self.assertEqual(m._deq_k_override, 5)
 
 
 if __name__ == "__main__":

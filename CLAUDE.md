@@ -18,6 +18,14 @@ Challenge: March 18 – April 30, 2026. Prize: $1M in OpenAI compute credits.
 - `run.log` — Latest training console capture (untracked by git)
 - `experiments/update_results.sh` — Log rotation + plot regeneration (run after EVERY iteration)
 
+## Agent Non-Negotiables
+- Only modify `train_gpt.py`, focused tests, and project docs unless the user explicitly approves a wider scope.
+- Never modify `data/`, tokenizer code, evaluation harness code, `records/`, dependency files, or package manifests.
+- Do not install new packages.
+- Submission-like training must honor the 600 second wall-clock cap and 16 MB artifact limit.
+- Code must remain DDP-safe for single-GPU and multi-GPU `torchrun`.
+- Expert health is final-only and computed on normalized per-component expert shares; total routed mass is tracked separately.
+
 ## Reference Implementations (READ-ONLY)
 - **RevDEQ**: `/home/mzhong4/work/research/rdeq/WIP-ARWDEQ/code/arwdeq/qwen3_utmoe_revdeq.py`
   - RevDEQ solver with custom autograd.Function, fp64 accumulators, Kahan compensation
@@ -35,7 +43,8 @@ Challenge: March 18 – April 30, 2026. Prize: $1M in OpenAI compute credits.
 
 ## Training Budget
 - **8xH100 SXM (competition)**: 600 seconds (10 min) — original competition constraint
-- **2xL40S (dev)**: 7200 seconds (2h) — extended for fair step-count comparison across configs
+- **Default script behavior**: `Hyperparameters.max_wallclock_seconds = 600`; submission-like runs must honor the cap.
+- **Step-matched dev runs**: may explicitly pass `--max-wallclock-seconds=0 --iterations=N`; label them non-submission.
 - **Fair comparison principle**: when configs have different throughput, compare at equal STEP COUNT
   (not wall-clock). A larger model needs proportionally more steps. Wall-clock matters for
   competition submission; step count matters for architectural comparison.
@@ -57,7 +66,9 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | train_batch_tokens | 524,288 |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
-| deq_beta | 0.50 |
+| deq_beta | 0.50 (fallback when `use_parcae=False`) |
+| use_parcae | True (per-dim damping; supersedes scalar beta/jitter when active) |
+| parcae_init_a_bar | 0.7 |
 | deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
 | num_refinements | 1 |
 
@@ -68,10 +79,11 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | scalar_lr | 0.02 |
 | tied_embed_lr | 0.03 |
 | embed_lr | 0.6 |
+| parcae_lr | 0.002 |
 | muon_momentum | 0.99 |
 | muon_momentum_warmup_start | 0.92 |
 | muon_momentum_warmup_steps | 800 |
-| weight_decay | 1.08 (iter 24; applied to both AdamW and Muon param groups) |
+| weight_decay | 0.30 (applied to both AdamW and Muon param groups) |
 | grad_clip_norm | 1.0 |
 | warmdown_frac | 0.72 |
 
@@ -83,7 +95,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | mlp_expert_rank | 192 |
 | bigram_vocab_size | 4096 |
 | bigram_dim | 128 |
-| deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step) |
+| deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
 | deq_k_jitter_set | (4, 6, 10) (DEQ iteration counts sampled per step) |
 | lyapunov_coef | 0.01 (λ_jac: Hutchinson-Frobenius penalty weight) |
 | lyapunov_gamma | 0.97 (target spectral radius threshold) |
@@ -153,12 +165,13 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
     - Run code review + `/simplify`, then keep
     - Promote to baseline: `bash experiments/update_results.sh --promote`
     - **ALWAYS review + `/simplify` before committing improvements** to keep code clean
-    - **Hard-gate failures (ortho, K-sweep, gg, inj, recon_err) DO NOT block promotion** —
-      they're tracked as tech debt and prescribed fixes for the *next* iteration. Promotion
-      is gated only on val_bpb improvement + 16MB budget. This unblocks autoresearch when
-      gate calibration is fighting val_bpb. To enable, the train script writes
-      `run_valid=true` whenever val_bpb is recorded; gate failures populate
-      `failure_categories` + `retry_hint.json` for the next iter, but don't block --promote.
+    - **Diagnostic-gate failures (ortho, K-sweep, gg, inj, recon_err) DO NOT block promotion** —
+      they're recorded as `validated_with_diagnostic_fail` in `meta_json["status"]` and
+      surfaced as retry prescriptions for the *next* iteration. Promotion is gated only on
+      val_bpb improvement + 16MB budget. This unblocks autoresearch when gate calibration is
+      fighting val_bpb. To enable, the train script writes `run_valid=true` whenever val_bpb
+      is recorded; diagnostic failures populate `failure_categories` + `retry_hint.json` for
+      the next iter, but don't block --promote.
 11. If val_bpb equal or worse -> `git revert` to previous good state (weights stay in previous/)
 12. **Update `experiments/hypotheses.md`** — record results, update hypothesis statuses, note confounds
 13. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
@@ -235,8 +248,8 @@ When proposing architecture improvements:
 - **Expert independence (HARD CONSTRAINT)**: every expert must be fully independent —
   **zero shared trainable parameters** within the expert computation path. Knowing one
   expert's weights must tell you nothing about any other expert. Specifically:
-  - All projections (Q, K, V, Wo, gate, fc, down) must be per-expert
-  - All learned norms (RMSNorm scale weights) must be per-expert
+  - All projections (Q, K, V, Wo, gate, fc, down, MoS output heads/vocab projections) must be per-expert
+  - All learned norms (including RMSNorm scale weights before expert projections) must be per-expert
   - Only the **router** (which routes TO experts, not inside them) and **non-learned
     operations** (RoPE cos/sin tables, activation functions) may be shared
   - When adding a new parameter to the expert path, it MUST have shape `(E, ...)`.
@@ -244,8 +257,10 @@ When proposing architecture improvements:
     forward should find nothing.
 - **Attn/MLP routing**: softmax allocation × sigmoid gate (SoftDenseRouter).
   Weights sum to ≤ 1 (NOT renormalized). The sigmoid gate allows the model to
-  globally suppress the expert mixture for tokens already near equilibrium
-  (`T(z,x0) ≈ x0` when all gates close). More expressive than forcing sum=1.
+  globally suppress the expert mixture (`T(z,x0) ≈ 0` when all expert paths close).
+  More expressive than forcing sum=1.
+  Expert-health min-share/CV metrics are computed on renormalized per-component
+  shares; total routed mass is logged separately and must not be conflated with balance.
 - **MoS routing**: pure softmax (convex combination summing to 1).
   Per Mixtape paper ("Breaking the Softmax Bottleneck Efficiently", NeurIPS 2019).
 - **Applied to ALL components**: attention output, MLP hidden, MoS output heads
@@ -297,7 +312,7 @@ When proposing architecture improvements:
 
 ### 6. Parameter Golf Hard Constraints (ENFORCED)
 - Artifact size <= 16,000,000 bytes (code + compressed model)
-- Training time <= 600 seconds on 8xH100 SXM (competition), <= 1200 seconds on 2xL40S (dev)
+- Training time <= 600 seconds on 8xH100 SXM for submission-like runs
 - Must use FineWeb validation set for evaluation
 - Tokenizer: SentencePiece BPE, vocab=1024
 
@@ -352,12 +367,20 @@ Rules:
 
 Rationale (incident from 2026-04-15 review): five drift defects shipped together — a stale 27b comment in iter 27d code, CLAUDE.md's config table two phases behind real code, `num_experts` hardcoded in three classes, a test silently relaxed from `== 6` to `>= 2`, and `opg_doc.tex` describing a removed `gg_gate`. All five share one root cause: configuration was duplicated across files with no single source of truth, so each editor only updated the file in front of them. This subsection codifies the fix.
 
+### DEQ Input Conditioning Rule
+The DEQ block may use `x0` to condition expert/router computation, currently through `h = RMSNorm(z + x0)`, but must not add an unconditional output-side `x0` residual unless an explicit ablation re-establishes it. Output residual injection can create shortcut fixed points and hide whether the learned dynamics carry the equilibrium representation. Any change to this equation must update `train_gpt.py`, `opg_doc.tex`, and a regression test that forces expert outputs to zero and verifies the block does not return `x0`.
+
 ### Permutation Consistency Audit Rule
 When multiple tensors of identical shape undergo `permute()+reshape()` to the same target layout (e.g., `(E,B,T,H,d)` → `(B,E*H,T,d)`), ALL must use identical permutation indices. Before committing any attention/expert tensor reshaping code:
 ```bash
 grep -n 'permute(' train_gpt.py | grep -v '#'
 ```
 Verify all groups of related permutes use the same index tuple. A single outlier is almost certainly a bug (cf. k_rope permute incident, commit ec1048b).
+
+### Tensor Layout and Optimizer Coverage Rule
+Any manual flatten/reshape of a parameter bank MUST have a focused equivalence test against an index-explicit formulation, such as `einsum`. Shape-only tests are insufficient because they do not catch transposed storage semantics (e.g., `(E,D,R)` flattened as if it were `(E,R,D)`).
+
+Any manual optimizer grouping MUST assert that every `requires_grad` parameter appears in exactly one optimizer group. This is mandatory when adding learnable norms, heads, gates, or other parameters outside the shared block.
 
 ### Dead Code Audit Rule
 When a feature is removed (e.g., gg_gate, SmearGate, tie_attn_mlp_router), the SAME commit must:
@@ -389,6 +412,23 @@ When `opg_doc.tex` describes an algorithm and `train_gpt.py` implements a differ
 
 ### Compile-Wrapper Write Rule
 All attribute writes to `base_model.shared_block` (or any potentially-compiled module) MUST go through `_unwrap_compiled_module()`. The pattern is: `sb = _unwrap_compiled_module(base_model.shared_block)` once per training-loop scope, then use `sb` for all reads/writes.
+
+### Explicit Boundary Rule
+Any code that crosses a wrapper, device, or optional-telemetry boundary MUST make that boundary explicit:
+1. Mutate model state only on the semantic owner after unwrapping compile/DDP/DataParallel wrappers with `_unwrap_compiled_module()`.
+2. Keep GPU tensors on GPU in the training hot path; use tensor math (`torch.relu`, `torch.where`, `clamp`) instead of Python branches on CUDA scalar tensors.
+3. Treat optional summary metrics as optional under `set -euo pipefail`; shell summaries must preserve `?` fallbacks instead of aborting when a grep has no matches.
+4. Add or update a contract test for the boundary. Comments and local intent are not enforcement.
+
+Rationale (incident from 2026-04-23 review): validation wrote `_deq_k_override` to a wrapper instead of the underlying `GPT`, a Lyapunov CUDA scalar branch risked hot-path synchronization, and `update_results.sh` could abort on an incomplete log before printing the intended `val_bpb=?` fallback. All three bugs crossed an implicit boundary without a test.
+
+### Routing Predicate Migration Rule
+When adding or changing any predicate that classifies parameters, modules, or tensors into regimes — optimizer groups, quantization tiers, compile targets, `CONTROL_TENSOR_PATTERNS`, `FP16_KEEP_PATTERNS`, EMA keys, gradient hooks, diagnostic buckets — the same commit MUST:
+1. Enumerate every pre-existing item the new predicate matches, and record the before/after regime for each in the commit message.
+2. Add (or extend) a contract test that asserts at least one representative pre-existing item lands in the intended regime — not the legacy one.
+3. If the new predicate claims *full coverage* (e.g. "every trainable param"), add an assertion at construction time that raises if any required item is missing or duplicated (as `_assert_optimizer_param_coverage` does).
+
+Rationale (incidents 2026-04-15 / -17 / -18 / -23, plus the pre-commit review of iter 66a): every prior silent-migration bug in this repo traces to a classification predicate that changed in one place while pre-existing objects quietly flipped regimes elsewhere. Partial migrations compound: the router-alias bug silently disabled `router_lr`; the `shared_block.named_parameters()` scope silently froze four RMSNorm scales (`bigram.proj_norm.weight`, `mos_head.input_norm.weight`, `final_norm.weight`, `embed_norm.weight`) for an entire phase of training; adding `"norm_weight"` to `CONTROL_TENSOR_PATTERNS` silently migrated `kv_norm_weight` and `hidden_norm_weight` from Muon/int6 to AdamW/fp32. Making the enumeration explicit in the commit and enforced in a test is the simplest first-principled fix.
 
 ## Submission Process (when ready)
 1. Run 3 seeds (e.g., 42, 1337, 2024) on 8xH100

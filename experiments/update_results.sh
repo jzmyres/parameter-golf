@@ -180,7 +180,7 @@ echo "=== Experiment Files ==="
 echo "Logs:"
 for f in baseline.log previous.log current.log; do
     if [ -f "$LOGDIR/$f" ]; then
-        bpb=$(grep -oP 'val_bpb:\K[\d.]+' "$LOGDIR/$f" | tail -1)
+        bpb=$(grep -oP 'val_bpb:\K[\d.]+' "$LOGDIR/$f" | tail -1 || true)
         echo "  $f  val_bpb=${bpb:-?}"
     fi
 done

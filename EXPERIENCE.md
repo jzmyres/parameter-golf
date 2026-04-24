@@ -2,6 +2,8 @@
 
 Short, reusable guardrails to avoid common experiment mistakes.
 
+- Learned parameters inside an expert path, including norm scales and output heads, must be per-expert.
+
 ## Metrics
 - Track and compare the *scored* metric (post-quant) separately from any in-training validation.
 - Always report both the final in-training validation and the final post-quant result.
@@ -55,7 +57,9 @@ Short, reusable guardrails to avoid common experiment mistakes.
 ## Configuration
 - Keep experiment hyperparameters in code defaults (or CLI), not hidden environment variables.
 - Remove dead/unreachable configuration paths; they silently rot and confuse debugging.
-- If you add gating that changes a probability simplex into sub-mass, define health metrics on the renormalized share and treat leftover mass explicitly.
+- For gated routers, define expert health on renormalized expert shares; track total routed mass as a separate metric or loss.
+- Prove flattened tensor-bank layouts against an index-explicit reference such as `einsum`; shape checks do not prove semantic correctness.
+- Assert optimizer coverage for every trainable parameter; manual groups silently miss newly added norms and heads.
 - In iterative solvers, prefer pooled convex gates with conservative initialization to preserve a stable identity path.
 - When an ablation is complete, delete the deprecated mode so logging, plots, and constraints can’t silently drift.
 - Throughput tuning must be validated against stability signals; “faster” configs that break DEQ behavior are not viable defaults.

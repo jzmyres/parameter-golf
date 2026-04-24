@@ -174,20 +174,21 @@ Stability is handled by \emph{training-time} Lyapunov regularization (Section~\r
 \texttt{kr\_rank} (K\_rope) & 32 & \texttt{wo\_rank} (Wo) & 64 \\
 \texttt{mlp\_mult} & 3.0 & \texttt{vocab\_size} & 1024 \\
 \texttt{train\_seq\_len} & 2048 & \texttt{train\_batch\_tokens} & 524{,}288 \\
-\texttt{deq\_beta} & 0.50 & \texttt{num\_layers} (max K) & 12 \\
-\texttt{deq\_backward} & revdeq (auto) & \texttt{deq\_bptt\_k} & 4 \\
+\texttt{deq\_beta} & 0.50 (fallback) & \texttt{num\_layers} (max K) & 12 \\
+\texttt{use\_parcae} & true & \texttt{parcae\_init\_a\_bar} & 0.7 \\
+\texttt{deq\_backward} & revdeq (auto) & \texttt{deq\_bptt\_k} & 2 \\
 \texttt{num\_refinements} & 1 & \texttt{tie\_embeddings} & yes \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \paragraph{Lyapunov regularization.}
-$\lambda_{\text{jac}}=0.01$, $\gamma=0.9$, warmup fraction~$=0.1$.
+$\lambda_{\text{jac}}=0.01$, $\gamma=0.97$, warmup fraction~$=0.05$.
 
 \paragraph{Optimizer.}
-Matrix params use Muon ($\text{lr}=0.022$, momentum$=0.99$, NS steps$=5$, WD$=1.08$).
+Matrix params use Muon ($\text{lr}=0.022$, momentum$=0.99$, NS steps$=5$, WD$=0.30$).
 Scalar params and routing weights use AdamW ($\text{lr}=0.02$, $\beta_1=0.85$, $\beta_2=0.90$).
-Gradient clipping at $\|\nabla\|=0.3$.
+Gradient clipping at $\|\nabla\|=1.0$.
 
 \paragraph{Expert independence invariant.}
 Every expert is \textbf{fully independent}: zero shared trainable parameters
@@ -202,8 +203,10 @@ We retain the existing embedding stack:
   \label{eq:x0}
   x_0 = \mathrm{rms\_norm}\!\left(E[x] + \mathrm{BigramHashEmb}(x)\right),
 \end{equation}
-where \texttt{BigramHashEmb} is optional and $\mathrm{rms\_norm}$ denotes the parameter-free RMS normalization currently used in code.
-(Any embedding-side normalization is outside the DEQ stability argument.)
+where \texttt{BigramHashEmb} is optional and $\mathrm{rms\_norm}$ denotes the learnable \texttt{RMSNorm} used in code.
+The optional bigram projection also uses a learnable
+pre-projection RMSNorm when \texttt{bigram\_dim != model\_dim}.
+(Any embedding-side normalization is outside the DEQ stability argument, but its learned scale must be included in optimizer groups.)
 
 \subsection{NormedLinear: learnable RMSNorm before every linear}
 \label{sec:normedlinear}
@@ -216,7 +219,8 @@ Define a reusable primitive:
 \end{equation}
 where $\mathrm{RMSNorm}(\cdot;g)$ is learnable (scale $g$, with $\varepsilon$ for numerical stability).
 We use \eqref{eq:normedlinear} for:
-router projections, Q/K/V/O projections, and both MLP linears.
+router projections, Q/K/V/O projections, both MLP linears, and MoS low-rank projections.
+Learned normalization scales outside $T_\theta$ (embedding, final norm, and MoS input norm) are also trainable and must be optimizer-covered.
 
 \begin{remark}[Why this helps stability without killing expressiveness]
 RMSNorm preconditioning controls activation scale and reduces sensitivity to weight growth,
@@ -242,17 +246,23 @@ The softmax in \eqref{eq:router_alloc} allocates relative budget across experts 
 The sigmoid gate in \eqref{eq:router_gate} independently scales each expert's contribution.
 Crucially, the product in \eqref{eq:router_final} is \textbf{not renormalized}: the total expert
 weight $\sum_j w_j$ can be strictly less than 1.
+Implementation health checks renormalize expert shares within each routed component before applying
+min-share or CV constraints; total routed mass is logged separately.
 
 \begin{remark}[Why un-normalized is more expressive]
 When the gate suppresses all experts ($g\to 0$), the mixture $\Delta_\theta(z,x_0)\to 0$ and
-$T_\theta(z,x_0)\to x_0$.  This gives the model a ``do nothing'' mode for tokens already
-near equilibrium, which is semantically meaningful for DEQ: the solver can recognize convergence
-token-by-token.  Forcing $\sum w_j=1$ (as the previous logit-space formulation did) removes
-this degree of freedom.
+$T_\theta(z,x_0)\to 0$.  This gives the model a true zero-update mode for the learned map:
+the solver cannot rely on an unconditional output-side $x_0$ shortcut when the expert bank is suppressed.
+Forcing $\sum w_j=1$ (as the previous logit-space formulation did) removes this degree of freedom.
 \end{remark}
 
 (Any scoring parameterization---L2 distance with $\tanh$, dot-product, SIPS---can be used
 for computing the route logits in \eqref{eq:router_alloc}.)
+
+\paragraph{Shared bypass experts.}
+The current implementation reserves the first expert in each component as an always-on shared expert with a per-token sigmoid gate.
+The pooled router therefore routes only the remaining $R=E-S$ experts and has $2R$ outputs: first attention, then MLP.
+Health checks normalize within each routed component; shared-gate mass is logged separately.
 
 \paragraph{Attention experts (fully independent per-expert MLA).}
 Each attention expert $e$ has its \textbf{own complete MLA pipeline with zero shared parameters}:
@@ -284,7 +294,7 @@ For MLP expert $e$, we use a gated MLP such as SwiGLU:
 \]
 with $\phi=\mathrm{SiLU}$ or $\mathrm{GELU}$.
 
-\paragraph{Dense mixture and residual update.}
+\paragraph{Dense mixture and output map.}
 Let the expert outputs be collected as $\{E_j(h)\}_{j=1}^E$ with $E_j\in\{A_e,M_e\}$.
 Compute the dense mixture:
 \begin{equation}
@@ -297,15 +307,17 @@ Compute the dense mixture:
 We define the equilibrium map as:
 \begin{equation}
   \label{eq:Tx_new}
-  T_\theta(z,x_0) := x_0 + \Delta_\theta(z,x_0).
+  T_\theta(z,x_0) := \Delta_\theta(z,x_0).
 \end{equation}
 This map is fully expressive (no $\Pi_R$, no $\|W\|_2$ constraints) and uses standard SDPA attention.
 Stability is enforced \emph{only} at the reached equilibrium using the Lyapunov penalty.
 
-\begin{remark}[Why keep an explicit $x_0$ injection]
-Even without a contraction proof, an explicit injection makes input-dependence structural:
-if the expert bank collapses to zero, $T_\theta(z,x_0)=x_0$ so the equilibrium remains input-dependent.
-This avoids the degenerate ``input-independent attractor'' failure mode.
+\begin{remark}[Input conditioning without an output shortcut]
+Input-dependence is structural because $x_0$ enters every expert and router through
+$h=\mathrm{RMSNorm}(z+x_0)$.  We deliberately avoid adding $x_0$ again at the output:
+an unconditional output residual can create a shortcut fixed point and hide whether the learned
+expert dynamics actually carry the equilibrium representation.  The implementation therefore
+uses $x_0$ as conditioning, not as an output-side residual injection.
 \end{remark}
 
 \section{RevDEQ solver and the efficient Lyapunov-regularized training algorithm}
@@ -667,6 +679,13 @@ Let $h=\mathrm{RMSNorm}(z^\star)$ and compute dual MoS logits (CTP+NTP) with FSQ
 \[
   \log p_{\text{CTP}},\ \log p_{\text{NTP}} = \mathrm{MoSHead}(h).
 \]
+Current code sets \texttt{fsq\_levels=0}, so FSQ machinery is bypassed and the low-rank MoS projection carries the head.
+The MoS $A$ banks are stored as $(E,D,R)$ and $B$ banks as $(E,V,R)$; the low-rank projection is
+\[
+  t_{n,e,r} = \sum_d h_{n,d} A_{e,d,r}.
+\]
+If this is implemented with a flat GEMM, the flattening must be equivalent to
+\texttt{einsum("nd,edr->ner")}; shape-only checks do not catch transposed storage mistakes.
 The task loss is the standard NTP negative log-likelihood plus existing auxiliary losses:
 \[
   L_{\text{task}} = L_{\text{NTP}} + \lambda_{\text{CTP}}L_{\text{CTP}}
@@ -703,30 +722,29 @@ Local stability allows multiple equilibria per input.
 This can be beneficial (implicit ``modes''), but can also introduce training noise if the solver hops basins.
 Warm starts and modest damping $\beta$ mitigate basin switching.
 
-\paragraph{Implementation: two-forward approach (torch.compile + DDP compatible).}
+\paragraph{Implementation: two-forward Hutchinson surrogate (torch.compile + DDP compatible).}
 \texttt{torch.compile} (AOTAutograd) does \textbf{not} support \texttt{create\_graph=True} (double backward)
 or \texttt{retain\_graph=True} (donated buffer conflict). Furthermore, calling a compiled module with
 detached inputs inside the compiled forward corrupts cached tensor metadata (SIGSEGV under DDP).
 
-The solution is a \textbf{two-forward} approach computed \textbf{outside} the compiled model forward,
+The solution is a \textbf{two-forward} Hutchinson surrogate computed \textbf{outside} the compiled model forward,
 in the training loop after \texttt{loss = model(x, y)} and before \texttt{loss.backward()}:
 \begin{enumerate}[leftmargin=2em,itemsep=0.1em]
-  \item \textbf{Forward \#1 (VJP for $\hat\rho$ + surrogate):} Evaluate the \emph{uncompiled} block $u = T_\theta(z_b, x_0)$
+  \item \textbf{Forward \#1 (VJP for $\hat\rho$):} Evaluate the block $u = T_\theta(z_b, x_0)$
         with $z_b = z^\star_{\text{detached}}.\text{requires\_grad\_(True)}$.
-        Compute $v_{\text{next}} = J_{z^\star}^\top v$ via \texttt{autograd.grad(\ldots, create\_graph=False, retain\_graph=True)}.
-        The \texttt{retain\_graph=True} keeps $u$'s computation graph alive for the surrogate below.
-        Update $v_{\text{buf}}$ with EMA smoothing (Frobenius-normalized, $\S$\ref{sec:notation}).
-  \item \textbf{Surrogate (reuses Forward \#1):}
-        Compute $\hat\rho = \|v_{\text{next}}\|_F$ and
-        $\text{scale}_t = \max(0, \hat\rho - \gamma) / \hat\rho$ as a pure-tensor hinge (no Python branching).
-        Define surrogate $S = |u \cdot \hat{v}_{\text{next}}| \times \text{scale}_t$.
+        Draw a fresh Rademacher probe $v$ and compute $v_{\text{next}} = J_{z^\star}^\top v$
+        via \texttt{autograd.grad(\ldots, create\_graph=False, retain\_graph=False)}.
+        Track $\hat\rho = \|v_{\text{next}}\|$ with a GPU-resident EMA.
+  \item \textbf{Forward \#2 (first-order surrogate):}
+        Re-evaluate $u_2 = T_\theta(z^\star_{\text{detached}}, x_0)$.
+        Compute $\text{scale}_t = \max(0, \hat\rho_{\text{EMA}}-\gamma)/\hat\rho_{\text{EMA}}$ as pure tensor math,
+        set $\hat v = v_{\text{next}}/\|v_{\text{next}}\|$, and define
+        $S = |u_2 \cdot \hat v| \times \text{scale}_t$.
         Add $\lambda_{\text{jac}} \cdot S$ to the loss before \texttt{backward()}.
-        Since $u$'s graph was retained, $\nabla_\theta S = J^\top \hat{v}_{\text{next}}$ flows to $\theta$ (first-order),
+        Forward~\#2 builds a fresh graph from $\theta$ through $T_\theta$: the leaf $z^\star_{\text{detached}}$ carries no gradient, but $S$ is differentiable in the block's parameters, so the backward pass reaches $\theta$ without double backward or retained donated buffers,
         pushing $\theta$ to shrink $T_\theta$'s output projection onto the dominant eigendirection.
 \end{enumerate}
-The single forward runs on the \emph{uncompiled} base model (outside the compiled graph) under
-\texttt{torch.compiler.disable()}, using \texttt{create\_graph=False} and \texttt{retain\_graph=True}.
-Cost: 1 extra block forward per step ($\approx 1/K$ of the DEQ solve, $\sim$8\% overhead at $K=12$).
+Cost: 2 extra block forwards on the final micro-step only.
 No \texttt{.item()} GPU$\to$CPU syncs: all control flow uses pure-tensor math.
 
 \paragraph{Theoretical guarantee (conditional).}

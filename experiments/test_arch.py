@@ -92,6 +92,91 @@ def test_all_constraints():
     print("PASS: All 5 constraints satisfied")
 
 
+def test_expert_path_parameters_are_expert_independent():
+    """Learned parameters inside expert paths must carry a leading expert dim."""
+    model = _make_model(num_experts=4)
+    attn = model.shared_block.attn
+    E = attn.num_experts
+    D = model.tok_emb.embedding_dim
+    assert attn.q_up_norm_weight.shape == (E, attn.expert_rank)
+    assert attn.kv_b_norm_weight.shape == (E, attn.kv_rank)
+    assert attn.kr_b_norm_weight.shape == (E, attn.kr_rank)
+    assert attn.wo_down_norm_weight.shape == (E, D)
+    assert attn.wo_up_norm_weight.shape == (E, attn.wo_rank)
+    assert attn.q_rope_norm_weight.shape == (E, attn.rope_dim)
+    assert attn.q_nope_norm_weight.shape == (E, attn.nope_dim)
+    assert attn.k_rope_norm_weight.shape == (E, attn.rope_dim)
+    assert attn.k_nope_norm_weight.shape == (E, attn.nope_dim)
+    for name in ("q_norm", "k_norm", "q_rope_norm", "k_rope_norm"):
+        assert not hasattr(attn, name), f"{name} must not be a shared learned expert-path norm"
+
+    mos = model.mos_head
+    mos_E = mos.num_experts
+    assert not hasattr(mos, "A_shared"), "CTP/NTP must not reuse one shared A bank"
+    assert mos.A_ctp_shared.shape == (mos.num_shared, D, mos.rank)
+    assert mos.A_ntp_shared.shape == (mos.num_shared, D, mos.rank)
+    assert mos.B_denoise.shape == (mos_E, mos.vocab_size, mos.rank)
+    assert mos.B_NTP.shape == (mos_E, mos.vocab_size, mos.rank)
+    assert mos.ctp_rank_norm_weight.shape == (mos_E, mos.rank)
+    assert mos.ntp_rank_norm_weight.shape == (mos_E, mos.rank)
+
+
+def test_prenorm_forward_shapes_are_unchanged():
+    """Targeted smoke test for MLA and MoS outputs after prenorm insertion."""
+    model = _make_model(num_experts=4)
+    dev = _get_device()
+    dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
+    B, T, D = 2, 8, model.tok_emb.embedding_dim
+    h = torch.randn(B, T, D, device=dev, dtype=dtype)
+
+    with torch.no_grad():
+        attn_out = model.shared_block.attn.forward_experts(h)
+        log_p_ctp, log_p_ntp = model.mos_head(h)
+
+    assert attn_out.shape == (B, T, model.num_experts, D)
+    assert log_p_ctp.shape == (B, T, model.mos_head.vocab_size)
+    assert log_p_ntp.shape == (B, T, model.mos_head.vocab_size)
+
+
+def test_shared_bypass_gate_diagnostics_are_separate():
+    """Shared bypass gates get their own stats, outside routed expert usage."""
+    model = _make_model(num_experts=4, num_shared_experts=1)
+    dev = _get_device()
+    dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
+    x0 = torch.randn(1, 8, model.tok_emb.embedding_dim, device=dev, dtype=dtype)
+    z = torch.randn_like(x0)
+
+    from train_gpt import router_diagnostics
+    with torch.no_grad(), router_diagnostics(True, step_tag=17):
+        _ = model.shared_block(z, x0)
+
+    block = model.shared_block
+    assert block._shared_gate_diag_step == 17
+    assert block._shared_gate_mean is not None
+    assert block._shared_gate_min is not None
+    assert block._shared_gate_std is not None
+
+    router = block.router
+    num_routed = block.num_experts - block.num_shared_experts
+    assert router._expert_usage is not None
+    assert len(router._expert_usage) == 2 * num_routed
+
+
+def test_parcae_a_bar_is_bounded_by_construction():
+    model = _make_model(use_parcae=True)
+    with torch.no_grad():
+        model.parcae_raw_delta.fill_(-100.0)
+        low_rate_a_bar = model._parcae_a_bar()
+        model.parcae_raw_delta.fill_(100.0)
+        high_rate_a_bar = model._parcae_a_bar()
+
+    min_a = model.parcae_min_a_bar
+    assert torch.all(low_rate_a_bar > min_a)
+    assert torch.all(low_rate_a_bar < 1.0)
+    assert torch.all(high_rate_a_bar > min_a)
+    assert torch.all(high_rate_a_bar < 1.0)
+
+
 def test_revdeq_convergence():
     """Test RevDEQ coupled-state iteration converges."""
     model = _make_model(num_layers=8)
@@ -145,6 +230,10 @@ def test_revdeq_reversibility():
 
 if __name__ == "__main__":
     test_all_constraints()
+    test_expert_path_parameters_are_expert_independent()
+    test_prenorm_forward_shapes_are_unchanged()
+    test_shared_bypass_gate_diagnostics_are_separate()
+    test_parcae_a_bar_is_bounded_by_construction()
     test_revdeq_convergence()
     test_revdeq_reversibility()
     print("\nAll tests passed!")
