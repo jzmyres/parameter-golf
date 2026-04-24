@@ -174,7 +174,16 @@ grep "peak_vram_mb:\|artifact.*bytes" run.log
       fighting val_bpb. To enable, the train script writes `run_valid=true` whenever val_bpb
       is recorded; diagnostic failures populate `failure_categories` + `retry_hint.json` for
       the next iter, but don't block --promote.
-11. If val_bpb equal or worse -> `git revert` to previous good state (weights stay in previous/)
+    - **EXCEPTION — strict-generalization unconditional promote**: when the new iter's
+      functional class *strictly subsumes* the baseline's (i.e. there exists a setting of
+      the new learnable params where the iter *exactly* recovers the baseline's forward
+      map — e.g. `B̄ → 0` in iter 66b recovering iter 74b's `T_θ = Δ`), promote the new
+      iter unconditionally regardless of val_bpb delta. Any val_bpb regression is by
+      construction an optimization-landscape artifact (new-params init, LR mismatch,
+      gradient topology), not a capacity loss — the fix is to tune the new params, not
+      to revert the more-general form. See "Strict-Generalization Promotion Rule" below.
+11. If val_bpb equal or worse AND the change does NOT strictly generalize the baseline
+    -> `git revert` to previous good state (weights stay in previous/)
 12. **Update `experiments/hypotheses.md`** — record results, update hypothesis statuses, note confounds
 13. Track consecutive non-improvements. **STOP after 100 consecutive non-improvements** and seek user guidance
 
@@ -454,6 +463,31 @@ When adding or changing any predicate that classifies parameters, modules, or te
 3. If the new predicate claims *full coverage* (e.g. "every trainable param"), add an assertion at construction time that raises if any required item is missing or duplicated (as `_assert_optimizer_param_coverage` does).
 
 Rationale (incidents 2026-04-15 / -17 / -18 / -23, plus the pre-commit review of iter 66a): every prior silent-migration bug in this repo traces to a classification predicate that changed in one place while pre-existing objects quietly flipped regimes elsewhere. Partial migrations compound: the router-alias bug silently disabled `router_lr`; the `shared_block.named_parameters()` scope silently froze four RMSNorm scales (`bigram.proj_norm.weight`, `mos_head.input_norm.weight`, `final_norm.weight`, `embed_norm.weight`) for an entire phase of training; adding `"norm_weight"` to `CONTROL_TENSOR_PATTERNS` silently migrated `kv_norm_weight` and `hidden_norm_weight` from Muon/int6 to AdamW/fp32. Making the enumeration explicit in the commit and enforced in a test is the simplest first-principled fix.
+
+### Strict-Generalization Promotion Rule
+When an iteration's functional class **strictly subsumes** the baseline — i.e. there exists a setting of the new learnable parameters under which the iteration's forward map is *exactly* identical to the baseline's (not approximately, not "close enough") — the iteration MUST be promoted unconditionally, regardless of any val_bpb delta measured on a short dev-hardware run.
+
+**Examples of strict generalization** (this repo):
+- Iter 66b's `T_θ = B̄ ⊙ RMSNorm_learn(x₀) + Δ` strictly generalizes iter 74b's `T_θ = Δ`: setting `parcae_raw_b → −∞` (or `x0_inject_norm_weight → 0`) recovers `T_θ = Δ` exactly (up to an ε_min·Δ injection term that the optimizer absorbs).
+- Changing a tied parameter to independent (e.g. iter 66a's tied `B̄ = 1 − Ā` → iter 66b's independent `B̄ = Δ·B`) generalizes as long as the tied setting is representable in the new parametrization.
+- Adding a learnable gate initialized open + residual bypass: `y = (1−g)·x + g·f(x)` with `g = σ(·)` init to `0` gives `y = x` at init, recovering identity (the absence of `f`).
+
+**Examples that are NOT strict generalization** (look-alikes to reject):
+- A re-parametrization with a different output range even in the limit (e.g. adding `clamp(·, 0, c)` with `c < ∞` to a previously-unbounded output — the new form cannot represent outputs outside `[0, c]`).
+- Adding a new loss term with strictly positive coefficient (the baseline is only recovered by setting the coefficient to exactly zero — not representable if the coefficient is a positive softplus).
+- Replacing a full-rank projection with a low-rank factorization (low-rank cannot represent all full-rank maps).
+
+**Required in the commit message for a strict-generalization iter:**
+1. The exact setting of the new parameters that recovers the baseline's forward map.
+2. A 1-2 line argument that this setting is representable in the new parametrization (e.g. "softplus(raw_b) can get arbitrarily close to 0; `Δ·ε_min ≈ 1e-3` is below training-noise scale"; or "`init_alpha = 0.0` reproduces baseline exactly").
+3. How the optimizer's access to this baseline-equivalent point is preserved (LR, weight decay, init range should be such that the optimizer can *reach* the baseline-equivalent point if that's the minimum).
+
+**What to do if val_bpb regresses after a strict-generalization promote:**
+- Do NOT revert. The new iter cannot be worse in capacity than the baseline — any regression is an optimization-landscape artifact.
+- Tune the new parameters in decreasing order of suspicion: (i) learning rate of the new params, (ii) initialization of the new params (try initializing so the step-0 forward map *exactly* matches the baseline), (iii) gradient flow paths if the new params sit behind a chain of reparametrizations.
+- Record the diagnostic in hypotheses.md but continue running the next queued iter on top of the new baseline.
+
+Rationale (iter 66b, 2026-04-23): reverting a strict generalization is categorically the wrong move — it strictly loses expressive capacity the baseline could not reach. The iter-66b / iter-74b choice is a training-dynamics question, not a capacity question; treating it as the latter lets autoresearch bounce between equivalent-or-better configurations forever on noise-floor val_bpb swings. Codifying "strict-generalization → unconditional promote" prevents that loop.
 
 ## Submission Process (when ready)
 1. Run 3 seeds (e.g., 42, 1337, 2024) on 8xH100

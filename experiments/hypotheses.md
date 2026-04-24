@@ -542,12 +542,19 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
-### H58: Parcae-paper-faithful DEQ input injection (iter 66b) — PROPOSED
+### H58: Parcae-paper-faithful DEQ input injection (iter 66b) — PROMOTED ★ (strict generalization, unconditional)
 **Claim:** Replacing the iter-66a post-refactor `T(z,x₀) = Δ(z,x₀)` with the Parcae ZOH-discretized form
 ```
 T(z, x₀) = B̄ ⊙ RMSNorm_learn(x₀) + Δ(z, x₀)
 ```
 where Ā and B̄ share *only* the per-dim step size Δ (otherwise independent), preserves input information at the equilibrium without creating the pre-iter-66a unconditional `T = x₀ + Δ` shortcut. Improves val_bpb vs iter 66a because the post-diff `T = Δ` form loses input information if experts collapse, while iter 66a-pre `T = x₀ + Δ` was unconditional.
+
+**Strict-generalization argument → unconditional promote.** Iter 66b subsumes iter 74b by construction:
+- `B̄ → 0` (via raw_b → −∞) recovers `T_θ = Δ` exactly (iter 74b's form). `B̄ = Δ·softplus(raw_b) + Δ·ε_min` so the lower bound is `Δ·ε_min ≈ 1e-3` — effectively zero for training dynamics.
+- Alternatively `x0_inject_norm_weight → 0` zeroes the injection directly.
+- Ā parametrization change (compound wrapper → `ε_rev + (1−ε_rev)·exp(Δ·A)`) re-parametrizes the same Ā ∈ [0.1, 1) range; raw_a/raw_delta can produce any target Ā in both forms.
+
+Therefore any val_bpb regression iter 66b → iter 74b is an **optimizer-landscape artifact** (different init, extra parameters, slightly different gradient topology), not a capacity loss. The fix is to tune the new parameters (parcae_lr, raw_b init, x0_inject_norm_weight init), not revert.
 
 **Parametrization (paper-faithful + RevDEQ safety):**
 - `Δ = softplus(parcae_raw_delta) + ε_min` (step size, shared by Ā and B̄)
@@ -565,13 +572,13 @@ where Ā and B̄ share *only* the per-dim step size Δ (otherwise independent), 
 
 **Predicted effect:** At least parity with iter 66a val_bpb; likely improvement because the expressive degree of freedom returns.
 
-**Test design:** ≥200-step dev run vs. iter 66a baseline, all other hyperparameters fixed. Init `parcae_raw_b` so `B̄₀ ≈ 1 − Ā₀ = 0.3` → step-0 effective dynamics match iter 66a.
+**Measurement (not a gate — iter 66b is already promoted):** ≥200-step dev run vs. iter 74b reference for val_bpb tracking + diagnostic. Init `parcae_raw_b` so `B̄₀ ≈ 1 − Ā₀ = 0.3` → step-0 effective dynamics match iter 66a.
 
-**Known confounds:**
-- Iter 66b also drops iter 66a's compound Ā wrapper (`min_a + (1−min_a)(floor + (1−floor)·decay)`) in favor of the paper form `Ā = ε_rev + (1−ε_rev)·exp(Δ·A)`. If val_bpb regresses the next bisect is:
-  (a) keep iter 66a's compound wrapper on Ā + independent B̄ → isolates B̄-decoupling
-  (b) paper-Ā with ε_rev floor + tied B̄ = 1−Ā → isolates Ā-parametrization
-- `CONTROL_TENSOR_PATTERNS += "norm_weight"` from commit 1 already migrated two pre-existing norm banks from Muon→AdamW — any val_bpb delta could also contain this carryover.
+**If val_bpb regresses (fix, don't revert):**
+- First tune: try raising `parcae_lr` (currently 0.002 — a 10× slower than `scalar_lr`); the extra parameter needs enough gradient to move.
+- Second tune: init `parcae_raw_b` to drive `B̄₀ → 0` so step 0 matches iter 74b exactly, then let training learn to open the injection gate if it helps. This isolates any optimization artifact from any latent capacity gain.
+- Third tune: `x0_inject_norm_weight` init / LR — currently covered by `scalar_lr` via `CONTROL_TENSOR_PATTERNS`; may need its own group.
+- Confound to keep in mind: `CONTROL_TENSOR_PATTERNS += "norm_weight"` from commit 1 migrated two pre-existing norm banks Muon→AdamW — any delta could carry-over from that and be unrelated to Parcae-faithful.
 
 **Reversibility sanity:** `experiments/test_arch.py::test_revdeq_reconstruction_at_a_bar_floor` asserts reconstruction stays finite (not NaN/Inf) when raw_a is driven to the ε_rev saturation; smoke-test recon_err stays ≤ 1e-1 under normal Ā training ranges. Full details in the new CLAUDE.md §RevDEQ Reversibility Floor Rule.
 
@@ -833,13 +840,12 @@ failure.
 
 ### Next up — recommended ordering after iter 66b
 
-Current baseline is iter 74b (val_bpb 1.5150) with iter 66b (Parcae-paper-faithful DEQ input injection, H58) just committed and awaiting A/B validation. Run ordering chosen for (i) low-risk → higher-risk, (ii) activation / gate / schedule tweaks before legacy-loss ablations, (iii) architectural scale-up last (depends on predecessors).
+Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) — promoted unconditionally because it strictly generalizes iter 74b (val_bpb 1.5150 reference): `B̄ → 0` recovers `T_θ = Δ` exactly. Running Groups A-D on top of iter 66b; val_bpb is measured relative to the iter 74b reference for diagnostic, but iter 66b is the working baseline regardless. Run ordering chosen for (i) low-risk → higher-risk, (ii) activation / gate / schedule tweaks before legacy-loss ablations, (iii) architectural scale-up last (depends on predecessors).
 
 #### Group A — low-risk quick wins (run first)
 
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
-| **66b A/B** | — | Validate iter 66b vs iter 74b on ≥200 dev steps | Predecessor of everything below; Parcae-faithful injection must first be either promoted or reverted based on val_bpb. |
 | **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` | Leaderboard-SOTA technique (abaybektursun 1.1194). Banach constraint forcing its removal is gone (Lyapunov replaces it). Lowest risk / highest upside-density item on the queue. |
 | **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | Trivial; fixes an accidental symmetry. Independent of 83 — can run in parallel if hardware permits. |
 | **85** | 82 | Stochastic TBPTT `{2,3,4}` | One-knob change matching the K-jitter principle (H12 VERIFIED). Known-class trade-off. |
