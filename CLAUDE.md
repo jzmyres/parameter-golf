@@ -42,12 +42,16 @@ Challenge: March 18 – April 30, 2026. Prize: $1M in OpenAI compute credits.
 - **This repo's working baseline** (true int6, dev hardware): tracked in `experiments/hypotheses.md` (latest promoted iter row). Update this line in the same commit that promotes a new baseline.
 
 ## Training Budget
-- **8xH100 SXM (competition)**: 600 seconds (10 min) — original competition constraint
-- **Default script behavior**: `Hyperparameters.max_wallclock_seconds = 600`; submission-like runs must honor the cap.
-- **Step-matched dev runs**: may explicitly pass `--max-wallclock-seconds=0 --iterations=N`; label them non-submission.
+- **Default script behavior**: 1000 iterations on DDP with all available GPUs; wallclock cap disabled (step-count governs).
+  - `Hyperparameters.iterations = 1000`
+  - `Hyperparameters.max_wallclock_seconds = 0`  # 0 = disabled
+  - Canonical invocation: `torchrun --standalone --nproc_per_node=gpu train_gpt.py` (auto-detects all GPUs).
+- **Submission runs (8xH100 SXM competition)**: 600-second wallclock cap — MUST pass `--max-wallclock-seconds=600` on the command line. The 600s hard cap comes from the competition constraint; it is never the default.
+- **Step-matched dev runs**: the default (1000 iters, no wallclock) IS a step-matched dev run. To run shorter, override `--iterations=N`.
 - **Fair comparison principle**: when configs have different throughput, compare at equal STEP COUNT
   (not wall-clock). A larger model needs proportionally more steps. Wall-clock matters for
-  competition submission; step count matters for architectural comparison.
+  competition submission; step count matters for architectural comparison. The default (1000 iters,
+  no wallclock) implements this by construction.
 
 ## Current Architecture (single source of truth: `train_gpt.py` `Hyperparameters`)
 The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you edit one, edit the other in the same commit (see "Config Single-Source-of-Truth" under Development Practices).
@@ -114,19 +118,33 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 
 ## How to Run
 
-### Dev mode (2x L40S — primary dev hardware)
+### Default — DDP on all available GPUs, 1000 iterations, no wallclock cap
 ```bash
 conda activate opg
-# Single GPU:
-python train_gpt.py
-# 2 GPUs:
-torchrun --standalone --nproc_per_node=2 train_gpt.py
+torchrun --standalone --nproc_per_node=gpu train_gpt.py
+```
+`--nproc_per_node=gpu` auto-detects all visible GPUs (2×L40S on dev, 8×H100 on full). 1000 iterations is the step-count-governed default — wallclock is OFF unless explicitly set.
+
+### Explicit GPU count (if the `gpu` alias is not supported on your launcher)
+```bash
+torchrun --standalone --nproc_per_node=2 train_gpt.py   # 2 GPUs
+torchrun --standalone --nproc_per_node=8 train_gpt.py   # 8 GPUs
 ```
 
-### Full mode (8xH100 — final validation only)
+### Shorter dev iterations / smoke
 ```bash
-conda activate opg
-torchrun --standalone --nproc_per_node=8 train_gpt.py
+torchrun --standalone --nproc_per_node=gpu train_gpt.py --iterations=200
+```
+
+### Submission-like run (8×H100 SXM, 600 s competition hard cap)
+```bash
+torchrun --standalone --nproc_per_node=8 train_gpt.py --max-wallclock-seconds=600
+```
+The 600 s wallclock cap is NEVER the default — it is the competition constraint and must be opted into explicitly so step-count-governed dev runs can't accidentally submit.
+
+### Single-GPU debug (no DDP, only if really needed)
+```bash
+python train_gpt.py   # world_size=1; runs but does not scale
 ```
 
 ### Evaluate results

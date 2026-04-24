@@ -156,12 +156,12 @@ class Hyperparameters:
     train_log_every = 10  # log every 10 steps (~85s at 8.5s/step) for better progress visibility
     auto_plot_on_val = True
 
-    iterations = 1065  # Phase 9: fixed step count for fair arch comparison (baseline ran 1065 steps in 7200s)
+    iterations = 1000  # default training budget: step-count-governed, DDP with all GPUs; submission runs override via --max-wallclock-seconds=600
     warmdown_frac = 0.72  # fraction of total steps for warmdown
     warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 600  # competition hard cap; use CLI override for step-matched dev runs
+    max_wallclock_seconds = 0  # 0 = disabled; step-count governs default runs. Submission runs MUST pass --max-wallclock-seconds=600 (8xH100 competition hard cap).
 
     # Model architecture
     vocab_size = 1024
