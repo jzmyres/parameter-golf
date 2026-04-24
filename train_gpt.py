@@ -207,7 +207,7 @@ class Hyperparameters:
     beta2 = 0.90
     adam_eps = 1e-8
     grad_clip_norm = 1.0  # iter 73: relax from 0.3 — Lyapunov provides soft contraction (H56)
-    weight_decay = 0.30  # Phase 9 iter 71: reduce from 1.08 (arch review: biggest expressiveness killer). Lyapunov+denoising provide contraction; WD was redundant.
+    weight_decay = 0.01  # Phase 9 iter 86 (2026-04-24): 0.30 → 0.01 re-test. Under iter 93 landscape (learnable norms everywhere + Parcae B̄ + split shared gates + no CTP + no BigramHash), the non-norm paths that WD=0.30 was regularizing have shifted. Test whether a much lower floor lets the transformer body's capacity express more. Prior iter 66a-b confirmed WD=0 on 1D params regresses, but this tests a lower GLOBAL floor.
     tied_embed_init_std = 0.005
 
     # Routing

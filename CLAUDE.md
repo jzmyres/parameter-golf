@@ -90,7 +90,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | muon_momentum | 0.99 |
 | muon_momentum_warmup_start | 0.92 |
 | muon_momentum_warmup_steps | 800 |
-| weight_decay | 0.30 (applied to both AdamW and Muon param groups) |
+| weight_decay | 0.01 (iter 86: 0.30 → 0.01 re-test under the iter 93 landscape; applied to both AdamW and Muon groups) |
 | grad_clip_norm | 1.0 |
 | warmdown_frac | 0.72 |
 
