@@ -260,6 +260,12 @@ class Hyperparameters:
     # iters should dominate the total param gradient.  If the hypothesis
     # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
     deq_bptt_k = 2  # Phase 9 iter 69b: TBPTT=2 (middle ground — TBPTT=1 was +0.021 regression, TBPTT=4 is baseline)
+    # Iter 85 (2026-04-24): stochastic TBPTT — sample deq_bptt_k per step from
+    # the set below, analogous to K-jitter (H12 VERIFIED). Forces the model to
+    # be robust across gradient-truncation depths. The set's shuffle-bag
+    # sampler matches the β-jitter pattern.
+    deq_bptt_k_jitter = True
+    deq_bptt_k_jitter_set = (2, 3, 4)
     # TBPTT investigation (28-28d) concluded; best point was 28c (val_bpb
     # 1.925, K=128 Δ=0.015 vs baseline 0.039).  Machinery retained in code
     # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
@@ -3213,6 +3219,27 @@ def main() -> None:
             b = float(b_t.item())
         return b
 
+    # Iter 85: stochastic TBPTT sampler (shuffle-bag, mirroring β-jitter).
+    _bptt_k_jitter_set = getattr(args, "deq_bptt_k_jitter_set", None)
+    _bptt_k_bag: list[int] = []
+    _bptt_k_rng = random.Random(args.seed + 31337)
+
+    def deq_bptt_k_for_step(step_i: int) -> int:
+        if not getattr(args, "deq_bptt_k_jitter", False):
+            return int(args.deq_bptt_k)
+        nonlocal _bptt_k_bag
+        k = int(args.deq_bptt_k)
+        if rank == 0:
+            if not _bptt_k_bag:
+                _bptt_k_bag = list(_bptt_k_jitter_set) if _bptt_k_jitter_set else [int(args.deq_bptt_k)]
+                _bptt_k_rng.shuffle(_bptt_k_bag)
+            k = int(_bptt_k_bag.pop())
+        if distributed:
+            k_t = torch.tensor([k], device=device, dtype=torch.int64)
+            dist.broadcast(k_t, src=0)
+            k = int(k_t.item())
+        return k
+
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(f"VOCAB_SIZE={args.vocab_size} != tokenizer vocab={int(sp.vocab_size())}")
@@ -3562,6 +3589,8 @@ def main() -> None:
         # Scalar β jitter only when Parcae is disabled (Parcae supersedes scalar β).
         if not base_model.use_parcae:
             base_model.deq_beta = deq_beta_for_step(next_step)
+        # Iter 85: stochastic TBPTT — sample deq_bptt_k per step from {2,3,4}.
+        base_model.deq_bptt_k = deq_bptt_k_for_step(next_step)
 
         # Refinement gating: enable after ramp_frac of wallclock
         ramp_frac = float(getattr(args, "num_refinements_ramp_frac", 0.85))
