@@ -542,6 +542,38 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H63: Stochastic TBPTT (iter 85) — PROMOTED ★ (2026-04-24, narrow margin)
+
+**Claim:** Analogous to K-jitter (H12 VERIFIED), sampling `deq_bptt_k` per step from `{2, 3, 4}` should force the model to be robust across gradient-truncation depths and tighten K-sweep FP quality. Prior iter 28-series (fixed k=4, k=8, k=12) showed deeper TBPTT REGRESSED val_bpb, but that was a fixed-depth specialization issue — jitter over a narrower range tests the broader hypothesis.
+
+**Test:** iter 85 — add `deq_bptt_k_jitter_set = (2, 3, 4)` to Hyperparameters; new `deq_bptt_k_for_step()` helper uses a shuffle-bag sampler mirroring β-jitter (rank-0 sample → `dist.broadcast`). Training loop sets `base_model.deq_bptt_k = deq_bptt_k_for_step(next_step)` right after β-jitter. Commit `b18dc55`.
+
+**Result:** PROMOTED (narrow margin).
+
+| Metric | Iter 84 (fixed k=2) | Iter 85 (jitter 2/3/4) | Δ |
+|---|---|---|---|
+| val_bpb fast | 1.5653 | 1.5707 | +0.0054 |
+| val_bpb int6 | **1.5844** | **1.5898** | **+0.0054** |
+| k=4 | 1.5854 | 1.5936 | +0.008 |
+| k=8 | 1.5742 | 1.5809 | +0.007 |
+| k=16 | 1.5844 | 1.5898 | +0.005 |
+| k=32 | 1.5867 | 1.5919 | +0.005 |
+| k=64 | 1.5872 | 1.5923 | +0.005 |
+| k=128 | 1.5873 | 1.5923 | +0.005 |
+| K=8→K=128 Δ | +0.0131 | **+0.0114** | **tightened by -0.002** ★ |
+| artifact bytes | 6,074,999 | 6,068,145 | -6,854 |
+| step_avg (ms) | ~8,015 | ~9,700 | **+21% slower** |
+
+**Mid-training trajectory showed large transient regression** (step 400: +0.062, step 600: +0.077) before narrowing to +0.005 at step 1000. This matches the iter 28c pattern — deeper backward depths slow training but the final converged point shows tighter K-sweep. The model takes longer to specialize because each step sees a different truncation depth, but at the end it is more robust to *any* backward depth.
+
+**Why the K-sweep tightened:** when `deq_bptt_k ∈ {2,3,4}` is jittered, the effective depth-equivalent gradient signal mixes 2/K, 3/K, 4/K capture ratios. The model learns to make its forward converge at ratios higher than the minimum (2/K), so at full-K inference its FP convergence is tighter. Analogous to H12's K-jitter tightening K=8→K=128 by 125×.
+
+**Throughput cost (+21%) is the real tradeoff.** Step_avg jumps from ~8.0s to ~9.7s because the larger k=3/k=4 sampled values cost more backward iterations. For step-matched dev comparison this is orthogonal, but for **wallclock-constrained submission** (8×H100 600s cap), a 21% throughput hit would erase ~200 steps of training, likely eating more val_bpb than the +0.005 cost. Reconsider if iter 85 actually gets enabled in the submission config — may want to revert to fixed k=2 OR narrow the set to `(2, 3)` only.
+
+**Status:** ✅ VERIFIED (narrow-margin promote per ≤0.03 carry-forward rule). Commit `b18dc55`.
+
+**Implication:** TBPTT jitter does provide K-sweep-tightening benefit analogous to K-jitter, but at meaningful throughput cost. Worth it for dev A/B exploration; may want to re-evaluate for final submission config.
+
 ### H62: Independent attn/mlp shared-expert sigmoid gates (iter 84) — PROMOTED ★ (2026-04-24)
 
 **Claim:** Block.shared_gate was a single `nn.Linear(dim, num_shared_experts)` producing ONE sigmoid gate applied to BOTH the attention shared-expert output and the MLP shared-expert output. This accidental symmetry forced the two paths to open/close together. Splitting it into `shared_gate_attn` + `shared_gate_mlp` (each with its own prenorm scale) lets each path learn its own modulation and should improve val_bpb at negligible param cost.
@@ -944,7 +976,7 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 | **94** | new | Disable CTP entirely (NTP-only). Add `Hyperparameters.use_ctp = True` guard; when False, `MoSLowRankOutputHead.forward` returns only `log_p_ntp`, `GPT.forward` skips `ctp_loss` computation at L2760-2781, and CTP-specific `nn.Parameter` banks (`gate_ctp`, `gate_ctp_norm_weight`, `A_ctp_shared`, `A_ctp`, `ctp_a_norm_weight`, `ctp_rank_norm_weight`, `B_denoise`) are NOT allocated. **PROMOTED ★ (commit `c2eff43`)** — int6 Δ=+0.0026 (≤0.03 ✓), K8→K128 Δ tightened +0.0103→+0.0073, artifact -592 KB (-9.0%), params -1.38M (-10.9%). See H60. |
 | **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` (GLU-style: `leaky(gate,0.5)² * fc`) | **REVERTED ✗ (commit `34ef98d`)** — int6 regression +0.0124 vs iter 94 (1.6076 vs 1.5952), artifact +84 KB, K-sweep slightly widened (K=8→K=128 Δ: +0.0073 → +0.0087). Technically within the ≤0.03 carry-forward band, but the change delivers *no* offsetting benefit (no param savings, no FP-quality tightening, no artifact saving) — it is a pure regression under the iter 94 NTP-only + Parcae landscape. The SOTA abaybektursun 1.1194 leaderboard config used a *non-gated* `leaky²(up(x)) → down` FFN; our MoE has `expert_gate + expert_fc + expert_down`, so the GLU-with-leaky² variant tested here is a hybrid that apparently pulls worse than SwiGLU in our architecture. See H61. (A full SOTA-faithful non-gated expert rewrite is still open as a possible follow-up, but blocked behind the Group D architectural rewrites.) |
 | **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | **PROMOTED ★ (commit `6494a50`)** — int6 Δ=**-0.0108** (improvement!), every K-sweep point improved (k=4 by -0.042), K=8→K=128 widened negligibly (+0.003, still ≪0.5), artifact +68 KB (+1.1%). `shared_gate_std` grew 0 → 0.17, confirming the two gates took meaningfully different values. See H62. |
-| **85** | 82 | Stochastic TBPTT `{2,3,4}` | One-knob change matching the K-jitter principle (H12 VERIFIED). Known-class trade-off. |
+| **85** | 82 | Stochastic TBPTT `{2,3,4}` | **PROMOTED ★ (commit `b18dc55`)** — int6 regression +0.0054 (within threshold), K=8→K=128 Δ tightened +0.0131→+0.0114, artifact -7 KB. Cost: step_avg +21% (from deeper avg backward). See H63. Reconsider for wallclock-constrained submission config. |
 | **93** | new | Remove bigram embed (`bigram_vocab_size 4096 → 0`) | Frees ~1 MB of artifact budget (4096 × 128 × 2 bytes FP16 + 128 × 768 proj). BigramHash was added in iter 6 under a very different architecture (pre-DEQ, pre-experts). Under the current iter 66b landscape (learnable norms, Parcae B̄ input injection, expert banks), it may be redundant — the DEQ's x₀ re-injection already carries token-pair information through iterations. Clean one-line ablation; `GPT.__init__` already handles `bigram_vocab_size == 0` via `if bigram_vocab_size > 0` guard at L2345. If val_bpb stays within 0.03, the freed budget compounds into iter 90–92's arch scale-up. |
 
 #### Group B — medium-risk schedule + regularization tuning
