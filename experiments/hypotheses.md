@@ -846,9 +846,10 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
-| **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` | Leaderboard-SOTA technique (abaybektursun 1.1194). Banach constraint forcing its removal is gone (Lyapunov replaces it). Lowest risk / highest upside-density item on the queue. |
+| **83** | 74e | Restore MLP activation `leaky_relu(0.5)²` (GLU-style: `leaky(gate,0.5)² * fc`) | Leaderboard-SOTA technique (abaybektursun 1.1194). Banach constraint forcing its removal is gone (Lyapunov replaces it). Lowest risk / highest upside-density item on the queue. NOTE: GLU variant (our MoE layout has expert_gate + expert_fc + expert_down); the SOTA FFN is non-gated `leaky²(up(x)) → down`. If iter 83 GLU-style promotes, queue iter 83b as a faithful-SOTA refactor dropping `expert_fc`. |
 | **84** | 74f | Independent attn/mlp shared gates (1-dim → 2-dim) | Trivial; fixes an accidental symmetry. Independent of 83 — can run in parallel if hardware permits. |
 | **85** | 82 | Stochastic TBPTT `{2,3,4}` | One-knob change matching the K-jitter principle (H12 VERIFIED). Known-class trade-off. |
+| **93** | new | Remove bigram embed (`bigram_vocab_size 4096 → 0`) | Frees ~1 MB of artifact budget (4096 × 128 × 2 bytes FP16 + 128 × 768 proj). BigramHash was added in iter 6 under a very different architecture (pre-DEQ, pre-experts). Under the current iter 66b landscape (learnable norms, Parcae B̄ input injection, expert banks), it may be redundant — the DEQ's x₀ re-injection already carries token-pair information through iterations. Clean one-line ablation; `GPT.__init__` already handles `bigram_vocab_size == 0` via `if bigram_vocab_size > 0` guard at L2345. If val_bpb stays within 0.03, the freed budget compounds into iter 90–92's arch scale-up. |
 
 #### Group B — medium-risk schedule + regularization tuning
 
