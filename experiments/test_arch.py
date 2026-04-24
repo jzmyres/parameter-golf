@@ -98,8 +98,13 @@ def test_expert_path_parameters_are_expert_independent():
     attn = model.shared_block.attn
     E = attn.num_experts
     D = model.tok_emb.embedding_dim
+    assert attn.q_down_norm_weight.shape == (E, D)
     assert attn.q_up_norm_weight.shape == (E, attn.expert_rank)
+    assert attn.kv_a_norm_weight.shape == (E, D)
     assert attn.kv_b_norm_weight.shape == (E, attn.kv_rank)
+    assert attn.k_nope_in_norm_weight.shape == (E, attn.kv_latent_dim)
+    assert attn.v_in_norm_weight.shape == (E, attn.kv_latent_dim)
+    assert attn.kr_a_norm_weight.shape == (E, D)
     assert attn.kr_b_norm_weight.shape == (E, attn.kr_rank)
     assert attn.wo_down_norm_weight.shape == (E, D)
     assert attn.wo_up_norm_weight.shape == (E, attn.wo_rank)
@@ -110,6 +115,11 @@ def test_expert_path_parameters_are_expert_independent():
     for name in ("q_norm", "k_norm", "q_rope_norm", "k_rope_norm"):
         assert not hasattr(attn, name), f"{name} must not be a shared learned expert-path norm"
 
+    mlp = model.shared_block.mlp
+    assert mlp.gate_in_norm_weight.shape == (E, D)
+    assert mlp.fc_in_norm_weight.shape == (E, D)
+    assert mlp.hidden_norm_weight.shape == (E, mlp.expert_rank)
+
     mos = model.mos_head
     mos_E = mos.num_experts
     assert not hasattr(mos, "A_shared"), "CTP/NTP must not reuse one shared A bank"
@@ -117,6 +127,10 @@ def test_expert_path_parameters_are_expert_independent():
     assert mos.A_ntp_shared.shape == (mos.num_shared, D, mos.rank)
     assert mos.B_denoise.shape == (mos_E, mos.vocab_size, mos.rank)
     assert mos.B_NTP.shape == (mos_E, mos.vocab_size, mos.rank)
+    assert mos.gate_ctp_norm_weight.shape == (D,)
+    assert mos.gate_ntp_norm_weight.shape == (D,)
+    assert mos.ctp_a_norm_weight.shape == (mos_E, D)
+    assert mos.ntp_a_norm_weight.shape == (mos_E, D)
     assert mos.ctp_rank_norm_weight.shape == (mos_E, mos.rank)
     assert mos.ntp_rank_norm_weight.shape == (mos_E, mos.rank)
 

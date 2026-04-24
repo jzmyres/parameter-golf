@@ -813,8 +813,13 @@ def _frob_normalize(t: Tensor, eps: float = 1e-8) -> Tensor:
     return (flat / (flat.norm() + eps)).reshape(t.shape)
 
 
+def _rms_unit(x: Tensor, eps: float = 1e-6) -> Tensor:
+    """Parameter-free RMS normalization over the last dimension."""
+    return F.rms_norm(x, (x.size(-1),), eps=eps)
+
+
 class RMSNorm(nn.Module):
-    """Learnable RMSNorm. ALL norms in the model MUST use this class (project constraint)."""
+    """Learnable RMSNorm used where the learned scale is intentionally shared."""
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = int(dim)
@@ -963,7 +968,7 @@ class BigramHashEmbedding(nn.Module):
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
-        self.proj_norm = RMSNorm(bigram_dim) if self.proj is not None else None  # ALL norms learnable
+        self.proj_norm = RMSNorm(bigram_dim) if self.proj is not None else None
         self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
 
     def bigram_hash(self, tokens: Tensor) -> Tensor:
@@ -1019,6 +1024,8 @@ class SoftDenseRouter(nn.Module):
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
+        self.score_norm_weight = nn.Parameter(torch.ones(dim))
+        self.gate_norm_weight = nn.Parameter(torch.ones(dim))
         # L2-distance scoring: learnable prototypes c_j and fixed γ.  When
         # scoring='linear', prototypes are unused (kept as a zero-init module
         # attribute for state-dict compatibility).
@@ -1137,7 +1144,11 @@ class SoftDenseRouter(nn.Module):
             self.expert_bias.clamp_(min=-clip, max=clip)
 
     def forward(self, x: Tensor, *, pre_normed: bool = True) -> Tensor:
-        x_n = x  # Always pre-normed by state_norm upstream
+        x_n = x  # Caller supplies parameter-free RMS-normalized activations.
+        score_weight = self.score_norm_weight.to(dtype=x_n.dtype)
+        gate_weight = self.gate_norm_weight.to(dtype=x_n.dtype)
+        x_score = x_n * score_weight
+        x_gate = x_n * gate_weight
         D = self.prototypes.shape[-1]
         if self.scoring in ("l2", "sips"):
             # Phase 6a.3 (reviews 1, 10): replace the O(B·T·E·D) broadcast
@@ -1145,8 +1156,8 @@ class SoftDenseRouter(nn.Module):
             # and apply the bounded-prototype projection.  Compute the
             # kernel in fp32 to avoid catastrophic cancellation of
             # ‖x‖² + ‖c‖² − 2·x·c in bf16.
-            leading = x_n.shape[:-1]
-            x_flat_32 = x_n.reshape(-1, D).float()
+            leading = x_score.shape[:-1]
+            x_flat_32 = x_score.reshape(-1, D).float()
             c_32 = self.prototypes.float()
             if self.scoring == "l2":
                 # ‖x − c‖² = ‖x‖² + ‖c‖² − 2·x·cᵀ  (fp32-safe GEMM path)
@@ -1163,13 +1174,13 @@ class SoftDenseRouter(nn.Module):
             route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
         else:
             # Linear scoring (iter 30-33b baseline).
-            route_logits = self.router(x_n) + self.expert_bias.to(dtype=x.dtype)
+            route_logits = self.router(x_score) + self.expert_bias.to(dtype=x.dtype)
         # Sigmoid gate: softmax(route_logits) * sigmoid(gate_logits).
         # NOT renormalized — total weight can be < 1, allowing the model to
         # suppress the entire expert mixture for tokens already near equilibrium.
         # This is more expressive than folding into logit space (which forces sum=1).
         p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
-        gate_act = torch.sigmoid(self.router_gate(x_n).float())
+        gate_act = torch.sigmoid(self.router_gate(x_gate).float())
         p = (p_alloc * gate_act).to(dtype=x.dtype)
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._router_gate_last_mean = float(gate_act.detach().mean().item())
@@ -1282,7 +1293,7 @@ class CausalSelfAttention(nn.Module):
     Each expert has its own complete MLA pipeline with zero shared params:
       1. Per-expert Q (low-rank): dim → rank → H*d_head + H (gate logits)
       2. Per-expert KV compression (low-rank): dim → kv_rank → kv_latent
-      3. Per-expert KV decompression: per-expert RMSNorm + kv_latent → K_nope, V
+      3. Per-expert KV decompression: RMS statistic + separate K/V scales → K_nope, V
       4. Per-expert K_rope (low-rank): dim → kr_rank → H_kv*rope_dim
       5. Per-expert Wo (low-rank): D → wo_rank → D (mixes heads per expert)
 
@@ -1310,6 +1321,7 @@ class CausalSelfAttention(nn.Module):
         q_out_dim = num_heads * self.head_dim + num_heads
         self.expert_q_down = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         self.expert_q_up = nn.Parameter(torch.empty(num_experts, q_out_dim, self.expert_rank))
+        self.q_down_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
         self.q_up_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_q_down.data[e])
@@ -1320,14 +1332,16 @@ class CausalSelfAttention(nn.Module):
         # Per-expert KV: low-rank dim → kv_rank → kv_latent_dim.
         self.expert_kv_a = nn.Parameter(torch.empty(num_experts, self.kv_rank, dim))
         self.expert_kv_b = nn.Parameter(torch.empty(num_experts, self.kv_latent_dim, self.kv_rank))
+        self.kv_a_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
         self.kv_b_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_kv_a.data[e])
             nn.init.xavier_uniform_(self.expert_kv_b.data[e])
 
         # Per-expert KV decompression from latent (full MLA per expert).
-        # Per-expert learned RMSNorm scale — no shared weights in the expert path.
-        self.kv_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_latent_dim))
+        # K and V own separate learned input scales after the shared RMS statistic.
+        self.k_nope_in_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_latent_dim))
+        self.v_in_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_latent_dim))
         self.expert_k_nope = nn.Parameter(
             torch.empty(num_experts, num_kv_heads * self.nope_dim, self.kv_latent_dim))
         self.expert_v = nn.Parameter(
@@ -1343,6 +1357,7 @@ class CausalSelfAttention(nn.Module):
         self.expert_kr_a = nn.Parameter(torch.empty(num_experts, self.kr_rank, dim))
         self.expert_kr_b = nn.Parameter(
             torch.empty(num_experts, num_kv_heads * self.rope_dim, self.kr_rank))
+        self.kr_a_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
         self.kr_b_norm_weight = nn.Parameter(torch.ones(num_experts, self.kr_rank))
         for e in range(num_experts):
             nn.init.xavier_uniform_(self.expert_kr_a.data[e])
@@ -1402,7 +1417,7 @@ class CausalSelfAttention(nn.Module):
 
         # --- Per-expert Q (low-rank) ---
         x_flat = x_n.reshape(N, D)
-        q_down = self.expert_q_down.to(dtype=dtype)
+        q_down = self.expert_q_down.to(dtype=dtype) * self.q_down_norm_weight.to(dtype=dtype).unsqueeze(1)
         q_h = (x_flat @ q_down.reshape(E * R_q, D).t()).view(N, E, R_q).permute(1, 0, 2)
         q_h = self._rms_scale(q_h, self.q_up_norm_weight)
         q_up = self.expert_q_up.to(dtype=dtype).transpose(1, 2)
@@ -1417,25 +1432,26 @@ class CausalSelfAttention(nn.Module):
         q_nope = self._rms_scale(q_nope, self.q_nope_norm_weight)
 
         # --- Per-expert KV (low-rank latent) ---
-        kv_a = self.expert_kv_a.to(dtype=dtype)
+        kv_a = self.expert_kv_a.to(dtype=dtype) * self.kv_a_norm_weight.to(dtype=dtype).unsqueeze(1)
         kv_b = self.expert_kv_b.to(dtype=dtype).transpose(1, 2)
         kv_h = (x_flat @ kv_a.reshape(E * R_kv, D).t()).view(N, E, R_kv).permute(1, 0, 2)
         kv_h = self._rms_scale(kv_h, self.kv_b_norm_weight)
         kv_latent = torch.bmm(kv_h, kv_b)  # (E, N, kv_lat)
 
         # Per-expert MLA decompress: kv_latent → K_nope, V
-        # Per-expert RMSNorm (no shared learned weights across experts)
+        # Parameter-free RMS statistic with separate learned K and V input scales.
         kv_flat = kv_latent.reshape(E * N, self.kv_latent_dim)
         kv_rms = kv_flat.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
-        kv_normed = (kv_flat * kv_rms).reshape(E, N, self.kv_latent_dim)
-        kv_normed = kv_normed * self.kv_norm_weight.to(dtype=dtype).unsqueeze(1)  # (E, 1, kv_lat)
+        kv_unit = (kv_flat * kv_rms).reshape(E, N, self.kv_latent_dim)
+        kv_k = kv_unit * self.k_nope_in_norm_weight.to(dtype=dtype).unsqueeze(1)
+        kv_v = kv_unit * self.v_in_norm_weight.to(dtype=dtype).unsqueeze(1)
         ek = self.expert_k_nope.to(dtype=dtype)
         ev = self.expert_v.to(dtype=dtype)
-        k_nope = torch.bmm(kv_normed, ek.transpose(1, 2)).reshape(E, B, T, H_kv, self.nope_dim)
-        v = torch.bmm(kv_normed, ev.transpose(1, 2)).reshape(E, B, T, H_kv, d)
+        k_nope = torch.bmm(kv_k, ek.transpose(1, 2)).reshape(E, B, T, H_kv, self.nope_dim)
+        v = torch.bmm(kv_v, ev.transpose(1, 2)).reshape(E, B, T, H_kv, d)
 
         # Per-expert K_rope (low-rank): each expert has independent position attention
-        kr_a = self.expert_kr_a.to(dtype=dtype)
+        kr_a = self.expert_kr_a.to(dtype=dtype) * self.kr_a_norm_weight.to(dtype=dtype).unsqueeze(1)
         kr_b = self.expert_kr_b.to(dtype=dtype).transpose(1, 2)
         kr_h = (x_flat @ kr_a.reshape(E * self.kr_rank, D).t()).view(N, E, self.kr_rank).permute(1, 0, 2)
         kr_h = self._rms_scale(kr_h, self.kr_b_norm_weight)
@@ -1540,6 +1556,8 @@ class MLP(nn.Module):
         self.expert_rank = expert_rank if expert_rank > 0 else max(hidden // max(num_experts, 1), 1)
         self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
         self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        self.gate_in_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
+        self.fc_in_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
         # Layout (E, D, R) matches repo tests/experiments; computation uses
         # a transpose view to (E, R, D) for batched GEMMs.
         self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
@@ -1556,13 +1574,19 @@ class MLP(nn.Module):
 
     def mix_experts(self, x: Tensor, w: Tensor, *,
                     num_shared: int = 0, shared_gate: Tensor | None = None) -> Tensor:
-        # Caller must pass x already normed by the Block's state_norm.
+        # Caller must pass x already parameter-free RMS-normalized by Block.
         B, T, D = x.shape
         E, R = self.num_experts, self.expert_rank
         N = B * T
         x_flat = x.reshape(N, D)
-        G = self.expert_gate.to(dtype=x_flat.dtype).reshape(E * R, D)
-        Fm = self.expert_fc.to(dtype=x_flat.dtype).reshape(E * R, D)
+        G = (
+            self.expert_gate.to(dtype=x_flat.dtype)
+            * self.gate_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
+        ).reshape(E * R, D)
+        Fm = (
+            self.expert_fc.to(dtype=x_flat.dtype)
+            * self.fc_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
+        ).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
         h = F.silu(gate) * fc
@@ -1644,11 +1668,14 @@ class MoSHead(nn.Module):
         self.rank = rank
         self.num_shared = num_shared
         self.num_specialized = num_specialized
-        self.input_norm = RMSNorm(d_model)  # ALL norms learnable (project constraint)
         self.num_experts = num_shared + num_specialized
         self.fsq_levels = fsq_levels
         self.gate_ctp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
         self.gate_ntp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
+        self.gate_ctp_norm_weight = nn.Parameter(torch.ones(d_model))
+        self.gate_ntp_norm_weight = nn.Parameter(torch.ones(d_model))
+        self.ctp_a_norm_weight = nn.Parameter(torch.ones(self.num_experts, d_model))
+        self.ntp_a_norm_weight = nn.Parameter(torch.ones(self.num_experts, d_model))
         self.A_ctp_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
         self.A_ntp_shared = nn.Parameter(torch.empty(num_shared, d_model, rank))
         self.A_ctp = nn.Parameter(torch.empty(num_specialized, d_model, rank))
@@ -1708,17 +1735,19 @@ class MoSHead(nn.Module):
         A_flat = A_all.permute(0, 2, 1).reshape(E * self.rank, self.d_model)
         return (x.to(A_all.dtype) @ A_flat.t()).view(x.shape[0], E, self.rank)
 
-    def _head_forward(self, x: Tensor, gate: nn.Linear, A_shared: Tensor,
-                      A_spec: Tensor, B: Tensor, rank_norm_weight: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def _head_forward(self, x: Tensor, gate: nn.Linear, gate_norm_weight: Tensor,
+                      A_shared: Tensor, A_spec: Tensor, a_norm_weight: Tensor,
+                      B: Tensor, rank_norm_weight: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         N = x.shape[0]
         E_s, E_p = A_shared.shape[0], A_spec.shape[0]
         E = E_s + E_p
-        x = self.input_norm(x)
-        alpha = F.softmax(gate(x).float(), dim=-1)  # (N, E)
+        x = _rms_unit(x)
+        alpha = F.softmax(gate(x * gate_norm_weight.to(dtype=x.dtype)).float(), dim=-1)  # (N, E)
         log_w = alpha.clamp(min=1e-8).log()          # (N, E)
 
         # Vectorized: concat all A matrices → single batched GEMM
         A_all = torch.cat([A_shared, A_spec], dim=0)  # (E, D, R)
+        A_all = A_all * a_norm_weight.to(dtype=A_all.dtype).unsqueeze(-1)
         t_all = self._project_A(x, A_all)  # (N, E, R)
 
         # Ortho diagnostic from mean expert projections
@@ -1747,12 +1776,14 @@ class MoSHead(nn.Module):
         orig_shape = h.shape[:-1]
         x = h.reshape(-1, self.d_model)
         log_p_d, alpha_d, ortho_ctp = self._head_forward(
-            x, self.gate_ctp, self.A_ctp_shared, self.A_ctp, self.B_denoise,
-            self.ctp_rank_norm_weight,
+            x, self.gate_ctp, self.gate_ctp_norm_weight,
+            self.A_ctp_shared, self.A_ctp, self.ctp_a_norm_weight,
+            self.B_denoise, self.ctp_rank_norm_weight,
         )
         log_p_n, alpha_n, ortho_ntp = self._head_forward(
-            x, self.gate_ntp, self.A_ntp_shared, self.A_ntp, self.B_NTP,
-            self.ntp_rank_norm_weight,
+            x, self.gate_ntp, self.gate_ntp_norm_weight,
+            self.A_ntp_shared, self.A_ntp, self.ntp_a_norm_weight,
+            self.B_NTP, self.ntp_rank_norm_weight,
         )
         self._ctp_ortho_out = ortho_ctp
         self._ntp_ortho_out = ortho_ntp
@@ -1821,19 +1852,15 @@ class Block(nn.Module):
                  num_experts: int = 8, num_shared_experts: int = 0,
                  router_scoring: str = "linear", **kwargs):
         super().__init__()
-        self.state_norm = RMSNorm(dim)
+        # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
+        # State preconditioner is parameter-free RMSUnit; every projection-local
+        # scale is owned by its downstream linear (see Prenorm Scale Independence
+        # Rule in CLAUDE.md). B̄ is passed explicitly through RevDEQFunction's
+        # autograd boundary; a None b_bar means ones(D) (direct Block() in tests).
         self.attn_post_mix_norm = RMSNorm(dim)
         self.mlp_post_mix_norm = RMSNorm(dim)
-        # Phase 9 iter 66b: Parcae-paper-faithful input injection.
-        # T_θ(z, x₀) = B̄ ⊙ RMSNorm_learn(x₀) + Δ_experts(z, x₀)
-        # Shared scale across experts (x₀ is the DEQ input seen by all experts;
-        # the per-expert invariant applies inside the expert path, not here).
-        # B̄ is threaded in by GPT._deq_solve as `_parcae_b_bar`; if unset
-        # (e.g. a direct Block() invocation in a unit test), fall back to ones.
         self.x0_inject_norm_weight = nn.Parameter(torch.ones(dim))
-        self._parcae_b_bar: Tensor | None = None
-        # Phase 9 iter 51 (DeepSeek shared expert): first num_shared_experts
-        # experts are always-on with per-token sigmoid gate (like routed experts).
+        # Shared experts (DeepSeek-style): always-on with per-token sigmoid gate.
         # T_θ = g_s·E_shared(h) + Σ w_j E_routed_j(h)
         self.num_experts = num_experts
         self.num_shared_experts = int(num_shared_experts)
@@ -1841,6 +1868,7 @@ class Block(nn.Module):
         # Sigmoid gate for shared experts (per-token modulation, matches router design)
         if self.num_shared_experts > 0:
             self.shared_gate = nn.Linear(dim, self.num_shared_experts, bias=True)
+            self.shared_gate_norm_weight = nn.Parameter(torch.ones(dim))
             nn.init.zeros_(self.shared_gate.weight)
             nn.init.constant_(self.shared_gate.bias, 1.0)  # init near-open
         # Router only covers routed experts (not shared).
@@ -1873,7 +1901,7 @@ class Block(nn.Module):
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
         x = z_sub + x0_sub
-        h = self.state_norm(x)
+        h = _rms_unit(x)
 
         # Attention ortho: per-expert outputs from independent expert SDPA.
         attn_expert_out = self.attn.forward_experts(h)  # (B, t, E, D)
@@ -1885,8 +1913,14 @@ class Block(nn.Module):
         N = bsz * t
         x_flat = h.reshape(N, dim)
         E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
-        G = self.mlp.expert_gate.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
-        Fm = self.mlp.expert_fc.to(dtype=x_flat.dtype).reshape(E2 * R2, dim)
+        G = (
+            self.mlp.expert_gate.to(dtype=x_flat.dtype)
+            * self.mlp.gate_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
+        ).reshape(E2 * R2, dim)
+        Fm = (
+            self.mlp.expert_fc.to(dtype=x_flat.dtype)
+            * self.mlp.fc_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
+        ).reshape(E2 * R2, dim)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
         h_mlp = F.silu(gate) * fc
@@ -1917,16 +1951,11 @@ class Block(nn.Module):
         w_all = self.router(u_proj, pre_normed=True)  # (..., 2*num_routed)
         return w_all[..., :num_routed].contiguous(), w_all[..., num_routed:].contiguous()
 
-    def forward(self, z_in: Tensor, x0: Tensor) -> Tensor:
-        # Phase 9 iter 51 (DeepSeek shared expert):
-        #   h = RMSNorm(z + x_0)
-        #   Δ_shared = Σ E_shared_j(h)                 — always-on experts (no routing)
-        #   Δ_routed = Σ w_j E_routed_j(h)             — routed experts
-        #   T_θ(z, x_0) = Δ_shared + Δ_routed
-        # x0 conditions the expert/router computation via z + x0, but is not
-        # directly injected into the output map.
+    def forward(self, z_in: Tensor, x0: Tensor, b_bar: Tensor | None = None) -> Tensor:
+        # h = RMSUnit(z + x_0); Δ = Σ g_s·E_shared(h) + Σ w_j·E_routed_j(h).
+        # Output injection (x_0 term) is applied below via B̄ ⊙ RMSUnit(x_0).
         u = z_in + x0
-        h = self.state_norm(u)                   # h = RMSNorm(z + x_0)
+        h = _rms_unit(u)
 
         E = self.num_experts
         S = self.num_shared_experts
@@ -1945,7 +1974,8 @@ class Block(nn.Module):
         attn_expert_out = self.attn.forward_experts(h)  # (B, T, E, D)
         if S > 0:
             # Shared: direct sum with per-token sigmoid gate (no .mean() overhead)
-            g_s = torch.sigmoid(self.shared_gate(h))  # (B, T, S)
+            h_shared_gate = h * self.shared_gate_norm_weight.to(dtype=h.dtype)
+            g_s = torch.sigmoid(self.shared_gate(h_shared_gate))  # (B, T, S)
             if _should_diag(self.training):
                 with torch.no_grad():
                     g_sf = g_s.detach().float()
@@ -1971,7 +2001,7 @@ class Block(nn.Module):
         attn_mix = self.attn_post_mix_norm(attn_mix)
 
         # MLP experts (same split: shared gated + routed).
-        # h is already state_norm-normalized above, which mix_experts assumes.
+        # h is already parameter-free RMS-normalized above, which mix_experts assumes.
         mlp_mix = self.mlp.mix_experts(h, w_mlp,
                                         num_shared=S, shared_gate=g_s if S > 0 else None)
         mlp_mix = self.mlp_post_mix_norm(mlp_mix)
@@ -1979,17 +2009,11 @@ class Block(nn.Module):
         # Dense mixture Δ = attn_mix + mlp_mix.
         delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
 
-        # Parcae-paper-faithful input injection (iter 66b):
-        #   T_θ(z, x_0) = B̄ ⊙ RMSNorm_learn(x_0) + Δ_θ(z, x_0)
-        # B̄ = Δ · B is threaded in by GPT._deq_solve as `_parcae_b_bar`.
-        # At the fixed point (β = 1 − Ā in the solver, Ā cancels):
-        #   y* = B̄ ⊙ RMSNorm_learn(x_0) + Δ*
-        # If B̄ is None (direct Block() call outside a DEQ solve, e.g. unit
-        # tests), use ones(D) so the block still runs as a sanity path —
-        # explicit sentinel rather than a silent zero.
+        # Parcae input injection: T_θ = B̄ ⊙ RMSUnit(x_0) ⊙ g + Δ_θ.
+        # b_bar=None ⇒ ones(D) (direct Block() in tests).  At the fixed point
+        # β=1-Ā cancels and y* = B̄ ⊙ RMSUnit(x_0) ⊙ g + Δ*.
         x0_rms_scale = x0.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
         x0_rms = x0 * x0_rms_scale * self.x0_inject_norm_weight.to(x0.dtype)
-        b_bar = self._parcae_b_bar
         if b_bar is not None:
             x0_rms = b_bar.to(x0_rms.dtype) * x0_rms
         raw_out = x0_rms.to(dtype=z_in.dtype) + delta
@@ -2037,7 +2061,7 @@ class RevDEQFunction(torch.autograd.Function):
             return contextlib.nullcontext()
 
     @staticmethod
-    def forward(ctx, f_theta, x0, z_init, beta, K, bptt_k, *params):
+    def forward(ctx, f_theta, x0, z_init, beta, b_bar, K, bptt_k, *params):
         acc_dtype = torch.float64
         state_dtype = torch.float32
         compute_dtype = z_init.dtype
@@ -2046,6 +2070,13 @@ class RevDEQFunction(torch.autograd.Function):
         # Track whether upstream graph needs grad_beta (for Parcae learning).
         ctx.beta_requires_grad = isinstance(beta, torch.Tensor) and beta.requires_grad
         ctx.beta_input_dtype = beta.dtype if isinstance(beta, torch.Tensor) else None
+        ctx.b_bar_requires_grad = isinstance(b_bar, torch.Tensor) and b_bar.requires_grad
+        ctx.b_bar_input_dtype = b_bar.dtype if isinstance(b_bar, torch.Tensor) else None
+        ctx.has_b_bar = isinstance(b_bar, torch.Tensor)
+        # Store the detached B̄ on ctx directly rather than embedding an empty
+        # sentinel tensor in save_for_backward — the sentinel pattern is brittle
+        # for anything that iterates ctx.saved_tensors expecting real shapes.
+        ctx.b_bar_saved = b_bar.detach() if isinstance(b_bar, torch.Tensor) else None
         if isinstance(beta, torch.Tensor):
             beta = beta.detach().to(torch.float64)
             beta_inv = 1.0 - beta
@@ -2064,13 +2095,13 @@ class RevDEQFunction(torch.autograd.Function):
                 z_prev_state = z_state
                 y_acc = y_state.to(acc_dtype) * beta_inv
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
-                    out_z = f_theta(z_state.to(compute_dtype), x0)
+                    out_z = f_theta(z_state.to(compute_dtype), x0, b_bar)
                 y_acc = y_acc + out_z.to(acc_dtype) * beta
                 y_state = y_acc.to(state_dtype)
 
                 z_acc = z_state.to(acc_dtype) * beta_inv
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
-                    out_y = f_theta(y_state.to(compute_dtype), x0)
+                    out_y = f_theta(y_state.to(compute_dtype), x0, b_bar)
                 z_acc = z_acc + out_y.to(acc_dtype) * beta
                 z_state = z_acc.to(state_dtype)
 
@@ -2088,7 +2119,8 @@ class RevDEQFunction(torch.autograd.Function):
                     except Exception:
                         pass
 
-        ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(), z_prev_state.detach())
+        ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(),
+                              z_prev_state.detach())
         ctx.z_init_state = z_init_state
         ctx.f_theta = f_theta
         # Store as fp64 tensors for backward precision.
@@ -2104,6 +2136,7 @@ class RevDEQFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_z, _grad_z_prev_ignored):
         x0, y_terminal, z_terminal, _z_prev = (t.detach() for t in ctx.saved_tensors)
+        b_bar_saved = ctx.b_bar_saved
         z_init_state = getattr(ctx, "z_init_state", None)
         f_theta = ctx.f_theta
         beta, beta_inv = ctx.beta, ctx.beta_inv
@@ -2121,6 +2154,14 @@ class RevDEQFunction(torch.autograd.Function):
         bar_y = torch.zeros_like(bar_z)
         cur_param_grads_req: list[torch.Tensor | None] = [None] * len(params_req)
         cur_x_grad = torch.zeros_like(x0, dtype=torch.float32)
+        b_bar_requires_grad = bool(getattr(ctx, "b_bar_requires_grad", False))
+        b_bar_local_base: Tensor | None = None
+        grad_b_bar: torch.Tensor | None = None
+        if bool(getattr(ctx, "has_b_bar", False)):
+            b_dtype = getattr(ctx, "b_bar_input_dtype", None) or compute_dtype
+            b_bar_local_base = b_bar_saved.detach().to(dtype=b_dtype)
+            if b_bar_requires_grad:
+                grad_b_bar = torch.zeros_like(b_bar_local_base, dtype=torch.float32)
 
         # Phase 9 iter 66a: accumulate dL/dβ for Parcae gradient flow.
         beta_requires_grad = ctx.beta_requires_grad
@@ -2140,9 +2181,14 @@ class RevDEQFunction(torch.autograd.Function):
         for _ in range(K_bwd):
             y_local = y_next64.detach().to(compute_dtype).requires_grad_()
             x_local = x0.detach().to(x0.dtype).requires_grad_()
+            b_bar_y = None
+            if b_bar_local_base is not None:
+                # .clone() (not .detach()) so the y-leg and z-leg cannot alias
+                # storage within the same iter.  See Custom Autograd Input Rule.
+                b_bar_y = b_bar_local_base.clone().requires_grad_(b_bar_requires_grad)
             with torch.enable_grad():
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
-                    out_y = f_theta(y_local, x_local)
+                    out_y = f_theta(y_local, x_local, b_bar_y)
             z_n64 = (z_next64 - out_y.detach().to(acc_dtype) * beta) / beta_inv
 
             # Parcae β gradient from z update: ∂z_{k+1}/∂β = f(y_{k+1}) - z_k
@@ -2151,16 +2197,28 @@ class RevDEQFunction(torch.autograd.Function):
                 grad_beta += (bar_z.to(acc_dtype) * innovation_z).sum(dim=(0, 1))
 
             grad_seed_y = (beta * bar_z).to(out_y.dtype)
-            grads_y = torch.autograd.grad(out_y, (y_local, x_local, *params_req),
-                                          grad_outputs=grad_seed_y, allow_unused=True)
+            if b_bar_requires_grad:
+                grads_y = torch.autograd.grad(out_y, (y_local, x_local, b_bar_y, *params_req),
+                                              grad_outputs=grad_seed_y, allow_unused=True)
+                gy_b = grads_y[2]
+                y_param_offset = 3
+            else:
+                grads_y = torch.autograd.grad(out_y, (y_local, x_local, *params_req),
+                                              grad_outputs=grad_seed_y, allow_unused=True)
+                gy_b = None
+                y_param_offset = 2
             vjp_y = grads_y[0].to(state_dtype)
             bar_y_acc = bar_y + vjp_y
 
             z_local = z_n64.detach().to(compute_dtype).requires_grad_()
             x_local2 = x0.detach().to(x0.dtype).requires_grad_()
+            b_bar_z = None
+            if b_bar_local_base is not None:
+                # .clone() so the z-leg has an independent leaf; see above.
+                b_bar_z = b_bar_local_base.clone().requires_grad_(b_bar_requires_grad)
             with torch.enable_grad():
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
-                    out_z = f_theta(z_local, x_local2)
+                    out_z = f_theta(z_local, x_local2, b_bar_z)
             y_n64 = (y_next64 - out_z.detach().to(acc_dtype) * beta) / beta_inv
 
             # Parcae β gradient from y update: ∂y_{k+1}/∂β = f(z_k) - y_k
@@ -2169,8 +2227,16 @@ class RevDEQFunction(torch.autograd.Function):
                 grad_beta += (bar_y_acc.to(acc_dtype) * innovation_y).sum(dim=(0, 1))
 
             grad_seed_z = (beta * bar_y_acc).to(out_z.dtype)
-            grads_z = torch.autograd.grad(out_z, (z_local, x_local2, *params_req),
-                                          grad_outputs=grad_seed_z, allow_unused=True)
+            if b_bar_requires_grad:
+                grads_z = torch.autograd.grad(out_z, (z_local, x_local2, b_bar_z, *params_req),
+                                              grad_outputs=grad_seed_z, allow_unused=True)
+                gz_b = grads_z[2]
+                z_param_offset = 3
+            else:
+                grads_z = torch.autograd.grad(out_z, (z_local, x_local2, *params_req),
+                                              grad_outputs=grad_seed_z, allow_unused=True)
+                gz_b = None
+                z_param_offset = 2
             vjp_z = grads_z[0].to(state_dtype)
 
             if do_vjp_diag:
@@ -2185,9 +2251,13 @@ class RevDEQFunction(torch.autograd.Function):
             bar_z = beta_inv * bar_z + vjp_z
             bar_y = beta_inv * bar_y_acc
 
+            if grad_b_bar is not None and (gy_b is not None or gz_b is not None):
+                g_b = (gy_b if gy_b is not None else 0.0) + (gz_b if gz_b is not None else 0.0)
+                grad_b_bar = grad_b_bar + g_b.detach().float()
+
             for j in range(len(params_req)):
-                gy = grads_y[2 + j]
-                gz = grads_z[2 + j]
+                gy = grads_y[y_param_offset + j]
+                gz = grads_z[z_param_offset + j]
                 if gy is None and gz is None:
                     continue
                 g = (gy if gy is not None else 0.0) + (gz if gz is not None else 0.0)
@@ -2237,7 +2307,9 @@ class RevDEQFunction(torch.autograd.Function):
         # grad_beta: (D,) gradient for Parcae β, or None for scalar β.
         # Autograd chain-rules from here through β = 1-exp(Δ·(-exp(log_a))) to parcae params.
         grad_beta_out = grad_beta.to(ctx.beta_input_dtype) if grad_beta is not None else None
-        return (None, cur_x_grad.to(x0.dtype), z_init_grad, grad_beta_out, None, None, *param_grads_out)
+        grad_b_bar_out = grad_b_bar.to(ctx.b_bar_input_dtype) if grad_b_bar is not None else None
+        return (None, cur_x_grad.to(x0.dtype), z_init_grad, grad_beta_out,
+                grad_b_bar_out, None, None, *param_grads_out)
 
 
 # ---------------------------------------------------------------------------
@@ -2340,7 +2412,7 @@ class GPT(nn.Module):
         self._lyapunov_rho_hat_buf: Tensor | None = None
         self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0)  # Phase 9 iter 62 (H53): disabled FSQ
         self.final_norm = RMSNorm(model_dim)
-        # Phase 9 iter 71g: ALL norms learnable (project constraint).
+        # Embedding/final norms remain learnable shared scales outside T_theta.
         self.embed_norm = RMSNorm(model_dim)
         self._init_weights()
 
@@ -2467,10 +2539,6 @@ class GPT(nn.Module):
         track_diag = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
         sb = _unwrap_compiled_module(self.shared_block)
         sb._diag_track_enabled = bool(track_diag)
-        # Thread Parcae B̄ onto the unwrapped block so Block.forward can apply
-        # T(z,x₀) = B̄ ⊙ RMSNorm_learn(x₀) + Δ.  Cleared in the finally below
-        # so direct Block invocations (e.g. from tests) fall back to ones(dim).
-        sb._parcae_b_bar = b_bar
         sb._attn_gate_call_track = []
         sb._router_gate_call_track = []
         sb._attn_router_gate_call_track = []
@@ -2482,7 +2550,7 @@ class GPT(nn.Module):
             if self.training and self.deq_backward == "revdeq":
                 params = tuple(p for p in sb.parameters() if p.requires_grad)
                 bptt_k = int(getattr(self, "deq_bptt_k", 0) or 0)
-                z, z_prev = RevDEQFunction.apply(f_theta, x0, z_init, beta, K, bptt_k, *params)
+                z, z_prev = RevDEQFunction.apply(f_theta, x0, z_init, beta, b_bar, K, bptt_k, *params)
                 return z, z_prev, None, None
 
             # FP32 accumulators for the unrolled solver (eval + non-revdeq train).
@@ -2494,23 +2562,16 @@ class GPT(nn.Module):
             z_prev = z
             for _ in range(K):
                 z_prev = z
-                f_z = f_theta(z, x0)
+                f_z = f_theta(z, x0, b_bar)
                 y_acc = (1 - beta) * y_acc + beta * f_z.to(acc_dtype)
                 y = y_acc.to(dtype)
-                f_y = f_theta(y, x0)
+                f_y = f_theta(y, x0, b_bar)
                 z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
                 z = z_acc.to(dtype)
             return z, z_prev, y_acc, z_acc
         finally:
             _DEQ_SOLVE_ACTIVE = prev_deq_flag
             sb._diag_track_enabled = False
-            # NOTE: do NOT clear sb._parcae_b_bar here. RevDEQFunction.apply
-            # returns immediately but its backward runs later (after loss.backward),
-            # and the backward re-runs Block.forward for reconstruction — which
-            # must use the same B̄ that forward used, or reversibility breaks.
-            # The next _deq_solve call overwrites _parcae_b_bar; direct Block()
-            # calls in tests can set it to None explicitly if they want the
-            # ones(dim) fallback.
             # Aggregate attn_gate per-iteration (1 call per block forward, 2 per iter)
             ag_calls = list(getattr(sb, "_attn_gate_call_track", []) or [])
             if len(ag_calls) == 2 * K:
@@ -2876,9 +2937,12 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
     mos = base_model.mos_head
     mos_params = [mos.A_ctp_shared, mos.A_ntp_shared, mos.A_ctp, mos.A_ntp,
                   mos.B_denoise, mos.B_NTP, mos.ctp_rank_norm_weight,
-                  mos.ntp_rank_norm_weight, mos.gate_ctp.weight,
+                  mos.ntp_rank_norm_weight, mos.gate_ctp_norm_weight,
+                  mos.gate_ntp_norm_weight, mos.ctp_a_norm_weight,
+                  mos.ntp_a_norm_weight,
+                  mos.gate_ctp.weight,
                   mos.gate_ctp.bias, mos.gate_ntp.weight, mos.gate_ntp.bias,
-                  mos.input_norm.weight]
+                  ]
     scalar_params.extend(mos_params)
     scalar_params.append(base_model.final_norm.weight)
     scalar_params.append(base_model.embed_norm.weight)
@@ -3480,12 +3544,18 @@ def main() -> None:
                 z_star = getattr(base_model, '_lyapunov_z_star', None)
                 x0_lyap = getattr(base_model, '_lyapunov_x0', None)
                 lyap_skip = micro_step < grad_accum_steps - 1  # only last micro-step
+                # Compute B̄ once for this step; reuse (detached) for the
+                # Hutchinson probe and (live) for the surrogate + denoising.
+                aux_b_bar = base_model._parcae_b_bar() if base_model.use_parcae else None
+                aux_b_bar_detached = aux_b_bar.detach() if aux_b_bar is not None else None
                 if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
                     blk = sb
                     # Hutchinson-Frobenius: random Rademacher probe (±1)
                     v_hutch = torch.randint(0, 2, z_star.shape, device=z_star.device, dtype=z_star.dtype) * 2.0 - 1.0
                     z_b = z_star.detach().requires_grad_(True)
-                    u_b = blk(z_b, x0_lyap)
+                    # Hutchinson JVP is a ρ̂ diagnostic, not a learning signal —
+                    # use the detached B̄ so it cannot leak grads into parcae_raw_b.
+                    u_b = blk(z_b, x0_lyap, aux_b_bar_detached)
                     jvp = torch.autograd.grad(
                         (u_b * v_hutch).sum(), z_b,
                         create_graph=False, retain_graph=False,
@@ -3508,7 +3578,9 @@ def main() -> None:
                     scale_t = (torch.relu(rho_buf - gamma) / rho_buf.clamp(min=1e-8)).detach()
                     v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
                     z_b2 = z_star.detach()
-                    u_b2 = blk(z_b2, x0_lyap)
+                    # Live B̄: the surrogate trains parcae_raw_b/raw_delta to
+                    # reduce the spectral-radius term.
+                    u_b2 = blk(z_b2, x0_lyap, aux_b_bar)
                     surrogate = (u_b2 * v_dir).sum().abs()
                     loss = loss + lyap_scale * lyap_coef * scale_t.to(dtype=surrogate.dtype) * surrogate
 
@@ -3522,7 +3594,8 @@ def main() -> None:
                     dn_std = float(args.denoising_noise_std)
                     eps_noise = torch.randn_like(z_star) * dn_std
                     z_noisy = z_star.detach() + eps_noise
-                    f_noisy = blk_dn(z_noisy, x0_lyap)
+                    # Live B̄: denoising loss trains all Parcae params.
+                    f_noisy = blk_dn(z_noisy, x0_lyap, aux_b_bar)
                     dn_loss = (f_noisy - z_star.detach()).float().pow(2).mean()
                     loss = loss + lyap_scale * dn_coef * dn_loss
 

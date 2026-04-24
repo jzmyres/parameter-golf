@@ -63,7 +63,10 @@ class TestOptimizerCoverage(unittest.TestCase):
         named = dict(model.named_parameters())
         for name in [
             "bigram.proj_norm.weight",
-            "mos_head.input_norm.weight",
+            "mos_head.gate_ctp_norm_weight",
+            "mos_head.gate_ntp_norm_weight",
+            "mos_head.ctp_a_norm_weight",
+            "mos_head.ntp_a_norm_weight",
             "final_norm.weight",
             "embed_norm.weight",
             # iter 66b: Parcae-paper-faithful input gain + per-dim input norm.
@@ -71,6 +74,13 @@ class TestOptimizerCoverage(unittest.TestCase):
             "parcae_raw_delta",
             "parcae_raw_b",
             "shared_block.x0_inject_norm_weight",
+            "shared_block.router.score_norm_weight",
+            "shared_block.router.gate_norm_weight",
+            "shared_block.attn.q_down_norm_weight",
+            "shared_block.attn.k_nope_in_norm_weight",
+            "shared_block.attn.v_in_norm_weight",
+            "shared_block.mlp.gate_in_norm_weight",
+            "shared_block.mlp.fc_in_norm_weight",
         ]:
             self.assertIn(id(named[name]), grouped_ids,
                           f"{name} missing from optimizer groups")

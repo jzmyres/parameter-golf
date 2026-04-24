@@ -59,7 +59,7 @@ so fixed-point iteration (and damped variants such as RevDEQ) converges from ini
 
 Architecturally, we restore a \textbf{fully expressive} transformer-like block inside $T_\theta$:
 \textbf{no ball projections}, \textbf{no spectral normalization constraints}, and \textbf{standard FlashAttention (MLA + SDPA)}
-instead of L2-attention tricks. Stability is encouraged by (i) a \textbf{learnable RMSNorm preconditioner} before \emph{every} linear projection,
+instead of L2-attention tricks. Stability is encouraged by (i) a \textbf{parameter-free RMS preconditioner plus projection-local learned scale} before \emph{every} linear projection,
 (ii) standard bounded-derivative nonlinearities (e.g.\ SiLU/GELU/SwiGLU), and (iii) a \textbf{single, boundary-only Lyapunov penalty}
 computed with one efficient vector--Jacobian product (VJP) at the detached equilibrium state, using a \textbf{persistent power-iteration vector}
 carried across training steps to reliably target the dominant Jacobian direction.
@@ -89,7 +89,7 @@ The concrete changes are:
         These were the main sources of lost expressiveness.
   \item \textbf{Restore standard attention}: use \textbf{FlashAttention-friendly scaled dot-product attention} (MLA + SDPA) rather than L2-distance attention and
         the homogeneous-coordinate trick.
-  \item \textbf{Stabilize via soft regularization + preconditioning}: add a \textbf{learnable RMSNorm} before \emph{every} linear projection
+  \item \textbf{Stabilize via soft regularization + preconditioning}: add a parameter-free RMS statistic plus an unshared learned scale before \emph{every} linear projection
         (router, Q/K/V/O, and MLP linears) and use standard nonlinearities (SiLU/GELU/SwiGLU).
   \item \textbf{Efficient Lyapunov penalty}: enforce $\rho(J_{z^\star})\lesssim\gamma$ with a single boundary VJP at $z^\star$ (Section~\ref{sec:algorithm}),
         using a \textbf{persistent} one-step power-iteration vector to reliably target the dominant Jacobian direction.
@@ -215,19 +215,43 @@ The optional bigram projection also uses a learnable
 pre-projection RMSNorm when \texttt{bigram\_dim != model\_dim}.
 (Any embedding-side normalization is outside the DEQ stability argument, but its learned scale must be included in optimizer groups.)
 
-\subsection{NormedLinear: learnable RMSNorm before every linear}
+\subsection{NormedLinear: unshared learned scale before every linear}
 \label{sec:normedlinear}
 
-A central design choice is to insert a learnable RMSNorm \emph{before every} linear map used inside $T_\theta$.
-Define a reusable primitive:
+A central design choice is to normalize the activation scale before every
+linear map used inside $T_\theta$, while keeping every learned scale attached
+to the projection it conditions.  The RMS statistic may be shared and
+parameter-free; the learned multiplicative scale must not be shared across
+distinct linear inputs.  Define the primitive:
 \begin{equation}
   \label{eq:normedlinear}
-  \mathrm{NormedLinear}(h;W,b,g) \;:=\; W\,\mathrm{RMSNorm}(h;g) + b,
+  \mathrm{NormedLinear}(h;W,b,g) \;:=\; W\,(\mathrm{RMSUnit}(h)\odot g) + b,
 \end{equation}
-where $\mathrm{RMSNorm}(\cdot;g)$ is learnable (scale $g$, with $\varepsilon$ for numerical stability).
-We use \eqref{eq:normedlinear} for:
-router projections, Q/K/V/O projections, both MLP linears, and MoS low-rank projections.
-Learned normalization scales outside $T_\theta$ (embedding, final norm, and MoS input norm) are also trainable and must be optimizer-covered.
+where $\mathrm{RMSUnit}$ is parameter-free RMS normalization (with
+$\varepsilon$ for numerical stability), and $g$ is the projection-local learned
+scale.  We use \eqref{eq:normedlinear} for router score/gate projections,
+Q/K/V/O projections, both MLP input linears, shared-expert gates, and MoS
+gate/A-bank projections.  Learned normalization scales outside $T_\theta$
+(embedding, final norm, and optional bigram projection norm) are also trainable
+and must be optimizer-covered.
+
+\paragraph{Practical implementation.}
+In \texttt{train\_gpt.py}, \texttt{Block.state\_norm} computes only
+parameter-free \texttt{RMSUnitNorm(z + x0)}.  Each downstream projection owns
+its own learned scale tensor (for example router score vs router gate, MLP
+gate vs MLP fc, K vs V decompression, and CTP vs NTP MoS paths).  This preserves
+the scale-control benefit of prenorm without tying unrelated linear maps
+through one shared learned vector.
+
+\paragraph{Independence constraint (hard).}
+All learnable prenorm scales are \emph{independent}: no two distinct linear
+inputs inside $T_\theta$ or its auxiliary heads may share the same learned
+scale parameter.  Every scale parameter must be referenced by exactly one
+linear's forward.  The shape of a scale follows its linear: per-expert linears
+own scales of shape $(E, D)$ or $(E, r)$; shared linears routing \emph{to}
+experts (router score, router gate, shared-expert gate, MoS routing gates)
+own scales of shape $(D,)$ because the linear itself has no $E$ dimension ---
+but the scales themselves remain pairwise distinct Parameters.
 
 \begin{remark}[Why this helps stability without killing expressiveness]
 RMSNorm preconditioning controls activation scale and reduces sensitivity to weight growth,
@@ -440,7 +464,7 @@ a_bar   = eps_rev + (1-eps_rev) * exp(delta_ * -(softplus(parcae_raw_a) + eps_mi
 b_bar   = delta_ * (softplus(parcae_raw_b) + eps_min)
 beta    = 1 - a_bar                                  # per-dim solver blend
 
-# 3) RevDEQ solve (forward) with block T_theta using b_bar internally.
+# 3) RevDEQ solve (forward); b_bar is an explicit solver/function input.
 y_state = x0
 z_state = x0
 for k in 0..K_max-1:
@@ -573,17 +597,27 @@ solves. Reconstruction inverts the Phase-1 update per dimension:
 The reversibility floor on $\bar A$ (Section~\ref{sec:parcae_params})
 guarantees a non-zero denominator; all Parcae parameters
 $(\text{raw\_a}, \text{raw\_delta}, \text{raw\_b})$ receive gradients from
-this reverse pass because $T_\theta$ and $\beta$ both depend on them:
+this reverse pass only if every Parcae-dependent tensor crosses the custom
+autograd boundary as an explicit input:
 \begin{itemize}[leftmargin=2em,itemsep=0.1em]
   \item $\beta = 1-\bar A$ — grads flow back to \texttt{parcae\_raw\_a} and
         \texttt{parcae\_raw\_delta} through the solver's convex-combination
         coefficient in every iteration.
-  \item $\bar B$ inside $T_\theta$ — grads flow back to
+  \item $\bar B$ is passed to \texttt{RevDEQFunction.apply(..., beta, b\_bar, ...)}
+        and then into every re-evaluation of $T_\theta$ — grads flow back to
         \texttt{parcae\_raw\_b} and \texttt{parcae\_raw\_delta} through the
         $\bar B\odot\mathrm{RMSNorm}_{\text{learn}}(x_0)$ term
         (equation~\ref{eq:Tx_new}) during each re-evaluation of $T_\theta$
         in the reverse pass.
 \end{itemize}
+
+\paragraph{Practical implementation.}
+Do not hide trainable or reparameterized tensors behind mutable module
+attributes when using a custom \texttt{autograd.Function}.  PyTorch can only
+chain gradients to inputs returned from the function's \texttt{backward}; a
+tensor read from module state inside \texttt{backward} is invisible unless it
+was also an explicit \texttt{apply} input.  Therefore $\bar B$ is a solver input
+like $\beta$, not an implicit \texttt{Block} attribute.
 
 \begin{lstlisting}
 # 3) Total loss and backward

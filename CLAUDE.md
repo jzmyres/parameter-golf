@@ -401,7 +401,9 @@ The DEQ block may add an output-side `x0` term only if it is scaled by a learnab
 ```
 T_θ(z, x_0) = B̄ ⊙ RMSNorm_learn(x_0) + Δ(z, x_0)
 ```
-where `B̄` is independent of the solver's `β = 1 − Ā` except through the shared per-dim step size Δ. Any change to this equation must update `train_gpt.py`, `opg_doc.tex` §eq:Tx_new, and the regression tests in `tests/test_gate_init_defaults.py` (`test_zero_expert_delta_returns_b_bar_times_norm_x0` and `test_direct_block_without_b_bar_uses_ones_fallback`) in the same commit.
+where `B̄` is independent of the solver's `β = 1 − Ā` except through the shared per-dim step size Δ. Any change to this equation must update `train_gpt.py`, `opg_doc.tex` §eq:Tx_new, and the regression tests in `tests/test_gate_init_defaults.py` (`test_zero_expert_delta_returns_b_bar_times_norm_x0`, `test_direct_block_without_b_bar_skips_b_bar_term`, and `test_revdeq_default_trains_parcae_b_bar`) in the same commit.
+
+`B̄` MUST be passed explicitly through `RevDEQFunction.apply(..., beta, b_bar, ...)`; storing it on a module attribute is insufficient because custom autograd can only return gradients for explicit inputs.
 
 ### RevDEQ Reversibility Floor Rule
 Any per-dim coefficient that divides the RevDEQ backward reconstruction MUST be lower-bounded by a correctness constant documented as such in code. The RevDEQ reverse step is:
@@ -473,6 +475,42 @@ Any code that crosses a wrapper, device, or optional-telemetry boundary MUST mak
 4. Add or update a contract test for the boundary. Comments and local intent are not enforcement.
 
 Rationale (incident from 2026-04-23 review): validation wrote `_deq_k_override` to a wrapper instead of the underlying `GPT`, a Lyapunov CUDA scalar branch risked hot-path synchronization, and `update_results.sh` could abort on an incomplete log before printing the intended `val_bpb=?` fallback. All three bugs crossed an implicit boundary without a test.
+
+### Custom Autograd Input Rule
+Every tensor that should receive gradients through a custom `torch.autograd.Function` MUST be an explicit `apply(...)` input and have a corresponding gradient slot in `backward(...)`. Reading a trainable tensor from module state inside the function's forward/backward is not enough: autograd has no edge to chain through unless the tensor crosses the function boundary.
+
+When a saved tensor is re-instantiated as a leaf inside a `for _ in range(K)` loop in `backward()` (for truncated-BPTT or K-step unrolled reverse solves), use `.clone().requires_grad_(flag)` — NOT `.detach().requires_grad_(flag)` — so that successive iterations and multiple legs (y-leg, z-leg) within one iteration do not share underlying storage. `.detach()` returns a view; a future in-place edit to the leaf inside `f_theta` then silently aliases across legs. Cost is one small-tensor allocation per step; the robustness is permanent.
+
+Optional tensor inputs (e.g. `b_bar` when `use_parcae=False`) MUST be stored on `ctx` as a plain attribute (`ctx.b_bar_saved = tensor_or_None`), not embedded in `save_for_backward` via an empty-tensor sentinel. `save_for_backward` is semantically a list of *real* tensors; iterating it elsewhere and assuming non-empty shapes must remain safe.
+
+Rationale (incident from 2026-04-23 review): `B̄ = Δ·B` was computed in `GPT._deq_solve()` and stored on a `Block` attribute, but `RevDEQFunction.apply(...)` only accepted `beta` and block parameters. The reverse pass re-ran `Block.forward`, so outputs numerically depended on `B̄`, but `backward(...)` never returned a `grad_b_bar`; task-loss gradients to `parcae_raw_b` were therefore silently absent. Contract tests must compare custom-backward gradients against explicit unroll gradients for every non-parameter tensor input (`beta`, `b_bar`, etc.). The clone-vs-detach clause comes from the 2026-04-24 pre-commit review of the same iter: two `.detach().requires_grad_()` leaves (y-leg, z-leg) aliased the same storage; the current backward is correct because autograd tracks by tensor identity, but any future in-place edit of `b_bar` inside `f_theta` would silently corrupt the other leg.
+
+### Prenorm Scale Independence Rule (HARD CONSTRAINT)
+**All learnable prenorm scales are independent — no two distinct linear inputs inside the training graph may share the same learned scale Parameter.** The RMS statistic (`RMSUnit(x) = x / sqrt(mean(x²) + ε)`) is parameter-free and may be reused freely; the learned multiplicative scale that follows it is owned exclusively by the linear input it conditions.
+
+Formally: for every linear map `y = W·(RMSUnit(x) ⊙ g) + b` inside `T_theta` or its auxiliary heads, `g` is an `nn.Parameter` that conditions exactly one linear weight (`W`). The same `(W, g)` pair may appear in multiple forward paths (e.g. the main expert mixer and the orthogonality diagnostic), but `g` must never condition a second, distinct weight tensor.
+
+**Shape follows the linear, not the rule.** The rule is about *independence*, not shape:
+- A per-expert linear (per-expert Q/K/V/O banks, per-expert MLP gate/fc, per-expert MoS A-banks) owns a scale of shape `(E, D)` or `(E, rank)` — leading dim `E` matches the linear's per-expert dimension.
+- A shared linear that the expert path routes *through* (router score, router gate, shared-expert gate, MoS routing gates) owns a scale of shape `(D,)` — there is no `E` dimension because the linear itself is not per-expert. This is still "independent": the router's score-scale and gate-scale are two distinct Parameters, even though both are shape `(D,)`.
+
+Rationale: a shared learned prenorm scale couples unrelated linear maps and violates the expert/projection independence invariant. The regression this rule guards against is the pre-iter-66b state where a single `state_norm.weight` was multiplied before the router, every attention projection, every MLP input, the shared gate, and every MoS A-bank — eight+ distinct linear maps tied to one learned vector. The fix is one Parameter per linear input: `router.score_norm_weight`, `router.gate_norm_weight`, `attn.q_down_norm_weight`, `attn.kv_a_norm_weight`, `attn.kr_a_norm_weight`, `attn.k_nope_in_norm_weight`, `attn.v_in_norm_weight`, `mlp.gate_in_norm_weight`, `mlp.fc_in_norm_weight`, `shared_gate_norm_weight`, `mos_head.gate_ctp_norm_weight`, `mos_head.gate_ntp_norm_weight`, `mos_head.ctp_a_norm_weight`, `mos_head.ntp_a_norm_weight`, and any per-rank post-projection scales on the expert path.
+
+**Enforcement.** Before committing any code that adds a learned prenorm scale, run:
+```
+grep -n '_norm_weight' train_gpt.py
+```
+For each scale, verify every usage multiplies the SAME linear weight — i.e. the scale conditions one `W`. A scale that appears against two distinct `W` Parameters in forward is a violation. The contract tests `test_expert_path_parameters_are_expert_independent` and `TestOptimizerCoverage.test_all_trainable_parameters_are_grouped_once` together catch missing scales and check per-expert shapes, but the grep audit is the first line of defense against cross-linear sharing.
+
+### Identifier Uniqueness Across Wrappers Rule
+An identifier that appears on more than one class in the same call graph (e.g. `GPT`/`Block`, `GPT`/`MoSHead`, `Block`/`MLP`) MUST NOT be a method on one class and an attribute on another. Two distinct semantics for one name — even when Python dispatch resolves them today — is a latent collision: a future proxy, wrapper, or `_unwrap_compiled_module` call can promote or demote the lookup and silently flip semantics.
+
+Checklist for every new attribute or method on a class used inside the training graph:
+1. `grep -n '\.<name>\b' train_gpt.py tests/ experiments/` — confirm no pre-existing method/attribute with the same base name on a sibling class.
+2. If the name must be reused (e.g. a cached value mirroring a computed property), suffix the cache or delete the duplicate if it is dead state.
+3. When adding a method whose name conflicts with a pre-existing attribute on a sibling class, rename (or delete) the attribute in the same commit and update every reader.
+
+Rationale (incident, iter 66b pre-commit review, 2026-04-24): `_parcae_b_bar` was simultaneously a `GPT` method (computes `Δ·B` on the fly) and a `Block` attribute (threaded by `_deq_solve`). The assignment and clear in `_deq_solve` became dead once all readers passed `b_bar` explicitly, but the shared name made dead writes read like live state; one reviewer mis-escalated to a correctness CRITICAL because they could not distinguish the two. The `/simplify` pass dropped the Block attribute entirely — the method on `GPT` is now the sole holder of that name.
 
 ### Routing Predicate Migration Rule
 When adding or changing any predicate that classifies parameters, modules, or tensors into regimes — optimizer groups, quantization tiers, compile targets, `CONTROL_TENSOR_PATTERNS`, `FP16_KEEP_PATTERNS`, EMA keys, gradient hooks, diagnostic buckets — the same commit MUST:

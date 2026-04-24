@@ -119,8 +119,10 @@ class TestMLPFusedExpertMix(unittest.TestCase):
         out_fused = mlp.mix_experts(x, w)
 
         x_n = x
-        gate_h = torch.einsum("btd,esd->btes", x_n, mlp.expert_gate.to(dtype=x_n.dtype))
-        fc_h = torch.einsum("btd,esd->btes", x_n, mlp.expert_fc.to(dtype=x_n.dtype))
+        gate_w = mlp.expert_gate.to(dtype=x_n.dtype) * mlp.gate_in_norm_weight.to(dtype=x_n.dtype).unsqueeze(1)
+        fc_w = mlp.expert_fc.to(dtype=x_n.dtype) * mlp.fc_in_norm_weight.to(dtype=x_n.dtype).unsqueeze(1)
+        gate_h = torch.einsum("btd,esd->btes", x_n, gate_w)
+        fc_h = torch.einsum("btd,esd->btes", x_n, fc_w)
         B_, T_, _, _ = gate_h.shape
         h_act = F.silu(gate_h) * fc_h  # [B,T,E,R]  — SwiGLU
         h_flat = h_act.reshape(B_ * T_, mlp.num_experts, mlp.expert_rank)
