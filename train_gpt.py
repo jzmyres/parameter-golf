@@ -1596,7 +1596,7 @@ class MLP(nn.Module):
         ).reshape(E * R, D)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h = F.leaky_relu(gate, 0.5).square() * fc
+        h = F.silu(gate) * fc
         h = h.view(N, E, R)
         # Per-expert RMSNorm (no shared weights across experts)
         h_rms = h.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
@@ -1955,7 +1955,7 @@ class Block(nn.Module):
         ).reshape(E2 * R2, dim)
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
-        h_mlp = F.leaky_relu(gate, 0.5).square() * fc
+        h_mlp = F.silu(gate) * fc
         mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)
         down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).transpose(1, 2)  # (E, R, D)
         mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
