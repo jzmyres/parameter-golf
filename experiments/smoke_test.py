@@ -68,8 +68,8 @@ def _get_expert_diagnostics(model):
     # Orthogonality (from 3D expert weight tensors [num_experts, rows, cols])
     with torch.no_grad():
         for name, w in [
-            ("mlp", model.shared_block.mlp.expert_fc.float()),
-            ("attn", model.shared_block.attn.expert_q_down.float()),
+            ("mlp", model.shared_block.mlp.expert_body.expert_fc.float()),
+            ("attn", model.shared_block.attn.in_proj.in_down.float()),
         ]:
             n_exp = w.shape[0]
             if n_exp < 2:
@@ -91,8 +91,13 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
-        attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
+        num_refinements=args.num_refinements,
+        attn_bottleneck_r=args.attn_bottleneck_r,
+        mlp_bottleneck_r=args.mlp_bottleneck_r,
+        expert_proj_rank=args.expert_proj_rank,
+        attn_inner_heads=args.attn_inner_heads,
+        attn_inner_kv_heads=args.attn_inner_kv_heads,
+        mlp_inner_mult=args.mlp_inner_mult,
         deq_backward="revdeq",
         router_scoring=args.router_scoring,
         num_experts=args.num_experts,

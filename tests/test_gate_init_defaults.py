@@ -21,6 +21,9 @@ def _fresh_block(dim: int = 32) -> Block:
     return Block(
         dim=dim, num_heads=4, num_kv_heads=2, rope_base=10000.0,
         qk_gain_init=1.0, mlp_mult=2.0,
+        num_experts=4, num_shared_experts=0, router_scoring="linear",
+        attn_bottleneck_r=16, mlp_bottleneck_r=16, expert_proj_rank=8,
+        attn_inner_heads=2, attn_inner_kv_heads=1, mlp_inner_mult=2.0,
     )
 
 
@@ -48,16 +51,22 @@ class TestLyapunovArchDefaults(unittest.TestCase):
         """Iter 41 removed all spectral-norm caps from Block."""
         from torch.nn.utils import parametrize
         b = _fresh_block()
-        # Check attention expert banks are NOT parametrized
-        for name in ["expert_q_down", "expert_q_up", "expert_kv_a", "expert_kv_b"]:
+        # Check attention expert banks are NOT parametrized (iter 90 layout).
+        for name in ["expert_q", "expert_kv_a", "expert_k_nope", "expert_v",
+                     "expert_kr", "expert_wo"]:
             self.assertFalse(
-                parametrize.is_parametrized(b.attn, name),
-                f"attn.{name} still has spectral norm parametrization",
+                parametrize.is_parametrized(b.attn.expert_body, name),
+                f"attn.expert_body.{name} still has spectral norm parametrization",
+            )
+        for name in ["in_down", "in_up"]:
+            self.assertFalse(
+                parametrize.is_parametrized(b.attn.in_proj, name),
+                f"attn.in_proj.{name} still has spectral norm parametrization",
             )
         for name in ["expert_gate", "expert_fc", "expert_down"]:
             self.assertFalse(
-                parametrize.is_parametrized(b.mlp, name),
-                f"mlp.{name} still has spectral norm parametrization",
+                parametrize.is_parametrized(b.mlp.expert_body, name),
+                f"mlp.expert_body.{name} still has spectral norm parametrization",
             )
 
     def test_no_tau_shell(self) -> None:
@@ -139,10 +148,13 @@ class TestLyapunovArchDefaults(unittest.TestCase):
             rope_base=10000.0,
             qk_gain_init=1.0,
             bigram_vocab_size=0,
-            kv_latent_dim=16,
             num_refinements=0,
-            attn_expert_rank=4,
-            mlp_expert_rank=4,
+            attn_bottleneck_r=16,
+            mlp_bottleneck_r=16,
+            expert_proj_rank=4,
+            attn_inner_heads=2,
+            attn_inner_kv_heads=1,
+            mlp_inner_mult=2.0,
             num_experts=2,
             num_shared_experts=0,
             use_parcae=True,

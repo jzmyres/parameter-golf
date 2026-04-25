@@ -71,6 +71,9 @@ class TestBlockForwardShape(unittest.TestCase):
         return Block(
             dim, num_heads=2, num_kv_heads=1, mlp_mult=2.0,
             rope_base=1000.0, qk_gain_init=1.0,
+            num_experts=2, num_shared_experts=0, router_scoring="linear",
+            attn_bottleneck_r=8, mlp_bottleneck_r=8, expert_proj_rank=4,
+            attn_inner_heads=2, attn_inner_kv_heads=1, mlp_inner_mult=2.0,
         )
 
     def test_forward_output_shape(self):
