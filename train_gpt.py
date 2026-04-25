@@ -243,7 +243,14 @@ class Hyperparameters:
     # Phase 9 iter 55: Denoising regularization (HyDRA 2026, Efficient DEQ 2025).
     # ||f(z*+ε, x0) - z*||² penalizes contraction failure at finite perturbation.
     # Complements Hutchinson (which penalizes ||J||²_F at infinitesimal scale).
-    denoising_coef = 0.01      # weight of denoising loss
+    # Phase 9 iter 89 (2026-04-25): HyDRA denoising disabled (0.01 → 0).
+    # Same hypothesis as iter 88 for the finite-perturbation contraction probe:
+    # under iter-66b Parcae per-dim Ā, the spectral radius is bounded away
+    # from 1 by construction, so ||f(z*+ε, x0) - z*||² has nothing to grip
+    # on at training time.  If the hypothesis holds, denoising contributes
+    # only noise + one extra block forward per step.  Code path retained
+    # (commented-out future cleanup permitted per user directive 2026-04-25).
+    denoising_coef = 0.0       # weight of denoising loss (iter 89: disabled)
     denoising_noise_std = 0.01 # σ: Gaussian noise scale added to z*
 
     # DEQ solver

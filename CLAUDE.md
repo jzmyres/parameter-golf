@@ -107,7 +107,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | lyapunov_coef | 0.0 (iter 88: λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
 | lyapunov_gamma | 0.97 (target spectral radius threshold) |
 | lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
-| denoising_coef | 0.01 (HyDRA denoising regularization weight) |
+| denoising_coef | 0.0 (iter 89: HyDRA denoising disabled — same Parcae-redundancy logic as iter 88) |
 | denoising_noise_std | 0.01 (Gaussian noise σ for denoising penalty) |
 
 ### Quantization & Techniques
