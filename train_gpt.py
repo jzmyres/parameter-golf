@@ -273,9 +273,9 @@ class Hyperparameters:
     # the new architecture stabilizes val_bpb.
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 16  # iter 30: reset to baseline for clean Phase 6 comparison
+    deq_k_max = 20  # iter 87 (2026-04-24): bumped 16 → 20 to accommodate widened deq_k_jitter_set (8,12,20).
     deq_k_step = 4
-    deq_k_jitter_set = (4, 6, 10)  # T-opt 5/10: lower avg K (β=0.30 converges faster → fewer iters needed)
+    deq_k_jitter_set = (8, 12, 20)  # iter 87 (2026-04-24): doubled from (4,6,10) — deeper FP at training time should tighten K-sweep.
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
