@@ -263,22 +263,9 @@ class Hyperparameters:
     # Iter 85 (2026-04-24): stochastic TBPTT — sample deq_bptt_k per step from
     # the set below, analogous to K-jitter (H12 VERIFIED). Forces the model to
     # be robust across gradient-truncation depths. The set's shuffle-bag
-    # sampler matches the β-jitter pattern. SUPERSEDED by iter 95 anneal when
-    # `deq_bptt_k_anneal=True`; the shuffle-bag fields below remain so that
-    # `--deq-bptt-k-anneal=0` falls back to the iter-85 sampler.
+    # sampler matches the β-jitter pattern.
     deq_bptt_k_jitter = True
     deq_bptt_k_jitter_set = (2, 3, 4)
-    # Iter 95 (2026-04-25): anneal TBPTT depth. Hypothesis: gradient-truncation
-    # needs change with optimization phase — early training benefits from
-    # short TBPTT (recent grad most informative when params change fast),
-    # late training benefits from deeper TBPTT (refines FP under stable
-    # params). Linear schedule across `args.iterations`. When True, supersedes
-    # the iter-85 shuffle-bag jitter. End-value 8 ≈ K/2 of mean K=16 (K-jitter
-    # set 8,12,20, mean ≈ 13.3, max 20). Clamped to the per-step K so that
-    # bptt_k ≤ K is always satisfied.
-    deq_bptt_k_anneal = True
-    deq_bptt_k_anneal_start = 1
-    deq_bptt_k_anneal_end = 8
     # TBPTT investigation (28-28d) concluded; best point was 28c (val_bpb
     # 1.925, K=128 Δ=0.015 vs baseline 0.039).  Machinery retained in code
     # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
@@ -342,7 +329,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
         "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
         "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
-        "deq-bptt-k-anneal-start", "deq-bptt-k-anneal-end",
         "warmdown-frac", "num-refinements-ramp-frac",
     ]:
         py_name = name.replace("-", "_")
@@ -356,7 +342,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
         "swa-enabled", "ema-enabled", "use-ctp",
-        "deq-bptt-k-jitter", "deq-bptt-k-anneal",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # Backward compat: "unroll" is the established name in experiments/docs.
@@ -369,8 +354,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         raise SystemExit(f"Unknown args: {unknown}")
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
-                 "swa_enabled", "ema_enabled", "use_ctp",
-                 "deq_bptt_k_jitter", "deq_bptt_k_anneal"}
+                 "swa_enabled", "ema_enabled", "use_ctp"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -3244,23 +3228,11 @@ def main() -> None:
         return b
 
     # Iter 85: stochastic TBPTT sampler (shuffle-bag, mirroring β-jitter).
-    # Iter 95: anneal schedule supersedes the shuffle-bag when enabled —
-    # linearly interpolate deq_bptt_k from `deq_bptt_k_anneal_start` to
-    # `deq_bptt_k_anneal_end` across `args.iterations`, clamped to the
-    # per-step K so bptt_k ≤ K always. The schedule is deterministic in
-    # `step_i`, so all DDP ranks compute the same value without broadcast.
     _bptt_k_jitter_set = getattr(args, "deq_bptt_k_jitter_set", None)
     _bptt_k_bag: list[int] = []
     _bptt_k_rng = random.Random(args.seed + 31337)
 
-    def deq_bptt_k_for_step(step_i: int, k_step: int) -> int:
-        if getattr(args, "deq_bptt_k_anneal", False):
-            total = max(int(args.iterations), 1)
-            progress = min(max(step_i / total, 0.0), 1.0)
-            start = int(getattr(args, "deq_bptt_k_anneal_start", 1))
-            end = int(getattr(args, "deq_bptt_k_anneal_end", 8))
-            k = int(round(start + progress * (end - start)))
-            return max(1, min(k, int(k_step)))
+    def deq_bptt_k_for_step(step_i: int) -> int:
         if not getattr(args, "deq_bptt_k_jitter", False):
             return int(args.deq_bptt_k)
         nonlocal _bptt_k_bag
@@ -3621,14 +3593,12 @@ def main() -> None:
             args.train_log_every > 0
             and (next_step <= 10 or next_step % args.train_log_every == 0 or stop_after_step is not None)
         )
-        k_for_step = deq_k_for_step(next_step)
-        base_model._deq_k_override = k_for_step
+        base_model._deq_k_override = deq_k_for_step(next_step)
         # Scalar β jitter only when Parcae is disabled (Parcae supersedes scalar β).
         if not base_model.use_parcae:
             base_model.deq_beta = deq_beta_for_step(next_step)
-        # Iter 85 / 95: TBPTT depth — anneal (95) supersedes shuffle-bag (85);
-        # both clamp to k_for_step so bptt_k ≤ K is always satisfied.
-        base_model.deq_bptt_k = deq_bptt_k_for_step(next_step, k_for_step)
+        # Iter 85: stochastic TBPTT — sample deq_bptt_k per step from {2,3,4}.
+        base_model.deq_bptt_k = deq_bptt_k_for_step(next_step)
 
         # Refinement gating: enable after ramp_frac of wallclock
         ramp_frac = float(getattr(args, "num_refinements_ramp_frac", 0.85))

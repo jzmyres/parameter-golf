@@ -75,10 +75,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | parcae_init_a_bar | 0.7 (initial Ā per dim; β₀ = 1-Ā₀ = 0.3) |
 | parcae_init_b_bar | 0.3 (B̄₀ ≈ 1-Ā₀ at step 0; iter 66b continuity with iter 66a) |
 | parcae_reversibility_floor | 0.1 (correctness constant — Ā ≥ this bound for RevDEQ backward safety, NOT a tuning knob) |
-| deq_bptt_k | 2 (fallback when both anneal and jitter are False) |
-| deq_bptt_k_anneal | True (iter 95: linear anneal from 1 → 8 across `iterations`, clamped to per-step K) |
-| deq_bptt_k_anneal_start | 1 |
-| deq_bptt_k_anneal_end | 8 (≈ K/2 of mean K=16 across K-jitter set 8,12,20) |
+| deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
 | num_refinements | 1 |
 | use_ctp | False (iter 94: CTP head disabled — NTP-only; CTP param banks not allocated) |
 
@@ -106,7 +103,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
-| deq_k_jitter_set | (8, 12, 20) (DEQ iteration counts sampled per step; iter 87) |
+| deq_k_jitter_set | (4, 6, 10) (DEQ iteration counts sampled per step) |
 | lyapunov_coef | 0.01 (λ_jac: Hutchinson-Frobenius penalty weight) |
 | lyapunov_gamma | 0.97 (target spectral radius threshold) |
 | lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
