@@ -542,6 +542,45 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H65: WD 0.30 → 0.01 (iter 86) — PROMOTED ★★★ (2026-04-24, MAJOR WIN)
+
+**Claim:** Under the iter 93 landscape (NTP-only + Parcae B̄ + learnable RMSNorm scales everywhere + split shared gates + no BigramHash), the regularization that WD=0.30 was providing has shifted to other mechanisms. A much lower WD floor lets the transformer body express more without destabilizing.
+
+**Test:** iter 86 — one-line `Hyperparameters.weight_decay 0.30 → 0.01`. NOT the same as iter 66a-b (which set WD=0 selectively on 1D params and regressed +0.14 — the WD=0.01 floor stays positive on 1D scalars/norms). Commit `df2cfdb`.
+
+**Result:** PROMOTED. **Largest single-iter improvement in the entire queue.**
+
+| Metric | Iter 93 baseline | Iter 86 | Δ |
+|---|---|---|---|
+| val_bpb fast | 1.5725 | **1.5042** | **-0.0683** ★★★ |
+| val_bpb int6 | 1.5921 | **1.5390** | **-0.0531** ★★★ |
+| k=4 | 1.5995 | 1.5423 | -0.0572 |
+| k=8 | 1.5834 | 1.5281 | -0.0553 |
+| k=16 | 1.5921 | 1.5390 | -0.0531 |
+| k=32 | 1.5940 | 1.5415 | -0.0525 |
+| k=64 | 1.5943 | 1.5421 | -0.0522 |
+| k=128 | 1.5945 | **1.5429** | **-0.0516** |
+| K=8→K=128 Δ | +0.0111 | +0.0148 | +0.004 (still ≪0.5 ✓) |
+| artifact bytes | 5,737,459 | 5,948,483 | +211,024 (+3.7%) |
+
+Mid-training trajectory was clean: step 200 +0.014 (small early regression as ramp-up needed slightly higher WD), then -0.018/-0.071/-0.083 at steps 400/600/800 — the lead widened monotonically from step 400 onward. **Every K-sweep point improved by ~5%**, an unusually broad and consistent gain.
+
+**Why WD=0.30 was over-regularizing:** the iter 93 landscape has shifted what each mechanism manages:
+- learnable prenorm scales (iter 71g+) carry per-projection magnitude control that WD was carrying implicitly
+- Parcae B̄ + learnable x0_inject_norm provide structural signal that WD's weight-shrink was preventing
+- split shared gates (iter 84) double the modulation degrees of freedom
+- removing CTP (iter 94) and BigramHash (iter 93) removed ~2 M params, so the *remaining* parameters are doing more work each — heavy WD throttles them
+
+The accumulated Group A changes converted the loss landscape so the transformer body needs *less* regularization, not more.
+
+**Tradeoff cost:** artifact +211 KB (+3.7%) — weights are slightly larger because less shrinkage. Still ~6 MB, well under 16 MB. K=8→K=128 Δ widened slightly (+0.004) but absolute K=128 still beats iter 93 by 0.052.
+
+**Status:** ✅ VERIFIED. PROMOTED as new baseline (commit `df2cfdb`, val_bpb int6 = 1.5390). This is the new SOTA-track baseline.
+
+**Implication:** WD=0.30 was a legacy from the iter 24 phase (β=0.20, dome-gate regime) where weight magnitudes had to be tightly controlled to keep the contraction property. Modern iter 93 landscape doesn't need that pressure. The next legacy WD-era choice to revisit is the AdamW β2 (iter 25 era), but later. For now, WD=0.01 is the new floor.
+
+**Next candidate for similar audit:** Lyapunov coefficient (iter 88) — same era as WD=0.30, may be similarly over-regularized.
+
 ### H64: Disable BigramHash (iter 93) — PROMOTED ★ (2026-04-24)
 
 **Claim:** BigramHash (4096-entry, 128-dim) was added in iter 6 under a very different architecture (pre-DEQ, pre-experts, no Parcae B̄ input injection, no learnable norms). Under the current iter 85 baseline — which now carries token-pair information through (a) the DEQ's x₀ re-injection at every iteration, (b) Parcae's `B̄ ⊙ RMSNorm(x₀)` additive injection at the fixed point, and (c) learnable prenorm scales on every projection — the BigramHash path is architecturally redundant and disabling it frees ~1 MB of artifact budget for the Group D arch scale-up.
@@ -1013,8 +1052,9 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
-| **86** | 74c | WD 0.30 → 0.01 re-test | Revisit under iter 71g (learnable norms everywhere) + iter 66b (Parcae B̄) landscape; both absorb some of what iter 71b showed WD was providing on non-norm paths. |
+| **86** | 74c | WD 0.30 → 0.01 re-test | **PROMOTED ★★★ (commit `df2cfdb`)** — int6 Δ=**-0.0531** (largest single-iter win in queue), every K-sweep point improved ~5%, K=8→K=128 widened +0.004 (still ≪0.5), artifact +3.7% (slightly larger weights, expected). See H65. |
 | **87** | 81 | K-jitter `{4,6,10} → {8,12,20}` | Iter 59 replay in milder form. Run only if 83-86 land cleanly — throughput budget has to accommodate ~10-15% fewer steps/s. |
+| **95** | new | Anneal TBPTT depth `1-2 → K/2 (or K)` over training | Builds on iter 85 TBPTT-jitter machinery. Hypothesis: early training has rapid param drift, so small TBPTT (k=1-2) captures the most useful recent gradients. Late training has stable params, so deeper TBPTT (k=K/2 or full K) refines FP quality without the warmup cost. Replaces the per-step uniform sampler with a schedule (linear or cosine) over `step/iterations`. Wallclock-aware variant: clamp the late-training k by elapsed_ms when wallclock-capped. Run after iter 87 since deq_k_max may have widened. |
 
 #### Group C — legacy-loss ablations (after Parcae is validated)
 
