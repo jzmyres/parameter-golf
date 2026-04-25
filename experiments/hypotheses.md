@@ -1086,7 +1086,6 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 |---|---|---|---|
 | **86** | 74c | WD 0.30 → 0.01 re-test | **PROMOTED ★★★ (commit `df2cfdb`)** — int6 Δ=**-0.0531** (largest single-iter win in queue), every K-sweep point improved ~5%, K=8→K=128 widened +0.004 (still ≪0.5), artifact +3.7% (slightly larger weights, expected). See H65. |
 | **87** | 81 | K-jitter `{4,6,10} → {8,12,20}` | **PROMOTED ★ (commit `88ad22c`)** — int6 Δ=**-0.0202**, K=8→K=128 Δ went **NEGATIVE** (+0.0148 → -0.003, deep K is now BETTER than train K). k=4 +0.16 (off-distribution, expected). Step_avg +41% (9.7s→13.7s). See H66. |
-| **95** | new | Anneal TBPTT depth `1-2 → K/2 (or K)` over training | Builds on iter 85 TBPTT-jitter machinery. Hypothesis: early training has rapid param drift, so small TBPTT (k=1-2) captures the most useful recent gradients. Late training has stable params, so deeper TBPTT (k=K/2 or full K) refines FP quality without the warmup cost. Replaces the per-step uniform sampler with a schedule (linear or cosine) over `step/iterations`. Wallclock-aware variant: clamp the late-training k by elapsed_ms when wallclock-capped. Run after iter 87 since deq_k_max may have widened. |
 
 #### Group C — legacy-loss ablations (after Parcae is validated)
 
@@ -1102,6 +1101,12 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 | **90** | 63-merged | Full-rank low-dim experts: `down(D→r) → full-rank attn+MLP at r → up(r→D)` per expert | H43 + H44. Replaces current low-rank factorization with explicit dim-reduction + full-rank expert compute. Precondition for 91 and 92 — without it, scaling experts or D blows the 16 MB artifact budget. |
 | **91** | 65 | Scale experts 8 → 16-32 at cheap per-expert dim r | H47. Router-diversity scaling becomes affordable once experts are low-dim (iter 90). |
 | **92** | 70-dup | model_dim 768 → 1024 under low-dim experts | H43. D now scales cheaply because only down/up projections grow with D (expert internals remain at r). |
+
+#### Group E — deferred (run last, lower-ROI / lower-uncertainty than C+D)
+
+| New # | Old # | One-line | Rationale |
+|---|---|---|---|
+| **95** | new | Anneal TBPTT depth `1-2 → K/2 (or K)` over training | **DEFERRED to end of queue (user reorder 2026-04-25)** — iter 95 was first attempted as the next-up after iter 87 but reverted before training (commit `37bfa7b` reverts `3b6695b`) so that Group C+D items run first. Rationale for the reorder: iter 88/89/90/91/92 are higher-uncertainty (regularization removal + arch scale-up) with larger expected ROI than a TBPTT scheduling refinement; running 95 last allows the schedule to be tuned against whatever K-jitter / experts / dim landscape is final. Builds on iter 85's TBPTT-jitter machinery — replaces the per-step uniform sampler with a schedule (linear or cosine) over `step/iterations`. Wallclock-aware variant: clamp the late-training k by elapsed_ms when wallclock-capped. |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
