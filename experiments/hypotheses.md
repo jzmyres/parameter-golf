@@ -542,6 +542,52 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H69: Bottleneck experts (iter 90) — NOT PROMOTED ✗ (capacity-bound at standalone scale; 2026-04-25)
+
+**Claim:** The pre-iter-90 design had each per-expert linear scaling per-expert with model_dim D — Q, KV-A, KV-B, K_rope, Wo all had a 768-side. This made every per-expert footprint proportional to D, so scaling D was unaffordable under the 16 MB artifact cap. Replacing the per-expert path with a *bottleneck* — `BottleneckIn (D → proj_rank → r)` + full-rank MLA/SwiGLU at r + `BottleneckOut (r → proj_rank → D)` — frees the per-expert footprint from D entirely (only the I/O bottleneck modules see D), enabling future iters to scale D and num_experts cheaply.
+
+**Architectural design (composition):**
+```
+x (B, T, D)
+   → BottleneckIn (D → proj_rank → r)        ← only stage that sees D
+   → ExpertMLABody / ExpertMLPBody (full-rank, all linears at r)
+   → BottleneckOut (r → proj_rank → D)        ← only stage that sees D
+   → y (B, T, E, D)
+```
+- **Inner attention at r=128**: Q (r → H_in*d_in + H_in gate logits), KV-A (r → kv_latent_inner = H_kv_in*d_in/2 — preserves DeepSeek-style 2× cache compression), KV-B-{K,V} (split heads), K_rope (r → H_kv_in*rope_d), Wo (H_in*d_in → r). All full-rank single-stage (no nested low-rank).
+- **Inner MLP at r=128**: gate, fc, down — all full-rank single-stage SwiGLU at `mlp_hidden = round(r × mlp_inner_mult) = 320`.
+- **Independent per-expert pre-RMSNorm** on every linear input (per the Prenorm Scale Independence Rule). 16+ scale Parameters per expert; trivial param cost.
+- **Optimizer coverage**: every new tensor matches `CONTROL_TENSOR_PATTERNS` (`norm_weight`, `q_gain`, `gate_bias`) or goes to the matrix group. `_assert_optimizer_param_coverage` passes at construction.
+
+**Test:** iter 90 — `attn_bottleneck_r=128`, `mlp_bottleneck_r=128`, `expert_proj_rank=32`, `attn_inner_heads=4`, `attn_inner_kv_heads=2`, `mlp_inner_mult=2.5`, with iter 89 baseline otherwise. Commit `8c2be77`. 1000 steps on 2× L40S.
+
+**Result:** ❌ NOT PROMOTED — capacity-bound. Bottleneck arch is functionally validated (DEQ converges, K-sweep TIGHTENS, gates healthy, throughput +34%, artifact 19% of budget) but param count fell from 13M (baseline) → 4.5M (iter 90, -65%) and val_bpb regressed proportionally. The follow-up iter 91+92 bundle (E=16, D=1024, r=192) restores capacity to ~11.3M (87% of baseline) for the architectural-validity comparison vs iter 89.
+
+| Metric | Baseline (iter 89) | Iter 90 | Δ |
+|---|---|---|---|
+| **val_bpb int6** | 1.5264 | **1.8023** | **+0.276** ✗ (gate: ≤ 0.03) |
+| val_bpb fast (final eval) | 1.4848 | 1.6950 | +0.210 |
+| K=4 | 1.7506 | 1.9470 | +0.196 |
+| K=8 | 1.5325 | 1.8123 | +0.280 |
+| K=16 | 1.5264 | 1.8023 | +0.276 |
+| K=32 | 1.5285 | 1.8029 | +0.274 |
+| K=64 | 1.5288 | 1.8028 | +0.274 |
+| K=128 | 1.5289 | 1.8031 | +0.274 |
+| **K=8 → K=128 Δ** | -0.0036 | **-0.0092** | tightens MORE under bottleneck ✓ (gate: ≤ 0.5) |
+| total params | ~13M | 4,496,467 | **-65%** (the explanation) |
+| artifact_bytes | 5,929,124 | 3,017,951 | **-49%** (3.0 MB, 19% of 16 MB budget — huge headroom) |
+| step_avg (ms) | ~13,000 | ~8,600 | **-34%** (faster — fewer matmul stages, smaller GEMMs) |
+| peak_vram_mb | 21,549 | 13,810 | **-36%** (much smaller activation footprint) |
+| no NaN/Inf, no gate catastrophe | ✓ | ✓ | clean |
+
+**Why the K-sweep TIGHTENED (-0.0036 → -0.0092):** the bottleneck design has a sharper FP because the inner work is full-rank at r=128 (vs nested low-rank at D=768 in the old MLA). Better-conditioned inner ops give a more contractive `f_θ`. This is consistent with iter 90's intent: simplify the per-expert compute path so the same Parcae per-dim Ā delivers more contraction.
+
+**Why val_bpb regressed:** capacity, full stop. Going 13M → 4.5M (-65%) is a ~3× capacity cut. iter 90's val_bpb gap vs baseline tracked: step 200 +0.295, step 400 +0.363, step 600 +0.266, step 800 +0.204, step 1000 +0.276. The bottleneck arch is converging *faster per step on the smaller model* than baseline does on the bigger one (final ntp_loss 2.82 at step 1000 vs baseline at similar step), but the smaller-model ceiling is lower. The trajectory at steps 600–800 closing the gap then re-widening at step 1000 is the warmdown phase exposing the capacity ceiling.
+
+**Implication:** The *architectural change* is validated — bottleneck experts (a) preserve MLA semantics with cheaper compute, (b) pass the K-sweep gate decisively, (c) free 65% of param budget and 36% of VRAM. The *capacity* needs to be restored. Iter 91+92 bundle (E=16, D=1024, r=192) is the matched-capacity follow-up, queued by user direction 2026-04-25 regardless of iter 90's standalone verdict.
+
+**Status:** ✅ Architecturally VALIDATED. Standalone NOT PROMOTED. Baseline stays at iter 89 (`aeba34a`, val_bpb 1.5264). Bottleneck infrastructure stays in code (load-bearing for iter 91/92).
+
 ### H68: Disable HyDRA denoising regularization (iter 89) — PROMOTED ★ (2026-04-25)
 
 **Claim:** Same Parcae-redundancy logic as H67 applied to the finite-perturbation contraction probe. HyDRA's `||f(z*+ε, x0) - z*||²` is a finite-scale analog of the Hutchinson-Frobenius infinitesimal probe — both regularize toward `‖J‖<1` at z*. Iter 88 showed the infinitesimal probe was redundant under iter-66b Parcae (per-dim Ā ∈ [0.1, 1) by construction); the finite probe should be redundant for the same reason.
