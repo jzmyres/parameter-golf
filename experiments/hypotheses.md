@@ -542,6 +542,38 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H66: K-jitter widen (4,6,10) → (8,12,20) (iter 87) — PROMOTED ★ (2026-04-25)
+
+**Claim:** Doubled the K-jitter set. Deeper average forward depth at training time should tighten the FP, replicating H12's K-sweep win at a wider scale.
+
+**Test:** iter 87 — `deq_k_jitter_set (4,6,10) → (8,12,20)`, `deq_k_max 16 → 20`. Commit `88ad22c`.
+
+**Result:** PROMOTED.
+
+| Metric | Iter 86 baseline | Iter 87 | Δ |
+|---|---|---|---|
+| val_bpb fast | 1.5042 | **1.4830** | -0.0212 |
+| val_bpb int6 | 1.5390 | **1.5188** | **-0.0202** ★ |
+| k=4 | 1.5423 | 1.7048 | **+0.16** (training set excludes k=4 now) |
+| k=8 | 1.5281 | 1.5245 | -0.004 |
+| k=16 | 1.5390 | 1.5188 | -0.020 |
+| k=32 | 1.5415 | 1.5208 | -0.021 |
+| k=64 | 1.5421 | 1.5212 | -0.021 |
+| k=128 | 1.5429 | **1.5213** | -0.022 |
+| K=8→K=128 Δ | +0.0148 | **-0.003 ★★** | NEGATIVE — deep K BETTER than train K |
+| artifact bytes | 5,948,483 | 5,937,629 | -10,854 |
+| step_avg (ms) | ~9700 | ~13700 | +41% slower |
+
+**The K=8→K=128 Δ went negative.** This is a textbook H12-VERIFIED outcome at a wider scale: when training samples deeper K, the model develops a tighter contraction that makes deep-K eval *better* than train-K eval. Iter 86's already-tight Δ=+0.015 became Δ=-0.003.
+
+**The k=4 outlier is expected and not a gate failure:** the K-jitter set no longer contains 4, so the model is no longer optimized for that regime. Eval at k=4 measures off-training-distribution performance. The K=8→K=128 gate (which tracks the in-distribution range) is what matters; that one improved.
+
+**Throughput cost:** step_avg +41% (9.7s → 13.7s). Not a wallclock-cap concern at step-matched 1000-step dev runs, but matters for the 600s submission cap. May want to use only `(6,8,12)` or `(8,12)` for submission.
+
+**Status:** ✅ VERIFIED. PROMOTED as new baseline (commit `88ad22c`, val_bpb int6 = 1.5188).
+
+**Implication:** K-jitter scaling continues to work — the H12 mechanism (K-jitter forces robustness across K) generalizes from 4→16 to 8→20. Could potentially scale further (16→40), but throughput cost would compound. For the current iter 87 win, paying +41% step-time for -0.020 int6 + tightened deep-K is a clear net positive at step-matched comparison.
+
 ### H65: WD 0.30 → 0.01 (iter 86) — PROMOTED ★★★ (2026-04-24, MAJOR WIN)
 
 **Claim:** Under the iter 93 landscape (NTP-only + Parcae B̄ + learnable RMSNorm scales everywhere + split shared gates + no BigramHash), the regularization that WD=0.30 was providing has shifted to other mechanisms. A much lower WD floor lets the transformer body express more without destabilizing.
@@ -1053,7 +1085,7 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
 | **86** | 74c | WD 0.30 → 0.01 re-test | **PROMOTED ★★★ (commit `df2cfdb`)** — int6 Δ=**-0.0531** (largest single-iter win in queue), every K-sweep point improved ~5%, K=8→K=128 widened +0.004 (still ≪0.5), artifact +3.7% (slightly larger weights, expected). See H65. |
-| **87** | 81 | K-jitter `{4,6,10} → {8,12,20}` | Iter 59 replay in milder form. Run only if 83-86 land cleanly — throughput budget has to accommodate ~10-15% fewer steps/s. |
+| **87** | 81 | K-jitter `{4,6,10} → {8,12,20}` | **PROMOTED ★ (commit `88ad22c`)** — int6 Δ=**-0.0202**, K=8→K=128 Δ went **NEGATIVE** (+0.0148 → -0.003, deep K is now BETTER than train K). k=4 +0.16 (off-distribution, expected). Step_avg +41% (9.7s→13.7s). See H66. |
 | **95** | new | Anneal TBPTT depth `1-2 → K/2 (or K)` over training | Builds on iter 85 TBPTT-jitter machinery. Hypothesis: early training has rapid param drift, so small TBPTT (k=1-2) captures the most useful recent gradients. Late training has stable params, so deeper TBPTT (k=K/2 or full K) refines FP quality without the warmup cost. Replaces the per-step uniform sampler with a schedule (linear or cosine) over `step/iterations`. Wallclock-aware variant: clamp the late-training k by elapsed_ms when wallclock-capped. Run after iter 87 since deq_k_max may have widened. |
 
 #### Group C — legacy-loss ablations (after Parcae is validated)
