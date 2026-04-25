@@ -77,12 +77,12 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | num_layers | 12 |
-| model_dim | 768 |
+| model_dim | 1024 (iter 91+92 bundle: 768 → 1024 — bottleneck experts no longer scale per-expert with D, so D=1024 is now affordable) |
 | num_heads | 8 |
 | num_kv_heads | 4 |
-| num_experts | 8 |
+| num_experts | 16 (iter 91+92 bundle: 8 → 16 — classic MoE-capacity scaling enabled by iter 90's bottleneck) |
 | num_shared_experts | 1 (DeepSeek shared expert, always-on with sigmoid gate) |
-| mlp_mult | 3.0 (hidden = 768 × 3 / num_experts via low-rank experts) |
+| mlp_mult | 3.0 (legacy SSOT mirror — bottleneck experts use `mlp_inner_mult * r` as the source of truth for inner hidden dim) |
 | train_seq_len | 2048 |
 | train_batch_tokens | 524,288 |
 | vocab_size | 1024 |
@@ -115,12 +115,12 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | router_scoring | linear (dot-product logits, iter 70) |
-| attn_bottleneck_r | 128 (per-expert MLA inner dim — iter 90 bottleneck experts) |
-| mlp_bottleneck_r | 128 (per-expert SwiGLU inner dim — iter 90) |
-| expert_proj_rank | 32 (rank of D→proj_rank→r factored I/O bottleneck — iter 90) |
-| attn_inner_heads | 4 (full-rank Q heads at r) |
+| attn_bottleneck_r | 192 (iter 91+92 bundle: 128 → 192 — wider inner bottleneck under D=1024; d_in = r/H_in = 48) |
+| mlp_bottleneck_r | 192 (iter 91+92 bundle: 128 → 192) |
+| expert_proj_rank | 32 (rank of D→proj_rank→r factored I/O bottleneck — kept from iter 90) |
+| attn_inner_heads | 4 (full-rank Q heads at r; d_in=48 at r=192) |
 | attn_inner_kv_heads | 2 (GQA ratio H_in / H_kv_in = 2; KV-A still latent-compressed for DeepSeek-style cache efficiency) |
-| mlp_inner_mult | 2.5 (mlp_hidden = round(r × 2.5) = 320) |
+| mlp_inner_mult | 2.5 (mlp_hidden = round(r × 2.5) = 480 at r=192) |
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
