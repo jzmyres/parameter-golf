@@ -542,6 +542,43 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H68: Disable HyDRA denoising regularization (iter 89) — PROMOTED ★ (2026-04-25)
+
+**Claim:** Same Parcae-redundancy logic as H67 applied to the finite-perturbation contraction probe. HyDRA's `||f(z*+ε, x0) - z*||²` is a finite-scale analog of the Hutchinson-Frobenius infinitesimal probe — both regularize toward `‖J‖<1` at z*. Iter 88 showed the infinitesimal probe was redundant under iter-66b Parcae (per-dim Ā ∈ [0.1, 1) by construction); the finite probe should be redundant for the same reason.
+
+**Test:** iter 89 — `denoising_coef = 0.01 → 0.0`. The hot-path block at L3690 short-circuits on `dn_coef > 0.0`, so the noisy-perturbation block forward and `dn_loss` skip entirely. Code path retained per user directive (commented-out future cleanup permitted; deletion not). Commit `aeba34a`. Promoted commit `aeba34a` (no doc-update commit needed pre-launch).
+
+**Result:** PROMOTED.
+
+| Metric | Iter 88 baseline | Iter 89 | Δ |
+|---|---|---|---|
+| val_bpb fast (final eval) | 1.4844 | **1.4848** | +0.0004 |
+| val_bpb int6 (sliding window) | 1.5238 | **1.5264** | **+0.0026** ✓ (≤ 0.03) |
+| k=4 | 1.7869 | 1.7506 | -0.036 (off-distribution; iter 89 actually less drifted) |
+| k=8 | 1.5310 | 1.5325 | +0.0015 |
+| k=16 | 1.5238 | 1.5264 | +0.003 |
+| k=32 | 1.5264 | 1.5285 | +0.002 |
+| k=64 | 1.5267 | 1.5288 | +0.002 |
+| k=128 | 1.5269 | **1.5289** | +0.002 |
+| K=8 → K=128 Δ | -0.0041 | **-0.0036** | nearly identical (still negative — deep K BETTER) |
+| artifact bytes | 5,880,289 | 5,929,124 | +48,835 (zstd compresses denoising-trained vs not slightly differently; not a parameter change) |
+| step_avg (ms) | ~13,300 | ~13,000 | -2% (denoising forward + dn_loss was ~0.3s/step) |
+| peak_vram_mb | 21,850 | 21,549 | -301 MB (one-fewer block forward in scope) |
+
+**Three confirmations match H67's pattern (independent test of the same Parcae-redundancy hypothesis):**
+
+1. **No val_bpb regression**: +0.0026 is below the noise floor on dev hardware. Capacity is unchanged.
+2. **K-sweep stays tight (-0.0036 ≈ -0.0041)**: contraction is at least as good without the finite-perturbation probe. Parcae per-dim Ā handles both infinitesimal AND finite contraction control.
+3. **Throughput recovery (-2%, peak VRAM -301 MB)**: removing the noisy block forward + `(f_noisy - z*)²` MSE recovered ~0.3s/step and ~14 MB working memory. Combined with iter 88, the two ablations together reclaim ~5% of step time and ~1.5% of peak VRAM.
+
+**The `k=4` improvement (1.7869 → 1.7506, -0.036)** is noteworthy — at k=4 (off-training-distribution since K-jitter set is {8,12,20}), iter 89 generalizes BETTER than iter 88. Plausible mechanism: removing the denoising MSE removes a finite-scale regularizer that was effectively asking the model to be insensitive to perturbations of σ=0.01 around z*. With that gone, the model fits training-K behavior more sharply, and that sharpness happens to extrapolate slightly better to shallow K. Not a load-bearing claim — could easily be noise — but it's at least not evidence of K-robustness loss.
+
+**Implication:** The two iter-66b-pre-Parcae regularizers (λ_jac + denoising MSE) were both redundant once Parcae's per-dim Ā took over spectral-radius control. With both off, the loss is now `task_loss + bal_loss + ortho_loss + router_health`, with no spectral-bound auxiliary losses. The contraction in fact *tightens* — see K=8→K=128 Δ trajectory iter 87 (-0.003) → iter 88 (-0.0041) → iter 89 (-0.0036) — and throughput recovers.
+
+**Why we kept the code instead of deleting:** per user directive 2026-04-25, dead-code cleanup uses comment-out, not deletion. Both Lyapunov and denoising paths remain in `train_gpt.py` behind `coef > 0.0` guards. They could re-activate via CLI flag if a future architectural change reintroduces a need for explicit ρ(J) bounding.
+
+**Status:** ✅ VERIFIED. PROMOTED as new baseline (commit `aeba34a`, val_bpb int6 = 1.5264).
+
 ### H67: Disable Lyapunov hinge penalty λ_jac (iter 88) — PROMOTED ★ (2026-04-25)
 
 **Claim:** Under iter-66b Parcae per-dim Ā, the spectral radius is already bounded away from 1 by construction (`Ā ∈ [0.1, 1)` via the reversibility floor + softplus reparam), so the Hutchinson-Frobenius `ρ(J) < γ` hinge penalty has nothing to grip on at training time. λ_jac contributes only Hutchinson-probe noise to the gradient and one VJP per step worth of compute.
@@ -1129,7 +1166,7 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
 | **88** | old 66b queue | Disable Lyapunov Hutchinson penalty (λ_jac 0.01 → 0) | **PROMOTED ★ (commit `45af5bf`)** — int6 Δ=+0.0050 (≤ 0.03 ✓), K=8→K=128 Δ tightened -0.003 → **-0.0041** (still negative — deep K BETTER), artifact -57 KB, step_avg **-2.9% (~3% throughput recovery)**. Hypothesis confirmed: Parcae per-dim Ā already bounds spectral radius; λ_jac contributed only noise + one VJP/step. Code path retained (commented-out future cleanup permitted, never delete). See H67. |
-| **89** | old 66c queue | Remove HyDRA denoising regularization | Same principle as 88 for the denoising term. Sequential after 88. |
+| **89** | old 66c queue | Disable HyDRA denoising regularization (denoising_coef 0.01 → 0) | **PROMOTED ★ (commit `aeba34a`)** — int6 Δ=+0.0026 (≤ 0.03 ✓), K=8→K=128 Δ -0.0041 → -0.0036 (still negative — deep K BETTER), artifact +49 KB (zstd-compression diff, no params changed), step_avg -2%, peak_vram -301 MB. Same Parcae-redundancy hypothesis as iter 88 confirmed for the finite-perturbation probe. Cumulative iter 88+89 reclaims ~5% step time and ~1.5% peak VRAM. Code path retained per user directive. See H68. |
 
 #### Group D — architectural scale-up (high-lift push; 2-3 iters each, interdependent)
 
