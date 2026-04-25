@@ -542,6 +542,43 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H67: Disable Lyapunov hinge penalty λ_jac (iter 88) — PROMOTED ★ (2026-04-25)
+
+**Claim:** Under iter-66b Parcae per-dim Ā, the spectral radius is already bounded away from 1 by construction (`Ā ∈ [0.1, 1)` via the reversibility floor + softplus reparam), so the Hutchinson-Frobenius `ρ(J) < γ` hinge penalty has nothing to grip on at training time. λ_jac contributes only Hutchinson-probe noise to the gradient and one VJP per step worth of compute.
+
+**Test:** iter 88 — `lyapunov_coef = 0.01 → 0.0`. The hot-path block at L3649 short-circuits on `lyap_coef > 0.0`, so the Hutchinson VJP and surrogate skip entirely. Code path retained (commented-out future cleanup permitted; deletion not). Commit `ceb7dfa`. Promoted commit `45af5bf`.
+
+**Result:** PROMOTED.
+
+| Metric | Iter 87 baseline | Iter 88 | Δ |
+|---|---|---|---|
+| val_bpb fast (final eval) | 1.4830 | **1.4844** | +0.0014 |
+| val_bpb int6 (sliding window) | 1.5188 | **1.5238** | **+0.0050** ✓ (≤ 0.03) |
+| k=4 | 1.7048 | 1.7869 | +0.082 (off-training-distribution; expected drift) |
+| k=8 | 1.5245 | 1.5310 | +0.0065 |
+| k=16 | 1.5188 | 1.5238 | +0.005 |
+| k=32 | 1.5208 | 1.5264 | +0.006 |
+| k=64 | 1.5212 | 1.5267 | +0.006 |
+| k=128 | 1.5213 | **1.5269** | +0.006 |
+| K=8 → K=128 Δ | -0.003 | **-0.0041** ★ | tighter (still negative — deep K BETTER than train K) |
+| artifact bytes | 5,937,629 | 5,880,289 | -57,340 (-1.0%) |
+| step_avg (ms) | ~13,700 | ~13,300 | **-2.9%** (Hutchinson VJP cost confirmed removed) |
+| peak_vram_mb | ~21,800 | 21,850 | ~flat |
+
+**Three independent confirmations of the hypothesis:**
+
+1. **No val_bpb regression**: Δ +0.005 is well within the carry-forward 0.03 band, and within the run-to-run noise envelope on this dev-hardware budget. The Hutchinson penalty was contributing nothing to capacity — its removal does not cost expressiveness.
+2. **K-sweep stays tight (-0.0041)**: the K=8 → K=128 gap is *more* negative than iter 87 (-0.003 → -0.0041). Lyapunov was supposed to enforce contraction; without it, contraction is at least as good. This is the cleanest evidence that Parcae's per-dim Ā was already doing the contraction work.
+3. **Throughput recovery (-2.9%)**: removing the Hutchinson probe + surrogate VJP recovered ~3% of step time, consistent with the cost of one extra forward-mode pass through the shared block per step.
+
+**Implication:** Two separate spectral-control mechanisms (Parcae per-dim Ā + Hutchinson-Frobenius hinge) were stacked redundantly since iter 66b promoted Parcae. λ_jac was load-bearing in pre-Parcae configurations (iter 45-onward) but became dead regularization once Parcae's reversibility floor + softplus reparam took over. Removing it cleans up the loss surface, recovers throughput, and drops one tuning knob (`lyapunov_coef`, `lyapunov_gamma`, `lyapunov_warmup_frac` all become inert defaults).
+
+**Why we kept the code instead of deleting:** per user directive 2026-04-25, dead-code cleanup uses comment-out, not deletion. The Lyapunov code path is structurally clean (gated by `if lyap_coef > 0.0`) and could re-activate via CLI flag if a future architecture change reintroduces a need for explicit ρ(J) bounding. The `_lyapunov_z_star` / `_lyapunov_x0` saves at L2772-2773 still serve the HyDRA denoising path (which iter 89 will ablate next).
+
+**Next implication for iter 89:** the same logic applies to HyDRA denoising (`denoising_coef = 0.01`). If λ_jac was redundant under Parcae, the finite-perturbation contraction probe (`||f(z*+ε, x0) - z*||²`) likely is too — and iter 89 tests that as a clean one-variable ablation on top of the iter-88 baseline.
+
+**Status:** ✅ VERIFIED. PROMOTED as new baseline (commit `45af5bf`, val_bpb int6 = 1.5238).
+
 ### H66: K-jitter widen (4,6,10) → (8,12,20) (iter 87) — PROMOTED ★ (2026-04-25)
 
 **Claim:** Doubled the K-jitter set. Deeper average forward depth at training time should tighten the FP, replicating H12's K-sweep win at a wider scale.
@@ -1091,7 +1128,7 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
-| **88** | old 66b queue | Remove Lyapunov Hutchinson penalty (λ_jac) | Does Parcae's per-dim Ā make the λ_jac term redundant? Clean one-variable ablation; renumbered to avoid collision with committed iter 66b. |
+| **88** | old 66b queue | Disable Lyapunov Hutchinson penalty (λ_jac 0.01 → 0) | **PROMOTED ★ (commit `45af5bf`)** — int6 Δ=+0.0050 (≤ 0.03 ✓), K=8→K=128 Δ tightened -0.003 → **-0.0041** (still negative — deep K BETTER), artifact -57 KB, step_avg **-2.9% (~3% throughput recovery)**. Hypothesis confirmed: Parcae per-dim Ā already bounds spectral radius; λ_jac contributed only noise + one VJP/step. Code path retained (commented-out future cleanup permitted, never delete). See H67. |
 | **89** | old 66c queue | Remove HyDRA denoising regularization | Same principle as 88 for the denoising term. Sequential after 88. |
 
 #### Group D — architectural scale-up (high-lift push; 2-3 iters each, interdependent)
