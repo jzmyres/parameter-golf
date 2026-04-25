@@ -104,7 +104,7 @@ The values below MUST match `Hyperparameters` defaults in `train_gpt.py`. If you
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
 | deq_k_jitter_set | (8, 12, 20) (DEQ iteration counts sampled per step; iter 87) |
-| lyapunov_coef | 0.01 (λ_jac: Hutchinson-Frobenius penalty weight) |
+| lyapunov_coef | 0.0 (iter 88: λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
 | lyapunov_gamma | 0.97 (target spectral radius threshold) |
 | lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
 | denoising_coef | 0.01 (HyDRA denoising regularization weight) |

@@ -231,7 +231,13 @@ class Hyperparameters:
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
     # power-iteration VJP. One boundary forward + one VJP per step.
-    lyapunov_coef = 0.01       # λ_jac: weight of hinge penalty (small: ~1% of task loss)
+    # Phase 9 iter 88 (2026-04-25): Lyapunov hinge penalty disabled (0.01 → 0).
+    # Hypothesis: under iter-66b Parcae per-dim Ā, the spectral radius is
+    # already bounded away from 1 by construction (Ā ∈ [0.1, 1) via the
+    # reversibility floor + softplus reparam), so the Hutchinson-Frobenius
+    # ρ(J)<γ hinge has nothing to grip on at training time.  Set λ_jac = 0;
+    # if val_bpb regresses by > 0.03 OR K-sweep widens > 0.5, restore.
+    lyapunov_coef = 0.0        # λ_jac: weight of hinge penalty (iter 88: disabled)
     lyapunov_gamma = 0.97      # iter 74b: raise from 0.9 — preserve faster warmup observed at γ=0.95 (H57)
     lyapunov_warmup_frac = 0.05 # T-opt 20: shorter warmup (10%→5%) — penalty near zero during warmup anyway
     # Phase 9 iter 55: Denoising regularization (HyDRA 2026, Efficient DEQ 2025).
