@@ -542,6 +542,69 @@ suggesting FSQ's quantization-awareness isn't needed.
 **Expected:** Better refinement utilization. Currently the Diffusion-AR refinement only helps at z0 init; this makes it help throughout.
 **Risk:** Refinement signal quality depends on prior-step prediction accuracy. If prediction is poor, injecting it throughout could hurt.
 
+### H70: Bottleneck experts at matched capacity (iter 91+92 bundle) — NOT PROMOTED ✗ (per-param efficiency penalty quantified; 2026-04-25)
+
+**Claim:** Iter 90 standalone (4.5M params, val_bpb +0.276) regressed because of capacity, not architectural validity (K-sweep tightened, gates healthy, throughput +34%). The follow-up iter 91+92 bundle scales to 87% of baseline capacity (`E=8→16, D=768→1024, r=128→192`) under the bottleneck arch — if the architecture has no per-param efficiency penalty, val_bpb should approach baseline 1.5264 within the 0.03 promotion gate. If it doesn't, that quantifies the cost of the bottleneck design vs the original full-D MLA.
+
+**Test:** iter 91+92 bundle — `num_experts=16, model_dim=1024, attn_bottleneck_r=192, mlp_bottleneck_r=192` (other knobs unchanged from iter 89 baseline including `expert_proj_rank=32`). Commit `3e35655`. 1000 steps on 2× L40S, ~5.5 hours wallclock.
+
+**Result:** ❌ NOT PROMOTED — bottleneck arch has a quantifiable per-param efficiency penalty.
+
+| Metric | Baseline (iter 89) | iter 91+92 bundle | Δ |
+|---|---|---|---|
+| **val_bpb int6 (sliding window)** | 1.5264 | **1.6784** | **+0.152** ✗ (gate: ≤ 0.03) |
+| val_bpb fast (final eval) | 1.4848 | 1.6198 | +0.135 |
+| K=4 | 1.7506 | 1.8432 | +0.093 |
+| K=8 | 1.5325 | 1.6836 | +0.151 |
+| K=16 | 1.5264 | 1.6784 | +0.152 |
+| K=32 | 1.5285 | 1.6794 | +0.151 |
+| K=64 | 1.5288 | 1.6795 | +0.151 |
+| K=128 | 1.5289 | **1.6796** | +0.151 |
+| **K=8 → K=128 Δ** | -0.0036 | **-0.004** | tighter contraction ✓ (gate: ≤ 0.5) |
+| total params | 13M (est) | **11.32M** | -13% (still under baseline) |
+| artifact_bytes | 5,929,124 | 6,607,625 | +12% (modest given more experts) |
+| step_avg (ms) | ~13,000 | ~20,000 | **+54% slower** (E=16 + D=1024 doubles compute) |
+| peak_vram_mb | 21,549 | 27,738 | +29% (more activations) |
+| no NaN/Inf, no gate catastrophe | ✓ | ✓ | clean |
+
+**val_bpb gap trajectory across training (vs baseline at equal step count):**
+
+| Step | iter 91+92 val_bpb | Baseline val_bpb | Gap |
+|---|---|---|---|
+| 200 | 2.2735 | 1.9996 | +0.274 |
+| 400 | 1.9450 | 1.6656 | +0.279 |
+| 600 | 1.7479 | 1.5683 | +0.180 |
+| 800 | 1.6601 | 1.5260 | +0.134 |
+| 1000 | 1.6198 | ~1.4848 | +0.135 |
+
+The gap was actively closing through steps 600-800 (-0.10 nats per 200 steps) but **plateaued at +0.134 from step 800 onward**. This rules out "needs more steps to converge" — at step-1000 budget, iter 91+92 bottleneck arch lands ~0.135 nats behind baseline and is no longer improving.
+
+**Three diagnostic findings:**
+
+1. **Capacity restoration helped, but not enough.** Iter 90 (4.5M, gap +0.276) → iter 91+92 (11.3M, gap +0.135). Going from 35% → 87% of baseline capacity closed half the gap. Linearly extrapolating, full baseline capacity (proj_rank=64, ~13.8M) might close another ~0.05, reaching gap ~+0.08 — still over the 0.03 gate.
+
+2. **K-sweep STILL tightens (-0.004).** Same architectural validity signal as iter 90: bottleneck experts produce a more contractive DEQ than full-D MLA, even at matched capacity. The K=128 val_bpb is the same as K=16 — the FP fully converges at modest K. This is independent evidence that the bottleneck arch is architecturally sound; the capacity penalty is **expressivity per param**, not stability.
+
+3. **Throughput penalty (+54% step time)** offsets iter 90's +34% gain when scaling to baseline capacity. At equal wallclock, baseline (13M, 13s/step) and iter 91+92 (11.3M, 20s/step) need different step counts — the bottleneck arch processes 1.54x more input per step but at higher param efficiency cost.
+
+**Per-param efficiency analysis:**
+
+| | iter 89 baseline | iter 91+92 bundle | iter 90 standalone |
+|---|---|---|---|
+| Total params | ~13M | 11.3M | 4.5M |
+| Final val_bpb int6 | 1.5264 | 1.6784 | 1.8023 |
+| **bpb / param** (10⁻⁷ nats/param) | **1.17** | 1.49 | 4.00 |
+
+Bottleneck experts deliver bpb/param ratio 1.49 vs baseline 1.17 — ~27% worse per parameter. This is the architectural cost of the D→r→D bottleneck: the inner low-dim work (full-rank at r=128 or r=192) is more flexible per matmul, but the I/O bottleneck (D→32→r) appears to be the real expressivity ceiling.
+
+**The proj_rank=32 hypothesis** is the most likely culprit. With D=1024, R_proj=32 means the input is squeezed through a 32-dim subspace BEFORE the expert sees it (and again on output). 32-dim subspace × 16 experts is 512 effective input ranks — only 50% of D=1024. Bumping proj_rank to 48 (97% of baseline capacity = 12.6M) or 64 (106% = 13.8M) would relax this bottleneck and is the natural rescue iter.
+
+**Implication:** The bottleneck-experts experiment closes with a clear, quantitative architectural finding rather than a promotion. The architecture is structurally sound (K-sweep TIGHTENS), tests independent across-expert representations (independent xavier per-expert per-stage), and saves significant artifact budget. But proj_rank=32 is an information bottleneck that costs ~27% per-param efficiency. A follow-up rescue iter could test proj_rank=48 or proj_rank=64 at fixed E=16, D=1024 to see if the gap closes within 0.03.
+
+**Status:** ❌ NOT PROMOTED. Baseline stays at iter 89 (`aeba34a`, val_bpb 1.5264). Bottleneck infrastructure stays in code as a validated design pattern (potentially useful as a building block for future architectures); production weights revert to baseline. The current Hyperparameters config (E=16, D=1024, r=192) is preserved on this branch as a documented "matched-capacity bottleneck reference run" — see this commit's revert if reverting back to iter 89's full-MLA defaults.
+
+**Decision after H70:** rather than chase the proj_rank rescue (which would consume another ~5 hours and is uncertain), proceed to **iter 95 (TBPTT efficiency sweep)** per user direction — TBPTT is a cleaner one-knob optimization on top of the existing baseline (iter 89), no architectural change. Also queues a "Lipschitz vs K probe" diagnostic suggested by the user 2026-04-25 for future K-sweep instrumentation.
+
 ### H69: Bottleneck experts (iter 90) — NOT PROMOTED ✗ (capacity-bound at standalone scale; 2026-04-25)
 
 **Claim:** The pre-iter-90 design had each per-expert linear scaling per-expert with model_dim D — Q, KV-A, KV-B, K_rope, Wo all had a 768-side. This made every per-expert footprint proportional to D, so scaling D was unaffordable under the 16 MB artifact cap. Replacing the per-expert path with a *bottleneck* — `BottleneckIn (D → proj_rank → r)` + full-rank MLA/SwiGLU at r + `BottleneckOut (r → proj_rank → D)` — frees the per-expert footprint from D entirely (only the I/O bottleneck modules see D), enabling future iters to scale D and num_experts cheaply.
