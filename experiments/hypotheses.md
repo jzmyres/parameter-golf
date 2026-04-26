@@ -995,6 +995,47 @@ Therefore any val_bpb regression iter 66b → iter 74b is an **optimizer-landsca
 
 **Related:** H56 (Lyapunov), H57 (γ=0.95); iter 66a (tied Parcae). Doc: `opg_doc.tex` §sec:parcae_params + §sec:algorithm describe the combined RevDEQ+Parcae setup.
 
+### H71: "More smaller experts" at iso-cost on linear projections (iter 96 rank/2, E×2) — VERIFIED ★ (2026-04-26)
+
+**Claim:** Halving per-expert LoRA rank (`attn_expert_rank 128→64, mlp_expert_rank 192→96`) and doubling expert count (`num_experts 8→16`) keeps the **linear-projection FLOPs constant** (E·R = const) while doubling routing diversity. The DeepSeek-MoE / Switch hypothesis predicts more, smaller experts win at iso-cost on the dominant cost class.
+
+**Test:** iter 96 — `num_experts=16, attn_expert_rank=64, mlp_expert_rank=96` on the iter 89 baseline (full-D LoRA-style attention/MLP, D=768, H=8, d_head=96 at FA-optimal sweet spot). All other knobs unchanged. Commit `b962b5f`. 1000 steps on 2× L40S, ~6.6 hours wallclock at step_avg=23.4-24.5s (vs iter 89 baseline ~13s — `+78%` step-time penalty, larger than the predicted +10-20% because **SDPA cost** scales `E·H·d_head·B·T²` and is independent of `attn_expert_rank`, so doubling E doubles SDPA wall-time).
+
+**Result:** ✅ PROMOTED — strong improvement on the per-param-efficiency frontier.
+
+| Metric | iter 89 baseline | iter 96 | Δ |
+|---|---|---|---|
+| val_bpb (int6) | 1.5264 | **1.4903** | **−0.0361** ★ |
+| val_bpb (fp32, K=16 best-K) | 1.5264 | 1.4603 | −0.0661 |
+| param count | ~13 M | 13.95 M | +7% (KV-A/KV-B/Wo paths scale with E independently of R) |
+| artifact_bytes | ~13.4 MB | 7.55 MB | **−44% smaller artifact** ★ (47% of 16 MB budget) |
+| step_avg | ~13 s | 23.4-24.5 s | **+78%** (SDPA cost dominates wall-time more than predicted) |
+| K=128 vs best-K Δ | −0.004 | +0.0016 | tighter contraction ✓ (gate: ≤ 0.5) |
+| attn_cv | ~0.18 | 0.20 | similar ✓ |
+| attn_entropy | ~0.95·max | 0.99·max | uniform routing ✓ |
+| Min expert share | ~0.04 | 0.040 | no dead experts ✓ |
+| Max expert share | ~0.20 | 0.107 | no winner-take-all ✓ |
+| router_mass | ~0.95 | 0.79 | gate closing some experts (healthy) |
+
+**Why it works:**
+1. **Routing diversity scales linearly with E** — 16 experts give the router 2× the "specialization slots" to compose. Soft dense routing (all experts process all tokens) doesn't suffer from dead-expert pathology of top-k routing, so larger E is pure capacity gain.
+2. **Per-expert linear projections still have meaningful rank** — at D=768, R=64 the Q linear sees a 64-dim subspace. Empirically enough headroom; not the floor.
+3. **No bottleneck/proj_rank penalty** — unlike iter 90's bottleneck experts (`proj_rank=32` valve), iter 96 keeps all activations at full D=768 with d_head=96 in the FA tensorcore sweet spot. **Per-param efficiency is preserved.**
+4. **Artifact savings as bonus** — total params actually grew by 7% but the int6 + zstd-22 compression got tighter (more, smaller experts compress better than fewer, larger ones), netting **−44% on artifact size**. Frees significant budget for iter 97/98 capacity scaling.
+5. **K-sweep tightened** — K=128 vs best-K (K=16) Δ = +0.0016 (well within 0.5 gate). The DEQ FP is highly contractive at the new layout.
+
+**Implications:**
+- **Iter 97 (E=24, attn_rank=42, mlp_rank=64)** is the natural continuation along this validated axis. Per-param efficiency at iter 96 should hold; routing diversity gain may diminish (E≥16 is already past where most MoE papers report saturation). Justified to test once.
+- **Iter 98 (D=1024 under iter 96 LoRA layout)** — D scaling under validated layout. Linear in artifact cost; needs budget check (currently 47% used → can grow to ~16 MB with D=1024 at E=16-24).
+- **The "more, smaller experts" axis is now the established scaling direction** for this codebase, replacing the previously-failing "bottleneck" axis. Closes Group D (bottleneck → NOT PROMOTED, archived) and opens Group F (LoRA-rank/E joint scaling) as the active design dimension.
+
+**Confounds / things to watch:**
+- The +78% step-time penalty is real. At submission time (600s wallclock), iter 96's config trains ~600/24.5 ≈ 24 steps vs iter 89's 600/13 ≈ 46 steps. **Submission-mode val_bpb may regress** if step count matters more than per-step capacity. Test before claiming submission-eligibility.
+- **router_mass dropped to 0.79** (from ~0.95 baseline) — the model is learning to suppress some experts via the sigmoid gate, not just route around them. This is healthy under soft dense routing but worth monitoring at E=24, E=32 to confirm it doesn't collapse.
+- **Compile recompiles intensified** with E=16 + k-jitter {8,12,20} + DDP. Adds ~5-10 min of front-loaded overhead. At E=24 and beyond this may need `torch._dynamo.config.recompile_limit` bumping.
+
+**Related:** H43 (low-rank experts — earlier attempt, proven viable here), H44 (bottleneck experts — failed alternative, see H69/H70), H47 (scale to E=16-32 — this iter validates the axis).
+
 ---
 
 ## Completed Iterations
@@ -1251,7 +1292,7 @@ failure.
 
 ### Next up — recommended ordering after iter 89
 
-**Current baseline:** iter 89 (`aeba34a`, val_bpb int6 = 1.5264) — last promoted iter; HyDRA denoising disabled on top of the iter 88 → iter 87 → iter 86 → iter 84 → iter 94 → iter 93 → iter 73 promotion chain over iter 66b's Parcae-faithful injection. Groups A-C are now closed (all PROMOTED ★ except iter 83 reverted). Group D (architectural scale-up: bottleneck experts) ran as iter 90 (standalone) + iter 91+92 (matched-capacity bundle); both NOT PROMOTED — bottleneck arch architecturally validated (K-sweep tightened in both runs) but carries a ~27% per-param efficiency penalty vs full-D MLA. **Group D code was reverted on `autoresearch/phase2-optimization` 2026-04-26** (commits `14e9fb2` + `0e6ab19`); the bottleneck infrastructure is preserved for a possible `proj_rank=48/64` rescue iter at tag `iter-91+92-bottleneck-NOT-PROMOTED` (immutable archival pointer at `3e35655`) and on side branch `autoresearch/bottleneck-rescue` (active-rescue workspace, with the user's `ExpertMLABody` `H_in/H_kv_in≥2` validator preserved as commit `59bc156`). Active queue is now Group E (iter 95) + the explicit "open work" tail at the bottom of the schedule.
+**Current baseline:** iter 96 (`b962b5f`, val_bpb int6 = 1.4903) — last promoted iter; "more, smaller experts" (`num_experts 8→16, attn_expert_rank 128→64, mlp_expert_rank 192→96`) on top of iter 89's full-D LoRA-style baseline. Improvement of −0.0361 vs iter 89, K=128-vs-best-K Δ=+0.0016, artifact 7.55 MB (47% of 16 MB budget). H71 documents the result. Groups A-D are now closed (Groups A-C all PROMOTED ★ except iter 83 reverted; Group D bottleneck → NOT PROMOTED, code reverted, archive at tag `iter-91+92-bottleneck-NOT-PROMOTED`). Group F (LoRA-rank/E joint scaling) is the active scaling direction, opened by iter 96. Active queue is Group F (iter 97 = E=24, iter 98 = D=1024) + Group E (iter 95 TBPTT sweep) + Lipschitz-per-K probe diagnostic.
 
 Run ordering rationale (preserved for posterity): low-risk → higher-risk, activation / gate / schedule tweaks before legacy-loss ablations, architectural scale-up last (depends on predecessors).
 
@@ -1309,14 +1350,18 @@ the change is broken.
 - **Accept (carry to next iter)** if the change does NOT *significantly*
   degrade gate metrics:
   - val_bpb regression ≤ **0.03** (small arch-reshape cost, noise-ish).
-  - K=128 Δ ≤ 0.5 (FP still converges at deep K).
+  - **K=128 vs best-K Δ ≤ 0.5** (FP still converges at deep K). The
+    reference is the K-sweep row with the lowest val_bpb (whichever K
+    that is — was K=8 historically when training-K was small, but with
+    `deq_k_jitter_set={8,12,20}` best-K may be K=12, K=20, or any K).
+    The gate is "K=128 is no worse than best-K by more than 0.5."
   - No catastrophic failure on other gates (no NaN, no routing collapse,
     mos_ortho ≤ 0.9, expert_min_share ≥ 0.005, etc.).
   → `update_results.sh --promote`, update H33 audit row for the newly-
      certified component, launch next iter in the queue.
 
 - **Fix-and-retry (stay on current iter)** if the change IS significant:
-  - val_bpb regression > 0.03 OR K=128 Δ > 0.5 OR any gate catastrophes.
+  - val_bpb regression > 0.03 OR K=128-vs-best-K Δ > 0.5 OR any gate catastrophes.
   → identify the **simplest, most principled fix** for the specific
      failure mode, rerun the SAME iter with the fix.  Iterate (30.1 →
      30.2 → ...) until the change is good enough to carry forward.
