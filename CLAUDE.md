@@ -80,7 +80,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | model_dim | 768 |
 | num_heads | 8 |
 | num_kv_heads | 4 |
-| num_experts | 24 (iter 97: 16 → 24 — extending the validated iter 96 "more, smaller experts" axis) |
+| num_experts | 20 (iter 97: 16 → 20 — extending the validated iter 96 axis; E=24 was OOM on 2× L40S) |
 | num_shared_experts | 1 (DeepSeek shared expert, always-on with sigmoid gate) |
 | mlp_mult | 3.0 (hidden = 768 × 3 / num_experts via low-rank experts) |
 | train_seq_len | 2048 |
@@ -116,8 +116,8 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 |---|---|
 | router_scoring | linear (dot-product logits, iter 70) |
 | mos_balance_mult | 50.0 (iter 26-lb-loss: hardcoded multiplier promoted to a Hyperparameter; multiplies MoS-NTP balance loss inside `_collect_routing_losses` — the principled fix for `mos_*_min_share` failures since H26) |
-| attn_expert_rank | 42 (iter 97: 64 → 42; iso-cost on Q linears as E×1.5: 16·64=1024 → 24·42≈1008) |
-| mlp_expert_rank | 64 (iter 97: 96 → 64; iso-cost on MLP linears as E×1.5: 16·96=1536 → 24·64=1536) |
+| attn_expert_rank | 51 (iter 97: 64 → 51; iso-cost on Q linears as E×1.25: 16·64=1024 → 20·51=1020) |
+| mlp_expert_rank | 77 (iter 97: 96 → 77; iso-cost on MLP linears as E×1.25: 16·96=1536 → 20·77=1540) |
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |

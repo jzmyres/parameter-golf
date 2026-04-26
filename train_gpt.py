@@ -172,7 +172,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 768  # optimal: dim sweep showed 768 > 896 > 1024 (expert rank more valuable than shared attn width)
     num_heads = 8
-    num_experts = 24  # iter 97: 16 → 24 — extending the "more, smaller experts" axis validated by iter 96. Rank scaled inversely (E·R const) on Q/MLP linears.
+    num_experts = 20  # iter 97: 16 → 20 — extending the "more, smaller experts" axis validated by iter 96. Rank scaled inversely (E·R const) on Q/MLP linears. (E=24 OOM on 2× L40S — fell back to E=20 mid-run.)
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
     # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
     # emits NTP log-probs; CTP param banks (gate_ctp, A_ctp_shared, A_ctp,
@@ -313,12 +313,13 @@ class Hyperparameters:
     bigram_vocab_size = 0
     bigram_dim = 128
     kv_latent_dim = 0  # auto: dim//2
-    # iter 97: extend the validated iter 96 axis. E 16→24, R scaled inversely
-    # so E·R is held constant on Q/MLP linears (iter 96: 16·64=1024 attn,
-    # 16·96=1536 mlp; iter 97: 24·42≈1008 attn, 24·64=1536 mlp). SDPA + Wo
-    # cost grow linearly with E (1.5× from iter 96).
-    attn_expert_rank = 42
-    mlp_expert_rank = 64
+    # iter 97: extend the validated iter 96 axis. E 16→20, R scaled inversely
+    # so E·R is held near constant on Q/MLP linears (iter 96: 16·64=1024 attn,
+    # 16·96=1536 mlp; iter 97: 20·51=1020 attn, 20·77=1540 mlp). SDPA + Wo
+    # cost grow linearly with E (1.25× from iter 96). E=24 was OOM on
+    # 2× L40S (44 GiB/rank) — E=20 is the largest fit.
+    attn_expert_rank = 51
+    mlp_expert_rank = 77
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
