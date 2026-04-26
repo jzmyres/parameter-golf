@@ -162,7 +162,16 @@ Paper: Soft MoE (arxiv:2308.00951). Mixtape (NeurIPS 2019) for MoS softmax.
 - **MoS routing**: pure softmax (convex combination summing to 1).
 - **Applied to**: attention output, MLP hidden, MoS output heads.
 - **Expert-health metrics** (min-share / CV) are computed on **renormalized** per-component shares; total routed mass is logged separately.
-- **Regularization**: per-token sparsity (L1 on routing weights) · global balance (MSE vs uniform target, per-component) · expert orthogonality (`|cos_sim| → 0`).
+- **Two distinct entropies — do not confuse them.** Both are reported under similar names but they answer different questions:
+  - **Global utilization entropy** (`expert_entropy` / `attn_entropy` / `mlp_entropy` in logs): `H_global = -Σ_e p̄_e log p̄_e` where `p̄_e` is the batch-averaged renormalized share for expert `e`. **HIGH = uniform usage across batch = no dead experts ✓.** This is the dead-expert sentinel; it should stay close to `log(N_routed)`.
+  - **Per-token routing entropy** (NEW under iter 99: `attn_pertoken_entropy` / `mlp_pertoken_entropy` in logs): `H_pertoken = mean_token(-Σ_e w(e|token) log w(e|token))` averaged over tokens. **LOW = each token concentrates weight on a few experts = specialization ✓.** This is the per-token sparsity / specialization signal; we want it driven down.
+  - You can have HIGH global *and* LOW per-token simultaneously — that's the target regime: every expert gets used somewhere in the batch (no waste), but each individual token uses only a few experts strongly (specialization).
+  - HIGH per-token entropy + HIGH global entropy = uniform smoothing, no specialization (current pre-iter-99 state).
+  - LOW per-token entropy + LOW global entropy = winner-take-all collapse with dead experts (bad — `min_share_loss_weight` exists to prevent this).
+- **Regularization** (each enforces a distinct objective; do not collapse them in commits):
+  - **Per-token sparsity / specialization**: per-token entropy penalty (iter 99: `entropy_coef * H_pertoken`). Drives `H_pertoken → 0`. Optionally paired with softmax temperature `τ > 1`.
+  - **Global balance / dead-expert prevention**: `min_share_loss_weight` (forces every expert above a min share floor) + `cv_loss_weight` (penalizes CV across experts). Drives `H_global → log(N)`.
+  - **Expert orthogonality**: `|cos_sim| → 0` between expert outputs (post-mix `mu_e`).
 - Fully differentiable, no discrete decisions.
 
 ### 6.3 Per-Expert MLA + Gated Attention
@@ -225,7 +234,7 @@ Reference impl: see §2.
 - **Model weights**: `experiments/weights/{baseline,previous,current}/`.
 - **Metrics comparison**: `python experiments/plot_metrics.py` → `experiments/metrics_comparison.png` (4×3 grid: train_loss · val_bpb · step_avg_ms / DEQ residual · recon_err · iter_conv / expert_usage · entropy · ortho / summary text).
 - **Progress plots**: `python experiments/plot_progress.py` → `experiments/progress.png`, `progress_full.png`.
-- All metrics tracked: train_loss, val_loss, val_bpb, step_avg_ms, deq_residual, deq_recon_err, deq_iter_conv, expert_usage (per expert), expert_entropy, expert_ortho.
+- All metrics tracked: train_loss, val_loss, val_bpb, step_avg_ms, deq_residual, deq_recon_err, deq_iter_conv, expert_usage (per expert), `expert_entropy` (global utilization — should be HIGH ≈ log(N) to confirm no dead experts), `pertoken_entropy` (per-token routing — should be LOW to confirm specialization, iter 99+), expert_ortho.
 - Detailed comparison: 2 configs only — baseline vs current.
 - **Prioritize architecture exploration** over hyperparameter tuning; cite papers/repos.
 
