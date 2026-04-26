@@ -354,7 +354,7 @@ has global context before entering the DEQ solver.
 **Risk:** Adds ~2-5M params and ~20ms per forward. RevDEQ-safe (outside solver).
 **Status:** PROPOSED
 
-### H43: Low-dim expert computation (D→r per expert, mix in D-space) — PROPOSED
+### H43: Low-dim expert computation (D→r per expert, mix in D-space) — TESTED ✗ (NOT PROMOTED, see H69 + H70; 2026-04-25)
 **Claim:** Instead of experts operating at full D=768 with internal low-rank projections,
 each expert should project to its OWN low-dimensional subspace (D→r), do ALL computation
 (attention, MLP) at dim r, then project back (r→D) before router-weighted mixing.
@@ -388,9 +388,9 @@ MUST preserve residual to raw token embedding: x0 = precond(x) + x. The raw embe
 is the identity signal that x0 falls back to when pre-conditioning is unhelpful.
 **Risk:** Medium — significant architectural change. Head-packed SDPA needs validation at
 smaller head dim. Per-expert expressiveness decreases (compensated by aggregate rank).
-**Status:** PROPOSED
+**Status:** TESTED 2026-04-25 — NOT PROMOTED. Bottleneck arch (H43 + H44 combined into the iter 90 + iter 91+92 bundle) is structurally sound (K-sweep TIGHTENS in both runs, throughput +34% standalone) but carries a quantified ~27% per-param efficiency penalty vs full-D MLA at matched capacity (iter 91+92: 11.3M params, val_bpb 1.6784 vs baseline 1.5264, Δ +0.152). proj_rank=32 at the D↔r boundary is the likely expressivity ceiling. See H69 (standalone) and H70 (matched-capacity) for full diagnostics. The architectural pattern is preserved in `train_gpt.py` as `BottleneckIn / ExpertMLABody / ExpertMLPBody / BottleneckOut` (committed `8c2be77`) and is available as a building block for future architectures, but is not the production path.
 
-### H44: Full-rank expert internals at dim r (remove low-rank factorization) — PROPOSED
+### H44: Full-rank expert internals at dim r (remove low-rank factorization) — TESTED ✗ (with H43, see H69+H70; 2026-04-25)
 **Claim:** With H43 moving expert computation to dim r, low-rank factorization inside
 experts becomes unnecessary. Expert linear layers should be full-rank at dim r instead
 of factored (r→rank→output). This is simultaneously simpler, more expressive, and faster.
@@ -413,7 +413,7 @@ x(768) → down(768×192) → z(192) → W(192×out)   # one matmul, full rank=1
 Expert capacity controlled by single knob: r (the expert subspace dimension).
 **Depends on:** H43 (low-dim expert computation). Without H43, full-rank at D=768 would
 explode params (768²=590K per expert per layer).
-**Status:** PROPOSED
+**Status:** TESTED 2026-04-25 alongside H43. Outcome: full-rank at r=128 (iter 90) and r=192 (iter 91+92) confirms the architectural simplicity claim — `attn_expert_rank` and `mlp_expert_rank` were removed from `Hyperparameters` and replaced by `attn_bottleneck_r`, `mlp_bottleneck_r`, `expert_proj_rank`, `attn_inner_heads`, `attn_inner_kv_heads`, `mlp_inner_mult` (see H69 / H70 for code-level details). Expert capacity is now a single (r, mlp_inner_mult) pair as predicted. NOT PROMOTED for the standalone arch reason from H69+H70 (per-param efficiency penalty); the simpler hyperparameter surface is preserved for any future bottleneck-arch revisit.
 
 ### H45: Independent-weight MLA pre-conditioning block — PROPOSED
 **Claim:** The pre-conditioning block for z0 must have INDEPENDENT weights from the DEQ
@@ -455,7 +455,7 @@ providing occasional deep-K signal. Step count should match baseline (~747 steps
 **Risk:** Low — no structural change, just K sampling strategy. Easy to tune scale parameter.
 **Status:** PROPOSED
 
-### H47: Scale up number of experts — PROPOSED
+### H47: Scale up number of experts — TESTED ✗ (E=16 in iter 91+92 bundle, NOT PROMOTED; 2026-04-25)
 **Claim:** More experts (16, 32) at same or reduced rank improves routing diversity and
 model capacity. Currently 8 experts (7 routed + 1 shared). Scaling to 16-32 experts gives
 better coverage of the input space.
@@ -470,7 +470,7 @@ experts (H43) would make this affordable.
 balanced. The scaling law is: more experts = better IF per-expert compute is cheap enough.
 **Risk:** Head-packed SDPA with 16×8=128 query heads may hit FlashAttention limits.
 Routing balance harder with more experts (higher balance loss needed).
-**Status:** PROPOSED
+**Status:** TESTED 2026-04-25 — bundled with H43+H44 in iter 91+92 (E=8→16 alongside D=768→1024 and r=128→192). Outcome: E=16 worked structurally — head-packed SDPA at E×H_in = 16×4 = 64 query heads ran without FlashAttention issues, attn_entropy converged to 2.37 (vs theoretical max log(15)≈2.71 for routed experts), no routing collapse, attn_cv=0.44 (well-balanced after warmup). The capacity went from 4.5M (iter 90, E=8) → 11.3M (iter 91+92, E=16+D=1024+r=192), closing half the gap to baseline. But the NOT-PROMOTED outcome (val_bpb +0.152 vs baseline) is attributable to H43's per-param efficiency penalty (the bottleneck I/O at proj_rank=32), NOT to the E=16 scaling itself. The E-scaling claim is **structurally validated** — more experts at low-dim work — but not in isolation. See H70.
 
 ### H48: Parcae negative diagonal injection (guaranteed contraction) — PROPOSED
 **Source:** "Parcae: Scaling Laws For Stable Looped Language Models" (arXiv:2604.12946, April 2026)
@@ -1245,13 +1245,15 @@ failure.
 | 79 | ~~Per-iter depth embeddings~~ | ~~iter_embed∈R^{K_max×dim}, zero-init, u=z+x0+embed[k]~~ | H24 | ~~REMOVED~~ — not principled: DEQ theory requires the fixed-point map T_θ to be *iteration-invariant* so the K→∞ limit is well-defined (Banach / Parcae-ZOH both assume a single map iterated indefinitely). Per-iteration embeddings make T_θ = T_θ(k) depend on k, destroying the fixed-point premise; K-sweep extrapolation (the existing `K=128` eval gate) ceases to be meaningful. This is a shared-weight K-layer transformer, not a DEQ. | — | — |
 | 80 | ~~Refinement inject during DEQ~~ | ~~REMOVED: raw x0 already blended into x0_refined~~ | H27 | REMOVED | — | — |
 | 68 | ~~DeltaDEQ dim skipping~~ | ~~REMOVED: non-bottleneck, breaks compile, K-jitter handles~~ | H50 | REMOVED | — | — |
-| 63 | Full-rank low-dim experts (merged 63+64) | down(D→r), full-rank attn+MLP at r, up(r→D) per expert | H43/H44 | **Queued — iter 90 (after 89)**; major rewrite (2-3 iters) but principled + on-queue | — | — |
-| 65 | Scale to 16-32 experts | More experts at cheap per-expert dim r | H47 | **Queued — iter 91 (after 90)**; requires low-dim experts from iter 90 to fit the 16MB budget | — | — |
-| 70d | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | **Queued — iter 92 (after 90)**; complements iter 91, same low-dim-experts dependency | — | — |
+| 63 | Full-rank low-dim experts (merged 63+64) | down(D→r), full-rank attn+MLP at r, up(r→D) per expert | H43/H44 | **NOT PROMOTED ✗ (iter 90, commit `8c2be77`)** — int6 Δ +0.276 vs baseline 1.5264 (capacity -65%, 4.5M params), but K=8→K=128 Δ tightened -0.0036 → -0.0092, throughput +34%, peak VRAM -36%, artifact -49% (3.0 MB). Architecturally validated; stand-alone capacity-bound. See H69. | 1.8023 | -0.0092 (tighter than baseline) |
+| 65 | Scale to 16-32 experts | More experts at cheap per-expert dim r | H47 | **NOT PROMOTED ✗ (iter 91+92 bundle, commit `3e35655`)** — bundled with model_dim 768→1024 + r 128→192 to test matched-capacity (11.3M = 87% of baseline). int6 Δ +0.152 vs baseline (closed half the iter-90 gap). K=8→K=128 Δ -0.004 (still tighter than baseline). Quantified per-param efficiency penalty: bpb/param 1.49 vs baseline 1.17 (~27% worse). proj_rank=32 likely the bottleneck. See H70. | 1.6784 | -0.004 |
+| 70d | model_dim 768→1024 | Scale D with low-dim experts (cheap: only down/up grow) | H43 | **Bundled into iter 91+92 (above)** — single combined run rather than two sequential iters; per-knob attribution would require separate runs. See H70. | (see iter 91+92) | (see iter 91+92) |
 
-### Next up — recommended ordering after iter 66b
+### Next up — recommended ordering after iter 89
 
-Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) — promoted unconditionally because it strictly generalizes iter 74b (val_bpb 1.5150 reference): `B̄ → 0` recovers `T_θ = Δ` exactly. Running Groups A-D on top of iter 66b; val_bpb is measured relative to the iter 74b reference for diagnostic, but iter 66b is the working baseline regardless. Run ordering chosen for (i) low-risk → higher-risk, (ii) activation / gate / schedule tweaks before legacy-loss ablations, (iii) architectural scale-up last (depends on predecessors).
+**Current baseline:** iter 89 (`aeba34a`, val_bpb int6 = 1.5264) — last promoted iter; HyDRA denoising disabled on top of the iter 88 → iter 87 → iter 86 → iter 84 → iter 94 → iter 93 → iter 73 promotion chain over iter 66b's Parcae-faithful injection. Groups A-C are now closed (all PROMOTED ★ except iter 83 reverted). Group D (architectural scale-up: bottleneck experts) ran as iter 90 (standalone) + iter 91+92 (matched-capacity bundle); both NOT PROMOTED — bottleneck arch architecturally validated (K-sweep tightened in both runs) but carries a ~27% per-param efficiency penalty vs full-D MLA. Active queue is now Group E (iter 95) + the explicit "open work" tail at the bottom of the schedule.
+
+Run ordering rationale (preserved for posterity): low-risk → higher-risk, activation / gate / schedule tweaks before legacy-loss ablations, architectural scale-up last (depends on predecessors).
 
 #### Group A — low-risk quick wins (run first)
 
@@ -1277,20 +1279,22 @@ Current baseline is iter 66b (Parcae-paper-faithful DEQ input injection, H58) �
 | **88** | old 66b queue | Disable Lyapunov Hutchinson penalty (λ_jac 0.01 → 0) | **PROMOTED ★ (commit `45af5bf`)** — int6 Δ=+0.0050 (≤ 0.03 ✓), K=8→K=128 Δ tightened -0.003 → **-0.0041** (still negative — deep K BETTER), artifact -57 KB, step_avg **-2.9% (~3% throughput recovery)**. Hypothesis confirmed: Parcae per-dim Ā already bounds spectral radius; λ_jac contributed only noise + one VJP/step. Code path retained (commented-out future cleanup permitted, never delete). See H67. |
 | **89** | old 66c queue | Disable HyDRA denoising regularization (denoising_coef 0.01 → 0) | **PROMOTED ★ (commit `aeba34a`)** — int6 Δ=+0.0026 (≤ 0.03 ✓), K=8→K=128 Δ -0.0041 → -0.0036 (still negative — deep K BETTER), artifact +49 KB (zstd-compression diff, no params changed), step_avg -2%, peak_vram -301 MB. Same Parcae-redundancy hypothesis as iter 88 confirmed for the finite-perturbation probe. Cumulative iter 88+89 reclaims ~5% step time and ~1.5% peak VRAM. Code path retained per user directive. See H68. |
 
-#### Group D — architectural scale-up (high-lift push; 2-3 iters each, interdependent)
+#### Group D — architectural scale-up (CLOSED 2026-04-25, NOT PROMOTED but architecturally validated)
 
-| New # | Old # | One-line | Rationale |
+| New # | Old # | One-line | Result |
 |---|---|---|---|
-| **90** | 63-merged | Full-rank low-dim experts: `down(D→r) → full-rank attn+MLP at r → up(r→D)` per expert | H43 + H44. Replaces current low-rank factorization with explicit dim-reduction + full-rank expert compute. Precondition for 91 and 92 — without it, scaling experts or D blows the 16 MB artifact budget. |
-| **91** | 65 | Scale experts 8 → 16-32 at cheap per-expert dim r | H47. Router-diversity scaling becomes affordable once experts are low-dim (iter 90). |
-| **92** | 70-dup | model_dim 768 → 1024 under low-dim experts | H43. D now scales cheaply because only down/up projections grow with D (expert internals remain at r). |
+| **90** | 63-merged | Full-rank low-dim experts: `BottleneckIn (D→proj_rank→r) → full-rank MLA/MLP at r → BottleneckOut (r→proj_rank→D)` per expert | **NOT PROMOTED ✗ (commit `8c2be77`)** — int6 Δ +0.276 vs baseline (capacity -65%, 4.5M params). Architecturally validated: K=8→K=128 Δ TIGHTER (-0.0092 vs baseline -0.0036), step_avg -34%, peak VRAM -36%, artifact -49% (3.0 MB / 19% of budget). KV-A still latent-compressed for DeepSeek-style cache benefit; expert independence + per-expert pre-RMSNorm preserved. See H69. |
+| **91+92** | 65+70-dup | Bundle: `num_experts 8→16, model_dim 768→1024, attn_bottleneck_r 128→192, mlp_bottleneck_r 128→192` (proj_rank=32 unchanged) | **NOT PROMOTED ✗ (commit `3e35655`)** — matched-capacity test of bottleneck arch at 11.3M params (87% of baseline). int6 Δ +0.152 vs baseline (closed half the iter-90 gap, but plateaus from step 800). K=8→K=128 Δ -0.004 (still tighter than baseline). Quantified per-param efficiency: bpb/param 1.49 vs baseline 1.17 (~27% worse). proj_rank=32 likely the bottleneck (D=1024 squeezed through 32-dim subspace per expert). See H70. |
+| 91+92 follow-up (deferred, optional) | new | proj_rank=48 or 64 rescue (12.6M / 13.8M params, full-baseline-capacity bottleneck arch) | Available if user prioritizes bottleneck-arch closure: would test whether the per-param penalty is intrinsic to the bottleneck or specific to proj_rank=32. Not on the active queue per user direction 2026-04-25 (proceed to iter 95 instead). |
 
-#### Group E — deferred (run last, lower-ROI / lower-uncertainty than C+D)
+#### Group E — active (now next-up after Group D closure)
 
-| New # | Old # | One-line | Rationale |
+| New # | Old # | One-line | Plan |
 |---|---|---|---|
-| **95** | new | Anneal TBPTT depth `1-2 → K/2 (or K)` over training | **DEFERRED to end of queue (user reorder 2026-04-25)** — iter 95 was first attempted as the next-up after iter 87 but reverted before training (commit `37bfa7b` reverts `3b6695b`) so that Group C+D items run first. Rationale for the reorder: iter 88/89/90/91/92 are higher-uncertainty (regularization removal + arch scale-up) with larger expected ROI than a TBPTT scheduling refinement; running 95 last allows the schedule to be tuned against whatever K-jitter / experts / dim landscape is final. Builds on iter 85's TBPTT-jitter machinery — replaces the per-step uniform sampler with a schedule (linear or cosine) over `step/iterations`. Wallclock-aware variant: clamp the late-training k by elapsed_ms when wallclock-capped. |
-| **Phase 8 — self-refinement extensions** | iter 38 | Further self-refinement work (`num_refinements ≥ 2`, alternative ramp schedules, self-conditioning variants on `_refine_mix_alpha`) | **DEFERRED to end of queue (user reorder 2026-04-25)**. Note: the *baseline* already has `num_refinements=1` with 85% ramp on `_refine_mix_alpha` (see `train_gpt.py` L3604-L3610) — that single-refinement form has been in the working baseline since Phase 7.5. What's deferred is any further self-refinement expansion (more refinement steps, alternative ramp curves, or self-conditioning variants). Rationale: same as iter 95 — should be tuned against the final post-Group-D arch (low-dim experts at iter 90, scaled experts at iter 91, larger D at iter 92), not against the iter-87 landscape that those will replace. |
+| **95** | new | TBPTT efficiency sweep — find elbow | **NEXT (active queue)** — per user redesign 2026-04-26: replace the originally-planned anneal schedule with a uniform stochastic sweep. Expand `Hyperparameters.deq_bptt_k_jitter_set` from `(2, 3, 4)` to `(1, 2, 3, 4, 5, 6, 8, 12)` (covers k=1 to K_max/2); each step samples uniformly. Existing run.log lines already capture `(tbptt_k, grad_norm, ntp_loss)` per step. Post-training: bin grad_norm by tbptt_k, identify the elbow where marginal gradient signal saturates. The elbow tbptt_k* is the optimal TBPTT depth — update the jitter set to a tighter range around k* in a follow-up commit. Deliverable: H71 entry with elbow finding + recommended set. Diagnostic addition (queued for the same iter, ~15-line patch): per-K Lipschitz probe `‖DEQ(x+ε,K) − DEQ(x,K)‖/‖ε‖` to verify contraction tightens with K (independent confirmation of K-sweep monotonicity). Runs on iter 89 baseline (`aeba34a`), no architectural change. |
+| **Phase 8 — self-refinement extensions** | iter 38 | Further self-refinement work (`num_refinements ≥ 2`, alternative ramp schedules, self-conditioning variants on `_refine_mix_alpha`) | **DEFERRED to after iter 95**. Note: the *baseline* already has `num_refinements=1` with 85% ramp on `_refine_mix_alpha` (see `train_gpt.py`) — that single-refinement form has been the working baseline since Phase 7.5. What's deferred is any further self-refinement expansion (more refinement steps, alternative ramp curves, or self-conditioning variants). Rationale (post-Group-D update 2026-04-25): the bottleneck-experts arch did NOT promote, so Group D's intended landscape change didn't materialize — Phase 8 will be tuned against the iter 89 baseline rather than waiting for the (now-not-happening) D=1024+E=16 landscape. Still ranked below iter 95 because TBPTT optimization is a single-knob investigation with cleaner attribution. |
+| **Phase 7.5 — profile pipeline + top 10 ROI bottlenecks** | new | Profile the iter 89 step pipeline + fix top 10 ROI bottlenecks | **DEFERRED to after Phase 8** — same rationale as Phase 8 reset; profile-driven optimization is more useful once iter 95 + Phase 8 settle. Step_avg is already at 13s on dev hardware (iter 89 baseline); profiling against that vs the bottleneck arch's 8.6s would mostly reidentify already-known wins. |
+| **iter 90 follow-up (proj_rank=48 or 64)** | new | Bottleneck-arch rescue at full baseline capacity | **OPTIONAL (deferred indefinitely)** per user direction 2026-04-25. Available if Group D revisit is prioritized: bumping proj_rank from 32 to 48 (12.6M params, 97% of baseline) or 64 (13.8M, 106%) would test whether the +0.135 plateau in iter 91+92 is intrinsic to the bottleneck arch or specific to the 32-dim per-expert subspace. Not on the active queue. |
 
 **Throughput baseline (T-opt 12-22 complete):** step_avg=8,494ms (-16.3% from iter 47 baseline). block.forward=20ms compiled (hardware-limited). 86% compute-bound, 14% DDP overhead.
 
