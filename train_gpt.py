@@ -172,7 +172,7 @@ class Hyperparameters:
     num_kv_heads = 4
     model_dim = 768  # optimal: dim sweep showed 768 > 896 > 1024 (expert rank more valuable than shared attn width)
     num_heads = 8
-    num_experts = 8  # H5: single source for attn + mlp expert banks (CLAUDE.md SSOT)
+    num_experts = 16  # iter 96: 8 → 16 — "more, smaller experts" hypothesis (rank/2, E×2). DeepSeek-MoE / Switch direction at iso-cost on linear projections.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
     # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
     # emits NTP log-probs; CTP param banks (gate_ctp, A_ctp_shared, A_ctp,
@@ -313,9 +313,12 @@ class Hyperparameters:
     bigram_vocab_size = 0
     bigram_dim = 128
     kv_latent_dim = 0  # auto: dim//2
-    # optimal: rank 128/192 at dim=768, 8 experts
-    attn_expert_rank = 128
-    mlp_expert_rank = 192
+    # iter 96: rank/2 paired with E×2 (8 → 16). Q/MLP linear cost stays
+    # iso-compute (E·R constant); SDPA + Wo path doubles (~10-20% step-time
+    # penalty). Tests DeepSeek-MoE "more smaller experts" hypothesis on the
+    # iter 89 LoRA-style baseline at full d_head=96 sweet spot.
+    attn_expert_rank = 64
+    mlp_expert_rank = 96
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
