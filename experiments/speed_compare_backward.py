@@ -29,15 +29,32 @@ def _sample(buf, batch, seq):
 
 
 def _build_model(args, backward_mode: str) -> GPT:
+    """Construct GPT in the iter-90+ bottleneck-experts layout.
+
+    The iter 90 refactor removed `kv_latent_dim`, `attn_expert_rank`, and
+    `mlp_expert_rank` from the GPT signature; the inner attention now lives
+    in `BottleneckIn` + `ExpertMLABody` + `BottleneckOut`, parameterized by
+    `attn_bottleneck_r`, `mlp_bottleneck_r`, `expert_proj_rank`,
+    `attn_inner_heads`, `attn_inner_kv_heads`, and `mlp_inner_mult`.
+    """
     return GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
-        attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
+        num_refinements=args.num_refinements,
+        attn_bottleneck_r=args.attn_bottleneck_r,
+        mlp_bottleneck_r=args.mlp_bottleneck_r,
+        expert_proj_rank=args.expert_proj_rank,
+        attn_inner_heads=args.attn_inner_heads,
+        attn_inner_kv_heads=args.attn_inner_kv_heads,
+        mlp_inner_mult=args.mlp_inner_mult,
+        num_experts=args.num_experts,
+        num_shared_experts=args.num_shared_experts,
+        router_scoring=args.router_scoring,
         deq_beta=args.deq_beta, deq_backward=backward_mode,
+        use_ctp=args.use_ctp,
     ).cuda()
 
 

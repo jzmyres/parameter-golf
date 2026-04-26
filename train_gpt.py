@@ -774,6 +774,52 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
     return out
 
 
+# Canonical int6 quantization category set used by the production save path
+# (`main()` end-of-training).  Tests must use the same set or they verify a
+# different artifact than the one actually scored.
+INT6_CATEGORIES: set[str] = {"matrix", "embed", "bigram"}
+
+
+def save_int6_artifact(state_dict: dict[str, Tensor]) -> tuple[bytes, dict, dict]:
+    """Quantize + serialize + compress a state_dict the same way `main()` does.
+
+    Single source of truth for the submission artifact format. Returns a
+    `(compressed, qsd, meta)` tuple — `compressed` is the bytes that get
+    written to `model.int6.ptz`; `qsd` and `meta` are the inputs to
+    `dequantize_mixed_int6` and are returned for callers that want to
+    diagnostic-roundtrip without re-decoding the blob.
+
+    Format mirrors `main()` exactly:
+      - int6_cats = INT6_CATEGORIES
+      - serialized as `{"state_dict": qsd, "meta": meta}` via torch.save
+      - compressed with zstd level 22 if zstandard is importable, else zlib 9
+    """
+    qsd, meta = mixed_quantize_int6(state_dict, INT6_CATEGORIES)
+    buf = io.BytesIO()
+    torch.save({"state_dict": qsd, "meta": meta}, buf)
+    raw_bytes = buf.getvalue()
+    if _COMPRESSOR == "zstd":
+        compressed = zstandard.ZstdCompressor(level=22).compress(raw_bytes)
+    else:
+        compressed = zlib.compress(raw_bytes, 9)
+    return compressed, qsd, meta
+
+
+def load_int6_artifact(blob: bytes, template_state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Decompress + deserialize + dequantize an artifact produced by save_int6_artifact.
+
+    `template_state_dict` is the un-quantized model's state_dict — needed by
+    `dequantize_mixed_int6` for original shapes / dtypes. Returns a state_dict
+    suitable for `model.load_state_dict(strict=True)`.
+    """
+    if _COMPRESSOR == "zstd":
+        decompressed = zstandard.ZstdDecompressor().decompress(blob)
+    else:
+        decompressed = zlib.decompress(blob)
+    payload = torch.load(io.BytesIO(decompressed), map_location="cpu", weights_only=False)
+    return dequantize_mixed_int6(payload["state_dict"], payload["meta"], template_state_dict)
+
+
 # ---------------------------------------------------------------------------
 # DATA LOADING
 # ---------------------------------------------------------------------------
@@ -4182,16 +4228,11 @@ def main() -> None:
         weights_dir.mkdir(parents=True, exist_ok=True)
         torch.save(sd, weights_dir / "model_full.pt")
         log0(f"saved full-precision weights: {weights_dir / 'model_full.pt'}")
-        int6_cats = {"matrix", "embed", "bigram"}
-        qsd, meta = mixed_quantize_int6(sd, int6_cats)
-        buf = io.BytesIO()
-        torch.save({"state_dict": qsd, "meta": meta}, buf)
-        raw_bytes = buf.getvalue()
-        if _COMPRESSOR == "zstd":
-            cctx = zstandard.ZstdCompressor(level=22)
-            compressed = cctx.compress(raw_bytes)
-        else:
-            compressed = zlib.compress(raw_bytes, 9)
+        # Single source of truth for the submission artifact format —
+        # `experiments/test_submission.py` calls the same helper so its
+        # quant_categories / serialization keys / compressor settings cannot
+        # drift away from what is actually scored.
+        compressed, qsd, meta = save_int6_artifact(sd)
         artifact_bytes = len(compressed)
         log0(f"artifact_bytes:{artifact_bytes} compressor:{_COMPRESSOR}")
 
@@ -4259,13 +4300,7 @@ def main() -> None:
         # Eager with B=64 val batches is reliable and fast enough.
         torch._dynamo.reset()
         torch._dynamo.config.disable = True
-        if _COMPRESSOR == "zstd":
-            dctx = zstandard.ZstdDecompressor()
-            decompressed = dctx.decompress(compressed)
-        else:
-            decompressed = zlib.decompress(compressed)
-        loaded = torch.load(io.BytesIO(decompressed), map_location="cpu", weights_only=True)
-        deq_sd = dequantize_mixed_int6(loaded["state_dict"], loaded["meta"], sd)
+        deq_sd = load_int6_artifact(compressed, sd)
         base_model.load_state_dict(deq_sd, strict=True)
 
     # Broadcast the dequantized weights from master to all ranks so every

@@ -4,15 +4,15 @@ Verifies that the model, after the same quantization + compression pipeline
 used for scoring, still meets the 16MB size limit and that the quantized
 model's loss closely matches the unquantized model's loss.
 
-This is the test for what actually gets submitted and scored.
+This is the test for what actually gets submitted and scored — the
+quantization, serialization, and compression all go through the SAME helpers
+that `train_gpt.main()` uses (`save_int6_artifact` / `load_int6_artifact`),
+so the test cannot drift away from the real save path.
 """
-import io
 import os
 import sys
-import zlib
 
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -21,7 +21,13 @@ MAX_QUANT_DEGRADATION = 0.05     # max allowed val_loss increase from quantizati
 
 
 def _build_model():
-    """Build model with default hyperparameters."""
+    """Build model with the production Hyperparameters.
+
+    Threads every architecture field through the GPT constructor so the
+    instantiated model matches what `train_gpt.main()` builds — otherwise
+    the artifact-size test verifies a different (likely smaller) model
+    than the one actually scored.
+    """
     from train_gpt import GPT, Hyperparameters
     args = Hyperparameters()
     model = GPT(
@@ -30,6 +36,34 @@ def _build_model():
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        num_refinements=args.num_refinements,
+        attn_bottleneck_r=args.attn_bottleneck_r,
+        mlp_bottleneck_r=args.mlp_bottleneck_r,
+        expert_proj_rank=args.expert_proj_rank,
+        attn_inner_heads=args.attn_inner_heads,
+        attn_inner_kv_heads=args.attn_inner_kv_heads,
+        mlp_inner_mult=args.mlp_inner_mult,
+        deq_beta=args.deq_beta,
+        attn_balance_mult=args.attn_balance_mult,
+        mlp_balance_mult=args.mlp_balance_mult,
+        mos_balance_mult=args.mos_balance_mult,
+        bal_loss_coef=args.bal_loss_coef,
+        router_health_coef=args.router_health_coef,
+        mos_ortho_out_coef=args.mos_ortho_out_coef,
+        deq_backward=args.deq_backward,
+        deq_bptt_k=args.deq_bptt_k,
+        block_ortho_aux_coef=args.block_ortho_aux_coef,
+        block_ortho_aux_every=args.block_ortho_aux_every,
+        block_ortho_aux_tokens=args.block_ortho_aux_tokens,
+        router_scoring=args.router_scoring,
+        num_experts=args.num_experts,
+        num_shared_experts=args.num_shared_experts,
+        lyapunov_coef=args.lyapunov_coef,
+        lyapunov_gamma=args.lyapunov_gamma,
+        lyapunov_warmup_frac=args.lyapunov_warmup_frac,
+        use_parcae=args.use_parcae,
+        parcae_init_a_bar=args.parcae_init_a_bar,
+        use_ctp=args.use_ctp,
     ).cuda()
     return model, args
 
@@ -66,37 +100,21 @@ def _ntp_loss(model, vocab_size, num_batches=5):
 
 
 def _quantize_and_compress(model):
-    """Run the same quantization + compression pipeline as train_gpt.py."""
-    from train_gpt import mixed_quantize_int6, _COMPRESSOR
+    """Run the EXACT save pipeline `train_gpt.main()` uses.
+
+    Returns `(blob, sd_cpu)` — `sd_cpu` is the un-quantized template needed
+    by the symmetric loader for shape/dtype reconstruction.
+    """
+    from train_gpt import save_int6_artifact
     sd_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"})
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    try:
-        import zstandard
-        if _COMPRESSOR == "zstd":
-            quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
-        else:
-            quant_blob = zlib.compress(quant_raw, 9)
-    except ImportError:
-        quant_blob = zlib.compress(quant_raw, 9)
-    return quant_blob, quant_raw, sd_cpu
+    blob, _qsd, _meta = save_int6_artifact(sd_cpu)
+    return blob, sd_cpu
 
 
 def _decompress_and_load(model, quant_blob, sd_cpu):
-    """Decompress and load quantized weights back into the model."""
-    from train_gpt import dequantize_mixed_int6, _COMPRESSOR
-    try:
-        import zstandard
-        if _COMPRESSOR == "zstd":
-            decompressed = zstandard.ZstdDecompressor().decompress(quant_blob)
-        else:
-            decompressed = zlib.decompress(quant_blob)
-    except ImportError:
-        decompressed = zlib.decompress(quant_blob)
-    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu", weights_only=False)
-    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+    """Inverse of _quantize_and_compress; uses the production load helper."""
+    from train_gpt import load_int6_artifact
+    deq_state = load_int6_artifact(quant_blob, sd_cpu)
     model.load_state_dict(deq_state, strict=True)
     return model
 
@@ -107,7 +125,7 @@ def test_artifact_size():
     model, args = _build_model()
     model = _train_few_steps(model, num_steps=5)
 
-    quant_blob, _, _ = _quantize_and_compress(model)
+    quant_blob, _ = _quantize_and_compress(model)
     quant_bytes = len(quant_blob)
 
     # Code size: read train_gpt.py
@@ -140,7 +158,7 @@ def test_quantization_roundtrip():
     print(f"  Pre-quantization NTP loss:  {pre_loss:.4f}")
 
     # Quantize -> compress -> decompress -> load
-    quant_blob, _, sd_cpu = _quantize_and_compress(model)
+    quant_blob, sd_cpu = _quantize_and_compress(model)
     model = _decompress_and_load(model, quant_blob, sd_cpu)
 
     # Loss after quantization roundtrip
@@ -168,10 +186,10 @@ def test_roundtrip_deterministic():
     model, _ = _build_model()
     model = _train_few_steps(model, num_steps=5)
 
-    blob1, _, sd_cpu1 = _quantize_and_compress(model)
+    blob1, sd_cpu1 = _quantize_and_compress(model)
     # Load quantized weights back and re-quantize
     model = _decompress_and_load(model, blob1, sd_cpu1)
-    blob2, _, _ = _quantize_and_compress(model)
+    blob2, _ = _quantize_and_compress(model)
 
     # Sizes should be very close (dequantized weights differ slightly)
     size_ratio = len(blob2) / len(blob1) if len(blob1) > 0 else 1.0

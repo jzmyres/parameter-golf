@@ -4,6 +4,13 @@ Instruments forward_experts, MLP, router, DEQ solver, and backward pass
 with CUDA events for accurate GPU timing. Reports ms and % breakdown.
 
 Usage: conda activate opg && python experiments/profile_step.py
+
+NOTE: The instrumented `profile_forward_experts` reaches into per-expert
+attribute names (`expert_q_down`, `expert_kv_a`, `kv_pre_norm`, etc.) that
+the iter 90+ bottleneck-experts refactor renamed/reorganized into
+`BottleneckIn` + `ExpertMLABody` + `BottleneckOut` modules.  The end-to-end
+profiling section (`Block.forward (actual)`) is unaffected and remains the
+authoritative source for throughput numbers.
 """
 import os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -11,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 import torch.nn.functional as F
 from train_gpt import (
-    GPT, Hyperparameters, router_diagnostics, _rms_norm,
+    GPT, Hyperparameters, router_diagnostics, _rms_unit,
 )
 
 def cuda_timer():
@@ -50,7 +57,7 @@ def profile_forward_experts(attn, x_n):
     s.record()
     q_rope = q_raw[..., :attn.rope_dim]
     q_nope = q_raw[..., attn.rope_dim:]
-    q_rope, q_nope = _rms_norm(q_rope), _rms_norm(q_nope)
+    q_rope, q_nope = _rms_unit(q_rope), _rms_unit(q_nope)
     e.record(); torch.cuda.synchronize()
     timings["Q_rmsnorm"] = s.elapsed_time(e)
 
@@ -81,7 +88,7 @@ def profile_forward_experts(attn, x_n):
     s.record()
     k_rope_shared = attn.c_k_rope(x_n).reshape(B, T, H_kv, attn.rope_dim)
     k_rope = k_rope_shared.unsqueeze(0).expand(E, -1, -1, -1, -1)
-    k_rope, k_nope = _rms_norm(k_rope), _rms_norm(k_nope)
+    k_rope, k_nope = _rms_unit(k_rope), _rms_unit(k_nope)
     e.record(); torch.cuda.synchronize()
     timings["K_rope+norm"] = s.elapsed_time(e)
 
@@ -138,16 +145,23 @@ def main():
     device = torch.device("cuda")
     args = Hyperparameters()
 
-    # Build model at production config
+    # Build model at production config (iter 90+ bottleneck-experts layout).
     model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        num_experts=args.num_experts, attn_expert_rank=128, mlp_expert_rank=192,
+        num_experts=args.num_experts,
+        attn_bottleneck_r=args.attn_bottleneck_r,
+        mlp_bottleneck_r=args.mlp_bottleneck_r,
+        expert_proj_rank=args.expert_proj_rank,
+        attn_inner_heads=args.attn_inner_heads,
+        attn_inner_kv_heads=args.attn_inner_kv_heads,
+        mlp_inner_mult=args.mlp_inner_mult,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         router_scoring=args.router_scoring,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
+        use_ctp=args.use_ctp,
     ).to(device).bfloat16()
 
     block = model.shared_block
@@ -162,7 +176,11 @@ def main():
     print(f"Config: B={B}, T={T}, D={D}, E={args.num_experts}, H={args.num_heads}")
     print(f"  Attn heads: E*H={args.num_experts * args.num_heads}, "
           f"KV heads: E*H_kv={args.num_experts * args.num_kv_heads}")
-    print(f"  expert_rank={block.attn.expert_rank}, kv_rank={block.attn.kv_rank}")
+    # Iter 90+: expert ranks live on the BottleneckIn/Out modules
+    # (`expert_proj_rank`) and the inner body (`bottleneck_r`).
+    print(f"  attn_bottleneck_r={args.attn_bottleneck_r}, "
+          f"mlp_bottleneck_r={args.mlp_bottleneck_r}, "
+          f"expert_proj_rank={args.expert_proj_rank}")
     print()
 
     # Warmup
@@ -176,7 +194,6 @@ def main():
     # --- Profile actual Block.forward (end-to-end) ---
     N_RUNS = 10
     block_times = []
-    attn_times = []
     for _ in range(N_RUNS):
         z_in = torch.randn(B, T, D, device=device, dtype=torch.bfloat16)
         x0 = torch.randn(B, T, D, device=device, dtype=torch.bfloat16)
@@ -186,29 +203,37 @@ def main():
             e.record(); torch.cuda.synchronize()
             block_times.append(s.elapsed_time(e))
 
-            h = block.state_norm(z_in + x0)
-            s2, e2 = cuda_timer(); s2.record()
-            block.attn.forward_experts(h)
-            e2.record(); torch.cuda.synchronize()
-            attn_times.append(s2.elapsed_time(e2))
-
     block_avg = sum(block_times) / len(block_times)
-    attn_avg = sum(attn_times) / len(attn_times)
-    print(f"Block.forward (actual):       {block_avg:.3f} ms")
-    print(f"  forward_experts (actual):   {attn_avg:.3f} ms")
-    print(f"  remainder (MLP+routing+..): {block_avg - attn_avg:.3f} ms")
+    print(f"Block.forward (end-to-end, actual): {block_avg:.3f} ms")
     print()
 
-    # --- Profile Block.forward components (instrumented) ---
+    # --- Component breakdown (instrumented) ---
+    # The detailed instrumented breakdown below targets the iter-89-and-earlier
+    # per-expert attention layout (attributes like `expert_q_down`,
+    # `kv_pre_norm`, `c_k_rope`, `state_norm`).  The iter 90+ bottleneck-
+    # experts refactor moved these into `BottleneckIn` + `ExpertMLABody` +
+    # `BottleneckOut`, so the breakdown crashes on the current architecture.
+    # Wrapped in try/except so the end-to-end profile above stays useful.
+    print("--- Component breakdown (legacy instrumentation) ---")
+    try:
+        _legacy_component_breakdown(block, B, T, D, device)
+    except (AttributeError, RuntimeError) as exc:
+        print(f"  SKIPPED — instrumented breakdown is incompatible with the "
+              f"iter 90+ bottleneck-experts layout ({type(exc).__name__}: {exc}).")
+        print("  End-to-end timing above is the authoritative throughput number.")
+
+
+def _legacy_component_breakdown(block, B, T, D, device):
+    """Pre-iter-90 attention component breakdown — kept for archival reference."""
     N_RUNS = 5
     all_timings = {}
 
-    for run in range(N_RUNS):
+    for _ in range(N_RUNS):
         z_in = torch.randn(B, T, D, device=device, dtype=torch.bfloat16)
         x0 = torch.randn(B, T, D, device=device, dtype=torch.bfloat16)
 
         with torch.no_grad():
-            # 1. state_norm
+            # 1. state_norm (legacy attribute)
             s, e = cuda_timer(); s.record()
             u = z_in + x0
             h = block.state_norm(u)
@@ -224,7 +249,7 @@ def main():
             e.record(); torch.cuda.synchronize()
             all_timings.setdefault("router", []).append(s.elapsed_time(e))
 
-            # 3. Attention forward_experts (sub-profiled)
+            # 3. Attention forward_experts (sub-profiled — legacy attrs)
             attn_out, attn_timings = profile_forward_experts(block.attn, h)
             for k, v in attn_timings.items():
                 all_timings.setdefault(f"attn.{k}", []).append(v)
