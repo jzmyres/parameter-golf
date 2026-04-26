@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
+import warnings
 import zlib
 from collections import Counter
 from pathlib import Path
@@ -787,8 +788,23 @@ def load_data_shard(file: Path) -> Tensor:
     # torch.from_numpy on a memmap returns a view (no copy) — the tensor
     # is backed by the file's page cache.  Slicing in TokenStream.take()
     # only materializes the accessed pages.
+    #
+    # PyTorch warns once per process when wrapping any read-only buffer,
+    # because in general writing to such a tensor would be undefined
+    # behavior.  Our flow never writes: TokenStream.take() only slices, and
+    # DistributedTokenLoader.next_batch() .copy_()s into a separately
+    # allocated pinned buffer before any GPU transfer.  Copying the shard
+    # at load time would defeat the page-cache sharing this loader was
+    # designed to provide (each rank would hold its own ~hundreds-of-MB
+    # copy).  Suppress the specific warning at the wrap site only.
     tokens_mmap = np.memmap(file, dtype="<u2", mode="r", offset=header_bytes, shape=(num_tokens,))
-    return torch.from_numpy(tokens_mmap.view(np.uint16))
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The given NumPy array is not writable.*",
+            category=UserWarning,
+        )
+        return torch.from_numpy(tokens_mmap.view(np.uint16))
 
 
 class TokenStream:
@@ -2143,12 +2159,18 @@ class Block(nn.Module):
         self._router_gate_call_track: list[float] = []
         self._attn_router_gate_call_track: list[float] = []
         self._mlp_router_gate_call_track: list[float] = []
-        # Per-expert routing weight per iteration (shows if experts specialize across iters)
-        self._attn_expert_weights_per_iter: list[list[float]] = []  # [iter][expert] mean weight
-        self._mlp_expert_weights_per_iter: list[list[float]] = []
-        self._shared_gate_mean: float | None = None
-        self._shared_gate_min: float | None = None
-        self._shared_gate_std: float | None = None
+        # Per-expert routing weight per iteration (shows if experts specialize across
+        # iters).  Stored as detached GPU tensors of shape (E,) — materialized to
+        # Python lists once after the DEQ solve, NOT per-iter (CLAUDE.md §9
+        # "Hot-path sync prohibition" forbids .item() inside the micro_step loop).
+        self._attn_expert_weights_per_iter: list[Tensor] = []
+        self._mlp_expert_weights_per_iter: list[Tensor] = []
+        # Shared-gate scalars are stored as GPU 0-d tensors during the solve;
+        # the .item() materialization happens at log time (outside the hot
+        # range) via the `float(...)` calls in `format_expert_info`.
+        self._shared_gate_mean: Tensor | float | None = None
+        self._shared_gate_min: Tensor | float | None = None
+        self._shared_gate_std: Tensor | float | None = None
         self._shared_gate_diag_step: int | None = None
 
     def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> tuple[Tensor, Tensor]:
@@ -2199,12 +2221,16 @@ class Block(nn.Module):
         w_attn, w_mlp = self._route_pooled(h)
         if self._diag_track_enabled:
             attn_rg = getattr(self.router, "_router_gate_last_mean", None)
-            # Track per-expert mean routing weights (shows specialization across iters)
+            # Track per-expert mean routing weights (shows specialization across
+            # iters).  Append GPU tensors only — single materialization happens
+            # post-solve in SharedBlock.forward.  Mean is over all non-expert
+            # dims (B, T) so each entry has shape (E,).
             with torch.no_grad():
+                reduce_dims = tuple(range(w_attn.dim() - 1))
                 self._attn_expert_weights_per_iter.append(
-                    [float(w_attn[..., i].mean().item()) for i in range(w_attn.shape[-1])])
+                    w_attn.detach().float().mean(dim=reduce_dims))
                 self._mlp_expert_weights_per_iter.append(
-                    [float(w_mlp[..., i].mean().item()) for i in range(w_mlp.shape[-1])])
+                    w_mlp.detach().float().mean(dim=reduce_dims))
 
         # All experts compute outputs together (shared + routed).
         attn_expert_out = self.attn.forward_experts(h)  # (B, T, E, D)
@@ -2217,9 +2243,12 @@ class Block(nn.Module):
             if _should_diag(self.training):
                 with torch.no_grad():
                     g_sf = torch.cat([g_s_attn.detach().float(), g_s_mlp.detach().float()], dim=-1)
-                    self._shared_gate_mean = float(g_sf.mean().item())
-                    self._shared_gate_min = float(g_sf.min().item())
-                    self._shared_gate_std = float(g_sf.std(unbiased=False).item())
+                    # Store as 0-d GPU tensors — log site (`format_expert_info`)
+                    # already calls `float(...)` for formatting, which performs
+                    # the single .item() sync OUTSIDE the micro_step loop.
+                    self._shared_gate_mean = g_sf.mean().detach()
+                    self._shared_gate_min = g_sf.min().detach()
+                    self._shared_gate_std = g_sf.std(unbiased=False).detach()
                     self._shared_gate_diag_step = _ROUTER_DIAGNOSTICS_STEP
             else:
                 self._shared_gate_mean = None
@@ -2862,14 +2891,22 @@ class GPT(nn.Module):
             else:
                 self._mlp_router_gate_iter_last_solve = []
 
-            # Per-expert routing weights per iteration (2 calls per iter: y-update, z-update)
+            # Per-expert routing weights per iteration (2 calls per iter: y-update,
+            # z-update).  The producer at Block.forward stored each entry as a
+            # detached GPU tensor of shape (E,); we stack + pair-mean here but
+            # KEEP THE RESULT ON GPU as `_attn_expert_weights_iter_t` — the .cpu()
+            # materialization is deferred to the log-emission site
+            # (`format_iter_dynamics_info`), which runs OUTSIDE the micro_step
+            # hot range (CLAUDE.md §9 "Hot-path sync prohibition").
             attn_ew = list(getattr(sb, "_attn_expert_weights_per_iter", []) or [])
             if len(attn_ew) == 2 * K:
-                self._attn_expert_weights_iter = [
-                    [0.5 * (attn_ew[2*i][j] + attn_ew[2*i+1][j]) for j in range(len(attn_ew[0]))]
-                    for i in range(K)]
+                # (2K, E) → reshape (K, 2, E) → mean over the 2-call axis → (K, E)
+                self._attn_expert_weights_iter_t = (
+                    torch.stack(attn_ew, dim=0).reshape(K, 2, -1).mean(dim=1)
+                )
             else:
-                self._attn_expert_weights_iter = []
+                self._attn_expert_weights_iter_t = None
+            self._attn_expert_weights_iter: list[list[float]] | None = None  # lazy materialization
             sb._attn_expert_weights_per_iter = []
             sb._mlp_expert_weights_per_iter = []
 
@@ -3763,8 +3800,18 @@ def main() -> None:
         mlp_rg_iter = getattr(m, "_mlp_router_gate_iter_last_solve", None)
         if mlp_rg_iter is not None and len(mlp_rg_iter) > 0:
             parts.append(f"mlp_rg_iter:[{','.join(f'{v:.3f}' for v in mlp_rg_iter)}]")
-        # Per-expert routing weights per iteration (shows expert specialization across iters)
+        # Per-expert routing weights per iteration (shows expert specialization
+        # across iters).  The DEQ solver stored the per-iter (K, E) routing
+        # weight tensor on GPU as `_attn_expert_weights_iter_t`; materialize it
+        # here at the log-emission site (outside the micro_step hot range) via
+        # a single .cpu() sync, and cache the resulting list on the module so
+        # repeated reads within the same logging cycle don't re-sync.
         ew_iter = getattr(m, "_attn_expert_weights_iter", None)
+        if ew_iter is None:
+            ew_iter_t = getattr(m, "_attn_expert_weights_iter_t", None)
+            if ew_iter_t is not None:
+                ew_iter = ew_iter_t.cpu().tolist()
+                m._attn_expert_weights_iter = ew_iter
         if ew_iter is not None and len(ew_iter) > 0:
             # Log std across iterations per expert (high std = specialist, low = uniform)
             ew_arr = np.array(ew_iter)  # (K, E)

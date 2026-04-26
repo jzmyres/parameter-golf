@@ -1,5 +1,5 @@
 """Tests for DistributedTokenLoader rank-local partitioning."""
-import sys, os, tempfile, unittest
+import sys, os, tempfile, unittest, warnings
 import numpy as np
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -60,6 +60,35 @@ class TestDistributedTokenLoader(unittest.TestCase):
             # With sequential token IDs, overlap should be minimal
             self.assertLess(overlap, x0.numel() // 2,
                             f"Excessive overlap: {overlap}/{x0.numel()} tokens")
+
+    def test_load_data_shard_no_writeable_warning(self):
+        """`load_data_shard` must NOT emit the read-only-buffer UserWarning.
+
+        Prior implementation called `torch.from_numpy()` directly on the
+        memmap view, which is read-only (mode="r"); torch warns because it
+        cannot enforce the immutability at the tensor layer.  We now make
+        the read-only contract explicit (`arr.flags.writeable = False`).
+        Downstream consumers (TokenStream.take, DistributedTokenLoader's
+        pinned-buf .copy_()) never mutate the loaded tensor.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shard_path = os.path.join(tmpdir, "test_warn_000000.bin")
+            _create_test_shard(shard_path, num_tokens=4096)
+            from pathlib import Path
+            from train_gpt import load_data_shard
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                tokens = load_data_shard(Path(shard_path))
+            writeable_warnings = [
+                w for w in caught
+                if "writeable" in str(w.message).lower() or "non-writable" in str(w.message).lower()
+            ]
+            self.assertEqual(
+                writeable_warnings, [],
+                f"Unexpected writeable-related warning(s): {[str(w.message) for w in writeable_warnings]}",
+            )
+            self.assertEqual(tokens.numel(), 4096)
+            self.assertEqual(tokens.dtype, torch.uint16)
 
     def test_multi_batch_no_drift(self):
         """Multiple consecutive batches should not produce overlapping tokens within a rank."""
