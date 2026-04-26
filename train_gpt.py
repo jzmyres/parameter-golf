@@ -170,17 +170,9 @@ class Hyperparameters:
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
-    # Phase 9 iter 91+92 bundle (2026-04-25): D 768 → 1024 to absorb the
-    # capacity freed by iter 90's bottleneck experts.  Earlier (pre-iter-90)
-    # the dim sweep showed 768 > 896 > 1024 because the OLD MLA experts
-    # scaled per-expert footprint quadratically with D; under bottleneck
-    # experts the per-expert path no longer scales with D, so D=1024 is now
-    # affordable and tests the matched-capacity comparison vs baseline (iter 89).
-    model_dim = 1024
+    model_dim = 768  # optimal: dim sweep showed 768 > 896 > 1024 (expert rank more valuable than shared attn width)
     num_heads = 8
-    # Phase 9 iter 91+92 bundle (2026-04-25): E 8 → 16 — classic MoE-capacity
-    # scaling.  Iter 90 freed budget; iter 91 spends it on more experts.
-    num_experts = 16  # H5+H47: SSOT for attn + mlp expert banks (CLAUDE.md mirror)
+    num_experts = 8  # H5: single source for attn + mlp expert banks (CLAUDE.md SSOT)
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
     # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
     # emits NTP log-probs; CTP param banks (gate_ctp, A_ctp_shared, A_ctp,
@@ -331,17 +323,12 @@ class Hyperparameters:
     # gate/fc/down for MLP), saving matmul stages vs the previous nested
     # low-rank MLA.  Total per-expert footprint shrinks from ~700K to ~290K,
     # freeing budget for iter 91 (more experts) and iter 92 (larger D).
-    # Phase 9 iter 91+92 bundle (2026-04-25): r 128 → 192 — wider inner
-    # bottleneck (still factored via proj_rank=32 at the D↔r boundary).  At
-    # r=192 with H_in=4 we get d_in=48 (vs d_in=32 at r=128), giving the
-    # per-expert MLA more head-dim room to specialize.  Justifies the D=1024
-    # outer dim by scaling the inner bottleneck proportionally.
-    attn_bottleneck_r = 192       # inner dim r for the per-expert MLA pipeline
-    mlp_bottleneck_r = 192        # inner dim r for the per-expert SwiGLU MLP
+    attn_bottleneck_r = 128       # inner dim r for the per-expert MLA pipeline
+    mlp_bottleneck_r = 128        # inner dim r for the per-expert SwiGLU MLP
     expert_proj_rank = 32         # rank of the D→proj_rank→r factored I/O bottleneck
     attn_inner_heads = 4          # H_in: full-rank Q heads at r (must divide r)
     attn_inner_kv_heads = 2       # H_kv_in: GQA ratio H_in / H_kv_in (KV is still latent-compressed via KV-A → kv_latent_inner)
-    mlp_inner_mult = 2.5          # SwiGLU hidden = round(r * mlp_inner_mult) = 480 at r=192
+    mlp_inner_mult = 2.5          # SwiGLU hidden = round(r * mlp_inner_mult)
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
@@ -2590,19 +2577,7 @@ class RevDEQFunction(torch.autograd.Function):
                 denom = z0.norm().clamp(min=1.0)
                 z_rec = z_next64.to(dtype=state_dtype)
                 y_rec = y_next64.to(dtype=state_dtype)
-                # IMPORTANT — semantic of `deq_recon_err` under TBPTT.
-                # Under truncated BPTT (K_bwd < K_fwd, the typical regime since
-                # iter 28-tbptt) the reverse loop stops at iteration K_fwd-K_bwd,
-                # NOT at z_0.  This metric then measures how far the forward FP
-                # *travelled* in the (K_fwd-K_bwd) un-reconstructed iterations,
-                # which is a "distance travelled" gauge — NOT a numerical
-                # reconstruction error.  Do not gate promotion / divergence
-                # decisions on its absolute magnitude under TBPTT; expect
-                # values O(||z_0||) once the FP is non-trivial.
-                # To measure true RevDEQ reconstruction error (target: near
-                # fp64 precision, ~1e-12), set `deq_bptt_k = 0` (full BPTT)
-                # and re-run; only that regime makes recon_err comparable
-                # to the fp64 floor.
+                # Store as GPU tensor — materialize at log time only.
                 recon_err_t = ((z_rec - z0).norm() + (y_rec - z0).norm()) / denom
                 _target = _unwrap_compiled_module(f_theta)
                 setattr(_target, "_deq_recon_error_last_bwd", recon_err_t.detach())
