@@ -1320,7 +1320,13 @@ Run ordering rationale (preserved for posterity): low-risk → higher-risk, acti
 | **88** | old 66b queue | Disable Lyapunov Hutchinson penalty (λ_jac 0.01 → 0) | **PROMOTED ★ (commit `45af5bf`)** — int6 Δ=+0.0050 (≤ 0.03 ✓), K=8→K=128 Δ tightened -0.003 → **-0.0041** (still negative — deep K BETTER), artifact -57 KB, step_avg **-2.9% (~3% throughput recovery)**. Hypothesis confirmed: Parcae per-dim Ā already bounds spectral radius; λ_jac contributed only noise + one VJP/step. Code path retained (commented-out future cleanup permitted, never delete). See H67. |
 | **89** | old 66c queue | Disable HyDRA denoising regularization (denoising_coef 0.01 → 0) | **PROMOTED ★ (commit `aeba34a`)** — int6 Δ=+0.0026 (≤ 0.03 ✓), K=8→K=128 Δ -0.0041 → -0.0036 (still negative — deep K BETTER), artifact +49 KB (zstd-compression diff, no params changed), step_avg -2%, peak_vram -301 MB. Same Parcae-redundancy hypothesis as iter 88 confirmed for the finite-perturbation probe. Cumulative iter 88+89 reclaims ~5% step time and ~1.5% peak VRAM. Code path retained per user directive. See H68. |
 
-#### Group D — architectural scale-up (CLOSED 2026-04-25, NOT PROMOTED but architecturally validated)
+#### Group D — architectural scale-up (CLOSED 2026-04-25; bottleneck DISCARDED — superseded by iter 96 full-D LoRA)
+
+> **DECISION (2026-04-26): Low-dim bottleneck experts are DISCARDED.** The iter 96 PROMOTION of full-D LoRA with rank-halving + E-doubling (H71, val_bpb int6 1.4903) demonstrated that **the same artifact-budget gain is achievable without sacrificing per-param efficiency or `d_head` tensorcore alignment**. Bottleneck experts forfeit both:
+> - Per-param efficiency: 1.49 bpb/param vs full-D LoRA's 1.17 (~27% worse, H70 quantified at matched capacity).
+> - SDPA throughput: small `r` forces `d_head ≤ 48` (off FA sweet spot of 64+), and the penalty compounds linearly when scaling N_expert.
+>
+> Full-D LoRA delivers strictly better val_bpb at the same artifact size, with a routing-diversity scaling axis (Group F) that doesn't require giving up `d_head ≥ 64`. The bottleneck infrastructure is preserved for archival/rescue purposes only — it should NOT be re-introduced as a forward-looking scaling axis. CLAUDE.md §6.3 records this as the architectural standard.
 
 | New # | Old # | One-line | Result |
 |---|---|---|---|

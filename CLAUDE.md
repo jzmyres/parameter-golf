@@ -174,8 +174,10 @@ Paper: Soft MoE (arxiv:2308.00951). Mixtape (NeurIPS 2019) for MoS softmax.
   - **Expert orthogonality**: `|cos_sim| → 0` between expert outputs (post-mix `mu_e`).
 - Fully differentiable, no discrete decisions.
 
-### 6.3 Per-Expert MLA + Gated Attention
+### 6.3 Per-Expert MLA + Gated Attention (full-D LoRA-style — architectural standard)
 Papers: DeepSeek-V2 MLA (arxiv:2405.04434); Gated Attention (arxiv:2505.06708, NeurIPS 2025 Best Paper).
+
+**Architectural standard**: full-D LoRA-style — every expert linear is rank-`R` factored (`D → R → H·d_head` etc.) but **all activations and SDPA run at full `model_dim`** with `d_head` in the FlashAttention tensorcore sweet spot (64+). The rank `R` constrains *parameter count per expert*, not the *attention compute width*.
 
 - Each expert has its own complete MLA pipeline (no shared params — see §6.2):
   - Per-expert Q: `dim → expert_rank → H·d_head + H` (gate logits appended).
@@ -186,6 +188,8 @@ Papers: DeepSeek-V2 MLA (arxiv:2405.04434); Gated Attention (arxiv:2505.06708, N
 - **Head-packed SDPA**: expert index extends head dimension (`E·H` query heads, `E·H_kv` KV heads) for one FlashAttention call. GQA ratio preserved.
 - **Decoupled RoPE**: split heads into RoPE and non-RoPE components.
 - **Gated Attention**: query-dependent per-expert-per-head sigmoid gate after SDPA. Gate logits from per-expert Q projection (appended to Q output); each token gets its own gate value per head per expert.
+
+**Discarded alternative — bottleneck experts (iter 90, 91+92)**. The "low-dim bottleneck" rewrite (BottleneckIn `D→proj_rank→r` + ExpertBody at small `r` + BottleneckOut `r→proj_rank→D`) was tested as Group D and NOT PROMOTED. Empirically it underperformed full-D LoRA on **per-param efficiency** (`bpb/param 1.49 vs full-D LoRA's 1.17 — ~27% worse`, H70) AND on **SDPA throughput** (forces `d_head ≤ 48` at any `r ≤ 192` with `H_in ≥ 4`, off the FA tensorcore sweet spot of 64+). Both penalties compound when scaling N_expert. **Do not re-introduce bottleneck-style experts as a scaling axis.** The bottleneck infrastructure is preserved for archival reference at git tag `iter-91+92-bottleneck-NOT-PROMOTED` (commit `3e35655`) and side branch `autoresearch/bottleneck-rescue` (`proj_rank=48/64` rescue workspace). The iter 96 PROMOTED axis — full-D LoRA with rank-halving / E-doubling at iso-cost on linears — supersedes it (H71). See §6.2 for the routing semantics that this expert layout feeds into.
 
 ### 6.4 FSQ in MoS Head
 Paper: FSQ (arxiv:2309.15505).
