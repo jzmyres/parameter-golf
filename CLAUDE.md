@@ -115,6 +115,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | router_scoring | linear (dot-product logits, iter 70) |
+| mos_balance_mult | 50.0 (iter 26-lb-loss: hardcoded multiplier promoted to a Hyperparameter; multiplies MoS-NTP balance loss inside `_collect_routing_losses` — the principled fix for `mos_*_min_share` failures since H26) |
 | attn_bottleneck_r | 192 (iter 91+92 bundle: 128 → 192 — wider inner bottleneck under D=1024; d_in = r/H_in = 48) |
 | mlp_bottleneck_r | 192 (iter 91+92 bundle: 128 → 192) |
 | expert_proj_rank | 32 (rank of D→proj_rank→r factored I/O bottleneck — kept from iter 90) |
@@ -292,6 +293,7 @@ Run before every commit that touches `train_gpt.py`. Each row is one-line enforc
 - **Identifier uniqueness across wrappers** — no name may be both a method and an attribute on sibling classes in the same call graph. `grep -n '\.<new_name>\b' train_gpt.py tests/ experiments/` before adding. → [`EXPERIENCE.md#identifier-uniqueness`](EXPERIENCE.md#identifier-uniqueness)
 - **Prenorm scale independence (HARD)** — `grep -n '_norm_weight' train_gpt.py`; every learned scale conditions exactly one linear weight. Shape follows the linear (E-prefixed for per-expert; bare D for shared linears that route to experts but aren't themselves per-expert). → [`EXPERIENCE.md#prenorm-scale-independence`](EXPERIENCE.md#prenorm-scale-independence)
 - **Doc-Code Invariant** — when `opg_doc.tex` describes an algorithm and `train_gpt.py` implements a different (better) variant, the doc MUST note the deviation in a "Practical implementation" paragraph. Pseudocode is theoretical; code is the source of truth. → [`EXPERIENCE.md#doc-code-invariant`](EXPERIENCE.md#doc-code-invariant)
+- **Diagnostic-gate component awareness** — when a feature flag disables a code path (e.g. `use_ctp=False`), the corresponding diagnostic emission MUST be gated on the same flag, and any retry prescription for that component MUST recommend a component-specific lever (e.g. `mos_balance_mult` for MoS routing collapse, NOT global `weight_decay`). `grep -n 'mos_ctp\|use_ctp' train_gpt.py` — every diagnostic spec referencing a CTP-only attribute lives behind a `mos_head.use_ctp` guard. → [`EXPERIENCE.md#diagnostic-gate-component-awareness`](EXPERIENCE.md#diagnostic-gate-component-awareness)
 
 ## 10. RevDEQ Specifics
 

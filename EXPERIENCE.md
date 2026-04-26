@@ -24,6 +24,7 @@ This file has two roles, in this order:
 | 2026-04-23 | [#strict-generalization](#strict-generalization)             | iter 66b vs 74b — capacity question vs landscape question                  |
 | 2026-04-24 | [#prenorm-scale-independence](#prenorm-scale-independence)   | One `state_norm.weight` shared across 8+ distinct linears                  |
 | 2026-04-24 | [#identifier-uniqueness](#identifier-uniqueness)             | `_parcae_b_bar` as method on GPT and attribute on Block                    |
+| 2026-04-26 | [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) | After iter 94 (use_ctp=False), `mos_ctp` diagnostic + WD prescription stale |
 | (meta)     | [#routing-predicate-migration](#routing-predicate-migration) | Cross-incident pattern (2026-04-15 / -17 / -18 / -23): silent predicate migration |
 | (pre-arch) | [#permutation-consistency](#permutation-consistency)         | k_rope outlier permute index produced silent transposition (commit ec1048b) |
 | (pre-arch) | [#doc-code-invariant](#doc-code-invariant)                   | Pseudocode in `opg_doc.tex` diverged from implementation; required co-update |
@@ -286,6 +287,46 @@ grep -n '\.<new_name>\b' train_gpt.py tests/ experiments/
 Every match should resolve to the same class (or be unambiguously distinct, e.g. cache-suffixed).
 
 **Cross-references.** [#custom-autograd-input](#custom-autograd-input) — the dead-attribute version of `_parcae_b_bar` was also entangled with the missing-grad-edge bug.
+
+---
+
+### diagnostic-gate-component-awareness
+
+**Date:** 2026-04-26 review of iter 94 follow-up
+**Rule in CLAUDE.md:** §9 row "Diagnostic-gate component awareness"
+
+**What happened.** Iter 94 promoted the **NTP-only baseline** by setting `Hyperparameters.use_ctp = False`, which gates `MoSHead` so the CTP param banks (`gate_ctp`, `A_ctp_shared`, `B_denoise`, etc.) are never allocated. But two adjacent diagnostic paths kept treating CTP as a live component:
+
+1. **Stale `mos_ctp` diagnostic (`train_gpt.py:4339`).** The post-int6 gate appended both `mos_ctp` and `mos_ntp` check_specs unconditionally. With CTP banks unallocated, `_mos_usage("ctp")` returned aliased / empty values, producing fake `mos_ctp_min_share` "dead expert" failures on a head that was never trained. `MoSHead.get_head_orthogonality("ctp")` already had the right guard (returns `0.0` if `head == "ctp" and not self.use_ctp`); the spec-emission site forgot to mirror it.
+
+2. **Wrong retry prescription (`train_gpt.py:4471`).** Every `min_share` failure mapped to `weight_decay_mult: 1.5`. Iter 24 (H5) controlled-tested exactly this: WD bump 0.72→1.08 *worsened* `mos_ntp_min_share` (0.008→0.006). Iter 26 (H26-lb-loss) fixed dead expert by 50× MoS balance loss. The gate's prescription contradicted both verified hypotheses — and the comment string "H5 RESOLVED — routing collapse is WD-addressable" was actively wrong.
+
+The root cause is the same in both: a feature-flag flip (CTP off) and a hypothesis-controlled refute (H5 for routing) were incorporated into the architecture but not into the diagnostic emitters that pattern-match on stale assumptions.
+
+**Root cause.** Diagnostic gates and their downstream prescriptions accumulate string-prefix matchers and global-knob recommendations that age out of date faster than the architecture they describe. When a feature flag disables a code path, the diagnostic emitters keep firing at the dead site. When a hypothesis flips a fix's verdict (H5 verified for ortho but refuted for routing collapse), the prescription tables keep recommending the disproved fix.
+
+**The rule.** When a feature flag disables a code path:
+1. Audit every diagnostic / metric / log emitter that references the gated component. Each must either be removed or guarded by the same flag.
+2. Audit every retry prescription / config-suggestion path that recommends fixes for that component. Stale fixes must be removed or rerouted to the actually-effective lever.
+
+When a hypothesis flips a verdict:
+1. The prescription dispatch must split by the same axis the hypothesis split (component prefix, in our case).
+2. The hypothesis tag in the prescription string must reflect the *current* verdict; "H5 RESOLVED" was misleading because H5 stands for the ortho/weight-space axis only — H26 covers routing-space collapse.
+
+Component-aware retry prescriptions for our gate:
+- `mos_*_min_share`  → `mos_balance_mult` (H26 lever)
+- `attn_*_min_share` → `attn_balance_mult` (H26 family)
+- `mlp_*_min_share`  → `mlp_balance_mult`  (H26 family)
+- `mos_*_ortho`      → `mos_ortho_out_coef` (head-internal regularizer)
+- `attn_*_ortho`, `mlp_*_ortho` → `weight_decay` (H5 stands for ortho only — weight-space collinearity)
+
+**Verification recipe.**
+- `grep -n 'mos_ctp\|use_ctp' train_gpt.py` — every spec referencing a CTP-only attribute must live behind a `mos_head.use_ctp` guard.
+- `experiments/test_arch.py::test_post_int6_gate_skips_mos_ctp_when_disabled` — instantiates `use_ctp=False`, asserts no `mos_ctp` prefix in the gate's spec list.
+- `experiments/test_arch.py::test_prescribe_min_share_routes_to_balance_loss` — synthetic failure strings drive `_prescribe_failure_fix` and assert each `*_min_share` prefix maps to the matching `*_balance_mult` knob (NOT `weight_decay`).
+- Fast smoke run: `torchrun … --iterations=20 2>&1 | grep "mos_ctp\|min_share\|category"`. Expect zero `mos_ctp` rows; any `min_share` prescription names a `*_balance_mult` knob.
+
+**Cross-references.** Sibling family with [#config-drift](#config-drift) — both stem from architecture state advancing faster than auxiliary state machines (config tables, diagnostic dispatchers). Sub-task delivered alongside this incident: hardcoded `50.0` literal (`train_gpt.py:3015`) promoted to `Hyperparameters.mos_balance_mult` so the prescription path can recommend bumping it without a separate refactor.
 
 ---
 

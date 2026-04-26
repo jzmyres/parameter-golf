@@ -221,6 +221,10 @@ class Hyperparameters:
     # Routing
     attn_balance_mult = 5.0
     mlp_balance_mult = 1.0
+    # iter 26-lb-loss: 50× multiplier on MoS NTP balance loss fixed dead-expert
+    # collapse where WD could not (H26).  Promoted from hardcoded literal so the
+    # retry-prescription path can recommend bumping it for mos_*_min_share.
+    mos_balance_mult = 50.0
     bal_loss_coef = 5e-3
     router_health_coef = 0.25
     block_ortho_aux_coef = 0.1  # partial restore from 0 (H32 was too aggressive — attn/mlp ortho drifted to 0.82, near the 0.9 gate fail). 0.1 keeps gradient pressure without dominating, preserves H32's "loss shouldn't chase gates" spirit while keeping experts apart.
@@ -362,7 +366,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "warmup-steps", "train-batch-tokens", "train-seq-len",
         "val-batch-size", "val-loss-every", "train-log-every",
         "max-wallclock-seconds", "attn-balance-mult", "mlp-balance-mult",
-        "bal-loss-coef", "router-health-coef",
+        "mos-balance-mult", "bal-loss-coef", "router-health-coef",
         "mos-ortho-out-coef", "block-ortho-aux-coef", "block-ortho-aux-every",
         "block-ortho-aux-tokens", "bigram-vocab-size", "bigram-dim",
         "attn-bottleneck-r", "mlp-bottleneck-r", "expert-proj-rank",
@@ -2574,7 +2578,8 @@ class GPT(nn.Module):
                  attn_inner_heads: int = 4, attn_inner_kv_heads: int = 2,
                  mlp_inner_mult: float = 2.5,
                  deq_beta: float = 0.35, attn_balance_mult: float = 5.0,
-                 mlp_balance_mult: float = 1.0, bal_loss_coef: float = 5e-3,
+                 mlp_balance_mult: float = 1.0, mos_balance_mult: float = 50.0,
+                 bal_loss_coef: float = 5e-3,
                  router_health_coef: float = 0.25, mos_ortho_out_coef: float = 0.0,
                  deq_backward: str = "revdeq", deq_bptt_k: int = 0,
                  block_ortho_aux_coef: float = 0.0,
@@ -2647,6 +2652,7 @@ class GPT(nn.Module):
             self.parcae_raw_b = nn.Parameter(torch.full((model_dim,), raw_b_init))
         self.attn_balance_mult = float(attn_balance_mult)
         self.mlp_balance_mult = float(mlp_balance_mult)
+        self.mos_balance_mult = float(mos_balance_mult)
         self.bal_loss_coef = float(bal_loss_coef)
         self.router_health_coef = float(router_health_coef)
         self.mos_ortho_out_coef = float(mos_ortho_out_coef)
@@ -3004,15 +3010,13 @@ class GPT(nn.Module):
             r_health = getattr(r, "_health_loss", zero)
             bal = bal + float(router_weights.get(rid, 0.0)) * r_bal
             health = health + float(router_weights.get(rid, 0.0)) * r_health
-        # iter 26-lb-loss: bump MoS balance weight 50x to address dead expert
-        # in MoS NTP router (min_share stuck at 0.006).  The MSE-to-uniform loss
-        # on mean(alpha) was computed but with weight 1.0 — too weak.  With
-        # bal_loss_coef=5e-3 downstream, effective weight becomes 50 × 5e-3 = 0.25,
-        # giving gradient signal ~50× stronger on router logits for underused
-        # MoS experts.  WD cannot fix routing-space collapse (it makes dead
-        # experts worse by decaying their already-unused weights); LB loss
-        # is the principled complementary fix.
-        bal = bal + 50.0 * getattr(self.mos_head, '_balance_loss', zero)
+        # iter 26-lb-loss: mos_balance_mult (default 50) × bal_loss_coef downstream
+        # (5e-3) → effective weight 0.25 on the MoS NTP balance loss — strong enough
+        # to drive dead MoS experts back toward fair share.  WD cannot fix routing-
+        # space collapse (it decays already-unused weights further); the LB loss
+        # is the principled complementary fix.  The retry-prescription path
+        # recommends bumping mos_balance_mult for mos_*_min_share failures.
+        bal = bal + self.mos_balance_mult * getattr(self.mos_head, '_balance_loss', zero)
         return bal, health
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -3227,6 +3231,126 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
         ("parcae", parcae_params),
     ])
     return tok_params, matrix_params, scalar_params, parcae_params
+
+
+def _prescribe_failure_fix(failure: str) -> dict:
+    """Map a post-int6 diagnostic failure string to its hypothesis-verified fix.
+
+    Pure function — exposed at module level for direct unit testing
+    (`experiments/test_arch.py::test_prescribe_min_share_routes_to_balance_loss`).
+
+    Routing rules (component-aware — see EXPERIENCE.md §1
+    `diagnostic-gate-component-awareness`):
+      - `mos_*_min_share`        → mos_balance_mult (H26: balance loss is the
+                                   routing-space lever; WD made it worse in iter 24)
+      - `attn_*_min_share`       → attn_balance_mult
+      - `mlp_*_min_share`        → mlp_balance_mult
+      - `mos_*_ortho`            → mos_ortho_out_coef (head-internal regularizer)
+      - `attn_*_ortho` / `mlp_*` → weight_decay (weight-space collinearity, H5
+                                   stands for ortho — only ortho — failures)
+      - `k-sweep…`               → widen K jitter
+      - `iter_conv_rel`          → WD or lower deq_beta
+      - `deq_recon_err`          → check determinism, lower deq_beta, raise WD
+    """
+    low = failure.lower()
+    first_token = low.split("=", 1)[0].split()[0] if low else ""
+
+    # Dead-expert: split by component because the FIX differs.
+    if "min_share" in first_token:
+        if first_token.startswith("mos_"):
+            return {
+                "failure": failure,
+                "category": "mos_router_collapse",
+                "hypothesis": "H26 VERIFIED — MoS balance loss controls dead-MoS-expert (iter 26-lb-loss)",
+                "fix": "Increase mos_balance_mult by 1.5× (e.g. 50→75). WD does NOT reach "
+                       "MoS routing collapse — iter 24 (H5) showed WD bump worsened "
+                       "mos_ntp_min_share (0.008→0.006). The MoS-internal balance loss "
+                       "is the principled fix.",
+                "config_change": {"mos_balance_mult_mult": 1.5},
+            }
+        if first_token.startswith("attn_"):
+            return {
+                "failure": failure,
+                "category": "attn_router_collapse",
+                "hypothesis": "H26 family — per-component balance loss is the routing-space lever",
+                "fix": "Increase attn_balance_mult by 1.5×. WD shrinks expert weights but "
+                       "doesn't move router logits — only the balance loss does.",
+                "config_change": {"attn_balance_mult_mult": 1.5},
+            }
+        if first_token.startswith("mlp_"):
+            return {
+                "failure": failure,
+                "category": "mlp_router_collapse",
+                "hypothesis": "H26 family — per-component balance loss is the routing-space lever",
+                "fix": "Increase mlp_balance_mult by 1.5×. WD shrinks expert weights but "
+                       "doesn't move router logits — only the balance loss does.",
+                "config_change": {"mlp_balance_mult_mult": 1.5},
+            }
+        # Unknown prefix shouldn't happen — defensive fallback.
+        return {
+            "failure": failure,
+            "category": "dead_expert_unknown_component",
+            "hypothesis": "unrecognized min_share prefix — manual triage required",
+            "fix": "Identify the failing component from the prefix and apply the "
+                   "corresponding `<component>_balance_mult` increase.",
+            "config_change": {},
+        }
+    # MoS head ortho is a DIFFERENT failure mode from attn/mlp expert ortho.
+    # MoS has fixed num_shared+num_specialized; the fix is regularization on the
+    # head, not the expert-count knob.  Check MoS-prefixed first.
+    if first_token.startswith("mos_") and "ortho" in first_token:
+        return {
+            "failure": failure,
+            "category": "mos_head_collapse",
+            "hypothesis": "MoSHead orthogonality under-regularized",
+            "fix": "Increase mos_ortho_out_coef by 1.5× (currently 1e-3 → 1.5e-3). "
+                   "If no effect, shrink mos_rank or add a lightweight orthogonality loss inside the head.",
+            "config_change": {"mos_ortho_out_coef_mult": 1.5},
+        }
+    if "ortho" in first_token:  # attn_ortho / mlp_ortho only — weight-space collinearity
+        return {
+            "failure": failure,
+            "category": "expert_collapse",
+            "hypothesis": "H5 — weight-space collinearity is WD-fixable (ortho only, not min_share)",
+            "fix": "Increase weight_decay by 1.5× (applied to both Muon and AdamW groups). "
+                   "If no effect, drop num_experts by 1 step.",
+            "config_change": {"weight_decay_mult": 1.5},
+        }
+    if low.startswith("k-sweep"):
+        return {
+            "failure": failure,
+            "category": "fp_quality_loss",
+            "hypothesis": "H12 VERIFIED (wider K jitter → better FP)",
+            "fix": "Gross FP-quality loss at deep K (Δ > 0.1).  Try widening K jitter: increase "
+                   "deq_k_max by 4.  Note: minor non-monotonicity (K=64 vs K=32 ±0.01) "
+                   "is no longer gated; it's within finite-K noise.",
+            "config_change": {"deq_k_max_delta": 4},
+        }
+    if first_token.startswith("iter_conv_rel"):
+        return {
+            "failure": failure,
+            "category": "solver_divergence",
+            "hypothesis": "H9 + H18 VERIFIED",
+            "fix": "Increase weight_decay 1.5× (H9) OR lower deq_beta by 0.05 (H18).",
+            "config_change": {"weight_decay_mult": 1.5},
+        }
+    if first_token.startswith("deq_recon_err"):
+        return {
+            "failure": failure,
+            "category": "reversibility_broken",
+            "hypothesis": "RevDEQ reversibility requires f(z, x0, W) be deterministic and solver in stable contraction region",
+            "fix": "1) Check for any random/non-deterministic op in the block (quant-noise, dropout etc. "
+                   "— see H15 REFUTED).  2) Lower deq_beta by 0.05 for tighter contraction.  "
+                   "3) Increase weight_decay 1.5× to shrink Jacobian spectral norm.",
+            "config_change": {"deq_beta_delta": -0.05, "weight_decay_mult": 1.5},
+        }
+    return {
+        "failure": failure,
+        "category": "unknown",
+        "hypothesis": "none",
+        "fix": "Manual analysis required — check hypotheses.md for related observations.",
+        "config_change": {},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3480,7 +3604,8 @@ def main() -> None:
         attn_inner_kv_heads=args.attn_inner_kv_heads,
         mlp_inner_mult=args.mlp_inner_mult,
         deq_beta=args.deq_beta, attn_balance_mult=args.attn_balance_mult,
-        mlp_balance_mult=args.mlp_balance_mult, bal_loss_coef=args.bal_loss_coef,
+        mlp_balance_mult=args.mlp_balance_mult, mos_balance_mult=args.mos_balance_mult,
+        bal_loss_coef=args.bal_loss_coef,
         router_health_coef=args.router_health_coef, mos_ortho_out_coef=args.mos_ortho_out_coef,
         deq_backward=args.deq_backward, deq_bptt_k=args.deq_bptt_k,
         block_ortho_aux_coef=args.block_ortho_aux_coef,
@@ -3727,7 +3852,11 @@ def main() -> None:
         if hasattr(m, "mos_head"):
             mos = m.mos_head
             if hasattr(mos, "get_head_orthogonality"):
-                parts.append(f"mos_ctp_ortho:{mos.get_head_orthogonality('ctp'):.4f}")
+                # CTP head is opt-in (iter 94 NTP-only baseline); emitting a
+                # constant 0.0 log row when CTP is disabled produces misleading
+                # log spam.  See EXPERIENCE.md §1 `diagnostic-gate-component-awareness`.
+                if getattr(mos, "use_ctp", False):
+                    parts.append(f"mos_ctp_ortho:{mos.get_head_orthogonality('ctp'):.4f}")
                 parts.append(f"mos_ntp_ortho:{mos.get_head_orthogonality('ntp'):.4f}")
         return (" " + " ".join(parts)) if parts else ""
 
@@ -4337,20 +4466,30 @@ def main() -> None:
             lambda: getattr(shared_block.mlp, "_out_ortho_cos_sim", None),
         ))
     if mos_head is not None:
-        n_ctp = _mos_num_experts("ctp")
+        # NTP head is always allocated.
         n_ntp = _mos_num_experts("ntp")
-        check_specs.append((
-            "mos_ctp", n_ctp,
-            lambda: _mos_usage_gpu("ctp"),
-            lambda: _mos_usage("ctp"),
-            lambda: _mos_ortho("ctp"),
-        ))
         check_specs.append((
             "mos_ntp", n_ntp,
             lambda: _mos_usage_gpu("ntp"),
             lambda: _mos_usage("ntp"),
             lambda: _mos_ortho("ntp"),
         ))
+        # CTP head is opt-in (iter 94: NTP-only baseline).  When
+        # `use_ctp=False` the CTP param banks are not allocated — the
+        # `_mos_usage("ctp")` getters fall back to NTP/empty values, so emitting
+        # a "mos_ctp" check_spec produces fake "dead expert" failures with no
+        # underlying CTP capacity to fix.  Mirror the analogous guard in
+        # `MoSHead.get_head_orthogonality("ctp")` (line ~1936) at the
+        # diagnostic-emission site.  See EXPERIENCE.md §1
+        # `diagnostic-gate-component-awareness`.
+        if getattr(mos_head, "use_ctp", False):
+            n_ctp = _mos_num_experts("ctp")
+            check_specs.append((
+                "mos_ctp", n_ctp,
+                lambda: _mos_usage_gpu("ctp"),
+                lambda: _mos_usage("ctp"),
+                lambda: _mos_ortho("ctp"),
+            ))
 
     for prefix, n_exp, usage_gpu_getter, usage_list_getter, ortho_getter in check_specs:
         if n_exp <= 0:
@@ -4449,94 +4588,12 @@ def main() -> None:
     # config change — the agent applies the prescribed fix and reruns.  We
     # do NOT raise here: letting the process exit cleanly preserves all the
     # artifacts and log output the fix decision needs.
-    def _prescribe(failure: str) -> dict:
-        """Map a failure string to its canonical hypothesis-verified fix.
-
-        Uses prefix-anchored matching on the LHS of the failure string's first
-        token (e.g. "mos_ntp_ortho=...") so substrings like "ortho" don't
-        over-match.  Order within mutually-exclusive categories doesn't matter;
-        order across them (routing > ortho > ...) reflects which fix to prefer
-        when a single failure could theoretically classify as multiple (it can't
-        in practice with prefix-anchored matching but the defensive ordering
-        remains).
-        """
-        low = failure.lower()
-        # Split off the first token (up to '=' or ' ') for prefix checks.
-        first_token = low.split("=", 1)[0].split()[0] if low else ""
-        # Dead-expert failure only (not balance CV — that's handled by training
-        # balance_loss, not a hard invariant).
-        if "min_share" in first_token:
-            return {
-                "failure": failure,
-                "category": "dead_expert",
-                "hypothesis": "H5 RESOLVED — routing collapse is WD-addressable",
-                "fix": "Increase weight_decay by 1.5× (e.g. 0.72→1.08; applied to both Muon and AdamW groups). "
-                       "If already ≥1.0, increase attn_balance_mult or mlp_balance_mult by 1.5× "
-                       "(strengthens the training balance loss that drives the dead expert's usage up). "
-                       "Cap WD at 1.44 — H19 showed 1.44 is already too high for β=0.20.",
-                "config_change": {"weight_decay_mult": 1.5, "balance_mult_mult": 1.5},
-            }
-        # MoS head ortho is a DIFFERENT failure mode from attn/mlp expert ortho.
-        # MoS has fixed num_shared+num_specialized; the fix is regularization on
-        # the head, not the expert-count knob.  Check MoS-prefixed first.
-        if first_token.startswith("mos_") and "ortho" in first_token:
-            return {
-                "failure": failure,
-                "category": "mos_head_collapse",
-                "hypothesis": "MoSHead orthogonality under-regularized",
-                "fix": "Increase mos_ortho_out_coef by 1.5× (currently 1e-3 → 1.5e-3). "
-                       "If no effect, shrink mos_rank or add a lightweight orthogonality loss inside the head.",
-                "config_change": {"mos_ortho_out_coef_mult": 1.5},
-            }
-        if "ortho" in first_token:  # now attn_ortho / mlp_ortho only
-            return {
-                "failure": failure,
-                "category": "expert_collapse",
-                "hypothesis": "H5 RESOLVED — collapse is WD-fixable",
-                "fix": "Increase weight_decay by 1.5× (applied to both Muon and AdamW groups). "
-                       "If no effect, drop num_experts by 1 step.",
-                "config_change": {"weight_decay_mult": 1.5},
-            }
-        if low.startswith("k-sweep"):
-            return {
-                "failure": failure,
-                "category": "fp_quality_loss",
-                "hypothesis": "H12 VERIFIED (wider K jitter → better FP)",
-                "fix": "Gross FP-quality loss at deep K (Δ > 0.1).  Try widening K jitter: increase "
-                       "deq_k_max by 4.  Note: minor non-monotonicity (K=64 vs K=32 ±0.01) "
-                       "is no longer gated; it's within finite-K noise.",
-                "config_change": {"deq_k_max_delta": 4},
-            }
-        if first_token.startswith("iter_conv_rel"):
-            return {
-                "failure": failure,
-                "category": "solver_divergence",
-                "hypothesis": "H9 + H18 VERIFIED",
-                "fix": "Increase weight_decay 1.5× (H9) OR lower deq_beta by 0.05 (H18).",
-                "config_change": {"weight_decay_mult": 1.5},
-            }
-        if first_token.startswith("deq_recon_err"):
-            return {
-                "failure": failure,
-                "category": "reversibility_broken",
-                "hypothesis": "RevDEQ reversibility requires f(z, x0, W) be deterministic and solver in stable contraction region",
-                "fix": "1) Check for any random/non-deterministic op in the block (quant-noise, dropout etc. "
-                       "— see H15 REFUTED).  2) Lower deq_beta by 0.05 for tighter contraction.  "
-                       "3) Increase weight_decay 1.5× to shrink Jacobian spectral norm.",
-                "config_change": {"deq_beta_delta": -0.05, "weight_decay_mult": 1.5},
-            }
-        return {
-            "failure": failure,
-            "category": "unknown",
-            "hypothesis": "none",
-            "fix": "Manual analysis required — check hypotheses.md for related observations.",
-            "config_change": {},
-        }
-
+    # `_prescribe_failure_fix` lives at module level for direct unit testing
+    # — see experiments/test_arch.py.
     if _failures:
         # POST-INT6 diagnostics are final guardrails and retry prescriptions.
         log0("POST-INT6 DIAGNOSTIC GATE FAILURES — retry prescription follows")
-        prescriptions = [_prescribe(f) for f in _failures]
+        prescriptions = [_prescribe_failure_fix(f) for f in _failures]
         log0(f"  {len(_failures)} failure(s):")
         for p in prescriptions:
             log0(f"  ⚠ [{p['category']}] {p['failure']}")

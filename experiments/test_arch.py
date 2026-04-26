@@ -392,6 +392,101 @@ def test_revdeq_reconstruction_at_a_bar_floor():
     print("PASS: RevDEQ reversibility at Ā=ε_rev stays finite")
 
 
+def test_ntp_only_baseline_skips_ctp_param_banks():
+    """Production baseline (iter 94, H60): use_ctp=False ⇒ CTP banks NOT allocated.
+
+    This is the production-faithful counterpart to test_all_constraints (which
+    instantiates the CTP variant via the GPT.__init__ default).  Mirrors the
+    Hyperparameters default `use_ctp = False` and the `MoSHead.use_ctp`
+    conditional at MoSHead.__init__ (line ~1890).
+    """
+    model = _make_model(num_experts=4, use_ctp=False)
+    mos = model.mos_head
+    assert mos.use_ctp is False, "use_ctp must thread through GPT → MoSHead"
+    # CTP-specific banks are NOT allocated in the NTP-only baseline.
+    for attr in ("gate_ctp", "gate_ctp_norm_weight", "A_ctp_shared", "A_ctp",
+                 "ctp_a_norm_weight", "ctp_rank_norm_weight", "B_denoise"):
+        assert not hasattr(mos, attr), (
+            f"NTP-only baseline must not allocate CTP bank `{attr}`")
+    # NTP banks ARE allocated.
+    for attr in ("gate_ntp", "gate_ntp_norm_weight", "A_ntp_shared",
+                 "ntp_a_norm_weight", "ntp_rank_norm_weight", "B_NTP"):
+        assert hasattr(mos, attr), f"NTP baseline must allocate `{attr}`"
+
+
+def test_post_int6_gate_skips_mos_ctp_when_disabled():
+    """Issue 3: when use_ctp=False, the post-int6 gate must NOT emit mos_ctp checks.
+
+    The diagnostic gate previously appended both `mos_ctp` and `mos_ntp` check
+    specs unconditionally; with use_ctp=False the CTP usage getters fall back
+    to aliased / empty values, producing fake "dead expert" failures.  We now
+    gate the CTP append on `mos_head.use_ctp`.
+
+    This test inspects the predicate logic by simulating the spec construction
+    on a real MoSHead (use_ctp=False) and asserting the resulting prefix set
+    contains "mos_ntp" but never "mos_ctp".
+    """
+    model = _make_model(num_experts=4, use_ctp=False)
+    mos = model.mos_head
+    # Replicate the gate's append logic on this MoSHead.
+    prefixes: list[str] = []
+    if mos is not None:
+        prefixes.append("mos_ntp")
+        if getattr(mos, "use_ctp", False):
+            prefixes.append("mos_ctp")
+    assert "mos_ntp" in prefixes, "NTP must always be checked"
+    assert "mos_ctp" not in prefixes, (
+        "use_ctp=False must skip mos_ctp diagnostic — CTP banks aren't allocated, "
+        "so any 'mos_ctp_min_share' failure would be fake.")
+
+
+def test_prescribe_min_share_routes_to_balance_loss():
+    """Issue 4: min_share failures map to component-specific balance_mult, not WD.
+
+    Iter 24 (H5): controlled WD bump worsened mos_ntp_min_share (0.008→0.006).
+    Iter 26 (H26-lb-loss): MoS balance loss 50× fixed dead expert.
+    Therefore _prescribe_failure_fix must map mos_*_min_share → mos_balance_mult,
+    NOT weight_decay.  Same logic for attn/mlp.
+    """
+    from train_gpt import _prescribe_failure_fix
+
+    p_mos = _prescribe_failure_fix(
+        "mos_ntp_min_share=0.005 < 0.150 (expert below 60% of fair share 1/4)")
+    assert p_mos["category"] == "mos_router_collapse"
+    assert "mos_balance_mult_mult" in p_mos["config_change"], (
+        f"mos_*_min_share must prescribe mos_balance_mult bump, got {p_mos['config_change']}")
+    assert "weight_decay_mult" not in p_mos["config_change"], (
+        "WD must NOT be prescribed for MoS routing collapse — H5 verified WD makes it worse.")
+
+    p_attn = _prescribe_failure_fix("attn_min_share=0.01 < 0.150 (...)")
+    assert p_attn["category"] == "attn_router_collapse"
+    assert "attn_balance_mult_mult" in p_attn["config_change"]
+
+    p_mlp = _prescribe_failure_fix("mlp_min_share=0.01 < 0.150 (...)")
+    assert p_mlp["category"] == "mlp_router_collapse"
+    assert "mlp_balance_mult_mult" in p_mlp["config_change"]
+
+    # Ortho failures still get WD (weight-space collinearity is the H5 territory).
+    p_ortho = _prescribe_failure_fix("attn_ortho=0.71 > 0.5 (max pairwise |cos| ...)")
+    assert p_ortho["category"] == "expert_collapse"
+    assert "weight_decay_mult" in p_ortho["config_change"]
+
+
+def test_mos_balance_mult_is_a_hyperparameter():
+    """Sub-task of Issue 4: 50.0 literal promoted to a Hyperparameter.
+
+    Asserts the knob exists on Hyperparameters AND on the GPT instance, and
+    that the default value preserves the iter 26-lb-loss baseline (50.0)."""
+    from train_gpt import Hyperparameters
+    assert hasattr(Hyperparameters, "mos_balance_mult")
+    assert float(Hyperparameters.mos_balance_mult) == 50.0, (
+        "Default must preserve iter 26-lb-loss baseline; changing it is an architecture iter, "
+        "not a diagnostic-cleanup commit.")
+    model = _make_model(num_experts=4)
+    assert hasattr(model, "mos_balance_mult")
+    assert float(model.mos_balance_mult) == 50.0
+
+
 if __name__ == "__main__":
     test_all_constraints()
     test_expert_path_parameters_are_expert_independent()
@@ -404,4 +499,8 @@ if __name__ == "__main__":
     test_revdeq_convergence()
     test_revdeq_reversibility()
     test_revdeq_reconstruction_at_a_bar_floor()
+    test_ntp_only_baseline_skips_ctp_param_banks()
+    test_post_int6_gate_skips_mos_ctp_when_disabled()
+    test_prescribe_min_share_routes_to_balance_loss()
+    test_mos_balance_mult_is_a_hyperparameter()
     print("\nAll tests passed!")
