@@ -312,23 +312,10 @@ class Hyperparameters:
     # scale-up. GPT.__init__ already guards `if bigram_vocab_size > 0`.
     bigram_vocab_size = 0
     bigram_dim = 128
-
-    # Phase 9 iter 90 (2026-04-25): bottleneck experts.
-    # Per-expert pipeline collapses every internal linear from operating on D
-    # to operating on a low-dim r:
-    #   D ──BottleneckIn──> r ──[full-rank MLA / SwiGLU at r]──> r ──BottleneckOut──> D
-    # The D↔r boundary is itself two-stage low-rank (D→proj_rank→r) with
-    # independent learnable pre-RMSNorm on each stage.  Inside the bottleneck
-    # every linear is full-rank single-stage (Q/KV-A/KV-B/K_rope/Wo for attn;
-    # gate/fc/down for MLP), saving matmul stages vs the previous nested
-    # low-rank MLA.  Total per-expert footprint shrinks from ~700K to ~290K,
-    # freeing budget for iter 91 (more experts) and iter 92 (larger D).
-    attn_bottleneck_r = 128       # inner dim r for the per-expert MLA pipeline
-    mlp_bottleneck_r = 128        # inner dim r for the per-expert SwiGLU MLP
-    expert_proj_rank = 32         # rank of the D→proj_rank→r factored I/O bottleneck
-    attn_inner_heads = 4          # H_in: full-rank Q heads at r (must divide r)
-    attn_inner_kv_heads = 2       # H_kv_in: GQA ratio H_in / H_kv_in (KV is still latent-compressed via KV-A → kv_latent_inner)
-    mlp_inner_mult = 2.5          # SwiGLU hidden = round(r * mlp_inner_mult)
+    kv_latent_dim = 0  # auto: dim//2
+    # optimal: rank 128/192 at dim=768, 8 experts
+    attn_expert_rank = 128
+    mlp_expert_rank = 192
 
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
@@ -357,8 +344,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "mos-balance-mult", "bal-loss-coef", "router-health-coef",
         "mos-ortho-out-coef", "block-ortho-aux-coef", "block-ortho-aux-every",
         "block-ortho-aux-tokens", "bigram-vocab-size", "bigram-dim",
-        "attn-bottleneck-r", "mlp-bottleneck-r", "expert-proj-rank",
-        "attn-inner-heads", "attn-inner-kv-heads", "mlp-inner-mult",
+        "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
         "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
         "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
         "warmdown-frac", "num-refinements-ramp-frac",
@@ -1398,406 +1384,251 @@ class SoftDenseRouter(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# BOTTLENECK EXPERT BUILDING BLOCKS (iter 90)
+# MLA + GATED ATTENTION
 # ---------------------------------------------------------------------------
 
-def _rms_scale_per_expert(x: Tensor, weight: Tensor, *, expert_dim: int = 0,
-                          eps: float = 1e-6) -> Tensor:
-    """Parameter-free RMS over last dim, then per-expert (E, last_dim) scale.
+class CausalSelfAttention(nn.Module):
+    """Fully independent expert MLA: per-expert Q/K/V/K_rope/Wo.
 
-    The RMS statistic is shared (parameter-free); each call sites passes its
-    own learned `weight` so every linear input has an independent scale, per
-    the Prenorm Scale Independence Rule.
+    Each expert has its own complete MLA pipeline with zero shared params:
+      1. Per-expert Q (low-rank): dim → rank → H*d_head + H (gate logits)
+      2. Per-expert KV compression (low-rank): dim → kv_rank → kv_latent
+      3. Per-expert KV decompression: RMS statistic + separate K/V scales → K_nope, V
+      4. Per-expert K_rope (low-rank): dim → kr_rank → H_kv*rope_dim
+      5. Per-expert Wo (low-rank): D → wo_rank → D (mixes heads per expert)
+
+    Expert index is packed into the head dimension (E×H query heads,
+    E×H_kv KV heads) for a single FlashAttention call.  GQA ratio is
+    H/H_kv (same as before).
     """
-    y = x * x.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
-    shape = [1] * y.ndim
-    shape[expert_dim] = weight.shape[0]
-    shape[-1] = weight.shape[-1]
-    return y * weight.to(dtype=y.dtype).reshape(*shape)
-
-
-class BottleneckIn(nn.Module):
-    """Per-expert D → r input projection via D → proj_rank → r factored low-rank.
-
-    Forward:
-        x (B, T, D) — caller must pre-RMS x with parameter-free RMSUnit
-        → h_r (E, B*T, r)
-
-    Stage 1 (D → R_proj) fuses the per-expert pre-RMS scale (E, D) into the
-    matmul; this relies on the caller having already applied parameter-free
-    RMS so the only learned per-expert factor here is the scale.
-    Stage 2 (R_proj → r) re-applies parameter-free RMS to the unbounded
-    intermediate before its own per-expert scale.
-    """
-    def __init__(self, dim: int, num_experts: int, bottleneck_r: int,
-                 expert_proj_rank: int):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
+                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
+                 expert_rank: int = 0, router: SoftDenseRouter | None = None,
+                 **kwargs):
         super().__init__()
-        self.dim = int(dim)
-        self.num_experts = int(num_experts)
-        self.bottleneck_r = int(bottleneck_r)
-        self.expert_proj_rank = int(expert_proj_rank)
-        E, D = self.num_experts, self.dim
-        R = self.expert_proj_rank
-        r = self.bottleneck_r
-        self.in_down = nn.Parameter(torch.empty(E, R, D))
-        self.in_up   = nn.Parameter(torch.empty(E, r, R))
-        self.in_down_norm_weight = nn.Parameter(torch.ones(E, D))
-        self.in_up_norm_weight   = nn.Parameter(torch.ones(E, R))
-        for e in range(E):
-            nn.init.xavier_uniform_(self.in_down.data[e])
-            nn.init.xavier_uniform_(self.in_up.data[e])
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        self.num_experts = num_experts
+        self.expert_rank = expert_rank if expert_rank > 0 else max(dim // max(num_experts, 1), 1)
+        self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
+        self.rope_dim = self.head_dim // 2
+        self.nope_dim = self.head_dim - self.rope_dim
+        self.kv_rank = max(self.kv_latent_dim // 8, 32)
 
-    def forward(self, x: Tensor) -> Tensor:
-        B, T, D = x.shape
-        E, R = self.num_experts, self.expert_proj_rank
-        r = self.bottleneck_r
-        N = B * T
-        dtype = x.dtype
-        x_flat = x.reshape(N, D)
-        # Stage 1: D → R_proj (fused per-expert scale + weight)
-        in_d = (
-            self.in_down.to(dtype)
-            * self.in_down_norm_weight.to(dtype).unsqueeze(1)  # (E, 1, D)
-        ).reshape(E * R, D)
-        h_pr = (x_flat @ in_d.t()).view(N, E, R).permute(1, 0, 2)  # (E, N, R)
-        # Stage 2: R_proj → r (parameter-free RMS + per-expert scale, then bmm)
-        h_pr = _rms_scale_per_expert(h_pr, self.in_up_norm_weight)
-        in_u = self.in_up.to(dtype).transpose(1, 2)  # (E, R, r)
-        h_r = torch.bmm(h_pr, in_u)  # (E, N, r)
-        return h_r
+        # Per-expert Q: low-rank dim → expert_rank → (H*d_head + H).
+        # The +H appended to Q output provides per-head gate logits (gated attn).
+        q_out_dim = num_heads * self.head_dim + num_heads
+        self.expert_q_down = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        self.expert_q_up = nn.Parameter(torch.empty(num_experts, q_out_dim, self.expert_rank))
+        self.q_down_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
+        self.q_up_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_q_down.data[e])
+            # Zero-init the gate logit rows so gates start at sigmoid(0) = 0.5.
+            nn.init.xavier_uniform_(self.expert_q_up.data[e, :num_heads * self.head_dim, :])
+            self.expert_q_up.data[e, num_heads * self.head_dim:, :].zero_()
 
+        # Per-expert KV: low-rank dim → kv_rank → kv_latent_dim.
+        self.expert_kv_a = nn.Parameter(torch.empty(num_experts, self.kv_rank, dim))
+        self.expert_kv_b = nn.Parameter(torch.empty(num_experts, self.kv_latent_dim, self.kv_rank))
+        self.kv_a_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
+        self.kv_b_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_rank))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_kv_a.data[e])
+            nn.init.xavier_uniform_(self.expert_kv_b.data[e])
 
-class BottleneckOut(nn.Module):
-    """Per-expert r → D output projection via r → proj_rank → D factored low-rank.
+        # Per-expert KV decompression from latent (full MLA per expert).
+        # K and V own separate learned input scales after the shared RMS statistic.
+        self.k_nope_in_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_latent_dim))
+        self.v_in_norm_weight = nn.Parameter(torch.ones(num_experts, self.kv_latent_dim))
+        self.expert_k_nope = nn.Parameter(
+            torch.empty(num_experts, num_kv_heads * self.nope_dim, self.kv_latent_dim))
+        self.expert_v = nn.Parameter(
+            torch.empty(num_experts, num_kv_heads * self.head_dim, self.kv_latent_dim))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_k_nope.data[e])
+            nn.init.xavier_uniform_(self.expert_v.data[e])
 
-    Forward:
-        y_r (E, B*T, r) → y_d (B, T, E, D)
+        # Per-expert K_rope: low-rank dim → rank_kr → H_kv*rope_dim.
+        # Position-dependent but per-expert — each expert attends to positions
+        # differently.  Low-rank (rank=32) keeps params manageable.
+        self.kr_rank = max(num_kv_heads * self.rope_dim // 6, 16)
+        self.expert_kr_a = nn.Parameter(torch.empty(num_experts, self.kr_rank, dim))
+        self.expert_kr_b = nn.Parameter(
+            torch.empty(num_experts, num_kv_heads * self.rope_dim, self.kr_rank))
+        self.kr_a_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
+        self.kr_b_norm_weight = nn.Parameter(torch.ones(num_experts, self.kr_rank))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_kr_a.data[e])
+            nn.init.xavier_uniform_(self.expert_kr_b.data[e])
 
-    Both stages apply parameter-free RMS + per-expert scale before their
-    bmm (the input is the expert body's output, magnitude unbounded).
-    """
-    def __init__(self, dim: int, num_experts: int, bottleneck_r: int,
-                 expert_proj_rank: int):
-        super().__init__()
-        self.dim = int(dim)
-        self.num_experts = int(num_experts)
-        self.bottleneck_r = int(bottleneck_r)
-        self.expert_proj_rank = int(expert_proj_rank)
-        E, D = self.num_experts, self.dim
-        R = self.expert_proj_rank
-        r = self.bottleneck_r
-        self.out_down = nn.Parameter(torch.empty(E, R, r))
-        self.out_up   = nn.Parameter(torch.empty(E, D, R))
-        self.out_down_norm_weight = nn.Parameter(torch.ones(E, r))
-        self.out_up_norm_weight   = nn.Parameter(torch.ones(E, R))
-        for e in range(E):
-            nn.init.xavier_uniform_(self.out_down.data[e])
-            nn.init.xavier_uniform_(self.out_up.data[e])
+        # Per-expert output projection Wo: low-rank D → rank_wo → D.
+        # Mixes heads per expert (DeepSeek MLA Wo equivalent).
+        self.wo_rank = max(dim // 12, 32)
+        self.expert_wo_down = nn.Parameter(torch.empty(num_experts, self.wo_rank, dim))
+        self.expert_wo_up = nn.Parameter(torch.empty(num_experts, dim, self.wo_rank))
+        self.wo_down_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
+        self.wo_up_norm_weight = nn.Parameter(torch.ones(num_experts, self.wo_rank))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_wo_down.data[e])
+            nn.init.xavier_uniform_(self.expert_wo_up.data[e])
 
-    def forward(self, y_r: Tensor, B: int, T: int) -> Tensor:
-        E, R = self.num_experts, self.expert_proj_rank
-        D = self.dim
-        dtype = y_r.dtype
-        # Stage 1: r → R_proj
-        y_r_unit = _rms_scale_per_expert(y_r, self.out_down_norm_weight)
-        out_d = self.out_down.to(dtype).transpose(1, 2)  # (E, r, R_proj)
-        y_pr = torch.bmm(y_r_unit, out_d)  # (E, N, R_proj)
-        # Stage 2: R_proj → D
-        y_pr_unit = _rms_scale_per_expert(y_pr, self.out_up_norm_weight)
-        out_u = self.out_up.to(dtype).transpose(1, 2)  # (E, R_proj, D)
-        y_d = torch.bmm(y_pr_unit, out_u)  # (E, N, D)
-        return y_d.permute(1, 0, 2).reshape(B, T, E, D)
+        # Per-expert-per-head gains and gates (E*H entries each).
+        self.q_gain = nn.Parameter(torch.full((num_experts * num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.rope_dim, base=rope_base)
+        self.gate_bias = nn.Parameter(torch.zeros(num_experts * num_heads, dtype=torch.float32))
 
-
-# ---------------------------------------------------------------------------
-# EXPERT BODIES (model-dim agnostic, full-rank single-stage at bottleneck r)
-# ---------------------------------------------------------------------------
-
-class ExpertMLABody(nn.Module):
-    """Per-expert MLA at the bottleneck dim r — full-rank, model-dim agnostic.
-
-    Inner pipeline at r:
-        Q          : r → H_in*d_in + H_in (gate logits)
-        KV-A       : r → kv_latent_inner   (DeepSeek-style latent compression)
-        KV-B-K     : kv_latent_inner → H_kv_in * nope_dim_inner
-        KV-B-V     : kv_latent_inner → H_kv_in * d_in
-        K_rope     : r → H_kv_in * rope_dim_inner
-        Wo         : H_in*d_in → r
-
-    All linears are full-rank single-stage (no nested low-rank), so the
-    per-expert compute path is 6 matmuls + SDPA + gated-attention sigmoid
-    instead of the previous nested-low-rank's 11 matmuls.
-
-    The KV latent dim is set to max(H_kv_in * d_in // 2, 16) by default,
-    giving DeepSeek-style 2× cache compression: instead of caching K
-    (H_kv_in*d_in) and V (H_kv_in*d_in) separately, autoregressive decoding
-    caches kv_latent_inner + K_rope (H_kv_in*rope_dim_inner) per token —
-    half the size of standard MHA storage.
-    """
-    def __init__(self, bottleneck_r: int, num_inner_heads: int,
-                 num_inner_kv_heads: int, num_experts: int,
-                 rope_base: float, qk_gain_init: float):
-        super().__init__()
-        self.bottleneck_r = int(bottleneck_r)
-        self.num_inner_heads = int(num_inner_heads)
-        self.num_inner_kv_heads = int(num_inner_kv_heads)
-        self.num_experts = int(num_experts)
-        H_in = self.num_inner_heads
-        H_kv_in = self.num_inner_kv_heads
-        r = self.bottleneck_r
-        if r % H_in != 0:
-            raise ValueError(f"bottleneck_r={r} must be divisible by num_inner_heads={H_in}")
-        if H_in % H_kv_in != 0:
-            raise ValueError(
-                f"num_inner_heads={H_in} must be divisible by num_inner_kv_heads={H_kv_in}"
-            )
-        d_in = r // H_in
-        self.head_dim_inner = d_in
-        self.rope_dim_inner = d_in // 2
-        self.nope_dim_inner = d_in - self.rope_dim_inner
-        # DeepSeek-style KV latent: half the full K-cache dim, gives 2× cache
-        # compression at inference while keeping the latent expressive enough
-        # at training time.
-        self.kv_latent_inner = max(H_kv_in * d_in // 2, 16)
-        E = self.num_experts
-        kv_lat = self.kv_latent_inner
-        rope_d = self.rope_dim_inner
-        nope_d = self.nope_dim_inner
-        # Q (head + gate logits): r → H_in*(d_in + 1)
-        q_out = H_in * d_in + H_in
-        self.expert_q = nn.Parameter(torch.empty(E, q_out, r))
-        self.q_in_norm_weight = nn.Parameter(torch.ones(E, r))
-        # KV-A: r → kv_latent_inner
-        self.expert_kv_a = nn.Parameter(torch.empty(E, kv_lat, r))
-        self.kv_a_in_norm_weight = nn.Parameter(torch.ones(E, r))
-        # KV-B (split K, V — separate scales after parameter-free RMS on kv_lat)
-        self.expert_k_nope = nn.Parameter(torch.empty(E, H_kv_in * nope_d, kv_lat))
-        self.expert_v      = nn.Parameter(torch.empty(E, H_kv_in * d_in,  kv_lat))
-        self.k_nope_in_norm_weight = nn.Parameter(torch.ones(E, kv_lat))
-        self.v_in_norm_weight      = nn.Parameter(torch.ones(E, kv_lat))
-        # K_rope: r → H_kv_in * rope_dim_inner
-        self.expert_kr = nn.Parameter(torch.empty(E, H_kv_in * rope_d, r))
-        self.kr_in_norm_weight = nn.Parameter(torch.ones(E, r))
-        # Per-component nope/rope post-assembly RMSNorm scales
-        self.q_rope_norm_weight = nn.Parameter(torch.ones(E, rope_d))
-        self.q_nope_norm_weight = nn.Parameter(torch.ones(E, nope_d))
-        self.k_rope_norm_weight = nn.Parameter(torch.ones(E, rope_d))
-        self.k_nope_norm_weight = nn.Parameter(torch.ones(E, nope_d))
-        # Wo: H_in*d_in → r
-        self.expert_wo = nn.Parameter(torch.empty(E, r, H_in * d_in))
-        self.wo_in_norm_weight = nn.Parameter(torch.ones(E, H_in * d_in))
-        # Per-expert-per-head gain + gated-attention sigmoid bias.
-        self.q_gain    = nn.Parameter(torch.full((E * H_in,), qk_gain_init,
-                                                  dtype=torch.float32))
-        self.gate_bias = nn.Parameter(torch.zeros(E * H_in, dtype=torch.float32))
-        self.rotary = Rotary(rope_d, base=rope_base)
-        for e in range(E):
-            for p in (self.expert_kv_a, self.expert_k_nope, self.expert_v,
-                      self.expert_kr, self.expert_wo):
-                nn.init.xavier_uniform_(p.data[e])
-            # Q is fused: head rows xavier, gate-logit rows zero (sigmoid(0)=0.5).
-            nn.init.xavier_uniform_(self.expert_q.data[e, :H_in * d_in, :])
-            self.expert_q.data[e, H_in * d_in:, :].zero_()
+        self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
+        # Per-expert learned pre-RMS scales for Q/K components. RMS math is
+        # shared and parameter-free; every learned scale stays expert-local.
+        self.q_rope_norm_weight = nn.Parameter(torch.ones(num_experts, self.rope_dim))
+        self.q_nope_norm_weight = nn.Parameter(torch.ones(num_experts, self.nope_dim))
+        self.k_rope_norm_weight = nn.Parameter(torch.ones(num_experts, self.rope_dim))
+        self.k_nope_norm_weight = nn.Parameter(torch.ones(num_experts, self.nope_dim))
+        self._out_ortho_cos_sim: float | None = None
+        self._out_ortho_loss: Tensor | None = None
         self._attn_gate_last_mean: float | None = None
 
-    def forward(self, h_r: Tensor, B: int, T: int) -> Tensor:
+    @staticmethod
+    def _rms_scale(x: Tensor, weight: Tensor, *, expert_dim: int = 0, eps: float = 1e-6) -> Tensor:
+        y = x * x.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+        shape = [1] * y.ndim
+        shape[expert_dim] = weight.shape[0]
+        shape[-1] = weight.shape[-1]
+        return y * weight.to(dtype=y.dtype).reshape(*shape)
+
+    def forward_experts(self, x_n: Tensor) -> Tensor:
+        """Compute per-expert attention outputs via head-packed SDPA.
+
+        Args:
+            x_n: Normalized input (B, T, D).
+
+        Returns:
+            Per-expert attention outputs (B, T, E, D).
+        """
+        B, T, D = x_n.shape
         E = self.num_experts
-        H_in, H_kv_in = self.num_inner_heads, self.num_inner_kv_heads
-        d_in = self.head_dim_inner
-        rope_d = self.rope_dim_inner
-        nope_d = self.nope_dim_inner
-        N = h_r.shape[1]
-        dtype = h_r.dtype
-        # Q (with gate logits packed)
-        h_q = _rms_scale_per_expert(h_r, self.q_in_norm_weight)
-        q_w = self.expert_q.to(dtype).transpose(1, 2)  # (E, r, q_out)
-        q_and_gate = torch.bmm(h_q, q_w)
-        q_raw = q_and_gate[..., :H_in * d_in].reshape(E, B, T, H_in, d_in)
-        gate_logits = q_and_gate[..., H_in * d_in:].reshape(E, B, T, H_in, 1)
-        q_rope = q_raw[..., :rope_d]
-        q_nope = q_raw[..., rope_d:]
-        q_rope = _rms_scale_per_expert(q_rope, self.q_rope_norm_weight)
-        q_nope = _rms_scale_per_expert(q_nope, self.q_nope_norm_weight)
-        # KV-A → kv_latent
-        h_kv = _rms_scale_per_expert(h_r, self.kv_a_in_norm_weight)
-        kv_a_w = self.expert_kv_a.to(dtype).transpose(1, 2)  # (E, r, kv_lat)
-        kv_lat_t = torch.bmm(h_kv, kv_a_w)  # (E, N, kv_lat)
-        # KV-B (split K, V — separate scales after parameter-free RMS on kv_lat)
-        kv_lat_unit = kv_lat_t * kv_lat_t.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
-        kv_k = kv_lat_unit * self.k_nope_in_norm_weight.to(dtype).unsqueeze(1)
-        kv_v = kv_lat_unit * self.v_in_norm_weight.to(dtype).unsqueeze(1)
-        ek = self.expert_k_nope.to(dtype).transpose(1, 2)  # (E, kv_lat, H_kv*nope)
-        ev = self.expert_v.to(dtype).transpose(1, 2)        # (E, kv_lat, H_kv*d)
-        k_nope = torch.bmm(kv_k, ek).reshape(E, B, T, H_kv_in, nope_d)
-        v      = torch.bmm(kv_v, ev).reshape(E, B, T, H_kv_in, d_in)
-        # K_rope
-        h_kr = _rms_scale_per_expert(h_r, self.kr_in_norm_weight)
-        kr_w = self.expert_kr.to(dtype).transpose(1, 2)
-        k_rope_raw = torch.bmm(h_kr, kr_w)
-        k_rope = k_rope_raw.reshape(E, B, T, H_kv_in, rope_d)
-        k_rope = _rms_scale_per_expert(k_rope, self.k_rope_norm_weight)
-        k_nope = _rms_scale_per_expert(k_nope, self.k_nope_norm_weight)
-        # RoPE
-        cos, sin = self.rotary(T, h_r.device, q_rope.dtype)
-        q_rope_p = q_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H_in, T, rope_d)
+        H, H_kv = self.num_heads, self.num_kv_heads
+        d = self.head_dim
+        R_q, R_kv = self.expert_rank, self.kv_rank
+        N = B * T
+        dtype = x_n.dtype
+
+        # --- Per-expert Q (low-rank) ---
+        x_flat = x_n.reshape(N, D)
+        q_down = self.expert_q_down.to(dtype=dtype) * self.q_down_norm_weight.to(dtype=dtype).unsqueeze(1)
+        q_h = (x_flat @ q_down.reshape(E * R_q, D).t()).view(N, E, R_q).permute(1, 0, 2)
+        q_h = self._rms_scale(q_h, self.q_up_norm_weight)
+        q_up = self.expert_q_up.to(dtype=dtype).transpose(1, 2)
+        q_and_gate = torch.bmm(q_h, q_up)  # (E, N, H*d+H)
+
+        q_raw = q_and_gate[:, :, :H * d].reshape(E, B, T, H, d)
+        gate_logits = q_and_gate[:, :, H * d:].reshape(E, B, T, H, 1)
+
+        q_rope = q_raw[..., :self.rope_dim]
+        q_nope = q_raw[..., self.rope_dim:]
+        q_rope = self._rms_scale(q_rope, self.q_rope_norm_weight)
+        q_nope = self._rms_scale(q_nope, self.q_nope_norm_weight)
+
+        # --- Per-expert KV (low-rank latent) ---
+        kv_a = self.expert_kv_a.to(dtype=dtype) * self.kv_a_norm_weight.to(dtype=dtype).unsqueeze(1)
+        kv_b = self.expert_kv_b.to(dtype=dtype).transpose(1, 2)
+        kv_h = (x_flat @ kv_a.reshape(E * R_kv, D).t()).view(N, E, R_kv).permute(1, 0, 2)
+        kv_h = self._rms_scale(kv_h, self.kv_b_norm_weight)
+        kv_latent = torch.bmm(kv_h, kv_b)  # (E, N, kv_lat)
+
+        # Per-expert MLA decompress: kv_latent → K_nope, V
+        # Parameter-free RMS statistic with separate learned K and V input scales.
+        kv_flat = kv_latent.reshape(E * N, self.kv_latent_dim)
+        kv_rms = kv_flat.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
+        kv_unit = (kv_flat * kv_rms).reshape(E, N, self.kv_latent_dim)
+        kv_k = kv_unit * self.k_nope_in_norm_weight.to(dtype=dtype).unsqueeze(1)
+        kv_v = kv_unit * self.v_in_norm_weight.to(dtype=dtype).unsqueeze(1)
+        ek = self.expert_k_nope.to(dtype=dtype)
+        ev = self.expert_v.to(dtype=dtype)
+        k_nope = torch.bmm(kv_k, ek.transpose(1, 2)).reshape(E, B, T, H_kv, self.nope_dim)
+        v = torch.bmm(kv_v, ev.transpose(1, 2)).reshape(E, B, T, H_kv, d)
+
+        # Per-expert K_rope (low-rank): each expert has independent position attention
+        kr_a = self.expert_kr_a.to(dtype=dtype) * self.kr_a_norm_weight.to(dtype=dtype).unsqueeze(1)
+        kr_b = self.expert_kr_b.to(dtype=dtype).transpose(1, 2)
+        kr_h = (x_flat @ kr_a.reshape(E * self.kr_rank, D).t()).view(N, E, self.kr_rank).permute(1, 0, 2)
+        kr_h = self._rms_scale(kr_h, self.kr_b_norm_weight)
+        k_rope_raw = torch.bmm(kr_h, kr_b)  # (E, N, H_kv*rope)
+        k_rope = k_rope_raw.reshape(E, B, T, H_kv, self.rope_dim)
+
+        k_rope = self._rms_scale(k_rope, self.k_rope_norm_weight)
+        k_nope = self._rms_scale(k_nope, self.k_nope_norm_weight)
+
+        # --- RoPE ---
+        cos, sin = self.rotary(T, x_n.device, q_rope.dtype)
+        q_rope_p = q_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, self.rope_dim)
         q_rope_p = apply_rotary_emb(q_rope_p, cos, sin)
-        k_rope_p = k_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv_in, T, rope_d)
+
+        k_rope_p = k_rope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, self.rope_dim)
         k_rope_p = apply_rotary_emb(k_rope_p, cos, sin)
-        q_nope_p = q_nope.permute(1, 0, 3, 2, 4).reshape(B, E * H_in, T, nope_d)
+
+        # --- Assemble full Q, K ---
+        q_nope_p = q_nope.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, self.nope_dim)
         q_full = torch.cat([q_rope_p, q_nope_p], dim=-1)
-        q_full = q_full * self.q_gain.to(dtype)[None, :, None, None]
-        k_nope_p = k_nope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv_in, T, nope_d)
+        q_full = q_full * self.q_gain.to(dtype=dtype)[None, :, None, None]
+
+        k_nope_p = k_nope.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, self.nope_dim)
         k_full = torch.cat([k_rope_p, k_nope_p], dim=-1)
-        v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv_in, T, d_in)
-        # Head-packed SDPA
+
+        v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
+
+        # --- Head-packed SDPA ---
         try:
             y = F.scaled_dot_product_attention(
                 q_full, k_full, v_full, attn_mask=None, is_causal=True,
-                enable_gqa=(H_kv_in != H_in),
+                enable_gqa=(H_kv != H),
             )
         except TypeError:
             k_use, v_use = k_full, v_full
-            if H_kv_in != H_in:
-                rep = H_in // H_kv_in
+            if H_kv != H:
+                rep = H // H_kv
                 k_use = k_full.repeat_interleave(rep, dim=1)
                 v_use = v_full.repeat_interleave(rep, dim=1)
             y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
-        # Gated attention
-        gate_logits_p = gate_logits.permute(1, 0, 3, 2, 4).reshape(B, E * H_in, T, 1)
+
+        # --- Gated attention ---
+        gate_logits_p = gate_logits.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, 1)
         gate_act = torch.sigmoid(
             gate_logits_p.to(dtype=y.dtype)
             + self.gate_bias.to(dtype=y.dtype)[None, :, None, None]
         )
         y = y * gate_act
+
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             self._attn_gate_last_mean = float(gate_act.detach().float().mean().item())
-        # Wo: H_in*d_in → r
-        # SDPA out is (B, E*H_in, T, d_in); pack heads to (E, N, H_in*d_in)
-        y = y.reshape(B, E, H_in, T, d_in).permute(1, 0, 3, 2, 4).reshape(E, B * T, H_in * d_in)
-        y = _rms_scale_per_expert(y, self.wo_in_norm_weight)
-        wo = self.expert_wo.to(dtype).transpose(1, 2)  # (E, H_in*d_in, r)
-        y_r = torch.bmm(y, wo)  # (E, N, r)
-        return y_r
 
+        # --- Per-expert output projection Wo (low-rank, mixes heads) ---
+        y = y.reshape(B, E, H, T, d).permute(0, 3, 1, 2, 4).reshape(B * T, E, D)
+        # (E, N, D) → down (E, N, rank_wo) → up (E, N, D)
+        wo_d = self.expert_wo_down.to(dtype=y.dtype)
+        wo_u = self.expert_wo_up.to(dtype=y.dtype).transpose(1, 2)  # (E, rank_wo, D)
+        y_e = y.permute(1, 0, 2)  # (E, N, D)
+        y_e = self._rms_scale(y_e, self.wo_down_norm_weight)
+        y_h = torch.bmm(y_e, wo_d.transpose(1, 2))  # (E, N, rank_wo)
+        y_h = self._rms_scale(y_h, self.wo_up_norm_weight)
+        y_out = torch.bmm(y_h, wo_u)  # (E, N, D)
+        y = y_out.permute(1, 0, 2).reshape(B, T, E, D)
 
-class ExpertMLPBody(nn.Module):
-    """Per-expert SwiGLU MLP at the bottleneck dim r — full-rank, model-dim agnostic.
-
-    Forward: h_r (E, N, r) → y_r (E, N, r).
-
-    Inner pipeline:
-        gate, fc   : r → mlp_hidden  (mlp_hidden = round(r * mlp_inner_mult))
-        SwiGLU     : silu(gate) * fc
-        per-expert : RMSNorm on hidden
-        down       : mlp_hidden → r
-    """
-    def __init__(self, bottleneck_r: int, num_experts: int, mlp_inner_mult: float):
-        super().__init__()
-        self.bottleneck_r = int(bottleneck_r)
-        self.num_experts = int(num_experts)
-        r = self.bottleneck_r
-        self.mlp_hidden = int(round(r * float(mlp_inner_mult)))
-        H = self.mlp_hidden
-        E = self.num_experts
-        self.expert_gate = nn.Parameter(torch.empty(E, H, r))
-        self.expert_fc   = nn.Parameter(torch.empty(E, H, r))
-        self.expert_down = nn.Parameter(torch.empty(E, r, H))
-        self.gate_in_norm_weight = nn.Parameter(torch.ones(E, r))
-        self.fc_in_norm_weight   = nn.Parameter(torch.ones(E, r))
-        self.hidden_norm_weight  = nn.Parameter(torch.ones(E, H))
-        self.down_in_norm_weight = nn.Parameter(torch.ones(E, H))
-        for e in range(E):
-            nn.init.xavier_uniform_(self.expert_gate.data[e])
-            nn.init.xavier_uniform_(self.expert_fc.data[e])
-            nn.init.xavier_uniform_(self.expert_down.data[e])
-
-    def forward(self, h_r: Tensor) -> Tensor:
-        dtype = h_r.dtype
-        h_g = _rms_scale_per_expert(h_r, self.gate_in_norm_weight)
-        h_f = _rms_scale_per_expert(h_r, self.fc_in_norm_weight)
-        gate = torch.bmm(h_g, self.expert_gate.to(dtype).transpose(1, 2))  # (E, N, H)
-        fc   = torch.bmm(h_f, self.expert_fc.to(dtype).transpose(1, 2))    # (E, N, H)
-        h_inner = F.silu(gate) * fc
-        # Per-expert RMSNorm on hidden
-        h_inner = h_inner * h_inner.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
-        h_inner = h_inner * self.hidden_norm_weight.to(dtype).unsqueeze(1)
-        # Down to r
-        h_inner = _rms_scale_per_expert(h_inner, self.down_in_norm_weight)
-        down = self.expert_down.to(dtype).transpose(1, 2)  # (E, H, r)
-        y_r = torch.bmm(h_inner, down)  # (E, N, r)
-        return y_r
-
-
-# ---------------------------------------------------------------------------
-# COMPOSITE: ATTENTION + MLP (BottleneckIn → ExpertBody → BottleneckOut)
-# ---------------------------------------------------------------------------
-
-class CausalSelfAttention(nn.Module):
-    """Per-expert MLA in a low-dim bottleneck (iter 90).
-
-    Composition:
-        x (B, T, D)
-          → BottleneckIn (D → r)
-          → ExpertMLABody (full-rank MLA at r)
-          → BottleneckOut (r → D)
-          → y (B, T, E, D)
-
-    Caller (Block) applies router weights to the (E,) dim and sums.  Public
-    API — `forward_experts(h)`, `attn_gate`, `attn_router`,
-    `get_expert_diagnostics()` — preserved so `Block.forward` is unchanged.
-    """
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
-                 rope_base: float, qk_gain_init: float, *,
-                 num_experts: int, num_inner_heads: int,
-                 num_inner_kv_heads: int, attn_bottleneck_r: int,
-                 expert_proj_rank: int, router: SoftDenseRouter | None = None):
-        super().__init__()
-        self.num_experts = int(num_experts)
-        # Outer head-config — kept for diagnostic / metadata compatibility
-        # (Block reports num_heads in run logs).  Inner head-config drives
-        # the actual per-expert MLA compute and is owned by ExpertMLABody.
-        self.num_heads = int(num_heads)
-        self.num_kv_heads = int(num_kv_heads)
-        self.in_proj = BottleneckIn(dim, num_experts, attn_bottleneck_r, expert_proj_rank)
-        self.expert_body = ExpertMLABody(attn_bottleneck_r, num_inner_heads,
-                                          num_inner_kv_heads, num_experts,
-                                          rope_base, qk_gain_init)
-        self.out_proj = BottleneckOut(dim, num_experts, attn_bottleneck_r, expert_proj_rank)
-        self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
-        self._out_ortho_cos_sim: float | None = None
-        self._out_ortho_loss: Tensor | None = None
-        self._attn_gate_last_mean: float | None = None
-
-    def forward_experts(self, x_n: Tensor) -> Tensor:
-        """Compute per-expert attention outputs (B, T, E, D).
-
-        Args:
-            x_n: Pre-RMS-normalized input (B, T, D).
-        """
-        B, T, _ = x_n.shape
-        h_r = self.in_proj(x_n)              # (E, N, r)
-        y_r = self.expert_body(h_r, B, T)     # (E, N, r)
-        y = self.out_proj(y_r, B, T)          # (B, T, E, D)
-        # Forward up the gated-attention diagnostic from expert_body so Block
-        # reads it from the standard attribute name.
-        self._attn_gate_last_mean = self.expert_body._attn_gate_last_mean
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
                 mu_out = y.detach().float().mean(dim=(0, 1))  # (E, D)
                 self._out_ortho_cos_sim = float(max_pairwise_abs_cosine(mu_out).item())
-        return y
 
-    def kv_subspace_for_ortho(self) -> Tensor:
-        """KV-A weights flattened to (E, kv_latent_inner * r) for Block.ortho_aux."""
-        kv_a = self.expert_body.expert_kv_a.float()
-        return kv_a.reshape(kv_a.shape[0], -1)
+        return y
 
     def forward(self, x: Tensor) -> Tensor:
         raise RuntimeError("Use Block.forward()")
 
     @property
     def attn_gate(self) -> Tensor:
-        return self.expert_body.gate_bias
+        return self.gate_bias
 
     def get_expert_diagnostics(self) -> dict:
         diag: dict = {}
@@ -1816,66 +1647,80 @@ class CausalSelfAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
-    """Per-expert SwiGLU MLP in a low-dim bottleneck (iter 90).
-
-    Composition: BottleneckIn → ExpertMLPBody → BottleneckOut + router.
-
-    Routing weights and shared-expert sigmoid gates are applied to the
-    (E,) dim of the bottleneck-out result; this is mathematically equivalent
-    to applying routing inside the bottleneck (linearity) and keeps the
-    route-weight application uniform with attention.
-    """
-    def __init__(self, dim: int, mlp_mult: float, *,
-                 num_experts: int, mlp_bottleneck_r: int,
-                 expert_proj_rank: int, mlp_inner_mult: float,
-                 router: SoftDenseRouter | None = None):
+    """SwiGLU-gated MLP expert bank (doc §3.4)."""
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 8,
+                 expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
-        # mlp_mult is preserved as a Hyperparameters / CLAUDE.md SSOT mirror
-        # for older docs/tests; the bottleneck design uses mlp_inner_mult * r
-        # as the truth source for the SwiGLU hidden dim.  Accept and ignore.
-        del mlp_mult
-        self.dim = int(dim)
-        self.num_experts = int(num_experts)
-        self.in_proj = BottleneckIn(dim, num_experts, mlp_bottleneck_r, expert_proj_rank)
-        self.expert_body = ExpertMLPBody(mlp_bottleneck_r, num_experts, mlp_inner_mult)
-        self.out_proj = BottleneckOut(dim, num_experts, mlp_bottleneck_r, expert_proj_rank)
+        hidden = int(mlp_mult * dim)
+        self.num_experts = num_experts
+        self.expert_rank = expert_rank if expert_rank > 0 else max(hidden // max(num_experts, 1), 1)
+        self.expert_gate = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        self.expert_fc = nn.Parameter(torch.empty(num_experts, self.expert_rank, dim))
+        self.gate_in_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
+        self.fc_in_norm_weight = nn.Parameter(torch.ones(num_experts, dim))
+        # Layout (E, D, R) matches repo tests/experiments; computation uses
+        # a transpose view to (E, R, D) for batched GEMMs.
+        self.expert_down = nn.Parameter(torch.empty(num_experts, dim, self.expert_rank))
+        for e in range(num_experts):
+            nn.init.xavier_uniform_(self.expert_gate.data[e])
+            nn.init.xavier_uniform_(self.expert_fc.data[e])
+            nn.init.xavier_uniform_(self.expert_down.data[e])
         self.mlp_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
-        # Backward-compat alias for diagnostics that read `mlp.expert_rank`.
-        self.expert_rank = self.expert_body.mlp_hidden
+        # Per-expert RMSNorm on hidden — no shared learned weights across experts.
+        # Shape: (E, R) scale weight, applied after normalization.
+        self.hidden_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
 
     def mix_experts(self, x: Tensor, w: Tensor, *,
                     num_shared: int = 0, shared_gate: Tensor | None = None) -> Tensor:
         # Caller must pass x already parameter-free RMS-normalized by Block.
-        B, T, _ = x.shape
-        h_r = self.in_proj(x)               # (E, N, r)
-        y_r = self.expert_body(h_r)          # (E, N, r), un-weighted
-        y_d = self.out_proj(y_r, B, T)       # (B, T, E, D), un-weighted
+        B, T, D = x.shape
+        E, R = self.num_experts, self.expert_rank
+        N = B * T
+        x_flat = x.reshape(N, D)
+        G = (
+            self.expert_gate.to(dtype=x_flat.dtype)
+            * self.gate_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
+        ).reshape(E * R, D)
+        Fm = (
+            self.expert_fc.to(dtype=x_flat.dtype)
+            * self.fc_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
+        ).reshape(E * R, D)
+        gate = x_flat @ G.t()
+        fc = x_flat @ Fm.t()
+        h = F.silu(gate) * fc
+        h = h.view(N, E, R)
+        # Per-expert RMSNorm (no shared weights across experts)
+        h_rms = h.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
+        h = h * h_rms * self.hidden_norm_weight.to(dtype=h.dtype)  # (E, R) broadcasts over (N, E, R)
+        # Phase 9 iter 51: shared experts (sigmoid-gated) + routed experts
         S = int(num_shared)
         if S > 0 and shared_gate is not None:
-            ws = shared_gate.to(y_d.dtype)              # (B, T, S)
-            wr = w.to(y_d.dtype)                         # (B, T, E - S)
-            shared = (y_d[:, :, :S, :] * ws.unsqueeze(-1)).sum(dim=2)
-            routed = (y_d[:, :, S:, :] * wr.unsqueeze(-1)).sum(dim=2)
-            out = shared + routed
+            num_routed = E - S
+            # Shared: gated by per-token sigmoid (same gate as attention path)
+            g_s_flat = shared_gate.reshape(N, S).to(dtype=h.dtype)
+            h_shared = h[:, :S, :] * g_s_flat.unsqueeze(-1)  # (N, S, R)
+            # Routed: weighted by router output
+            w_flat = w.reshape(N, num_routed).to(dtype=h.dtype)
+            h_routed = h[:, S:, :] * w_flat.unsqueeze(-1)  # (N, num_routed, R)
+            h = torch.cat([h_shared, h_routed], dim=1)  # (N, E, R)
         else:
-            out = (y_d * w.to(y_d.dtype).unsqueeze(-1)).sum(dim=2)
+            w_flat = w.reshape(N, E).to(dtype=x_flat.dtype)
+            h = h * w_flat.unsqueeze(-1)
+        Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
+        out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
+        out = out_e.sum(dim=0)  # (N, D)
+
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
-                mu_out = y_d.detach().float().mean(dim=(0, 1))  # (E, D)
+                mu_h = h.reshape(N, E, R).mean(dim=0).to(dtype=torch.float32)
+                down_T = self.expert_down.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
+                mu_out = torch.einsum("er,erd->ed", mu_h, down_T)
+                # Max pairwise |cos| across expert pairs — near-duplicate check.
                 self._out_ortho_cos_sim = float(max_pairwise_abs_cosine(mu_out).item())
-        return out  # (B, T, D)
 
-    def mean_expert_outputs_for_ortho(self, h: Tensor, max_tokens: int) -> Tensor:
-        """For Block.ortho_aux: (E, D) mean MLP output, no router/shared-gate."""
-        B, T, _ = h.shape
-        t = int(min(max(1, int(max_tokens)), T))
-        h_sub = h[:, :t]
-        h_r = self.in_proj(h_sub)
-        y_r = self.expert_body(h_r)
-        y_d = self.out_proj(y_r, B, t)  # (B, t, E, D)
-        return y_d.detach().float().mean(dim=(0, 1))  # (E, D)
+        return out.reshape(B, T, D)
 
     def forward(self, x: Tensor) -> Tensor:
         raise RuntimeError("Use Block.forward()")
@@ -2127,13 +1972,10 @@ class Block(nn.Module):
     # Locked config: 8 experts (iter 13 best at 1h budget).
     # H5 resolved: 12exp works at WD=0.72 but throughput penalty hurts val_bpb.
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
-                 rope_base: float, qk_gain_init: float, *,
-                 num_experts: int, num_shared_experts: int,
-                 router_scoring: str,
-                 attn_bottleneck_r: int, mlp_bottleneck_r: int,
-                 expert_proj_rank: int,
-                 attn_inner_heads: int, attn_inner_kv_heads: int,
-                 mlp_inner_mult: float):
+                 rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
+                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
+                 num_experts: int = 8, num_shared_experts: int = 0,
+                 router_scoring: str = "linear", **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
         # State preconditioner is parameter-free RMSUnit; every projection-local
@@ -2169,23 +2011,10 @@ class Block(nn.Module):
                                       health_slices=(num_routed, num_routed))
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
-        self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-            num_experts=num_experts,
-            num_inner_heads=attn_inner_heads,
-            num_inner_kv_heads=attn_inner_kv_heads,
-            attn_bottleneck_r=attn_bottleneck_r,
-            expert_proj_rank=expert_proj_rank,
-            router=self.router,
-        )
-        self.mlp = MLP(
-            dim, mlp_mult,
-            num_experts=num_experts,
-            mlp_bottleneck_r=mlp_bottleneck_r,
-            expert_proj_rank=expert_proj_rank,
-            mlp_inner_mult=mlp_inner_mult,
-            router=self.router,
-        )
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                         kv_latent_dim=kv_latent_dim, num_experts=num_experts,
+                                         expert_rank=attn_expert_rank, router=self.router)
+        self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
         self._attn_gate_call_track: list[float] = []
@@ -2207,27 +2036,47 @@ class Block(nn.Module):
         self._shared_gate_diag_step: int | None = None
 
     def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> tuple[Tensor, Tensor]:
-        bsz, seqlen, _ = z_in.shape
+        bsz, seqlen, dim = z_in.shape
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
         x0_sub = x0[:, :t]
         x = z_sub + x0_sub
         h = _rms_unit(x)
 
-        # Attention ortho: per-expert outputs from independent expert MLA.
+        # Attention ortho: per-expert outputs from independent expert SDPA.
         attn_expert_out = self.attn.forward_experts(h)  # (B, t, E, D)
         mu_attn = attn_expert_out.detach().float().mean(dim=(0, 1))  # (E, D)
         attn_ortho = mean_abs_offdiag_cosine(mu_attn)
 
-        # MLP ortho: delegate to MLP body (computes (E, D) mean output without
-        # router weights, then off-diagonal cosine over expert pairs).
-        mu_mlp = self.mlp.mean_expert_outputs_for_ortho(h, max_tokens=t)  # (E, D)
+        # MLP ortho (unchanged: compute mean expert outputs via existing path).
+        E = self.num_experts
+        N = bsz * t
+        x_flat = h.reshape(N, dim)
+        E2, R2 = self.mlp.num_experts, self.mlp.expert_rank
+        G = (
+            self.mlp.expert_gate.to(dtype=x_flat.dtype)
+            * self.mlp.gate_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
+        ).reshape(E2 * R2, dim)
+        Fm = (
+            self.mlp.expert_fc.to(dtype=x_flat.dtype)
+            * self.mlp.fc_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
+        ).reshape(E2 * R2, dim)
+        gate = x_flat @ G.t()
+        fc = x_flat @ Fm.t()
+        h_mlp = F.silu(gate) * fc
+        mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)
+        down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).transpose(1, 2)  # (E, R, D)
+        mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
         mlp_ortho = mean_abs_offdiag_cosine(mu_mlp)
 
-        # KV latent subspace orthogonalization (iter 52): forces per-expert KV-A
-        # weights to span distinct subspaces.  Delegated to the attention class
-        # so the bottleneck/MLA boundary stays inside its owner.
-        kv_subspace_ortho = mean_abs_offdiag_cosine(self.attn.kv_subspace_for_ortho())
+        # Phase 9 iter 52: KV latent subspace orthogonalization.
+        # Penalize off-diagonal cosine similarity of KV down-projection weights.
+        # Forces expert KV compressions to span distinct subspaces.
+        # Weight-space penalty (structural) vs output-space penalty (input-dependent).
+        kv_a = self.attn.expert_kv_a.float()  # (E, kv_rank, dim)
+        kv_flat = kv_a.reshape(kv_a.shape[0], -1)  # (E, kv_rank*dim)
+        kv_subspace_ortho = mean_abs_offdiag_cosine(kv_flat)
+        # Blend: 50% output-level ortho + 50% weight-level KV subspace ortho
         attn_ortho = 0.5 * attn_ortho + 0.5 * kv_subspace_ortho
 
         return attn_ortho, mlp_ortho
@@ -2622,11 +2471,8 @@ class GPT(nn.Module):
                  num_kv_heads: int, mlp_mult: float, tie_embeddings: bool,
                  tied_embed_init_std: float, rope_base: float,
                  qk_gain_init: float, bigram_vocab_size: int = 0, bigram_dim: int = 128,
-                 num_refinements: int = 1,
-                 attn_bottleneck_r: int = 128, mlp_bottleneck_r: int = 128,
-                 expert_proj_rank: int = 32,
-                 attn_inner_heads: int = 4, attn_inner_kv_heads: int = 2,
-                 mlp_inner_mult: float = 2.5,
+                 kv_latent_dim: int = 0, num_refinements: int = 1,
+                 attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  deq_beta: float = 0.35, attn_balance_mult: float = 5.0,
                  mlp_balance_mult: float = 1.0, mos_balance_mult: float = 50.0,
                  bal_loss_coef: float = 5e-3,
@@ -2655,16 +2501,11 @@ class GPT(nn.Module):
         self.num_experts = int(num_experts)
         self.num_shared_experts = int(num_shared_experts)
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
-                                   rope_base, qk_gain_init,
+                                   rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
+                                   attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
                                    num_experts=self.num_experts,
                                    num_shared_experts=self.num_shared_experts,
                                    router_scoring=router_scoring,
-                                   attn_bottleneck_r=attn_bottleneck_r,
-                                   mlp_bottleneck_r=mlp_bottleneck_r,
-                                   expert_proj_rank=expert_proj_rank,
-                                   attn_inner_heads=attn_inner_heads,
-                                   attn_inner_kv_heads=attn_inner_kv_heads,
-                                   mlp_inner_mult=mlp_inner_mult,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
@@ -2792,8 +2633,8 @@ class GPT(nn.Module):
                     if ".proj." in name or name.endswith(".proj"):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * self.num_layers))
-        # Gate logits are zero-initialized in ExpertMLABody.__init__
-        # (expert_q gate-logit rows zeroed → sigmoid(0) = 0.5 at init).
+        # Gate logits are zero-initialized in CausalSelfAttention.__init__
+        # (expert_q_up gate rows zeroed → sigmoid(0) = 0.5 at init).
         self.mos_head.init_from_embedding(self.tok_emb.weight.data)
 
     def _get_soft_embedding(self, z: Tensor, topk: int = 64) -> Tensor:
@@ -3654,13 +3495,8 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        num_refinements=args.num_refinements,
-        attn_bottleneck_r=args.attn_bottleneck_r,
-        mlp_bottleneck_r=args.mlp_bottleneck_r,
-        expert_proj_rank=args.expert_proj_rank,
-        attn_inner_heads=args.attn_inner_heads,
-        attn_inner_kv_heads=args.attn_inner_kv_heads,
-        mlp_inner_mult=args.mlp_inner_mult,
+        kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
+        attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
         deq_beta=args.deq_beta, attn_balance_mult=args.attn_balance_mult,
         mlp_balance_mult=args.mlp_balance_mult, mos_balance_mult=args.mos_balance_mult,
         bal_loss_coef=args.bal_loss_coef,

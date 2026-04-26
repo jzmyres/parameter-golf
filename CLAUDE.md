@@ -116,12 +116,8 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 |---|---|
 | router_scoring | linear (dot-product logits, iter 70) |
 | mos_balance_mult | 50.0 (iter 26-lb-loss: hardcoded multiplier promoted to a Hyperparameter; multiplies MoS-NTP balance loss inside `_collect_routing_losses` — the principled fix for `mos_*_min_share` failures since H26) |
-| attn_bottleneck_r | 128 (per-expert MLA inner dim — iter 90 bottleneck experts) |
-| mlp_bottleneck_r | 128 (per-expert SwiGLU inner dim — iter 90) |
-| expert_proj_rank | 32 (rank of D→proj_rank→r factored I/O bottleneck — iter 90) |
-| attn_inner_heads | 4 (full-rank Q heads at r) |
-| attn_inner_kv_heads | 2 (GQA ratio H_in / H_kv_in = 2; KV-A still latent-compressed for DeepSeek-style cache efficiency) |
-| mlp_inner_mult | 2.5 (mlp_hidden = round(r × 2.5) = 320) |
+| attn_expert_rank | 128 |
+| mlp_expert_rank | 192 |
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |

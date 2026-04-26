@@ -9,16 +9,12 @@ def _get_device() -> torch.device:
 
 def _make_model(**overrides):
     from train_gpt import GPT
-    # Test config picks small bottleneck dims that keep CPU smoke runs fast.
-    # Inner head config divides r evenly: r=64, H_in=4 → d_in=16.
     defaults = dict(
         vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
         num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
         tied_embed_init_std=0.005, rope_base=10000.0,
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
-        num_refinements=1,
-        attn_bottleneck_r=64, mlp_bottleneck_r=64, expert_proj_rank=16,
-        attn_inner_heads=4, attn_inner_kv_heads=2, mlp_inner_mult=2.5,
+        kv_latent_dim=0, num_refinements=1,
     )
     defaults.update(overrides)
     dev = _get_device()
@@ -50,26 +46,21 @@ def test_all_constraints():
     assert attn.num_experts == model.num_experts, (
         f"CSA must inherit num_experts from GPT, got {attn.num_experts} vs {model.num_experts}"
     )
-    # Iter 90: per-expert MLA in a low-dim bottleneck (BottleneckIn → ExpertMLABody → BottleneckOut).
-    body = attn.expert_body
-    assert hasattr(body, 'expert_kv_a'), "Must have per-expert KV (independent expert attn)"
-    assert hasattr(body, 'expert_k_nope'), "Must have per-expert K_nope decompress (MLA)"
-    assert hasattr(body, 'expert_kr'), "Must have per-expert K_rope (independent experts)"
+    assert hasattr(attn, 'expert_kv_a'), "Must have per-expert KV (independent expert attn)"
+    assert hasattr(attn, 'expert_k_nope'), "Must have per-expert K_nope decompress (MLA)"
+    assert hasattr(attn, 'expert_kr_a'), "Must have per-expert K_rope (independent experts)"
     assert hasattr(attn, 'attn_gate'), "Must have gated attention"
-    assert hasattr(attn, 'in_proj'), "Must have BottleneckIn input projection"
-    assert hasattr(attn, 'out_proj'), "Must have BottleneckOut output projection"
 
     # Check constraint #2: Soft Dense Routing (Dense MoE)
     mlp = model.shared_block.mlp
     assert mlp.num_experts == model.num_experts, (
         f"MLP must inherit num_experts from GPT, got {mlp.num_experts} vs {model.num_experts}"
     )
-    mbody = mlp.expert_body
-    assert hasattr(mbody, 'expert_gate'), "MLP body must have expert_gate (3D per-expert)"
-    assert hasattr(mbody, 'expert_fc'), "MLP body must have expert_fc (3D per-expert)"
-    assert hasattr(mbody, 'expert_down'), "MLP body must have expert_down (3D per-expert)"
+    assert hasattr(mlp, 'expert_gate'), "Must have expert_gate (3D per-expert params)"
+    assert hasattr(mlp, 'expert_fc'), "Must have expert_fc (3D per-expert params)"
+    assert hasattr(mlp, 'expert_down'), "Must have expert_down (3D per-expert params)"
     assert hasattr(mlp, 'mlp_router'), "Must have mlp_router"
-    assert mbody.expert_gate.ndim == 3, f"expert_gate must be 3D, got {mbody.expert_gate.ndim}D"
+    assert mlp.expert_gate.ndim == 3, f"expert_gate must be 3D, got {mlp.expert_gate.ndim}D"
 
     # Check constraint #4: FSQ in MoS Head
     assert hasattr(model, 'mos_head'), "Must have MoS output head"
@@ -102,75 +93,32 @@ def test_all_constraints():
 
 
 def test_expert_path_parameters_are_expert_independent():
-    """Learned parameters inside expert paths must carry a leading expert dim.
-
-    Iter 90 layout: BottleneckIn (D→R_proj→r) + ExpertMLABody (full-rank at r)
-    + BottleneckOut (r→R_proj→D).  Every linear input has its own per-expert
-    pre-RMSNorm scale (Prenorm Scale Independence Rule).
-    """
+    """Learned parameters inside expert paths must carry a leading expert dim."""
     model = _make_model(num_experts=4)
     attn = model.shared_block.attn
-    body = attn.expert_body
-    in_p, out_p = attn.in_proj, attn.out_proj
     E = attn.num_experts
     D = model.tok_emb.embedding_dim
-    R_proj = in_p.expert_proj_rank
-    r = body.bottleneck_r
-    H_in = body.num_inner_heads
-    H_kv_in = body.num_inner_kv_heads
-    d_in = body.head_dim_inner
-    rope_d = body.rope_dim_inner
-    nope_d = body.nope_dim_inner
-    kv_lat = body.kv_latent_inner
-
-    # Bottleneck-in: (E, R_proj, D), (E, r, R_proj)
-    assert in_p.in_down.shape == (E, R_proj, D)
-    assert in_p.in_up.shape == (E, r, R_proj)
-    assert in_p.in_down_norm_weight.shape == (E, D)
-    assert in_p.in_up_norm_weight.shape == (E, R_proj)
-    # Inner MLA at r
-    assert body.expert_q.shape == (E, H_in * d_in + H_in, r)
-    assert body.q_in_norm_weight.shape == (E, r)
-    assert body.expert_kv_a.shape == (E, kv_lat, r)
-    assert body.kv_a_in_norm_weight.shape == (E, r)
-    assert body.expert_k_nope.shape == (E, H_kv_in * nope_d, kv_lat)
-    assert body.expert_v.shape == (E, H_kv_in * d_in, kv_lat)
-    assert body.k_nope_in_norm_weight.shape == (E, kv_lat)
-    assert body.v_in_norm_weight.shape == (E, kv_lat)
-    assert body.expert_kr.shape == (E, H_kv_in * rope_d, r)
-    assert body.kr_in_norm_weight.shape == (E, r)
-    assert body.q_rope_norm_weight.shape == (E, rope_d)
-    assert body.q_nope_norm_weight.shape == (E, nope_d)
-    assert body.k_rope_norm_weight.shape == (E, rope_d)
-    assert body.k_nope_norm_weight.shape == (E, nope_d)
-    assert body.expert_wo.shape == (E, r, H_in * d_in)
-    assert body.wo_in_norm_weight.shape == (E, H_in * d_in)
-    # Bottleneck-out: (E, R_proj, r), (E, D, R_proj)
-    assert out_p.out_down.shape == (E, R_proj, r)
-    assert out_p.out_up.shape == (E, D, R_proj)
-    assert out_p.out_down_norm_weight.shape == (E, r)
-    assert out_p.out_up_norm_weight.shape == (E, R_proj)
-    # No shared learned expert-path norms
+    assert attn.q_down_norm_weight.shape == (E, D)
+    assert attn.q_up_norm_weight.shape == (E, attn.expert_rank)
+    assert attn.kv_a_norm_weight.shape == (E, D)
+    assert attn.kv_b_norm_weight.shape == (E, attn.kv_rank)
+    assert attn.k_nope_in_norm_weight.shape == (E, attn.kv_latent_dim)
+    assert attn.v_in_norm_weight.shape == (E, attn.kv_latent_dim)
+    assert attn.kr_a_norm_weight.shape == (E, D)
+    assert attn.kr_b_norm_weight.shape == (E, attn.kr_rank)
+    assert attn.wo_down_norm_weight.shape == (E, D)
+    assert attn.wo_up_norm_weight.shape == (E, attn.wo_rank)
+    assert attn.q_rope_norm_weight.shape == (E, attn.rope_dim)
+    assert attn.q_nope_norm_weight.shape == (E, attn.nope_dim)
+    assert attn.k_rope_norm_weight.shape == (E, attn.rope_dim)
+    assert attn.k_nope_norm_weight.shape == (E, attn.nope_dim)
     for name in ("q_norm", "k_norm", "q_rope_norm", "k_rope_norm"):
-        assert not hasattr(body, name), f"{name} must not be a shared learned expert-path norm"
+        assert not hasattr(attn, name), f"{name} must not be a shared learned expert-path norm"
 
     mlp = model.shared_block.mlp
-    mbody = mlp.expert_body
-    m_in_p, m_out_p = mlp.in_proj, mlp.out_proj
-    H_mlp = mbody.mlp_hidden
-    r_mlp = mbody.bottleneck_r
-    R_proj_mlp = m_in_p.expert_proj_rank
-    assert m_in_p.in_down.shape == (E, R_proj_mlp, D)
-    assert m_in_p.in_up.shape == (E, r_mlp, R_proj_mlp)
-    assert mbody.expert_gate.shape == (E, H_mlp, r_mlp)
-    assert mbody.expert_fc.shape == (E, H_mlp, r_mlp)
-    assert mbody.expert_down.shape == (E, r_mlp, H_mlp)
-    assert mbody.gate_in_norm_weight.shape == (E, r_mlp)
-    assert mbody.fc_in_norm_weight.shape == (E, r_mlp)
-    assert mbody.hidden_norm_weight.shape == (E, H_mlp)
-    assert mbody.down_in_norm_weight.shape == (E, H_mlp)
-    assert m_out_p.out_down.shape == (E, R_proj_mlp, r_mlp)
-    assert m_out_p.out_up.shape == (E, D, R_proj_mlp)
+    assert mlp.gate_in_norm_weight.shape == (E, D)
+    assert mlp.fc_in_norm_weight.shape == (E, D)
+    assert mlp.hidden_norm_weight.shape == (E, mlp.expert_rank)
 
     mos = model.mos_head
     mos_E = mos.num_experts
