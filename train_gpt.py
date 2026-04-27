@@ -40,20 +40,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-# iter 97.5 throughput micro-opts (config-only, no math change):
-# 1. Bump dynamo recompile cache to 32 (default 8 saturates with K-jitter
-#    {8,12,20} × variable-length list guards in some compiled forwards).
-# 2. capture_scalar_outputs=True swallows .item() graph breaks in compiled
-#    code (e.g., diagnostic _router_gate_last_mean reads).
-# 3. Persistent inductor cache amortizes the front-loaded compile cost
-#    (~5-10 min) across runs. Keyed off run_id so concurrent runs don't
-#    collide. Falls back gracefully if filesystem write fails.
-torch._dynamo.config.recompile_limit = 32
-torch._dynamo.config.capture_scalar_outputs = True
-_INDUCTOR_CACHE_DIR = os.path.expanduser("~/.cache/torchinductor_opg")
-os.makedirs(_INDUCTOR_CACHE_DIR, exist_ok=True)
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", _INDUCTOR_CACHE_DIR)
 # donated_buffer left ENABLED (default). Lyapunov uses two-forward approach
 # with retain_graph=False to avoid conflict with compiled donated buffers.
 
