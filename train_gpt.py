@@ -4142,17 +4142,90 @@ def main() -> None:
     )
     log0(f"roundtrip_verification:done val_loss:{val_loss_q:.4f} val_bpb:{val_bpb_q:.6f}")
 
+    def _compute_eval_fp_lipschitz(
+        base_m,
+        n_hutch: int = 8,
+        n_finite_diff: int = 5,
+        eps_step: float = 1e-3,
+    ) -> tuple[float | None, float | None]:
+        """Two Lipschitz upper-bound probes at the saved DEQ FP z*.
+
+        - Hutchinson-Frobenius (resurrected from iter 88 dead code, commit
+          ceb7dfa): for random Rademacher v with ``E[v v^T] = I``,
+          ``E[||J^T v||²] = ||J||²_F``. Reports
+          ``rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)`` — proxy for
+          average-singular-value-squared.
+        - Finite-direction random step: for unit ``v̂``,
+          ``||T_θ(z* + eps·v̂) - T_θ(z*)|| / eps ≈ ||J·v̂||``. Sampled
+          along ``n_finite_diff`` random directions; report the max as a
+          single-shot operator-norm lower bound.
+
+        Returns ``(rho_F, rho_op)`` or ``(None, None)`` if z*/x0 unavailable.
+        Caller should run AFTER a forward pass that populates the model's
+        ``_lyapunov_z_star`` and ``_lyapunov_x0`` attributes (set by
+        ``GPT.forward`` at L2870-2871; populated on every forward including
+        eval).
+        """
+        z_star = getattr(base_m, '_lyapunov_z_star', None)
+        x0_lyap = getattr(base_m, '_lyapunov_x0', None)
+        if z_star is None or x0_lyap is None:
+            return None, None
+        sb = _unwrap_compiled_module(base_m.shared_block)
+        b_bar = base_m._parcae_b_bar() if base_m.use_parcae else None
+        b_bar_d = b_bar.detach() if b_bar is not None else None
+
+        # Hutchinson-Frobenius probe (multiple samples for variance reduction).
+        rho_F_samples: list[float] = []
+        for _ in range(n_hutch):
+            v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
+                               dtype=z_star.dtype) * 2.0 - 1.0)
+            z_b = z_star.detach().clone().requires_grad_(True)
+            with torch.enable_grad():
+                u_b = sb(z_b, x0_lyap, b_bar_d)
+                jvp = torch.autograd.grad(
+                    (u_b * v).sum(), z_b,
+                    create_graph=False, retain_graph=False,
+                )[0]
+            rho_F_samples.append(
+                float(jvp.detach().float().pow(2).mean().sqrt().item()))
+        rho_F = sum(rho_F_samples) / max(len(rho_F_samples), 1)
+
+        # Finite-direction random-step Lipschitz sample.
+        rho_op_samples: list[float] = []
+        with torch.no_grad():
+            u_base = sb(z_star, x0_lyap, b_bar_d)
+            for _ in range(n_finite_diff):
+                eps_dir = torch.randn_like(z_star)
+                eps_norm = eps_dir.float().norm()
+                if float(eps_norm.item()) < 1e-8:
+                    continue
+                eps_unit = eps_dir / eps_norm
+                u_pert = sb(z_star + eps_step * eps_unit, x0_lyap, b_bar_d)
+                rho_op_samples.append(
+                    float((u_pert - u_base).float().norm().item()) / eps_step)
+        rho_op = max(rho_op_samples) if rho_op_samples else None
+        return rho_F, rho_op
+
     # DEQ fixed-point K-sweep: verify val_bpb improves (or plateaus) as K grows.
     # A valid DEQ should converge to a fixed point — more solver iterations = better
     # or equal quality, never worse.  Non-monotone behaviour indicates the model
     # is exploiting a specific iteration count rather than a true fixed point.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
+    #
+    # iter 97.6 (PERMANENT, 2026-04-26): K-sweep harness now includes
+    # (a) Hutchinson-Frobenius Lipschitz upper bound at the converged FP,
+    # (b) finite-direction random-step Lipschitz sample (operator-norm proxy),
+    # (c) acyclicity primes K=17, 37, 113 — coprime to {2,3,4,5,12,20} to
+    #     detect period-L cycles aliased by power-of-2 sampling.
     log0("k_sweep:start")
     # T-opt 15: Reset dynamo before K-sweep to prevent recompilation storm.
     # Different K values change iteration counts, triggering dynamo guards
     # that cause recompile_limit hits → stall one rank → NCCL timeout.
     torch._dynamo.reset()
-    k_sweep_values = [4, 8, 16, 32, 64, 128]  # geometric doubling to K=128; fast eval keeps total sweep <5 min
+    # iter 97.6: insert primes {17, 37, 113} between the powers of 2.
+    # Primes coprime to {2,3,4,5,12,20} (training K-jitter set GCD = 4)
+    # break the period-L cycle alias inherent in power-of-2 sampling.
+    k_sweep_values = [4, 8, 16, 17, 32, 37, 64, 113, 128]
     k_sweep_results: dict[int, float] = {}
     for k_eval in k_sweep_values:
         # Pass deq_k explicitly — run_validation uses it directly instead of
@@ -4190,6 +4263,17 @@ def main() -> None:
         resid_t = getattr(base_m_for_roundtrip, "_deq_residual_t", None)
         if isinstance(resid_t, torch.Tensor):
             diag_parts.append(f"residual:{float(resid_t.detach().float().item()):.2f}")
+        # iter 97.6: Lipschitz upper bounds at the saved DEQ FP (z*).
+        # Hutchinson-Frobenius reuses the iter 88 dead code (commit ceb7dfa);
+        # finite-direction random-step samples ||J·v̂|| as an operator-norm proxy.
+        # Both are reported per-K so we can plot Lipschitz vs depth alongside
+        # val_bpb and iter_conv_rel — directly diagnoses whether contraction
+        # tightens with K (target: rho ≤ 1 and stable across K).
+        rho_F, rho_op = _compute_eval_fp_lipschitz(base_m_for_roundtrip)
+        if rho_F is not None:
+            diag_parts.append(f"hutch_F:{rho_F:.4f}")
+        if rho_op is not None:
+            diag_parts.append(f"rd_step:{rho_op:.4f}")
         log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
     k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
     log0(f"k_sweep:done {k_parts}")
