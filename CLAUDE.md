@@ -238,7 +238,20 @@ Reference impl: see §2.
 - **Model weights**: `experiments/weights/{baseline,previous,current}/`.
 - **Metrics comparison**: `python experiments/plot_metrics.py` → `experiments/metrics_comparison.png` (4×3 grid: train_loss · val_bpb · step_avg_ms / DEQ residual · recon_err · iter_conv / expert_usage · entropy · ortho / summary text).
 - **Progress plots**: `python experiments/plot_progress.py` → `experiments/progress.png`, `progress_full.png`.
-- All metrics tracked: train_loss, val_loss, val_bpb, step_avg_ms, deq_residual, deq_recon_err, deq_iter_conv, expert_usage (per expert), `expert_entropy` (global utilization — should be HIGH ≈ log(N) to confirm no dead experts), `pertoken_entropy` (per-token routing — should be LOW to confirm specialization, iter 99+), expert_ortho.
+
+#### Required routing-health metrics (ALL must be reported every train+val log line)
+
+| Metric | Target | What it tracks | Pool prefix? |
+|---|---|---|---|
+| **`pertoken_entropy`** (sparsity, iter 99+) | **LOW** ≈ 1.0 nat | Per-token routing concentration: `−Σ_e w(e\|token) log w(e\|token)` averaged over tokens. LOW = each token uses few experts strongly = specialization | **NO** — single pooled router, identical for attn and mlp slices |
+| **`expert_entropy`** (global utilization) | **HIGH** ≈ log(N_routed) | Global cross-batch entropy: `−Σ_e p̄_e log p̄_e` where `p̄_e` is batch-averaged share. HIGH = no dead experts, balanced utilization | **NO** — same reason; attn and mlp halves of the pooled router yield identical values when computed over the full N_routed components |
+| **`min_expert_contribution`** | **≥ 0.005** (0.5%) | `min_e p̄_e` — smallest batch-averaged share across the routed-expert pool. Sentinel for dead experts. Should report explicitly per pool slice (attn min, mlp min) | **YES** — `attn_min_share` / `mlp_min_share` differ because the per-component shares differ across pool slices |
+| **`cv`** (coefficient of variation) | **LOW** ≈ 0.2-0.3 | `std(p̄_e) / mean(p̄_e)` — spread of utilization. LOW = balanced; HIGH = winner-take-all | **NO** when computed over the full pooled distribution (current logging shows identical attn_cv == mlp_cv since they share the router); **YES** if computed per slice |
+| **`ortho`** (expert orthogonality) | **LOW** ≈ 0.1-0.2 | `max\|cos_sim\|` between expert OUTPUT means. Low cosine = experts represent different directions | **YES** — `attn_ortho` / `mlp_ortho` differ because attention experts and MLP experts produce DIFFERENT outputs even with shared router; per-pool computation is required |
+| **`router_mass`** | 0.7-0.95 typical | Mean `sigmoid(gate)` value — total routed contribution per token. Drops as the model gates the mixture down | NO — single gate, single value |
+
+**Prefix convention** (clarified 2026-04-26): the SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components (per CLAUDE.md §6.2 and the iter 35 router consolidation). Metrics derived only from the **routing distribution** (entropy, cv when computed over the full pool, pertoken_entropy, router_mass) carry NO meaningful information in their `attn_` vs `mlp_` prefix — the values are necessarily identical. Metrics derived from **expert outputs** (usage arrays, orthogonality, min_share per slice) DO differ by component pool and must keep their prefix. Future logging consolidation: drop the redundant prefix on router-distribution metrics; preserve it on expert-output metrics.
+
 - Detailed comparison: 2 configs only — baseline vs current.
 - **Prioritize architecture exploration** over hyperparameter tuning; cite papers/repos.
 
