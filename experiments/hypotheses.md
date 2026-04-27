@@ -1086,6 +1086,40 @@ The axis's win is front-loaded: extra experts deliver capacity early when each e
 
 **Related:** H43 (low-rank experts), H47 (scale E=16-32 — this iter shows the upper boundary), H71 (the iter 96 PROMOTION that opened this axis), iter 99 sparsemax (next attack on the same problem from a different angle).
 
+### H73: D=1024 under iter 96 LoRA layout — NOT TESTED on dev hardware (3× OOM at 44 GiB cap; 2026-04-26)
+
+**Claim:** Scaling `model_dim 768 → 1024` on the iter 96 baseline (E=16, attn_R=64, mlp_R=96, full-D LoRA, K-jitter {8,12,20}) is an orthogonal axis to E-scaling and should pay off — d_head bumps 96 → 128 (FA tensorcore sweet-spot), per-expert linears scale linearly in D, and the iter 91+92 bottleneck-D failure (H70) was attributed to the bottleneck design not D-scaling itself.
+
+**Test:** iter 98 — 3 attempts on 2× L40S dev hardware (44.4 GiB/rank cap):
+
+| Attempt | Config | Outcome |
+|---|---|---|
+| 1 | D=1024 + K_max=20 + seq=2048 + batch=524K | OOM at first backward (~46 GiB needed) |
+| 2 | D=1024 + K_max=16 + seq=2048 + batch=524K | OOM at same ~43.6 GiB ceiling — issue is D-bound, not K-bound |
+| 3 | D=1024 + K_max=16 + seq=1024 + batch=524K | OOM at same 43.57 GiB — DEQ TBPTT floor + D=1024 activations exceed cap regardless of seq/K reductions |
+
+Halving `train_batch_tokens` to 262K caused divergence at the same LRs (smoke test loss UP 6.08 → 6.28; would need LR rescaling, multi-knob change). Reducing both seq and K simultaneously also failed.
+
+**Result:** ❌ **NOT TESTED on dev hardware.** Documented gap, not refutation.
+
+**Why it doesn't fit:**
+- iter 96 (D=768): peak VRAM 35.7 GiB. Activations dominate: B·T·D·layers ≈ 256·2048·768·12·4B = 19 GB plus expert outputs.
+- iter 98 (D=1024): activation memory scales linearly in D → ~25 GiB just for hidden states. Plus DEQ K=20 saves K+1 states for fp64 reconstruction → another ~25 GiB.
+- Total >50 GiB peak, exceeds 44 GiB cap.
+
+**Implications:**
+- D-scaling on this codebase needs **gradient checkpointing** (recompute activations on backward; ~30% throughput penalty but cuts activation memory by 12×) OR **submission hardware** (8× H100 80 GiB = 640 GiB total, plenty of headroom).
+- For dev iteration: D=768 stays. The "more, smaller experts" axis (iter 96 H71) is the only architectural width axis we can exercise on 2× L40S.
+- **For submission**: D=1024 should be re-tested on 8× H100. Iter 91+92 (bottleneck D=1024) was tested on dev because bottleneck experts compute at small r (≤192) per expert, fitting in dev VRAM. LoRA D=1024 doesn't have that escape valve.
+
+**Implications for queue:**
+- Iter 98 marked NOT TESTED. Don't retry on dev hardware without gradient checkpointing — same OOM expected.
+- Skip ahead to iter 99 (sparsemax) on iter 96 baseline (D=768). Sparsemax doesn't change D, so VRAM cost is iter-96-comparable.
+- Future submission-mode iter: re-test D=1024 on 8× H100 (orthogonal axis still untested architecturally).
+- Could also try gradient checkpointing as iter 98b — but that's a significant code refactor; not on the active queue.
+
+**Related:** H70 (iter 91+92 bottleneck D=1024 — different arch, NOT PROMOTED but did fit in VRAM), H71 (iter 96 PROMOTION at D=768 — the working baseline this couldn't extend on dev).
+
 ---
 
 ## Completed Iterations
@@ -1342,7 +1376,7 @@ failure.
 
 ### Next up — recommended ordering after iter 89
 
-**Current baseline:** iter 96 (`b962b5f`, val_bpb int6 = 1.4903) — last promoted iter; "more, smaller experts" (`num_experts 8→16, attn_expert_rank 128→64, mlp_expert_rank 192→96`) on top of iter 89's full-D LoRA-style baseline. Improvement of −0.0361 vs iter 89, K=128-vs-best-K Δ=+0.0016, artifact 7.55 MB (47% of 16 MB budget). H71 documents the result. Groups A-D are now closed (Groups A-C all PROMOTED ★ except iter 83 reverted; Group D bottleneck → NOT PROMOTED, code reverted, archive at tag `iter-91+92-bottleneck-NOT-PROMOTED`). Group F (LoRA-rank/E joint scaling) is the active scaling direction, opened by iter 96. **Iter 97 (E=20 continuation) NOT PROMOTED on per-wallclock grounds — H72 closes the rank-halving subdirection past E=16.** **Iter 97.5 (throughput config bumps) NOT IMPROVED — reverted.** **Iter 97.6 (PERMANENT eval-harness change)**: K-sweep now auto-reports Hutchinson-Frobenius + finite-direction random-step Lipschitz at the FP, plus acyclicity primes K∈{17,37,113}. Iter 98+ inherit these diagnostics. Active queue (in order): **iter 98** (D=768→1024, orthogonal axis — first to inherit the new K-sweep diagnostics) → **iter 99** (sparsemax architectural sparsity + per-token entropy logging) → **iter 100** (conditional entropy penalty stack on sparsemax) → **iter 102** (conditional inference-time top-k) → **iter 103** (chained 2-stage routing) → **Group E** (iter 95 TBPTT sweep) → **Phase 7.5** (profile pipeline). E-scaling past 16 is closed (do not test E=24, E=32).
+**Current baseline:** iter 96 (`b962b5f`, val_bpb int6 = 1.4903) — last promoted iter; "more, smaller experts" (`num_experts 8→16, attn_expert_rank 128→64, mlp_expert_rank 192→96`) on top of iter 89's full-D LoRA-style baseline. Improvement of −0.0361 vs iter 89, K=128-vs-best-K Δ=+0.0016, artifact 7.55 MB (47% of 16 MB budget). H71 documents the result. Groups A-D are now closed (Groups A-C all PROMOTED ★ except iter 83 reverted; Group D bottleneck → NOT PROMOTED, code reverted, archive at tag `iter-91+92-bottleneck-NOT-PROMOTED`). Group F (LoRA-rank/E joint scaling) is the active scaling direction, opened by iter 96. **Iter 97 (E=20 continuation) NOT PROMOTED on per-wallclock grounds — H72 closes the rank-halving subdirection past E=16.** **Iter 97.5 (throughput config bumps) NOT IMPROVED — reverted.** **Iter 97.6 (PERMANENT eval-harness change)**: K-sweep now auto-reports Hutchinson-Frobenius + finite-direction random-step Lipschitz at the FP, plus acyclicity primes K∈{17,37,113}. Iter 99+ inherit these diagnostics. **Iter 98 (D=1024) NOT TESTED on dev hardware** — 3× OOM at 44 GiB cap; deferred to 8× H100 submission hardware or future gradient-checkpointing iter (H73). Active queue (in order): **iter 99** (sparsemax architectural sparsity + per-token entropy logging — first iter to inherit the iter 97.6 K-sweep diagnostics) → **iter 100** (conditional entropy penalty stack on sparsemax) → **iter 97.7** (PROFILE-driven throughput retry) → **iter 103** (chained 2-stage routing) → **iter 95** (TBPTT efficiency sweep). E-scaling past 16 is closed (do not test E=24, E=32). Iter 102 removed 2026-04-26.
 
 Run ordering rationale (preserved for posterity): low-risk → higher-risk, activation / gate / schedule tweaks before legacy-loss ablations, architectural scale-up last (depends on predecessors).
 

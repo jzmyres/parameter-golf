@@ -77,13 +77,13 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | num_layers | 12 |
-| model_dim | 1024 (iter 98: 768 → 1024 under iter 96 LoRA layout. d_head naturally 96 → 128 = FA tensorcore sweet spot. Per-expert linear cost scales linearly in D; first D=1024 test under the LoRA-style baseline since iter 91+92's bottleneck-D variant was NOT PROMOTED.) |
+| model_dim | 768 (iter 96 baseline. Iter 98 D=1024 attempt NOT TESTED on dev hardware — 3× OOM at 44 GiB cap; deferred to 8× H100 submission hardware. See H73.) |
 | num_heads | 8 |
 | num_kv_heads | 4 |
 | num_experts | 16 (iter 96 baseline H71; iter 97 E=20 attempt NOT PROMOTED on per-wallclock grounds, see H72 — E-scaling past 16 closed) |
 | num_shared_experts | 1 (DeepSeek shared expert, always-on with sigmoid gate) |
 | mlp_mult | 3.0 (hidden = 768 × 3 / num_experts via low-rank experts) |
-| train_seq_len | 1024 (iter 98: 2048 → 1024 to fit D=1024 in 44 GiB/rank dev hardware. Same total tokens per step (524K = 512 sequences). Document deviation; if iter 98 promotes, seq=1024 cap stays.) |
+| train_seq_len | 2048 |
 | train_batch_tokens | 524,288 |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
@@ -121,7 +121,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
-| deq_k_jitter_set | (8, 12, 16) (iter 98: K_max 20 → 16 for D=1024 fit; preserves bulk of iter 87 K-sweep tightening) |
+| deq_k_jitter_set | (8, 12, 20) (DEQ iteration counts sampled per step; iter 87) |
 | lyapunov_coef | 0.0 (iter 88: λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
 | lyapunov_gamma | 0.97 (target spectral radius threshold) |
 | lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |

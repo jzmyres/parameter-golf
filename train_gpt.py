@@ -161,7 +161,7 @@ class Hyperparameters:
     warmdown_frac = 0.72  # fraction of total steps for warmdown
     warmup_steps = 0
     train_batch_tokens = 524_288
-    train_seq_len = 1024  # iter 98 (2026-04-26): 2048 → 1024 to fit D=1024 in 44 GiB/rank L40S budget. Activation memory ∝ D·T·L, halving T halves the per-step VRAM. Same total tokens per step (524K = 512 sequences × 1024). Document deviation: iter 98 sees half the per-sequence context of iter 96; if iter 98 promotes, the seq=1024 cap is part of the new D=1024 baseline.
+    train_seq_len = 2048
     max_wallclock_seconds = 0  # 0 = disabled; step-count governs default runs. Submission runs MUST pass --max-wallclock-seconds=600 (8xH100 competition hard cap).
 
     # Model architecture
@@ -170,7 +170,7 @@ class Hyperparameters:
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
-    model_dim = 1024  # iter 98: 768 → 1024 — orthogonal axis to iter 96 E-scaling. d_head naturally 96 → 128 (FA tensorcore sweet-spot upgrade). Per-expert linear cost scales linearly in D; LoRA layout (R=64/96 fixed) absorbs the D bump without bottleneck-style penalties (H69/H70 closed). Old comment "768 > 896 > 1024" was from the iter-66b-era sweep BEFORE iter 96's "more, smaller experts" win — now that we have R=64 with 16 experts, D=1024 may pay off.
+    model_dim = 768  # iter 96 baseline. Iter 98 attempted 768 → 1024 but OOM'd 3× on 44 GiB L40S dev hardware (D=1024 + DEQ TBPTT exceeds VRAM cap regardless of seq/K reductions). Documented as NOT TESTED in H73; D-scaling deferred until 8× H100 80GB submission hardware (won't OOM there).
     num_heads = 8
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
@@ -291,9 +291,9 @@ class Hyperparameters:
     # the new architecture stabilizes val_bpb.
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 16  # iter 98 (2026-04-26): 20 → 16 to fit D=1024 RevDEQ backward in 44 GiB/rank L40S budget. iter 87 had bumped 16 → 20; iter 98 reduces to fit D-scaling. Still > iter 86's deq_k_max=16 baseline.
+    deq_k_max = 20  # iter 87 (2026-04-24): bumped 16 → 20 to accommodate widened deq_k_jitter_set (8,12,20).
     deq_k_step = 4
-    deq_k_jitter_set = (8, 12, 16)  # iter 98 (2026-04-26): K_max 20 → 16 for D=1024 fit. Still wider than iter 87 baseline {4,6,10}; preserves bulk of H66's K-sweep tightening.
+    deq_k_jitter_set = (8, 12, 20)  # iter 87 (2026-04-24): doubled from (4,6,10) — deeper FP at training time should tighten K-sweep.
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
