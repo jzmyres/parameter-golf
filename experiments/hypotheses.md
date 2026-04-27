@@ -1171,6 +1171,56 @@ The val_bpb gap is **roughly constant at +0.12-0.16** from step 200 onwards — 
 
 **Related:** H32 (DEQ smoothness preservation — sparsemax piecewise smooth, RevDEQ-safe ✓ as designed), iter 96 H71 (working softmax baseline), iter 101 (α=1.5 entmax, the principled next step), iter 99b shelved.
 
+### H75: α=1.5 entmax routing — NOT PROMOTED ✗ (architectural-sparsity capacity gap +0.10; 2026-04-27)
+
+**Claim:** α=1.5 entmax (Peters, Niculae & Martins 2019) is the principled middle ground between softmax (α=1, iter 96, no sparsity) and sparsemax (α=2, iter 99, top-1 trap). At α=1.5, weights are typically all positive but peakier, with possibly some exact zeros — preserving gradient flow through low-weight experts to avoid iter 99's monotonic collapse, while still creating architectural sparsity for implicit regularization.
+
+**Test:** iter 101 — `Hyperparameters.router_kind = "entmax15"` on iter 96 baseline. Closed-form α-entmax via 30-iter bisection over the threshold τ. Commit `caf8a0d`. 1000 steps on 2× L40S, 7.1 hours wallclock.
+
+**Result:** ❌ NOT PROMOTED — but VINDICATES the middle-ground hypothesis structurally; just doesn't beat softmax on val_bpb.
+
+| Metric | iter 96 | iter 99 (sparsemax) | iter 101 (entmax-1.5) | Δ vs iter 96 |
+|---|---|---|---|---|
+| val_bpb int6 | 1.4903 | 1.6494 | **1.5873** | +0.0970 (vs +0.159 sparsemax) |
+| val_bpb fp32 step 1000 | 1.4603 | 1.6032 | 1.5449 | +0.085 |
+| step_avg | 23.4 s | 23.4 s | ~24-25 s | +5-7% (bisection overhead) |
+| Peak VRAM | 35.7 GiB | 35.7 GiB | 35.7 GiB | unchanged ✓ |
+| Artifact | 7.55 MB | 7.66 MB | 7.58 MB | identical ✓ |
+| **attn_entropy step 1000** | **~3.0** (uniform) | **0.009** (top-1 trap) | **1.94** (≈7 effective experts/token, sweet spot ★) | as designed |
+
+**Trajectory — gap closes during training (entmax-1.5 SELF-CORRECTS where sparsemax CAN'T):**
+
+| Step | iter 101 val | iter 99 val | iter 101 attn_entropy | Note |
+|---|---|---|---|---|
+| 70 | (no val) | (no val) | 0.20 | initial collapse |
+| 200 | 2.0523 | 2.0743 | 0.28 | collapsed start |
+| 400 | 1.7715 | 1.7809 | 0.69 | recovery begins |
+| 600 | 1.6233 | 1.6675 | 1.31 | back in sweet spot |
+| 800 | 1.5665 | 1.6144 | 1.73 | gap narrowing |
+| 1000 fp32 | 1.5449 | 1.6032 | 1.94 | architectural sparsity stable |
+
+**Critical observations:**
+1. **Self-correction works**: attn_entropy went 0.20 (collapsed) → 0.69 → 1.31 → 1.73 → 1.94. Iter 99 monotonically collapsed; iter 101 RE-DIVERSIFIED routing as the model learned. This is the principled difference α=1.5 vs α=2 was supposed to deliver, and it did.
+2. **Val_bpb gap stabilizes around +0.08** late in training (iter 99 stabilized at +0.12-0.16). α=1.5 has roughly half the capacity penalty of sparsemax — but still NOT enough to promote at the 0.03 gate.
+3. **Train-loss gap (~+25%) >> val-loss gap (~+6%)**: same implicit-regularization signature as iter 99. Sparsemax/entmax act as REGULARIZERS — improve generalization gap, hurt absolute fit.
+4. **K-sweep crashed at Hutchinson probe AGAIN** — `RuntimeError: Invalid backend` in SDPA under `enable_grad`. Bug in iter 97.6's helper. Fixed in same commit as this H75: wrap Hutchinson + finite-diff probes in try/except so K-sweep never crashes on a diagnostic.
+
+**Why it doesn't promote:**
+- α=1.5 buffer reduces but doesn't eliminate the architectural-sparsity capacity penalty.
+- The +0.08 final regression is real and ≫ the 0.03 promotion gate.
+- Even with ~7 effective experts/token (vs sparsemax's 1), the model still doesn't fit training data as well as full softmax (α=1).
+- The implicit-regularization benefit is small relative to the lost expressive capacity.
+
+**Implications for queue:**
+- **Architectural sparsity (any α∈{1.5, 2}) does NOT win on val_bpb at this codebase's scale.** Both α=1.5 and α=2 attempted; both NOT PROMOTED. Could test α=1.2 or α=1.3 (closer to softmax) but expected gain is marginal.
+- **Loss-side proxy (iter 100 entropy penalty) is now the principled next test** — different mechanism (penalty added to softmax, not architectural change). Doesn't pay capacity cost. May get the regularization benefit without losing the softmax fit.
+- **iter 99b (sparse expert dispatch) and iter 101b are CANCELLED** — depended on architectural sparsity promoting, which it didn't.
+- **Bigger lesson**: the H72 (E=20 saturation) + H74 (sparsemax) + H75 (entmax-1.5) trio collectively suggest iter 96's softmax + LoRA routing IS near-optimal for THIS codebase at 2× L40S budget. Further val_bpb gains likely require ORTHOGONAL axes (D-scaling on submission hardware, chained routing, attention-side sparsity via AdaSplash, or different optimizer) — not more routing-mechanism variants.
+
+**Pivot**: skip α=1.2/1.3 follow-ups (diminishing returns on closed direction). Run iter 100 (entropy penalty + softmax) to test loss-side proxy, then iter 103 (chained routing) for the orthogonal architectural axis. Iter 95 (TBPTT efficiency sweep) and iter 97.7 (profile-driven throughput) remain as broader optimizations.
+
+**Related:** H32 (DEQ smoothness — entmax-1.5 piecewise smooth, RevDEQ-safe ✓ as designed; iter 101 confirmed by stable training), H74 (sparsemax direct comparison), iter 96 H71 (the softmax baseline this couldn't beat), iter 100 (next test, loss-side mechanism).
+
 ---
 
 ## Completed Iterations

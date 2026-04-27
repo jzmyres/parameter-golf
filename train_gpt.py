@@ -237,7 +237,7 @@ class Hyperparameters:
     # driving per-token specialization architecturally rather than via loss
     # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
     # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
-    router_kind = "entmax15"  # iter 101 (2026-04-27): α=1.5 entmax — principled middle ground after iter 99 sparsemax (α=2) NOT PROMOTED with +0.16 capacity cost (H74). Mild sparsity preserves gradient flow through low-weight experts → router can still learn to diversify. Options: "softmax" (iter 96), "sparsemax" (iter 99 NOT PROMOTED), "entmax15" (iter 101).
+    router_kind = "softmax"  # iter 96 baseline. Iter 99 (sparsemax α=2) NOT PROMOTED H74 (+0.16). Iter 101 (entmax-1.5) NOT PROMOTED H75 (+0.10). Both architectural-sparsity attempts had capacity cost > regularization gain. Reverted to softmax. Options: "softmax", "sparsemax", "entmax15".
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
@@ -4290,35 +4290,54 @@ def main() -> None:
         b_bar_d = b_bar.detach().to(target_dtype) if b_bar is not None else None
 
         # Hutchinson-Frobenius probe (multiple samples for variance reduction).
-        rho_F_samples: list[float] = []
-        for _ in range(n_hutch):
-            v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
-                               dtype=z_star.dtype) * 2.0 - 1.0)
-            z_b = z_star.detach().clone().requires_grad_(True)
-            with torch.enable_grad():
-                u_b = sb(z_b, x0_lyap, b_bar_d)
-                jvp = torch.autograd.grad(
-                    (u_b * v).sum(), z_b,
-                    create_graph=False, retain_graph=False,
-                )[0]
-            rho_F_samples.append(
-                float(jvp.detach().float().pow(2).mean().sqrt().item()))
-        rho_F = sum(rho_F_samples) / max(len(rho_F_samples), 1)
+        # Wrapped in try/except: SDPA backend selection differs under
+        # `enable_grad` at eval time and can fail with `Invalid backend`
+        # depending on dtype/scaled-dot-product-attention kernel paths.
+        # If the probe fails for any reason, skip it (rho_F=None) and let
+        # the cheaper finite-direction probe still report — the K-sweep
+        # must not be allowed to crash on a diagnostic.
+        rho_F: float | None = None
+        try:
+            rho_F_samples: list[float] = []
+            for _ in range(n_hutch):
+                v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
+                                   dtype=z_star.dtype) * 2.0 - 1.0)
+                z_b = z_star.detach().clone().requires_grad_(True)
+                with torch.enable_grad():
+                    u_b = sb(z_b, x0_lyap, b_bar_d)
+                    jvp = torch.autograd.grad(
+                        (u_b * v).sum(), z_b,
+                        create_graph=False, retain_graph=False,
+                    )[0]
+                rho_F_samples.append(
+                    float(jvp.detach().float().pow(2).mean().sqrt().item()))
+            if rho_F_samples:
+                rho_F = sum(rho_F_samples) / len(rho_F_samples)
+        except Exception:
+            rho_F = None  # Hutchinson unavailable; finite-diff still runs.
 
-        # Finite-direction random-step Lipschitz sample.
-        rho_op_samples: list[float] = []
-        with torch.no_grad():
-            u_base = sb(z_star, x0_lyap, b_bar_d)
-            for _ in range(n_finite_diff):
-                eps_dir = torch.randn_like(z_star)
-                eps_norm = eps_dir.float().norm()
-                if float(eps_norm.item()) < 1e-8:
-                    continue
-                eps_unit = eps_dir / eps_norm
-                u_pert = sb(z_star + eps_step * eps_unit, x0_lyap, b_bar_d)
-                rho_op_samples.append(
-                    float((u_pert - u_base).float().norm().item()) / eps_step)
-        rho_op = max(rho_op_samples) if rho_op_samples else None
+        # Finite-direction random-step Lipschitz sample. Also wrapped in
+        # try/except — same SDPA-backend risk as Hutchinson but under
+        # no_grad which usually avoids it. Defensive: never crash the
+        # K-sweep on a diagnostic.
+        rho_op: float | None = None
+        try:
+            rho_op_samples: list[float] = []
+            with torch.no_grad():
+                u_base = sb(z_star, x0_lyap, b_bar_d)
+                for _ in range(n_finite_diff):
+                    eps_dir = torch.randn_like(z_star)
+                    eps_norm = eps_dir.float().norm()
+                    if float(eps_norm.item()) < 1e-8:
+                        continue
+                    eps_unit = eps_dir / eps_norm
+                    u_pert = sb(z_star + eps_step * eps_unit, x0_lyap, b_bar_d)
+                    rho_op_samples.append(
+                        float((u_pert - u_base).float().norm().item()) / eps_step)
+            if rho_op_samples:
+                rho_op = max(rho_op_samples)
+        except Exception:
+            rho_op = None
         return rho_F, rho_op
 
     # DEQ fixed-point K-sweep: verify val_bpb improves (or plateaus) as K grows.
