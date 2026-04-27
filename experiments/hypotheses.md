@@ -1036,6 +1036,56 @@ Therefore any val_bpb regression iter 66b → iter 74b is an **optimizer-landsca
 
 **Related:** H43 (low-rank experts — earlier attempt, proven viable here), H44 (bottleneck experts — failed alternative, see H69/H70), H47 (scale to E=16-32 — this iter validates the axis).
 
+### H72: More-experts axis saturates past E=16 / R=64 on D=768 (iter 97 E=20, R=51/77) — TESTED ✗ NOT PROMOTED (2026-04-26)
+
+**Claim:** The "more, smaller experts" axis validated by iter 96 (H71) extends linearly past E=16. Continuing the same iso-cost trade — E 16→20, attn_expert_rank 64→51, mlp_expert_rank 96→77 (E·R held constant on Q/MLP linears) — should yield further val_bpb improvement at proportional throughput cost.
+
+**Test:** iter 97 — `num_experts=20, attn_expert_rank=51, mlp_expert_rank=77` on the iter 96 baseline. All other knobs unchanged. Commit `acce3d4`. (Originally targeted E=24/R=42; OOM on 2× L40S at backward (44 GiB cap); fell back to E=20 with `PYTORCH_ALLOC_CONF=expandable_segments:True`.) 1000 steps, ~8.6 hours wallclock at step_avg=28-31s.
+
+**Result:** ❌ **NOT PROMOTED** — the axis has saturated. Even though val_bpb is within the 0.03 carry-forward gate, **per-wallclock val_bpb regresses** by ~19%, and the projected submission-run gap (600s cap) widens.
+
+| Metric | iter 96 baseline | iter 97 | Δ |
+|---|---|---|---|
+| val_bpb (int6, fast eval K=16) | 1.4903 | **1.5036** | **+0.0133** (within 0.03 ✓ but regression) |
+| val_bpb (fp32 step 1000) | 1.4603 | 1.4672 | +0.007 |
+| K=4 / K=8 / K=16 / K=32 / K=64 / K=128 | 1.723 / 1.498 / **1.490** / 1.492 / 1.492 / 1.492 | 1.756 / 1.510 / **1.504** / 1.505 / 1.505 / *pending* | K=16 best-K both, +0.013 across deep K |
+| K=128 vs best-K Δ | +0.0016 | ~+0.002 | tighter both, well within 0.5 gate ✓ |
+| Params | 13.95 M | 15.62 M | +12% |
+| step_avg | 23.4 s | 28-31 s | **+22-32%** ✗ |
+| Peak VRAM | 35.7 GiB | 42.75 GiB | +20% (near OOM cliff) |
+| Artifact | 7.55 MB | 8.42 MB | +12% (still 53% of budget) |
+| **bpb / wallclock-hour** | 0.229 | 0.186 | **−19%** ✗ |
+| **Submission run @ 600s** | ~25 steps | ~20 steps | -5 steps × no val_bpb gain ✗ |
+
+**Trajectory** (the smoking gun for saturation):
+
+| Step | iter 97 val_bpb | iter 96 val_bpb | Δ |
+|---|---|---|---|
+| 200 | 1.9744 | 1.9884 | **−0.014** (capacity premium) |
+| 400 | 1.6463 | 1.6564 | **−0.010** (still leading) |
+| 600 | 1.5406 | 1.5433 | −0.003 (gap closing) |
+| 800 | 1.5008 | 1.4935 | **+0.0073** (gap reverses!) |
+| 1000 (final int6) | 1.5036 | 1.4903 | **+0.0133** (regression confirmed) |
+
+The axis's win is front-loaded: extra experts deliver capacity early when each expert is undertrained, but the rank-halving (R=64→51) trades per-token expressivity faster than routing diversity compensates as training matures. By step 800 the rank cost dominates the diversity gain.
+
+**Why E=16 / R=64 is approximately Pareto-optimal on this codebase:**
+1. **Rank floor**: each expert sees a `R`-dim subspace of D=768. Below R≈64, per-expert representational capacity drops faster than soft-dense routing diversity gains can compensate.
+2. **Router fan-out cost**: the routing softmax over 38 outputs (= 2 × 19 routed components) at iter 97 mechanically smears the per-token distribution — even with `min_share_loss_weight=10.0` keeping experts alive, signal-to-noise on "best expert per token" drops with more candidates.
+3. **`min_share` vs specialization tension**: with E=20, the constraint pulls toward uniform-ish utilization, fighting the specialization that would otherwise differentiate the experts. iter 99 (sparsemax) is the principled fix for this — exact zeros let the router specialize without violating the global balance.
+
+**Override of the carry-forward auto-promote rule**: the 0.03 gate is val_bpb-primary by default, so iter 97 would auto-promote on val_bpb alone. Per user directive 2026-04-26, the per-wallclock regression overrides for this iter — the submission run (600s cap) is what the metric ultimately serves, and iter 97 strictly regresses at that scope. **Documented as override, not protocol change** — the carry-forward rule remains val_bpb-primary; this is a one-off override on per-wallclock grounds.
+
+**Implications for queue:**
+- **Stop scaling E along this axis.** Further attempts (E=24, E=32) would saturate harder. iter 97 closes the rank-halving subdirection of Group F.
+- **Pivot to orthogonal axes**:
+  - **iter 98 (D=768→1024)** — different axis, each expert linear scales linearly in D, d_head bumps to 128 (FA tensorcore sweet-spot upgrade). Expected to pay better than more E.
+  - **iter 99 (sparsemax)** — dissolves the `min_share` vs specialization tension by letting routing produce exact zeros, may unlock effectively-larger E by allowing peakier per-token distributions.
+- **Retain iter 96 as baseline.** Config reverted at the same commit as this H72 entry.
+- **Inference-time top-k** (conditional iter 102) could still test "iter 97-style E with sparsemax masking off the bottom experts at inference" — captures the routing-diversity gain with deployment-side sparsity. Logged for later.
+
+**Related:** H43 (low-rank experts), H47 (scale E=16-32 — this iter shows the upper boundary), H71 (the iter 96 PROMOTION that opened this axis), iter 99 sparsemax (next attack on the same problem from a different angle).
+
 ---
 
 ## Completed Iterations
@@ -1292,7 +1342,7 @@ failure.
 
 ### Next up — recommended ordering after iter 89
 
-**Current baseline:** iter 96 (`b962b5f`, val_bpb int6 = 1.4903) — last promoted iter; "more, smaller experts" (`num_experts 8→16, attn_expert_rank 128→64, mlp_expert_rank 192→96`) on top of iter 89's full-D LoRA-style baseline. Improvement of −0.0361 vs iter 89, K=128-vs-best-K Δ=+0.0016, artifact 7.55 MB (47% of 16 MB budget). H71 documents the result. Groups A-D are now closed (Groups A-C all PROMOTED ★ except iter 83 reverted; Group D bottleneck → NOT PROMOTED, code reverted, archive at tag `iter-91+92-bottleneck-NOT-PROMOTED`). Group F (LoRA-rank/E joint scaling) is the active scaling direction, opened by iter 96. Active queue (in order): **Group F** (iter 97 = E=20 IN FLIGHT, iter 98 = D=1024, iter 99 = per-token entropy logging+penalty, iter 100 conditional sweep) → **Group E** (iter 95 TBPTT sweep + Lipschitz probe). See §"Group F" below for current details on the entropy distinction and the per-token specialization mechanism in iter 99.
+**Current baseline:** iter 96 (`b962b5f`, val_bpb int6 = 1.4903) — last promoted iter; "more, smaller experts" (`num_experts 8→16, attn_expert_rank 128→64, mlp_expert_rank 192→96`) on top of iter 89's full-D LoRA-style baseline. Improvement of −0.0361 vs iter 89, K=128-vs-best-K Δ=+0.0016, artifact 7.55 MB (47% of 16 MB budget). H71 documents the result. Groups A-D are now closed (Groups A-C all PROMOTED ★ except iter 83 reverted; Group D bottleneck → NOT PROMOTED, code reverted, archive at tag `iter-91+92-bottleneck-NOT-PROMOTED`). Group F (LoRA-rank/E joint scaling) is the active scaling direction, opened by iter 96. **Iter 97 (E=20 continuation) NOT PROMOTED on per-wallclock grounds — H72 closes the rank-halving subdirection past E=16.** Active queue (in order): **iter 97.5** (throughput-only profile-driven fix, 30-min validation) → **iter 98** (D=768→1024, orthogonal axis) → **iter 99** (sparsemax architectural sparsity + per-token entropy logging) → **iter 100** (conditional entropy penalty stack on sparsemax) → **Lipschitz + acyclicity-prime probe** (diagnostic, eval-harness only) → **Group E** (iter 95 TBPTT sweep). E-scaling past 16 is closed (do not test E=24, E=32).
 
 Run ordering rationale (preserved for posterity): low-risk → higher-risk, activation / gate / schedule tweaks before legacy-loss ablations, architectural scale-up last (depends on predecessors).
 
@@ -1349,7 +1399,7 @@ The "more, smaller experts" axis: hold `E·R` constant on Q/MLP linears (preserv
 
 | New # | One-line | Status |
 |---|---|---|
-| **97** | E=20 (was 24, OOM on 2× L40S — fell back), `attn_expert_rank=51, mlp_expert_rank=77` (iso-cost on linears: 16·64=1024 → 20·51=1020). Continuation of the iter 96 axis. | **IN FLIGHT (commit `acce3d4`)** — relaunched with `PYTORCH_ALLOC_CONF=expandable_segments:True` after E=24 hit OOM at backward (43.6 GiB → +2.25 GiB > 44.4 GiB cap). E=20 fits with ~3 GiB headroom. step_avg=28.6 s/step (vs iter 96 23.4s, +22%), 1000 steps ~8h wallclock. Trajectory shows iter 97 leading at step 200/400/600 (-0.014/-0.010/-0.003 vs iter 96) but **falling behind at step 800 (+0.0073 vs iter 96)** — capacity premium decaying late in training as routing equilibration cost outweighs extra-expert capacity. Final outcome pending step 1000 + K-sweep + int6. May not promote against the very tight 0.03 gate vs iter 96. |
+| **97** | E=20 (was 24, OOM on 2× L40S — fell back), `attn_expert_rank=51, mlp_expert_rank=77` (iso-cost on linears: 16·64=1024 → 20·51=1020). Continuation of the iter 96 axis. | **NOT PROMOTED ✗ (commit `acce3d4`, reverted; H72)** — int6 Δ +0.0133 vs iter 96 (within 0.03 carry-forward gate), but **per-wallclock regresses 19% (bpb/h 0.229 → 0.186)** and submission @ 600s drops 5 steps. Per-wallclock override applied per user directive 2026-04-26. Trajectory inverted (-0.014 step 200 → +0.0133 step 1000) — capacity gain front-loaded, rank cost dominates late. K-sweep tightened (K=128 vs best-K Δ ~+0.002). E=16/R=64 is Pareto-optimal on D=768; further E-scaling along this axis is closed. Pivot to iter 98 (D scaling) and iter 99 (sparsemax). |
 | **98** | `model_dim 768 → 1024` under iter 96/97 LoRA layout | **PENDING** — D scaling on top of the validated more-smaller-experts axis (no bottleneck involved). d_head naturally goes 96 → 128 (FA tensorcore sweet spot). Per-expert linear cost scales linearly in D (D·R + R·H·d_head ≈ 2·D·R). Budget check required: artifact must stay ≤ 16 MB after int6 + zstd-22. iter 96 used 47% of budget (7.55 MB) so significant headroom. Runs on whichever of iter 96/97 is the latest promoted baseline. |
 | **99** | Per-token entropy logging + penalty (`entropy_coef = 0.02`) | **PENDING** — drives per-token routing specialization. Two distinct entropies are tracked separately (per CLAUDE.md §6.2): `expert_entropy` (global utilization, target HIGH ≈ log(N) — no dead experts) vs new `pertoken_entropy` (per-token routing distribution, target LOW — concentration on few experts per token). Single bundled change: (a) add per-token entropy logging in `SoftDenseRouter.forward` as `H_pertoken = -(w * log(w+eps)).sum(-1).mean()`; (b) add penalty `loss += entropy_coef * H_pertoken.mean()` with `entropy_coef = 0.02`. The `min_share_loss_weight=10.0` stays as anti-collapse guard for global balance (different aggregation, compatible objective). Logging alone is insufficient — observation does not change the loss landscape; the penalty is what creates the specialization gradient. Watch DEQ FP convergence: sharper softmax may make T_θ less smooth and hurt iter_conv_rel; if so, drop entropy_coef or pair with τ>1 in iter 100. |
 | **100 (conditional)** | Sweep `λ_entropy ∈ {0.01, 0.05, 0.1}` × softmax temperature `τ ∈ {1.0, 1.5}` | **PENDING (only if iter 99 promotes)** — joint sweep of the per-token specialization knobs. τ alone is borderline (optimizer can compensate via flatter logits); pairing τ with λ_entropy is the principled combination for true per-token sparsity without hard top-k masking. |
