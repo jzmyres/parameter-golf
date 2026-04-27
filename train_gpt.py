@@ -238,14 +238,24 @@ class Hyperparameters:
     # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
     # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
     router_kind = "softmax"  # iter 96 baseline. Iter 99 (sparsemax α=2) NOT PROMOTED H74 (+0.16). Iter 101 (entmax-1.5) NOT PROMOTED H75 (+0.10). Both architectural-sparsity attempts had capacity cost > regularization gain. Reverted to softmax. Options: "softmax", "sparsemax", "entmax15".
-    # iter 100 (2026-04-27): per-token entropy penalty on softmax. Loss-side
-    # specialization mechanism — adds `entropy_coef * H_pertoken` to loss.
-    # Drives router to concentrate weight per-token without changing softmax's
-    # full-support property → preserves capacity (vs iter 99/101 architectural
-    # sparsity, both NOT PROMOTED). Disabled (=0.0) by default; iter 100 sets
-    # to 0.02. Compatible with router_kind=softmax. Stacks gracefully with
-    # entmax/sparsemax variants if both desired in future.
-    router_entropy_coef = 0.02
+    # iter 100b (2026-04-27): per-token entropy penalty with ANNEALED schedule
+    # + min_share_loss decoupled. iter 100 (entropy_coef=0.02 from step 0)
+    # hit train_loss instability — penalty fights min_share_loss penalty
+    # (one pushes uniform, other pushes peaky). Decouple them:
+    #   1. Lower coef target: 0.02 → 0.005 (4× weaker)
+    #   2. Anneal from 0 over first warmup_frac of training (cold-start trap
+    #      avoidance, same principle as α-annealing for iter 102).
+    #   3. Drop min_share_loss penalty; keep min_share as DIAGNOSTIC metric only.
+    # CV loss alone provides global-balance regularization; entropy penalty
+    # alone provides per-token sparsity push. Two forces pulling in same-axis
+    # not opposite. Cleaner gradient landscape.
+    router_entropy_coef = 0.005
+    # Annealing schedule (iter 100b): scale = 0 for time_frac < warmup_delay_frac,
+    # then linear ramp 0 → 1 over remaining training. Final effective coef =
+    # router_entropy_coef × scale. Avoids cold-start trap (router needs free
+    # softmax exploration early; sparsity pressure ramps in once routing has
+    # stabilized).
+    router_entropy_warmup_delay_frac = 0.3
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
@@ -2136,7 +2146,10 @@ class Block(nn.Module):
                 nn.init.zeros_(g.weight)
                 nn.init.constant_(g.bias, 1.0)  # init near-open (matches pre-iter-84)
         # Router only covers routed experts (not shared).
-        self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=10.0,
+        # iter 100b (2026-04-27): drop min_share_loss penalty (was 10.0).
+        # min_share remains in diagnostics; CV loss alone provides global
+        # balance regularization. Decouples from entropy-penalty axis.
+        self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=0.0,
                                       cv_loss_weight=2.0, scoring=router_scoring,
                                       health_slices=(num_routed, num_routed),
                                       router_kind=router_kind,
@@ -2615,6 +2628,7 @@ class GPT(nn.Module):
                  router_scoring: str = "linear",
                  router_kind: str = "softmax",
                  router_entropy_coef: float = 0.0,
+                 router_entropy_warmup_delay_frac: float = 0.0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -2628,6 +2642,11 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.num_layers = num_layers
         self.num_refinements = num_refinements
+        # iter 100b: store entropy-coef target + warmup-delay for the
+        # training-loop annealing hook to read. Router's entropy_coef is set
+        # dynamically per-step via these values.
+        self._router_entropy_coef_target = float(router_entropy_coef)
+        self._router_entropy_warmup_delay_frac = float(router_entropy_warmup_delay_frac)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -3648,6 +3667,7 @@ def main() -> None:
         router_scoring=args.router_scoring,
         router_kind=getattr(args, "router_kind", "softmax"),
         router_entropy_coef=float(getattr(args, "router_entropy_coef", 0.0)),
+        router_entropy_warmup_delay_frac=float(getattr(args, "router_entropy_warmup_delay_frac", 0.0)),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
@@ -3958,6 +3978,17 @@ def main() -> None:
         # Compile-wrapper-safe: always write through unwrapped module.
         sb = _unwrap_compiled_module(base_model.shared_block)
         sb.router.health_scale = float(health_scale)
+        # iter 100b: anneal entropy_coef. scale = 0 for time_frac<delay,
+        # then linear ramp 0 → 1 over remaining training. Final coef
+        # = target × scale. Avoids cold-start trap that hurt iter 99/100.
+        ent_target = float(getattr(base_model, "_router_entropy_coef_target", 0.0))
+        ent_delay = float(getattr(base_model, "_router_entropy_warmup_delay_frac", 0.0))
+        if ent_target > 0.0:
+            if time_frac < ent_delay:
+                ent_scale = 0.0
+            else:
+                ent_scale = min(max((time_frac - ent_delay) / max(1.0 - ent_delay, 1e-8), 0.0), 1.0)
+            sb.router.entropy_coef = ent_target * ent_scale
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
