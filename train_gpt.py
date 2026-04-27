@@ -238,6 +238,14 @@ class Hyperparameters:
     # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
     # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
     router_kind = "softmax"  # iter 96 baseline. Iter 99 (sparsemax α=2) NOT PROMOTED H74 (+0.16). Iter 101 (entmax-1.5) NOT PROMOTED H75 (+0.10). Both architectural-sparsity attempts had capacity cost > regularization gain. Reverted to softmax. Options: "softmax", "sparsemax", "entmax15".
+    # iter 100 (2026-04-27): per-token entropy penalty on softmax. Loss-side
+    # specialization mechanism — adds `entropy_coef * H_pertoken` to loss.
+    # Drives router to concentrate weight per-token without changing softmax's
+    # full-support property → preserves capacity (vs iter 99/101 architectural
+    # sparsity, both NOT PROMOTED). Disabled (=0.0) by default; iter 100 sets
+    # to 0.02. Compatible with router_kind=softmax. Stacks gracefully with
+    # entmax/sparsemax variants if both desired in future.
+    router_entropy_coef = 0.02
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
@@ -1199,7 +1207,8 @@ class SoftDenseRouter(nn.Module):
                  min_share_frac: float = 0.6, cv_target: float = 0.20,
                  min_share_loss_weight: float = 1.0, cv_loss_weight: float = 0.10,
                  scoring: str = "linear", health_slices: tuple[int, ...] | None = None,
-                 router_kind: str = "softmax"):
+                 router_kind: str = "softmax",
+                 entropy_coef: float = 0.0):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
@@ -1207,7 +1216,8 @@ class SoftDenseRouter(nn.Module):
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
-        self.router_kind = str(router_kind)  # iter 99: "softmax" | "sparsemax"
+        self.router_kind = str(router_kind)  # iter 99: "softmax" | "sparsemax" | "entmax15"
+        self.entropy_coef = float(entropy_coef)  # iter 100: per-token entropy penalty coef
         assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
         self.health_slices = tuple(int(v) for v in (health_slices or (num_experts,)))
         if sum(self.health_slices) != int(num_experts) or any(v <= 0 for v in self.health_slices):
@@ -1399,6 +1409,19 @@ class SoftDenseRouter(nn.Module):
                 float(self.min_share_loss_weight) * hs * min_share_loss
                 + float(self.cv_loss_weight) * hs * cv_loss
             )
+            # iter 100 (2026-04-27): per-token entropy penalty on routing.
+            # Drives per-token sparsity (peakier softmax) without architectural
+            # capacity cost (vs iter 99/101 NOT PROMOTED). Renormalize routing
+            # weights per-token so the entropy is measured over a probability
+            # distribution (sum=1); softmax already does this, but sigmoid gate
+            # makes raw `p` sum to ≤1, so renormalize before entropy compute.
+            if float(self.entropy_coef) > 0.0:
+                p_norm = p.float() / p.float().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                # H_pertoken = -Σ_e w(e|t) log w(e|t), averaged over tokens.
+                pertoken_ent = -(p_norm * (p_norm + 1e-8).log()).sum(dim=-1).mean()
+                self._pertoken_entropy_loss = float(self.entropy_coef) * pertoken_ent
+            else:
+                self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = mean_share.detach()
             with torch.no_grad():
                 if _should_diag(self.training):
@@ -1411,6 +1434,7 @@ class SoftDenseRouter(nn.Module):
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._health_loss = torch.tensor(0.0, device=x.device)
+            self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = None
             with torch.no_grad():
                 if _should_diag(self.training):
@@ -2080,7 +2104,8 @@ class Block(nn.Module):
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  router_scoring: str = "linear",
-                 router_kind: str = "softmax", **kwargs):
+                 router_kind: str = "softmax",
+                 router_entropy_coef: float = 0.0, **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
         # State preconditioner is parameter-free RMSUnit; every projection-local
@@ -2114,7 +2139,8 @@ class Block(nn.Module):
         self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=10.0,
                                       cv_loss_weight=2.0, scoring=router_scoring,
                                       health_slices=(num_routed, num_routed),
-                                      router_kind=router_kind)
+                                      router_kind=router_kind,
+                                      entropy_coef=router_entropy_coef)
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -2588,6 +2614,7 @@ class GPT(nn.Module):
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
                  router_scoring: str = "linear",
                  router_kind: str = "softmax",
+                 router_entropy_coef: float = 0.0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -2614,6 +2641,7 @@ class GPT(nn.Module):
                                    num_shared_experts=self.num_shared_experts,
                                    router_scoring=router_scoring,
                                    router_kind=router_kind,
+                                   router_entropy_coef=router_entropy_coef,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
@@ -3017,6 +3045,10 @@ class GPT(nn.Module):
             r_health = getattr(r, "_health_loss", zero)
             bal = bal + float(router_weights.get(rid, 0.0)) * r_bal
             health = health + float(router_weights.get(rid, 0.0)) * r_health
+            # iter 100: per-token entropy penalty (drives sparsity loss-side).
+            # Folded into health so existing aggregation/scaling reuses.
+            r_ent = getattr(r, "_pertoken_entropy_loss", zero)
+            health = health + float(router_weights.get(rid, 0.0)) * r_ent
         # iter 26-lb-loss: mos_balance_mult (default 50) × bal_loss_coef downstream
         # (5e-3) → effective weight 0.25 on the MoS NTP balance loss — strong enough
         # to drive dead MoS experts back toward fair share.  WD cannot fix routing-
@@ -3615,6 +3647,7 @@ def main() -> None:
         num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
         router_kind=getattr(args, "router_kind", "softmax"),
+        router_entropy_coef=float(getattr(args, "router_entropy_coef", 0.0)),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
