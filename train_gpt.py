@@ -161,7 +161,7 @@ class Hyperparameters:
     warmdown_frac = 0.72  # fraction of total steps for warmdown
     warmup_steps = 0
     train_batch_tokens = 524_288
-    train_seq_len = 2048
+    train_seq_len = 1024  # iter 98 (2026-04-26): 2048 → 1024 to fit D=1024 in 44 GiB/rank L40S budget. Activation memory ∝ D·T·L, halving T halves the per-step VRAM. Same total tokens per step (524K = 512 sequences × 1024). Document deviation: iter 98 sees half the per-sequence context of iter 96; if iter 98 promotes, the seq=1024 cap is part of the new D=1024 baseline.
     max_wallclock_seconds = 0  # 0 = disabled; step-count governs default runs. Submission runs MUST pass --max-wallclock-seconds=600 (8xH100 competition hard cap).
 
     # Model architecture

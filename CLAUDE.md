@@ -83,7 +83,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | num_experts | 16 (iter 96 baseline H71; iter 97 E=20 attempt NOT PROMOTED on per-wallclock grounds, see H72 — E-scaling past 16 closed) |
 | num_shared_experts | 1 (DeepSeek shared expert, always-on with sigmoid gate) |
 | mlp_mult | 3.0 (hidden = 768 × 3 / num_experts via low-rank experts) |
-| train_seq_len | 2048 |
+| train_seq_len | 1024 (iter 98: 2048 → 1024 to fit D=1024 in 44 GiB/rank dev hardware. Same total tokens per step (524K = 512 sequences). Document deviation; if iter 98 promotes, seq=1024 cap stays.) |
 | train_batch_tokens | 524,288 |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
