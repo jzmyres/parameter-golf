@@ -170,7 +170,7 @@ class Hyperparameters:
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
-    model_dim = 768  # optimal: dim sweep showed 768 > 896 > 1024 (expert rank more valuable than shared attn width)
+    model_dim = 1024  # iter 98: 768 → 1024 — orthogonal axis to iter 96 E-scaling. d_head naturally 96 → 128 (FA tensorcore sweet-spot upgrade). Per-expert linear cost scales linearly in D; LoRA layout (R=64/96 fixed) absorbs the D bump without bottleneck-style penalties (H69/H70 closed). Old comment "768 > 896 > 1024" was from the iter-66b-era sweep BEFORE iter 96's "more, smaller experts" win — now that we have R=64 with 16 experts, D=1024 may pay off.
     num_heads = 8
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)

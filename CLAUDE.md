@@ -77,7 +77,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | num_layers | 12 |
-| model_dim | 768 |
+| model_dim | 1024 (iter 98: 768 → 1024 under iter 96 LoRA layout. d_head naturally 96 → 128 = FA tensorcore sweet spot. Per-expert linear cost scales linearly in D; first D=1024 test under the LoRA-style baseline since iter 91+92's bottleneck-D variant was NOT PROMOTED.) |
 | num_heads | 8 |
 | num_kv_heads | 4 |
 | num_experts | 16 (iter 96 baseline H71; iter 97 E=20 attempt NOT PROMOTED on per-wallclock grounds, see H72 — E-scaling past 16 closed) |
