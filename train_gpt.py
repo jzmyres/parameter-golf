@@ -231,6 +231,13 @@ class Hyperparameters:
     # (expert_iter_std≈0). Linear dot-product captures rotation → different expert
     # mixtures across iterations → effective depth > 1.
     router_scoring = "linear"
+    # iter 99 (2026-04-26): router output activation. "softmax" was the iter 96
+    # baseline; "sparsemax" replaces softmax with closed-form simplex projection
+    # (Martins & Astudillo 2016) — produces EXACT zeros for low-logit experts,
+    # driving per-token specialization architecturally rather than via loss
+    # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
+    # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
+    router_kind = "sparsemax"
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
@@ -1092,6 +1099,40 @@ class BigramHashEmbedding(nn.Module):
 # SOFT DENSE ROUTER
 # ---------------------------------------------------------------------------
 
+def sparsemax(logits: Tensor, dim: int = -1) -> Tensor:
+    """Sparsemax (Martins & Astudillo 2016) — closed-form simplex projection.
+
+    Outputs a probability vector that sums to 1 with EXACT zeros for
+    sufficiently low logits. Unlike softmax (always strictly positive),
+    sparsemax produces architectural sparsity per token without requiring
+    a loss-side penalty.
+
+    RevDEQ-safe: deterministic, 1-Lipschitz in ‖·‖₁→‖·‖∞, subdifferentiable
+    a.e. (gradient is the indicator that the entry is in the support set).
+
+    Args:
+        logits: Tensor of arbitrary shape with the simplex axis on `dim`.
+        dim: Axis to project over (default: last).
+    Returns:
+        Tensor of same shape; entries are in [0, 1], sum to 1 along `dim`,
+        with possibly many exact zeros.
+    """
+    z_sorted, _ = torch.sort(logits, dim=dim, descending=True)
+    K = logits.size(dim)
+    arange = torch.arange(1, K + 1, dtype=logits.dtype, device=logits.device)
+    arange_shape = [1] * logits.ndim
+    arange_shape[dim] = K
+    arange = arange.view(arange_shape)
+    z_cumsum = torch.cumsum(z_sorted, dim=dim)
+    # Support condition: 1 + k * z_sorted[k] > sum_{i<=k} z_sorted[i]
+    support = (1 + arange * z_sorted) > z_cumsum
+    k_z = support.long().sum(dim=dim, keepdim=True).clamp(min=1)
+    # Threshold tau = (sum of top-k - 1) / k
+    z_cumsum_at_k = z_cumsum.gather(dim, k_z - 1)
+    tau = (z_cumsum_at_k - 1) / k_z.to(logits.dtype)
+    return torch.clamp(logits - tau, min=0.0)
+
+
 class SoftDenseRouter(nn.Module):
     """Dense softmax routing over experts (no top-k, no dropping).
 
@@ -1109,7 +1150,8 @@ class SoftDenseRouter(nn.Module):
     def __init__(self, dim: int, num_experts: int, *,
                  min_share_frac: float = 0.6, cv_target: float = 0.20,
                  min_share_loss_weight: float = 1.0, cv_loss_weight: float = 0.10,
-                 scoring: str = "linear", health_slices: tuple[int, ...] | None = None):
+                 scoring: str = "linear", health_slices: tuple[int, ...] | None = None,
+                 router_kind: str = "softmax"):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
@@ -1117,6 +1159,7 @@ class SoftDenseRouter(nn.Module):
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
+        self.router_kind = str(router_kind)  # iter 99: "softmax" | "sparsemax"
         assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
         self.health_slices = tuple(int(v) for v in (health_slices or (num_experts,)))
         if sum(self.health_slices) != int(num_experts) or any(v <= 0 for v in self.health_slices):
@@ -1277,11 +1320,19 @@ class SoftDenseRouter(nn.Module):
         else:
             # Linear scoring (iter 30-33b baseline).
             route_logits = self.router(x_score) + self.expert_bias.to(dtype=x.dtype)
-        # Sigmoid gate: softmax(route_logits) * sigmoid(gate_logits).
+        # iter 99 (2026-04-26): router output activation per `self.router_kind`.
+        # `softmax` (iter 96 baseline) produces all-positive weights with full
+        # support; `sparsemax` (iter 99) produces exact zeros for low-logit
+        # experts → architectural per-token sparsity. Both compose with the
+        # sigmoid gate identically.
+        # Sigmoid gate: <activation>(route_logits) * sigmoid(gate_logits).
         # NOT renormalized — total weight can be < 1, allowing the model to
         # suppress the entire expert mixture for tokens already near equilibrium.
         # This is more expressive than folding into logit space (which forces sum=1).
-        p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
+        if getattr(self, "router_kind", "softmax") == "sparsemax":
+            p_alloc = sparsemax(route_logits.float(), dim=-1)  # fp32 for stability
+        else:
+            p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
         gate_act = torch.sigmoid(self.router_gate(x_gate).float())
         p = (p_alloc * gate_act).to(dtype=x.dtype)
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
@@ -1977,7 +2028,8 @@ class Block(nn.Module):
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 8, num_shared_experts: int = 0,
-                 router_scoring: str = "linear", **kwargs):
+                 router_scoring: str = "linear",
+                 router_kind: str = "softmax", **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
         # State preconditioner is parameter-free RMSUnit; every projection-local
@@ -2010,7 +2062,8 @@ class Block(nn.Module):
         # Router only covers routed experts (not shared).
         self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=10.0,
                                       cv_loss_weight=2.0, scoring=router_scoring,
-                                      health_slices=(num_routed, num_routed))
+                                      health_slices=(num_routed, num_routed),
+                                      router_kind=router_kind)
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -2483,6 +2536,7 @@ class GPT(nn.Module):
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
                  router_scoring: str = "linear",
+                 router_kind: str = "softmax",
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -2508,6 +2562,7 @@ class GPT(nn.Module):
                                    num_experts=self.num_experts,
                                    num_shared_experts=self.num_shared_experts,
                                    router_scoring=router_scoring,
+                                   router_kind=router_kind,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
@@ -3508,6 +3563,7 @@ def main() -> None:
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
+        router_kind=getattr(args, "router_kind", "softmax"),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
