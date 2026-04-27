@@ -3869,18 +3869,35 @@ def main() -> None:
                     mlp_half = usage[R:]
                     attn_sum = sum(attn_half) or 1e-8
                     mlp_sum = sum(mlp_half) or 1e-8
+                    pool_sum = (attn_sum + mlp_sum) or 1e-8
                     attn_norm = [u / attn_sum for u in attn_half]
                     mlp_norm = [u / mlp_sum for u in mlp_half]
+                    pool_norm = [u / pool_sum for u in usage]
                     parts.append(f"attn_usage:[{','.join(f'{u:.3f}' for u in attn_norm)}]")
                     parts.append(f"mlp_usage:[{','.join(f'{u:.3f}' for u in mlp_norm)}]")
-                    ent = getattr(router, "_expert_entropy", None)
-                    if ent is not None:
-                        parts.append(f"attn_entropy:{ent:.4f}")
-                        parts.append(f"mlp_entropy:{ent:.4f}")
-                    cv = getattr(router, "_expert_balance_cv", None)
-                    if cv is not None:
-                        parts.append(f"attn_cv:{cv:.4f}")
-                        parts.append(f"mlp_cv:{cv:.4f}")
+                    # Per-slice CV (within-role balance) + pool CV (cross-slice
+                    # dominance: attn-vs-mlp). Pool CV is computed on the full
+                    # 2R distribution WITHOUT slice renormalization, so it
+                    # captures both within-slice imbalance AND any tilt of total
+                    # mass toward attn or mlp. Per-slice CVs use the already-
+                    # renormalized halves above so they are independent of the
+                    # cross-slice tilt.
+                    def _cv(p: list[float]) -> float:
+                        n = len(p)
+                        mu = sum(p) / max(n, 1) or 1e-8
+                        var = sum((x - mu) ** 2 for x in p) / max(n, 1)
+                        return (var ** 0.5) / mu
+                    def _entropy(p: list[float]) -> float:
+                        return -sum(x * math.log(x + 1e-8) for x in p if x > 0.0)
+                    parts.append(f"attn_cv:{_cv(attn_norm):.4f}")
+                    parts.append(f"mlp_cv:{_cv(mlp_norm):.4f}")
+                    parts.append(f"pool_cv:{_cv(pool_norm):.4f}")
+                    parts.append(f"attn_entropy:{_entropy(attn_norm):.4f}")
+                    parts.append(f"mlp_entropy:{_entropy(mlp_norm):.4f}")
+                    parts.append(f"pool_entropy:{_entropy(pool_norm):.4f}")
+                    pertoken_ent = getattr(router, "_expert_entropy", None)
+                    if pertoken_ent is not None:
+                        parts.append(f"pertoken_entropy:{pertoken_ent:.4f}")
                     total_mass = getattr(router, "_expert_total_mass", None)
                     if total_mass is not None:
                         parts.append(f"router_mass:{float(total_mass):.4f}")

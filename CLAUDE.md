@@ -2,6 +2,47 @@
 
 > **Before each iteration, READ `EXPERIENCE.md` §1 index** for the dated incident-driven rules. The §9 audit checklist below cites those anchors — consult them before adding new code of the same shape. New audit/development rules go into `EXPERIENCE.md` §1, not into this file (see §8).
 
+## 0. Pre-Action Memory (READ BEFORE ANY ACTION)
+
+> **MANDATORY**: Before making any code change, doc edit, training launch, or commit, read every memory file referenced below. The auto-memory `MEMORY.md` index is loaded with the system prompt, but individual files are NOT — read them with the Read tool. New memory files MUST be added to this section in the same commit that creates them, or they will not be read on future sessions.
+
+**Memory directory**: `/home/mzhong4/.claude/projects/-project-ylin-mzhong4-research-opg-parameter-golf/memory/`
+
+**User profile** — read first to frame interactions:
+- `user_profile.md` — ML researcher, Parameter Golf, RevDEQ/MoE/MLA focus, L40S dev hardware
+
+**Feedback (durable rules — overrides default behavior)** — read before any action:
+- `feedback_hypotheses_sync.md` — Update hypotheses.md IN REAL TIME for any queue/baseline/status change
+- `feedback_pre_commit_review.md` — Pre-commit chain: /simplify + 3 code reviews + fix valid issues
+- `feedback_simplify_before_commit.md` — /simplify before each iteration commit
+- `feedback_dry_fixes.md` — When fixing a bug class, audit ALL instances in same commit
+- `feedback_arch_exploration.md` — Prioritize architecture over hyperparameter tuning
+- `feedback_compile_training.md` — Disable torch.compile for dev runs
+- `feedback_always_ddp.md` — Always use all GPUs with DDP, never single-GPU
+- `feedback_wakeup_cadence.md` — 5-min wakeups after failure → 20-min after 3 healthy checks
+- `feedback_lipschitz_in_ksweep.md` — Lipschitz + acyclicity primes permanent in K-sweep
+- `feedback_per_wallclock_override.md` — val_bpb gate can be overridden on per-wallclock grounds (H72)
+- `feedback_profile_before_throughput.md` — Throughput optimization needs chrome trace; not log fragments
+- `feedback_decouple_regularizers.md` — Antagonistic regularizers → keep one as metric, the other as loss
+- `feedback_anneal_sparsity_coefs.md` — Sparsity coefs anneal from 0; warmup_delay_frac=0.3 default
+- `feedback_deq_convergence.md` — DEQ as true fixed point; K=64 extrapolation; stability over task perf
+- `feedback_expert_collapse.md` — Full-dim low-rank experts; no split-dim; router on pre-attention input
+- `feedback_mla_preferred.md` — MLA is preferred attention; do not replace with MHA/GQA
+- `feedback_mos_routing.md` — MoS uses pure softmax routing (no sigmoid gates)
+- `feedback_refinement_decoupled.md` — Refinement step must be separate independent forward pass
+
+**Project (current state, lessons)** — read for context on running work:
+- `project_autoresearch.md` — Autoresearch setup + experiment loop protocol
+- `project_group_f_lessons.md` — H71-H75 trio: architectural sparsity closed; iter 96 near-optimal
+- `project_experiment_results.md` — Ongoing experiment log + insights
+- `project_phase0_learnings.md` — Phase 0 takeaways: hyperparameter landscape
+- `project_phase4_throughput_first.md` — Throughput micro-opts first; numerical equivalence required
+- `project_deq_depth_insight.md` — DEQ effective depth = 1; soft sparsity could unlock real depth
+- `project_architecture_ideas.md` — XSA, GPTQ-lite, Late QAT, DiffAttn, DeltaNet
+- `project_fix_later.md` — Deferred tech debt
+
+**When adding a new memory file**: append it under the right section here AND to `MEMORY.md`. Both must be touched in the same commit, otherwise future sessions miss the directive.
+
 ## 1. Project at a Glance
 
 OpenAI Parameter Golf challenge (March 18 – April 30, 2026; $1M OpenAI compute prize): train the best small LM that fits in a **16 MB artifact** (code + compressed model), trains in **≤10 minutes** on 8×H100 SXM GPUs, evaluated by **val_bpb** (bits-per-byte) on the FineWeb validation set. Lower is better.
@@ -243,14 +284,14 @@ Reference impl: see §2.
 
 | Metric | Target | What it tracks | Pool prefix? |
 |---|---|---|---|
-| **`pertoken_entropy`** (sparsity, iter 99+) | **LOW** ≈ 1.0 nat | Per-token routing concentration: `−Σ_e w(e\|token) log w(e\|token)` averaged over tokens. LOW = each token uses few experts strongly = specialization | **NO** — single pooled router, identical for attn and mlp slices |
-| **`expert_entropy`** (global utilization) | **HIGH** ≈ log(N_routed) | Global cross-batch entropy: `−Σ_e p̄_e log p̄_e` where `p̄_e` is batch-averaged share. HIGH = no dead experts, balanced utilization | **NO** — same reason; attn and mlp halves of the pooled router yield identical values when computed over the full N_routed components |
+| **`pertoken_entropy`** (sparsity, iter 99+) | **LOW** ≈ 1.0 nat | Per-token routing concentration: `−Σ_e w(e\|token) log w(e\|token)` averaged over tokens. LOW = each token uses few experts strongly = specialization | **NO** — single pooled router-output value; pool-level by construction |
+| **`attn_entropy` / `mlp_entropy` / `pool_entropy`** (global utilization, iter 100b+) | **HIGH** ≈ log(N_routed) per slice; pool ≈ log(2·N_routed) | Global cross-batch entropy `−Σ_e p̄_e log p̄_e` computed on (a) the per-slice renormalized batch-averaged shares (attn / mlp) and (b) the full unrenormalized pool. Comparing slice values against pool diagnoses cross-slice dominance: pool >> max(attn_slice, mlp_slice) means total mass is well-spread across attn+mlp; pool ≈ slice means one slice carries most mass | **YES** — three distinct values, attn ≠ mlp ≠ pool |
 | **`min_expert_contribution`** | **≥ 0.005** (0.5%) | `min_e p̄_e` — smallest batch-averaged share across the routed-expert pool. Sentinel for dead experts. Should report explicitly per pool slice (attn min, mlp min) | **YES** — `attn_min_share` / `mlp_min_share` differ because the per-component shares differ across pool slices |
-| **`cv`** (coefficient of variation) | **LOW** ≈ 0.2-0.3 | `std(p̄_e) / mean(p̄_e)` — spread of utilization. LOW = balanced; HIGH = winner-take-all | **NO** when computed over the full pooled distribution (current logging shows identical attn_cv == mlp_cv since they share the router); **YES** if computed per slice |
+| **`attn_cv` / `mlp_cv` / `pool_cv`** (coefficient of variation, iter 100b+) | **LOW** ≈ 0.2-0.3 per slice | Per-slice CV uses the renormalized within-slice distribution; pool CV uses the full 2R unrenormalized distribution. Per-slice CVs measure within-role imbalance independently; pool CV captures BOTH within-slice imbalance AND any tilt of total mass between attn and mlp slices. Diagnostic: large gap between attn_cv and mlp_cv = role-asymmetric routing (e.g., iter 100b s120 attn_cv≈1.07, mlp_cv≈0.18 — attn winner-take-all, MLP uniform). Large pool_cv with small per-slice CVs = cross-slice dominance | **YES** — three distinct values |
 | **`ortho`** (expert orthogonality) | **LOW** ≈ 0.1-0.2 | `max\|cos_sim\|` between expert OUTPUT means. Low cosine = experts represent different directions | **YES** — `attn_ortho` / `mlp_ortho` differ because attention experts and MLP experts produce DIFFERENT outputs even with shared router; per-pool computation is required |
 | **`router_mass`** | 0.7-0.95 typical | Mean `sigmoid(gate)` value — total routed contribution per token. Drops as the model gates the mixture down | NO — single gate, single value |
 
-**Prefix convention** (clarified 2026-04-26): the SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components (per CLAUDE.md §6.2 and the iter 35 router consolidation). Metrics derived only from the **routing distribution** (entropy, cv when computed over the full pool, pertoken_entropy, router_mass) carry NO meaningful information in their `attn_` vs `mlp_` prefix — the values are necessarily identical. Metrics derived from **expert outputs** (usage arrays, orthogonality, min_share per slice) DO differ by component pool and must keep their prefix. Future logging consolidation: drop the redundant prefix on router-distribution metrics; preserve it on expert-output metrics.
+**Prefix convention** (updated 2026-04-27, iter 100b): the SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components (per CLAUDE.md §6.2 and the iter 35 router consolidation). Logging now decomposes routing-distribution metrics into THREE values: `attn_*` (per-slice renormalized within attn experts), `mlp_*` (per-slice renormalized within mlp experts), and `pool_*` (full 2R distribution without slice renormalization). The three values diagnose distinct phenomena: per-slice within-role imbalance (attn_cv vs mlp_cv asymmetry), cross-slice dominance (pool_cv vs max(per-slice)), and the relationship between them. Metrics derived from **expert outputs** (usage arrays, orthogonality, min_share per slice) keep their `attn_*`/`mlp_*` prefix as before. `pertoken_entropy` remains a single pool-level value (per-token entropy is a pool-level quantity by construction — each token has ONE distribution).
 
 - Detailed comparison: 2 configs only — baseline vs current.
 - **Prioritize architecture exploration** over hyperparameter tuning; cite papers/repos.
@@ -298,6 +339,13 @@ New incident-driven rules go into **`EXPERIENCE.md` §1**, not into this file. P
 1. Add `### <slug>` section to `EXPERIENCE.md` §1 using the section template at the top of that file.
 2. Add one row to the §9 audit checklist: `- **<rule>** — <one-sentence summary + grep cmd if any> → \`EXPERIENCE.md#<slug>\``.
 3. Update the index table at the top of `EXPERIENCE.md` §1.
+
+### Where new memory files go
+New auto-memory files (feedback / project / user / reference) go in `/home/mzhong4/.claude/projects/-project-ylin-mzhong4-research-opg-parameter-golf/memory/`. Procedure (all four touches in the same commit, otherwise future sessions miss the file):
+1. Write the file with the standard frontmatter (name / description / type).
+2. Append a one-line entry to `MEMORY.md` (the index loaded into the system prompt).
+3. Append a one-line entry to **CLAUDE.md §0 Pre-Action Memory** under the right category (User / Feedback / Project) so future sessions actively read it.
+4. If the new file supersedes or modifies an existing rule, update the affected file in place rather than creating a duplicate.
 
 ## 9. Code-Quality Audit Checklist
 
