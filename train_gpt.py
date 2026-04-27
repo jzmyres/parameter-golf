@@ -291,9 +291,9 @@ class Hyperparameters:
     # the new architecture stabilizes val_bpb.
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 20  # iter 87 (2026-04-24): bumped 16 → 20 to accommodate widened deq_k_jitter_set (8,12,20).
+    deq_k_max = 16  # iter 98 (2026-04-26): 20 → 16 to fit D=1024 RevDEQ backward in 44 GiB/rank L40S budget. iter 87 had bumped 16 → 20; iter 98 reduces to fit D-scaling. Still > iter 86's deq_k_max=16 baseline.
     deq_k_step = 4
-    deq_k_jitter_set = (8, 12, 20)  # iter 87 (2026-04-24): doubled from (4,6,10) — deeper FP at training time should tighten K-sweep.
+    deq_k_jitter_set = (8, 12, 16)  # iter 98 (2026-04-26): K_max 20 → 16 for D=1024 fit. Still wider than iter 87 baseline {4,6,10}; preserves bulk of H66's K-sweep tightening.
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
