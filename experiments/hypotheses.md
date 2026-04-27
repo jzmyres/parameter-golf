@@ -1120,6 +1120,57 @@ Halving `train_batch_tokens` to 262K caused divergence at the same LRs (smoke te
 
 **Related:** H70 (iter 91+92 bottleneck D=1024 — different arch, NOT PROMOTED but did fit in VRAM), H71 (iter 96 PROMOTION at D=768 — the working baseline this couldn't extend on dev).
 
+### H74: Sparsemax routing — NOT PROMOTED ✗ (extreme architectural sparsity ≈ +0.16 capacity cost; 2026-04-27)
+
+**Claim:** Replacing softmax routing (iter 96) with sparsemax (Martins & Astudillo 2016) — closed-form simplex projection that produces exact zeros for low-logit experts — drives architectural per-token specialization without a tuning knob. Two distinct entropies in routing: per-token entropy (sparsity signal, target LOW) and global utilization entropy (dead-expert sentinel, target HIGH). Sparsemax should crush per-token entropy directly while min_share_loss=10.0 protects global balance.
+
+**Test:** iter 99 — `Hyperparameters.router_kind = "sparsemax"` on iter 96 baseline. All other knobs unchanged. Commit `8f2049e`. 1000 steps, 7.0 hours wallclock.
+
+**Result:** ❌ **NOT PROMOTED** — extreme sparsity exceeds capacity threshold.
+
+| Metric | iter 96 baseline | iter 99 sparsemax | Δ |
+|---|---|---|---|
+| val_bpb (int6, fast eval K=16) | 1.4903 | **1.6494** | **+0.1591** ✗ (>>0.03 gate) |
+| val_bpb (fp32 step 1000) | 1.4603 | 1.6032 | +0.1429 |
+| Params | 13.95 M | 13.95 M | unchanged ✓ |
+| step_avg | 23.4 s | 23.4 s | identical ✓ (sparsemax overhead amortized) |
+| Peak VRAM | 35.7 GiB | 35.7 GiB | identical ✓ |
+| Artifact | 7.55 MB | 7.66 MB | +1.5% ✓ |
+| **attn_entropy (per-token)** | ~3.0 (≈ uniform over 30 components) | **0.009** (≈ pure top-1 routing) | crushed by 332× ★ |
+| attn_cv | ~0.20 | ~0.75 | strong concentration |
+
+**Trajectory** — gap STABILIZES, doesn't diverge:
+
+| Step | iter 99 | iter 96 | Δ |
+|---|---|---|---|
+| 200 | 2.0743 | 1.9884 | +0.086 |
+| 400 | 1.7809 | 1.6564 | +0.125 |
+| 600 | 1.6675 | 1.5433 | +0.124 |
+| 800 | 1.6144 | 1.4935 | +0.121 |
+| 1000 (fp32) | 1.6032 | 1.4603 | +0.143 |
+| 1000 (int6) | **1.6494** | **1.4903** | **+0.1591** |
+
+The val_bpb gap is **roughly constant at +0.12-0.16** from step 200 onwards — iter 99's trajectory is iter 96's trajectory shifted up by an architectural-capacity penalty, not a divergent failure. Train_loss gap is much larger (~+1.0 / +35%) than val_bpb gap (+0.16 / +5-8%): **sparsemax acts as implicit regularization** — the model can't memorize as effectively (worse train fit) but generalizes proportionally well (smaller val gap).
+
+**Why it didn't promote (root cause):**
+
+1. **Pure top-1 routing trap.** attn_entropy = 0.009 means each token routes to ~1.01 experts effectively. Inactive experts receive ZERO gradient (sparsemax sets w=0 → gradient is zero through that path) → bad initial routing freezes → model can't escape. min_share_loss=10.0 prevents complete collapse but doesn't drive useful re-diversification at this aggressive sparsity.
+
+2. **Capacity loss > regularization gain.** With effectively k=1 routing, the model has 1/16th the parallel expert capacity per token. Even with implicit-regularization benefit, the +0.16 capacity cost exceeds the regularization gain by ~3×.
+
+3. **Inability to specialize properly.** True specialization requires the router learning good token→expert assignments. With zero gradient through unused experts, the router gets very weak signal for expert reassignment. Becomes path-dependent on initialization.
+
+**Implications:**
+
+- **Architectural sparsity is principled but α=2 is too aggressive on this codebase.** The +0.16 capacity cost is the price of pure top-1 routing.
+- **α=1.5 entmax (iter 101) is the natural middle ground.** Mild sparsity (some zeros but mostly soft) preserves gradient flow through low-weight experts → router can still learn to diversify → less capacity loss.
+- **iter 99b (sparse expert dispatch)** is shelved — only valued if iter 99 promoted, which it didn't.
+- **iter 100 (entropy penalty + softmax)** is also DEFERRED — iter 99's regularization-as-implicit insight suggests the architectural axis (α-entmax family) is more aligned than the loss-side proxy. Skip iter 100 unless iter 101 fails.
+
+**Diagnostic data lost:** the K-sweep with iter 97.6's new Hutchinson + acyclicity-prime probes crashed at the first probe call due to a dtype mismatch (`Float vs BFloat16`) — z_star saved in fp32 by training-time hot path, eval-time SharedBlock runs in bf16. **Bug fixed in same commit as this H74 entry**: `_compute_eval_fp_lipschitz` now casts inputs to the SharedBlock's compute dtype before the probe. Iter 101 will be the first run where the new Lipschitz/acyclicity-prime data actually lands.
+
+**Related:** H32 (DEQ smoothness preservation — sparsemax piecewise smooth, RevDEQ-safe ✓ as designed), iter 96 H71 (working softmax baseline), iter 101 (α=1.5 entmax, the principled next step), iter 99b shelved.
+
 ---
 
 ## Completed Iterations
@@ -1376,7 +1427,7 @@ failure.
 
 ### Next up — recommended ordering after iter 89
 
-**Current baseline:** iter 96 (`b962b5f`, val_bpb int6 = 1.4903) — last promoted iter; "more, smaller experts" (`num_experts 8→16, attn_expert_rank 128→64, mlp_expert_rank 192→96`) on top of iter 89's full-D LoRA-style baseline. Improvement of −0.0361 vs iter 89, K=128-vs-best-K Δ=+0.0016, artifact 7.55 MB (47% of 16 MB budget). H71 documents the result. Groups A-D are now closed (Groups A-C all PROMOTED ★ except iter 83 reverted; Group D bottleneck → NOT PROMOTED, code reverted, archive at tag `iter-91+92-bottleneck-NOT-PROMOTED`). Group F (LoRA-rank/E joint scaling) is the active scaling direction, opened by iter 96. **Iter 97 (E=20 continuation) NOT PROMOTED on per-wallclock grounds — H72 closes the rank-halving subdirection past E=16.** **Iter 97.5 (throughput config bumps) NOT IMPROVED — reverted.** **Iter 97.6 (PERMANENT eval-harness change)**: K-sweep now auto-reports Hutchinson-Frobenius + finite-direction random-step Lipschitz at the FP, plus acyclicity primes K∈{17,37,113}. Iter 99+ inherit these diagnostics. **Iter 98 (D=1024) NOT TESTED on dev hardware** — 3× OOM at 44 GiB cap; deferred to 8× H100 submission hardware or future gradient-checkpointing iter (H73). Active queue (in order): **iter 99** (sparsemax architectural sparsity + per-token entropy logging — first iter to inherit the iter 97.6 K-sweep diagnostics) → **iter 100** (conditional entropy penalty stack on sparsemax) → **iter 97.7** (PROFILE-driven throughput retry) → **iter 103** (chained 2-stage routing) → **iter 95** (TBPTT efficiency sweep). E-scaling past 16 is closed (do not test E=24, E=32). Iter 102 removed 2026-04-26.
+**Current baseline:** iter 96 (`b962b5f`, val_bpb int6 = 1.4903) — last promoted iter; "more, smaller experts" (`num_experts 8→16, attn_expert_rank 128→64, mlp_expert_rank 192→96`) on top of iter 89's full-D LoRA-style baseline. Improvement of −0.0361 vs iter 89, K=128-vs-best-K Δ=+0.0016, artifact 7.55 MB (47% of 16 MB budget). H71 documents the result. Groups A-D are now closed (Groups A-C all PROMOTED ★ except iter 83 reverted; Group D bottleneck → NOT PROMOTED, code reverted, archive at tag `iter-91+92-bottleneck-NOT-PROMOTED`). Group F (LoRA-rank/E joint scaling) is the active scaling direction, opened by iter 96. **Iter 97 (E=20 continuation) NOT PROMOTED on per-wallclock grounds — H72 closes the rank-halving subdirection past E=16.** **Iter 97.5 (throughput config bumps) NOT IMPROVED — reverted.** **Iter 97.6 (PERMANENT eval-harness change)**: K-sweep now auto-reports Hutchinson-Frobenius + finite-direction random-step Lipschitz at the FP, plus acyclicity primes K∈{17,37,113}. Iter 99 first run, but K-sweep crashed at probe call due to dtype mismatch — fixed at H74-commit. **Iter 98 (D=1024) NOT TESTED** — 3× OOM at 44 GiB cap (H73). **Iter 99 (sparsemax) NOT PROMOTED** — +0.16 capacity cost from pure top-1 routing trap (H74). Active queue (in order): **iter 101** (α=1.5 entmax — the principled middle ground; preserves gradient through low-weight experts, avoids iter 99 trap) → **iter 100** (DEFERRED unless iter 101 also fails — entropy penalty proxy is less aligned with the H74 architectural-sparsity insight) → **iter 97.7** (PROFILE-driven throughput retry) → **iter 103** (chained 2-stage routing) → **iter 95** (TBPTT efficiency sweep). E-scaling past 16 is closed (H72). Iter 99b/100 deferred per H74. Iter 102 removed 2026-04-26.
 
 Run ordering rationale (preserved for posterity): low-risk → higher-risk, activation / gate / schedule tweaks before legacy-loss ablations, architectural scale-up last (depends on predecessors).
 

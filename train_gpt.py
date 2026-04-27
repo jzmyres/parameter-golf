@@ -237,7 +237,7 @@ class Hyperparameters:
     # driving per-token specialization architecturally rather than via loss
     # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
     # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
-    router_kind = "sparsemax"
+    router_kind = "softmax"  # iter 99 (sparsemax) NOT PROMOTED ✗ — H74 documents +0.16 capacity cost. Revert to softmax baseline. Iter 101 will test α=1.5 entmax middle ground.
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
@@ -4227,8 +4227,16 @@ def main() -> None:
         if z_star is None or x0_lyap is None:
             return None, None
         sb = _unwrap_compiled_module(base_m.shared_block)
+        # Cast saved tensors to the SharedBlock's compute dtype (eval-time may
+        # be bf16 while z_star/x0_lyap were saved in fp32 by the train hot path).
+        try:
+            target_dtype = next(sb.parameters()).dtype
+        except StopIteration:
+            target_dtype = z_star.dtype
+        z_star = z_star.to(target_dtype)
+        x0_lyap = x0_lyap.to(target_dtype)
         b_bar = base_m._parcae_b_bar() if base_m.use_parcae else None
-        b_bar_d = b_bar.detach() if b_bar is not None else None
+        b_bar_d = b_bar.detach().to(target_dtype) if b_bar is not None else None
 
         # Hutchinson-Frobenius probe (multiple samples for variance reduction).
         rho_F_samples: list[float] = []
