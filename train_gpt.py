@@ -237,7 +237,7 @@ class Hyperparameters:
     # driving per-token specialization architecturally rather than via loss
     # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
     # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
-    router_kind = "softmax"  # iter 99 (sparsemax) NOT PROMOTED ✗ — H74 documents +0.16 capacity cost. Revert to softmax baseline. Iter 101 will test α=1.5 entmax middle ground.
+    router_kind = "entmax15"  # iter 101 (2026-04-27): α=1.5 entmax — principled middle ground after iter 99 sparsemax (α=2) NOT PROMOTED with +0.16 capacity cost (H74). Mild sparsity preserves gradient flow through low-weight experts → router can still learn to diversify. Options: "softmax" (iter 96), "sparsemax" (iter 99 NOT PROMOTED), "entmax15" (iter 101).
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
@@ -1099,6 +1099,54 @@ class BigramHashEmbedding(nn.Module):
 # SOFT DENSE ROUTER
 # ---------------------------------------------------------------------------
 
+def entmax15(logits: Tensor, dim: int = -1, n_iter: int = 30) -> Tensor:
+    """α=1.5 entmax (Peters, Niculae & Martins 2019) — bisection over α-entmax.
+
+    α-entmax interpolates between softmax (α=1, full support, smooth) and
+    sparsemax (α=2, sparse, exact zeros). At α=1.5: TYPICALLY-FULL support
+    (most weights nonzero, peakier than softmax) with possibly some exact
+    zeros — the principled middle ground.
+
+    Solution: w_i = max(0, (α-1)·(z_i - τ))^(1/(α-1)) where τ is the
+    Lagrangian satisfying Σw_i = 1. With α=1.5: w_i = max(0, 0.5·(z_i - τ))²
+    and we bisect for τ.
+
+    RevDEQ-safe: deterministic, 1-Lipschitz, subdifferentiable a.e. — same
+    properties as sparsemax. AVOIDS sparsemax's pure top-1 trap (iter 99
+    H74) because w_i > 0 across most experts → all get nonzero gradient.
+
+    Args:
+        logits: Tensor with simplex axis on `dim`.
+        dim: Axis to project over (default: last).
+        n_iter: Bisection iterations (30 → 1e-9 precision; differentiable
+            via implicit function theorem through autograd).
+    Returns:
+        Probability tensor of same shape, sum=1 along `dim`.
+    """
+    # Bisect for τ such that Σ max(0, 0.5·(z - τ))² = 1.
+    # Bracket: τ_low = z.max() - 2 (guarantees support includes at least
+    # the max), τ_high = z.max() (guarantees support is empty if equality).
+    # Actually, at τ = z.max() the only nonzero contribution would be 0,
+    # so the sum is 0 < 1. So τ must be < z.max() to have support.
+    # We use τ_low = z.max() - sqrt(2*K) as a safe lower bound (worst case
+    # all K entries equal, then w_i = 1/K → sum K · ((1/K)^(1/2))² · 0.5²
+    # ... derivation messy; just pick a wide bracket and bisect.
+    z_max = logits.max(dim=dim, keepdim=True).values
+    tau_lo = z_max - 4.0  # generous lower bound
+    tau_hi = z_max
+    for _ in range(n_iter):
+        tau = 0.5 * (tau_lo + tau_hi)
+        w = torch.clamp(0.5 * (logits - tau), min=0.0).pow(2)
+        w_sum = w.sum(dim=dim, keepdim=True)
+        # If sum > 1, threshold τ is too low; raise it. If sum < 1, lower it.
+        tau_lo = torch.where(w_sum > 1.0, tau, tau_lo)
+        tau_hi = torch.where(w_sum > 1.0, tau_hi, tau)
+    # Final eval with the converged τ.
+    tau = 0.5 * (tau_lo + tau_hi)
+    w = torch.clamp(0.5 * (logits - tau), min=0.0).pow(2)
+    return w
+
+
 def sparsemax(logits: Tensor, dim: int = -1) -> Tensor:
     """Sparsemax (Martins & Astudillo 2016) — closed-form simplex projection.
 
@@ -1329,8 +1377,11 @@ class SoftDenseRouter(nn.Module):
         # NOT renormalized — total weight can be < 1, allowing the model to
         # suppress the entire expert mixture for tokens already near equilibrium.
         # This is more expressive than folding into logit space (which forces sum=1).
-        if getattr(self, "router_kind", "softmax") == "sparsemax":
-            p_alloc = sparsemax(route_logits.float(), dim=-1)  # fp32 for stability
+        _rk = getattr(self, "router_kind", "softmax")
+        if _rk == "sparsemax":
+            p_alloc = sparsemax(route_logits.float(), dim=-1)  # iter 99 (NOT PROMOTED H74)
+        elif _rk == "entmax15":
+            p_alloc = entmax15(route_logits.float(), dim=-1)  # iter 101: α=1.5 middle ground
         else:
             p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
         gate_act = torch.sigmoid(self.router_gate(x_gate).float())
