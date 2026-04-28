@@ -353,9 +353,9 @@ class Hyperparameters:
     # the new architecture stabilizes val_bpb.
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 20  # iter 87 (2026-04-24): bumped 16 → 20 to accommodate widened deq_k_jitter_set (8,12,20).
+    deq_k_max = 24  # 2026-04-28 user directive: bumped 20 → 24 to accommodate deq_k_jitter_set=(16,24) — deeper FP regime, both K values above iter 87's old max of 16.
     deq_k_step = 4
-    deq_k_jitter_set = (8, 12, 20)  # iter 87 (2026-04-24): doubled from (4,6,10) — deeper FP at training time should tighten K-sweep.
+    deq_k_jitter_set = (16, 24)  # 2026-04-28 user directive: deeper-K regime. Replaces (8,12,20) (iter 87 PROMOTED set) with two values BOTH above the iter 30 baseline K=12. Trades training-step throughput (~14-30s/step depending on K) for FP-quality at training time. Two-value set keeps compile cache slot count low (post Fix #5a rationale: 2 K-variants × 3 graph-types × grad_mode = 12 slots, comfortably under recompile_limit=16). Eval still uses deq_k_eval=16 (matches K-jitter min). Tradeoff vs iter 87's (8,12,20): loses K=8 (shallow) variance — if val_bpb regresses on this run, the principled rescue is to add K=8 back as (8,16,24) since cache budget allows up to 3 values.
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs

@@ -169,7 +169,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
-| deq_k_jitter_set | (8, 12, 20) (DEQ iteration counts sampled per step; iter 87) |
+| deq_k_jitter_set | (16, 24) (DEQ iteration counts sampled per step. 2026-04-28 user directive: deeper-K regime replacing iter 87's (8,12,20). Two-value set keeps compile-cache pressure low (3 graph-types × 2 K × grad_mode = 12 slots vs recompile_limit=16). `deq_k_max=24`. Eval `deq_k_eval=16` matches the K-jitter min.) |
 | lyapunov_coef | 0.0 (iter 88: λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
 | lyapunov_gamma | 0.97 (target spectral radius threshold) |
 | lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
