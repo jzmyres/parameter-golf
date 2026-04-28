@@ -4373,26 +4373,30 @@ def main() -> None:
         # iter 100b user directive (2026-04-28): force a grad-compatible
         # SDPA backend for the probes. Flash-attention rejects grad-required
         # bf16 inputs at eval time; the EFFICIENT and MATH backends accept
-        # both. We wrap the entire probe block in `sdpa_kernel(...)` so the
-        # JVP and finite-diff calls go through an attention path that can
-        # actually run under `enable_grad`.
+        # both. sdpa_kernel returns a SINGLE-USE context manager — make a
+        # factory so each probe gets a fresh context.
         try:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-            _grad_safe_sdpa = sdpa_kernel(
-                [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
-            )
+            from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel_impl
+            def _grad_safe_sdpa():
+                return _sdpa_kernel_impl(
+                    [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+                )
         except Exception:
             from contextlib import nullcontext
-            _grad_safe_sdpa = nullcontext()
+            def _grad_safe_sdpa():
+                return nullcontext()
 
-        # Hutchinson-Frobenius probe (multiple samples for variance reduction).
-        # Outer try/except remains a defensive guard so a probe failure cannot
-        # crash the K-sweep, but it should now report on every iter.
+        # Hutchinson-Frobenius probe — reduced sample count (was 8 → 2) since
+        # the JVP through SharedBlock at B×T×D scales costs ~3 GiB per sample
+        # and the K-sweep already pushes peak VRAM near 42 GiB on a 44 GiB
+        # cap. Variance is acceptable for a diagnostic. Cache cleared first.
         rho_F: float | None = None
         try:
             rho_F_samples: list[float] = []
-            with _grad_safe_sdpa:
-                for _ in range(n_hutch):
+            torch.cuda.empty_cache()
+            n_hutch_eff = min(n_hutch, 2)
+            with _grad_safe_sdpa():
+                for _ in range(n_hutch_eff):
                     v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
                                        dtype=z_star.dtype) * 2.0 - 1.0)
                     z_b = z_star.detach().clone().requires_grad_(True)
@@ -4404,6 +4408,8 @@ def main() -> None:
                         )[0]
                     rho_F_samples.append(
                         float(jvp.detach().float().pow(2).mean().sqrt().item()))
+                    del v, z_b, u_b, jvp
+                    torch.cuda.empty_cache()
             if rho_F_samples:
                 rho_F = sum(rho_F_samples) / len(rho_F_samples)
         except Exception as e:
@@ -4414,7 +4420,8 @@ def main() -> None:
         rho_op: float | None = None
         try:
             rho_op_samples: list[float] = []
-            with _grad_safe_sdpa, torch.no_grad():
+            torch.cuda.empty_cache()
+            with _grad_safe_sdpa(), torch.no_grad():
                 u_base = sb(z_star, x0_lyap, b_bar_d)
                 for _ in range(n_finite_diff):
                     eps_dir = torch.randn_like(z_star)
@@ -4425,6 +4432,7 @@ def main() -> None:
                     u_pert = sb(z_star + eps_step * eps_unit, x0_lyap, b_bar_d)
                     rho_op_samples.append(
                         float((u_pert - u_base).float().norm().item()) / eps_step)
+                    del eps_dir, eps_unit, u_pert
             if rho_op_samples:
                 rho_op = max(rho_op_samples)
         except Exception as e:
@@ -4459,21 +4467,26 @@ def main() -> None:
     # routing trajectory across K can be plotted/compared per H-claim.
     # Header is emitted before the loop; each K appends one row.
     def _collect_eval_kdiag(base_m) -> dict[str, float]:
-        """Per-K expert/sparsity/shared-gate diagnostics collected from the
-        most recent eval forward pass. Pooled-router single source of truth:
-        attn_router and mlp_router are the same instance under the iter 35
-        consolidation, so per-slice metrics are computed from the pooled
-        usage array using the (R, R) split; ortho is read per-component."""
-        sb = getattr(base_m, "shared_block", None)
-        if sb is None:
+        """Per-K expert/sparsity/shared-gate diagnostics from the most recent
+        eval forward pass. Reads from the pooled router (single source of
+        truth post iter 35 consolidation): SharedBlock has `self.router` and
+        per-component aliases on `self.attn.attn_router` / `self.mlp.mlp_router`
+        all pointing at the same instance. Per-slice CV/min/entropy split
+        the pooled usage by the (R, R) layout; ortho is per-component."""
+        sb_raw = getattr(base_m, "shared_block", None)
+        if sb_raw is None:
             return {}
+        sb = _unwrap_compiled_module(sb_raw)
         out: dict[str, float] = {}
         R_total = int(getattr(sb, "num_experts", 0))
         R = R_total - int(getattr(sb, "num_shared_experts", 0))
-        attn_router = getattr(getattr(sb, "attention", None), "attn_router", None)
-        if attn_router is not None and hasattr(attn_router, "_materialize_diag_lists"):
-            attn_router._materialize_diag_lists()
-        usage = getattr(attn_router, "_expert_usage", None) if attn_router else None
+        # Prefer the pooled router on the SharedBlock; fall back to per-comp aliases.
+        router = getattr(sb, "router", None)
+        if router is None:
+            router = getattr(getattr(sb, "attn", None), "attn_router", None)
+        if router is not None and hasattr(router, "_materialize_diag_lists"):
+            router._materialize_diag_lists()
+        usage = getattr(router, "_expert_usage", None) if router else None
         if usage and len(usage) >= 2 * R and R > 0:
             attn_half, mlp_half = usage[:R], usage[R:]
             for label, half in [("attn", attn_half), ("mlp", mlp_half)]:
@@ -4489,11 +4502,11 @@ def main() -> None:
             pvar = sum((x - pmu) ** 2 for x in pool_norm) / len(pool_norm)
             out["pool_cv"] = (pvar ** 0.5) / pmu
             out["pool_ent"] = -sum(x * math.log(x + 1e-8) for x in pool_norm if x > 0.0)
-        pertoken = getattr(attn_router, "_expert_entropy", None) if attn_router else None
+        pertoken = getattr(router, "_expert_entropy", None) if router else None
         if pertoken is not None:
             out["pertoken_ent"] = float(pertoken)
-        for prefix, comp_attr in [("attn", "attention"), ("mlp", "mlp")]:
-            comp = getattr(sb, comp_attr, None)
+        for prefix in ("attn", "mlp"):
+            comp = getattr(sb, prefix, None)
             if comp is None:
                 continue
             v_t = getattr(comp, "_out_ortho_cos_sim_t", None)
@@ -4515,8 +4528,13 @@ def main() -> None:
         ("pertoken_ent", 13), ("pool_ent", 9), ("shared_gate", 12),
         ("hutch_F", 9), ("rd_step", 9), ("iter_conv_rel", 14),
     ]
-    def _fmt_kdiag(value: float | None, width: int) -> str:
-        s = "N/A" if value is None else f"{value:.4f}"
+    def _fmt_kdiag(value: float | None, width: int, name: str = "") -> str:
+        if value is None:
+            s = "N/A"
+        elif name == "K":
+            s = str(int(value))
+        else:
+            s = f"{value:.4f}"
         return s.rjust(width)
     log0("k_sweep_table:" + " ".join(name.rjust(w) for name, w in _kdiag_cols))
     for k_eval in k_sweep_values:
@@ -4587,7 +4605,7 @@ def main() -> None:
             "rd_step": rho_op,
             "iter_conv_rel": conv_rel_val,
         }
-        log0("k_sweep_table:" + " ".join(_fmt_kdiag(kdiag_row[name], w) for name, w in _kdiag_cols))
+        log0("k_sweep_table:" + " ".join(_fmt_kdiag(kdiag_row[name], w, name) for name, w in _kdiag_cols))
     k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
     log0(f"k_sweep:done {k_parts}")
 
