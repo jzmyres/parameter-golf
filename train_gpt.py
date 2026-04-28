@@ -351,11 +351,11 @@ class Hyperparameters:
     # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
     # be re-combined with Phase 6 contraction shell in a follow-up iter once
     # the new architecture stabilizes val_bpb.
-    deq_k_jitter = True
+    deq_k_jitter = False  # 2026-04-28 user directive: disable K-jitter, fix K=16 to controlled-isolate the OOM root cause. RevDEQ should be O(1) in K via reversible solver, but profile_v8 OOM'd at K=24 step 1 backward (44 GiB cap). Fixing K removes K-axis from compile cache + isolates whether RevDEQ memory truly depends on K (it shouldn't). If OOM persists at K=16, the issue is RevDEQ backward implementation, not K-jitter cache pressure.
     deq_k_min = 4
-    deq_k_max = 24  # 2026-04-28 user directive: bumped 20 → 24 to accommodate deq_k_jitter_set=(16,24) — deeper FP regime, both K values above iter 87's old max of 16.
+    deq_k_max = 16  # 2026-04-28 user directive: K-jitter disabled, K fixed at 16 (matches deq_k_eval).
     deq_k_step = 4
-    deq_k_jitter_set = (16, 24)  # 2026-04-28 user directive: deeper-K regime. Replaces (8,12,20) (iter 87 PROMOTED set) with two values BOTH above the iter 30 baseline K=12. Trades training-step throughput (~14-30s/step depending on K) for FP-quality at training time. Two-value set keeps compile cache slot count low (post Fix #5a rationale: 2 K-variants × 3 graph-types × grad_mode = 12 slots, comfortably under recompile_limit=16). Eval still uses deq_k_eval=16 (matches K-jitter min). Tradeoff vs iter 87's (8,12,20): loses K=8 (shallow) variance — if val_bpb regresses on this run, the principled rescue is to add K=8 back as (8,16,24) since cache budget allows up to 3 values.
+    deq_k_jitter_set = (16,)  # 2026-04-28 user directive: singleton (jitter disabled). Sampler at L3870 short-circuits to args.deq_k_max=16.
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
