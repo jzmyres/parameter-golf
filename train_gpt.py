@@ -2496,18 +2496,8 @@ class Block(nn.Module):
         S = self.num_shared_experts
         # Route only the non-shared experts.
         w_attn, w_mlp = self._route_pooled(h)
-        if self._diag_track_enabled:
-            attn_rg = getattr(self.router, "_router_gate_last_mean", None)
-            # Track per-expert mean routing weights (shows specialization across
-            # iters).  Append GPU tensors only — single materialization happens
-            # post-solve in SharedBlock.forward.  Mean is over all non-expert
-            # dims (B, T) so each entry has shape (E,).
-            with torch.no_grad():
-                reduce_dims = tuple(range(w_attn.dim() - 1))
-                self._attn_expert_weights_per_iter.append(
-                    w_attn.detach().float().mean(dim=reduce_dims))
-                self._mlp_expert_weights_per_iter.append(
-                    w_mlp.detach().float().mean(dim=reduce_dims))
+        # Eager-only per-iter expert-weight tracking — see helper docstring.
+        self._maybe_track_expert_weights(w_attn, w_mlp)
 
         # All experts compute outputs together (shared + routed).
         attn_expert_out = self.attn.forward_experts(h)  # (B, T, E, D)
@@ -2563,28 +2553,63 @@ class Block(nn.Module):
             x0_rms = b_bar.to(x0_rms.dtype) * x0_rms
         raw_out = x0_rms.to(dtype=z_in.dtype) + delta
 
-        if self._diag_track_enabled:
-            ag = getattr(self.attn, "_attn_gate_last_mean", None)
-            if ag is not None:
-                self._attn_gate_call_track.append(ag)
-            if attn_rg is not None:
-                self._attn_router_gate_call_track.append(attn_rg)
-            # Pooled router: attn and mlp share the same router instance.
-            mlp_rg = attn_rg
-            if mlp_rg is not None:
-                self._mlp_router_gate_call_track.append(mlp_rg)
-            # Combined router-gate (attn+mlp pair-mean) — kept as 0-d GPU tensor.
-            # `float(t)` here would `.item()`-sync inside the compiled forward;
-            # tensor pair-mean is fused with surrounding ops.
-            rg_vals: list[Tensor] = []
-            if attn_rg is not None:
-                rg_vals.append(attn_rg)
-            if mlp_rg is not None:
-                rg_vals.append(mlp_rg)
-            if rg_vals:
-                avg_rg = rg_vals[0] if len(rg_vals) == 1 else 0.5 * (rg_vals[0] + rg_vals[1])
-                self._router_gate_call_track.append(avg_rg)
+        # Eager-only gate-call tracking — see helper docstring.
+        self._maybe_track_gate_calls()
         return raw_out
+
+    @dynamo_disable
+    def _maybe_track_expert_weights(self, w_attn: Tensor, w_mlp: Tensor) -> None:
+        """Eager-only per-iter expert-weight tracking.
+
+        Profile_v3 (post Fix #3, commit d7996da) showed the residual recompile
+        vector at 23.45s/step was `len(self._mlp_expert_weights_per_iter) == N`
+        guards inside the compiled `Block.forward`. With K-jitter (8,12,20)
+        and incremental list growth per iter (lengths 0,1,2,...,2K), dynamo
+        sees 2*8 + 2*12 + 2*20 = 80 unique list-length values across the
+        K-loop — even with `recompile_limit=16`, the cache thrashes.
+
+        Wrapping the append in this `@dynamo_disable` helper makes the call
+        opaque to dynamo (one fixed graph break per forward, no list-length
+        guards). Same pattern as `_capture_attn_out_ortho` from Fix #3, applied
+        to the second graph-break vector identified in profile_v3.
+        """
+        if not self._diag_track_enabled:
+            return
+        with torch.no_grad():
+            reduce_dims = tuple(range(w_attn.dim() - 1))
+            self._attn_expert_weights_per_iter.append(
+                w_attn.detach().float().mean(dim=reduce_dims))
+            self._mlp_expert_weights_per_iter.append(
+                w_mlp.detach().float().mean(dim=reduce_dims))
+
+    @dynamo_disable
+    def _maybe_track_gate_calls(self) -> None:
+        """Eager-only per-call gate-stat tracking (attn gate, router gate).
+        Same dynamo-disable rationale as `_maybe_track_expert_weights`: removes
+        list-length guards on `_attn_gate_call_track`, `_router_gate_call_track`,
+        and `_*_router_gate_call_track` from the compiled Block.forward.
+        """
+        if not self._diag_track_enabled:
+            return
+        ag = getattr(self.attn, "_attn_gate_last_mean", None)
+        if ag is not None:
+            self._attn_gate_call_track.append(ag)
+        attn_rg = getattr(self.router, "_router_gate_last_mean", None)
+        if attn_rg is not None:
+            self._attn_router_gate_call_track.append(attn_rg)
+        # Pooled router: attn and mlp share the same router instance.
+        mlp_rg = attn_rg
+        if mlp_rg is not None:
+            self._mlp_router_gate_call_track.append(mlp_rg)
+        # Combined router-gate (attn+mlp pair-mean) — kept as 0-d GPU tensor.
+        rg_vals: list[Tensor] = []
+        if attn_rg is not None:
+            rg_vals.append(attn_rg)
+        if mlp_rg is not None:
+            rg_vals.append(mlp_rg)
+        if rg_vals:
+            avg_rg = rg_vals[0] if len(rg_vals) == 1 else 0.5 * (rg_vals[0] + rg_vals[1])
+            self._router_gate_call_track.append(avg_rg)
 
 
 # ---------------------------------------------------------------------------
