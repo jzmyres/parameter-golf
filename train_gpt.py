@@ -4370,41 +4370,51 @@ def main() -> None:
         b_bar = base_m._parcae_b_bar() if base_m.use_parcae else None
         b_bar_d = b_bar.detach().to(target_dtype) if b_bar is not None else None
 
+        # iter 100b user directive (2026-04-28): force a grad-compatible
+        # SDPA backend for the probes. Flash-attention rejects grad-required
+        # bf16 inputs at eval time; the EFFICIENT and MATH backends accept
+        # both. We wrap the entire probe block in `sdpa_kernel(...)` so the
+        # JVP and finite-diff calls go through an attention path that can
+        # actually run under `enable_grad`.
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            _grad_safe_sdpa = sdpa_kernel(
+                [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+            )
+        except Exception:
+            from contextlib import nullcontext
+            _grad_safe_sdpa = nullcontext()
+
         # Hutchinson-Frobenius probe (multiple samples for variance reduction).
-        # Wrapped in try/except: SDPA backend selection differs under
-        # `enable_grad` at eval time and can fail with `Invalid backend`
-        # depending on dtype/scaled-dot-product-attention kernel paths.
-        # If the probe fails for any reason, skip it (rho_F=None) and let
-        # the cheaper finite-direction probe still report — the K-sweep
-        # must not be allowed to crash on a diagnostic.
+        # Outer try/except remains a defensive guard so a probe failure cannot
+        # crash the K-sweep, but it should now report on every iter.
         rho_F: float | None = None
         try:
             rho_F_samples: list[float] = []
-            for _ in range(n_hutch):
-                v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
-                                   dtype=z_star.dtype) * 2.0 - 1.0)
-                z_b = z_star.detach().clone().requires_grad_(True)
-                with torch.enable_grad():
-                    u_b = sb(z_b, x0_lyap, b_bar_d)
-                    jvp = torch.autograd.grad(
-                        (u_b * v).sum(), z_b,
-                        create_graph=False, retain_graph=False,
-                    )[0]
-                rho_F_samples.append(
-                    float(jvp.detach().float().pow(2).mean().sqrt().item()))
+            with _grad_safe_sdpa:
+                for _ in range(n_hutch):
+                    v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
+                                       dtype=z_star.dtype) * 2.0 - 1.0)
+                    z_b = z_star.detach().clone().requires_grad_(True)
+                    with torch.enable_grad():
+                        u_b = sb(z_b, x0_lyap, b_bar_d)
+                        jvp = torch.autograd.grad(
+                            (u_b * v).sum(), z_b,
+                            create_graph=False, retain_graph=False,
+                        )[0]
+                    rho_F_samples.append(
+                        float(jvp.detach().float().pow(2).mean().sqrt().item()))
             if rho_F_samples:
                 rho_F = sum(rho_F_samples) / len(rho_F_samples)
-        except Exception:
+        except Exception as e:
+            print(f"[hutch_F probe failed] {type(e).__name__}: {e}", flush=True)
             rho_F = None  # Hutchinson unavailable; finite-diff still runs.
 
-        # Finite-direction random-step Lipschitz sample. Also wrapped in
-        # try/except — same SDPA-backend risk as Hutchinson but under
-        # no_grad which usually avoids it. Defensive: never crash the
-        # K-sweep on a diagnostic.
+        # Finite-direction random-step Lipschitz sample.
         rho_op: float | None = None
         try:
             rho_op_samples: list[float] = []
-            with torch.no_grad():
+            with _grad_safe_sdpa, torch.no_grad():
                 u_base = sb(z_star, x0_lyap, b_bar_d)
                 for _ in range(n_finite_diff):
                     eps_dir = torch.randn_like(z_star)
@@ -4417,7 +4427,8 @@ def main() -> None:
                         float((u_pert - u_base).float().norm().item()) / eps_step)
             if rho_op_samples:
                 rho_op = max(rho_op_samples)
-        except Exception:
+        except Exception as e:
+            print(f"[rd_step probe failed] {type(e).__name__}: {e}", flush=True)
             rho_op = None
         return rho_F, rho_op
 
