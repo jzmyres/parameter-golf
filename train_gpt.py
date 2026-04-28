@@ -237,8 +237,8 @@ class Hyperparameters:
     # driving per-token specialization architecturally rather than via loss
     # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
     # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
-    router_kind = "entmax_anneal"  # iter 102 (2026-04-28): annealed entmax — linear blend of softmax (full support) and entmax15 (sparse). At time_frac < router_alpha_warmup_delay_frac → α_scale=0 (pure softmax); else linear ramp 0→1 over remaining training. Final output = (1-α_scale)·softmax + α_scale·entmax15. Avoids H75 cold-start trap (iter 101 entmax15 from step 0 cost +0.10). Options: "softmax", "sparsemax", "entmax15", "entmax_anneal".
-    router_alpha_warmup_delay_frac = 0.3  # iter 102: pure softmax exploration for first 30% of training before introducing entmax sparsity pressure.
+    router_kind = "softmax"  # iter 100b promoted baseline. Iter 102 (entmax_anneal) NOT PROMOTED ✗ — val_bpb tracked iter 100b but +6.8% wallclock cost from entmax15 30-iter bisection. See H77. Options: "softmax", "sparsemax", "entmax15", "entmax_anneal".
+    router_alpha_warmup_delay_frac = 0.3  # unused at router_kind="softmax"; retained for entmax_anneal HP plumbing.
     # iter 100b (2026-04-27): per-token entropy penalty with ANNEALED schedule
     # + min_share_loss decoupled. iter 100 (entropy_coef=0.02 from step 0)
     # hit train_loss instability — penalty fights min_share_loss penalty
@@ -325,12 +325,19 @@ class Hyperparameters:
     # iters should dominate the total param gradient.  If the hypothesis
     # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
     deq_bptt_k = 2  # Phase 9 iter 69b: TBPTT=2 (middle ground — TBPTT=1 was +0.021 regression, TBPTT=4 is baseline)
-    # Iter 85 (2026-04-24): stochastic TBPTT — sample deq_bptt_k per step from
-    # the set below, analogous to K-jitter (H12 VERIFIED). Forces the model to
-    # be robust across gradient-truncation depths. The set's shuffle-bag
-    # sampler matches the β-jitter pattern.
-    deq_bptt_k_jitter = True
-    deq_bptt_k_jitter_set = (2, 3, 4)
+    # Iter 85 enabled stochastic TBPTT {2,3,4} as a K-jitter analog (H63
+    # PROMOTED ★ narrow margin). 2026-04-28 PROFILE-driven revert: H63 itself
+    # noted +0.0054 val_bpb regression vs fixed k=2 AND +21% throughput cost,
+    # and the dev profile run showed jitter (3 values) × K-jitter (3 values)
+    # = 9 unique compiled-graph variants, exceeding `_dynamo.config.recompile_limit
+    # = 8` and triggering per-step recompile thrash (~10-15s spikes mixed with
+    # cached steps). Disabling jitter recovers iter 84's val_bpb baseline,
+    # +21% throughput, AND eliminates the 3× cache-axis pressure from the K
+    # × TBPTT cross product. Sampler at L3737 short-circuits to `args.deq_bptt_k`
+    # when `deq_bptt_k_jitter=False` — the singleton set below is kept for
+    # state-dict / config compat.
+    deq_bptt_k_jitter = False
+    deq_bptt_k_jitter_set = (2,)
     # TBPTT investigation (28-28d) concluded; best point was 28c (val_bpb
     # 1.925, K=128 Δ=0.015 vs baseline 0.039).  Machinery retained in code
     # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
@@ -1328,7 +1335,10 @@ class SoftDenseRouter(nn.Module):
         with torch.no_grad():
             self.router_gate.weight.zero_()
             self.router_gate.bias.fill_(5.0)
-        self._router_gate_last_mean: float | None = None
+        # 0-d GPU tensor (or None) — see comment at the assignment site in `forward`.
+        # Stored on GPU to avoid the dynamo Python-float value-guard that triggered
+        # a per-step recompile of the compiled block.forward (profile, 2026-04-28).
+        self._router_gate_last_mean: Tensor | None = None
         self._mean_share_last: Tensor | None = None
         self._balance_loss = None
         self._health_loss = None
@@ -1492,8 +1502,18 @@ class SoftDenseRouter(nn.Module):
             p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
         gate_act = torch.sigmoid(self.router_gate(x_gate).float())
         p = (p_alloc * gate_act).to(dtype=x.dtype)
-        if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
-            self._router_gate_last_mean = float(gate_act.detach().mean().item())
+        # Diagnostic capture — store as 0-d GPU tensor (no `.item()`).
+        # `.item()` here triggered a dynamo graph break AND the resulting Python
+        # float was guard-captured by the outer compiled block.forward, causing a
+        # per-step recompile when the running batch stat changed (profile run
+        # 2026-04-28: dynamo log `[6/8] last reason: ... _router_gate_last_mean ==
+        # 0.9846050143241882`). Mirrors the iter 84 `_shared_gate_mean` pattern at
+        # L2388-2390. Materialization to Python float happens at log time
+        # (`format_expert_info`), which already calls `float(t)` for formatting.
+        # Always-on (no flag gate): mean reduction is negligible vs the recompile
+        # cost it eliminates, and removes the `_ROUTER_DIAGNOSTICS_ACTIVE` guard
+        # recompile axis at this site.
+        self._router_gate_last_mean = gate_act.detach().mean()
         if self.training:
             reduce_dims = tuple(range(p.ndim - 1))
             mean_mass = p.mean(dim=reduce_dims)
@@ -1719,7 +1739,9 @@ class CausalSelfAttention(nn.Module):
         self.k_nope_norm_weight = nn.Parameter(torch.ones(num_experts, self.nope_dim))
         self._out_ortho_cos_sim: float | None = None
         self._out_ortho_loss: Tensor | None = None
-        self._attn_gate_last_mean: float | None = None
+        # 0-d GPU tensor (or None) — same rationale as
+        # SoftDenseRouter._router_gate_last_mean (avoid dynamo Python-float guards).
+        self._attn_gate_last_mean: Tensor | None = None
 
     @staticmethod
     def _rms_scale(x: Tensor, weight: Tensor, *, expert_dim: int = 0, eps: float = 1e-6) -> Tensor:
@@ -1847,8 +1869,10 @@ class CausalSelfAttention(nn.Module):
         )
         y = y * gate_act
 
-        if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
-            self._attn_gate_last_mean = float(gate_act.detach().float().mean().item())
+        # 0-d GPU tensor; same pattern as SoftDenseRouter._router_gate_last_mean
+        # at L1496 — avoids dynamo per-step value-guard recompiles. Materialization
+        # to Python float happens at log time.
+        self._attn_gate_last_mean = gate_act.detach().float().mean()
 
         # --- Per-expert output projection Wo (low-rank, mixes heads) ---
         y = y.reshape(B, E, H, T, d).permute(0, 3, 1, 2, 4).reshape(B * T, E, D)
@@ -2274,10 +2298,14 @@ class Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
-        self._attn_gate_call_track: list[float] = []
-        self._router_gate_call_track: list[float] = []
-        self._attn_router_gate_call_track: list[float] = []
-        self._mlp_router_gate_call_track: list[float] = []
+        # Call-track lists hold 0-d GPU tensors (one per block.forward invocation
+        # under DEQ solve). Materialization to Python floats happens in
+        # `_run_solver_kernel`'s finally block, OUTSIDE the compiled forward —
+        # mirrors the `_attn_expert_weights_per_iter` pattern at L3041.
+        self._attn_gate_call_track: list[Tensor] = []
+        self._router_gate_call_track: list[Tensor] = []
+        self._attn_router_gate_call_track: list[Tensor] = []
+        self._mlp_router_gate_call_track: list[Tensor] = []
         # Per-expert routing weight per iteration (shows if experts specialize across
         # iters).  Stored as detached GPU tensors of shape (E,) — materialized to
         # Python lists once after the DEQ solve, NOT per-iter (CLAUDE.md §9
@@ -2435,13 +2463,17 @@ class Block(nn.Module):
             mlp_rg = attn_rg
             if mlp_rg is not None:
                 self._mlp_router_gate_call_track.append(mlp_rg)
-            rg_vals = []
+            # Combined router-gate (attn+mlp pair-mean) — kept as 0-d GPU tensor.
+            # `float(t)` here would `.item()`-sync inside the compiled forward;
+            # tensor pair-mean is fused with surrounding ops.
+            rg_vals: list[Tensor] = []
             if attn_rg is not None:
-                rg_vals.append(float(attn_rg))
+                rg_vals.append(attn_rg)
             if mlp_rg is not None:
-                rg_vals.append(float(mlp_rg))
+                rg_vals.append(mlp_rg)
             if rg_vals:
-                self._router_gate_call_track.append(sum(rg_vals) / float(len(rg_vals)))
+                avg_rg = rg_vals[0] if len(rg_vals) == 1 else 0.5 * (rg_vals[0] + rg_vals[1])
+                self._router_gate_call_track.append(avg_rg)
         return raw_out
 
 
@@ -3007,29 +3039,27 @@ class GPT(nn.Module):
         finally:
             _DEQ_SOLVE_ACTIVE = prev_deq_flag
             sb._diag_track_enabled = False
-            # Aggregate attn_gate per-iteration (1 call per block forward, 2 per iter)
-            ag_calls = list(getattr(sb, "_attn_gate_call_track", []) or [])
-            if len(ag_calls) == 2 * K:
-                self._attn_gate_iter_last_solve = [0.5 * (ag_calls[2*i] + ag_calls[2*i+1]) for i in range(K)]
-            else:
-                self._attn_gate_iter_last_solve = []
-            # Aggregate router_gate per-iteration (combined, backward compat)
-            rg_calls = list(getattr(sb, "_router_gate_call_track", []) or [])
-            if len(rg_calls) == 2 * K:
-                self._router_gate_iter_last_solve = [0.5 * (rg_calls[2*i] + rg_calls[2*i+1]) for i in range(K)]
-            else:
-                self._router_gate_iter_last_solve = []
-            # Per-component router gates (attn vs FFN)
-            attn_rg_calls = list(getattr(sb, "_attn_router_gate_call_track", []) or [])
-            if len(attn_rg_calls) == 2 * K:
-                self._attn_router_gate_iter_last_solve = [0.5 * (attn_rg_calls[2*i] + attn_rg_calls[2*i+1]) for i in range(K)]
-            else:
-                self._attn_router_gate_iter_last_solve = []
-            mlp_rg_calls = list(getattr(sb, "_mlp_router_gate_call_track", []) or [])
-            if len(mlp_rg_calls) == 2 * K:
-                self._mlp_router_gate_iter_last_solve = [0.5 * (mlp_rg_calls[2*i] + mlp_rg_calls[2*i+1]) for i in range(K)]
-            else:
-                self._mlp_router_gate_iter_last_solve = []
+            # Aggregate per-iteration gate stats. Producers (Block.forward,
+            # SoftDenseRouter.forward, CausalSelfAttention.forward) now store 0-d
+            # GPU tensors instead of Python floats — the materialization to floats
+            # happens HERE, outside the compiled forward, with one .item() per
+            # iteration (CLAUDE.md §9 "Hot-path sync prohibition"-compliant since
+            # this finally block runs after the K-iteration solver loop exits,
+            # not inside it).
+            def _materialize_pairs(track: list) -> list[float]:
+                if len(track) != 2 * K:
+                    return []
+                pairs = [0.5 * (track[2*i] + track[2*i+1]) for i in range(K)]
+                return [float(p.item()) if torch.is_tensor(p) else float(p) for p in pairs]
+
+            self._attn_gate_iter_last_solve = _materialize_pairs(
+                list(getattr(sb, "_attn_gate_call_track", []) or []))
+            self._router_gate_iter_last_solve = _materialize_pairs(
+                list(getattr(sb, "_router_gate_call_track", []) or []))
+            self._attn_router_gate_iter_last_solve = _materialize_pairs(
+                list(getattr(sb, "_attn_router_gate_call_track", []) or []))
+            self._mlp_router_gate_iter_last_solve = _materialize_pairs(
+                list(getattr(sb, "_mlp_router_gate_call_track", []) or []))
 
             # Per-expert routing weights per iteration (2 calls per iter: y-update,
             # z-update).  The producer at Block.forward stored each entry as a
@@ -3833,6 +3863,21 @@ def main() -> None:
     # Compiling the method avoids DDP graph expansion that caused the ~40 GB
     # workspace OOM with torch.compile(module).  Works with revdeq because
     # the VJP backward is a single block.forward call.  1.97× speedup, 4.4 GB.
+    # 2026-04-28 PROFILE-driven: raise dynamo's compile-cache size. Default 8
+    # was hit during dev runs by K-jitter (3 unique K values change the
+    # `_*_expert_weights_per_iter` list lengths and thus the graph variant) ×
+    # any other guard axis (e.g., `_diag_track_enabled` toggling at log
+    # boundaries). Hitting recompile_limit causes dynamo to fall back to eager
+    # mode for the offending frame, losing the `compiled block.forward` 1.97×
+    # speedup. Setting to 16 gives headroom for the 3 K-variants × eval/train
+    # mode × diagnostic-on/off = up to 12 expected slots without thrash.
+    # Setting both attribute names — recompile_limit is the current name in
+    # this PyTorch version (per the W0428 14:42:19 dynamo log message);
+    # cache_size_limit is the older alias.
+    for _attr in ("recompile_limit", "cache_size_limit"):
+        if hasattr(torch._dynamo.config, _attr):
+            setattr(torch._dynamo.config, _attr, 16)
+
     if not hasattr(base_model.shared_block, '_orig_mod'):  # not already full-compiled
         sb = base_model.shared_block
         try:
