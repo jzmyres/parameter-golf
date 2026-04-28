@@ -267,7 +267,11 @@ class Hyperparameters:
     # window boundary. Mitigation if regression: pair with sink_size > 0
     # (first sink_size tokens visible globally to all chunks via concat-on-K).
     attn_window_size = 256  # iter 104: 8x attention compute reduction at T=2048
-    attn_num_sinks = 4      # iter 104: StreamingLLM-style global anchors
+    attn_num_sinks = 0      # iter 104: sinks DISABLED for now — non-square attn_mask(W,S+W)
+                            # rejected by SDPA under torch.compile dynamo trace
+                            # ('Invalid backend'). Sinks deferred to iter 104b with
+                            # a static sdpa_kernel(MATH) wrapper. Pure block-causal
+                            # at W=256 keeps the 8× throughput claim with is_causal=True.
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
@@ -1030,79 +1034,92 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
-def block_causal_sdpa(
-    q: Tensor, k: Tensor, v: Tensor, window_size: int, num_sinks: int = 0,
+_FLEX_ATTENTION_AVAILABLE = False
+_flex_attention = None
+_create_block_mask = None
+try:
+    from torch.nn.attention.flex_attention import (
+        flex_attention as _flex_attention,
+        create_block_mask as _create_block_mask,
+    )
+    _FLEX_ATTENTION_AVAILABLE = True
+except ImportError:
+    pass
+
+# Cache compiled flex_attention to enable the FA-style fused Triton kernel
+# (without compile, flex_attention materializes full scores per the runtime
+# warning). Compile is per-call for safety; torch caches the compiled artifact.
+_flex_attention_compiled = (
+    torch.compile(_flex_attention, dynamic=False)
+    if _FLEX_ATTENTION_AVAILABLE else None
+)
+
+# Block-mask cache: sliding-window patterns are pure functions of (T, W) so we
+# compute them once per shape and reuse. Keyed by (T, W, device).
+_block_mask_cache: dict[tuple[int, int, str], object] = {}
+
+
+def _build_sliding_window_block_mask(T: int, window_size: int, device):
+    """Sliding-window causal block_mask for flex_attention. Each query Q[i]
+    attends only to keys K[max(0, i-W+1):i+1]. Block-mask granularity gives
+    FA-level efficiency: under torch.compile, masked blocks are skipped at
+    the kernel level (genuine sparse compute, not compute-then-mask)."""
+    if not _FLEX_ATTENTION_AVAILABLE:
+        return None
+    key = (T, window_size, str(device))
+    if key in _block_mask_cache:
+        return _block_mask_cache[key]
+    def sliding_window_causal(b, h, q_idx, kv_idx):
+        causal = q_idx >= kv_idx
+        within_window = (q_idx - kv_idx) < window_size
+        return causal & within_window
+    bm = _create_block_mask(
+        sliding_window_causal, B=None, H=None, Q_LEN=T, KV_LEN=T,
+        device=str(device), _compile=True,
+    )
+    _block_mask_cache[key] = bm
+    return bm
+
+
+def sliding_window_attention(
+    q: Tensor, k: Tensor, v: Tensor, window_size: int,
     enable_gqa: bool = False,
 ) -> Tensor:
-    """Block-causal sliding-window SDPA for iter 104.
+    """Sliding-window attention via torch.nn.attention.flex_attention.
 
-    Each query in chunk c attends only within chunk c (and optionally the
-    first ``num_sinks`` keys of chunk 0, broadcast to all chunks). Throughput:
-    O(T·(W+S)) instead of O(T²). At T=2048, W=256, S=4 the attention compute
-    is ~8× lower than dense causal. Skip-sparse-entries comes from the
-    reshape-flatten-SDPA pattern: the chunk dimension is folded into the
-    batch dimension so no compute is spent on cross-chunk pairs.
+    Keeps the MLA + head-packed pattern intact — same q/k/v shapes as the
+    dense path. Only the SDPA primitive changes. The block_mask drives a
+    sparse Triton kernel (under torch.compile) that genuinely SKIPS masked
+    blocks rather than computing and masking. Throughput: O(T·W) attention
+    compute vs O(T²); at T=2048, W=256 → ~8× attention speedup.
 
     q: (B, H,    T, d_q)
     k: (B, H_kv, T, d_k)
     v: (B, H_kv, T, d_v)
-    Returns: (B, H, T, d_v).
-
-    Requires T % window_size == 0. Falls back to dense SDPA if not divisible.
+    Falls back to dense causal SDPA if flex_attention unavailable or T<=W.
     """
-    B, H, T, d_q = q.shape
+    B, H, T, _ = q.shape
     H_kv = k.size(1)
-    if window_size <= 0 or T % window_size != 0 or T <= window_size:
-        # Fallback to dense causal SDPA (block size larger than seq → no gain).
+    if (
+        not _FLEX_ATTENTION_AVAILABLE
+        or window_size <= 0
+        or T <= window_size
+    ):
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=True, enable_gqa=enable_gqa,
         )
-    n = T // window_size
-    W = window_size
-    # (B, H, n, W, d) → flatten chunk dim into batch so SDPA runs per chunk.
-    q_b = q.reshape(B, H, n, W, d_q).flatten(0, 2)        # (B*H*n, W, d_q)
-    k_b = k.reshape(B, H_kv, n, W, k.size(-1)).flatten(0, 2)  # (B*H_kv*n, W, d_k)
-    v_b = v.reshape(B, H_kv, n, W, v.size(-1)).flatten(0, 2)  # (B*H_kv*n, W, d_v)
+    # GQA: flex_attention uses a kv_idx that already maps via H_kv ratio if we
+    # replicate explicitly. Cheaper to expand non-contiguously here.
     if enable_gqa and H_kv != H:
-        # Replicate KV across query heads (FA's enable_gqa works on dim=1; we
-        # replicate manually here since the chunked tensors have flattened batch).
         rep = H // H_kv
-        # Re-shape so we can interleave: (B, H_kv, n, W, d) → (B, H, n, W, d)
-        k_full = k.reshape(B, H_kv, n, W, k.size(-1)).repeat_interleave(rep, dim=1)
-        v_full = v.reshape(B, H_kv, n, W, v.size(-1)).repeat_interleave(rep, dim=1)
-        k_b = k_full.flatten(0, 2)
-        v_b = v_full.flatten(0, 2)
-    if num_sinks > 0 and num_sinks < W:
-        # Prepend first num_sinks keys of CHUNK 0 to every chunk (StreamingLLM-style
-        # global anchor). For chunk 0 this duplicates positions 0..S-1 → harmless
-        # since causal mask within (S+W) keeps each query at the right position.
-        sinks_k = k.reshape(B, H_kv, n, W, k.size(-1))[:, :, 0:1, :num_sinks, :]
-        sinks_v = v.reshape(B, H_kv, n, W, v.size(-1))[:, :, 0:1, :num_sinks, :]
-        sinks_k = sinks_k.expand(-1, -1, n, -1, -1)
-        sinks_v = sinks_v.expand(-1, -1, n, -1, -1)
-        if enable_gqa and H_kv != H:
-            rep = H // H_kv
-            sinks_k = sinks_k.repeat_interleave(rep, dim=1)
-            sinks_v = sinks_v.repeat_interleave(rep, dim=1)
-        sinks_k_b = sinks_k.flatten(0, 2)  # (B*H*n, S, d_k)
-        sinks_v_b = sinks_v.flatten(0, 2)
-        k_b = torch.cat([sinks_k_b, k_b], dim=1)  # (B*H*n, S+W, d_k)
-        v_b = torch.cat([sinks_v_b, v_b], dim=1)
-        # Mask: queries (W positions) attend to all S sinks + causal within W chunk.
-        # SDPA's is_causal flag implies square attention; with non-square here we
-        # build an explicit mask of shape (W, S+W).
-        device = q.device
-        i = torch.arange(W, device=device)
-        j = torch.arange(W, device=device)
-        causal_chunk = i.unsqueeze(1) >= j.unsqueeze(0)  # (W, W)
-        sinks_visible = torch.ones(W, num_sinks, dtype=torch.bool, device=device)
-        attn_mask = torch.cat([sinks_visible, causal_chunk], dim=1)  # (W, S+W)
-        y_b = F.scaled_dot_product_attention(
-            q_b, k_b, v_b, attn_mask=attn_mask, is_causal=False,
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+    block_mask = _build_sliding_window_block_mask(T, window_size, q.device)
+    if block_mask is None:
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=enable_gqa,
         )
-    else:
-        y_b = F.scaled_dot_product_attention(q_b, k_b, v_b, is_causal=True)
-    return y_b.reshape(B, H, n, W, -1).reshape(B, H, T, -1)
+    return _flex_attention_compiled(q, k, v, block_mask=block_mask)
 
 
 def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
@@ -1808,28 +1825,19 @@ class CausalSelfAttention(nn.Module):
         v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
 
         # --- Head-packed SDPA ---
-        # iter 104: optional block-causal sliding window. When attn_window_size > 0
-        # and seq_len divisible, use block_causal_sdpa for ~T/W× attention speedup.
-        if self.attn_window_size > 0 and T > self.attn_window_size and T % self.attn_window_size == 0:
-            try:
-                y = block_causal_sdpa(
-                    q_full, k_full, v_full,
-                    window_size=self.attn_window_size,
-                    num_sinks=self.attn_num_sinks,
-                    enable_gqa=(H_kv != H),
-                )
-            except TypeError:
-                k_use, v_use = k_full, v_full
-                if H_kv != H:
-                    rep = H // H_kv
-                    k_use = k_full.repeat_interleave(rep, dim=1)
-                    v_use = v_full.repeat_interleave(rep, dim=1)
-                y = block_causal_sdpa(
-                    q_full, k_use, v_use,
-                    window_size=self.attn_window_size,
-                    num_sinks=self.attn_num_sinks,
-                    enable_gqa=False,
-                )
+        # iter 104: optional sliding-window attention via flex_attention. Keeps
+        # MLA + head-packed pattern intact (same q_full/k_full/v_full shapes);
+        # only the SDPA primitive changes. block_mask drives a sparse Triton
+        # kernel under torch.compile that genuinely SKIPS masked blocks
+        # (kernel-level skip, not compute-then-mask). At T=2048, W=256 → ~8×
+        # attention speedup. Falls back to dense causal SDPA if window_size=0
+        # or T<=W or flex_attention unavailable.
+        if self.attn_window_size > 0 and T > self.attn_window_size:
+            y = sliding_window_attention(
+                q_full, k_full, v_full,
+                window_size=self.attn_window_size,
+                enable_gqa=(H_kv != H),
+            )
         else:
             try:
                 y = F.scaled_dot_product_attention(
