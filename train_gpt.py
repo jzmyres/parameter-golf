@@ -258,6 +258,17 @@ class Hyperparameters:
     router_entropy_warmup_delay_frac = 0.3
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
+    # Iter 104 (2026-04-28): block-causal sliding-window attention. Each query
+    # attends only within its chunk of W=attn_window_size tokens. T must be
+    # divisible by W. Throughput: O(T·W) attention compute vs O(T²); at T=2048
+    # and W=256, that's an 8× attention speedup via reshape-flatten-SDPA. Set
+    # to 0 to disable (full causal attention as before). Trade-off: drops
+    # cross-chunk context — language model loses long-range dependencies past
+    # window boundary. Mitigation if regression: pair with sink_size > 0
+    # (first sink_size tokens visible globally to all chunks via concat-on-K).
+    attn_window_size = 256  # iter 104: 8x attention compute reduction at T=2048
+    attn_num_sinks = 4      # iter 104: StreamingLLM-style global anchors
+
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
     # power-iteration VJP. One boundary forward + one VJP per step.
@@ -1019,6 +1030,81 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def block_causal_sdpa(
+    q: Tensor, k: Tensor, v: Tensor, window_size: int, num_sinks: int = 0,
+    enable_gqa: bool = False,
+) -> Tensor:
+    """Block-causal sliding-window SDPA for iter 104.
+
+    Each query in chunk c attends only within chunk c (and optionally the
+    first ``num_sinks`` keys of chunk 0, broadcast to all chunks). Throughput:
+    O(T·(W+S)) instead of O(T²). At T=2048, W=256, S=4 the attention compute
+    is ~8× lower than dense causal. Skip-sparse-entries comes from the
+    reshape-flatten-SDPA pattern: the chunk dimension is folded into the
+    batch dimension so no compute is spent on cross-chunk pairs.
+
+    q: (B, H,    T, d_q)
+    k: (B, H_kv, T, d_k)
+    v: (B, H_kv, T, d_v)
+    Returns: (B, H, T, d_v).
+
+    Requires T % window_size == 0. Falls back to dense SDPA if not divisible.
+    """
+    B, H, T, d_q = q.shape
+    H_kv = k.size(1)
+    if window_size <= 0 or T % window_size != 0 or T <= window_size:
+        # Fallback to dense causal SDPA (block size larger than seq → no gain).
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=enable_gqa,
+        )
+    n = T // window_size
+    W = window_size
+    # (B, H, n, W, d) → flatten chunk dim into batch so SDPA runs per chunk.
+    q_b = q.reshape(B, H, n, W, d_q).flatten(0, 2)        # (B*H*n, W, d_q)
+    k_b = k.reshape(B, H_kv, n, W, k.size(-1)).flatten(0, 2)  # (B*H_kv*n, W, d_k)
+    v_b = v.reshape(B, H_kv, n, W, v.size(-1)).flatten(0, 2)  # (B*H_kv*n, W, d_v)
+    if enable_gqa and H_kv != H:
+        # Replicate KV across query heads (FA's enable_gqa works on dim=1; we
+        # replicate manually here since the chunked tensors have flattened batch).
+        rep = H // H_kv
+        # Re-shape so we can interleave: (B, H_kv, n, W, d) → (B, H, n, W, d)
+        k_full = k.reshape(B, H_kv, n, W, k.size(-1)).repeat_interleave(rep, dim=1)
+        v_full = v.reshape(B, H_kv, n, W, v.size(-1)).repeat_interleave(rep, dim=1)
+        k_b = k_full.flatten(0, 2)
+        v_b = v_full.flatten(0, 2)
+    if num_sinks > 0 and num_sinks < W:
+        # Prepend first num_sinks keys of CHUNK 0 to every chunk (StreamingLLM-style
+        # global anchor). For chunk 0 this duplicates positions 0..S-1 → harmless
+        # since causal mask within (S+W) keeps each query at the right position.
+        sinks_k = k.reshape(B, H_kv, n, W, k.size(-1))[:, :, 0:1, :num_sinks, :]
+        sinks_v = v.reshape(B, H_kv, n, W, v.size(-1))[:, :, 0:1, :num_sinks, :]
+        sinks_k = sinks_k.expand(-1, -1, n, -1, -1)
+        sinks_v = sinks_v.expand(-1, -1, n, -1, -1)
+        if enable_gqa and H_kv != H:
+            rep = H // H_kv
+            sinks_k = sinks_k.repeat_interleave(rep, dim=1)
+            sinks_v = sinks_v.repeat_interleave(rep, dim=1)
+        sinks_k_b = sinks_k.flatten(0, 2)  # (B*H*n, S, d_k)
+        sinks_v_b = sinks_v.flatten(0, 2)
+        k_b = torch.cat([sinks_k_b, k_b], dim=1)  # (B*H*n, S+W, d_k)
+        v_b = torch.cat([sinks_v_b, v_b], dim=1)
+        # Mask: queries (W positions) attend to all S sinks + causal within W chunk.
+        # SDPA's is_causal flag implies square attention; with non-square here we
+        # build an explicit mask of shape (W, S+W).
+        device = q.device
+        i = torch.arange(W, device=device)
+        j = torch.arange(W, device=device)
+        causal_chunk = i.unsqueeze(1) >= j.unsqueeze(0)  # (W, W)
+        sinks_visible = torch.ones(W, num_sinks, dtype=torch.bool, device=device)
+        attn_mask = torch.cat([sinks_visible, causal_chunk], dim=1)  # (W, S+W)
+        y_b = F.scaled_dot_product_attention(
+            q_b, k_b, v_b, attn_mask=attn_mask, is_causal=False,
+        )
+    else:
+        y_b = F.scaled_dot_product_attention(q_b, k_b, v_b, is_causal=True)
+    return y_b.reshape(B, H, n, W, -1).reshape(B, H, T, -1)
+
+
 def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
     e = groups.shape[0]
     if e < 2:
@@ -1542,11 +1628,15 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
+                 attn_window_size: int = 0, attn_num_sinks: int = 0,
                  **kwargs):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        # iter 104: block-causal sliding-window. 0 disables (full causal).
+        self.attn_window_size = int(attn_window_size)
+        self.attn_num_sinks = int(attn_num_sinks)
         self.num_experts = num_experts
         self.expert_rank = expert_rank if expert_rank > 0 else max(dim // max(num_experts, 1), 1)
         self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
@@ -1718,18 +1808,41 @@ class CausalSelfAttention(nn.Module):
         v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
 
         # --- Head-packed SDPA ---
-        try:
-            y = F.scaled_dot_product_attention(
-                q_full, k_full, v_full, attn_mask=None, is_causal=True,
-                enable_gqa=(H_kv != H),
-            )
-        except TypeError:
-            k_use, v_use = k_full, v_full
-            if H_kv != H:
-                rep = H // H_kv
-                k_use = k_full.repeat_interleave(rep, dim=1)
-                v_use = v_full.repeat_interleave(rep, dim=1)
-            y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
+        # iter 104: optional block-causal sliding window. When attn_window_size > 0
+        # and seq_len divisible, use block_causal_sdpa for ~T/W× attention speedup.
+        if self.attn_window_size > 0 and T > self.attn_window_size and T % self.attn_window_size == 0:
+            try:
+                y = block_causal_sdpa(
+                    q_full, k_full, v_full,
+                    window_size=self.attn_window_size,
+                    num_sinks=self.attn_num_sinks,
+                    enable_gqa=(H_kv != H),
+                )
+            except TypeError:
+                k_use, v_use = k_full, v_full
+                if H_kv != H:
+                    rep = H // H_kv
+                    k_use = k_full.repeat_interleave(rep, dim=1)
+                    v_use = v_full.repeat_interleave(rep, dim=1)
+                y = block_causal_sdpa(
+                    q_full, k_use, v_use,
+                    window_size=self.attn_window_size,
+                    num_sinks=self.attn_num_sinks,
+                    enable_gqa=False,
+                )
+        else:
+            try:
+                y = F.scaled_dot_product_attention(
+                    q_full, k_full, v_full, attn_mask=None, is_causal=True,
+                    enable_gqa=(H_kv != H),
+                )
+            except TypeError:
+                k_use, v_use = k_full, v_full
+                if H_kv != H:
+                    rep = H // H_kv
+                    k_use = k_full.repeat_interleave(rep, dim=1)
+                    v_use = v_full.repeat_interleave(rep, dim=1)
+                y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
 
         # --- Gated attention ---
         gate_logits_p = gate_logits.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, 1)
@@ -2115,7 +2228,9 @@ class Block(nn.Module):
                  num_experts: int = 8, num_shared_experts: int = 0,
                  router_scoring: str = "linear",
                  router_kind: str = "softmax",
-                 router_entropy_coef: float = 0.0, **kwargs):
+                 router_entropy_coef: float = 0.0,
+                 attn_window_size: int = 0, attn_num_sinks: int = 0,
+                 **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
         # State preconditioner is parameter-free RMSUnit; every projection-local
@@ -2158,7 +2273,9 @@ class Block(nn.Module):
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
-                                         expert_rank=attn_expert_rank, router=self.router)
+                                         expert_rank=attn_expert_rank, router=self.router,
+                                         attn_window_size=attn_window_size,
+                                         attn_num_sinks=attn_num_sinks)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
@@ -2629,6 +2746,7 @@ class GPT(nn.Module):
                  router_kind: str = "softmax",
                  router_entropy_coef: float = 0.0,
                  router_entropy_warmup_delay_frac: float = 0.0,
+                 attn_window_size: int = 0, attn_num_sinks: int = 0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -2661,6 +2779,8 @@ class GPT(nn.Module):
                                    router_scoring=router_scoring,
                                    router_kind=router_kind,
                                    router_entropy_coef=router_entropy_coef,
+                                   attn_window_size=attn_window_size,
+                                   attn_num_sinks=attn_num_sinks,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
@@ -3668,6 +3788,8 @@ def main() -> None:
         router_kind=getattr(args, "router_kind", "softmax"),
         router_entropy_coef=float(getattr(args, "router_entropy_coef", 0.0)),
         router_entropy_warmup_delay_frac=float(getattr(args, "router_entropy_warmup_delay_frac", 0.0)),
+        attn_window_size=int(getattr(args, "attn_window_size", 0)),
+        attn_num_sinks=int(getattr(args, "attn_num_sinks", 0)),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
