@@ -667,6 +667,17 @@ def run_validation(args, model, rank, world_size, device, grad_accum_steps,
     model.train(False)
     base_m = _unwrap_compiled_module(model)
     k = int(deq_k if deq_k is not None else getattr(args, "deq_k_eval", base_m.num_layers))
+    # Option G2 attempt (2026-04-28) — REVERTED. Wrapping val in
+    # `torch._dynamo.config.disable=True` would have eliminated the grad_mode
+    # toggle as a recompile axis, but the global config flip disrupted the
+    # compile-cache state across val→train transitions, forcing a fresh
+    # compile of block.forward at training step 1 with K=24, which spiked peak
+    # VRAM over the 44 GiB cap → OOM at the RevDEQ backward (profile_v8). Fix
+    # #5a's 0 recompile_limit hits already provided sufficient cache headroom
+    # (12 of 16 slots used), so G2's marginal benefit (further reduce to ~6
+    # slots) wasn't worth the OOM risk. Keeping the val path as-is —
+    # `torch.inference_mode()` triggers ONE cache slot for the eval graph,
+    # which is bounded and fits comfortably under recompile_limit=16.
     try:
         with _temporary_deq_k_override(base_m, k):
             with torch.inference_mode():
@@ -4016,6 +4027,16 @@ def main() -> None:
     if not hasattr(base_model.shared_block, '_orig_mod'):  # not already full-compiled
         sb = base_model.shared_block
         try:
+            # Option A test (2026-04-28) FAILED — dynamic=True crashed at val_loss
+            # eval under DDP with `BackendCompilerFailed: AttributeError: 'int'
+            # object has no attribute 'meta'` (aot_autograd inference-compile
+            # pre_compile pass at runtime_wrappers.py:577). Known pytorch issue
+            # for the dynamic=True + DDP + aot_autograd inference path. Smoke
+            # test PASSED on single-GPU (no DDP), masking the bug. Reverted to
+            # dynamic=False — keeps the static-shape Inductor optimizations and
+            # avoids the DDP interaction. The 12 cache slots (2 K × 2 grad_mode
+            # × 3 graph types) fit comfortably under recompile_limit=16 since
+            # Fix #5a, so cache simplification is no longer pressing.
             sb.forward = torch.compile(sb.forward, dynamic=False)
             log0("compiled block.forward (1.97× speedup, fused router→attn→MLP)")
         except Exception as e:
