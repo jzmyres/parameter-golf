@@ -258,20 +258,26 @@ class Hyperparameters:
     router_entropy_warmup_delay_frac = 0.3
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
-    # Iter 104 (2026-04-28): block-causal sliding-window attention. Each query
-    # attends only within its chunk of W=attn_window_size tokens. T must be
-    # divisible by W. Throughput: O(T·W) attention compute vs O(T²); at T=2048
-    # and W=256, that's an 8× attention speedup via reshape-flatten-SDPA. Set
-    # to 0 to disable (full causal attention as before). Trade-off: drops
-    # cross-chunk context — language model loses long-range dependencies past
-    # window boundary. Mitigation if regression: pair with sink_size > 0
-    # (first sink_size tokens visible globally to all chunks via concat-on-K).
-    attn_window_size = 256  # iter 104: 8x attention compute reduction at T=2048
-    attn_num_sinks = 0      # iter 104: sinks DISABLED for now — non-square attn_mask(W,S+W)
-                            # rejected by SDPA under torch.compile dynamo trace
-                            # ('Invalid backend'). Sinks deferred to iter 104b with
-                            # a static sdpa_kernel(MATH) wrapper. Pure block-causal
-                            # at W=256 keeps the 8× throughput claim with is_causal=True.
+    # Iter 104 (2026-04-28, REVISED v3): AdaSplash α-entmax attention. Replaces
+    # softmax with α-entmax (Peters 2019), producing exact zeros in attention
+    # weights → real adaptive sparsity. Uses AdaSplash's fused Triton kernel
+    # (deep-spin/adasplash, ICML 2025, arxiv 2502.12082) for kernel-level skip
+    # of zero entries. Genuine "sparse attention with FA-level efficiency".
+    #
+    # Anneal α from 1.0 (softmax) to attn_alpha_target (e.g. 1.5) over training
+    # to avoid the cold-start trap that hurt iter 99 (sparsemax α=2 from step 0,
+    # H74) and iter 101 (entmax α=1.5 from step 0, H75). Schedule mirrors
+    # router_entropy_warmup_delay_frac per feedback_anneal_sparsity_coefs.md:
+    #   if time_frac < warmup_delay → α = 1.0 (pure softmax exploration)
+    #   else                       → α = 1.0 + (target − 1.0) × ramp(time_frac)
+    #
+    # Sliding window (prior v2 design) explicitly REJECTED by user directive
+    # 2026-04-28: "sliding window would significantly hurt long sequence
+    # performance which should never be used alone". AdaSplash's adaptive
+    # sparsity is learned per-query and preserves long-range dependencies.
+    attn_alpha_target = 1.5             # 1.0 = softmax (off), >1.0 = α-entmax
+    attn_alpha_warmup_delay_frac = 0.3  # pure softmax for first 30% of training
+    attn_alpha_niter = 10               # entmax bisection iterations (AdaSplash default)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
@@ -1034,92 +1040,50 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
-_FLEX_ATTENTION_AVAILABLE = False
-_flex_attention = None
-_create_block_mask = None
+_ADASPLASH_AVAILABLE = False
+_adasplash_attention = None
 try:
-    from torch.nn.attention.flex_attention import (
-        flex_attention as _flex_attention,
-        create_block_mask as _create_block_mask,
-    )
-    _FLEX_ATTENTION_AVAILABLE = True
+    from adasplash import adasplash as _adasplash_attention
+    _ADASPLASH_AVAILABLE = True
 except ImportError:
     pass
 
-# Cache compiled flex_attention to enable the FA-style fused Triton kernel
-# (without compile, flex_attention materializes full scores per the runtime
-# warning). Compile is per-call for safety; torch caches the compiled artifact.
-_flex_attention_compiled = (
-    torch.compile(_flex_attention, dynamic=False)
-    if _FLEX_ATTENTION_AVAILABLE else None
-)
 
-# Block-mask cache: sliding-window patterns are pure functions of (T, W) so we
-# compute them once per shape and reuse. Keyed by (T, W, device).
-_block_mask_cache: dict[tuple[int, int, str], object] = {}
-
-
-def _build_sliding_window_block_mask(T: int, window_size: int, device):
-    """Sliding-window causal block_mask for flex_attention. Each query Q[i]
-    attends only to keys K[max(0, i-W+1):i+1]. Block-mask granularity gives
-    FA-level efficiency: under torch.compile, masked blocks are skipped at
-    the kernel level (genuine sparse compute, not compute-then-mask)."""
-    if not _FLEX_ATTENTION_AVAILABLE:
-        return None
-    key = (T, window_size, str(device))
-    if key in _block_mask_cache:
-        return _block_mask_cache[key]
-    def sliding_window_causal(b, h, q_idx, kv_idx):
-        causal = q_idx >= kv_idx
-        within_window = (q_idx - kv_idx) < window_size
-        return causal & within_window
-    bm = _create_block_mask(
-        sliding_window_causal, B=None, H=None, Q_LEN=T, KV_LEN=T,
-        device=str(device), _compile=True,
-    )
-    _block_mask_cache[key] = bm
-    return bm
-
-
-def sliding_window_attention(
-    q: Tensor, k: Tensor, v: Tensor, window_size: int,
+def adasplash_alpha_entmax_attention(
+    q: Tensor, k: Tensor, v: Tensor, alpha: float, niter: int = 10,
     enable_gqa: bool = False,
 ) -> Tensor:
-    """Sliding-window attention via torch.nn.attention.flex_attention.
+    """α-entmax attention via AdaSplash's fused Triton kernel (Peters 2019,
+    ICML 2025 arxiv 2502.12082). Replaces softmax with α-entmax which produces
+    EXACT ZEROS in attention weights — real adaptive sparsity. The fused
+    Triton kernel skips zero entries at the kernel level → kernel-level skip
+    + FA-style efficiency. At α=1.0 reduces to softmax (no sparsity); at
+    α=1.5 produces moderate sparsity; α=2.0 = sparsemax (top-1 trap risk).
 
-    Keeps the MLA + head-packed pattern intact — same q/k/v shapes as the
-    dense path. Only the SDPA primitive changes. The block_mask drives a
-    sparse Triton kernel (under torch.compile) that genuinely SKIPS masked
-    blocks rather than computing and masking. Throughput: O(T·W) attention
-    compute vs O(T²); at T=2048, W=256 → ~8× attention speedup.
+    Keeps MLA + head-packed pattern intact — same q/k/v shapes as the dense
+    path. AdaSplash supports GQA natively (H_kv < H broadcasts internally).
 
-    q: (B, H,    T, d_q)
-    k: (B, H_kv, T, d_k)
-    v: (B, H_kv, T, d_v)
-    Falls back to dense causal SDPA if flex_attention unavailable or T<=W.
+    q: (B, H,    T, d_q) bf16
+    k: (B, H_kv, T, d_k) bf16
+    v: (B, H_kv, T, d_v) bf16
+    alpha: 1.0 → 2.0 (1.0 = softmax fallback, dense)
+
+    Falls back to dense causal SDPA if adasplash unavailable or alpha <= 1.0.
     """
-    B, H, T, _ = q.shape
-    H_kv = k.size(1)
-    if (
-        not _FLEX_ATTENTION_AVAILABLE
-        or window_size <= 0
-        or T <= window_size
-    ):
+    if not _ADASPLASH_AVAILABLE or alpha <= 1.0:
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=True, enable_gqa=enable_gqa,
         )
-    # GQA: flex_attention uses a kv_idx that already maps via H_kv ratio if we
-    # replicate explicitly. Cheaper to expand non-contiguously here.
-    if enable_gqa and H_kv != H:
-        rep = H // H_kv
-        k = k.repeat_interleave(rep, dim=1)
-        v = v.repeat_interleave(rep, dim=1)
-    block_mask = _build_sliding_window_block_mask(T, window_size, q.device)
-    if block_mask is None:
-        return F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, enable_gqa=enable_gqa,
-        )
-    return _flex_attention_compiled(q, k, v, block_mask=block_mask)
+    # AdaSplash requires consistent dtype across q/k/v (bf16 path is the
+    # supported one in the published Triton kernel).
+    target_dtype = v.dtype
+    if q.dtype != target_dtype:
+        q = q.to(target_dtype)
+    if k.dtype != target_dtype:
+        k = k.to(target_dtype)
+    return _adasplash_attention(
+        q, k, v, alpha=float(alpha), is_causal=True, niter=int(niter),
+    )
 
 
 def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
@@ -1645,15 +1609,18 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
-                 attn_window_size: int = 0, attn_num_sinks: int = 0,
+                 attn_alpha_target: float = 1.0, attn_alpha_niter: int = 10,
                  **kwargs):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        # iter 104: block-causal sliding-window. 0 disables (full causal).
-        self.attn_window_size = int(attn_window_size)
-        self.attn_num_sinks = int(attn_num_sinks)
+        # iter 104 v3: AdaSplash α-entmax. _attn_alpha is the CURRENT α value,
+        # mutated by the training loop's annealing schedule. Defaults to 1.0
+        # (softmax fallback) until warmup_delay_frac elapses.
+        self.attn_alpha_target = float(attn_alpha_target)
+        self.attn_alpha_niter = int(attn_alpha_niter)
+        self._attn_alpha = 1.0
         self.num_experts = num_experts
         self.expert_rank = expert_rank if expert_rank > 0 else max(dim // max(num_experts, 1), 1)
         self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
@@ -1825,17 +1792,18 @@ class CausalSelfAttention(nn.Module):
         v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
 
         # --- Head-packed SDPA ---
-        # iter 104: optional sliding-window attention via flex_attention. Keeps
-        # MLA + head-packed pattern intact (same q_full/k_full/v_full shapes);
-        # only the SDPA primitive changes. block_mask drives a sparse Triton
-        # kernel under torch.compile that genuinely SKIPS masked blocks
-        # (kernel-level skip, not compute-then-mask). At T=2048, W=256 → ~8×
-        # attention speedup. Falls back to dense causal SDPA if window_size=0
-        # or T<=W or flex_attention unavailable.
-        if self.attn_window_size > 0 and T > self.attn_window_size:
-            y = sliding_window_attention(
+        # iter 104 v3: AdaSplash α-entmax attention (Peters 2019; ICML 2025).
+        # Replaces softmax with α-entmax → exact zeros in attention weights →
+        # adaptive learned sparsity, fused Triton kernel skips zero entries.
+        # When α=1.0 (init or off), reduces to dense softmax via fallback.
+        # Annealed: parent SharedBlock writes self._attn_alpha from training
+        # loop (1.0 during pre-warmup, ramping to attn_alpha_target after
+        # warmup_delay_frac). Avoids cold-start trap that hurt iter 99/101.
+        current_alpha = float(getattr(self, "_attn_alpha", 1.0))
+        if current_alpha > 1.0:
+            y = adasplash_alpha_entmax_attention(
                 q_full, k_full, v_full,
-                window_size=self.attn_window_size,
+                alpha=current_alpha, niter=int(self.attn_alpha_niter),
                 enable_gqa=(H_kv != H),
             )
         else:
@@ -2237,7 +2205,7 @@ class Block(nn.Module):
                  router_scoring: str = "linear",
                  router_kind: str = "softmax",
                  router_entropy_coef: float = 0.0,
-                 attn_window_size: int = 0, attn_num_sinks: int = 0,
+                 attn_alpha_target: float = 1.0, attn_alpha_niter: int = 10,
                  **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
@@ -2282,8 +2250,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
                                          expert_rank=attn_expert_rank, router=self.router,
-                                         attn_window_size=attn_window_size,
-                                         attn_num_sinks=attn_num_sinks)
+                                         attn_alpha_target=attn_alpha_target,
+                                         attn_alpha_niter=attn_alpha_niter)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
@@ -2754,7 +2722,9 @@ class GPT(nn.Module):
                  router_kind: str = "softmax",
                  router_entropy_coef: float = 0.0,
                  router_entropy_warmup_delay_frac: float = 0.0,
-                 attn_window_size: int = 0, attn_num_sinks: int = 0,
+                 attn_alpha_target: float = 1.0,
+                 attn_alpha_warmup_delay_frac: float = 0.3,
+                 attn_alpha_niter: int = 10,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -2773,6 +2743,9 @@ class GPT(nn.Module):
         # dynamically per-step via these values.
         self._router_entropy_coef_target = float(router_entropy_coef)
         self._router_entropy_warmup_delay_frac = float(router_entropy_warmup_delay_frac)
+        # iter 104 v3: AdaSplash α-entmax target + anneal schedule.
+        self._attn_alpha_target = float(attn_alpha_target)
+        self._attn_alpha_warmup_delay_frac = float(attn_alpha_warmup_delay_frac)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -2787,8 +2760,8 @@ class GPT(nn.Module):
                                    router_scoring=router_scoring,
                                    router_kind=router_kind,
                                    router_entropy_coef=router_entropy_coef,
-                                   attn_window_size=attn_window_size,
-                                   attn_num_sinks=attn_num_sinks,
+                                   attn_alpha_target=attn_alpha_target,
+                                   attn_alpha_niter=attn_alpha_niter,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
@@ -3796,8 +3769,9 @@ def main() -> None:
         router_kind=getattr(args, "router_kind", "softmax"),
         router_entropy_coef=float(getattr(args, "router_entropy_coef", 0.0)),
         router_entropy_warmup_delay_frac=float(getattr(args, "router_entropy_warmup_delay_frac", 0.0)),
-        attn_window_size=int(getattr(args, "attn_window_size", 0)),
-        attn_num_sinks=int(getattr(args, "attn_num_sinks", 0)),
+        attn_alpha_target=float(getattr(args, "attn_alpha_target", 1.0)),
+        attn_alpha_warmup_delay_frac=float(getattr(args, "attn_alpha_warmup_delay_frac", 0.3)),
+        attn_alpha_niter=int(getattr(args, "attn_alpha_niter", 10)),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
@@ -4136,6 +4110,17 @@ def main() -> None:
             else:
                 ent_scale = min(max((time_frac - ent_delay) / max(1.0 - ent_delay, 1e-8), 0.0), 1.0)
             sb.router.entropy_coef = ent_target * ent_scale
+        # iter 104 v3: anneal AdaSplash α-entmax alpha 1.0 → target. Same
+        # warmup-delay-then-linear-ramp shape as router entropy coef. α=1.0
+        # = softmax (no sparsity); α=target (e.g. 1.5) at end of training.
+        alpha_target = float(getattr(base_model, "_attn_alpha_target", 1.0))
+        alpha_delay = float(getattr(base_model, "_attn_alpha_warmup_delay_frac", 0.3))
+        if alpha_target > 1.0:
+            if time_frac < alpha_delay:
+                alpha_scale = 0.0
+            else:
+                alpha_scale = min(max((time_frac - alpha_delay) / max(1.0 - alpha_delay, 1e-8), 0.0), 1.0)
+            sb.attn._attn_alpha = 1.0 + (alpha_target - 1.0) * alpha_scale
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()

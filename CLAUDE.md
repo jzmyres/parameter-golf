@@ -23,6 +23,7 @@
 - `feedback_lipschitz_in_ksweep.md` — Lipschitz + acyclicity primes permanent in K-sweep
 - `feedback_per_wallclock_override.md` — val_bpb gate can be overridden on per-wallclock grounds (H72)
 - `feedback_sparsity_value_props.md` — Score sparsity iters on val_bpb / throughput / reg as 3 orthogonal axes; soft-dense routing → router sparsity has zero throughput benefit without sparse dispatch
+- `feedback_uv_install.md` — Authorized installs use `uv pip install` (user directive 2026-04-28)
 - `feedback_profile_before_throughput.md` — Throughput optimization needs chrome trace; not log fragments
 - `feedback_decouple_regularizers.md` — Antagonistic regularizers → keep one as metric, the other as loss
 - `feedback_anneal_sparsity_coefs.md` — Sparsity coefs anneal from 0; warmup_delay_frac=0.3 default
@@ -60,7 +61,7 @@ OpenAI Parameter Golf challenge (March 18 – April 30, 2026; $1M OpenAI compute
 ## 2. Environment & Files
 
 - **Conda env**: `conda activate opg` (must be active before any command).
-- **Python deps**: `requirements.txt`. **Do not install new packages.**
+- **Python deps**: `requirements.txt`. **Do not install new packages by default.** When the user explicitly authorizes a new package install, use `uv` (NOT `pip`): `uv pip install <pkg>` (user directive 2026-04-28). Update `requirements.txt` in the same commit as the package usage.
 - **Data (READ-ONLY)**: `./data/datasets/fineweb10B_sp1024/`; tokenizer at `./data/tokenizers/fineweb_1024_bpe.model`.
 
 **Key files.**
@@ -81,7 +82,7 @@ OpenAI Parameter Golf challenge (March 18 – April 30, 2026; $1M OpenAI compute
 
 - **Modify only**: `train_gpt.py`, focused tests, project docs (incl. `EXPERIENCE.md`, `experiments/hypotheses.md`). Wider scope requires explicit user approval.
 - **Never modify**: `data/`, tokenizer code, evaluation harness code, `records/`, dependency files, package manifests.
-- **No new packages.**
+- **No new packages by default.** Authorized installs use `uv pip install <pkg>` (NOT `pip install`). User directive 2026-04-28.
 - **DDP-safe**: all code MUST work with both single-GPU and multi-GPU `torchrun` (dev: 1–2× L40S; full: 8× H100). No GPU-count-specific logic without proper `world_size` handling.
 - **Submission runs honor 600 s wallclock + 16 MB artifact** (see §1).
 - **Expert health is final-only**, computed on **normalized per-component** expert shares; total routed mass is tracked separately and must not be conflated with balance.

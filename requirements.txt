@@ -8,3 +8,4 @@ typing-extensions==4.15.0
 datasets
 tiktoken
 sentencepiece
+adasplash==0.1.1b0  # iter 104 α-entmax attention (deep-spin/adasplash, ICML 2025)
