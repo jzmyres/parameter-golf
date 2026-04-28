@@ -22,6 +22,7 @@
 - `feedback_wakeup_cadence.md` — 5-min wakeups after failure → 20-min after 3 healthy checks
 - `feedback_lipschitz_in_ksweep.md` — Lipschitz + acyclicity primes permanent in K-sweep
 - `feedback_per_wallclock_override.md` — val_bpb gate can be overridden on per-wallclock grounds (H72)
+- `feedback_sparsity_value_props.md` — Score sparsity iters on val_bpb / throughput / reg as 3 orthogonal axes; soft-dense routing → router sparsity has zero throughput benefit without sparse dispatch
 - `feedback_profile_before_throughput.md` — Throughput optimization needs chrome trace; not log fragments
 - `feedback_decouple_regularizers.md` — Antagonistic regularizers → keep one as metric, the other as loss
 - `feedback_anneal_sparsity_coefs.md` — Sparsity coefs anneal from 0; warmup_delay_frac=0.3 default
@@ -157,8 +158,12 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 |---|---|
 | router_scoring | linear (dot-product logits, iter 70) |
 | mos_balance_mult | 50.0 (iter 26-lb-loss: hardcoded multiplier promoted to a Hyperparameter; multiplies MoS-NTP balance loss inside `_collect_routing_losses` — the principled fix for `mos_*_min_share` failures since H26) |
-| attn_expert_rank | 64 (iter 96 baseline) |
-| mlp_expert_rank | 96 (iter 96 baseline) |
+| min_share_loss_weight | 0.0 (iter 100b: dropped to 0; CV loss alone provides smooth global-balance regularization without the hard-floor antagonism that hurt iter 100. min_share remains a diagnostic metric — sentinel: `min_share < 0.005` sustained → intervene. See H76.) |
+| cv_loss_weight | 2.0 (iter 100b: 0.10 → 2.0, 20× to compensate for dropping min_share floor; CV-only global balance VALIDATED at this weight. See H76.) |
+| router_entropy_coef | 0.005 (iter 100b: per-token entropy penalty for soft per-token specialization) |
+| router_entropy_warmup_delay_frac | 0.3 (iter 100b: anneal entropy_coef from 0 over training, ramping linearly 0→target after 30% of wallclock; avoids cold-start trap that hurt iter 99/101 architectural sparsity attempts. See H76 + `feedback_anneal_sparsity_coefs.md`.) |
+| attn_expert_rank | 64 (iter 96 baseline, unchanged through iter 100b) |
+| mlp_expert_rank | 96 (iter 96 baseline, unchanged through iter 100b) |
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
