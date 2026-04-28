@@ -169,9 +169,9 @@ class Hyperparameters:
     num_layers = 12  # DEQ solver max K
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
-    num_kv_heads = 4
+    num_kv_heads = 6  # iter 104 v4: 4→6 paired with num_heads 8→12, preserves GQA ratio 2:1, gives d_head=64 (AdaSplash-compatible)
     model_dim = 768  # iter 96 baseline. Iter 98 attempted 768 → 1024 but OOM'd 3× on 44 GiB L40S dev hardware (D=1024 + DEQ TBPTT exceeds VRAM cap regardless of seq/K reductions). Documented as NOT TESTED in H73; D-scaling deferred until 8× H100 80GB submission hardware (won't OOM there).
-    num_heads = 8
+    num_heads = 12  # iter 104 v4: 8→12 to make d_head=64 (model_dim 768 / 12 = 64), AdaSplash-compatible (kernel asserts H_DIM in {16,32,64,128,256}). Same total head capacity (12·64=768=8·96).
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
     # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
