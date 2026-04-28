@@ -4049,6 +4049,19 @@ def main() -> None:
 
     # MAIN TRAINING LOOP
     training_time_ms = 0.0
+    # iter 104 throughput diagnostic: rolling window of step durations so we
+    # can compute a recent step_avg (vs the lifetime mean). Lets us see if
+    # α-anneal kicking in at step 300 changes throughput vs the pre-warmup
+    # softmax baseline.
+    from collections import deque
+    _step_dt_window: deque[float] = deque(maxlen=50)
+    # Phase-broken-down step_avg accumulators (alpha=1.0 vs alpha>1.0 at
+    # step start). Helps disambiguate "are we faster or slower with the
+    # AdaSplash kernel active vs the softmax fallback path".
+    _phase_dense_total_ms = 0.0
+    _phase_dense_count = 0
+    _phase_sparse_total_ms = 0.0
+    _phase_sparse_count = 0
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
@@ -4065,7 +4078,20 @@ def main() -> None:
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
-            training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            _step_dt_ms = 1000.0 * (time.perf_counter() - t0)
+            training_time_ms += _step_dt_ms
+            _step_dt_window.append(_step_dt_ms)
+            # iter 104: bucket the step duration by α-anneal phase. The
+            # _attn_alpha was set at the top of this step (training-loop hook
+            # before forward), so reading it now reflects the value used
+            # during this step's compute.
+            _alpha_now = float(getattr(_unwrap_compiled_module(base_model.shared_block).attn, "_attn_alpha", 1.0))
+            if _alpha_now > 1.0:
+                _phase_sparse_total_ms += _step_dt_ms
+                _phase_sparse_count += 1
+            else:
+                _phase_dense_total_ms += _step_dt_ms
+                _phase_dense_count += 1
             val_loss, val_bpb = run_validation(
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
@@ -4073,10 +4099,22 @@ def main() -> None:
             )
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step) if master_process else ""
+            # iter 104 throughput diagnostic. Emit current α + windowed
+            # step_avg + phase-broken-down means so we can attribute speed
+            # changes to AdaSplash kernel activation vs pre-warmup softmax
+            # fallback. Pre-warmup phase (α=1.0, dense SDPA) and post-warmup
+            # phase (α>1.0, AdaSplash) accumulate separately.
+            _alpha_at_val = float(getattr(_unwrap_compiled_module(base_model.shared_block).attn, "_attn_alpha", 1.0))
+            _window_avg = (sum(_step_dt_window) / len(_step_dt_window)) if _step_dt_window else 0.0
+            _dense_avg = (_phase_dense_total_ms / _phase_dense_count) if _phase_dense_count > 0 else 0.0
+            _sparse_avg = (_phase_sparse_total_ms / _phase_sparse_count) if _phase_sparse_count > 0 else 0.0
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"val_mode:fast "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"attn_alpha:{_alpha_at_val:.4f} step_avg_w50:{_window_avg:.2f}ms "
+                f"step_avg_dense:{_dense_avg:.2f}ms_n{_phase_dense_count} "
+                f"step_avg_sparse:{_sparse_avg:.2f}ms_n{_phase_sparse_count}"
                 f"{deq_info}{expert_info}"
             )
             _best_effort_update_plots("val")
