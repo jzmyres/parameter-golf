@@ -108,6 +108,7 @@ def dynamo_disable(fn):
         return fn
 
 
+@dynamo_disable
 def _should_diag(training: bool) -> bool:
     """Return True if this rank should record diagnostics right now.
 
@@ -115,6 +116,13 @@ def _should_diag(training: bool) -> bool:
     Eval: ALL ranks — the post-eval DDP-global assertions need every rank to
     have populated diagnostics so dist.all_reduce() has matching participants.
     Rank-gating still happens at the log sites, not here.
+
+    `@dynamo_disable`: this function reads `_ROUTER_DIAGNOSTICS_ACTIVE` (Python
+    bool global) and `dist.get_rank()`. Without dynamo_disable, any call from a
+    torch.compile region creates guards on these values that recompile when the
+    flag toggles (at every diagnostic-emission boundary, ~every 10 train steps).
+    Disabling makes the function opaque to dynamo: callers see a Python-bool
+    return without internal guards. (Profile 2026-04-28.)
     """
     if training and not _ROUTER_DIAGNOSTICS_ACTIVE:
         return False
@@ -1057,6 +1065,38 @@ except ImportError:
     pass
 
 
+@dynamo_disable
+def _adasplash_kernel_call(q: Tensor, k: Tensor, v: Tensor,
+                           alpha: float, niter: int) -> Tensor:
+    """Eager-only invocation of the AdaSplash Triton kernel. Wrapped in
+    `@dynamo_disable` so the kernel runs in pure eager mode regardless of any
+    surrounding `torch.compile` context.
+
+    This is the principled fix for iter 104 v3/v4's SIGABRT crash (2026-04-28):
+    when α first exceeded 1.0 (post-anneal-warmup, step 301), dynamo had to
+    recompile the parent `forward_experts` graph to incorporate the AdaSplash
+    branch. The Triton kernel + dynamo's stream/context management + DDP all-
+    reduce + RevDEQ custom autograd + Inductor codegen interact at C-level in a
+    way that produces SIGABRT (signal 6, no Python traceback). By contrast,
+    Triton kernels invoked from PURE eager mode work reliably (verified
+    standalone). `@dynamo_disable` keeps dynamo from tracing into the kernel
+    invocation: the surrounding compiled forward fuses around a stable graph-
+    break boundary at this call. torch.compile (router/MLP fusion) and
+    AdaSplash (sparse-attention kernel) compose cleanly via this boundary —
+    only the kernel itself runs uncompiled, which is what we want anyway.
+    """
+    # AdaSplash requires consistent dtype across q/k/v (bf16 path is the
+    # supported one in the published Triton kernel).
+    target_dtype = v.dtype
+    if q.dtype != target_dtype:
+        q = q.to(target_dtype)
+    if k.dtype != target_dtype:
+        k = k.to(target_dtype)
+    return _adasplash_attention(
+        q, k, v, alpha=float(alpha), is_causal=True, niter=int(niter),
+    )
+
+
 def adasplash_alpha_entmax_attention(
     q: Tensor, k: Tensor, v: Tensor, alpha: float, niter: int = 10,
     enable_gqa: bool = False,
@@ -1076,22 +1116,29 @@ def adasplash_alpha_entmax_attention(
     v: (B, H_kv, T, d_v) bf16
     alpha: 1.0 → 2.0 (1.0 = softmax fallback, dense)
 
-    Falls back to dense causal SDPA if adasplash unavailable or alpha <= 1.0.
+    Falls back to dense causal SDPA if adasplash unavailable, alpha <= 1.0, or
+    if head_dim is incompatible with AdaSplash's Triton block specialization
+    (the kernel asserts H_DIM ∈ {16, 32, 64, 128, 256}).
+
+    Compile compatibility: the AdaSplash kernel call is wrapped in
+    `_adasplash_kernel_call` which is `@dynamo_disable`-decorated. The outer
+    `if` here is traceable so the dense fast path (alpha ≤ 1.0) stays fully
+    compiled.
     """
     if not _ADASPLASH_AVAILABLE or alpha <= 1.0:
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=True, enable_gqa=enable_gqa,
         )
-    # AdaSplash requires consistent dtype across q/k/v (bf16 path is the
-    # supported one in the published Triton kernel).
-    target_dtype = v.dtype
-    if q.dtype != target_dtype:
-        q = q.to(target_dtype)
-    if k.dtype != target_dtype:
-        k = k.to(target_dtype)
-    return _adasplash_attention(
-        q, k, v, alpha=float(alpha), is_causal=True, niter=int(niter),
-    )
+    # AdaSplash's Triton kernel hardcodes block sizes for specific head_dim
+    # values; non-power-of-2 head_dim (e.g. 96 = 768/8) would assert at kernel
+    # launch. Fallback to dense SDPA preserves correctness, losing the kernel
+    # speedup at that head_dim.
+    head_dim = int(q.shape[-1])
+    if head_dim not in {16, 32, 64, 128, 256}:
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, enable_gqa=enable_gqa,
+        )
+    return _adasplash_kernel_call(q, k, v, alpha=alpha, niter=niter)
 
 
 def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
@@ -1539,35 +1586,15 @@ class SoftDenseRouter(nn.Module):
             else:
                 self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = mean_share.detach()
-            with torch.no_grad():
-                if _should_diag(self.training):
-                    self._record_diagnostics(p.detach(), reduce_dims)
-                    # Backward compatibility: standalone-router tests expect
-                    # list-form diagnostics immediately when diagnostics are on.
-                    # Avoid materializing inside DEQ solves (would sync K×).
-                    if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and not bool(_DEQ_SOLVE_ACTIVE):
-                        self._materialize_diag_lists()
+            # Record diagnostics — eager-only (dynamo-disabled); see helper docstring.
+            self._maybe_record_diag(p.detach(), reduce_dims, clear_on_skip=False)
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._health_loss = torch.tensor(0.0, device=x.device)
             self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = None
-            with torch.no_grad():
-                if _should_diag(self.training):
-                    self._record_diagnostics(p.detach(), tuple(range(p.ndim - 1)))
-                    if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and not bool(_DEQ_SOLVE_ACTIVE):
-                        self._materialize_diag_lists()
-                else:
-                    self._expert_usage = None
-                    self._expert_entropy = None
-                    self._expert_sparsity = None
-                    self._expert_balance_cv = None
-                    self._expert_total_mass = None
-                    self._expert_usage_gpu = None
-                    self._expert_entropy_gpu = None
-                    self._expert_balance_cv_gpu = None
-                    self._expert_total_mass_gpu = None
-                    self._diag_step = None
+            self._maybe_record_diag(p.detach(), tuple(range(p.ndim - 1)),
+                                    clear_on_skip=True)
         return p
 
     @dynamo_disable
@@ -1625,6 +1652,49 @@ class SoftDenseRouter(nn.Module):
             ent = float(self._expert_entropy_gpu.item())
             self._expert_entropy = ent
             self._expert_sparsity = 1.0 - (ent / max(math.log(float(self.num_experts)), 1e-8))
+
+    @dynamo_disable
+    def _maybe_record_diag(self, routed_mass: Tensor,
+                           reduce_dims: tuple[int, ...],
+                           clear_on_skip: bool) -> None:
+        """Eager-only diagnostic record/clear — moves the
+        `_ROUTER_DIAGNOSTICS_ACTIVE` flag check OUT of the compiled forward.
+
+        Pre-fix the forward had:
+            if _should_diag(self.training):
+                self._record_diagnostics(...)
+                if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and not bool(_DEQ_SOLVE_ACTIVE):
+                    self._materialize_diag_lists()
+            else:
+                <clear python-list views>
+        Both `_should_diag` and `_ROUTER_DIAGNOSTICS_ACTIVE` are read inside the
+        compiled SoftDenseRouter.forward; dynamo guards on each global, and any
+        toggle (every ~10 train steps for log emission) invalidates the cache
+        slot → recompile of the parent compiled block. Profile (2026-04-28)
+        showed this was a dominant residual recompile vector even after value-
+        guard fixes (see commit 7343c06 H78). Hoisting the gate into a
+        `@dynamo_disable` helper makes the call opaque to dynamo, so the flag
+        toggle has no effect on the compiled graph cache.
+
+        `clear_on_skip=True`: in eval mode (training=False) the original code
+        cleared the python-list-form diagnostics when not active.
+        """
+        with torch.no_grad():
+            if _should_diag(self.training):
+                self._record_diagnostics(routed_mass, reduce_dims)
+                if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and not bool(_DEQ_SOLVE_ACTIVE):
+                    self._materialize_diag_lists()
+            elif clear_on_skip:
+                self._expert_usage = None
+                self._expert_entropy = None
+                self._expert_sparsity = None
+                self._expert_balance_cv = None
+                self._expert_total_mass = None
+                self._expert_usage_gpu = None
+                self._expert_entropy_gpu = None
+                self._expert_balance_cv_gpu = None
+                self._expert_total_mass_gpu = None
+                self._diag_step = None
 
 
 # ---------------------------------------------------------------------------
@@ -1886,12 +1956,30 @@ class CausalSelfAttention(nn.Module):
         y_out = torch.bmm(y_h, wo_u)  # (E, N, D)
         y = y_out.permute(1, 0, 2).reshape(B, T, E, D)
 
+        # Eager-only diagnostic — see helper docstring.
+        self._capture_attn_out_ortho(y)
+
+        return y
+
+    @dynamo_disable
+    def _capture_attn_out_ortho(self, y: Tensor) -> None:
+        """Eager-only capture of attention-expert output orthogonality
+        (`_out_ortho_cos_sim`).
+
+        Profile run (2026-04-28, post-Fix-#1) identified THIS site as the
+        dominant remaining recompile vector — dynamo's [9/0] graph break at
+        L1892 with reason `_ROUTER_DIAGNOSTICS_ACTIVE` flag-flip. The flag
+        toggles every ~10 train steps (log boundary) AND the `.item()` materi-
+        alization is itself a sync + value-guard. Wrapping in `@dynamo_disable`
+        keeps the compiled `forward_experts` graph stable: dynamo sees this
+        method call as an opaque op (one fixed graph break per forward, no
+        guards on internal state), and the flag check + cosine sim run in pure
+        eager mode when actually needed.
+        """
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
                 mu_out = y.detach().float().mean(dim=(0, 1))  # (E, D)
                 self._out_ortho_cos_sim = float(max_pairwise_abs_cosine(mu_out).item())
-
-        return y
 
     def forward(self, x: Tensor) -> Tensor:
         raise RuntimeError("Use Block.forward()")
@@ -1982,15 +2070,26 @@ class MLP(nn.Module):
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
         out = out_e.sum(dim=0)  # (N, D)
 
+        # Eager-only diagnostic — see helper docstring.
+        self._capture_mlp_out_ortho(h, N, E, R)
+
+        return out.reshape(B, T, D)
+
+    @dynamo_disable
+    def _capture_mlp_out_ortho(self, h: Tensor, N: int, E: int, R: int) -> None:
+        """Eager-only capture of MLP-expert output orthogonality.
+        Same dynamo-disable rationale as
+        CausalSelfAttention._capture_attn_out_ortho — moves the
+        `_ROUTER_DIAGNOSTICS_ACTIVE` flag check + `.item()` materialization
+        out of the compiled `mix_experts` graph.
+        """
         if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and _should_diag(self.training):
             with torch.no_grad():
                 mu_h = h.reshape(N, E, R).mean(dim=0).to(dtype=torch.float32)
-                down_T = self.expert_down.to(dtype=mu_h.dtype).transpose(1, 2)  # (E, R, D)
+                down_T = self.expert_down.to(dtype=mu_h.dtype).transpose(1, 2)
                 mu_out = torch.einsum("er,erd->ed", mu_h, down_T)
                 # Max pairwise |cos| across expert pairs — near-duplicate check.
                 self._out_ortho_cos_sim = float(max_pairwise_abs_cosine(mu_out).item())
-
-        return out.reshape(B, T, D)
 
     def forward(self, x: Tensor) -> Tensor:
         raise RuntimeError("Use Block.forward()")
@@ -2181,8 +2280,6 @@ class MoSHead(nn.Module):
             ortho_ctp = x.new_zeros(())
         self._ctp_ortho_out = ortho_ctp
         self._ntp_ortho_out = ortho_ntp
-        distributed = dist.is_available() and dist.is_initialized()
-        is_master = (not distributed) or dist.get_rank() == 0
 
         if self.training:
             bal = torch.tensor(0.0, device=x.device)
@@ -2195,10 +2292,22 @@ class MoSHead(nn.Module):
         else:
             self._balance_loss = torch.tensor(0.0, device=x.device)
 
-        # Diagnostics: store GPU-resident mean expert shares (+ CV) so post-int6
-        # health checks can all-reduce without forcing a per-forward CPU sync.
-        # Only materialize Python lists on master when diagnostics are explicitly
-        # enabled (router_diagnostics), keeping eval fast by default.
+        # Eager-only diagnostic capture — see helper docstring.
+        self._capture_mos_diagnostics(alpha_d, alpha_n)
+        return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
+
+    @dynamo_disable
+    def _capture_mos_diagnostics(self, alpha_d: Tensor, alpha_n: Tensor) -> None:
+        """Eager-only MoS expert-usage diagnostic capture.
+
+        The compiled `mos_head.forward` (5.45× speedup, L3847) was guarded on
+        `_ROUTER_DIAGNOSTICS_ACTIVE` and `_should_diag`. Each toggle of the
+        global flag invalidated the cache slot. Hoisting into a dynamo-disabled
+        helper makes the call opaque (one fixed graph break per forward, no
+        guards on internal state). Same pattern as
+        SoftDenseRouter._maybe_record_diag and
+        CausalSelfAttention._capture_attn_out_ortho.
+        """
         with torch.no_grad():
             if _should_diag(self.training):
                 a_d = alpha_d.detach()
@@ -2215,6 +2324,8 @@ class MoSHead(nn.Module):
                 self._ntp_expert_usage = None
                 self._ctp_expert_balance_cv = None
                 self._ntp_expert_balance_cv = None
+                distributed = dist.is_available() and dist.is_initialized()
+                is_master = (not distributed) or dist.get_rank() == 0
                 if bool(_ROUTER_DIAGNOSTICS_ACTIVE) and is_master:
                     # Backward-compat: retain list-form usage on master when explicitly enabled.
                     self._ctp_expert_usage = mean_d.cpu().tolist()
@@ -2231,7 +2342,6 @@ class MoSHead(nn.Module):
                 self._ctp_expert_balance_cv = None
                 self._ntp_expert_balance_cv = None
                 self._diag_step = None
-        return log_p_d.view(*orig_shape, -1), log_p_n.view(*orig_shape, -1)
 
 
 # ---------------------------------------------------------------------------
