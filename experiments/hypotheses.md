@@ -1494,7 +1494,34 @@ failure.
 | artifact ≤ 16 MB | 7.52 MB ✅ |
 | peak_vram_mb | 35,721 (under 44 GB) ✅ |
 
-K-sweep tail: K=8 1.4936, K=16 1.4893, K=32 1.4906, K=64 1.4908, K=128 1.4908. Slight monotone rise past K=16 (~0.001) is FP numerical drift, well within budget. Hutchinson-Frobenius + Lipschitz probes did NOT emit (silently caught by iter 97.6 try/except — SDPA backend rejects under enable_grad in this dtype path; known issue, non-blocking).
+**Eval results (iter 100b, full K-sweep + routing health)**:
+
+Roundtrip verification: val_bpb (int6 + zstd) = **1.489339**, val_loss = 2.4744. Final val checkpoint at step 1000 (fast mode K=16): val_bpb = 1.4572, val_loss = 2.4210, attn_cv 0.1735, attn min share 0.040, attn max share (expert 12) 0.099, attn_ortho 0.139, mlp_ortho 0.236, router_mass 0.802, shared_gate_mean 0.122, shared_gate_min 0.003, pertoken_entropy 2.986.
+
+| K | val_bpb | iter_conv_rel | residual | acyclicity check |
+|---|---|---|---|---|
+| 4 | 1.668684 | 0.297594 | 853.87 | (under-converged) |
+| 8 | 1.493566 | 0.078900 | 853.87 | — |
+| 16 | **1.489331** ← best | 0.017228 | 853.87 | — |
+| 17 (prime) | 1.489594 | 0.016195 | 853.87 | Δ vs K=16 = 0.0003 ✓ |
+| 32 | 1.490595 | 0.013763 | 853.87 | — |
+| 37 (prime) | 1.490654 | 0.013892 | 853.87 | Δ vs K=32 = 0.00006 ✓ |
+| 64 | 1.490774 | 0.013790 | 853.87 | — |
+| 113 (prime) | 1.490766 | n/a | 853.87 | Δ vs K=128 = 0.00004 ✓ |
+| 128 | 1.490805 | n/a | 853.87 | — |
+
+K=128 vs best-K (K=16) Δ = +0.001474, ≪ 0.5 promotion gate ✓. All three acyclicity primes confirm genuine fixed point. Hutchinson-Frobenius + finite-direction Lipschitz probes did NOT emit (silently caught by iter 97.6 try/except — SDPA backend rejects under enable_grad in this dtype path). Per-K expert/sparsity/shared_gate diagnostics were NOT YET emitted by iter 100b run (this is the data the post-iter-100b `k_sweep_table:` extension adds, commit `100ffcc`).
+
+**Trajectory summary** (val_bpb at each in-training val checkpoint, fast mode K=16):
+
+| Step | val_loss | val_bpb | Δ from prev |
+|---|---|---|---|
+| 0 | 7.0040 | 4.2156 | — |
+| 200 | 3.3249 | 2.0012 | −2.215 |
+| 400 | 2.7391 | 1.6486 | −0.353 |
+| 600 | 2.5489 | 1.5342 | −0.114 |
+| 800 | 2.4869 | 1.4968 | −0.037 |
+| 1000 | 2.4210 | **1.4572** | −0.040 |
 
 **Trajectory** (s200→s1000 every 200 steps, fast-mode val_bpb): 2.0012 → 1.6486 → 1.5342 → 1.4968 → **1.4572**. Drops 0.353 → 0.114 → 0.037 → 0.040 (decay leveled off in last 200 instead of continuing to halve). Roundtrip int6+zstd 1.4893.
 

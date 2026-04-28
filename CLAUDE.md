@@ -276,7 +276,7 @@ Reference impl: see §2.
 9. Log to `results.tsv` (do NOT commit `results.tsv`).
 10. **Always** run `bash experiments/update_results.sh` (rotates `current.log`/`current/weights` → `previous`, copies `run.log` → `current.log`, regenerates plots).
 11. Apply §11 Promotion Rules.
-12. **Update `experiments/hypotheses.md`** — record results, update statuses, note confounds.
+12. **Update `experiments/hypotheses.md`** — record results, update statuses, note confounds. The H-claim section MUST include a FULL eval result subsection (user directive 2026-04-28): (a) roundtrip int6 val_bpb + val_loss; (b) K-sweep table — one row per K with val_bpb, iter_conv_rel, residual, plus the `k_sweep_table:` 14-column row (attn_cv, mlp_cv, pool_cv, attn_min, mlp_min, attn_ortho, mlp_ortho, pertoken_ent, pool_ent, shared_gate, hutch_F, rd_step); (c) trajectory table — val_bpb at each in-training val checkpoint with Δ from prev; (d) acyclicity prime check results (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP). Numbers must be grep-able from run.log. See `feedback_hypotheses_sync.md`.
 13. Track consecutive non-improvements. **STOP after 100** and seek user guidance.
 
 ### Logging, Weights & Plotting (every iteration)
