@@ -169,9 +169,9 @@ class Hyperparameters:
     num_layers = 12  # DEQ solver max K
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
-    num_kv_heads = 6  # iter 104 v4: 4→6 paired with num_heads 8→12, preserves GQA ratio 2:1, gives d_head=64 (AdaSplash-compatible)
+    num_kv_heads = 4
     model_dim = 768  # iter 96 baseline. Iter 98 attempted 768 → 1024 but OOM'd 3× on 44 GiB L40S dev hardware (D=1024 + DEQ TBPTT exceeds VRAM cap regardless of seq/K reductions). Documented as NOT TESTED in H73; D-scaling deferred until 8× H100 80GB submission hardware (won't OOM there).
-    num_heads = 12  # iter 104 v4: 8→12 to make d_head=64 (model_dim 768 / 12 = 64), AdaSplash-compatible (kernel asserts H_DIM in {16,32,64,128,256}). Same total head capacity (12·64=768=8·96).
+    num_heads = 8
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
     # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
@@ -237,7 +237,8 @@ class Hyperparameters:
     # driving per-token specialization architecturally rather than via loss
     # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
     # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
-    router_kind = "softmax"  # iter 96 baseline. Iter 99 (sparsemax α=2) NOT PROMOTED H74 (+0.16). Iter 101 (entmax-1.5) NOT PROMOTED H75 (+0.10). Both architectural-sparsity attempts had capacity cost > regularization gain. Reverted to softmax. Options: "softmax", "sparsemax", "entmax15".
+    router_kind = "entmax_anneal"  # iter 102 (2026-04-28): annealed entmax — linear blend of softmax (full support) and entmax15 (sparse). At time_frac < router_alpha_warmup_delay_frac → α_scale=0 (pure softmax); else linear ramp 0→1 over remaining training. Final output = (1-α_scale)·softmax + α_scale·entmax15. Avoids H75 cold-start trap (iter 101 entmax15 from step 0 cost +0.10). Options: "softmax", "sparsemax", "entmax15", "entmax_anneal".
+    router_alpha_warmup_delay_frac = 0.3  # iter 102: pure softmax exploration for first 30% of training before introducing entmax sparsity pressure.
     # iter 100b (2026-04-27): per-token entropy penalty with ANNEALED schedule
     # + min_share_loss decoupled. iter 100 (entropy_coef=0.02 from step 0)
     # hit train_loss instability — penalty fights min_share_loss penalty
@@ -275,9 +276,9 @@ class Hyperparameters:
     # 2026-04-28: "sliding window would significantly hurt long sequence
     # performance which should never be used alone". AdaSplash's adaptive
     # sparsity is learned per-query and preserves long-range dependencies.
-    attn_alpha_target = 1.5             # 1.0 = softmax (off), >1.0 = α-entmax
-    attn_alpha_warmup_delay_frac = 0.3  # pure softmax for first 30% of training
-    attn_alpha_niter = 10               # entmax bisection iterations (AdaSplash default)
+    attn_alpha_target = 1.0             # iter 104 DEFERRED: AdaSplash kernel SIGABRTs under compile+DDP at d_head=64 (and asserts H_DIM at d_head=96). Set to 1.0 to disable AdaSplash entirely; falls back to dense softmax SDPA for attention. iter 104 returns to queue when we have a torch.compiler.disable wrapper or single-GPU validation infrastructure.
+    attn_alpha_warmup_delay_frac = 0.3  # unused when attn_alpha_target=1.0 (path bypassed)
+    attn_alpha_niter = 10               # unused when attn_alpha_target=1.0 (path bypassed)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
@@ -1293,7 +1294,12 @@ class SoftDenseRouter(nn.Module):
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
-        self.router_kind = str(router_kind)  # iter 99: "softmax" | "sparsemax" | "entmax15"
+        self.router_kind = str(router_kind)  # iter 99: "softmax" | "sparsemax" | "entmax15" | iter 102: "entmax_anneal"
+        # iter 102: blend factor between softmax (0) and entmax15 (1). Set by training loop
+        # hook from time_frac with router_alpha_warmup_delay_frac schedule. Defaults to 0
+        # (pure softmax) so eval, smoke test, and the first warmup_delay fraction of training
+        # all behave as iter 96/100b baseline.
+        self._router_alpha_scale = 0.0
         self.entropy_coef = float(entropy_coef)  # iter 100: per-token entropy penalty coef
         assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
         self.health_slices = tuple(int(v) for v in (health_slices or (num_experts,)))
@@ -1468,7 +1474,20 @@ class SoftDenseRouter(nn.Module):
         if _rk == "sparsemax":
             p_alloc = sparsemax(route_logits.float(), dim=-1)  # iter 99 (NOT PROMOTED H74)
         elif _rk == "entmax15":
-            p_alloc = entmax15(route_logits.float(), dim=-1)  # iter 101: α=1.5 middle ground
+            p_alloc = entmax15(route_logits.float(), dim=-1)  # iter 101: α=1.5 fixed
+        elif _rk == "entmax_anneal":
+            # iter 102: linear blend of softmax + entmax15 weighted by alpha_scale.
+            # alpha_scale is set by training loop hook from time_frac (0 during
+            # warmup → pure softmax; 1 at end → pure entmax15). Avoids the H75
+            # cold-start trap that hurt iter 101 (fixed α=1.5 from step 0).
+            alpha_scale = float(getattr(self, "_router_alpha_scale", 0.0))
+            logits_f = route_logits.float()
+            sm = torch.softmax(logits_f, dim=-1)
+            if alpha_scale > 0.0:
+                em = entmax15(logits_f, dim=-1)
+                p_alloc = (1.0 - alpha_scale) * sm + alpha_scale * em
+            else:
+                p_alloc = sm
         else:
             p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
         gate_act = torch.sigmoid(self.router_gate(x_gate).float())
@@ -2722,6 +2741,7 @@ class GPT(nn.Module):
                  router_kind: str = "softmax",
                  router_entropy_coef: float = 0.0,
                  router_entropy_warmup_delay_frac: float = 0.0,
+                 router_alpha_warmup_delay_frac: float = 0.3,
                  attn_alpha_target: float = 1.0,
                  attn_alpha_warmup_delay_frac: float = 0.3,
                  attn_alpha_niter: int = 10,
@@ -2743,6 +2763,8 @@ class GPT(nn.Module):
         # dynamically per-step via these values.
         self._router_entropy_coef_target = float(router_entropy_coef)
         self._router_entropy_warmup_delay_frac = float(router_entropy_warmup_delay_frac)
+        # iter 102: router α-anneal (softmax → entmax15 blend) warmup-delay schedule.
+        self._router_alpha_warmup_delay_frac = float(router_alpha_warmup_delay_frac)
         # iter 104 v3: AdaSplash α-entmax target + anneal schedule.
         self._attn_alpha_target = float(attn_alpha_target)
         self._attn_alpha_warmup_delay_frac = float(attn_alpha_warmup_delay_frac)
@@ -3769,6 +3791,7 @@ def main() -> None:
         router_kind=getattr(args, "router_kind", "softmax"),
         router_entropy_coef=float(getattr(args, "router_entropy_coef", 0.0)),
         router_entropy_warmup_delay_frac=float(getattr(args, "router_entropy_warmup_delay_frac", 0.0)),
+        router_alpha_warmup_delay_frac=float(getattr(args, "router_alpha_warmup_delay_frac", 0.3)),
         attn_alpha_target=float(getattr(args, "attn_alpha_target", 1.0)),
         attn_alpha_warmup_delay_frac=float(getattr(args, "attn_alpha_warmup_delay_frac", 0.3)),
         attn_alpha_niter=int(getattr(args, "attn_alpha_niter", 10)),
@@ -4159,6 +4182,17 @@ def main() -> None:
             else:
                 alpha_scale = min(max((time_frac - alpha_delay) / max(1.0 - alpha_delay, 1e-8), 0.0), 1.0)
             sb.attn._attn_alpha = 1.0 + (alpha_target - 1.0) * alpha_scale
+        # iter 102: anneal router α-blend (softmax → entmax15). 0 = pure
+        # softmax, 1 = pure entmax15. Same warmup-delay schedule. Only
+        # applied when router_kind="entmax_anneal" (other kinds ignore the
+        # attribute). Avoids H75 cold-start trap that hurt iter 101.
+        if str(getattr(sb.router, "router_kind", "softmax")) == "entmax_anneal":
+            r_alpha_delay = float(getattr(base_model, "_router_alpha_warmup_delay_frac", 0.3))
+            if time_frac < r_alpha_delay:
+                r_alpha_scale = 0.0
+            else:
+                r_alpha_scale = min(max((time_frac - r_alpha_delay) / max(1.0 - r_alpha_delay, 1e-8), 0.0), 1.0)
+            sb.router._router_alpha_scale = float(r_alpha_scale)
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
