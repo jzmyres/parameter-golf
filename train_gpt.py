@@ -4442,6 +4442,72 @@ def main() -> None:
     # break the period-L cycle alias inherent in power-of-2 sampling.
     k_sweep_values = [4, 8, 16, 17, 32, 37, 64, 113, 128]
     k_sweep_results: dict[int, float] = {}
+
+    # iter 100b user directive (PERMANENT 2026-04-27): emit a structured
+    # per-K table of expert health + Lipschitz + sparsity + shared_gate so
+    # routing trajectory across K can be plotted/compared per H-claim.
+    # Header is emitted before the loop; each K appends one row.
+    def _collect_eval_kdiag(base_m) -> dict[str, float]:
+        """Per-K expert/sparsity/shared-gate diagnostics collected from the
+        most recent eval forward pass. Pooled-router single source of truth:
+        attn_router and mlp_router are the same instance under the iter 35
+        consolidation, so per-slice metrics are computed from the pooled
+        usage array using the (R, R) split; ortho is read per-component."""
+        sb = getattr(base_m, "shared_block", None)
+        if sb is None:
+            return {}
+        out: dict[str, float] = {}
+        R_total = int(getattr(sb, "num_experts", 0))
+        R = R_total - int(getattr(sb, "num_shared_experts", 0))
+        attn_router = getattr(getattr(sb, "attention", None), "attn_router", None)
+        if attn_router is not None and hasattr(attn_router, "_materialize_diag_lists"):
+            attn_router._materialize_diag_lists()
+        usage = getattr(attn_router, "_expert_usage", None) if attn_router else None
+        if usage and len(usage) >= 2 * R and R > 0:
+            attn_half, mlp_half = usage[:R], usage[R:]
+            for label, half in [("attn", attn_half), ("mlp", mlp_half)]:
+                s = sum(half) or 1e-8
+                norm = [u / s for u in half]
+                mu = sum(norm) / len(norm) or 1e-8
+                var = sum((x - mu) ** 2 for x in norm) / len(norm)
+                out[f"{label}_cv"] = (var ** 0.5) / mu
+                out[f"{label}_min"] = min(norm)
+            pool_sum = sum(usage) or 1e-8
+            pool_norm = [u / pool_sum for u in usage]
+            pmu = sum(pool_norm) / len(pool_norm) or 1e-8
+            pvar = sum((x - pmu) ** 2 for x in pool_norm) / len(pool_norm)
+            out["pool_cv"] = (pvar ** 0.5) / pmu
+            out["pool_ent"] = -sum(x * math.log(x + 1e-8) for x in pool_norm if x > 0.0)
+        pertoken = getattr(attn_router, "_expert_entropy", None) if attn_router else None
+        if pertoken is not None:
+            out["pertoken_ent"] = float(pertoken)
+        for prefix, comp_attr in [("attn", "attention"), ("mlp", "mlp")]:
+            comp = getattr(sb, comp_attr, None)
+            if comp is None:
+                continue
+            v_t = getattr(comp, "_out_ortho_cos_sim_t", None)
+            if isinstance(v_t, torch.Tensor):
+                out[f"{prefix}_ortho"] = float(v_t.float().item())
+            else:
+                v = getattr(comp, "_out_ortho_cos_sim", None)
+                if v is not None:
+                    out[f"{prefix}_ortho"] = float(v)
+        sg = getattr(sb, "_shared_gate_mean", None)
+        if sg is not None:
+            out["shared_gate"] = float(sg) if not isinstance(sg, torch.Tensor) else float(sg.detach().float().item())
+        return out
+
+    # Tabular K-sweep header — fixed-width columns for grep + visual scanning.
+    _kdiag_cols = [
+        ("K", 5), ("val_bpb", 9), ("attn_cv", 8), ("mlp_cv", 8), ("pool_cv", 8),
+        ("attn_min", 9), ("mlp_min", 9), ("attn_ortho", 11), ("mlp_ortho", 10),
+        ("pertoken_ent", 13), ("pool_ent", 9), ("shared_gate", 12),
+        ("hutch_F", 9), ("rd_step", 9), ("iter_conv_rel", 14),
+    ]
+    def _fmt_kdiag(value: float | None, width: int) -> str:
+        s = "N/A" if value is None else f"{value:.4f}"
+        return s.rjust(width)
+    log0("k_sweep_table:" + " ".join(name.rjust(w) for name, w in _kdiag_cols))
     for k_eval in k_sweep_values:
         # Pass deq_k explicitly — run_validation uses it directly instead of
         # reading from args.deq_k_eval (which was the root cause of the bug
@@ -4490,6 +4556,27 @@ def main() -> None:
         if rho_op is not None:
             diag_parts.append(f"rd_step:{rho_op:.4f}")
         log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
+        # iter 100b user directive (PERMANENT): tabular per-K row.
+        kdiag = _collect_eval_kdiag(base_m_for_roundtrip)
+        conv_rel_val = float(conv_rel_t.detach().float().item()) if isinstance(conv_rel_t, torch.Tensor) else None
+        kdiag_row = {
+            "K": float(k_eval),
+            "val_bpb": float(bpb_k),
+            "attn_cv": kdiag.get("attn_cv"),
+            "mlp_cv": kdiag.get("mlp_cv"),
+            "pool_cv": kdiag.get("pool_cv"),
+            "attn_min": kdiag.get("attn_min"),
+            "mlp_min": kdiag.get("mlp_min"),
+            "attn_ortho": kdiag.get("attn_ortho"),
+            "mlp_ortho": kdiag.get("mlp_ortho"),
+            "pertoken_ent": kdiag.get("pertoken_ent"),
+            "pool_ent": kdiag.get("pool_ent"),
+            "shared_gate": kdiag.get("shared_gate"),
+            "hutch_F": rho_F,
+            "rd_step": rho_op,
+            "iter_conv_rel": conv_rel_val,
+        }
+        log0("k_sweep_table:" + " ".join(_fmt_kdiag(kdiag_row[name], w) for name, w in _kdiag_cols))
     k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
     log0(f"k_sweep:done {k_parts}")
 
