@@ -29,3 +29,8 @@ experiments/__pycache__/
 experiments/test_runs/
 experiments/archive/
 tmux*
+# Profiler artifacts (chrome traces can exceed GitHub's 100 MB push limit)
+profile*.log
+test_*.log
+*chrome_trace*.json
+experiments/profile_chrome_trace.json
