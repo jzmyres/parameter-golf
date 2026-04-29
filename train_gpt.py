@@ -101,18 +101,34 @@ if _ADASPLASH_AVAILABLE:
     def _adasplash_attn_op(
         q: Tensor, k: Tensor, v: Tensor, alpha: float, niter: int,
     ) -> Tensor:
-        return _adasplash_attention(
+        # iter 104 systematic debug round 2 (2026-04-29): force contiguity at
+        # the custom_op boundary so AOTAutograd functionalization sees
+        # standard contiguous metadata on both inputs and output. Round 1
+        # (custom_op alone, commit c127271) crashed at step 2 with the same
+        # `_functionalization.apply_view_meta_sequence` error — root cause
+        # was likely a stride/contiguity mismatch between the FakeTensor
+        # metadata (`q.new_empty(q.shape)` — contiguous) and the kernel's
+        # actual output tensor (which may have non-contiguous strides).
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        out = _adasplash_attention(
             q, k, v, alpha=float(alpha), is_causal=True, niter=int(niter),
         )
+        return out.contiguous()
 
     @_adasplash_attn_op.register_fake
     def _(q, k, v, alpha, niter):
         # Output shape == q's shape (causal attention preserves Q's heads/T/d).
-        return q.new_empty(q.shape)
+        # Match the real impl's contiguity guarantee.
+        return q.new_empty(q.shape).contiguous()
 
     def _adasplash_setup_context(ctx, inputs, output):
         q, k, v, alpha, niter = inputs
-        ctx.save_for_backward(q, k, v)
+        # Save contiguous copies — backward will run them through eager
+        # AdaSplash autograd, so non-contiguous strides could trigger the
+        # same metadata-replay bug.
+        ctx.save_for_backward(q.contiguous(), k.contiguous(), v.contiguous())
         ctx.alpha = float(alpha)
         ctx.niter = int(niter)
 
@@ -129,10 +145,12 @@ if _ADASPLASH_AVAILABLE:
                 q_in, k_in, v_in, alpha=ctx.alpha, is_causal=True, niter=ctx.niter,
             )
             grad_q, grad_k, grad_v = torch.autograd.grad(
-                out, [q_in, k_in, v_in], grad_output,
+                out, [q_in, k_in, v_in], grad_output.contiguous(),
                 create_graph=False, retain_graph=False,
             )
-        return grad_q, grad_k, grad_v, None, None  # alpha, niter not differentiable
+        # Return contiguous grads so the upstream backward replay sees
+        # standard metadata.
+        return grad_q.contiguous(), grad_k.contiguous(), grad_v.contiguous(), None, None
 
     _adasplash_attn_op.register_autograd(
         _adasplash_backward, setup_context=_adasplash_setup_context,
