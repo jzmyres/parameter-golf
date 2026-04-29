@@ -262,6 +262,25 @@ class Hyperparameters:
     parcae_init_b_bar = 0.3
     parcae_lr = 0.002  # 10× slower than scalar_lr — Parcae params control DEQ mixing
 
+    # Iter 106 (NSA — Native Sparse Attention; arxiv:2502.11089). Three-branch
+    # hybrid that preserves O(T) reachability while remaining sparse:
+    #   compression — mean-pool K/V over fixed-size sliding blocks, attend to
+    #     the downsampled stream (global, coarse).
+    #   selection — top-K block selection per query (sparse, precise).
+    #     DEFERRED to iter 106b: `nsa_num_selected_blocks=0` disables it.
+    #   sliding-window — last W tokens (local recency).
+    # Mixed via per-expert-per-head learnable softmax gate. Strict-generalization:
+    # `nsa_compress_block_size=1, nsa_compress_block_sliding_stride=1,
+    # nsa_sliding_window_size=T, nsa_branch_gate_init=0` recovers full causal
+    # SDPA exactly. See H86 in experiments/hypotheses.md for the design spec.
+    use_nsa_attention = False
+    nsa_compress_block_size = 32
+    nsa_compress_block_sliding_stride = 16
+    nsa_selection_block_size = 64
+    nsa_num_selected_blocks = 0  # 0 disables selection branch (iter 106 = 2-branch); 4 enables it (iter 106b)
+    nsa_sliding_window_size = 256
+    nsa_branch_gate_init = 0.0   # zero → softmax uniform mix at init
+
     # Optimizer
     tied_embed_lr = 0.03
     embed_lr = 0.6
@@ -455,6 +474,11 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "min-share-loss-weight", "cv-loss-weight",
     "router-entropy-coef", "router-entropy-warmup-delay-frac",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
+    # iter 106 NSA — Native Sparse Attention (H86)
+    "use-nsa-attention",
+    "nsa-compress-block-size", "nsa-compress-block-sliding-stride",
+    "nsa-selection-block-size", "nsa-num-selected-blocks",
+    "nsa-sliding-window-size", "nsa-branch-gate-init",
 )
 
 
@@ -474,6 +498,9 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "swa-enabled", "ema-enabled", "use-ctp",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
+    # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
+    # which the loop above already routes through `add_argument(type=int)`. Add
+    # it to bool_keys so 0/1 → False/True conversion happens at parse time.
     p.add_argument("--router-bias-lr", type=float, default=None)
     p.add_argument("--router-bias-clip", type=float, default=None)
     ns, unknown = p.parse_known_args(argv)
@@ -485,7 +512,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         raise SystemExit(f"Unknown args: {bad}")
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
-                 "swa_enabled", "ema_enabled", "use_ctp"}
+                 "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -776,7 +803,7 @@ eval_val = run_validation
 # QUANTIZATION (uniform INT6 + SDClip)
 # ---------------------------------------------------------------------------
 
-CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale", "norm_weight")
+CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale", "norm_weight", "nsa_branch_gate")
 FP16_KEEP_PATTERNS = ("tok_emb",)
 SDCLIP_K_MATRIX = 12.85
 SDCLIP_K_EMBED = 20.0
@@ -1575,6 +1602,147 @@ class SoftDenseRouter(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# NSA — Native Sparse Attention (iter 106; arxiv:2502.11089)
+# ---------------------------------------------------------------------------
+#
+# Two branches are implemented here (selection branch deferred to iter 106b):
+#   compression — mean-pool K/V over fixed-size sliding blocks, attend to the
+#     downsampled stream (global, coarse coverage).
+#   sliding-window — last W tokens (local recency).
+#
+# Mixed via a per-expert-per-head learnable softmax gate stored on
+# CausalSelfAttention as `nsa_branch_gate` (shape `(E*H, 2)`). Init at zero →
+# uniform softmax → equal mixing of the two branches.
+#
+# Strict-generalization (CLAUDE.md §11): with `nsa_compress_block_size=1,
+# nsa_compress_block_sliding_stride=1, nsa_sliding_window_size=T,
+# nsa_branch_gate_init=0` both branches collapse to full causal SDPA and the
+# uniform mixer averages two identical outputs → the iter 100b forward map is
+# recovered exactly.
+
+def _nsa_compression_branch(
+    q_full: Tensor, k_full: Tensor, v_full: Tensor, *,
+    block_size: int, stride: int,
+) -> Tensor:
+    """Compression branch: mean-pool K/V over sliding blocks, then SDPA against
+    the (B, H_kv, n_blocks_pad, d) compressed K/V with a rectangular causal
+    mask. A leading zero-block is prepended so queries at t < block_size − 1
+    (which observe no completed compression block) still see one valid key
+    column — keeps softmax well-defined without per-row masking gymnastics.
+    """
+    B, H, T, d = q_full.shape
+    H_kv = k_full.shape[1]
+    device = q_full.device
+    dtype = q_full.dtype
+
+    # Edge case: sequence shorter than one compression block. Compression has
+    # nothing to summarize; return zeros so the mixer drops this branch's
+    # contribution. Sliding-window branch handles all attention in this regime.
+    if T < block_size:
+        return torch.zeros_like(q_full)
+
+    # n_blocks: (T - block_size) // stride + 1 sliding windows fit in T tokens.
+    n_blocks = (T - block_size) // stride + 1
+    # unfold last-but-one dim → (B, H_kv, n_blocks, d, block_size); mean over
+    # block_size axis.
+    k_unf = k_full.unfold(dimension=2, size=block_size, step=stride).mean(dim=-1)
+    v_unf = v_full.unfold(dimension=2, size=block_size, step=stride).mean(dim=-1)
+
+    # Prepend a zero K/V column so every query has at least one finite-score
+    # key (avoids softmax(-inf) → NaN on early rows that observe no completed
+    # block). The zero column's score is biased by `_NSA_NEG` so it dominates
+    # the softmax ONLY when every real block is masked out (early rows when
+    # block_size > 1) — otherwise its weight is numerically zero, leaving the
+    # forward map unchanged from a pure "real-keys-only" SDPA.
+    zero_kv = torch.zeros(B, H_kv, 1, d, device=device, dtype=dtype)
+    k_pad = torch.cat([zero_kv, k_unf], dim=2)
+    v_pad = torch.cat([zero_kv, v_unf], dim=2)
+
+    # Rectangular causal mask: query t observes compressed block i iff the
+    # block has fully ended (last source position i*stride+block_size-1 ≤ t).
+    block_ends = torch.arange(n_blocks, device=device) * stride + block_size - 1
+    q_pos = torch.arange(T, device=device)
+    valid = q_pos[:, None] >= block_ends[None, :]                  # (T, n_blocks)
+
+    # Mask convention chosen so the zero column has zero weight when ANY real
+    # block is observable (its logit −1e9 is dominated by any real q·k score)
+    # but FULL weight when every real block is masked (the masked reals get
+    # true −inf, so the zero column's −1e9 is the only finite logit).
+    NEG_INF = torch.tensor(float("-inf"), device=device, dtype=dtype)
+    NEG_LARGE = torch.tensor(-1e9, device=device, dtype=dtype)
+    ZERO = torch.tensor(0.0, device=device, dtype=dtype)
+    real_bias = torch.where(valid, ZERO, NEG_INF)                  # (T, n_blocks)
+    zero_col_bias = NEG_LARGE.expand(T, 1)                         # (T, 1) — finite but tiny
+    attn_mask = torch.cat([zero_col_bias, real_bias], dim=1)[None, None, :, :]  # (1, 1, T, 1+n_blocks)
+
+    return F.scaled_dot_product_attention(
+        q_full, k_pad, v_pad,
+        attn_mask=attn_mask, is_causal=False,
+        enable_gqa=(H_kv != H),
+    )
+
+
+def _nsa_sliding_branch(
+    q_full: Tensor, k_full: Tensor, v_full: Tensor, *, window_size: int,
+) -> Tensor:
+    """Sliding-window branch: SDPA with a band-causal mask
+    `M[t, k] = (max(0, t-W+1) ≤ k ≤ t)`. The first row (t=0) always has at
+    least one valid key (k=0) so softmax is well-defined.
+    """
+    B, H, T, d = q_full.shape
+    H_kv = k_full.shape[1]
+    device = q_full.device
+    dtype = q_full.dtype
+
+    # Fast path: if W ≥ T the band degenerates to full causal — let SDPA's
+    # built-in is_causal=True path take over (FA backend, no explicit mask).
+    if window_size >= T:
+        return F.scaled_dot_product_attention(
+            q_full, k_full, v_full, attn_mask=None, is_causal=True,
+            enable_gqa=(H_kv != H),
+        )
+
+    q_pos = torch.arange(T, device=device)[:, None]                # (T, 1)
+    k_pos = torch.arange(T, device=device)[None, :]                # (1, T)
+    valid = (k_pos <= q_pos) & (k_pos >= q_pos - window_size + 1)  # (T, T)
+    attn_mask = torch.where(
+        valid,
+        torch.zeros((), device=device, dtype=dtype),
+        torch.full((), float("-inf"), device=device, dtype=dtype),
+    )[None, None, :, :]                                            # (1, 1, T, T)
+
+    return F.scaled_dot_product_attention(
+        q_full, k_full, v_full, attn_mask=attn_mask, is_causal=False,
+        enable_gqa=(H_kv != H),
+    )
+
+
+def _nsa_attention(
+    q_full: Tensor, k_full: Tensor, v_full: Tensor, *,
+    branch_gate: Tensor,
+    compress_block_size: int, compress_stride: int,
+    sliding_window_size: int,
+) -> Tensor:
+    """Two-branch NSA mixer. `branch_gate` has shape `(H, 2)` (logits per head
+    over [compression, sliding]). Selection branch deferred to iter 106b — the
+    CausalSelfAttention call site sets `nsa_num_selected_blocks=0` for now.
+    """
+    out_c = _nsa_compression_branch(
+        q_full, k_full, v_full,
+        block_size=compress_block_size, stride=compress_stride,
+    )
+    out_s = _nsa_sliding_branch(
+        q_full, k_full, v_full, window_size=sliding_window_size,
+    )
+
+    # Per-head softmax mixer. branch_gate (H, 2) → (H, 2) softmax.
+    gate = F.softmax(branch_gate.to(q_full.dtype), dim=-1)
+    w_c = gate[:, 0][None, :, None, None]                          # (1, H, 1, 1)
+    w_s = gate[:, 1][None, :, None, None]
+    return w_c * out_c + w_s * out_s
+
+
+# ---------------------------------------------------------------------------
 # MLA + GATED ATTENTION
 # ---------------------------------------------------------------------------
 
@@ -1595,6 +1763,11 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
+                 use_nsa_attention: bool = False,
+                 nsa_compress_block_size: int = 32,
+                 nsa_compress_block_sliding_stride: int = 16,
+                 nsa_sliding_window_size: int = 256,
+                 nsa_branch_gate_init: float = 0.0,
                  **kwargs):
         super().__init__()
         self.num_heads = num_heads
@@ -1603,6 +1776,11 @@ class CausalSelfAttention(nn.Module):
         self.num_experts = num_experts
         self.expert_rank = expert_rank if expert_rank > 0 else max(dim // max(num_experts, 1), 1)
         self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
+        # iter 106 NSA settings — see H86 + module-level NSA helpers above.
+        self.use_nsa_attention = bool(use_nsa_attention)
+        self.nsa_compress_block_size = int(nsa_compress_block_size)
+        self.nsa_compress_block_sliding_stride = int(nsa_compress_block_sliding_stride)
+        self.nsa_sliding_window_size = int(nsa_sliding_window_size)
         self.rope_dim = self.head_dim // 2
         self.nope_dim = self.head_dim - self.rope_dim
         self.kv_rank = max(self.kv_latent_dim // 8, 32)
@@ -1674,6 +1852,17 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_experts * num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
         self.gate_bias = nn.Parameter(torch.zeros(num_experts * num_heads, dtype=torch.float32))
+        # iter 106 NSA: per-expert-per-head two-branch (compression, sliding)
+        # softmax mixer logits. Allocated only when NSA is on; zero-param when
+        # off so disabled-default has no opt-coverage / quantization fallout.
+        # CLAUDE.md §6.2 hard constraint: every learned per-head param has
+        # leading dim E to keep experts fully independent. Stored as float32
+        # (matches q_gain / gate_bias) — auto-routes to scalar AdamW group.
+        if self.use_nsa_attention:
+            self.nsa_branch_gate = nn.Parameter(torch.full(
+                (num_experts * num_heads, 2), float(nsa_branch_gate_init),
+                dtype=torch.float32,
+            ))
 
         self.attn_router = router if router is not None else SoftDenseRouter(dim, num_experts)
         # Per-expert learned pre-RMS scales for Q/K components. RMS math is
@@ -1785,19 +1974,29 @@ class CausalSelfAttention(nn.Module):
 
         v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
 
-        # --- Head-packed SDPA ---
-        try:
-            y = F.scaled_dot_product_attention(
-                q_full, k_full, v_full, attn_mask=None, is_causal=True,
-                enable_gqa=(H_kv != H),
+        # --- Head-packed SDPA / NSA ---
+        if self.use_nsa_attention:
+            # iter 106: 2-branch NSA replaces dense causal SDPA.
+            y = _nsa_attention(
+                q_full, k_full, v_full,
+                branch_gate=self.nsa_branch_gate,
+                compress_block_size=self.nsa_compress_block_size,
+                compress_stride=self.nsa_compress_block_sliding_stride,
+                sliding_window_size=self.nsa_sliding_window_size,
             )
-        except TypeError:
-            k_use, v_use = k_full, v_full
-            if H_kv != H:
-                rep = H // H_kv
-                k_use = k_full.repeat_interleave(rep, dim=1)
-                v_use = v_full.repeat_interleave(rep, dim=1)
-                y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
+        else:
+            try:
+                y = F.scaled_dot_product_attention(
+                    q_full, k_full, v_full, attn_mask=None, is_causal=True,
+                    enable_gqa=(H_kv != H),
+                )
+            except TypeError:
+                k_use, v_use = k_full, v_full
+                if H_kv != H:
+                    rep = H // H_kv
+                    k_use = k_full.repeat_interleave(rep, dim=1)
+                    v_use = v_full.repeat_interleave(rep, dim=1)
+                    y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
 
         # --- Gated attention ---
         gate_logits_p = gate_logits.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, 1)
@@ -2223,6 +2422,11 @@ class Block(nn.Module):
                  router_entropy_coef: float = 0.0,
                  min_share_loss_weight: float = 0.0,
                  cv_loss_weight: float = 2.0,
+                 use_nsa_attention: bool = False,
+                 nsa_compress_block_size: int = 32,
+                 nsa_compress_block_sliding_stride: int = 16,
+                 nsa_sliding_window_size: int = 256,
+                 nsa_branch_gate_init: float = 0.0,
                  **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
@@ -2268,7 +2472,12 @@ class Block(nn.Module):
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
-                                         expert_rank=attn_expert_rank, router=self.router)
+                                         expert_rank=attn_expert_rank, router=self.router,
+                                         use_nsa_attention=use_nsa_attention,
+                                         nsa_compress_block_size=nsa_compress_block_size,
+                                         nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
+                                         nsa_sliding_window_size=nsa_sliding_window_size,
+                                         nsa_branch_gate_init=nsa_branch_gate_init)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
@@ -2801,7 +3010,12 @@ class GPT(nn.Module):
                  parcae_init_b_bar: float | None = None,
                  min_share_loss_weight: float = 0.0,
                  cv_loss_weight: float = 2.0,
-                 use_ctp: bool = True):
+                 use_ctp: bool = True,
+                 use_nsa_attention: bool = False,
+                 nsa_compress_block_size: int = 32,
+                 nsa_compress_block_sliding_stride: int = 16,
+                 nsa_sliding_window_size: int = 256,
+                 nsa_branch_gate_init: float = 0.0):
         super().__init__()
         self.use_ctp = bool(use_ctp)
         self.tie_embeddings = tie_embeddings
@@ -2828,6 +3042,11 @@ class GPT(nn.Module):
                                    router_entropy_coef=router_entropy_coef,
                                    min_share_loss_weight=min_share_loss_weight,
                                    cv_loss_weight=cv_loss_weight,
+                                   use_nsa_attention=use_nsa_attention,
+                                   nsa_compress_block_size=nsa_compress_block_size,
+                                   nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
+                                   nsa_sliding_window_size=nsa_sliding_window_size,
+                                   nsa_branch_gate_init=nsa_branch_gate_init,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
@@ -3949,6 +4168,11 @@ def main() -> None:
         min_share_loss_weight=args.min_share_loss_weight,
         cv_loss_weight=args.cv_loss_weight,
         use_ctp=args.use_ctp,
+        use_nsa_attention=args.use_nsa_attention,
+        nsa_compress_block_size=args.nsa_compress_block_size,
+        nsa_compress_block_sliding_stride=args.nsa_compress_block_sliding_stride,
+        nsa_sliding_window_size=args.nsa_sliding_window_size,
+        nsa_branch_gate_init=args.nsa_branch_gate_init,
     ).to(device).bfloat16()
 
     for module in base_model.modules():

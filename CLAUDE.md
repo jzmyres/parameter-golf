@@ -140,6 +140,13 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
 | num_refinements | 0 (2026-04-29 user directive: disable refinement by default after iter 98b showed +70% step cost at D=1024 / +6% at D=768 with no directly-ablated val_bpb benefit; iter 110 queued to test re-enable as a clean ablation. CLAUDE.md §6.5 still defines the architectural form for when re-enabled.) |
 | use_ctp | False (iter 94: CTP head disabled — NTP-only; CTP param banks not allocated) |
+| use_nsa_attention | False (iter 106 default off; CLI-enabled per launch. When True, replaces dense causal SDPA with the 2-branch NSA mixer — compression branch (mean-pool K/V over `nsa_compress_block_size` blocks at `nsa_compress_block_sliding_stride` stride) + sliding-window branch (last `nsa_sliding_window_size` tokens). Selection branch (3rd NSA branch) deferred to iter 106b: gated by `nsa_num_selected_blocks > 0`, currently 0. Per-expert-per-head learnable softmax mixer `nsa_branch_gate (E*H, 2)` initialized to `nsa_branch_gate_init=0.0` (uniform mix). See H86 in hypotheses.md.) |
+| nsa_compress_block_size | 32 (only used when `use_nsa_attention=True`) |
+| nsa_compress_block_sliding_stride | 16 |
+| nsa_selection_block_size | 64 (selection branch deferred — iter 106b knob) |
+| nsa_num_selected_blocks | 0 (0 disables selection branch; 4 enables it for iter 106b) |
+| nsa_sliding_window_size | 256 |
+| nsa_branch_gate_init | 0.0 (logits init to 0 → uniform softmax over branches at init) |
 
 ### Optimizer
 | Parameter | Value |
@@ -237,6 +244,8 @@ Papers: DeepSeek-V2 MLA (arxiv:2405.04434); Gated Attention (arxiv:2505.06708, N
 - **Head-packed SDPA**: expert index extends head dimension (`E·H` query heads, `E·H_kv` KV heads) for one FlashAttention call. GQA ratio preserved.
 - **Decoupled RoPE**: split heads into RoPE and non-RoPE components.
 - **Gated Attention**: query-dependent per-expert-per-head sigmoid gate after SDPA. Gate logits from per-expert Q projection (appended to Q output); each token gets its own gate value per head per expert.
+
+**Optional sparse-attention path — NSA (iter 106, default off).** When `use_nsa_attention=True`, the head-packed `(B, E·H, T, d)` SDPA call is replaced by a two-branch Native Sparse Attention mixer (arxiv:2502.11089): (1) **compression branch** mean-pools K/V over fixed-size sliding blocks then attends with a rectangular causal mask; (2) **sliding-window branch** attends to the last W tokens with a band-causal mask. A per-expert-per-head learnable softmax gate (`nsa_branch_gate` shape `(E·H, 2)`) mixes the two outputs. Gated attention (post-SDPA per-head sigmoid) is preserved unchanged. The third NSA branch (selection — top-K per-query block selection) is deferred to iter 106b via `nsa_num_selected_blocks=0`. **Strict-generalization (CLAUDE.md §11):** `nsa_compress_block_size=1`, `nsa_compress_block_sliding_stride=1`, `nsa_sliding_window_size=T`, `nsa_branch_gate_init=0` recovers full causal SDPA exactly within bf16 numerical floor — promotion is unconditional on val_bpb improvement.
 
 **Discarded alternative — bottleneck experts (iter 90, 91+92)**. The "low-dim bottleneck" rewrite (BottleneckIn `D→proj_rank→r` + ExpertBody at small `r` + BottleneckOut `r→proj_rank→D`) was tested as Group D and NOT PROMOTED. Empirically it underperformed full-D LoRA on **per-param efficiency** (`bpb/param 1.49 vs full-D LoRA's 1.17 — ~27% worse`, H70) AND on **SDPA throughput** (forces `d_head ≤ 48` at any `r ≤ 192` with `H_in ≥ 4`, off the FA tensorcore sweet spot of 64+). Both penalties compound when scaling N_expert. **Do not re-introduce bottleneck-style experts as a scaling axis.** The bottleneck infrastructure is preserved for archival reference at git tag `iter-91+92-bottleneck-NOT-PROMOTED` (commit `3e35655`) and side branch `autoresearch/bottleneck-rescue` (`proj_rank=48/64` rescue workspace). The iter 96 PROMOTED axis — full-D LoRA with rank-halving / E-doubling at iso-cost on linears — supersedes it (H71). See §6.2 for the routing semantics that this expert layout feeds into.
 
