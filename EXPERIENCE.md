@@ -28,6 +28,7 @@ This file has two roles, in this order:
 | (meta)     | [#routing-predicate-migration](#routing-predicate-migration) | Cross-incident pattern (2026-04-15 / -17 / -18 / -23): silent predicate migration |
 | (pre-arch) | [#permutation-consistency](#permutation-consistency)         | k_rope outlier permute index produced silent transposition (commit ec1048b) |
 | (pre-arch) | [#doc-code-invariant](#doc-code-invariant)                   | Pseudocode in `opg_doc.tex` diverged from implementation; required co-update |
+| 2026-04-28 | [#hyperparameter-fanout](#hyperparameter-fanout)             | Five "tunable" knobs documented in CLAUDE.md §5 were hardcoded inside constructors |
 
 ### Section template
 
@@ -395,6 +396,43 @@ Verify all groups of related permutes use the same index tuple. A single outlier
 - Reviewers grep `opg_doc.tex` for stale references to removed names (e.g. `gg_gate`, `SmearGate`) when those features are dropped.
 
 **Cross-references.** [#config-drift](#config-drift) (this was one of the five defects).
+
+---
+
+### hyperparameter-fanout
+
+**Date:** 2026-04-28 review of Phase 9 cleanup
+**Rule in CLAUDE.md:** §9 row "Hyperparameter fan-out" · §5 Single-source-of-truth
+
+**What happened.** A multi-agent pre-commit review of the Phase 9 throughput chain found five knobs documented in CLAUDE.md §5 (Routing & Expert Ranks table) as `Hyperparameters` fields that were ACTUALLY hardcoded as constructor literals deep inside `SoftDenseRouter` / `Block` / `MoSHead` / `_parcae_init_raw_values`:
+
+- `min_share_loss_weight = 1.0` (in `SoftDenseRouter.__init__`) and a SECOND override `0.0` in `Block.__init__` — three sources of truth, none of them `Hyperparameters`.
+- `cv_loss_weight = 0.10` (in `SoftDenseRouter.__init__`) and `2.0` in `Block.__init__`.
+- `router_entropy_coef` was a `Hyperparameters` field but reached the consumer through several `getattr(args, ...)` calls — every layer added a hardcoded fallback default.
+- `router_entropy_warmup_delay_frac` — same pattern.
+- `parcae_init_b_bar` — not a `Hyperparameters` field at all, only derived as `1 − parcae_init_a_bar` inside `_parcae_init_raw_values`.
+
+A user attempting to override these via CLI saw no effect: the override either never reached the consumer or was shadowed by a function-default literal. The doc said "tunable", but the code was not.
+
+In the same review, the per-token entropy loss term was found to be silently scaled by `(attn_balance_mult + mlp_balance_mult)` because the pooled router is summed across attn+mlp slices via `id()` dedup in `_collect_routing_losses`. The documented `router_entropy_coef = 0.005` was acting as `~0.03` in effect — the doc and the running model disagreed on the loss landscape.
+
+**Root cause.** When a knob lives in `Hyperparameters` and is also a constructor argument with a default, future hands edit the constructor default and forget the dataclass — or vice versa. The doc says one thing, the code does another, neither catches it.
+
+**The rule (Hyperparameter fan-out invariant).** Any tunable knob with a documented effect on a metric (val_bpb, throughput, an audit invariant) MUST live in `Hyperparameters` and be reachable through `_parse_cli_overrides`. The four-touch checklist for adding a knob:
+
+1. Field in `Hyperparameters` with the documented default.
+2. `args.<field>` read at the consumer site — NO constructor literal default that shadows it.
+3. Row in CLAUDE.md §5 mirroring the dataclass default.
+4. Row in `opg_doc.tex` parameter table (or a "Practical implementation" deviation note per the doc-code-invariant rule).
+
+When effective magnitude differs from documented magnitude (as with the entropy loss × balance-mult dedup), document the *effective* value in §5 OR fix the multiplication so documented = effective. Do not silently leave readers with the wrong mental model.
+
+**Verification recipe.**
+- Pre-commit grep: every CLAUDE.md §5 row name must match `args.<row>` somewhere in `train_gpt.py`.
+- `experiments/test_cli_parser.py::test_default_parity` iterates the documented routing knobs and asserts each is reachable through `_parse_cli_overrides` with the documented default.
+- Reviewers reading a PR that adds a knob should grep CLAUDE.md §5 + `_parse_cli_overrides` for the new field name BEFORE approving.
+
+**Cross-references.** [#config-drift](#config-drift) (parent pattern), [#doc-code-invariant](#doc-code-invariant) (the doc-side enforcement).
 
 ---
 
