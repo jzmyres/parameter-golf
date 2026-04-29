@@ -1826,7 +1826,15 @@ class CausalSelfAttention(nn.Module):
 
     @staticmethod
     def _rms_scale(x: Tensor, weight: Tensor, *, expert_dim: int = 0, eps: float = 1e-6) -> Tensor:
-        y = x * x.pow(2).mean(dim=-1, keepdim=True).add(eps).rsqrt()
+        # 2026-04-28 Fix #1 (profile-driven): replace inline `x.pow(2).mean(-1)
+        # .add(eps).rsqrt() * x` with the fused F.rms_norm kernel. The inline
+        # pattern produced 6 distinct triton_per_fused__to_copy_add_mean_mul_pow_rsqrt
+        # variants in profile_v12 totalling ~31% of CUDA time. F.rms_norm dispatches
+        # to a single well-tuned fused kernel (PyTorch 2.5+).
+        # Per-expert weight is applied as a separate elementwise mul because the
+        # weight shape (E, D) does not match F.rms_norm's `weight` arg requirement
+        # of broadcasting to `normalized_shape` (D,).
+        y = F.rms_norm(x, (x.size(-1),), eps=eps)
         shape = [1] * y.ndim
         shape[expert_dim] = weight.shape[0]
         shape[-1] = weight.shape[-1]
@@ -1875,8 +1883,8 @@ class CausalSelfAttention(nn.Module):
         # Per-expert MLA decompress: kv_latent → K_nope, V
         # Parameter-free RMS statistic with separate learned K and V input scales.
         kv_flat = kv_latent.reshape(E * N, self.kv_latent_dim)
-        kv_rms = kv_flat.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
-        kv_unit = (kv_flat * kv_rms).reshape(E, N, self.kv_latent_dim)
+        # Fix #1 (profile-driven, see _rms_scale comment): fused F.rms_norm.
+        kv_unit = F.rms_norm(kv_flat, (self.kv_latent_dim,), eps=1e-6).reshape(E, N, self.kv_latent_dim)
         kv_k = kv_unit * self.k_nope_in_norm_weight.to(dtype=dtype).unsqueeze(1)
         kv_v = kv_unit * self.v_in_norm_weight.to(dtype=dtype).unsqueeze(1)
         ek = self.expert_k_nope.to(dtype=dtype)
@@ -2060,9 +2068,9 @@ class MLP(nn.Module):
         fc = x_flat @ Fm.t()
         h = F.silu(gate) * fc
         h = h.view(N, E, R)
-        # Per-expert RMSNorm (no shared weights across experts)
-        h_rms = h.pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
-        h = h * h_rms * self.hidden_norm_weight.to(dtype=h.dtype)  # (E, R) broadcasts over (N, E, R)
+        # Per-expert RMSNorm (no shared weights across experts).
+        # Fix #1 (profile-driven, see _rms_scale comment): fused F.rms_norm.
+        h = F.rms_norm(h, (R,), eps=1e-6) * self.hidden_norm_weight.to(dtype=h.dtype)  # (E, R) broadcasts over (N, E, R)
         # Phase 9 iter 51: shared experts (sigmoid-gated) + routed experts
         S = int(num_shared)
         if S > 0 and shared_gate is not None:
@@ -2253,8 +2261,8 @@ class MoSHead(nn.Module):
         # FSQ + per-expert rank prenorm + logits:
         # (N, E, R) → FSQ/RMS → per-expert B → (N, E, V)
         u_all = self._fsq(t_all)
-        u_rms = u_all.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
-        u_all = u_all * u_rms * rank_norm_weight.to(dtype=u_all.dtype).unsqueeze(0)
+        # Fix #1 (profile-driven, see _rms_scale comment): fused F.rms_norm.
+        u_all = F.rms_norm(u_all, (u_all.size(-1),), eps=1e-6) * rank_norm_weight.to(dtype=u_all.dtype).unsqueeze(0)
         logits_all = torch.bmm(
             u_all.permute(1, 0, 2).to(B.dtype),
             B.transpose(1, 2),
@@ -2558,8 +2566,8 @@ class Block(nn.Module):
         # Parcae input injection: T_θ = B̄ ⊙ RMSUnit(x_0) ⊙ g + Δ_θ.
         # b_bar=None ⇒ ones(D) (direct Block() in tests).  At the fixed point
         # β=1-Ā cancels and y* = B̄ ⊙ RMSUnit(x_0) ⊙ g + Δ*.
-        x0_rms_scale = x0.pow(2).mean(dim=-1, keepdim=True).add(1e-6).rsqrt()
-        x0_rms = x0 * x0_rms_scale * self.x0_inject_norm_weight.to(x0.dtype)
+        # Fix #1 (profile-driven, see _rms_scale comment): fused F.rms_norm.
+        x0_rms = F.rms_norm(x0, (x0.size(-1),), eps=1e-6) * self.x0_inject_norm_weight.to(x0.dtype)
         if b_bar is not None:
             x0_rms = b_bar.to(x0_rms.dtype) * x0_rms
         raw_out = x0_rms.to(dtype=z_in.dtype) + delta
@@ -4691,6 +4699,31 @@ def main() -> None:
         torch._dynamo.config.disable = True
         deq_sd = load_int6_artifact(compressed, sd)
         base_model.load_state_dict(deq_sd, strict=True)
+
+    # PROFILE_SKIP_KSWEEP=1 (set by experiments/profile_train.py) tells ALL
+    # ranks to exit cleanly here, BEFORE the int6 weight broadcast +
+    # roundtrip + K-sweep section. The K-sweep's OOM-prone Hutchinson/Lipschitz
+    # probes (task #102) drag profile runs by 10+ min without contributing
+    # any train-step ops to the trace. This check sits OUTSIDE the
+    # `if master_process:` block at L4656-4693 — so all ranks reach it and
+    # exit together (no NCCL hang from rank-divergent exits at the next
+    # collective). Sys.exit raises SystemExit, which the
+    # `experiments/profile_train.py` `try/except SystemExit: pass` catches
+    # cleanly — then the profile context exits and the trace + ops table
+    # are written.
+    if os.environ.get("PROFILE_SKIP_KSWEEP") == "1":
+        if master_process:
+            log0("PROFILE_SKIP_KSWEEP=1 — all ranks exiting before roundtrip + K-sweep")
+        if distributed:
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        sys.exit(0)
 
     # Broadcast the dequantized weights from master to all ranks so every
     # rank runs eval on the same int6-roundtripped model.  Parameters and

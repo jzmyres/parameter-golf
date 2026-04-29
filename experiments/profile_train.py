@@ -96,6 +96,14 @@ def main_with_profile():
     global _profiler, _real_clip_grad_norm
     print(f"[profile] starting profiler: warmup={PROFILE_WARMUP} active={PROFILE_ACTIVE}",
           flush=True)
+    # PROFILE_SKIP_KSWEEP=1 (default) tells train_gpt to early-exit AFTER the
+    # train loop, BEFORE the int6 roundtrip + K-sweep. The OOM-prone Hutchinson
+    # / Lipschitz probes (task #102) drag the profile run by 10+ min without
+    # contributing any training-step ops. The env var is checked by ALL ranks
+    # in train_gpt.main right at the post-train boundary (see L4574-area), so
+    # all ranks exit together — no NCCL hang.
+    os.environ.setdefault("PROFILE_SKIP_KSWEEP", "1")
+
     sched = schedule(wait=0, warmup=PROFILE_WARMUP, active=PROFILE_ACTIVE, repeat=1)
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
     with profile(
