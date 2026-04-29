@@ -51,176 +51,18 @@ _ROUTER_DIAGNOSTICS_STEP: int | None = None
 _DEQ_SOLVE_ACTIVE = False
 
 
-# ---------------------------------------------------------------------------
-# ADASPLASH α-ENTMAX ATTENTION (iter 104, re-introduced 2026-04-29)
-# ---------------------------------------------------------------------------
-# AdaSplash (deep-spin/adasplash, ICML 2025, arxiv 2502.12082) replaces
-# softmax with α-entmax in attention, producing exact zeros via a fused
-# Triton kernel. At α=1.0 reduces to dense softmax; α>1.0 produces adaptive
-# learned sparsity. This module is the gated re-introduction post the
-# session's Fix #2 SIGABRT — root cause was an upstream kernel bug in
-# AdaSplash's GQA broadcast: `cudaErrorIllegalAddress` whenever H_q ≠ H_kv
-# and B*T*H exceeds a kernel block-tile threshold. (Empirically: H_q=96
-# H_kv=48 GQA crashes even at B=1; H_q=12 H_kv=6 GQA crashes at B≥4.)
-#
-# Principled fix (`adasplash_alpha_entmax_attention` below):
-# 1) Reshape head-packed (B, E*H, T, d) → (B*E, H, T, d) to keep H within
-#    the safe range (the kernel is fine at H=12 no-GQA up to B=512).
-# 2) Explicit GQA broadcast via `repeat_interleave` to make K/V match Q's
-#    head count, bypassing the buggy internal GQA path entirely.
-# Cost: 2× KV memory inside the call (transient — frees on return). Both
-# steps are ZERO-COMPUTE-COST (just contiguous reshape + one alloc).
-_ADASPLASH_AVAILABLE = False
-_adasplash_attention = None
-try:
-    from adasplash import adasplash as _adasplash_attention
-    _ADASPLASH_AVAILABLE = True
-except ImportError:
-    pass
-
-
-# 2026-04-29 user directive (iter 104 systematic debug):
-# Wrap the AdaSplash kernel in a `torch.library.custom_op` so AOTAutograd
-# treats it as a first-class opaque op with proper FakeTensor metadata. The
-# previous `@torch._dynamo.disable`-only wrap was insufficient — dynamo's
-# tracer skipped the function but AOTAutograd's view-meta replay still
-# corrupted the kernel output's tensor metadata at training step 2
-# (`_functionalization.apply_view_meta_sequence` returned garbage int64
-# shape `[22343783044301, ...]`).
-#
-# The custom_op pattern:
-#   1. Forward op `opg::adasplash_attn_op` wraps the kernel call.
-#   2. FakeTensor abstract impl returns `q.new_empty(q.shape)` — pure
-#      shape inference, no compute.
-#   3. Autograd setup_context saves q/k/v + alpha/niter; backward re-runs
-#      the kernel with `enable_grad` and `torch.autograd.grad` to extract
-#      grad_q/k/v. AdaSplash supports backward via standard autograd
-#      (verified standalone), so we delegate rather than write manual VJP.
-if _ADASPLASH_AVAILABLE:
-    @torch.library.custom_op("opg::adasplash_attn_op", mutates_args=())
-    def _adasplash_attn_op(
-        q: Tensor, k: Tensor, v: Tensor, alpha: float, niter: int,
-    ) -> Tensor:
-        # iter 104 systematic debug round 2 (2026-04-29): force contiguity at
-        # the custom_op boundary so AOTAutograd functionalization sees
-        # standard contiguous metadata on both inputs and output. Round 1
-        # (custom_op alone, commit c127271) crashed at step 2 with the same
-        # `_functionalization.apply_view_meta_sequence` error — root cause
-        # was likely a stride/contiguity mismatch between the FakeTensor
-        # metadata (`q.new_empty(q.shape)` — contiguous) and the kernel's
-        # actual output tensor (which may have non-contiguous strides).
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-        out = _adasplash_attention(
-            q, k, v, alpha=float(alpha), is_causal=True, niter=int(niter),
-        )
-        return out.contiguous()
-
-    @_adasplash_attn_op.register_fake
-    def _(q, k, v, alpha, niter):
-        # Output shape == q's shape (causal attention preserves Q's heads/T/d).
-        # Match the real impl's contiguity guarantee.
-        return q.new_empty(q.shape).contiguous()
-
-    def _adasplash_setup_context(ctx, inputs, output):
-        q, k, v, alpha, niter = inputs
-        # Save contiguous copies — backward will run them through eager
-        # AdaSplash autograd, so non-contiguous strides could trigger the
-        # same metadata-replay bug.
-        ctx.save_for_backward(q.contiguous(), k.contiguous(), v.contiguous())
-        ctx.alpha = float(alpha)
-        ctx.niter = int(niter)
-
-    def _adasplash_backward(ctx, grad_output):
-        q, k, v = ctx.saved_tensors
-        # Re-run forward in an isolated grad scope to extract VJP via
-        # AdaSplash's own autograd (verified standalone — it implements
-        # backward through PyTorch autograd, not as a custom Function).
-        q_in = q.detach().clone().requires_grad_(True)
-        k_in = k.detach().clone().requires_grad_(True)
-        v_in = v.detach().clone().requires_grad_(True)
-        with torch.enable_grad():
-            out = _adasplash_attention(
-                q_in, k_in, v_in, alpha=ctx.alpha, is_causal=True, niter=ctx.niter,
-            )
-            grad_q, grad_k, grad_v = torch.autograd.grad(
-                out, [q_in, k_in, v_in], grad_output.contiguous(),
-                create_graph=False, retain_graph=False,
-            )
-        # Return contiguous grads so the upstream backward replay sees
-        # standard metadata.
-        return grad_q.contiguous(), grad_k.contiguous(), grad_v.contiguous(), None, None
-
-    _adasplash_attn_op.register_autograd(
-        _adasplash_backward, setup_context=_adasplash_setup_context,
-    )
-else:
-    _adasplash_attn_op = None
-
-
-@torch._dynamo.disable
-def adasplash_alpha_entmax_attention(
-    q: Tensor, k: Tensor, v: Tensor, alpha: float, niter: int = 10,
-) -> Tensor:
-    """α-entmax attention via AdaSplash's fused Triton kernel.
-
-    Inputs are head-packed (B, H, T, d) for q and (B, H_kv, T, d) for k/v.
-    Falls back to dense causal SDPA if AdaSplash unavailable or alpha <= 1.0
-    (the softmax limit). For alpha > 1.0:
-
-    1) Cast q/k to v's dtype (bf16 path is the supported one).
-    2) Explicit GQA broadcast — repeat_interleave K/V to H heads — avoids
-       the upstream kernel's GQA crash at scale (root-caused 2026-04-29).
-    3) Call kernel with is_causal=True; AdaSplash handles the causal mask
-       internally per its docstring.
-
-    The function is `@torch._dynamo.disable`-decorated so dynamo treats it
-    as an opaque op, avoiding the per-step recompile thrash from alpha
-    being a Python-float guard.
-    """
-    # alpha == 1.0 is the softmax limit — dense SDPA path is mathematically
-    # equivalent (and avoids spinning up the kernel for a no-op blend). This
-    # is the ONLY allowed fallback to dense.
-    if float(alpha) <= 1.0:
-        return F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, enable_gqa=(k.size(1) != q.size(1)),
-        )
-
-    # 2026-04-29 user directive: fail fast on ANY α-entmax precondition
-    # violation. Silent fallback to dense SDPA hides the fact that the iter
-    # is running with sub-optimal perf — the user explicitly does NOT want
-    # the model to silently regress to dense softmax when α-entmax was
-    # requested. Both head-dim and adasplash-availability are HARD errors.
-    _SAFE_HEAD_DIMS = (16, 32, 64, 128, 256)
-    if not _ADASPLASH_AVAILABLE:
-        raise RuntimeError(
-            "α-entmax requested (alpha={}) but adasplash package not importable. "
-            "Install via `uv pip install adasplash` (CLAUDE.md authorized install).".format(alpha)
-        )
-    if q.size(-1) not in _SAFE_HEAD_DIMS:
-        raise RuntimeError(
-            f"α-entmax requested (alpha={alpha}) but head_dim={q.size(-1)} "
-            f"not in AdaSplash kernel-safe set {_SAFE_HEAD_DIMS}. "
-            f"For model_dim=768, set num_heads=12 (head_dim=64) or num_heads=24 (head_dim=32)."
-        )
-    target_dtype = v.dtype
-    if q.dtype != target_dtype:
-        q = q.to(target_dtype)
-    if k.dtype != target_dtype:
-        k = k.to(target_dtype)
-    H_q, H_kv = q.size(1), k.size(1)
-    if H_kv != H_q:
-        if H_q % H_kv != 0:
-            raise ValueError(f"GQA broadcast requires H_q ({H_q}) % H_kv ({H_kv}) == 0")
-        rep = H_q // H_kv
-        k = k.repeat_interleave(rep, dim=1)
-        v = v.repeat_interleave(rep, dim=1)
-    # Route through the torch.library.custom_op so AOTAutograd treats the
-    # kernel as an opaque op with FakeTensor metadata — fixes the iter 104
-    # production crash (`_functionalization.apply_view_meta_sequence` returning
-    # garbage int64 shape at step 2). See `_adasplash_attn_op` definition.
-    return _adasplash_attn_op(q, k, v, float(alpha), int(niter))
+# Iter 104 (AdaSplash α-entmax attention) DROPPED 2026-04-29 user directive
+# after two systematic-debug rounds confirmed the upstream incompatibility
+# between AdaSplash's `torch.autograd.Function` (line 936 of adasplash_block_mask.py)
+# and torch.compile's AOTAutograd. Per PyTorch dev-discuss "Custom Ops
+# Under torch.compile": "torch.autograd.Function is not the recommended one
+# if you need torch.compile integration." Wrapping with custom_op + FakeTensor
+# does not bypass the inner Function — both register, view-meta replay corrupts.
+# Sliding-window attention (iter 104 v2) also dropped — global reach loss
+# fundamentally hurts long-range modeling. NSA (iter 106, see H77-region in
+# hypotheses.md) is the principled forward path: torch.compile-native via
+# flex_attention, preserves global reach via 3-branch (compression + selection
+# + sliding), natively trainable from scratch.
 
 
 def _unwrap_compiled_module(m: nn.Module) -> nn.Module:
@@ -420,15 +262,6 @@ class Hyperparameters:
     parcae_init_b_bar = 0.3
     parcae_lr = 0.002  # 10× slower than scalar_lr — Parcae params control DEQ mixing
 
-    # Iter 104 AdaSplash α-entmax attention (re-introduced 2026-04-29 after
-    # the upstream-kernel-bug root cause — see `adasplash_alpha_entmax_attention`
-    # docstring). Annealed: pure softmax for the first `warmup_delay_frac` of
-    # training, then linearly ramps to `target` by end. α=1.0 = softmax (off);
-    # the kernel route activates for any α > 1.0.
-    attn_alpha_target = 1.0              # 1.0 = softmax (disabled); >1.0 = α-entmax
-    attn_alpha_warmup_delay_frac = 0.3   # pure softmax for first 30% of training
-    attn_alpha_niter = 10                # entmax bisection iterations (AdaSplash default)
-
     # Optimizer
     tied_embed_lr = 0.03
     embed_lr = 0.6
@@ -622,7 +455,6 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "min-share-loss-weight", "cv-loss-weight",
     "router-entropy-coef", "router-entropy-warmup-delay-frac",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
-    "attn-alpha-target", "attn-alpha-warmup-delay-frac", "attn-alpha-niter",
 )
 
 
@@ -1763,7 +1595,6 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
-                 attn_alpha_niter: int = 10,
                  **kwargs):
         super().__init__()
         self.num_heads = num_heads
@@ -1775,13 +1606,6 @@ class CausalSelfAttention(nn.Module):
         self.rope_dim = self.head_dim // 2
         self.nope_dim = self.head_dim - self.rope_dim
         self.kv_rank = max(self.kv_latent_dim // 8, 32)
-        # Iter 104 (re-introduced 2026-04-29): AdaSplash α-entmax attention.
-        # `_attn_alpha` is mutated by the training loop's annealing schedule;
-        # the SDPA call site reads it each forward. Default 1.0 = softmax
-        # fallback (no kernel call). `attn_alpha_niter` is the entmax
-        # bisection-iteration count (AdaSplash default 10).
-        self.attn_alpha_niter = int(attn_alpha_niter)
-        self._attn_alpha = 1.0
 
         # Per-expert Q: low-rank dim → expert_rank → (H*d_head + H).
         # The +H appended to Q output provides per-head gate logits (gated attn).
@@ -1821,6 +1645,11 @@ class CausalSelfAttention(nn.Module):
         # Position-dependent but per-expert — each expert attends to positions
         # differently.  Low-rank (rank=32) keeps params manageable.
         self.kr_rank = max(num_kv_heads * self.rope_dim // 6, 16)
+        # Iter 104 (AdaSplash α-entmax) DROPPED 2026-04-29 — see module-level
+        # comment near `_unwrap_compiled_module` for the full root-cause +
+        # decision rationale. The `attn_alpha_niter` and `_attn_alpha`
+        # attributes were removed in the same cleanup; the SDPA call site
+        # below now goes straight to dense `F.scaled_dot_product_attention`.
         self.expert_kr_a = nn.Parameter(torch.empty(num_experts, self.kr_rank, dim))
         self.expert_kr_b = nn.Parameter(
             torch.empty(num_experts, num_kv_heads * self.rope_dim, self.kr_rank))
@@ -1957,34 +1786,17 @@ class CausalSelfAttention(nn.Module):
         v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
 
         # --- Head-packed SDPA ---
-        # Iter 104 (2026-04-29 re-introduction): when self._attn_alpha > 1.0,
-        # route through AdaSplash α-entmax. Annealing schedule writes
-        # _attn_alpha from the training loop; default 1.0 falls back to dense
-        # softmax. Reshape head-packed (B, E*H, T, d) → (B*E, H, T, d) before
-        # the kernel: AdaSplash's GQA path crashes at H_q ≥ ~96 (root-caused
-        # 2026-04-29). Keeping H within the safe range (=num_heads) and
-        # putting E into the batch dim avoids the kernel bug entirely.
-        current_alpha = float(getattr(self, "_attn_alpha", 1.0))
-        if _ADASPLASH_AVAILABLE and current_alpha > 1.0:
-            q_be = q_full.reshape(B, E, H, T, q_full.size(-1)).reshape(B * E, H, T, q_full.size(-1))
-            k_be = k_full.reshape(B, E, H_kv, T, k_full.size(-1)).reshape(B * E, H_kv, T, k_full.size(-1))
-            v_be = v_full.reshape(B, E, H_kv, T, v_full.size(-1)).reshape(B * E, H_kv, T, v_full.size(-1))
-            y_be = adasplash_alpha_entmax_attention(
-                q_be, k_be, v_be, alpha=current_alpha, niter=int(getattr(self, "attn_alpha_niter", 10)),
+        try:
+            y = F.scaled_dot_product_attention(
+                q_full, k_full, v_full, attn_mask=None, is_causal=True,
+                enable_gqa=(H_kv != H),
             )
-            y = y_be.reshape(B, E, H, T, v_full.size(-1)).reshape(B, E * H, T, v_full.size(-1))
-        else:
-            try:
-                y = F.scaled_dot_product_attention(
-                    q_full, k_full, v_full, attn_mask=None, is_causal=True,
-                    enable_gqa=(H_kv != H),
-                )
-            except TypeError:
-                k_use, v_use = k_full, v_full
-                if H_kv != H:
-                    rep = H // H_kv
-                    k_use = k_full.repeat_interleave(rep, dim=1)
-                    v_use = v_full.repeat_interleave(rep, dim=1)
+        except TypeError:
+            k_use, v_use = k_full, v_full
+            if H_kv != H:
+                rep = H // H_kv
+                k_use = k_full.repeat_interleave(rep, dim=1)
+                v_use = v_full.repeat_interleave(rep, dim=1)
                 y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
 
         # --- Gated attention ---
@@ -2411,7 +2223,6 @@ class Block(nn.Module):
                  router_entropy_coef: float = 0.0,
                  min_share_loss_weight: float = 0.0,
                  cv_loss_weight: float = 2.0,
-                 attn_alpha_niter: int = 10,
                  **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
@@ -2457,8 +2268,7 @@ class Block(nn.Module):
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
-                                         expert_rank=attn_expert_rank, router=self.router,
-                                         attn_alpha_niter=attn_alpha_niter)
+                                         expert_rank=attn_expert_rank, router=self.router)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
@@ -2991,10 +2801,7 @@ class GPT(nn.Module):
                  parcae_init_b_bar: float | None = None,
                  min_share_loss_weight: float = 0.0,
                  cv_loss_weight: float = 2.0,
-                 use_ctp: bool = True,
-                 attn_alpha_target: float = 1.0,
-                 attn_alpha_warmup_delay_frac: float = 0.3,
-                 attn_alpha_niter: int = 10):
+                 use_ctp: bool = True):
         super().__init__()
         self.use_ctp = bool(use_ctp)
         self.tie_embeddings = tie_embeddings
@@ -3012,14 +2819,6 @@ class GPT(nn.Module):
         # (threaded from Hyperparameters; verified by experiments/test_arch.py).
         self.num_experts = int(num_experts)
         self.num_shared_experts = int(num_shared_experts)
-        # Iter 104 (re-introduced 2026-04-29): AdaSplash α-entmax annealing.
-        # Store target + delay frac on self for the training loop's per-step
-        # update; the training loop writes shared_block.attn._attn_alpha each
-        # step via _attn_alpha_target / _attn_alpha_warmup_delay_frac and the
-        # current time_frac. attn_alpha_niter is wired into the attn module
-        # construction below (read on every forward; not annealed).
-        self._attn_alpha_target = float(attn_alpha_target)
-        self._attn_alpha_warmup_delay_frac = float(attn_alpha_warmup_delay_frac)
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
@@ -3029,7 +2828,6 @@ class GPT(nn.Module):
                                    router_entropy_coef=router_entropy_coef,
                                    min_share_loss_weight=min_share_loss_weight,
                                    cv_loss_weight=cv_loss_weight,
-                                   attn_alpha_niter=attn_alpha_niter,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
@@ -4151,9 +3949,6 @@ def main() -> None:
         min_share_loss_weight=args.min_share_loss_weight,
         cv_loss_weight=args.cv_loss_weight,
         use_ctp=args.use_ctp,
-        attn_alpha_target=float(getattr(args, "attn_alpha_target", 1.0)),
-        attn_alpha_warmup_delay_frac=float(getattr(args, "attn_alpha_warmup_delay_frac", 0.3)),
-        attn_alpha_niter=int(getattr(args, "attn_alpha_niter", 10)),
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -4527,19 +4322,6 @@ def main() -> None:
             else:
                 ent_scale = min(max((time_frac - ent_delay) / max(1.0 - ent_delay, 1e-8), 0.0), 1.0)
             sb.router.entropy_coef = ent_target * ent_scale
-
-        # Iter 104 (re-introduced 2026-04-29): anneal AdaSplash α-entmax
-        # alpha 1.0 → target. Same warmup-delay-then-linear-ramp shape as
-        # router entropy coef. α=1.0 = softmax (no kernel call); α=target
-        # at end of training. Avoids cold-start trap that hurt iter 99/101.
-        alpha_target = float(getattr(base_model, "_attn_alpha_target", 1.0))
-        alpha_delay = float(getattr(base_model, "_attn_alpha_warmup_delay_frac", 0.3))
-        if alpha_target > 1.0:
-            if time_frac < alpha_delay:
-                alpha_scale = 0.0
-            else:
-                alpha_scale = min(max((time_frac - alpha_delay) / max(1.0 - alpha_delay, 1e-8), 0.0), 1.0)
-            sb.attn._attn_alpha = 1.0 + (alpha_target - 1.0) * alpha_scale
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
