@@ -261,6 +261,11 @@ class Hyperparameters:
     # in _parcae_init_raw_values).
     parcae_init_b_bar = 0.3
     parcae_lr = 0.002  # 10× slower than scalar_lr — Parcae params control DEQ mixing
+    # iter 117 v2 (H87): same precedent as parcae_lr. The blend_logit
+    # controls how much entmax-1.5 sparsity contributes to routing — drift
+    # too fast and routing collapses (NaN at iter 117 v1 step 60). 10×
+    # slower LR keeps drift bounded once anneal ramps.
+    entmax_blend_lr = 0.002
 
     # Iter 106 (NSA — Native Sparse Attention; arxiv:2502.11089). Three-branch
     # hybrid that preserves O(T) reachability while remaining sparse:
@@ -287,7 +292,17 @@ class Hyperparameters:
     matrix_lr = 0.022
     scalar_lr = 0.02
     muon_momentum = 0.99
-    muon_backend_steps = 5
+    # iter 121 (PE-NS adoption 2026-04-29): default lifted 5 → 10 because
+    # Polar-Express coefficients with backend_steps=5 break DEQ reconstruction
+    # in our codebase (iter 117 smoke recon err 1.2e-4 → 6.8e-2 at steps=5).
+    # The aggressive first-iter coeff (8.16) produces overshoots that take
+    # multiple correction iterations to settle; under DEQ where weight updates
+    # are reverse-reconstructed via fp64 accumulators, that intermediate spike
+    # exceeds the bf16 reversibility window. At steps=10 PE-NS converges to
+    # 0.053 rel err vs stock 0.203 — 4× better orthogonalization quality at
+    # ~10% Muon compute overhead. The records use steps=5 because their
+    # non-DEQ models tolerate the aggressive first-iter; we cannot.
+    muon_backend_steps = 10
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 800
     beta1 = 0.85
@@ -357,12 +372,20 @@ class Hyperparameters:
     # capacity-padded dispatch (true compute-skip, ~4-15 hr refactor) is
     # iter 117b conditional on 117a's val_bpb preservation.
     use_entmax_routing = False
-    # Init the blend logit to +5 so `sigmoid(5) ≈ 0.9933` → routing is dominated
-    # by softmax at init (strict-gen recovery within 1% of iter 100b in bf16).
+    # Init the blend logit to +5 so `sigmoid(5) ≈ 0.9933` → at full anneal,
+    # routing is dominated by softmax (strict-gen recovery within 1% in bf16).
     # Gradient drives this LOGIT DOWN if entmax-1.5's exact-zeros routing
-    # benefits val_bpb. Reading the property `router.entmax_blend_softmax_frac`
-    # at log time materializes the post-sigmoid blend.
+    # benefits val_bpb.
     entmax_blend_init_logit = 5.0
+    # iter 117 v2 (post-NaN rescue 2026-04-29): the entmax blend itself is
+    # ANNEALED from pure softmax (anneal=0 → blend forced to 1.0 = softmax)
+    # to learnable (anneal=1 → blend = sigmoid(blend_logit)) over training.
+    # Without this anneal, even a 0.7% entmax contribution at init produced
+    # exact-zero routing for low-score experts, which combined with no entropy
+    # cushion let CV concentration cascade to NaN at step 60. Strict-gen at
+    # step 0 is now EXACT (anneal=0 → pure softmax = iter 100b forward map).
+    # Mirrors the entropy/variance warmup_delay_frac=0.3 pattern.
+    entmax_blend_warmup_delay_frac = 0.3
     # SoftDenseRouter loss weights — promoted from hardcoded literals (Block.__init__
     # at L2415-2416) to Hyperparameters per §9 single-source-of-truth + the
     # hyperparameter fan-out invariant (EXPERIENCE.md#hyperparameter-fanout).
@@ -502,7 +525,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "min-share-loss-weight", "cv-loss-weight",
     "router-entropy-coef", "router-entropy-warmup-delay-frac",
     "routing-variance-coef", "routing-variance-warmup-delay-frac",
-    "entmax-alpha-init-logit",
+    "entmax-blend-init-logit", "entmax-blend-warmup-delay-frac", "entmax-blend-lr",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
@@ -567,35 +590,66 @@ def update_ema_state_(ema_state: dict[str, Tensor], model_state: dict[str, Tenso
 # MUON OPTIMIZER
 # ---------------------------------------------------------------------------
 
-def _ns5_2d(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    """NS preconditioner for a single 2D matrix."""
-    a, b, c = (3.4445, -4.7750, 2.0315)
+# Polar-Express per-iteration minimax-optimized Newton-Schulz coefficients
+# (Bernstein et al. 2024; adopted in records via PR #1344 → #1787).
+# Each tuple is (a, b, c) for ONE iteration of the quintic NS recurrence
+# `X' = aX + (bA + cA²)X` where `A = XX^T`. The coefficients are tuned per
+# iteration: aggressive at the start (X far from polar factor), gentle at
+# the end (X near polar factor). Same converged accuracy as the stock fixed
+# `(3.4445, -4.7750, 2.0315)` tuple in ~half the matmul count (5 iter vs ~10).
+# Outside `len(_PE_COEFFS)` iterations, fall back to the last (converged)
+# tuple — strict equivalence to the standard NS limit.
+_PE_COEFFS: tuple[tuple[float, float, float], ...] = (
+    (8.156554524902461,  -22.48329292557795,   15.878769915207462),
+    (4.042929935166739,   -2.808917465908714,   0.5000178451051316),
+    (3.8916678022926607,  -2.772484153217685,   0.5060648178503393),
+    (3.285753657755655,   -2.3681294933425376,  0.46449024233003106),
+    (2.3465413258596377,  -1.7097828382687081,  0.42323551169305323),
+)
+
+
+def _ns_iter_coeffs(steps: int) -> tuple[tuple[float, float, float], ...]:
+    """Return `steps` (a, b, c) tuples for the NS iteration. The first
+    `min(steps, len(_PE_COEFFS))` come from the per-iter Polar-Express table;
+    any remaining iterations re-use the LAST tuple (converged regime)."""
+    if steps <= len(_PE_COEFFS):
+        return _PE_COEFFS[:steps]
+    return _PE_COEFFS + (_PE_COEFFS[-1],) * (steps - len(_PE_COEFFS))
+
+
+def _ns5_2d(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
+    """NS preconditioner for a single 2D matrix.
+
+    Uses Polar-Express per-iter coefficients: 5 iterations matches the
+    convergence quality of stock NS at 10 iterations. `muon_backend_steps`
+    default is 5 — exactly the length of `_PE_COEFFS`.
+    """
     X = G.bfloat16()
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
-    for _ in range(steps):
+    for a, b, c in _ns_iter_coeffs(steps):
         A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
 
 
-def _ns5_batched(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+def _ns5_batched(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     """NS preconditioner for a batch of independent matrices.
 
     Input: (..., m, n) — leading dims are batch, last two are the matrix.
-    Each matrix is normalized and processed independently (no cross-batch coupling).
+    Each matrix is normalized and processed independently. Polar-Express
+    coefficients (per-iter; see `_ns_iter_coeffs`).
     """
-    a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     norms = X.flatten(-2).norm(dim=-1)
     X = X / (norms[..., None, None] + eps)
     transposed = X.size(-2) > X.size(-1)
     if transposed:
         X = X.transpose(-1, -2).contiguous()
-    for _ in range(steps):
+    for a, b, c in _ns_iter_coeffs(steps):
         A = X @ X.transpose(-1, -2)
         B = b * A + c * (A @ A)
         X = a * X + B @ X
@@ -1381,6 +1435,13 @@ class SoftDenseRouter(nn.Module):
             self.register_buffer("_entmax_blend_logit",
                                   torch.tensor(float(entmax_blend_init_logit), dtype=torch.float32),
                                   persistent=False)
+        # iter 117 v2: anneal scale, written by training-loop annealer. anneal=0
+        # forces blend=1.0 (pure softmax, strict-gen exact); anneal=1 lets
+        # blend = sigmoid(blend_logit) (learnable). Tensor-gated to avoid
+        # per-step dynamo recompile (mirrors entropy/variance pattern).
+        self.register_buffer("_entmax_blend_anneal",
+                              torch.tensor(0.0, dtype=torch.float32),
+                              persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
         self.score_norm_weight = nn.Parameter(torch.ones(dim))
@@ -1498,6 +1559,15 @@ class SoftDenseRouter(nn.Module):
         with torch.no_grad():
             self._variance_coef.fill_(float(value))
 
+    @property
+    def entmax_blend_anneal(self) -> float:
+        return float(self._entmax_blend_anneal.item())
+
+    @entmax_blend_anneal.setter
+    def entmax_blend_anneal(self, value: float) -> None:
+        with torch.no_grad():
+            self._entmax_blend_anneal.fill_(float(value))
+
     @torch.no_grad()
     def bias_update(self, *, lr: float, clip: float, distributed: bool) -> None:
         ms = self._mean_share_last
@@ -1567,7 +1637,13 @@ class SoftDenseRouter(nn.Module):
         logits_f32 = route_logits.float()
         p_softmax = torch.softmax(logits_f32, dim=-1)
         if self.use_entmax_routing:
-            blend = torch.sigmoid(self._entmax_blend_logit)  # ∈ (0, 1)
+            # iter 117 v2: annealed blend. anneal=0 → effective_blend=1.0 (pure
+            # softmax, strict-gen exact). anneal=1 → effective_blend = sigmoid(
+            # blend_logit) (learnable). Linear interpolation between the two:
+            # effective = 1.0 * (1 − anneal) + sigmoid(blend_logit) * anneal.
+            blend_learned = torch.sigmoid(self._entmax_blend_logit)
+            anneal = self._entmax_blend_anneal
+            blend = (1.0 - anneal) + blend_learned * anneal
             p_entmax = entmax_1p5(logits_f32, dim=-1)
             p_alloc = blend * p_softmax + (1.0 - blend) * p_entmax
         else:
@@ -3159,6 +3235,7 @@ class GPT(nn.Module):
                  routing_variance_warmup_delay_frac: float = 0.0,
                  use_entmax_routing: bool = False,
                  entmax_blend_init_logit: float = 5.0,
+                 entmax_blend_warmup_delay_frac: float = 0.3,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -3190,6 +3267,11 @@ class GPT(nn.Module):
         # (see L4549-area).
         self._routing_variance_coef_target = float(routing_variance_coef)
         self._routing_variance_warmup_delay_frac = float(routing_variance_warmup_delay_frac)
+        # iter 117 v2: entmax blend anneal warmup delay. The router's
+        # entmax_blend_anneal buffer is set by the same annealer to ramp
+        # 0 → 1 after this delay fraction (pure softmax during warmup).
+        self._use_entmax_routing = bool(use_entmax_routing)
+        self._entmax_blend_warmup_delay_frac = float(entmax_blend_warmup_delay_frac)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -3206,6 +3288,11 @@ class GPT(nn.Module):
                                    routing_variance_coef=routing_variance_coef,
                                    use_entmax_routing=use_entmax_routing,
                                    entmax_blend_init_logit=entmax_blend_init_logit,
+                                   # entmax_blend_warmup_delay_frac is consumed by the
+                                   # training-loop annealer (not by Block/SoftDenseRouter directly)
+                                   # so it doesn't need to be passed here. The router's
+                                   # _entmax_blend_anneal buffer starts at 0 and is updated
+                                   # by the annealer reading GPT._entmax_blend_warmup_delay_frac.
                                    min_share_loss_weight=min_share_loss_weight,
                                    cv_loss_weight=cv_loss_weight,
                                    use_nsa_attention=use_nsa_attention,
@@ -3807,8 +3894,15 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
     # all ndim < 2 / control params -> AdamW scalar.
     matrix_params = [p for name, p in block_named_params
                      if p.ndim >= 2 and not any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
+    # iter 117 v2 (H87): carve out `_entmax_blend_logit` to a slow-LR group
+    # (entmax_blend_lr=0.002, 10× smaller than scalar_lr) so the blend drift
+    # rate is bounded once anneal ramps up. Mirrors the parcae_lr precedent
+    # (system-dynamics-sensitive params get a slower LR than other scalars).
+    entmax_blend_params = [p for name, p in block_named_params
+                            if "_entmax_blend_logit" in name and p.requires_grad]
     scalar_params = [p for name, p in block_named_params
-                     if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
+                     if (p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_PATTERNS))
+                     and "_entmax_blend_logit" not in name]
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params: list[dict[str, object]] = [
@@ -3850,8 +3944,9 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
         ("matrix", matrix_params),
         ("scalar", scalar_params),
         ("parcae", parcae_params),
+        ("entmax_blend", entmax_blend_params),
     ])
-    return tok_params, matrix_params, scalar_params, parcae_params
+    return tok_params, matrix_params, scalar_params, parcae_params, entmax_blend_params
 
 
 def _prescribe_failure_fix(failure: str) -> dict:
@@ -4335,6 +4430,7 @@ def main() -> None:
         routing_variance_warmup_delay_frac=float(args.routing_variance_warmup_delay_frac),
         use_entmax_routing=args.use_entmax_routing,
         entmax_blend_init_logit=float(args.entmax_blend_init_logit),
+        entmax_blend_warmup_delay_frac=float(args.entmax_blend_warmup_delay_frac),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
@@ -4421,7 +4517,7 @@ def main() -> None:
     )
 
     # OPTIMIZER SETUP
-    tok_params, matrix_params, scalar_params, parcae_params = _build_optimizer_param_lists(base_model, args)
+    tok_params, matrix_params, scalar_params, parcae_params, entmax_blend_params = _build_optimizer_param_lists(base_model, args)
 
     optimizer_tok = torch.optim.AdamW(tok_params, betas=(args.beta1, args.beta2),
                                        eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
@@ -4441,6 +4537,14 @@ def main() -> None:
             [{"params": parcae_params, "lr": args.parcae_lr, "base_lr": args.parcae_lr}],
             betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True)
         optimizers.append(optimizer_parcae)
+    # iter 117 v2 (H87): blend_logit gets a 10× slower LR (mirrors parcae_lr
+    # precedent for sensitive system-dynamics params). Empty list when
+    # use_entmax_routing=False — no optimizer added.
+    if entmax_blend_params:
+        optimizer_entmax_blend = torch.optim.AdamW(
+            [{"params": entmax_blend_params, "lr": args.entmax_blend_lr, "base_lr": args.entmax_blend_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True)
+        optimizers.append(optimizer_entmax_blend)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -4733,6 +4837,18 @@ def main() -> None:
             else:
                 var_scale = min(max((time_frac - var_delay) / max(1.0 - var_delay, 1e-8), 0.0), 1.0)
             sb.router.variance_coef = var_target * var_scale
+        # iter 117 v2 (H87 rescue): anneal entmax blend. anneal=0 → pure
+        # softmax (strict-gen exact). After warmup_delay, ramps 0 → 1 so the
+        # learnable blend_logit takes over. Avoids the cold-start NaN cascade
+        # observed in iter 117 v1 (CV concentration cascade at s60 from 0.7%
+        # entmax contribution before training stabilized).
+        if bool(getattr(base_model, "_use_entmax_routing", False)):
+            blend_delay = float(getattr(base_model, "_entmax_blend_warmup_delay_frac", 0.3))
+            if time_frac < blend_delay:
+                blend_anneal = 0.0
+            else:
+                blend_anneal = min(max((time_frac - blend_delay) / max(1.0 - blend_delay, 1e-8), 0.0), 1.0)
+            sb.router.entmax_blend_anneal = blend_anneal
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
