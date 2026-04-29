@@ -157,7 +157,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | embed_lr | 0.6 |
 | parcae_lr | 0.002 (applied to `parcae_raw_a`, `parcae_raw_delta`, `parcae_raw_b`) |
 | muon_momentum | 0.99 |
-| muon_backend_steps | 10 (iter 121 PE-NS adoption: lifted 5 → 10. Polar-Express per-iter coefficients (Bernstein et al. 2024) replace stock fixed `(3.4445, -4.7750, 2.0315)` with 5 distinct (a, b, c) tuples — first iter aggressive (8.16, -22.5, 15.9), 5th iter gentle (2.35, -1.71, 0.42). 4× better orthogonalization at 10 iters than stock 10 iters. The records use 5 iters but our DEQ requires 10 — at 5 iters the aggressive first-iter overshoots breaks DEQ reversibility (smoke recon 1.2e-4 → 6.8e-2 at steps=5).) |
+| muon_backend_steps | 7 (iter 121 PE-NS adoption: 5 → 7 the empirical elbow. Polar-Express per-iter coefficients replace stock fixed `(3.4445, -4.7750, 2.0315)` with 5 distinct (a, b, c) tuples — iter 1 aggressive (8.16, -22.5, 15.9), iter 5 gentle (2.35, -1.71, 0.42); iters 6-7 reuse the gentle iter-5 tuple. Empirical sweep: 5→7 cuts rel_err 39% (0.096→0.059), 7→10 only cuts another 10% (0.059→0.053) at 43% more compute. Smoke at steps=7 is CLEANER than steps=10 (loss descent −2.58 vs −2.47, no convergence warnings). steps=5 (records' default) breaks DEQ reverse-reconstruction at our scale (smoke recon 1.2e-4→6.8e-2). steps=7 = ~3-5% step_avg overhead vs stock NS @ 5 for 4× orthogonalization quality.) |
 | muon_momentum_warmup_start | 0.92 |
 | muon_momentum_warmup_steps | 800 |
 | weight_decay | 0.01 (iter 86: 0.30 → 0.01 re-test under the iter 93 landscape; applied to both AdamW and Muon groups) |

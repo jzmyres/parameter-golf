@@ -292,17 +292,20 @@ class Hyperparameters:
     matrix_lr = 0.022
     scalar_lr = 0.02
     muon_momentum = 0.99
-    # iter 121 (PE-NS adoption 2026-04-29): default lifted 5 → 10 because
-    # Polar-Express coefficients with backend_steps=5 break DEQ reconstruction
-    # in our codebase (iter 117 smoke recon err 1.2e-4 → 6.8e-2 at steps=5).
-    # The aggressive first-iter coeff (8.16) produces overshoots that take
-    # multiple correction iterations to settle; under DEQ where weight updates
-    # are reverse-reconstructed via fp64 accumulators, that intermediate spike
-    # exceeds the bf16 reversibility window. At steps=10 PE-NS converges to
-    # 0.053 rel err vs stock 0.203 — 4× better orthogonalization quality at
-    # ~10% Muon compute overhead. The records use steps=5 because their
-    # non-DEQ models tolerate the aggressive first-iter; we cannot.
-    muon_backend_steps = 10
+    # iter 121 (PE-NS adoption 2026-04-29): default 5 → 7 (the empirical elbow).
+    # Polar-Express per-iter coefficients (Bernstein et al. 2024) replace stock
+    # fixed (3.4445, -4.7750, 2.0315). At backend_steps=5 the aggressive
+    # iter-1 coefficient (8.16, -22.5, 15.9) overshoots and breaks DEQ reverse
+    # reconstruction (smoke recon 1.2e-4 → 6.8e-2). The records use steps=5
+    # because their non-DEQ models tolerate that overshoot; we cannot.
+    # Empirical sweep at steps={3,5,7,10,12,15,20,25}: 5→7 cuts rel_err 39%
+    # (0.096 → 0.059), 7→10 only cuts another 10% (0.059 → 0.053). The 7→10
+    # improvement does not justify 43% more Muon matmul. Smoke at steps=7
+    # is CLEANER than smoke at steps=10 (loss descent −2.58 vs −2.47, no
+    # iter_conv warnings). steps=7 = 14 matmul = ~3-5% step_avg overhead vs
+    # stock NS @ 5 (10 matmul) for 4× orthogonalization quality. Records'
+    # 5-iter regime is fundamentally inaccessible to us due to DEQ stability.
+    muon_backend_steps = 7
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 800
     beta1 = 0.85
