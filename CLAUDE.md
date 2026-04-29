@@ -138,7 +138,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | parcae_init_b_bar | 0.3 (B̄₀ ≈ 1−Ā₀ at step 0; iter 66b continuity with iter 66a) |
 | parcae_reversibility_floor | 0.1 (correctness constant — Ā ≥ this bound for RevDEQ backward safety, NOT a tuning knob) |
 | deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
-| num_refinements | 1 |
+| num_refinements | 0 (2026-04-29 user directive: disable refinement by default after iter 98b showed +70% step cost at D=1024 / +6% at D=768 with no directly-ablated val_bpb benefit; iter 110 queued to test re-enable as a clean ablation. CLAUDE.md §6.5 still defines the architectural form for when re-enabled.) |
 | use_ctp | False (iter 94: CTP head disabled — NTP-only; CTP param banks not allocated) |
 
 ### Optimizer
@@ -170,7 +170,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
-| deq_k_jitter_set | (16,) — JITTER DISABLED, K fixed at 16. 2026-04-28 user directive after profile_v8 OOM at K=24 step 1 backward: controlled isolation to verify RevDEQ memory truly is O(1) in K. RevDEQ's reversible solver SHOULD make memory independent of K; if OOM persists at K=16, root cause is in `RevDEQFunction.backward` (not K-jitter cache pressure). `deq_k_jitter=False`, `deq_k_max=deq_k_eval=16`. |
+| deq_k_jitter_set | (16, 24) — 2026-04-29 user directive: K-jitter RE-ENABLED with set {16, 24} after iter 98b K-sweep showed val_bpb is essentially CONVERGED at K=16 (K=16: 1.5018, K=128: 1.5039, Δ=+0.0021 — FP found at K=16). The previous K=24 OOM (profile_v8 2026-04-28) has been re-confirmed as RevDEQ-memory-O(1)-in-K via the iter 97.5b-fix diagnostic loop; no OOM concern at K=24. Adding K=24 to both training-jitter and the K-sweep matrix tests whether wider FP-depth jitter regularizes (analog of H12 VERIFIED). `deq_k_jitter=True`, `deq_k_max=24`, `deq_k_eval=16`. |
 | lyapunov_coef | 0.0 (iter 88: λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
 | lyapunov_gamma | 0.97 (target spectral radius threshold) |
 | lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
@@ -279,7 +279,7 @@ Reference impl: see §2.
 9. Log to `results.tsv` (do NOT commit `results.tsv`).
 10. **Always** run `bash experiments/update_results.sh` (rotates `current.log`/`current/weights` → `previous`, copies `run.log` → `current.log`, regenerates plots).
 11. Apply §11 Promotion Rules.
-12. **Update `experiments/hypotheses.md`** — record results, update statuses, note confounds. The H-claim section MUST include a FULL eval result subsection (user directive 2026-04-28): (a) roundtrip int6 val_bpb + val_loss; (b) K-sweep table — one row per K with val_bpb, iter_conv_rel, residual, plus the `k_sweep_table:` 14-column row (attn_cv, mlp_cv, pool_cv, attn_min, mlp_min, attn_ortho, mlp_ortho, pertoken_ent, pool_ent, shared_gate, hutch_F, rd_step); (c) trajectory table — val_bpb at each in-training val checkpoint with Δ from prev; (d) acyclicity prime check results (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP). Numbers must be grep-able from run.log. See `feedback_hypotheses_sync.md`.
+12. **Update `experiments/hypotheses.md`** — record results, update statuses, note confounds. The H-claim section MUST include a FULL eval result subsection (user directive 2026-04-28, K-sweep matrix mandate strengthened 2026-04-29): (a) roundtrip int6 val_bpb + val_loss; (b) **K-sweep matrix — ALWAYS print the FULL `k_sweep_table:` matrix (header row + one data row per K) verbatim from run.log, NOT just summary text**. The 14 columns are: K, val_bpb, attn_cv, mlp_cv, pool_cv, attn_min, mlp_min, attn_ortho, mlp_ortho, pertoken_ent, pool_ent, shared_gate, hutch_F, rd_step, iter_conv_rel. This protocol is non-optional — every iter that completes a K-sweep gets its matrix copied into hypotheses.md, no exceptions. Acyclicity primes (17 / 37 / 113) are bolded. (c) trajectory table — val_bpb at each in-training val checkpoint with Δ from prev; (d) acyclicity prime check results (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP). Numbers must be grep-able from run.log. See `feedback_hypotheses_sync.md`.
 13. Track consecutive non-improvements. **STOP after 100** and seek user guidance.
 
 ### Logging, Weights & Plotting (every iteration)

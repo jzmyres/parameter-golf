@@ -1744,6 +1744,21 @@ K=128 vs best-K (K=17, 1.5008) Δ = +0.0031 — well within 0.5 FP-quality gate.
 
 **Status:** PROPOSED — queued (priority 9, after iter 108).
 
+### H82: Re-enable num_refinements=1 (iter 110) — PROPOSED (2026-04-29 user spec)
+
+**Hypothesis.** iter 98b's NOT PROMOTED post-mortem showed refinement adds +6% step cost at D=768 (iter 100b) and +70% at D=1024 (iter 98b), but the val_bpb benefit of refinement has NEVER been directly ablated under the iter-100b baseline. Disabling by default (`num_refinements=0`, set 2026-04-29) creates a clean baseline without the refinement cost. iter 110 tests RE-ENABLE on top of iter 100b's CV-only equilibrium to determine whether refinement contributes meaningful val_bpb gain.
+
+**Test:** Single config flip from the new disabled-default baseline: `num_refinements = 1`, `num_refinements_ramp_frac = 0.85` (the prior default — refinement enables for the last 15% of training). All other knobs at iter 100b's `c5154b3` baseline.
+
+**Expected outcomes:**
+- (a) **Refinement helps**: val_bpb int6 < baseline by ≥ 0.005, justifying the +6% step cost. Promote (with refinement on by default).
+- (b) **Refinement neutral**: |Δ val_bpb| < 0.005. NOT PROMOTED — keep refinement disabled (saves wallclock with no quality cost).
+- (c) **Refinement hurts**: val_bpb regression. Confirms the 2026-04-29 disable decision; refinement was load-bearing only for the now-cancelled diffusion-AR objective (iter 94 disabled CTP, removing the loss that motivated refinement).
+
+**Why now (2026-04-29 user direction).** The architecture invariant in CLAUDE.md §6.5 marked refinement as "currently enabled with ramp 0.85" but no H-claim ever VERIFIED its val_bpb contribution. iter 98b's failure mode brought the cost into focus; this iter brings the benefit-side into focus.
+
+**Status:** PROPOSED — queued (priority 7 in revised post-iter-98b queue per user reorder 2026-04-29).
+
 ### iter 104 (AdaSplash α-entmax) — BLOCKED on `torch.library.custom_op` registration (2026-04-29 root-caused)
 
 **Updated diagnosis (supersedes earlier "needs custom_op" speculation in task #95).** Live 10-iter test (commit `72f4de0`, launched 2026-04-29 with `num-heads=12 num-kv-heads=6 attn-alpha-target=1.5 attn-alpha-warmup-delay-frac=0.0`) revealed two distinct bugs:

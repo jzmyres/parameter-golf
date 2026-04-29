@@ -79,6 +79,68 @@ except ImportError:
     pass
 
 
+# 2026-04-29 user directive (iter 104 systematic debug):
+# Wrap the AdaSplash kernel in a `torch.library.custom_op` so AOTAutograd
+# treats it as a first-class opaque op with proper FakeTensor metadata. The
+# previous `@torch._dynamo.disable`-only wrap was insufficient — dynamo's
+# tracer skipped the function but AOTAutograd's view-meta replay still
+# corrupted the kernel output's tensor metadata at training step 2
+# (`_functionalization.apply_view_meta_sequence` returned garbage int64
+# shape `[22343783044301, ...]`).
+#
+# The custom_op pattern:
+#   1. Forward op `opg::adasplash_attn_op` wraps the kernel call.
+#   2. FakeTensor abstract impl returns `q.new_empty(q.shape)` — pure
+#      shape inference, no compute.
+#   3. Autograd setup_context saves q/k/v + alpha/niter; backward re-runs
+#      the kernel with `enable_grad` and `torch.autograd.grad` to extract
+#      grad_q/k/v. AdaSplash supports backward via standard autograd
+#      (verified standalone), so we delegate rather than write manual VJP.
+if _ADASPLASH_AVAILABLE:
+    @torch.library.custom_op("opg::adasplash_attn_op", mutates_args=())
+    def _adasplash_attn_op(
+        q: Tensor, k: Tensor, v: Tensor, alpha: float, niter: int,
+    ) -> Tensor:
+        return _adasplash_attention(
+            q, k, v, alpha=float(alpha), is_causal=True, niter=int(niter),
+        )
+
+    @_adasplash_attn_op.register_fake
+    def _(q, k, v, alpha, niter):
+        # Output shape == q's shape (causal attention preserves Q's heads/T/d).
+        return q.new_empty(q.shape)
+
+    def _adasplash_setup_context(ctx, inputs, output):
+        q, k, v, alpha, niter = inputs
+        ctx.save_for_backward(q, k, v)
+        ctx.alpha = float(alpha)
+        ctx.niter = int(niter)
+
+    def _adasplash_backward(ctx, grad_output):
+        q, k, v = ctx.saved_tensors
+        # Re-run forward in an isolated grad scope to extract VJP via
+        # AdaSplash's own autograd (verified standalone — it implements
+        # backward through PyTorch autograd, not as a custom Function).
+        q_in = q.detach().clone().requires_grad_(True)
+        k_in = k.detach().clone().requires_grad_(True)
+        v_in = v.detach().clone().requires_grad_(True)
+        with torch.enable_grad():
+            out = _adasplash_attention(
+                q_in, k_in, v_in, alpha=ctx.alpha, is_causal=True, niter=ctx.niter,
+            )
+            grad_q, grad_k, grad_v = torch.autograd.grad(
+                out, [q_in, k_in, v_in], grad_output,
+                create_graph=False, retain_graph=False,
+            )
+        return grad_q, grad_k, grad_v, None, None  # alpha, niter not differentiable
+
+    _adasplash_attn_op.register_autograd(
+        _adasplash_backward, setup_context=_adasplash_setup_context,
+    )
+else:
+    _adasplash_attn_op = None
+
+
 @torch._dynamo.disable
 def adasplash_alpha_entmax_attention(
     q: Tensor, k: Tensor, v: Tensor, alpha: float, niter: int = 10,
@@ -99,17 +161,30 @@ def adasplash_alpha_entmax_attention(
     as an opaque op, avoiding the per-step recompile thrash from alpha
     being a Python-float guard.
     """
-    # Head-dim guard: AdaSplash kernel asserts on head_dim ∉ {16,32,64,128,256}.
-    # Default num_heads=8 with model_dim=768 gives head_dim=96 — rejected.
-    # num_heads=12 gives head_dim=64 — safe. Fall back to dense for unsafe dims.
-    _SAFE_HEAD_DIMS = (16, 32, 64, 128, 256)
-    if (
-        not _ADASPLASH_AVAILABLE
-        or float(alpha) <= 1.0
-        or q.size(-1) not in _SAFE_HEAD_DIMS
-    ):
+    # alpha == 1.0 is the softmax limit — dense SDPA path is mathematically
+    # equivalent (and avoids spinning up the kernel for a no-op blend). This
+    # is the ONLY allowed fallback to dense.
+    if float(alpha) <= 1.0:
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=True, enable_gqa=(k.size(1) != q.size(1)),
+        )
+
+    # 2026-04-29 user directive: fail fast on ANY α-entmax precondition
+    # violation. Silent fallback to dense SDPA hides the fact that the iter
+    # is running with sub-optimal perf — the user explicitly does NOT want
+    # the model to silently regress to dense softmax when α-entmax was
+    # requested. Both head-dim and adasplash-availability are HARD errors.
+    _SAFE_HEAD_DIMS = (16, 32, 64, 128, 256)
+    if not _ADASPLASH_AVAILABLE:
+        raise RuntimeError(
+            "α-entmax requested (alpha={}) but adasplash package not importable. "
+            "Install via `uv pip install adasplash` (CLAUDE.md authorized install).".format(alpha)
+        )
+    if q.size(-1) not in _SAFE_HEAD_DIMS:
+        raise RuntimeError(
+            f"α-entmax requested (alpha={alpha}) but head_dim={q.size(-1)} "
+            f"not in AdaSplash kernel-safe set {_SAFE_HEAD_DIMS}. "
+            f"For model_dim=768, set num_heads=12 (head_dim=64) or num_heads=24 (head_dim=32)."
         )
     target_dtype = v.dtype
     if q.dtype != target_dtype:
@@ -123,9 +198,11 @@ def adasplash_alpha_entmax_attention(
         rep = H_q // H_kv
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
-    return _adasplash_attention(
-        q, k, v, alpha=float(alpha), is_causal=True, niter=int(niter),
-    )
+    # Route through the torch.library.custom_op so AOTAutograd treats the
+    # kernel as an opaque op with FakeTensor metadata — fixes the iter 104
+    # production crash (`_functionalization.apply_view_meta_sequence` returning
+    # garbage int64 shape at step 2). See `_adasplash_attn_op` definition.
+    return _adasplash_attn_op(q, k, v, float(alpha), int(niter))
 
 
 def _unwrap_compiled_module(m: nn.Module) -> nn.Module:
@@ -284,8 +361,15 @@ class Hyperparameters:
     # Model architecture
     vocab_size = 1024
     num_layers = 12  # DEQ solver max K
-    num_refinements = 1
-    num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
+    # 2026-04-29 user directive: disable refinement by DEFAULT after iter 98b
+    # showed refinement adds +6% step cost at D=768 (iter 100b) → +70% at
+    # D=1024 (iter 98b) — the 85% ramp activates a full extra DEQ pass that
+    # becomes a major cost driver and the val_bpb benefit is unverified
+    # (never directly ablated). iter 110 (queued) tests re-enable on top of
+    # the current baseline as a clean ablation. Set to 1 + ramp_frac<1 to
+    # restore the prior diffusion-AR refinement loop.
+    num_refinements = 0
+    num_refinements_ramp_frac = 0.85  # only matters if num_refinements > 0
     num_kv_heads = 4
     # Iter 96 baseline restored (iter 98b D=1024 NOT PROMOTED, see
     # grad_accum_multiplier docstring + H73). D-scaling deferred to 8× H100.
@@ -443,12 +527,20 @@ class Hyperparameters:
     # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
     # be re-combined with Phase 6 contraction shell in a follow-up iter once
     # the new architecture stabilizes val_bpb.
-    deq_k_jitter = False  # 2026-04-28 user directive: disable K-jitter, fix K=16 to controlled-isolate the OOM root cause. RevDEQ should be O(1) in K via reversible solver, but profile_v8 OOM'd at K=24 step 1 backward (44 GiB cap). Fixing K removes K-axis from compile cache + isolates whether RevDEQ memory truly depends on K (it shouldn't). If OOM persists at K=16, the issue is RevDEQ backward implementation, not K-jitter cache pressure.
+    # 2026-04-29 user directive: K-jitter re-enabled with set {16, 24}.
+    # Rationale: iter 98b K-sweep showed val_bpb is essentially CONVERGED at
+    # K=16 (K=16: 1.5018, K=128: 1.5039, Δ=+0.0021). The FP is found at K=16.
+    # Adding K=24 to the jitter set tests whether wider FP-depth jitter
+    # provides regularization gain (analog of H12 VERIFIED at the wider
+    # {4,6,10}→{8,12,20} scale). The post-2026-04-28 K=16-fix established that
+    # RevDEQ is O(1) in K — there's no OOM concern at K=24. K=24 is also
+    # added to the K-sweep matrix for cross-K diagnostics at this depth.
+    deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 16  # 2026-04-28 user directive: K-jitter disabled, K fixed at 16 (matches deq_k_eval).
+    deq_k_max = 24
     deq_k_step = 4
-    deq_k_jitter_set = (16,)  # singleton (jitter disabled). The `deq_k_for_step` sampler short-circuits to args.deq_k_max=16 when deq_k_jitter=False.
-    deq_k_eval = 16  # iter 30: baseline eval K
+    deq_k_jitter_set = (16, 24)
+    deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
 
     # Architecture knobs
     # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
@@ -4924,7 +5016,12 @@ def main() -> None:
     # iter 97.6: insert primes {17, 37, 113} between the powers of 2.
     # Primes coprime to {2,3,4,5,12,20} (training K-jitter set GCD = 4)
     # break the period-L cycle alias inherent in power-of-2 sampling.
-    k_sweep_values = [4, 8, 16, 17, 32, 37, 64, 113, 128]
+    # 2026-04-29 user directive: K=24 added per the {16, 24} K-jitter set —
+    # captures the FP behaviour at the deeper jitter point so the K-sweep
+    # matrix has direct training-K coverage (K=16 + K=24 are both in the
+    # training jitter set; K=4/8/32/64/128 + primes 17/37/113 give the
+    # cross-depth diagnostics).
+    k_sweep_values = [4, 8, 16, 17, 24, 32, 37, 64, 113, 128]
     k_sweep_results: dict[int, float] = {}
 
     # iter 100b user directive (PERMANENT 2026-04-27): emit a structured
