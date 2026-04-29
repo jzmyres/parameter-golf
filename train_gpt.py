@@ -335,6 +335,16 @@ class Hyperparameters:
     # softmax exploration early; sparsity pressure ramps in once routing has
     # stabilized).
     router_entropy_warmup_delay_frac = 0.3
+    # iter 111 (H83): per-token routing-variance penalty. Forms an orthogonal
+    # basis with cv_loss_weight (across-batch imbalance) and router_entropy_coef
+    # (per-token spread): variance penalty rewards HIGH variance of `w(e|t)`
+    # ACROSS tokens for fixed expert e — different tokens use different mixtures
+    # → token-conditional basis decomposition. Diagnoses iter 100b's
+    # pertoken_entropy ≈ 3.0 plateau (all tokens use same near-uniform mixture).
+    # Strict-gen: 0.0 recovers iter 100b exactly. Same anneal-from-zero schedule
+    # as entropy_coef (feedback_anneal_sparsity_coefs.md).
+    routing_variance_coef = 0.005
+    routing_variance_warmup_delay_frac = 0.3
     # SoftDenseRouter loss weights — promoted from hardcoded literals (Block.__init__
     # at L2415-2416) to Hyperparameters per §9 single-source-of-truth + the
     # hyperparameter fan-out invariant (EXPERIENCE.md#hyperparameter-fanout).
@@ -473,6 +483,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "warmdown-frac", "num-refinements-ramp-frac",
     "min-share-loss-weight", "cv-loss-weight",
     "router-entropy-coef", "router-entropy-warmup-delay-frac",
+    "routing-variance-coef", "routing-variance-warmup-delay-frac",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
@@ -1259,7 +1270,7 @@ class SoftDenseRouter(nn.Module):
                  min_share_frac: float = 0.6, cv_target: float = 0.20,
                  min_share_loss_weight: float = 0.0, cv_loss_weight: float = 2.0,
                  scoring: str = "linear", health_slices: tuple[int, ...] | None = None,
-                 entropy_coef: float = 0.0):
+                 entropy_coef: float = 0.0, variance_coef: float = 0.0):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
@@ -1278,6 +1289,10 @@ class SoftDenseRouter(nn.Module):
         # `@property` setters so legacy code/tests can write Python floats.
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.register_buffer("_entropy_coef", torch.tensor(float(entropy_coef), dtype=torch.float32), persistent=False)
+        # iter 111 (H83): per-token routing-variance penalty buffer. Same
+        # tensor-gated pattern as `_entropy_coef` to avoid per-step dynamo
+        # guard recompile when annealing.
+        self.register_buffer("_variance_coef", torch.tensor(float(variance_coef), dtype=torch.float32), persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
         self.score_norm_weight = nn.Parameter(torch.ones(dim))
@@ -1386,6 +1401,15 @@ class SoftDenseRouter(nn.Module):
         with torch.no_grad():
             self._entropy_coef.fill_(float(value))
 
+    @property
+    def variance_coef(self) -> float:
+        return float(self._variance_coef.item())
+
+    @variance_coef.setter
+    def variance_coef(self, value: float) -> None:
+        with torch.no_grad():
+            self._variance_coef.fill_(float(value))
+
     @torch.no_grad()
     def bias_update(self, *, lr: float, clip: float, distributed: bool) -> None:
         ms = self._mean_share_last
@@ -1489,6 +1513,27 @@ class SoftDenseRouter(nn.Module):
                 self._pertoken_entropy_loss = ec_t.to(dtype=pertoken_ent.dtype) * pertoken_ent
             else:
                 self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
+            # iter 111 (H83): per-token routing-variance penalty. Encourages
+            # `w(e|t)` to vary ACROSS tokens for fixed expert e — different
+            # tokens use different mixtures → token-conditional basis
+            # decomposition. Sign convention: subtract var_sum from loss
+            # (negative coefficient in the additive sense) so optimizer rewards
+            # high across-token variance. Orthogonal to entropy (per-token
+            # spread within token) and CV (across-batch imbalance for fixed
+            # expert).
+            vc_t = self._variance_coef
+            if bool((vc_t > 0.0).item()):  # one-time trace-time guard
+                # `p` shape varies by reduce_dims (token + batch dims). Compute
+                # variance over all reduce_dims (the "across-tokens" axis), per
+                # expert, then sum across experts.
+                p32 = p.float()
+                # E is the LAST axis after softmax; reduce_dims are the
+                # "token" / "batch" axes per the router contract.
+                var_per_expert = p32.var(dim=reduce_dims, unbiased=False)  # shape (..., E)
+                var_sum = var_per_expert.sum()
+                self._variance_loss = -vc_t.to(dtype=var_sum.dtype) * var_sum
+            else:
+                self._variance_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = mean_share.detach()
             # Record diagnostics — eager-only (dynamo-disabled); see helper docstring.
             self._maybe_record_diag(p.detach(), reduce_dims, clear_on_skip=False)
@@ -1496,6 +1541,7 @@ class SoftDenseRouter(nn.Module):
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._health_loss = torch.tensor(0.0, device=x.device)
             self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
+            self._variance_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = None
             self._maybe_record_diag(p.detach(), tuple(range(p.ndim - 1)),
                                     clear_on_skip=True)
@@ -2420,6 +2466,7 @@ class Block(nn.Module):
                  num_experts: int = 8, num_shared_experts: int = 0,
                  router_scoring: str = "linear",
                  router_entropy_coef: float = 0.0,
+                 routing_variance_coef: float = 0.0,
                  min_share_loss_weight: float = 0.0,
                  cv_loss_weight: float = 2.0,
                  use_nsa_attention: bool = False,
@@ -2467,7 +2514,8 @@ class Block(nn.Module):
                                       cv_loss_weight=cv_loss_weight,
                                       scoring=router_scoring,
                                       health_slices=(num_routed, num_routed),
-                                      entropy_coef=router_entropy_coef)
+                                      entropy_coef=router_entropy_coef,
+                                      variance_coef=routing_variance_coef)
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -3001,6 +3049,8 @@ class GPT(nn.Module):
                  router_scoring: str = "linear",
                  router_entropy_coef: float = 0.0,
                  router_entropy_warmup_delay_frac: float = 0.0,
+                 routing_variance_coef: float = 0.0,
+                 routing_variance_warmup_delay_frac: float = 0.0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -3027,6 +3077,11 @@ class GPT(nn.Module):
         # dynamically per-step via these values.
         self._router_entropy_coef_target = float(router_entropy_coef)
         self._router_entropy_warmup_delay_frac = float(router_entropy_warmup_delay_frac)
+        # iter 111 (H83): routing-variance coef target + warmup-delay; same
+        # annealer pattern as entropy_coef. Read by the training-loop annealer
+        # (see L4549-area).
+        self._routing_variance_coef_target = float(routing_variance_coef)
+        self._routing_variance_warmup_delay_frac = float(routing_variance_warmup_delay_frac)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -3040,6 +3095,7 @@ class GPT(nn.Module):
                                    num_shared_experts=self.num_shared_experts,
                                    router_scoring=router_scoring,
                                    router_entropy_coef=router_entropy_coef,
+                                   routing_variance_coef=routing_variance_coef,
                                    min_share_loss_weight=min_share_loss_weight,
                                    cv_loss_weight=cv_loss_weight,
                                    use_nsa_attention=use_nsa_attention,
@@ -3459,6 +3515,12 @@ class GPT(nn.Module):
             # as ~0.03 in effect (pr-review-toolkit M3, coderabbit follow-up).
             r_ent = getattr(r, "_pertoken_entropy_loss", zero)
             health = health + r_ent
+            # iter 111 (H83): per-token routing-variance penalty. Same
+            # un-multiplication rationale as r_ent above (per-token, no slice
+            # multiplicity). Sign already encoded inside the router (the loss
+            # is `−vc · var_sum`); accumulate as-is.
+            r_var = getattr(r, "_variance_loss", zero)
+            health = health + r_var
         # iter 26-lb-loss: mos_balance_mult (default 50) × bal_loss_coef downstream
         # (5e-3) → effective weight 0.25 on the MoS NTP balance loss — strong enough
         # to drive dead MoS experts back toward fair share.  WD cannot fix routing-
@@ -4159,6 +4221,8 @@ def main() -> None:
         router_scoring=args.router_scoring,
         router_entropy_coef=float(args.router_entropy_coef),
         router_entropy_warmup_delay_frac=float(args.router_entropy_warmup_delay_frac),
+        routing_variance_coef=float(args.routing_variance_coef),
+        routing_variance_warmup_delay_frac=float(args.routing_variance_warmup_delay_frac),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
@@ -4546,6 +4610,17 @@ def main() -> None:
             else:
                 ent_scale = min(max((time_frac - ent_delay) / max(1.0 - ent_delay, 1e-8), 0.0), 1.0)
             sb.router.entropy_coef = ent_target * ent_scale
+        # iter 111 (H83): same annealer for routing-variance coef. Avoids
+        # cold-start trap (routing needs free softmax exploration before the
+        # variance pressure kicks in to push token specialization).
+        var_target = float(getattr(base_model, "_routing_variance_coef_target", 0.0))
+        var_delay = float(getattr(base_model, "_routing_variance_warmup_delay_frac", 0.0))
+        if var_target > 0.0:
+            if time_frac < var_delay:
+                var_scale = 0.0
+            else:
+                var_scale = min(max((time_frac - var_delay) / max(1.0 - var_delay, 1e-8), 0.0), 1.0)
+            sb.router.variance_coef = var_target * var_scale
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()

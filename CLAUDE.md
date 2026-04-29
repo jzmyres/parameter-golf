@@ -172,6 +172,8 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | cv_loss_weight | 2.0 (iter 100b: 0.10 → 2.0, 20× to compensate for dropping min_share floor; CV-only global balance VALIDATED at this weight. See H76.) |
 | router_entropy_coef | 0.005 (iter 100b: per-token entropy penalty for soft per-token specialization) |
 | router_entropy_warmup_delay_frac | 0.3 (iter 100b: anneal entropy_coef from 0 over training, ramping linearly 0→target after 30% of wallclock; avoids cold-start trap that hurt iter 99/101 architectural sparsity attempts. See H76 + `feedback_anneal_sparsity_coefs.md`.) |
+| routing_variance_coef | 0.005 (iter 111 H83: per-token routing-variance penalty `L_var = −λ · sum_e Var_token(w(e\|t))`; encourages HIGH across-token variance for fixed expert e → token-conditional basis decomposition. Orthogonal to CV (across-batch imbalance) and entropy (within-token spread). Strict-gen at 0.0 recovers iter 100b exactly.) |
+| routing_variance_warmup_delay_frac | 0.3 (same anneal pattern as entropy_coef; avoids cold-start trap) |
 | attn_expert_rank | 64 (iter 96 baseline, unchanged through iter 100b) |
 | mlp_expert_rank | 96 (iter 96 baseline, unchanged through iter 100b) |
 | bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
