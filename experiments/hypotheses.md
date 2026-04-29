@@ -1744,7 +1744,13 @@ K=128 vs best-K (K=17, 1.5008) Δ = +0.0031 — well within 0.5 FP-quality gate.
 
 **Status:** PROPOSED — queued (priority 9, after iter 108).
 
-### H83b: Variance-only routing regularization (iter 111b) — PROPOSED HIGH PRIORITY (sequenced after H83/iter 111a)
+### H83 + H83b SUPERSEDED by iter 117 (2026-04-29)
+
+**iter 111a was launched 17:39, killed 17:55 at step 20/1000** after user redirect: skip 111a/111b, go directly to iter 117 (combined). Rationale: iter 117's blend_logit trajectory provides built-in attribution between variance-only-help vs entmax-help vs combined-help — recovers the same information as separate 111a + 111b runs, saves ~10 hours of compute. Variance penalty implementation (committed in `3e1bd50`) is preserved and reused inside iter 117.
+
+iter 111a's partial trajectory (s0→s20): ntp_loss 7.01 → 5.05, attn_cv 0.03 → 0.63, pertoken_entropy 3.36 → 2.99, step_avg 21.1s steady. **Healthy at kill time.** Insufficient signal for attribution since variance penalty was still in warmup_delay (coef=0 below s300/1000).
+
+### H83b ORIGINAL (frozen, superseded): Variance-only routing regularization (iter 111b) — PROPOSED (now folded into iter 117)
 
 **Hypothesis.** iter 100b's reframe demonstrated that the per-token entropy penalty was "marginally effective at high coef — halted rise of pertoken_entropy but couldn't bend it down." The structural reason (H83 analysis): per-token entropy has SYMMETRIC gradient at uniform routing — no symmetry-breaking direction. Across-token variance has ASYMMETRIC gradient that points toward token specialization. Critically, **variance maximized at top-1 specialization (which has zero per-token entropy by construction)** — so variance subsumes entropy in the optimization sense. Test whether entropy is redundant: drop `router_entropy_coef → 0`, keep `routing_variance_coef = 0.005`.
 

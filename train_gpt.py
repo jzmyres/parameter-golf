@@ -345,6 +345,24 @@ class Hyperparameters:
     # as entropy_coef (feedback_anneal_sparsity_coefs.md).
     routing_variance_coef = 0.005
     routing_variance_warmup_delay_frac = 0.3
+    # iter 117a (H87 Phase 1): entmax-α routing replacement. When True, the
+    # post-softmax routing weights are computed via entmax-α (closed-form
+    # sort-and-threshold) instead of softmax. α is a learnable scalar per
+    # router with `α = 1.0 + softplus(alpha_logit)`; init `alpha_logit = −7.0`
+    # gives `softplus(−7) ≈ 9e-4` → `α ≈ 1.0009` ≈ softmax (strict-gen at
+    # init). Sparsity emerges as gradient pushes alpha_logit upward (variance
+    # penalty from iter 111 provides the gradient signal).
+    # Phase 1 (117a): KEEP fused BMM, no compute-skip yet — this is the
+    # cheap val_bpb signal for whether sparse routing helps. Path D
+    # capacity-padded dispatch (true compute-skip, ~4-15 hr refactor) is
+    # iter 117b conditional on 117a's val_bpb preservation.
+    use_entmax_routing = False
+    # Init the blend logit to +5 so `sigmoid(5) ≈ 0.9933` → routing is dominated
+    # by softmax at init (strict-gen recovery within 1% of iter 100b in bf16).
+    # Gradient drives this LOGIT DOWN if entmax-1.5's exact-zeros routing
+    # benefits val_bpb. Reading the property `router.entmax_blend_softmax_frac`
+    # at log time materializes the post-sigmoid blend.
+    entmax_blend_init_logit = 5.0
     # SoftDenseRouter loss weights — promoted from hardcoded literals (Block.__init__
     # at L2415-2416) to Hyperparameters per §9 single-source-of-truth + the
     # hyperparameter fan-out invariant (EXPERIENCE.md#hyperparameter-fanout).
@@ -484,6 +502,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "min-share-loss-weight", "cv-loss-weight",
     "router-entropy-coef", "router-entropy-warmup-delay-frac",
     "routing-variance-coef", "routing-variance-warmup-delay-frac",
+    "entmax-alpha-init-logit",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
@@ -506,7 +525,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             p.add_argument(f"--{name}", type=str, default=None)
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
-        "swa-enabled", "ema-enabled", "use-ctp",
+        "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
@@ -523,7 +542,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         raise SystemExit(f"Unknown args: {bad}")
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
-                 "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention"}
+                 "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
+                 "use_entmax_routing"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -814,7 +834,7 @@ eval_val = run_validation
 # QUANTIZATION (uniform INT6 + SDClip)
 # ---------------------------------------------------------------------------
 
-CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale", "norm_weight", "nsa_branch_gate")
+CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale", "norm_weight", "nsa_branch_gate", "_entmax_blend_logit")
 FP16_KEEP_PATTERNS = ("tok_emb",)
 SDCLIP_K_MATRIX = 12.85
 SDCLIP_K_EMBED = 20.0
@@ -1249,6 +1269,54 @@ class BigramHashEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Entmax-1.5 (Peters et al. 2019, "Sparse Sequence-to-Sequence Models")
+# ---------------------------------------------------------------------------
+# Closed-form sparse softmax for α=1.5. Output sums to 1 with exact zeros for
+# entries below threshold. Mathematically: p_i = max(0, 0.5*(z_i − τ))^2 with
+# τ chosen by sort-and-threshold so the surviving entries sum to 1.
+# Differentiable everywhere (Lipschitz Jacobian). Used by SoftDenseRouter via
+# a learnable sigmoid blend with softmax (init blend ≈ 0.993 softmax → strict-
+# generalization recovery of iter 100b).
+
+def entmax_1p5(z: Tensor, dim: int = -1) -> Tensor:
+    """α=1.5 entmax via closed-form sort-and-threshold.
+
+    Numerically stable variant: shift z so max=0 along `dim` before solving.
+    Each candidate k (size of support) gives a quadratic in τ:
+        sum_{i≤k} (0.5(z_sort_i − τ))^2 = 1
+        ⟹  k τ^2 − 2 S τ + (S2 − 4) = 0
+    where S = sum z_sort_{1..k}, S2 = sum z_sort_{1..k}^2. Solve, pick the
+    smaller root (the relevant one that satisfies τ < z_sort_k), then accept
+    the largest k where τ < z_sort_k.
+    """
+    z = z - z.amax(dim=dim, keepdim=True)
+    z_sorted, _ = torch.sort(z, dim=dim, descending=True)
+    K = z.shape[dim]
+
+    # Cumulative sums (S, S2) along `dim`.
+    S = z_sorted.cumsum(dim=dim)
+    S2 = (z_sorted * z_sorted).cumsum(dim=dim)
+    k_range = torch.arange(1, K + 1, device=z.device, dtype=z.dtype)
+    k_shape = [1] * z.ndim
+    k_shape[dim] = K
+    k = k_range.view(*k_shape)
+
+    # quadratic k τ² − 2 S τ + (S2 − 4) = 0  → τ = (S ± sqrt(S² − k(S2 − 4))) / k
+    # Smaller root is τ_low = (S − sqrt(...)) / k.
+    discr = (S * S - k * (S2 - 4.0)).clamp_min(0.0)
+    tau_k = (S - discr.sqrt()) / k.clamp_min(1.0)
+
+    # Pick largest k with tau_k < z_sorted_k (support size).
+    valid = tau_k < z_sorted
+    # Convert to support-count via sum along `dim`. (broadcast_dim_safe sum)
+    support = valid.to(dtype=torch.long).sum(dim=dim, keepdim=True).clamp_min(1)
+    # Gather τ at support − 1 (1-indexed → 0-indexed).
+    tau = tau_k.gather(dim, support - 1)
+
+    return (0.5 * (z - tau)).clamp_min(0.0).square()
+
+
+# ---------------------------------------------------------------------------
 # SOFT DENSE ROUTER
 # ---------------------------------------------------------------------------
 
@@ -1270,7 +1338,9 @@ class SoftDenseRouter(nn.Module):
                  min_share_frac: float = 0.6, cv_target: float = 0.20,
                  min_share_loss_weight: float = 0.0, cv_loss_weight: float = 2.0,
                  scoring: str = "linear", health_slices: tuple[int, ...] | None = None,
-                 entropy_coef: float = 0.0, variance_coef: float = 0.0):
+                 entropy_coef: float = 0.0, variance_coef: float = 0.0,
+                 use_entmax_routing: bool = False,
+                 entmax_blend_init_logit: float = 5.0):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
@@ -1293,6 +1363,24 @@ class SoftDenseRouter(nn.Module):
         # tensor-gated pattern as `_entropy_coef` to avoid per-step dynamo
         # guard recompile when annealing.
         self.register_buffer("_variance_coef", torch.tensor(float(variance_coef), dtype=torch.float32), persistent=False)
+        # iter 117 (H87): learnable blend between softmax (init ≈ 1.0) and
+        # entmax-1.5 (sparse with exact zeros). NOT a buffer — this is a
+        # learnable nn.Parameter that gradient drives. Init logit=+5 →
+        # sigmoid(+5) ≈ 0.9933 ≈ pure softmax (strict-gen recovery within
+        # bf16 floor). Gradient pushes logit DOWN when sparse routing helps.
+        # Stored as fp32 (matches q_gain/gate_bias pattern); placed under
+        # CONTROL_TENSOR_PATTERNS for AdamW + scalar_lr routing.
+        self.use_entmax_routing = bool(use_entmax_routing)
+        if self.use_entmax_routing:
+            self._entmax_blend_logit = nn.Parameter(
+                torch.tensor(float(entmax_blend_init_logit), dtype=torch.float32))
+        else:
+            # Register a buffer so the attribute exists but never has gradient.
+            # Forward path branches on `use_entmax_routing` so this is unused
+            # when entmax routing is off, but keeps `getattr(...)` safe.
+            self.register_buffer("_entmax_blend_logit",
+                                  torch.tensor(float(entmax_blend_init_logit), dtype=torch.float32),
+                                  persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
         self.score_norm_weight = nn.Parameter(torch.ones(dim))
@@ -1469,7 +1557,21 @@ class SoftDenseRouter(nn.Module):
         # H74/H75/H77 in experiments/hypotheses.md. Sigmoid gate is applied
         # multiplicatively (NOT renormalized) so total mass can be < 1, letting
         # the model suppress the mixture near fixed point.
-        p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
+        # iter 117 (H87): when use_entmax_routing=True, p_alloc is a learnable
+        # blend of softmax (always-dense) and entmax-1.5 (sparse with exact
+        # zeros). Init blend_logit=+5 → sigmoid(5)≈0.993 → essentially softmax
+        # at init (strict-gen recovery within bf16 floor). Gradient drives
+        # blend_logit DOWN if entmax-1.5's sparse routing benefits val_bpb;
+        # variance penalty (iter 111 H83) provides the bootstrap signal that
+        # rewards token specialization (which higher entmax weight expresses).
+        logits_f32 = route_logits.float()
+        p_softmax = torch.softmax(logits_f32, dim=-1)
+        if self.use_entmax_routing:
+            blend = torch.sigmoid(self._entmax_blend_logit)  # ∈ (0, 1)
+            p_entmax = entmax_1p5(logits_f32, dim=-1)
+            p_alloc = blend * p_softmax + (1.0 - blend) * p_entmax
+        else:
+            p_alloc = p_softmax
         gate_act = torch.sigmoid(self.router_gate(x_gate).float())
         p = (p_alloc * gate_act).to(dtype=x.dtype)
         # Diagnostic capture — store as 0-d GPU tensor (no `.item()`).
@@ -2467,6 +2569,8 @@ class Block(nn.Module):
                  router_scoring: str = "linear",
                  router_entropy_coef: float = 0.0,
                  routing_variance_coef: float = 0.0,
+                 use_entmax_routing: bool = False,
+                 entmax_blend_init_logit: float = 5.0,
                  min_share_loss_weight: float = 0.0,
                  cv_loss_weight: float = 2.0,
                  use_nsa_attention: bool = False,
@@ -2515,7 +2619,9 @@ class Block(nn.Module):
                                       scoring=router_scoring,
                                       health_slices=(num_routed, num_routed),
                                       entropy_coef=router_entropy_coef,
-                                      variance_coef=routing_variance_coef)
+                                      variance_coef=routing_variance_coef,
+                                      use_entmax_routing=use_entmax_routing,
+                                      entmax_blend_init_logit=entmax_blend_init_logit)
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -3051,6 +3157,8 @@ class GPT(nn.Module):
                  router_entropy_warmup_delay_frac: float = 0.0,
                  routing_variance_coef: float = 0.0,
                  routing_variance_warmup_delay_frac: float = 0.0,
+                 use_entmax_routing: bool = False,
+                 entmax_blend_init_logit: float = 5.0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -3096,6 +3204,8 @@ class GPT(nn.Module):
                                    router_scoring=router_scoring,
                                    router_entropy_coef=router_entropy_coef,
                                    routing_variance_coef=routing_variance_coef,
+                                   use_entmax_routing=use_entmax_routing,
+                                   entmax_blend_init_logit=entmax_blend_init_logit,
                                    min_share_loss_weight=min_share_loss_weight,
                                    cv_loss_weight=cv_loss_weight,
                                    use_nsa_attention=use_nsa_attention,
@@ -4223,6 +4333,8 @@ def main() -> None:
         router_entropy_warmup_delay_frac=float(args.router_entropy_warmup_delay_frac),
         routing_variance_coef=float(args.routing_variance_coef),
         routing_variance_warmup_delay_frac=float(args.routing_variance_warmup_delay_frac),
+        use_entmax_routing=args.use_entmax_routing,
+        entmax_blend_init_logit=float(args.entmax_blend_init_logit),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
