@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt import Hyperparameters, _parse_cli_overrides
+from train_gpt import Hyperparameters, _CLI_TUNABLE_KNOBS, _parse_cli_overrides
 
 
 class TestCliParser(unittest.TestCase):
@@ -44,17 +44,30 @@ class TestCliParser(unittest.TestCase):
             _parse_cli_overrides(["--deq-backward", "revdeq"])
 
     def test_default_parity(self):
-        # Item 1: every documented routing knob is reachable through the CLI.
-        for name, expected in [
-            ("min_share_loss_weight", Hyperparameters.min_share_loss_weight),
-            ("cv_loss_weight", Hyperparameters.cv_loss_weight),
-            ("router_entropy_coef", Hyperparameters.router_entropy_coef),
-            ("router_entropy_warmup_delay_frac", Hyperparameters.router_entropy_warmup_delay_frac),
-            ("parcae_init_b_bar", Hyperparameters.parcae_init_b_bar),
-        ]:
-            flag = "--" + name.replace("_", "-")
+        # Hyperparameter fan-out invariant: every CLI-tunable knob (per the
+        # _CLI_TUNABLE_KNOBS single source of truth) must (a) name a real
+        # Hyperparameters field and (b) round-trip its default through the
+        # parser. This catches knob drift the moment a new entry is added
+        # to _CLI_TUNABLE_KNOBS without a matching Hyperparameters field.
+        skip = {"data-path", "tokenizer-path", "run-id"}  # path strings — separate validation
+        for cli_name in _CLI_TUNABLE_KNOBS:
+            if cli_name in skip:
+                continue
+            py_name = cli_name.replace("-", "_")
+            self.assertTrue(
+                hasattr(Hyperparameters, py_name),
+                f"_CLI_TUNABLE_KNOBS entry {cli_name!r} has no Hyperparameters field {py_name!r}",
+            )
+            expected = getattr(Hyperparameters, py_name)
+            if isinstance(expected, bool):
+                continue  # booleans go through the int-flag path tested separately
+            flag = "--" + cli_name
             ov = _parse_cli_overrides([flag, str(expected)])
-            self.assertAlmostEqual(float(ov[name]), float(expected), places=9, msg=name)
+            got = ov[py_name]
+            if isinstance(expected, float):
+                self.assertAlmostEqual(float(got), float(expected), places=9, msg=cli_name)
+            else:
+                self.assertEqual(type(expected)(got), expected, msg=cli_name)
 
 
 if __name__ == "__main__":

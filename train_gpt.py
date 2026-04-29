@@ -391,25 +391,32 @@ class Hyperparameters:
     eval_batch_seqs = 256  # fast eval: 256 seqs × 2048 = 512K tokens (~8x more representative than 32)
 
 
+# Numeric / string knobs that are tunable from the command line. Single source
+# of truth — `experiments/test_cli_parser.py::test_default_parity` iterates
+# this tuple to verify every entry resolves to a `Hyperparameters` field with
+# the documented default. Adding a new tunable knob? Append here AND add the
+# CLAUDE.md §5 row in the same commit (EXPERIENCE.md#hyperparameter-fanout).
+_CLI_TUNABLE_KNOBS: tuple[str, ...] = (
+    "data-path", "tokenizer-path", "run-id", "seed", "iterations",
+    "warmup-steps", "train-batch-tokens", "train-seq-len",
+    "val-batch-size", "val-loss-every", "train-log-every",
+    "max-wallclock-seconds", "attn-balance-mult", "mlp-balance-mult",
+    "mos-balance-mult", "bal-loss-coef", "router-health-coef",
+    "mos-ortho-out-coef", "block-ortho-aux-coef", "block-ortho-aux-every",
+    "block-ortho-aux-tokens", "bigram-vocab-size", "bigram-dim",
+    "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
+    "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
+    "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
+    "warmdown-frac", "num-refinements-ramp-frac",
+    "min-share-loss-weight", "cv-loss-weight",
+    "router-entropy-coef", "router-entropy-warmup-delay-frac",
+    "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
+)
+
+
 def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p = argparse.ArgumentParser(add_help=True)
-    for name in [
-        "data-path", "tokenizer-path", "run-id", "seed", "iterations",
-        "warmup-steps", "train-batch-tokens", "train-seq-len",
-        "val-batch-size", "val-loss-every", "train-log-every",
-        "max-wallclock-seconds", "attn-balance-mult", "mlp-balance-mult",
-        "mos-balance-mult", "bal-loss-coef", "router-health-coef",
-        "mos-ortho-out-coef", "block-ortho-aux-coef", "block-ortho-aux-every",
-        "block-ortho-aux-tokens", "bigram-vocab-size", "bigram-dim",
-        "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
-        "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
-        "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
-        "warmdown-frac", "num-refinements-ramp-frac",
-        # Item 1 (config fan-out): plumb missing knobs to CLI per §9 SSoT.
-        "min-share-loss-weight", "cv-loss-weight",
-        "router-entropy-coef", "router-entropy-warmup-delay-frac",
-        "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
-    ]:
+    for name in _CLI_TUNABLE_KNOBS:
         py_name = name.replace("-", "_")
         field_val = getattr(Hyperparameters, py_name, None)
         if isinstance(field_val, float):
@@ -2799,11 +2806,8 @@ class GPT(nn.Module):
         # smoke-test tolerance together.
         self.parcae_reversibility_floor = 0.1
         if self.use_parcae:
-            # Init raw params so Ā₀ ≈ parcae_init_a_bar and B̄₀ ≈ parcae_init_b_bar.
-            # parcae_init_b_bar=None → default to 1 − parcae_init_a_bar (iter 66a continuity).
-            init_b_bar = 1.0 - float(parcae_init_a_bar) if parcae_init_b_bar is None else float(parcae_init_b_bar)
             raw_a_init, raw_delta_init, raw_b_init = self._parcae_init_raw_values(
-                float(parcae_init_a_bar), init_b_bar
+                float(parcae_init_a_bar), parcae_init_b_bar,
             )
             self.parcae_raw_a = nn.Parameter(torch.full((model_dim,), raw_a_init))
             self.parcae_raw_delta = nn.Parameter(torch.full((model_dim,), raw_delta_init))
@@ -2836,13 +2840,16 @@ class GPT(nn.Module):
         self.embed_norm = RMSNorm(model_dim)
         self._init_weights()
 
-    def _parcae_init_raw_values(self, init_a_bar: float, init_b_bar: float) -> tuple[float, float, float]:
+    def _parcae_init_raw_values(self, init_a_bar: float, init_b_bar: float | None = None) -> tuple[float, float, float]:
         """Invert the paper forms to choose raw params at initialization.
 
-        Picks Δ₀, |A|₀, B₀ so Ā₀ ≈ init_a_bar and B̄₀ ≈ init_b_bar (default 1 − Ā₀).
-        Returns raw values that pass through softplus+ε_min to recover the
-        targets exactly (modulo the safety ε_min offset on |A| and B).
+        Picks Δ₀, |A|₀, B₀ so Ā₀ ≈ init_a_bar and B̄₀ ≈ init_b_bar.
+        ``init_b_bar=None`` defaults to ``1 − init_a_bar`` (iter 66a continuity
+        with tied β = 1 − Ā). Returns raw values that pass through softplus+ε_min
+        to recover the targets exactly (modulo the safety ε_min offset on |A|, B).
         """
+        if init_b_bar is None:
+            init_b_bar = 1.0 - float(init_a_bar)
         eps_min = float(self.parcae_min_rate)
         eps_rev = float(self.parcae_reversibility_floor)
 
@@ -4655,12 +4662,14 @@ def main() -> None:
         if usage and len(usage) >= 2 * R and R > 0:
             attn_half, mlp_half = usage[:R], usage[R:]
             for label, half in [("attn", attn_half), ("mlp", mlp_half)]:
-                norm = [u / _safe_sum(half) for u in half]
+                half_sum = _safe_sum(half)
+                norm = [u / half_sum for u in half]
                 mu = _safe_mean(norm)
                 var = sum((x - mu) ** 2 for x in norm) / len(norm)
                 out[f"{label}_cv"] = (var ** 0.5) / mu
                 out[f"{label}_min"] = min(norm)
-            pool_norm = [u / _safe_sum(usage) for u in usage]
+            usage_sum = _safe_sum(usage)
+            pool_norm = [u / usage_sum for u in usage]
             pmu = _safe_mean(pool_norm)
             pvar = sum((x - pmu) ** 2 for x in pool_norm) / len(pool_norm)
             out["pool_cv"] = (pvar ** 0.5) / pmu
