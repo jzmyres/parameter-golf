@@ -93,7 +93,6 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
-        deq_backward="revdeq",
         router_scoring=args.router_scoring,
         num_experts=args.num_experts,
         num_shared_experts=args.num_shared_experts,
@@ -138,10 +137,14 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
                     model.forward_logits(ex)
             r = model._deq_residuals[0] if model._deq_residuals else 0.0
             residuals.append(r)
-            recon_err = model._deq_recon_error
-            # RevDEQ backward sets recon on shared_block; transfer if available
+            # Under TBPTT (deq_bptt_k > 0), the metric is "distance travelled"
+            # not true reconstruction. The attr was renamed accordingly; fall
+            # back to the legacy name for forward-compat.
+            recon_err = getattr(model.shared_block, "_deq_distance_travelled_last_bwd", None)
             if recon_err is None:
                 recon_err = getattr(model.shared_block, "_deq_recon_error_last_bwd", None)
+            if hasattr(recon_err, "item"):
+                recon_err = recon_err.item()
             recon_errors.append(recon_err)
             iter_convs.append(model._deq_iter_convergence)
             diag = _get_expert_diagnostics(model)

@@ -121,14 +121,15 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | num_layers | 12 |
-| model_dim | 768 (iter 96 baseline. Iter 98 D=1024 attempt NOT TESTED on dev hardware — 3× OOM at 44 GiB cap; deferred to 8× H100 submission hardware. See H73.) |
+| model_dim | 1024 (iter 98b: D=768 → 1024 rescue of iter 98 H73 OOM via `grad_accum_multiplier=2` halving the micro-batch. d_head 96 → 128 hits FA tensorcore sweet spot; per-expert linears scale linearly in D. See H73 + queue line.) |
 | num_heads | 8 |
 | num_kv_heads | 4 |
 | num_experts | 16 (iter 96 baseline H71; iter 97 E=20 attempt NOT PROMOTED on per-wallclock grounds, see H72 — E-scaling past 16 closed) |
 | num_shared_experts | 1 (DeepSeek shared expert, always-on with sigmoid gate) |
-| mlp_mult | 3.0 (hidden = 768 × 3 / num_experts via low-rank experts) |
+| mlp_mult | 3.0 (hidden = D × 3 / num_experts via low-rank experts) |
 | train_seq_len | 2048 |
 | train_batch_tokens | 524,288 |
+| grad_accum_multiplier | 2 (iter 98b: doubles base grad_accum_steps so per-step activation memory halves; effective batch invariant — no LR/WD rescaling needed. Default 1 = pre-iter-98b behavior.) |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
 | deq_beta | 0.50 (fallback when `use_parcae=False`) |

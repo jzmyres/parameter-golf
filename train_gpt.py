@@ -192,6 +192,14 @@ class Hyperparameters:
     train_batch_tokens = 524_288
     train_seq_len = 2048
     max_wallclock_seconds = 0  # 0 = disabled; step-count governs default runs. Submission runs MUST pass --max-wallclock-seconds=600 (8xH100 competition hard cap).
+    # Iter 98b (2026-04-28): user rescue of iter 98 H73 OOM via micro-batch
+    # halving. grad_accum_multiplier multiplies the base grad_accum_steps
+    # (computed from world_size at L~3574) so the same effective batch is
+    # accumulated over 2× more micro-steps with halved per-step activation
+    # memory. With model_dim=1024 the iter 96 D=768 peak (35.7 GiB) projects
+    # to ~47 GiB; halving micro-batch brings it to ~24 GiB, fitting the 44 GiB
+    # dev cap. Set to 1 to disable (default behavior pre-iter-98b).
+    grad_accum_multiplier = 2
 
     # Model architecture
     vocab_size = 1024
@@ -199,7 +207,12 @@ class Hyperparameters:
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
-    model_dim = 768  # iter 96 baseline. Iter 98 attempted 768 → 1024 but OOM'd 3× on 44 GiB L40S dev hardware (D=1024 + DEQ TBPTT exceeds VRAM cap regardless of seq/K reductions). Documented as NOT TESTED in H73; D-scaling deferred until 8× H100 80GB submission hardware (won't OOM there).
+    # Iter 98b (2026-04-28): D=768 → 1024 — rescue of iter 98 H73 OOM via
+    # `grad_accum_multiplier=2` (halves micro-batch, holds effective batch).
+    # Per H73, D-scaling on this codebase needs activation-memory headroom that
+    # iter 98 couldn't reach without micro-batch reduction. d_head 96 → 128 hits
+    # FA tensorcore sweet spot; per-expert linears scale linearly in D.
+    model_dim = 1024
     num_heads = 8
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
@@ -400,7 +413,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "data-path", "tokenizer-path", "run-id", "seed", "iterations",
     "warmup-steps", "train-batch-tokens", "train-seq-len",
     "val-batch-size", "val-loss-every", "train-log-every",
-    "max-wallclock-seconds", "attn-balance-mult", "mlp-balance-mult",
+    "max-wallclock-seconds", "grad-accum-multiplier",
+    "attn-balance-mult", "mlp-balance-mult",
     "mos-balance-mult", "bal-loss-coef", "router-health-coef",
     "mos-ortho-out-coef", "block-ortho-aux-coef", "block-ortho-aux-every",
     "block-ortho-aux-tokens", "bigram-vocab-size", "bigram-dim",
@@ -3571,7 +3585,10 @@ def main() -> None:
     # count is modest). RevDEQ's O(1) backward memory makes the base sufficient.
     # k_rope permute fix (64ac616) doubled the Hutchinson VJP VRAM, so we
     # double grad_accum to halve per-microstep B.
-    grad_accum_steps = max(1, math.ceil(4 / world_size)) * 2
+    # Iter 98b: args.grad_accum_multiplier (default 1; 2 under iter 98b D=1024)
+    # halves per-step activation memory by doubling micro-steps; effective batch
+    # is invariant so LR / WD do NOT need rescaling.
+    grad_accum_steps = max(1, math.ceil(4 / world_size)) * 2 * args.grad_accum_multiplier
     global_seqs = args.train_batch_tokens // args.train_seq_len
     while grad_accum_steps > 1 and global_seqs < world_size * grad_accum_steps:
         grad_accum_steps -= 1
