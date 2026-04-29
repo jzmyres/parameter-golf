@@ -192,14 +192,17 @@ class Hyperparameters:
     train_batch_tokens = 524_288
     train_seq_len = 2048
     max_wallclock_seconds = 0  # 0 = disabled; step-count governs default runs. Submission runs MUST pass --max-wallclock-seconds=600 (8xH100 competition hard cap).
-    # Iter 98b (2026-04-28): user rescue of iter 98 H73 OOM via micro-batch
-    # halving. grad_accum_multiplier multiplies the base grad_accum_steps
-    # (computed from world_size at L~3574) so the same effective batch is
-    # accumulated over 2× more micro-steps with halved per-step activation
-    # memory. With model_dim=1024 the iter 96 D=768 peak (35.7 GiB) projects
-    # to ~47 GiB; halving micro-batch brings it to ~24 GiB, fitting the 44 GiB
-    # dev cap. Set to 1 to disable (default behavior pre-iter-98b).
-    grad_accum_multiplier = 2
+    # Iter 98b (2026-04-28) NOT PROMOTED ✗ (closed 2026-04-29). The
+    # micro-batch-halving rescue successfully fit D=1024 (peak VRAM 23 GiB
+    # vs iter 98's 47 GiB OOM), but val_bpb int6 = 1.5018 vs iter 100b
+    # 1.4893 (Δ +0.0125 regression) AND step_avg 25.1s vs 24.5s (+2.6%
+    # slower per-wallclock). Refinement at D=1024 amplified to +70% step
+    # cost (vs iter 100b's +6%) — the activation-memory pressure during
+    # the extra DEQ pass dominates. D=1024 deferred to 8× H100 submission
+    # hardware where activation memory isn't the binding constraint.
+    # Field retained as default=1 (no behavior change) for future use; can
+    # be enabled via CLI for any iter that wants halved micro-batch.
+    grad_accum_multiplier = 1
 
     # Model architecture
     vocab_size = 1024
@@ -207,12 +210,9 @@ class Hyperparameters:
     num_refinements = 1
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
-    # Iter 98b (2026-04-28): D=768 → 1024 — rescue of iter 98 H73 OOM via
-    # `grad_accum_multiplier=2` (halves micro-batch, holds effective batch).
-    # Per H73, D-scaling on this codebase needs activation-memory headroom that
-    # iter 98 couldn't reach without micro-batch reduction. d_head 96 → 128 hits
-    # FA tensorcore sweet spot; per-expert linears scale linearly in D.
-    model_dim = 1024
+    # Iter 96 baseline restored (iter 98b D=1024 NOT PROMOTED, see
+    # grad_accum_multiplier docstring + H73). D-scaling deferred to 8× H100.
+    model_dim = 768
     num_heads = 8
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
@@ -3553,6 +3553,79 @@ def _prescribe_failure_fix(failure: str) -> dict:
 # TRAINING
 # ---------------------------------------------------------------------------
 
+
+def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2) -> float | None:
+    """Hutchinson-Frobenius estimator at the model's saved DEQ fixed point.
+
+    Reads ``_lyapunov_z_star`` and ``_lyapunov_x0`` saved by the most recent
+    ``GPT.forward`` (populated on every forward including eval mode). For
+    Rademacher ``v`` with ``E[v v^T] = I``,
+    ``E[||J^T v||²] = ||J||²_F``. Reports
+    ``rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)``, a per-element
+    proxy for average squared singular value of ``J = ∂T_θ/∂z`` at ``z*``.
+
+    Returns ``None`` on any of: missing saved FP, OOM (predicted via
+    ``mem_get_info`` or runtime), or SDPA backend rejection under
+    ``enable_grad`` (the EFFICIENT/MATH SDPA backends are forced for grad
+    compatibility — flash-attention rejects grad-required bf16 inputs).
+
+    iter 97.5b PERMANENT (2026-04-29): hoisted from the K-sweep harness so
+    val checkpoints can also report ``hutch_F``. Cost: ~2 backward passes
+    through the SharedBlock at z*; the predictive OOM skip avoids surprises
+    when grad-accum has fragmented the allocator.
+    """
+    z_star = getattr(base_m, "_lyapunov_z_star", None)
+    x0_lyap = getattr(base_m, "_lyapunov_x0", None)
+    if z_star is None or x0_lyap is None:
+        return None
+    sb = _unwrap_compiled_module(base_m.shared_block)
+    try:
+        target_dtype = next(sb.parameters()).dtype
+    except StopIteration:
+        target_dtype = z_star.dtype
+    z_star = z_star.to(target_dtype)
+    x0_lyap = x0_lyap.to(target_dtype)
+    b_bar = base_m._parcae_b_bar() if base_m.use_parcae else None
+    b_bar_d = b_bar.detach().to(target_dtype) if b_bar is not None else None
+
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel_impl
+        ctx_factory = lambda: _sdpa_kernel_impl(
+            [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+        )
+    except Exception:
+        from contextlib import nullcontext
+        ctx_factory = nullcontext
+
+    try:
+        torch.cuda.empty_cache()
+        free_b, _ = torch.cuda.mem_get_info(z_star.device)
+        need_b = int(z_star.numel() * z_star.element_size() * 4)
+        if free_b < int(need_b * 1.25):
+            return None
+        samples: list[float] = []
+        with ctx_factory():
+            for _ in range(max(1, n_samples)):
+                v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
+                                   dtype=z_star.dtype) * 2.0 - 1.0)
+                z_b = z_star.detach().clone().requires_grad_(True)
+                with torch.enable_grad():
+                    u_b = sb(z_b, x0_lyap, b_bar_d)
+                    jvp = torch.autograd.grad(
+                        (u_b * v).sum(), z_b,
+                        create_graph=False, retain_graph=False,
+                    )[0]
+                samples.append(float(jvp.detach().float().pow(2).mean().sqrt().item()))
+                del v, z_b, u_b, jvp
+                torch.cuda.empty_cache()
+        return sum(samples) / len(samples) if samples else None
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return None
+    except Exception:
+        return None
+
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -4133,11 +4206,19 @@ def main() -> None:
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step) if master_process else ""
             _window_avg = (sum(_step_dt_window) / len(_step_dt_window)) if _step_dt_window else 0.0
+            # iter 97.5b PERMANENT (2026-04-29): Hutchinson-Frobenius at val
+            # checkpoints. Tracks ||J(z*)||_F across training time, distinguishes
+            # contractive FP (rho_F decreasing) from trivial dynamics or marginal
+            # stability where deq_residual alone is uninformative. Silently
+            # skipped on SDPA backend rejection / OOM (returns None).
+            hutch_F = _hutchinson_F_at_saved_fp(base_model) if master_process else None
+            hutch_str = f" hutch_F:{hutch_F:.4f}" if hutch_F is not None else ""
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"val_mode:fast "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
                 f"step_avg_w50:{_window_avg:.2f}ms"
+                f"{hutch_str}"
                 f"{deq_info}{expert_info}"
             )
             _best_effort_update_plots("val")

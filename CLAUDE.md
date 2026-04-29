@@ -121,7 +121,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | num_layers | 12 |
-| model_dim | 1024 (iter 98b: D=768 → 1024 rescue of iter 98 H73 OOM via `grad_accum_multiplier=2` halving the micro-batch. d_head 96 → 128 hits FA tensorcore sweet spot; per-expert linears scale linearly in D. See H73 + queue line.) |
+| model_dim | 768 (iter 96 baseline. Iter 98b D=1024 attempt NOT PROMOTED on dev hardware 2026-04-29 — micro-batch halving fit D=1024 in VRAM but val_bpb int6 1.5018 vs iter 100b 1.4893 (Δ +0.0125 regression) AND step_avg 25.1s vs 24.5s (+2.6% slower per-wallclock; refinement at D=1024 amplified to +70% step cost). D-scaling deferred to 8× H100 submission hardware. See H73 retry section in hypotheses.md.) |
 | num_heads | 8 |
 | num_kv_heads | 4 |
 | num_experts | 16 (iter 96 baseline H71; iter 97 E=20 attempt NOT PROMOTED on per-wallclock grounds, see H72 — E-scaling past 16 closed) |
@@ -129,7 +129,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | mlp_mult | 3.0 (hidden = D × 3 / num_experts via low-rank experts) |
 | train_seq_len | 2048 |
 | train_batch_tokens | 524,288 |
-| grad_accum_multiplier | 2 (iter 98b: doubles base grad_accum_steps so per-step activation memory halves; effective batch invariant — no LR/WD rescaling needed. Default 1 = pre-iter-98b behavior.) |
+| grad_accum_multiplier | 1 (iter 98b retired this default 2 → 1 after NOT PROMOTED. Field retained for future use; setting >1 multiplies base grad_accum_steps to halve per-step activation memory at constant effective batch. No LR/WD rescaling needed.) |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
 | deq_beta | 0.50 (fallback when `use_parcae=False`) |
@@ -298,6 +298,7 @@ Reference impl: see §2.
 | **`attn_cv` / `mlp_cv` / `pool_cv`** (coefficient of variation, iter 100b+) | **LOW** ≈ 0.2-0.3 per slice | Per-slice CV uses the renormalized within-slice distribution; pool CV uses the full 2R unrenormalized distribution. Per-slice CVs measure within-role imbalance independently; pool CV captures BOTH within-slice imbalance AND any tilt of total mass between attn and mlp slices. Diagnostic: large gap between attn_cv and mlp_cv = role-asymmetric routing (e.g., iter 100b s120 attn_cv≈1.07, mlp_cv≈0.18 — attn winner-take-all, MLP uniform). Large pool_cv with small per-slice CVs = cross-slice dominance | **YES** — three distinct values |
 | **`ortho`** (expert orthogonality) | **LOW** ≈ 0.1-0.2 | `max\|cos_sim\|` between expert OUTPUT means. Low cosine = experts represent different directions | **YES** — `attn_ortho` / `mlp_ortho` differ because attention experts and MLP experts produce DIFFERENT outputs even with shared router; per-pool computation is required |
 | **`router_mass`** | 0.7-0.95 typical | Mean `sigmoid(gate)` value — total routed contribution per token. Drops as the model gates the mixture down | NO — single gate, single value |
+| **`hutch_F`** (FP spectral, iter 97.5b PERMANENT 2026-04-29) | LOW + decreasing across val checkpoints | Hutchinson-Frobenius estimator at the saved DEQ FP `z*`: `rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)` for `J = ∂T_θ/∂z`. Distinguishes contractive attractor (rho_F < 1, decreasing with training) from marginal stability (rho_F ≈ 1) or trivial dynamics (rho_F → 0). Emitted on val log lines AND in the K-sweep table per-K. Silently skipped (no `hutch_F:` field in log) on SDPA-grad-incompatibility / OOM | NO — single global value at the FP |
 
 **Prefix convention** (updated 2026-04-27, iter 100b): the SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components (per CLAUDE.md §6.2 and the iter 35 router consolidation). Logging now decomposes routing-distribution metrics into THREE values: `attn_*` (per-slice renormalized within attn experts), `mlp_*` (per-slice renormalized within mlp experts), and `pool_*` (full 2R distribution without slice renormalization). The three values diagnose distinct phenomena: per-slice within-role imbalance (attn_cv vs mlp_cv asymmetry), cross-slice dominance (pool_cv vs max(per-slice)), and the relationship between them. Metrics derived from **expert outputs** (usage arrays, orthogonality, min_share per slice) keep their `attn_*`/`mlp_*` prefix as before. `pertoken_entropy` remains a single pool-level value (per-token entropy is a pool-level quantity by construction — each token has ONE distribution).
 
