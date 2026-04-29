@@ -24,7 +24,7 @@ import time
 import uuid
 import warnings
 import zlib
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 try:
@@ -134,6 +134,27 @@ def _should_diag(training: bool) -> bool:
     return True
 
 
+def _safe_sum(values, floor: float = 1e-8) -> float:
+    """sum(values) clamped to a positive floor to keep downstream divisions safe.
+
+    Replaces the ``sum(values) or 1e-8`` pattern (which only triggers when the
+    sum is exactly 0) with an explicit max(_, floor) so the intent — divide-by-
+    zero protection in degenerate empty/all-zero cases — is the literal code.
+    """
+    return max(sum(values), floor)
+
+
+def _safe_mean(values, floor: float = 1e-8) -> float:
+    """sum(values)/len(values) clamped to a positive floor — companion to _safe_sum.
+
+    Used by the routing-health diagnostics, where ``mu`` is the denominator of
+    a CV computation and the surrounding `usage` list can be empty during a
+    cold-start window.
+    """
+    n = len(values) if hasattr(values, "__len__") else 0
+    return max(sum(values) / max(n, 1), floor)
+
+
 @contextlib.contextmanager
 def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
     global _ROUTER_DIAGNOSTICS_ACTIVE, _ROUTER_DIAGNOSTICS_STEP
@@ -179,7 +200,7 @@ class Hyperparameters:
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
     model_dim = 768  # iter 96 baseline. Iter 98 attempted 768 → 1024 but OOM'd 3× on 44 GiB L40S dev hardware (D=1024 + DEQ TBPTT exceeds VRAM cap regardless of seq/K reductions). Documented as NOT TESTED in H73; D-scaling deferred until 8× H100 80GB submission hardware (won't OOM there).
-    num_heads = 8  # Fix #2 (AdaSplash) attempt 2026-04-28 NOT VIABLE — even with @dynamo_disable wrapper from d7996da, AdaSplash kernel SIGABRTs at step 1 under compile+DDP+RevDEQ at head_dim=64. Reverted from 12. The `@dynamo_disable` makes the call opaque to dynamo's TRACER but doesn't isolate Triton's CUDA stream/context from DDP's NCCL streams or RevDEQ's autograd backward replay. Path forward requires either (a) torch.library.custom_op registration (more invasive) or (b) single-GPU validation harness. Defer.
+    num_heads = 8
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
     # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
@@ -201,6 +222,10 @@ class Hyperparameters:
     # When active, supersedes deq_beta / deq_beta_jitter.
     use_parcae = True
     parcae_init_a_bar = 0.7  # initial Ā per dim (0.7 → β=0.3, tested sweet spot)
+    # B̄₀ at step 0; defaults to 1 − Ā₀ for continuity with iter 66a tied β = 1 − Ā.
+    # Promoted to Hyperparameters per §9 single-source-of-truth (was derived inline
+    # in _parcae_init_raw_values).
+    parcae_init_b_bar = 0.3
     parcae_lr = 0.002  # 10× slower than scalar_lr — Parcae params control DEQ mixing
 
     # Optimizer
@@ -239,14 +264,6 @@ class Hyperparameters:
     # (expert_iter_std≈0). Linear dot-product captures rotation → different expert
     # mixtures across iterations → effective depth > 1.
     router_scoring = "linear"
-    # iter 99 (2026-04-26): router output activation. "softmax" was the iter 96
-    # baseline; "sparsemax" replaces softmax with closed-form simplex projection
-    # (Martins & Astudillo 2016) — produces EXACT zeros for low-logit experts,
-    # driving per-token specialization architecturally rather than via loss
-    # penalty. RevDEQ-safe: deterministic + 1-Lipschitz + subdifferentiable.
-    # Composes with sigmoid gate (`p_alloc * gate_act`) unchanged.
-    router_kind = "softmax"  # iter 100b promoted baseline. Iter 102 (entmax_anneal) NOT PROMOTED ✗ — val_bpb tracked iter 100b but +6.8% wallclock cost from entmax15 30-iter bisection. See H77. Options: "softmax", "sparsemax", "entmax15", "entmax_anneal".
-    router_alpha_warmup_delay_frac = 0.3  # unused at router_kind="softmax"; retained for entmax_anneal HP plumbing.
     # iter 100b (2026-04-27): per-token entropy penalty with ANNEALED schedule
     # + min_share_loss decoupled. iter 100 (entropy_coef=0.02 from step 0)
     # hit train_loss instability — penalty fights min_share_loss penalty
@@ -265,28 +282,14 @@ class Hyperparameters:
     # softmax exploration early; sparsity pressure ramps in once routing has
     # stabilized).
     router_entropy_warmup_delay_frac = 0.3
+    # SoftDenseRouter loss weights — promoted from hardcoded literals (Block.__init__
+    # at L2415-2416) to Hyperparameters per §9 single-source-of-truth + the
+    # hyperparameter fan-out invariant (EXPERIENCE.md#hyperparameter-fanout).
+    # Iter 100b: min_share floor dropped (entropy decoupled from CV); CV weight
+    # raised 0.10 → 2.0 to compensate (H76).
+    min_share_loss_weight = 0.0
+    cv_loss_weight = 2.0
     mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
-
-    # Iter 104 (2026-04-28, REVISED v3): AdaSplash α-entmax attention. Replaces
-    # softmax with α-entmax (Peters 2019), producing exact zeros in attention
-    # weights → real adaptive sparsity. Uses AdaSplash's fused Triton kernel
-    # (deep-spin/adasplash, ICML 2025, arxiv 2502.12082) for kernel-level skip
-    # of zero entries. Genuine "sparse attention with FA-level efficiency".
-    #
-    # Anneal α from 1.0 (softmax) to attn_alpha_target (e.g. 1.5) over training
-    # to avoid the cold-start trap that hurt iter 99 (sparsemax α=2 from step 0,
-    # H74) and iter 101 (entmax α=1.5 from step 0, H75). Schedule mirrors
-    # router_entropy_warmup_delay_frac per feedback_anneal_sparsity_coefs.md:
-    #   if time_frac < warmup_delay → α = 1.0 (pure softmax exploration)
-    #   else                       → α = 1.0 + (target − 1.0) × ramp(time_frac)
-    #
-    # Sliding window (prior v2 design) explicitly REJECTED by user directive
-    # 2026-04-28: "sliding window would significantly hurt long sequence
-    # performance which should never be used alone". AdaSplash's adaptive
-    # sparsity is learned per-query and preserves long-range dependencies.
-    attn_alpha_target = 1.0             # iter 104 (AdaSplash) attempt 2026-04-28 NOT VIABLE — SIGABRT at step 1 under compile+DDP+RevDEQ even with `_adasplash_kernel_call` decorated `@dynamo_disable` (commit d7996da). The dynamo-disable wrapper makes the call opaque to dynamo's TRACER but doesn't isolate Triton's CUDA stream/context from DDP's NCCL streams or RevDEQ's autograd backward replay. Set to 1.0 to disable AdaSplash entirely (falls back to dense softmax SDPA). Path forward: torch.library.custom_op registration OR single-GPU harness validation.
-    attn_alpha_warmup_delay_frac = 0.3  # unused when attn_alpha_target=1.0 (path bypassed)
-    attn_alpha_niter = 10               # unused when attn_alpha_target=1.0 (path bypassed)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
@@ -313,19 +316,10 @@ class Hyperparameters:
     denoising_coef = 0.0       # weight of denoising loss (iter 89: disabled)
     denoising_noise_std = 0.01 # σ: Gaussian noise scale added to z*
 
-    # DEQ solver
-    # "revdeq" = custom RevDEQFunction with fp64 accumulators (O(1) memory).
-    #   Enables torch.compile(shared_block) → 45% block speedup from fused
-    #   permute+rms_norm kernels.  3 forwards per DEQ iter (fwd+reconstruct).
-    # "unroll" = standard autograd through K DEQ iterations (O(K) memory).
-    #   2 forwards per DEQ iter but CANNOT compile (breaks autograd chaining).
-    #   Also needs 4× grad_accum for VRAM, reducing effective throughput.
-    # Net: revdeq+compile > unroll+eager on 64-head independent expert MLA.
-    # RevDEQ is the default: O(1) backward memory (4.4 GB peak at B=8) vs
-    # unroll's O(K) autograd graph (43.7 GB, OOMs on L40S with 64 heads).
-    # Sub-module compile (forward_experts + mix_experts) gives 2× attn + 1.5×
-    # MLP speedup.  Full shared_block compile needs ≥60 GB (H100 only).
-    deq_backward = "revdeq"
+    # DEQ solver: RevDEQFunction with fp64 accumulators (O(1) memory). Enables
+    # torch.compile(shared_block) for fused permute+rms_norm kernels. The legacy
+    # "unroll"/"autograd" backward modes were removed (user directive 2026-04-28)
+    # — only revdeq is supported. Memory: 4.4 GB peak vs unroll's 43.7 GB at K=12.
     # iter 28-tbptt: Truncated BPTT. Backward reconstructs only the last
     # `deq_bptt_k` forward iterations; earlier iters contribute no gradient.
     # 0 (or >= num_layers) = full BPTT.  Rationale: for a contractive DEQ,
@@ -338,12 +332,11 @@ class Hyperparameters:
     # noted +0.0054 val_bpb regression vs fixed k=2 AND +21% throughput cost,
     # and the dev profile run showed jitter (3 values) × K-jitter (3 values)
     # = 9 unique compiled-graph variants, exceeding `_dynamo.config.recompile_limit
-    # = 8` and triggering per-step recompile thrash (~10-15s spikes mixed with
-    # cached steps). Disabling jitter recovers iter 84's val_bpb baseline,
-    # +21% throughput, AND eliminates the 3× cache-axis pressure from the K
-    # × TBPTT cross product. Sampler at L3737 short-circuits to `args.deq_bptt_k`
-    # when `deq_bptt_k_jitter=False` — the singleton set below is kept for
-    # state-dict / config compat.
+    # = 8` and triggering per-step recompile thrash. Disabling jitter recovers
+    # iter 84's val_bpb baseline, +21% throughput, AND eliminates the 3× cache-axis
+    # pressure from the K × TBPTT cross product. The `deq_bptt_k_for_step`
+    # sampler short-circuits to `args.deq_bptt_k` when `deq_bptt_k_jitter=False`
+    # — the singleton set below is kept for state-dict / config compat.
     deq_bptt_k_jitter = False
     deq_bptt_k_jitter_set = (2,)
     # TBPTT investigation (28-28d) concluded; best point was 28c (val_bpb
@@ -355,7 +348,7 @@ class Hyperparameters:
     deq_k_min = 4
     deq_k_max = 16  # 2026-04-28 user directive: K-jitter disabled, K fixed at 16 (matches deq_k_eval).
     deq_k_step = 4
-    deq_k_jitter_set = (16,)  # 2026-04-28 user directive: singleton (jitter disabled). Sampler at L3870 short-circuits to args.deq_k_max=16.
+    deq_k_jitter_set = (16,)  # singleton (jitter disabled). The `deq_k_for_step` sampler short-circuits to args.deq_k_max=16 when deq_k_jitter=False.
     deq_k_eval = 16  # iter 30: baseline eval K
 
     # Architecture knobs
@@ -412,6 +405,10 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
         "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
         "warmdown-frac", "num-refinements-ramp-frac",
+        # Item 1 (config fan-out): plumb missing knobs to CLI per §9 SSoT.
+        "min-share-loss-weight", "cv-loss-weight",
+        "router-entropy-coef", "router-entropy-warmup-delay-frac",
+        "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     ]:
         py_name = name.replace("-", "_")
         field_val = getattr(Hyperparameters, py_name, None)
@@ -426,14 +423,15 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "swa-enabled", "ema-enabled", "use-ctp",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
-    # Backward compat: "unroll" is the established name in experiments/docs.
-    # "autograd" is accepted as an alias for the same mode.
-    p.add_argument("--deq-backward", type=str, default=None, choices=["unroll", "autograd", "revdeq"])
     p.add_argument("--router-bias-lr", type=float, default=None)
     p.add_argument("--router-bias-clip", type=float, default=None)
     ns, unknown = p.parse_known_args(argv)
-    if unknown:
-        raise SystemExit(f"Unknown args: {unknown}")
+    # Reject only `--`-prefixed unknowns; bare positionals are passed through
+    # so wrapper / profile harnesses can inject their own flags without breaking
+    # this parser.
+    bad = [u for u in unknown if u.startswith("--")]
+    if bad:
+        raise SystemExit(f"Unknown args: {bad}")
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
                  "swa_enabled", "ema_enabled", "use_ctp"}
@@ -1067,91 +1065,6 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
-_ADASPLASH_AVAILABLE = False
-_adasplash_attention = None
-try:
-    from adasplash import adasplash as _adasplash_attention
-    _ADASPLASH_AVAILABLE = True
-except ImportError:
-    pass
-
-
-@dynamo_disable
-def _adasplash_kernel_call(q: Tensor, k: Tensor, v: Tensor,
-                           alpha: float, niter: int) -> Tensor:
-    """Eager-only invocation of the AdaSplash Triton kernel. Wrapped in
-    `@dynamo_disable` so the kernel runs in pure eager mode regardless of any
-    surrounding `torch.compile` context.
-
-    This is the principled fix for iter 104 v3/v4's SIGABRT crash (2026-04-28):
-    when α first exceeded 1.0 (post-anneal-warmup, step 301), dynamo had to
-    recompile the parent `forward_experts` graph to incorporate the AdaSplash
-    branch. The Triton kernel + dynamo's stream/context management + DDP all-
-    reduce + RevDEQ custom autograd + Inductor codegen interact at C-level in a
-    way that produces SIGABRT (signal 6, no Python traceback). By contrast,
-    Triton kernels invoked from PURE eager mode work reliably (verified
-    standalone). `@dynamo_disable` keeps dynamo from tracing into the kernel
-    invocation: the surrounding compiled forward fuses around a stable graph-
-    break boundary at this call. torch.compile (router/MLP fusion) and
-    AdaSplash (sparse-attention kernel) compose cleanly via this boundary —
-    only the kernel itself runs uncompiled, which is what we want anyway.
-    """
-    # AdaSplash requires consistent dtype across q/k/v (bf16 path is the
-    # supported one in the published Triton kernel).
-    target_dtype = v.dtype
-    if q.dtype != target_dtype:
-        q = q.to(target_dtype)
-    if k.dtype != target_dtype:
-        k = k.to(target_dtype)
-    return _adasplash_attention(
-        q, k, v, alpha=float(alpha), is_causal=True, niter=int(niter),
-    )
-
-
-def adasplash_alpha_entmax_attention(
-    q: Tensor, k: Tensor, v: Tensor, alpha: float, niter: int = 10,
-    enable_gqa: bool = False,
-) -> Tensor:
-    """α-entmax attention via AdaSplash's fused Triton kernel (Peters 2019,
-    ICML 2025 arxiv 2502.12082). Replaces softmax with α-entmax which produces
-    EXACT ZEROS in attention weights — real adaptive sparsity. The fused
-    Triton kernel skips zero entries at the kernel level → kernel-level skip
-    + FA-style efficiency. At α=1.0 reduces to softmax (no sparsity); at
-    α=1.5 produces moderate sparsity; α=2.0 = sparsemax (top-1 trap risk).
-
-    Keeps MLA + head-packed pattern intact — same q/k/v shapes as the dense
-    path. AdaSplash supports GQA natively (H_kv < H broadcasts internally).
-
-    q: (B, H,    T, d_q) bf16
-    k: (B, H_kv, T, d_k) bf16
-    v: (B, H_kv, T, d_v) bf16
-    alpha: 1.0 → 2.0 (1.0 = softmax fallback, dense)
-
-    Falls back to dense causal SDPA if adasplash unavailable, alpha <= 1.0, or
-    if head_dim is incompatible with AdaSplash's Triton block specialization
-    (the kernel asserts H_DIM ∈ {16, 32, 64, 128, 256}).
-
-    Compile compatibility: the AdaSplash kernel call is wrapped in
-    `_adasplash_kernel_call` which is `@dynamo_disable`-decorated. The outer
-    `if` here is traceable so the dense fast path (alpha ≤ 1.0) stays fully
-    compiled.
-    """
-    if not _ADASPLASH_AVAILABLE or alpha <= 1.0:
-        return F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, enable_gqa=enable_gqa,
-        )
-    # AdaSplash's Triton kernel hardcodes block sizes for specific head_dim
-    # values; non-power-of-2 head_dim (e.g. 96 = 768/8) would assert at kernel
-    # launch. Fallback to dense SDPA preserves correctness, losing the kernel
-    # speedup at that head_dim.
-    head_dim = int(q.shape[-1])
-    if head_dim not in {16, 32, 64, 128, 256}:
-        return F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, enable_gqa=enable_gqa,
-        )
-    return _adasplash_kernel_call(q, k, v, alpha=alpha, niter=niter)
-
-
 def mean_abs_offdiag_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
     e = groups.shape[0]
     if e < 2:
@@ -1250,88 +1163,6 @@ class BigramHashEmbedding(nn.Module):
 # SOFT DENSE ROUTER
 # ---------------------------------------------------------------------------
 
-def entmax15(logits: Tensor, dim: int = -1, n_iter: int = 30) -> Tensor:
-    """α=1.5 entmax (Peters, Niculae & Martins 2019) — bisection over α-entmax.
-
-    α-entmax interpolates between softmax (α=1, full support, smooth) and
-    sparsemax (α=2, sparse, exact zeros). At α=1.5: TYPICALLY-FULL support
-    (most weights nonzero, peakier than softmax) with possibly some exact
-    zeros — the principled middle ground.
-
-    Solution: w_i = max(0, (α-1)·(z_i - τ))^(1/(α-1)) where τ is the
-    Lagrangian satisfying Σw_i = 1. With α=1.5: w_i = max(0, 0.5·(z_i - τ))²
-    and we bisect for τ.
-
-    RevDEQ-safe: deterministic, 1-Lipschitz, subdifferentiable a.e. — same
-    properties as sparsemax. AVOIDS sparsemax's pure top-1 trap (iter 99
-    H74) because w_i > 0 across most experts → all get nonzero gradient.
-
-    Args:
-        logits: Tensor with simplex axis on `dim`.
-        dim: Axis to project over (default: last).
-        n_iter: Bisection iterations (30 → 1e-9 precision; differentiable
-            via implicit function theorem through autograd).
-    Returns:
-        Probability tensor of same shape, sum=1 along `dim`.
-    """
-    # Bisect for τ such that Σ max(0, 0.5·(z - τ))² = 1.
-    # Bracket: τ_low = z.max() - 2 (guarantees support includes at least
-    # the max), τ_high = z.max() (guarantees support is empty if equality).
-    # Actually, at τ = z.max() the only nonzero contribution would be 0,
-    # so the sum is 0 < 1. So τ must be < z.max() to have support.
-    # We use τ_low = z.max() - sqrt(2*K) as a safe lower bound (worst case
-    # all K entries equal, then w_i = 1/K → sum K · ((1/K)^(1/2))² · 0.5²
-    # ... derivation messy; just pick a wide bracket and bisect.
-    z_max = logits.max(dim=dim, keepdim=True).values
-    tau_lo = z_max - 4.0  # generous lower bound
-    tau_hi = z_max
-    for _ in range(n_iter):
-        tau = 0.5 * (tau_lo + tau_hi)
-        w = torch.clamp(0.5 * (logits - tau), min=0.0).pow(2)
-        w_sum = w.sum(dim=dim, keepdim=True)
-        # If sum > 1, threshold τ is too low; raise it. If sum < 1, lower it.
-        tau_lo = torch.where(w_sum > 1.0, tau, tau_lo)
-        tau_hi = torch.where(w_sum > 1.0, tau_hi, tau)
-    # Final eval with the converged τ.
-    tau = 0.5 * (tau_lo + tau_hi)
-    w = torch.clamp(0.5 * (logits - tau), min=0.0).pow(2)
-    return w
-
-
-def sparsemax(logits: Tensor, dim: int = -1) -> Tensor:
-    """Sparsemax (Martins & Astudillo 2016) — closed-form simplex projection.
-
-    Outputs a probability vector that sums to 1 with EXACT zeros for
-    sufficiently low logits. Unlike softmax (always strictly positive),
-    sparsemax produces architectural sparsity per token without requiring
-    a loss-side penalty.
-
-    RevDEQ-safe: deterministic, 1-Lipschitz in ‖·‖₁→‖·‖∞, subdifferentiable
-    a.e. (gradient is the indicator that the entry is in the support set).
-
-    Args:
-        logits: Tensor of arbitrary shape with the simplex axis on `dim`.
-        dim: Axis to project over (default: last).
-    Returns:
-        Tensor of same shape; entries are in [0, 1], sum to 1 along `dim`,
-        with possibly many exact zeros.
-    """
-    z_sorted, _ = torch.sort(logits, dim=dim, descending=True)
-    K = logits.size(dim)
-    arange = torch.arange(1, K + 1, dtype=logits.dtype, device=logits.device)
-    arange_shape = [1] * logits.ndim
-    arange_shape[dim] = K
-    arange = arange.view(arange_shape)
-    z_cumsum = torch.cumsum(z_sorted, dim=dim)
-    # Support condition: 1 + k * z_sorted[k] > sum_{i<=k} z_sorted[i]
-    support = (1 + arange * z_sorted) > z_cumsum
-    k_z = support.long().sum(dim=dim, keepdim=True).clamp(min=1)
-    # Threshold tau = (sum of top-k - 1) / k
-    z_cumsum_at_k = z_cumsum.gather(dim, k_z - 1)
-    tau = (z_cumsum_at_k - 1) / k_z.to(logits.dtype)
-    return torch.clamp(logits - tau, min=0.0)
-
-
 class SoftDenseRouter(nn.Module):
     """Dense softmax routing over experts (no top-k, no dropping).
 
@@ -1348,9 +1179,8 @@ class SoftDenseRouter(nn.Module):
     """
     def __init__(self, dim: int, num_experts: int, *,
                  min_share_frac: float = 0.6, cv_target: float = 0.20,
-                 min_share_loss_weight: float = 1.0, cv_loss_weight: float = 0.10,
+                 min_share_loss_weight: float = 0.0, cv_loss_weight: float = 2.0,
                  scoring: str = "linear", health_slices: tuple[int, ...] | None = None,
-                 router_kind: str = "softmax",
                  entropy_coef: float = 0.0):
         super().__init__()
         self.num_experts = num_experts
@@ -1359,20 +1189,17 @@ class SoftDenseRouter(nn.Module):
         self.min_share_loss_weight = float(min_share_loss_weight)
         self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
-        self.router_kind = str(router_kind)  # iter 99: "softmax" | "sparsemax" | "entmax15" | iter 102: "entmax_anneal"
-        # iter 102: blend factor between softmax (0) and entmax15 (1). Set by training loop
-        # hook from time_frac with router_alpha_warmup_delay_frac schedule. Defaults to 0
-        # (pure softmax) so eval, smoke test, and the first warmup_delay fraction of training
-        # all behave as iter 96/100b baseline.
-        self._router_alpha_scale = 0.0
-        self.entropy_coef = float(entropy_coef)  # iter 100: per-token entropy penalty coef
         assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
         self.health_slices = tuple(int(v) for v in (health_slices or (num_experts,)))
         if sum(self.health_slices) != int(num_experts) or any(v <= 0 for v in self.health_slices):
             raise ValueError(f"health_slices={self.health_slices} must partition {num_experts} experts")
-        # Tensor buffer to avoid Python-float guards inside torch.compile graphs.
-        # Kept behind a property so legacy code/tests can assign `health_scale = 5.0`.
+        # Tensor buffers to avoid Python-float guards inside torch.compile graphs.
+        # The training loop annealer writes `entropy_coef` every step after the
+        # warmup-delay frac elapses; without a buffer that's a per-step dynamo
+        # guard fail → recompile cascade (coderabbit Major #1). Kept behind
+        # `@property` setters so legacy code/tests can write Python floats.
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("_entropy_coef", torch.tensor(float(entropy_coef), dtype=torch.float32), persistent=False)
         self.router = CastedLinear(dim, num_experts, bias=False)
         nn.init.normal_(self.router.weight, std=0.01)
         self.score_norm_weight = nn.Parameter(torch.ones(dim))
@@ -1465,15 +1292,21 @@ class SoftDenseRouter(nn.Module):
 
     @property
     def health_scale(self) -> float:
-        try:
-            return float(self._health_scale.detach().float().item())
-        except Exception:
-            return 1.0
+        return float(self._health_scale.item())
 
     @health_scale.setter
     def health_scale(self, value: float) -> None:
         with torch.no_grad():
             self._health_scale.fill_(float(value))
+
+    @property
+    def entropy_coef(self) -> float:
+        return float(self._entropy_coef.item())
+
+    @entropy_coef.setter
+    def entropy_coef(self, value: float) -> None:
+        with torch.no_grad():
+            self._entropy_coef.fill_(float(value))
 
     @torch.no_grad()
     def bias_update(self, *, lr: float, clip: float, distributed: bool) -> None:
@@ -1529,35 +1362,12 @@ class SoftDenseRouter(nn.Module):
         else:
             # Linear scoring (iter 30-33b baseline).
             route_logits = self.router(x_score) + self.expert_bias.to(dtype=x.dtype)
-        # iter 99 (2026-04-26): router output activation per `self.router_kind`.
-        # `softmax` (iter 96 baseline) produces all-positive weights with full
-        # support; `sparsemax` (iter 99) produces exact zeros for low-logit
-        # experts → architectural per-token sparsity. Both compose with the
-        # sigmoid gate identically.
-        # Sigmoid gate: <activation>(route_logits) * sigmoid(gate_logits).
-        # NOT renormalized — total weight can be < 1, allowing the model to
-        # suppress the entire expert mixture for tokens already near equilibrium.
-        # This is more expressive than folding into logit space (which forces sum=1).
-        _rk = getattr(self, "router_kind", "softmax")
-        if _rk == "sparsemax":
-            p_alloc = sparsemax(route_logits.float(), dim=-1)  # iter 99 (NOT PROMOTED H74)
-        elif _rk == "entmax15":
-            p_alloc = entmax15(route_logits.float(), dim=-1)  # iter 101: α=1.5 fixed
-        elif _rk == "entmax_anneal":
-            # iter 102: linear blend of softmax + entmax15 weighted by alpha_scale.
-            # alpha_scale is set by training loop hook from time_frac (0 during
-            # warmup → pure softmax; 1 at end → pure entmax15). Avoids the H75
-            # cold-start trap that hurt iter 101 (fixed α=1.5 from step 0).
-            alpha_scale = float(getattr(self, "_router_alpha_scale", 0.0))
-            logits_f = route_logits.float()
-            sm = torch.softmax(logits_f, dim=-1)
-            if alpha_scale > 0.0:
-                em = entmax15(logits_f, dim=-1)
-                p_alloc = (1.0 - alpha_scale) * sm + alpha_scale * em
-            else:
-                p_alloc = sm
-        else:
-            p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
+        # Softmax allocation (iter 100b promoted baseline). Sparsemax/entmax15/
+        # entmax_anneal variants tested in iters 99/101/102 NOT PROMOTED — see
+        # H74/H75/H77 in experiments/hypotheses.md. Sigmoid gate is applied
+        # multiplicatively (NOT renormalized) so total mass can be < 1, letting
+        # the model suppress the mixture near fixed point.
+        p_alloc = torch.softmax(route_logits.float(), dim=-1)  # fp32 for stability
         gate_act = torch.sigmoid(self.router_gate(x_gate).float())
         p = (p_alloc * gate_act).to(dtype=x.dtype)
         # Diagnostic capture — store as 0-d GPU tensor (no `.item()`).
@@ -1589,11 +1399,16 @@ class SoftDenseRouter(nn.Module):
             # weights per-token so the entropy is measured over a probability
             # distribution (sum=1); softmax already does this, but sigmoid gate
             # makes raw `p` sum to ≤1, so renormalize before entropy compute.
-            if float(self.entropy_coef) > 0.0:
+            # Tensor-gated to avoid the per-step Python-float guard recompile
+            # (coderabbit Major #1). The buffer is updated in-place by the
+            # training loop's annealer; reading it as a tensor keeps dynamo
+            # from recompiling on every value change.
+            ec_t = self._entropy_coef
+            if bool((ec_t > 0.0).item()):  # one-time guard at trace, not per-step
                 p_norm = p.float() / p.float().sum(dim=-1, keepdim=True).clamp_min(1e-8)
                 # H_pertoken = -Σ_e w(e|t) log w(e|t), averaged over tokens.
                 pertoken_ent = -(p_norm * (p_norm + 1e-8).log()).sum(dim=-1).mean()
-                self._pertoken_entropy_loss = float(self.entropy_coef) * pertoken_ent
+                self._pertoken_entropy_loss = ec_t.to(dtype=pertoken_ent.dtype) * pertoken_ent
             else:
                 self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = mean_share.detach()
@@ -1729,18 +1544,11 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
-                 attn_alpha_target: float = 1.0, attn_alpha_niter: int = 10,
                  **kwargs):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        # iter 104 v3: AdaSplash α-entmax. _attn_alpha is the CURRENT α value,
-        # mutated by the training loop's annealing schedule. Defaults to 1.0
-        # (softmax fallback) until warmup_delay_frac elapses.
-        self.attn_alpha_target = float(attn_alpha_target)
-        self.attn_alpha_niter = int(attn_alpha_niter)
-        self._attn_alpha = 1.0
         self.num_experts = num_experts
         self.expert_rank = expert_rank if expert_rank > 0 else max(dim // max(num_experts, 1), 1)
         self.kv_latent_dim = kv_latent_dim if kv_latent_dim > 0 else dim // 2
@@ -1922,33 +1730,18 @@ class CausalSelfAttention(nn.Module):
         v_full = v.permute(1, 0, 3, 2, 4).reshape(B, E * H_kv, T, d)
 
         # --- Head-packed SDPA ---
-        # iter 104 v3: AdaSplash α-entmax attention (Peters 2019; ICML 2025).
-        # Replaces softmax with α-entmax → exact zeros in attention weights →
-        # adaptive learned sparsity, fused Triton kernel skips zero entries.
-        # When α=1.0 (init or off), reduces to dense softmax via fallback.
-        # Annealed: parent SharedBlock writes self._attn_alpha from training
-        # loop (1.0 during pre-warmup, ramping to attn_alpha_target after
-        # warmup_delay_frac). Avoids cold-start trap that hurt iter 99/101.
-        current_alpha = float(getattr(self, "_attn_alpha", 1.0))
-        if current_alpha > 1.0:
-            y = adasplash_alpha_entmax_attention(
-                q_full, k_full, v_full,
-                alpha=current_alpha, niter=int(self.attn_alpha_niter),
+        try:
+            y = F.scaled_dot_product_attention(
+                q_full, k_full, v_full, attn_mask=None, is_causal=True,
                 enable_gqa=(H_kv != H),
             )
-        else:
-            try:
-                y = F.scaled_dot_product_attention(
-                    q_full, k_full, v_full, attn_mask=None, is_causal=True,
-                    enable_gqa=(H_kv != H),
-                )
-            except TypeError:
-                k_use, v_use = k_full, v_full
-                if H_kv != H:
-                    rep = H // H_kv
-                    k_use = k_full.repeat_interleave(rep, dim=1)
-                    v_use = v_full.repeat_interleave(rep, dim=1)
-                y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
+        except TypeError:
+            k_use, v_use = k_full, v_full
+            if H_kv != H:
+                rep = H // H_kv
+                k_use = k_full.repeat_interleave(rep, dim=1)
+                v_use = v_full.repeat_interleave(rep, dim=1)
+            y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
 
         # --- Gated attention ---
         gate_logits_p = gate_logits.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, 1)
@@ -2207,9 +2000,6 @@ class MoSHead(nn.Module):
             for e in range(B.shape[0]):
                 nn.init.xavier_uniform_(B.data[e])
 
-    def init_from_embedding(self, embed_weight: Tensor):
-        pass  # No SVD init; xavier from scratch
-
     def get_head_orthogonality(self, head: str) -> float:
         # GATE metric: max pairwise |cos| across MoS head experts (shared + specialized),
         # computed on the A weight matrices directly.  We DO NOT fall back to the
@@ -2368,16 +2158,15 @@ class MoSHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    # Locked config: 8 experts (iter 13 best at 1h budget).
-    # H5 resolved: 12exp works at WD=0.72 but throughput penalty hurts val_bpb.
+    # iter 96 baseline: num_experts=16 (H71 PROMOTED ★).
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  router_scoring: str = "linear",
-                 router_kind: str = "softmax",
                  router_entropy_coef: float = 0.0,
-                 attn_alpha_target: float = 1.0, attn_alpha_niter: int = 10,
+                 min_share_loss_weight: float = 0.0,
+                 cv_loss_weight: float = 2.0,
                  **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
@@ -2412,18 +2201,18 @@ class Block(nn.Module):
         # iter 100b (2026-04-27): drop min_share_loss penalty (was 10.0).
         # min_share remains in diagnostics; CV loss alone provides global
         # balance regularization. Decouples from entropy-penalty axis.
-        self.router = SoftDenseRouter(dim, 2 * num_routed, min_share_loss_weight=0.0,
-                                      cv_loss_weight=2.0, scoring=router_scoring,
+        # Loss weights threaded from Hyperparameters per §9 single-source-of-truth.
+        self.router = SoftDenseRouter(dim, 2 * num_routed,
+                                      min_share_loss_weight=min_share_loss_weight,
+                                      cv_loss_weight=cv_loss_weight,
+                                      scoring=router_scoring,
                                       health_slices=(num_routed, num_routed),
-                                      router_kind=router_kind,
                                       entropy_coef=router_entropy_coef)
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                          kv_latent_dim=kv_latent_dim, num_experts=num_experts,
-                                         expert_rank=attn_expert_rank, router=self.router,
-                                         attn_alpha_target=attn_alpha_target,
-                                         attn_alpha_niter=attn_alpha_niter)
+                                         expert_rank=attn_expert_rank, router=self.router)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
@@ -2433,8 +2222,9 @@ class Block(nn.Module):
         # mirrors the `_attn_expert_weights_per_iter` pattern at L3041.
         self._attn_gate_call_track: list[Tensor] = []
         self._router_gate_call_track: list[Tensor] = []
+        # Pooled router (iter 35): attn track is the canonical source — the
+        # legacy `_mlp_router_gate_call_track` was a value-equal duplicate.
         self._attn_router_gate_call_track: list[Tensor] = []
-        self._mlp_router_gate_call_track: list[Tensor] = []
         # Per-expert routing weight per iteration (shows if experts specialize across
         # iters).  Stored as detached GPU tensors of shape (E,) — materialized to
         # Python lists once after the DEQ solve, NOT per-iter (CLAUDE.md §9
@@ -2629,16 +2419,16 @@ class Block(nn.Module):
         attn_rg = getattr(self.router, "_router_gate_last_mean", None)
         if attn_rg is not None:
             self._attn_router_gate_call_track.append(attn_rg)
-        # Pooled router: attn and mlp share the same router instance.
-        mlp_rg = attn_rg
-        if mlp_rg is not None:
-            self._mlp_router_gate_call_track.append(mlp_rg)
-        # Combined router-gate (attn+mlp pair-mean) — kept as 0-d GPU tensor.
+        # Iter 35: attn and mlp share the same router instance, so the mlp
+        # router-gate value equals the attn router-gate value. The legacy
+        # `_mlp_router_gate_call_track` was dropped (value-equal duplicate
+        # of `_attn_router_gate_call_track`); downstream readers consume the
+        # attn track and treat it as the pooled-router value.
+        # Combined router-gate pair-mean (kept for log-format compat — attn
+        # value alone equals the pair mean since the two are identical).
         rg_vals: list[Tensor] = []
         if attn_rg is not None:
             rg_vals.append(attn_rg)
-        if mlp_rg is not None:
-            rg_vals.append(mlp_rg)
         if rg_vals:
             avg_rg = rg_vals[0] if len(rg_vals) == 1 else 0.5 * (rg_vals[0] + rg_vals[1])
             self._router_gate_call_track.append(avg_rg)
@@ -2882,10 +2672,17 @@ class RevDEQFunction(torch.autograd.Function):
                 denom = z0.norm().clamp(min=1.0)
                 z_rec = z_next64.to(dtype=state_dtype)
                 y_rec = y_next64.to(dtype=state_dtype)
-                # Store as GPU tensor — materialize at log time only.
+                # Under TBPTT (deq_bptt_k < num_layers), the reverse loop stops
+                # at iter (K_fwd − K_bwd), NOT at z_0 — so this metric measures
+                # the FP "distance travelled" during the un-reconstructed
+                # iterations, NOT a reconstruction error. Only when bptt_k == 0
+                # (full BPTT) does z_rec actually approximate z_0 and the value
+                # become a true reconstruction error. Naming reflects this:
+                # `_deq_distance_travelled_last_bwd` under TBPTT, with the
+                # full-BPTT case detected at log time and routed differently.
                 recon_err_t = ((z_rec - z0).norm() + (y_rec - z0).norm()) / denom
                 _target = _unwrap_compiled_module(f_theta)
-                setattr(_target, "_deq_recon_error_last_bwd", recon_err_t.detach())
+                setattr(_target, "_deq_distance_travelled_last_bwd", recon_err_t.detach())
             except Exception:
                 pass
 
@@ -2933,23 +2730,21 @@ class GPT(nn.Module):
                  mlp_balance_mult: float = 1.0, mos_balance_mult: float = 50.0,
                  bal_loss_coef: float = 5e-3,
                  router_health_coef: float = 0.25, mos_ortho_out_coef: float = 0.0,
-                 deq_backward: str = "revdeq", deq_bptt_k: int = 0,
+                 deq_bptt_k: int = 0,
                  block_ortho_aux_coef: float = 0.0,
                  block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
                  router_scoring: str = "linear",
-                 router_kind: str = "softmax",
                  router_entropy_coef: float = 0.0,
                  router_entropy_warmup_delay_frac: float = 0.0,
-                 router_alpha_warmup_delay_frac: float = 0.3,
-                 attn_alpha_target: float = 1.0,
-                 attn_alpha_warmup_delay_frac: float = 0.3,
-                 attn_alpha_niter: int = 10,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
                  lyapunov_warmup_frac: float = 0.1,
                  use_parcae: bool = True,
                  parcae_init_a_bar: float = 0.7,
+                 parcae_init_b_bar: float | None = None,
+                 min_share_loss_weight: float = 0.0,
+                 cv_loss_weight: float = 2.0,
                  use_ctp: bool = True):
         super().__init__()
         self.use_ctp = bool(use_ctp)
@@ -2962,11 +2757,6 @@ class GPT(nn.Module):
         # dynamically per-step via these values.
         self._router_entropy_coef_target = float(router_entropy_coef)
         self._router_entropy_warmup_delay_frac = float(router_entropy_warmup_delay_frac)
-        # iter 102: router α-anneal (softmax → entmax15 blend) warmup-delay schedule.
-        self._router_alpha_warmup_delay_frac = float(router_alpha_warmup_delay_frac)
-        # iter 104 v3: AdaSplash α-entmax target + anneal schedule.
-        self._attn_alpha_target = float(attn_alpha_target)
-        self._attn_alpha_warmup_delay_frac = float(attn_alpha_warmup_delay_frac)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -2979,10 +2769,9 @@ class GPT(nn.Module):
                                    num_experts=self.num_experts,
                                    num_shared_experts=self.num_shared_experts,
                                    router_scoring=router_scoring,
-                                   router_kind=router_kind,
                                    router_entropy_coef=router_entropy_coef,
-                                   attn_alpha_target=attn_alpha_target,
-                                   attn_alpha_niter=attn_alpha_niter,
+                                   min_share_loss_weight=min_share_loss_weight,
+                                   cv_loss_weight=cv_loss_weight,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
@@ -3010,10 +2799,11 @@ class GPT(nn.Module):
         # smoke-test tolerance together.
         self.parcae_reversibility_floor = 0.1
         if self.use_parcae:
-            # Init raw params so Ā₀ ≈ parcae_init_a_bar and B̄₀ ≈ 1 − Ā₀,
-            # giving continuity with iter 66a's tied β = 1 − Ā at step 0.
+            # Init raw params so Ā₀ ≈ parcae_init_a_bar and B̄₀ ≈ parcae_init_b_bar.
+            # parcae_init_b_bar=None → default to 1 − parcae_init_a_bar (iter 66a continuity).
+            init_b_bar = 1.0 - float(parcae_init_a_bar) if parcae_init_b_bar is None else float(parcae_init_b_bar)
             raw_a_init, raw_delta_init, raw_b_init = self._parcae_init_raw_values(
-                float(parcae_init_a_bar)
+                float(parcae_init_a_bar), init_b_bar
             )
             self.parcae_raw_a = nn.Parameter(torch.full((model_dim,), raw_a_init))
             self.parcae_raw_delta = nn.Parameter(torch.full((model_dim,), raw_delta_init))
@@ -3024,7 +2814,6 @@ class GPT(nn.Module):
         self.bal_loss_coef = float(bal_loss_coef)
         self.router_health_coef = float(router_health_coef)
         self.mos_ortho_out_coef = float(mos_ortho_out_coef)
-        self.deq_backward = deq_backward
         self.deq_bptt_k = int(deq_bptt_k)
         self.block_ortho_aux_coef = float(block_ortho_aux_coef)
         self.block_ortho_aux_every = int(block_ortho_aux_every)
@@ -3047,10 +2836,10 @@ class GPT(nn.Module):
         self.embed_norm = RMSNorm(model_dim)
         self._init_weights()
 
-    def _parcae_init_raw_values(self, init_a_bar: float) -> tuple[float, float, float]:
+    def _parcae_init_raw_values(self, init_a_bar: float, init_b_bar: float) -> tuple[float, float, float]:
         """Invert the paper forms to choose raw params at initialization.
 
-        Picks Δ₀, |A|₀, B₀ so that Ā₀ ≈ init_a_bar and B̄₀ ≈ 1 − init_a_bar.
+        Picks Δ₀, |A|₀, B₀ so Ā₀ ≈ init_a_bar and B̄₀ ≈ init_b_bar (default 1 − Ā₀).
         Returns raw values that pass through softplus+ε_min to recover the
         targets exactly (modulo the safety ε_min offset on |A| and B).
         """
@@ -3071,8 +2860,8 @@ class GPT(nn.Module):
         a_mag = -math.log(a_bar_core) / delta0  # |A|₀
         raw_a_init = inv_softplus(max(a_mag - eps_min, 1e-8))
 
-        # B̄₀ = Δ₀ · B₀ ≈ 1 − Ā₀ (continuity with iter 66a's tied β = 1 − Ā).
-        b_mag = max((1.0 - clamped_a) / delta0, eps_min + 1e-8)
+        # B̄₀ = Δ₀ · B₀; solve for B₀ given target init_b_bar.
+        b_mag = max(float(init_b_bar) / delta0, eps_min + 1e-8)
         raw_b_init = inv_softplus(b_mag - eps_min)
         return raw_a_init, raw_delta_init, raw_b_init
 
@@ -3112,7 +2901,6 @@ class GPT(nn.Module):
                             module.weight.mul_(1.0 / math.sqrt(2 * self.num_layers))
         # Gate logits are zero-initialized in CausalSelfAttention.__init__
         # (expert_q_up gate rows zeroed → sigmoid(0) = 0.5 at init).
-        self.mos_head.init_from_embedding(self.tok_emb.weight.data)
 
     def _get_soft_embedding(self, z: Tensor, topk: int = 64) -> Tensor:
         def _logp_to_prob(log_p: Tensor) -> Tensor:
@@ -3176,18 +2964,17 @@ class GPT(nn.Module):
         sb._attn_gate_call_track = []
         sb._router_gate_call_track = []
         sb._attn_router_gate_call_track = []
-        sb._mlp_router_gate_call_track = []
         prev_deq_flag = bool(_DEQ_SOLVE_ACTIVE)
         _DEQ_SOLVE_ACTIVE = True
         try:
             f_theta = self.shared_block
-            if self.training and self.deq_backward == "revdeq":
+            if self.training:
                 params = tuple(p for p in sb.parameters() if p.requires_grad)
                 bptt_k = int(getattr(self, "deq_bptt_k", 0) or 0)
                 z, z_prev = RevDEQFunction.apply(f_theta, x0, z_init, beta, b_bar, K, bptt_k, *params)
                 return z, z_prev, None, None
 
-            # FP32 accumulators for the unrolled solver (eval + non-revdeq train).
+            # FP32 accumulators for the unrolled solver (eval path only — train uses revdeq).
             # FP64 is only needed inside RevDEQFunction for exact reversibility.
             acc_dtype = torch.float32
             y_acc = z_init.to(acc_dtype)
@@ -3225,8 +3012,9 @@ class GPT(nn.Module):
                 list(getattr(sb, "_router_gate_call_track", []) or []))
             self._attn_router_gate_iter_last_solve = _materialize_pairs(
                 list(getattr(sb, "_attn_router_gate_call_track", []) or []))
-            self._mlp_router_gate_iter_last_solve = _materialize_pairs(
-                list(getattr(sb, "_mlp_router_gate_call_track", []) or []))
+            # mlp track was a value-equal duplicate; mlp readers consume the
+            # attn track (pooled router post iter 35).
+            self._mlp_router_gate_iter_last_solve = self._attn_router_gate_iter_last_solve
 
             # Per-expert routing weights per iteration (2 calls per iter: y-update,
             # z-update).  The producer at Block.forward stored each entry as a
@@ -3266,7 +3054,10 @@ class GPT(nn.Module):
         x0 = x
         z = x
         self._deq_residuals: list[float] = []
-        self._deq_recon_error = None
+        # Distance travelled during un-reconstructed iterations under TBPTT;
+        # equals true reconstruction error only when deq_bptt_k == 0 (full BPTT).
+        # See RevDEQFunction.backward for the math; CLAUDE.md §6.1 for the rule.
+        self._deq_distance_travelled = None
         self._deq_z_init_last: Tensor | None = None
         self._deq_k_last = None
         prev_soft_embed = x0
@@ -3385,9 +3176,14 @@ class GPT(nn.Module):
             bal = bal + float(router_weights.get(rid, 0.0)) * r_bal
             health = health + float(router_weights.get(rid, 0.0)) * r_health
             # iter 100: per-token entropy penalty (drives sparsity loss-side).
-            # Folded into health so existing aggregation/scaling reuses.
+            # NOT multiplied by router_weights[rid]: the pooled router is summed
+            # across attn+mlp slices via id-dedup (router_weights ≈ attn_mult +
+            # mlp_mult ≈ 6.0 by default), but the entropy term is per-token —
+            # there is no slice multiplicity to compensate for. Without this
+            # un-multiplication the documented router_entropy_coef=0.005 acts
+            # as ~0.03 in effect (pr-review-toolkit M3, coderabbit follow-up).
             r_ent = getattr(r, "_pertoken_entropy_loss", zero)
-            health = health + float(router_weights.get(rid, 0.0)) * r_ent
+            health = health + r_ent
         # iter 26-lb-loss: mos_balance_mult (default 50) × bal_loss_coef downstream
         # (5e-3) → effective weight 0.25 on the MoS NTP balance loss — strong enough
         # to drive dead MoS experts back toward fair share.  WD cannot fix routing-
@@ -3629,6 +3425,7 @@ def _prescribe_failure_fix(failure: str) -> dict:
       - `k-sweep…`               → widen K jitter
       - `iter_conv_rel`          → WD or lower deq_beta
       - `deq_recon_err`          → check determinism, lower deq_beta, raise WD
+                                   (only emitted under full BPTT — see §6.1)
     """
     low = failure.lower()
     first_token = low.split("=", 1)[0].split()[0] if low else ""
@@ -3750,10 +3547,6 @@ def main() -> None:
     if not getattr(args, "run_id", ""):
         args.run_id = str(uuid.uuid4())
 
-    # Normalize backward-mode naming: "autograd" is an alias for "unroll".
-    if getattr(args, "deq_backward", None) == "autograd":
-        args.deq_backward = "unroll"
-
     if int(args.deq_k_min) <= 0:
         raise ValueError("deq_k_min must be positive")
     if int(args.deq_k_max) < int(args.deq_k_min):
@@ -3767,23 +3560,11 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    # Base grad_accum: 8 global microsteps / world_size (so per-rank microstep
-    # count is modest).  When deq_backward="unroll" we store K-step activations
-    # per microstep, so bump grad_accum 4× to keep per-microstep batch small
-    # enough to fit in 48 GB L40S per rank.  revdeq's O(1) backward memory
-    # means the base grad_accum is fine.
-    # T-opt 17: halve grad_accum (B=32→B=64 per rank) to exploit VRAM headroom.
-    # RevDEQ O(1) backward memory peaks at 38 GB (80% of 48 GB L40S) with B=64.
-    # 16% throughput gain from fewer micro-steps + better GPU utilization.
-    _base_grad_accum = max(1, math.ceil(4 / world_size))
-    # k_rope permute fix (64ac616) changed attention layout → Hutchinson VJP
-    # FlashAttention backward needs more VRAM. Double grad_accum to halve B.
-    _base_grad_accum *= 2
-    # Unroll O(K) stores full autograd graph (43+ GB) → needs 8× to shrink B.
-    if getattr(args, "deq_backward", "revdeq") == "unroll":
-        grad_accum_steps = _base_grad_accum * 8
-    else:
-        grad_accum_steps = _base_grad_accum
+    # Base grad_accum: 4 global microsteps / world_size (so per-rank microstep
+    # count is modest). RevDEQ's O(1) backward memory makes the base sufficient.
+    # k_rope permute fix (64ac616) doubled the Hutchinson VJP VRAM, so we
+    # double grad_accum to halve per-microstep B.
+    grad_accum_steps = max(1, math.ceil(4 / world_size)) * 2
     global_seqs = args.train_batch_tokens // args.train_seq_len
     while grad_accum_steps > 1 and global_seqs < world_size * grad_accum_steps:
         grad_accum_steps -= 1
@@ -3894,9 +3675,14 @@ def main() -> None:
                                     values=list(_k_jitter_set) if _k_jitter_set else None)
 
     def deq_k_for_step(step_i: int) -> int:
+        # Short-circuit when jitter is disabled — broadcasting a constant
+        # value every step is wasteful and pulls a `.item()` sync into the
+        # train hot path. The default (jitter=False) hits this fast path.
+        if not args.deq_k_jitter:
+            return int(args.deq_k_max)
         k = 0
         if rank == 0:
-            k = int(k_sampler.sample()) if args.deq_k_jitter else int(args.deq_k_max)
+            k = int(k_sampler.sample())
         if distributed:
             k_t = torch.tensor([k], device=device, dtype=torch.int64)
             dist.broadcast(k_t, src=0)
@@ -3980,23 +3766,21 @@ def main() -> None:
         mlp_balance_mult=args.mlp_balance_mult, mos_balance_mult=args.mos_balance_mult,
         bal_loss_coef=args.bal_loss_coef,
         router_health_coef=args.router_health_coef, mos_ortho_out_coef=args.mos_ortho_out_coef,
-        deq_backward=args.deq_backward, deq_bptt_k=args.deq_bptt_k,
+        deq_bptt_k=args.deq_bptt_k,
         block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
-        router_kind=getattr(args, "router_kind", "softmax"),
-        router_entropy_coef=float(getattr(args, "router_entropy_coef", 0.0)),
-        router_entropy_warmup_delay_frac=float(getattr(args, "router_entropy_warmup_delay_frac", 0.0)),
-        router_alpha_warmup_delay_frac=float(getattr(args, "router_alpha_warmup_delay_frac", 0.3)),
-        attn_alpha_target=float(getattr(args, "attn_alpha_target", 1.0)),
-        attn_alpha_warmup_delay_frac=float(getattr(args, "attn_alpha_warmup_delay_frac", 0.3)),
-        attn_alpha_niter=int(getattr(args, "attn_alpha_niter", 10)),
+        router_entropy_coef=float(args.router_entropy_coef),
+        router_entropy_warmup_delay_frac=float(args.router_entropy_warmup_delay_frac),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
         use_parcae=args.use_parcae,
         parcae_init_a_bar=args.parcae_init_a_bar,
+        parcae_init_b_bar=args.parcae_init_b_bar,
+        min_share_loss_weight=args.min_share_loss_weight,
+        cv_loss_weight=args.cv_loss_weight,
         use_ctp=args.use_ctp,
     ).to(device).bfloat16()
 
@@ -4005,22 +3789,13 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
-    # Auto-select backward mode based on GPU memory:
-    #   H100 (80 GB): revdeq + torch.compile → 45% block speedup (fused kernels)
-    #   L40S (44 GB): unroll + eager (compile needs ~40 GB workspace, doesn't fit)
+    # GPU-class compile policy: full shared_block compile on ≥60 GB GPUs
+    # (H100), sub-module compile elsewhere. The legacy "unroll"/"autograd"
+    # backward modes were removed (user directive) — only revdeq is supported,
+    # and revdeq is always compile-compatible because its VJP backward is a
+    # single block.forward call.
     _gpu_mem_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
-    if args.deq_backward == "auto":
-        if _gpu_mem_gb >= 60:
-            args.deq_backward = "revdeq"
-            log0(f"auto-selected deq_backward=revdeq ({_gpu_mem_gb:.0f} GB GPU → compile enabled)")
-        else:
-            args.deq_backward = "unroll"
-            log0(f"auto-selected deq_backward=unroll ({_gpu_mem_gb:.0f} GB GPU)")
-
-    if distributed and args.deq_backward == "unroll":
-        log0("skipping torch.compile: unroll is incompatible with compile+DDP")
-    elif _gpu_mem_gb >= 60:
-        # H100 (80 GB): compile full shared_block (maximum fusion)
+    if _gpu_mem_gb >= 60:
         try:
             base_model.shared_block = torch.compile(base_model.shared_block, dynamic=False)
             log0(f"compiled shared_block (dynamic=False, {_gpu_mem_gb:.0f} GB GPU)")
@@ -4073,7 +3848,7 @@ def main() -> None:
 
     model: nn.Module = (
         DDP(base_model, device_ids=[local_rank], broadcast_buffers=False,
-            find_unused_parameters=(args.deq_backward == "unroll" and args.deq_bptt_k > 0),
+            find_unused_parameters=False,
             bucket_cap_mb=50)  # T-opt 22: larger buckets → fewer all_reduce calls (~10M params fit in 1 bucket)
         if distributed else base_model
     )
@@ -4130,9 +3905,15 @@ def main() -> None:
         resid_t = getattr(m, "_deq_residual_t", None)
         if isinstance(resid_t, torch.Tensor):
             parts.append(f"deq_residual:{float(resid_t.detach().float().item()):.6f}")
-        recon = getattr(m, "_deq_recon_error", None)
-        if recon is not None:
-            parts.append(f"deq_recon_err:{float(recon):.3e}")
+        # Under TBPTT (default since iter 28), this is a "distance travelled"
+        # gauge — the FP excursion during un-reconstructed iters, NOT a true
+        # reconstruction error. Only emit `deq_recon_err:` when full BPTT is
+        # active (deq_bptt_k == 0); otherwise emit `deq_dist_travelled:` with
+        # no threshold. CLAUDE.md §6.1 documents the math.
+        dist = getattr(m, "_deq_distance_travelled", None)
+        if dist is not None:
+            label = "deq_recon_err" if int(getattr(m, "deq_bptt_k", 0)) == 0 else "deq_dist_travelled"
+            parts.append(f"{label}:{float(dist):.3e}")
         conv_t = getattr(m, "_deq_iter_convergence_t", None)
         if isinstance(conv_t, torch.Tensor):
             parts.append(f"deq_iter_conv:{float(conv_t.detach().float().item()):.6f}")
@@ -4216,9 +3997,9 @@ def main() -> None:
                 if len(usage) == 2 * R:
                     attn_half = usage[:R]
                     mlp_half = usage[R:]
-                    attn_sum = sum(attn_half) or 1e-8
-                    mlp_sum = sum(mlp_half) or 1e-8
-                    pool_sum = (attn_sum + mlp_sum) or 1e-8
+                    attn_sum = _safe_sum(attn_half)
+                    mlp_sum = _safe_sum(mlp_half)
+                    pool_sum = max(attn_sum + mlp_sum, 1e-8)
                     attn_norm = [u / attn_sum for u in attn_half]
                     mlp_norm = [u / mlp_sum for u in mlp_half]
                     pool_norm = [u / pool_sum for u in usage]
@@ -4232,9 +4013,8 @@ def main() -> None:
                     # renormalized halves above so they are independent of the
                     # cross-slice tilt.
                     def _cv(p: list[float]) -> float:
-                        n = len(p)
-                        mu = sum(p) / max(n, 1) or 1e-8
-                        var = sum((x - mu) ** 2 for x in p) / max(n, 1)
+                        mu = _safe_mean(p)
+                        var = sum((x - mu) ** 2 for x in p) / max(len(p), 1)
                         return (var ** 0.5) / mu
                     def _entropy(p: list[float]) -> float:
                         return -sum(x * math.log(x + 1e-8) for x in p if x > 0.0)
@@ -4294,19 +4074,8 @@ def main() -> None:
 
     # MAIN TRAINING LOOP
     training_time_ms = 0.0
-    # iter 104 throughput diagnostic: rolling window of step durations so we
-    # can compute a recent step_avg (vs the lifetime mean). Lets us see if
-    # α-anneal kicking in at step 300 changes throughput vs the pre-warmup
-    # softmax baseline.
-    from collections import deque
+    # Rolling window of step durations for a recent step_avg (vs lifetime mean).
     _step_dt_window: deque[float] = deque(maxlen=50)
-    # Phase-broken-down step_avg accumulators (alpha=1.0 vs alpha>1.0 at
-    # step start). Helps disambiguate "are we faster or slower with the
-    # AdaSplash kernel active vs the softmax fallback path".
-    _phase_dense_total_ms = 0.0
-    _phase_dense_count = 0
-    _phase_sparse_total_ms = 0.0
-    _phase_sparse_count = 0
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
@@ -4322,21 +4091,16 @@ def main() -> None:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
+            # Timing-accounting boundary: stop the train clock BEFORE val so
+            # validation time does NOT contribute to training_time_ms / step_avg.
+            # `t0` is reset post-val below (after `_best_effort_update_plots`),
+            # so the next training step's clock starts AFTER val is done.
+            # Post-training artifact write + K-sweep happen after the main loop
+            # break, so they cannot pollute step_avg either.
             torch.cuda.synchronize()
             _step_dt_ms = 1000.0 * (time.perf_counter() - t0)
             training_time_ms += _step_dt_ms
             _step_dt_window.append(_step_dt_ms)
-            # iter 104: bucket the step duration by α-anneal phase. The
-            # _attn_alpha was set at the top of this step (training-loop hook
-            # before forward), so reading it now reflects the value used
-            # during this step's compute.
-            _alpha_now = float(getattr(_unwrap_compiled_module(base_model.shared_block).attn, "_attn_alpha", 1.0))
-            if _alpha_now > 1.0:
-                _phase_sparse_total_ms += _step_dt_ms
-                _phase_sparse_count += 1
-            else:
-                _phase_dense_total_ms += _step_dt_ms
-                _phase_dense_count += 1
             val_loss, val_bpb = run_validation(
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
@@ -4344,22 +4108,12 @@ def main() -> None:
             )
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step) if master_process else ""
-            # iter 104 throughput diagnostic. Emit current α + windowed
-            # step_avg + phase-broken-down means so we can attribute speed
-            # changes to AdaSplash kernel activation vs pre-warmup softmax
-            # fallback. Pre-warmup phase (α=1.0, dense SDPA) and post-warmup
-            # phase (α>1.0, AdaSplash) accumulate separately.
-            _alpha_at_val = float(getattr(_unwrap_compiled_module(base_model.shared_block).attn, "_attn_alpha", 1.0))
             _window_avg = (sum(_step_dt_window) / len(_step_dt_window)) if _step_dt_window else 0.0
-            _dense_avg = (_phase_dense_total_ms / _phase_dense_count) if _phase_dense_count > 0 else 0.0
-            _sparse_avg = (_phase_sparse_total_ms / _phase_sparse_count) if _phase_sparse_count > 0 else 0.0
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"val_mode:fast "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
-                f"attn_alpha:{_alpha_at_val:.4f} step_avg_w50:{_window_avg:.2f}ms "
-                f"step_avg_dense:{_dense_avg:.2f}ms_n{_phase_dense_count} "
-                f"step_avg_sparse:{_sparse_avg:.2f}ms_n{_phase_sparse_count}"
+                f"step_avg_w50:{_window_avg:.2f}ms"
                 f"{deq_info}{expert_info}"
             )
             _best_effort_update_plots("val")
@@ -4393,33 +4147,11 @@ def main() -> None:
             else:
                 ent_scale = min(max((time_frac - ent_delay) / max(1.0 - ent_delay, 1e-8), 0.0), 1.0)
             sb.router.entropy_coef = ent_target * ent_scale
-        # iter 104 v3: anneal AdaSplash α-entmax alpha 1.0 → target. Same
-        # warmup-delay-then-linear-ramp shape as router entropy coef. α=1.0
-        # = softmax (no sparsity); α=target (e.g. 1.5) at end of training.
-        alpha_target = float(getattr(base_model, "_attn_alpha_target", 1.0))
-        alpha_delay = float(getattr(base_model, "_attn_alpha_warmup_delay_frac", 0.3))
-        if alpha_target > 1.0:
-            if time_frac < alpha_delay:
-                alpha_scale = 0.0
-            else:
-                alpha_scale = min(max((time_frac - alpha_delay) / max(1.0 - alpha_delay, 1e-8), 0.0), 1.0)
-            sb.attn._attn_alpha = 1.0 + (alpha_target - 1.0) * alpha_scale
-        # iter 102: anneal router α-blend (softmax → entmax15). 0 = pure
-        # softmax, 1 = pure entmax15. Same warmup-delay schedule. Only
-        # applied when router_kind="entmax_anneal" (other kinds ignore the
-        # attribute). Avoids H75 cold-start trap that hurt iter 101.
-        if str(getattr(sb.router, "router_kind", "softmax")) == "entmax_anneal":
-            r_alpha_delay = float(getattr(base_model, "_router_alpha_warmup_delay_frac", 0.3))
-            if time_frac < r_alpha_delay:
-                r_alpha_scale = 0.0
-            else:
-                r_alpha_scale = min(max((time_frac - r_alpha_delay) / max(1.0 - r_alpha_delay, 1e-8), 0.0), 1.0)
-            sb.router._router_alpha_scale = float(r_alpha_scale)
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
-        if hasattr(sb, "_deq_recon_error_last_bwd"):
-            sb._deq_recon_error_last_bwd = None
+        if hasattr(sb, "_deq_distance_travelled_last_bwd"):
+            sb._deq_distance_travelled_last_bwd = None
 
         train_loss = torch.zeros((), device=device)
         next_step = step + 1
@@ -4458,72 +4190,51 @@ def main() -> None:
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
 
-                # Phase 9 iter 50: Hutchinson-Frobenius Jacobian regularization.
-                # Replaces power-iteration Lyapunov (iter 45) with a simpler
-                # Hutchinson trace estimator: ||J^T v||² ≈ ||J||²_F for random v.
-                # ONE forward + ONE VJP (vs TWO forwards for old Lyapunov).
-                # All eigenvalues regularized, not just the largest.
-                # Ref: Bai et al., "Stabilizing Equilibrium Models" (arXiv:2106.14342)
+                # Lyapunov + denoising auxiliaries: hard-gated on coefs > 0
+                # (both default 0.0 since iter 88/89 — Parcae per-dim Ā already
+                # bounds spectral radius below 1, so these probes have nothing
+                # to grip on at training time). Code retained behind a single
+                # flag so the eval-time Hutchinson harness in the K-sweep can
+                # still recompute ρ̂ on demand. The aggressive zero-skip means
+                # disabled-by-default = zero forward/backward cost.
                 lyap_coef = float(base_model.lyapunov_coef)
-                lyap_warmup_frac = float(base_model.lyapunov_warmup_frac)
-                lyap_scale = min(time_frac / max(lyap_warmup_frac, 1e-8), 1.0) if lyap_warmup_frac > 0 else 1.0
-                z_star = getattr(base_model, '_lyapunov_z_star', None)
-                x0_lyap = getattr(base_model, '_lyapunov_x0', None)
-                lyap_skip = micro_step < grad_accum_steps - 1  # only last micro-step
-                # Compute B̄ once for this step; reuse (detached) for the
-                # Hutchinson probe and (live) for the surrogate + denoising.
-                aux_b_bar = base_model._parcae_b_bar() if base_model.use_parcae else None
-                aux_b_bar_detached = aux_b_bar.detach() if aux_b_bar is not None else None
-                if lyap_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
-                    blk = sb
-                    # Hutchinson-Frobenius: random Rademacher probe (±1)
-                    v_hutch = torch.randint(0, 2, z_star.shape, device=z_star.device, dtype=z_star.dtype) * 2.0 - 1.0
-                    z_b = z_star.detach().requires_grad_(True)
-                    # Hutchinson JVP is a ρ̂ diagnostic, not a learning signal —
-                    # use the detached B̄ so it cannot leak grads into parcae_raw_b.
-                    u_b = blk(z_b, x0_lyap, aux_b_bar_detached)
-                    jvp = torch.autograd.grad(
-                        (u_b * v_hutch).sum(), z_b,
-                        create_graph=False, retain_graph=False,
-                    )[0]
-                    # ||J^T v||² / dim ≈ ||J||²_F / dim (Hutchinson estimator)
-                    # Pure-tensor math; keep GPU scalars on device in this block.
-                    rho_sample_t = jvp.detach().float().pow(2).mean().sqrt()
-                    # EMA smoothing (GPU-resident) to reduce variance of random
-                    # probe estimates. Without this, noisy high estimates trigger
-                    # large surrogate losses that destabilize training.
-                    rho_buf = base_model._lyapunov_rho_hat_buf
-                    if rho_buf is None:
-                        base_model._lyapunov_rho_hat_buf = rho_sample_t.detach().clone()
-                        rho_buf = base_model._lyapunov_rho_hat_buf
-                    else:
-                        rho_buf.mul_(0.9).add_(rho_sample_t.detach(), alpha=0.1)
-                    # Surrogate is tensor-gated, avoiding GPU→CPU sync in the
-                    # gradient hot path.
-                    gamma = float(base_model.lyapunov_gamma)
-                    scale_t = (torch.relu(rho_buf - gamma) / rho_buf.clamp(min=1e-8)).detach()
-                    v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
-                    z_b2 = z_star.detach()
-                    # Live B̄: the surrogate trains parcae_raw_b/raw_delta to
-                    # reduce the spectral-radius term.
-                    u_b2 = blk(z_b2, x0_lyap, aux_b_bar)
-                    surrogate = (u_b2 * v_dir).sum().abs()
-                    loss = loss + lyap_scale * lyap_coef * scale_t.to(dtype=surrogate.dtype) * surrogate
-
-                # Phase 9 iter 55: Denoising regularization (HyDRA 2026).
-                # ||f(z*+ε, x0) - z*||² at finite perturbation complements
-                # Hutchinson's infinitesimal Jacobian penalty. If contraction
-                # holds, one step from z*+ε should land closer to z*.
                 dn_coef = float(args.denoising_coef)
-                if dn_coef > 0.0 and lyap_scale > 0.0 and z_star is not None and x0_lyap is not None and not lyap_skip:
-                    blk_dn = sb
-                    dn_std = float(args.denoising_noise_std)
-                    eps_noise = torch.randn_like(z_star) * dn_std
-                    z_noisy = z_star.detach() + eps_noise
-                    # Live B̄: denoising loss trains all Parcae params.
-                    f_noisy = blk_dn(z_noisy, x0_lyap, aux_b_bar)
-                    dn_loss = (f_noisy - z_star.detach()).float().pow(2).mean()
-                    loss = loss + lyap_scale * dn_coef * dn_loss
+                if (lyap_coef > 0.0 or dn_coef > 0.0) and micro_step == grad_accum_steps - 1:
+                    lyap_warmup_frac = float(base_model.lyapunov_warmup_frac)
+                    lyap_scale = min(time_frac / max(lyap_warmup_frac, 1e-8), 1.0) if lyap_warmup_frac > 0 else 1.0
+                    z_star = getattr(base_model, '_lyapunov_z_star', None)
+                    x0_lyap = getattr(base_model, '_lyapunov_x0', None)
+                    if z_star is not None and x0_lyap is not None and lyap_scale > 0.0:
+                        aux_b_bar = base_model._parcae_b_bar() if base_model.use_parcae else None
+                        aux_b_bar_detached = aux_b_bar.detach() if aux_b_bar is not None else None
+                        if lyap_coef > 0.0:
+                            v_hutch = torch.randint(0, 2, z_star.shape, device=z_star.device, dtype=z_star.dtype) * 2.0 - 1.0
+                            z_b = z_star.detach().requires_grad_(True)
+                            u_b = sb(z_b, x0_lyap, aux_b_bar_detached)
+                            jvp = torch.autograd.grad(
+                                (u_b * v_hutch).sum(), z_b,
+                                create_graph=False, retain_graph=False,
+                            )[0]
+                            rho_sample_t = jvp.detach().float().pow(2).mean().sqrt()
+                            rho_buf = base_model._lyapunov_rho_hat_buf
+                            if rho_buf is None:
+                                base_model._lyapunov_rho_hat_buf = rho_sample_t.detach().clone()
+                                rho_buf = base_model._lyapunov_rho_hat_buf
+                            else:
+                                rho_buf.mul_(0.9).add_(rho_sample_t.detach(), alpha=0.1)
+                            gamma = float(base_model.lyapunov_gamma)
+                            scale_t = (torch.relu(rho_buf - gamma) / rho_buf.clamp(min=1e-8)).detach()
+                            v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
+                            u_b2 = sb(z_star.detach(), x0_lyap, aux_b_bar)
+                            surrogate = (u_b2 * v_dir).sum().abs()
+                            loss = loss + lyap_scale * lyap_coef * scale_t.to(dtype=surrogate.dtype) * surrogate
+                        if dn_coef > 0.0:
+                            dn_std = float(args.denoising_noise_std)
+                            eps_noise = torch.randn_like(z_star) * dn_std
+                            z_noisy = z_star.detach() + eps_noise
+                            f_noisy = sb(z_noisy, x0_lyap, aux_b_bar)
+                            dn_loss = (f_noisy - z_star.detach()).float().pow(2).mean()
+                            loss = loss + lyap_scale * dn_coef * dn_loss
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -4569,7 +4280,7 @@ def main() -> None:
             ctp_t = getattr(base_model, '_ctp_loss_t', None)
             ntp = float(ntp_t.detach().float().item()) if isinstance(ntp_t, torch.Tensor) else 0.0
             ctp = float(ctp_t.detach().float().item()) if isinstance(ctp_t, torch.Tensor) else 0.0
-            base_model._deq_recon_error = getattr(base_model.shared_block, "_deq_recon_error_last_bwd", None)
+            base_model._deq_distance_travelled = getattr(base_model.shared_block, "_deq_distance_travelled_last_bwd", None)
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step, require_step_match=True) if master_process else ""
             log0(
@@ -4704,12 +4415,6 @@ def main() -> None:
             }, f)
 
         log0("roundtrip_verification:start")
-        # T-opt 17: run roundtrip + K-sweep in EAGER mode. torch.compile
-        # after load_state_dict crashes silently (inductor segfault — tested
-        # stale-guard reuse, compile-fresh, and dynamo.config.disable).
-        # Eager with B=64 val batches is reliable and fast enough.
-        torch._dynamo.reset()
-        torch._dynamo.config.disable = True
         deq_sd = load_int6_artifact(compressed, sd)
         base_model.load_state_dict(deq_sd, strict=True)
 
@@ -4737,6 +4442,16 @@ def main() -> None:
             except Exception:
                 pass
         sys.exit(0)
+
+    # Disable dynamo on ALL ranks before the post-train roundtrip + K-sweep.
+    # Hoisted out of the master_process block (was at L4382) because asymmetric
+    # disable causes non-master ranks to recompile during the K-sweep, risking
+    # NCCL desync if recompile latency varies across ranks (coderabbit Major #2).
+    # T-opt 17 rationale: torch.compile after load_state_dict crashes silently
+    # during inductor compilation; eager is reliable and fast enough for the
+    # one-time roundtrip diagnostic with B=64 val batches.
+    torch._dynamo.reset()
+    torch._dynamo.config.disable = True
 
     # Broadcast the dequantized weights from master to all ranks so every
     # rank runs eval on the same int6-roundtripped model.  Parameters and
@@ -4820,17 +4535,42 @@ def main() -> None:
             def _grad_safe_sdpa():
                 return nullcontext()
 
+        # OOM-safe + general-fallback probe wrapper. Both probes share the
+        # same `try / except OutOfMemoryError / except Exception` outer
+        # structure; the wrapper centralizes the ksweep_skip_reason logging
+        # and post-OOM cache cleanup so the inner closures only describe
+        # the probe math.
+        def _try_probe(name: str, fn):
+            try:
+                torch.cuda.empty_cache()
+                return fn()
+            except torch.cuda.OutOfMemoryError as e:
+                print(f"ksweep_skip_reason:{name} oom_runtime {e}", flush=True)
+                torch.cuda.empty_cache()
+                return None
+            except Exception as e:
+                print(f"[{name} probe failed] {type(e).__name__}: {e}", flush=True)
+                return None
+
         # Hutchinson-Frobenius probe — reduced sample count (was 8 → 2) since
         # the JVP through SharedBlock at B×T×D scales costs ~3 GiB per sample
         # and the K-sweep already pushes peak VRAM near 42 GiB on a 44 GiB
-        # cap. Variance is acceptable for a diagnostic. Cache cleared first.
-        rho_F: float | None = None
-        try:
-            rho_F_samples: list[float] = []
-            torch.cuda.empty_cache()
-            n_hutch_eff = min(n_hutch, 2)
+        # cap. Variance is acceptable for a diagnostic. Predictive OOM skip:
+        # the forward retains activations for grad, budget ≈ 4× z_star bytes
+        # (z_b + u_b + jvp + grad-path scratch).
+        def _hutch_F_probe() -> float | None:
+            free_b, _ = torch.cuda.mem_get_info(z_star.device)
+            need_b = int(z_star.numel() * z_star.element_size() * 4)
+            if free_b < int(need_b * 1.25):
+                print(
+                    f"ksweep_skip_reason:hutch_F oom_pred "
+                    f"need={need_b/1e9:.2f}GiB free={free_b/1e9:.2f}GiB",
+                    flush=True,
+                )
+                return None
+            samples: list[float] = []
             with _grad_safe_sdpa():
-                for _ in range(n_hutch_eff):
+                for _ in range(min(n_hutch, 2)):
                     v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
                                        dtype=z_star.dtype) * 2.0 - 1.0)
                     z_b = z_star.detach().clone().requires_grad_(True)
@@ -4840,38 +4580,29 @@ def main() -> None:
                             (u_b * v).sum(), z_b,
                             create_graph=False, retain_graph=False,
                         )[0]
-                    rho_F_samples.append(
-                        float(jvp.detach().float().pow(2).mean().sqrt().item()))
+                    samples.append(float(jvp.detach().float().pow(2).mean().sqrt().item()))
                     del v, z_b, u_b, jvp
                     torch.cuda.empty_cache()
-            if rho_F_samples:
-                rho_F = sum(rho_F_samples) / len(rho_F_samples)
-        except Exception as e:
-            print(f"[hutch_F probe failed] {type(e).__name__}: {e}", flush=True)
-            rho_F = None  # Hutchinson unavailable; finite-diff still runs.
+            return sum(samples) / len(samples) if samples else None
 
-        # Finite-direction random-step Lipschitz sample.
-        rho_op: float | None = None
-        try:
-            rho_op_samples: list[float] = []
-            torch.cuda.empty_cache()
+        # Finite-direction random-step Lipschitz sample. Avoid `.item()`
+        # GPU→CPU sync inside the loop by clamping in-place.
+        def _rd_step_probe() -> float | None:
+            samples: list[float] = []
             with _grad_safe_sdpa(), torch.no_grad():
                 u_base = sb(z_star, x0_lyap, b_bar_d)
                 for _ in range(n_finite_diff):
                     eps_dir = torch.randn_like(z_star)
-                    eps_norm = eps_dir.float().norm()
-                    if float(eps_norm.item()) < 1e-8:
-                        continue
+                    eps_norm = eps_dir.float().norm().clamp(min=1e-8)
                     eps_unit = eps_dir / eps_norm
                     u_pert = sb(z_star + eps_step * eps_unit, x0_lyap, b_bar_d)
-                    rho_op_samples.append(
+                    samples.append(
                         float((u_pert - u_base).float().norm().item()) / eps_step)
                     del eps_dir, eps_unit, u_pert
-            if rho_op_samples:
-                rho_op = max(rho_op_samples)
-        except Exception as e:
-            print(f"[rd_step probe failed] {type(e).__name__}: {e}", flush=True)
-            rho_op = None
+            return max(samples) if samples else None
+
+        rho_F = _try_probe("hutch_F", _hutch_F_probe)
+        rho_op = _try_probe("rd_step", _rd_step_probe)
         return rho_F, rho_op
 
     # DEQ fixed-point K-sweep: verify val_bpb improves (or plateaus) as K grows.
@@ -4924,15 +4655,13 @@ def main() -> None:
         if usage and len(usage) >= 2 * R and R > 0:
             attn_half, mlp_half = usage[:R], usage[R:]
             for label, half in [("attn", attn_half), ("mlp", mlp_half)]:
-                s = sum(half) or 1e-8
-                norm = [u / s for u in half]
-                mu = sum(norm) / len(norm) or 1e-8
+                norm = [u / _safe_sum(half) for u in half]
+                mu = _safe_mean(norm)
                 var = sum((x - mu) ** 2 for x in norm) / len(norm)
                 out[f"{label}_cv"] = (var ** 0.5) / mu
                 out[f"{label}_min"] = min(norm)
-            pool_sum = sum(usage) or 1e-8
-            pool_norm = [u / pool_sum for u in usage]
-            pmu = sum(pool_norm) / len(pool_norm) or 1e-8
+            pool_norm = [u / _safe_sum(usage) for u in usage]
+            pmu = _safe_mean(pool_norm)
             pvar = sum((x - pmu) ** 2 for x in pool_norm) / len(pool_norm)
             out["pool_cv"] = (pvar ** 0.5) / pmu
             out["pool_ent"] = -sum(x * math.log(x + 1e-8) for x in pool_norm if x > 0.0)
@@ -5133,7 +4862,7 @@ def main() -> None:
         if lst is None:
             return None
         h = lst[:E] if half == 0 else lst[E:]
-        s = sum(h) or 1e-8
+        s = _safe_sum(h)
         return [u / s for u in h]
 
     # 1. Expert health per routed component (DDP-global).
@@ -5311,18 +5040,20 @@ def main() -> None:
 
     # 6. RevDEQ reconstruction error: the backward reconstructs forward states
     # from the solver's final state; ||reconstructed_z - z|| must stay small
-    # for the reversibility invariant to hold AND for high-quality gradients.
-    # Bf16 + FP64 accumulators: healthy runs see 1e-3 to 1e-2 typically.
-    # Tightened from 1.0 → 0.1 (matches smoke test threshold; lower recon err
-    # = higher-quality gradients = more efficient training).  >0.1 means the
-    # reversibility approximation is degrading and gradients become noisy.
-    recon_err_local = getattr(base_m_for_roundtrip.shared_block, "_deq_recon_error_last_bwd", None)
-    recon_err = _ddp_mean_scalar(
-        float(recon_err_local) if recon_err_local is not None else None
+    # The 0.1 reversibility threshold is only meaningful under FULL BPTT
+    # (deq_bptt_k == 0). Under TBPTT (the default since iter 28), the metric
+    # is a "distance travelled" gauge, NOT a true reconstruction error — see
+    # CLAUDE.md §6.1. Skip the threshold check entirely under TBPTT to avoid
+    # gating on a metric whose interpretation does not match the threshold.
+    bptt_k_now = int(getattr(base_m_for_roundtrip, "deq_bptt_k", 0) or 0)
+    is_full_bptt = bptt_k_now == 0
+    dist_local = getattr(base_m_for_roundtrip.shared_block, "_deq_distance_travelled_last_bwd", None)
+    dist_val = _ddp_mean_scalar(
+        float(dist_local) if dist_local is not None else None
     )
-    if recon_err is not None and recon_err > 0.1:
+    if is_full_bptt and dist_val is not None and dist_val > 0.1:
         _failures.append(
-            f"deq_recon_err={recon_err:.3e} > 0.1 (RevDEQ reversibility degrading — "
+            f"deq_recon_err={dist_val:.3e} > 0.1 (RevDEQ reversibility degrading — "
             f"gradients getting noisy, training efficiency drops)"
         )
 
