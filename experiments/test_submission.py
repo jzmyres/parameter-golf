@@ -26,7 +26,8 @@ def _build_model():
     Threads every architecture field through the GPT constructor so the
     instantiated model matches what `train_gpt.main()` builds — otherwise
     the artifact-size test verifies a different (likely smaller) model
-    than the one actually scored.
+    than the one actually scored. Iter 96 baseline: full-D LoRA experts
+    (no bottleneck rewrite), revdeq backward only.
     """
     from train_gpt import GPT, Hyperparameters
     args = Hyperparameters()
@@ -36,13 +37,8 @@ def _build_model():
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        num_refinements=args.num_refinements,
-        attn_bottleneck_r=args.attn_bottleneck_r,
-        mlp_bottleneck_r=args.mlp_bottleneck_r,
-        expert_proj_rank=args.expert_proj_rank,
-        attn_inner_heads=args.attn_inner_heads,
-        attn_inner_kv_heads=args.attn_inner_kv_heads,
-        mlp_inner_mult=args.mlp_inner_mult,
+        kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
+        attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
         deq_beta=args.deq_beta,
         attn_balance_mult=args.attn_balance_mult,
         mlp_balance_mult=args.mlp_balance_mult,
@@ -50,12 +46,13 @@ def _build_model():
         bal_loss_coef=args.bal_loss_coef,
         router_health_coef=args.router_health_coef,
         mos_ortho_out_coef=args.mos_ortho_out_coef,
-        deq_backward=args.deq_backward,
         deq_bptt_k=args.deq_bptt_k,
         block_ortho_aux_coef=args.block_ortho_aux_coef,
         block_ortho_aux_every=args.block_ortho_aux_every,
         block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         router_scoring=args.router_scoring,
+        router_entropy_coef=args.router_entropy_coef,
+        router_entropy_warmup_delay_frac=args.router_entropy_warmup_delay_frac,
         num_experts=args.num_experts,
         num_shared_experts=args.num_shared_experts,
         lyapunov_coef=args.lyapunov_coef,
@@ -63,6 +60,9 @@ def _build_model():
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
         use_parcae=args.use_parcae,
         parcae_init_a_bar=args.parcae_init_a_bar,
+        parcae_init_b_bar=args.parcae_init_b_bar,
+        min_share_loss_weight=args.min_share_loss_weight,
+        cv_loss_weight=args.cv_loss_weight,
         use_ctp=args.use_ctp,
     ).cuda()
     return model, args

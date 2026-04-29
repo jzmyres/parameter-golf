@@ -1,129 +1,25 @@
-"""Compare forward+backward wall-clock for deq_backward="revdeq" vs "unroll".
+"""DEPRECATED — speed comparison between deq_backward modes.
 
-Measures actual per-step compute delta on the current hardware.
-If unroll is significantly faster AND VRAM fits, switch the default for training.
+Removed 2026-04-28 (Phase 9 cleanup, Item 4 + Item 2): the ``deq_backward``
+knob was eliminated entirely; only ``revdeq`` is supported. The
+``unroll`` / ``autograd`` backward modes (which this script compared
+against ``revdeq``) no longer exist. There is nothing to compare.
+
+For per-step throughput profiling, use ``experiments/profile_train.py``
+which wraps the main training loop in ``torch.profiler`` and emits a
+chrome trace.
 """
-import sys, time
-from pathlib import Path
-sys.path.insert(0, ".")
-import numpy as np
-import torch
-
-from train_gpt import GPT, Hyperparameters, router_diagnostics
+import sys
 
 
-def _load_data(vocab_size=1024, total=65536):
-    # Read data path from Hyperparameters so this benchmark works across environments.
-    from train_gpt import Hyperparameters
-    data_path = getattr(Hyperparameters(), "data_path", "./data/datasets/fineweb10B_sp1024/")
-    shard = Path(data_path) / "fineweb_train_000000.bin"
-    raw = np.fromfile(str(shard), dtype=np.int16, count=total)
-    return torch.from_numpy(raw.astype(np.int64)).clamp(0, vocab_size - 1).cuda()
-
-
-def _sample(buf, batch, seq):
-    starts = torch.randint(0, len(buf) - seq - 1, (batch,))
-    x = torch.stack([buf[s:s + seq] for s in starts])
-    y = torch.stack([buf[s + 1:s + seq + 1] for s in starts])
-    return x, y
-
-
-def _build_model(args, backward_mode: str) -> GPT:
-    """Construct GPT in the iter-90+ bottleneck-experts layout.
-
-    The iter 90 refactor removed `kv_latent_dim`, `attn_expert_rank`, and
-    `mlp_expert_rank` from the GPT signature; the inner attention now lives
-    in `BottleneckIn` + `ExpertMLABody` + `BottleneckOut`, parameterized by
-    `attn_bottleneck_r`, `mlp_bottleneck_r`, `expert_proj_rank`,
-    `attn_inner_heads`, `attn_inner_kv_heads`, and `mlp_inner_mult`.
-    """
-    return GPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        num_refinements=args.num_refinements,
-        attn_bottleneck_r=args.attn_bottleneck_r,
-        mlp_bottleneck_r=args.mlp_bottleneck_r,
-        expert_proj_rank=args.expert_proj_rank,
-        attn_inner_heads=args.attn_inner_heads,
-        attn_inner_kv_heads=args.attn_inner_kv_heads,
-        mlp_inner_mult=args.mlp_inner_mult,
-        num_experts=args.num_experts,
-        num_shared_experts=args.num_shared_experts,
-        router_scoring=args.router_scoring,
-        deq_beta=args.deq_beta, deq_backward=backward_mode,
-        use_ctp=args.use_ctp,
-    ).cuda()
-
-
-def benchmark_mode(backward_mode: str, n_warmup: int = 3, n_iter: int = 10,
-                   batch: int = 8, seq: int = 1024) -> dict:
-    torch.manual_seed(0)
-    args = Hyperparameters()
-    model = _build_model(args, backward_mode)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    buf = _load_data(args.vocab_size)
-
-    # Warmup (also triggers any JIT compile)
-    model.train()
-    for _ in range(n_warmup):
-        x, y = _sample(buf, batch, seq)
-        with router_diagnostics(enabled=True, step_tag=0):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = model(x, y)
-        loss.backward()
-        opt.step()
-        opt.zero_grad()
-    torch.cuda.synchronize()
-
-    torch.cuda.reset_peak_memory_stats()
-    t0 = time.perf_counter()
-    losses = []
-    for _ in range(n_iter):
-        x, y = _sample(buf, batch, seq)
-        with router_diagnostics(enabled=True, step_tag=0):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = model(x, y)
-        loss.backward()
-        opt.step()
-        opt.zero_grad()
-        losses.append(float(loss.item()))
-    torch.cuda.synchronize()
-    dt = time.perf_counter() - t0
-    peak_mem = torch.cuda.max_memory_allocated() / 1e9
-
-    return {
-        "mode": backward_mode,
-        "ms_per_step": 1000.0 * dt / n_iter,
-        "peak_mem_gb": peak_mem,
-        "final_loss": losses[-1],
-    }
+def main() -> int:
+    sys.stderr.write(
+        "speed_compare_backward.py is deprecated — deq_backward modes were "
+        "removed (only revdeq remains). Use experiments/profile_train.py "
+        "for throughput profiling.\n"
+    )
+    return 1
 
 
 if __name__ == "__main__":
-    print("Benchmarking revdeq (O(1) memory, 3× forward FLOPs per step)...")
-    r_rev = benchmark_mode("revdeq")
-    print(f"  revdeq: {r_rev['ms_per_step']:.1f} ms/step  peak={r_rev['peak_mem_gb']:.2f} GB  loss={r_rev['final_loss']:.4f}")
-
-    # Free memory between runs so peak measurement of unroll is clean.
-    torch.cuda.empty_cache()
-
-    print("Benchmarking unroll (O(K) memory, 2× forward FLOPs per step)...")
-    r_unr = benchmark_mode("unroll")
-    print(f"  unroll: {r_unr['ms_per_step']:.1f} ms/step  peak={r_unr['peak_mem_gb']:.2f} GB  loss={r_unr['final_loss']:.4f}")
-
-    print()
-    speedup = r_rev["ms_per_step"] / max(r_unr["ms_per_step"], 1e-6)
-    mem_ratio = r_unr["peak_mem_gb"] / max(r_rev["peak_mem_gb"], 1e-6)
-    print(f"Speedup (unroll vs revdeq):     {speedup:.2f}×")
-    print(f"Memory ratio (unroll/revdeq):   {mem_ratio:.2f}×")
-    print(f"VRAM headroom on L40S (48GB):    {48.0 - r_unr['peak_mem_gb']:.1f} GB remaining with unroll")
-    print()
-    if speedup >= 1.20:
-        print(f"✓ UNROLL gives ≥1.20× speedup — RECOMMEND switching default to 'unroll'.")
-    elif speedup >= 1.05:
-        print(f"⚠ UNROLL gives {speedup:.2f}× speedup — modest, judgment call.")
-    else:
-        print(f"✗ UNROLL gives only {speedup:.2f}× speedup — keep revdeq.")
+    raise SystemExit(main())
