@@ -3554,7 +3554,23 @@ def _prescribe_failure_fix(failure: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2) -> float | None:
+def _slice_for_fp_probe(z_star: Tensor, x0_lyap: Tensor, B_probe: int) -> tuple[Tensor, Tensor]:
+    """Slice (z_star, x0_lyap) to the first ``B_probe`` sequences along the
+    batch dim. The Hutchinson estimator and finite-direction Lipschitz probe
+    are both unbiased at any batch size — for an LM with translation-invariant
+    attention, B=1 yields a representative spectral estimate. Slicing bounds
+    the SharedBlock-forward activation graph from ~32 GiB (B=val_micro≈32)
+    down to ~1 GiB (B=1), which is what unblocks the probes on the 44 GiB
+    dev cap.
+
+    Returns the original tensors if ``B_probe <= 0`` or already smaller.
+    """
+    if B_probe <= 0 or z_star.shape[0] <= B_probe:
+        return z_star, x0_lyap
+    return z_star[:B_probe].contiguous(), x0_lyap[:B_probe].contiguous()
+
+
+def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2, B_probe: int = 1) -> float | None:
     """Hutchinson-Frobenius estimator at the model's saved DEQ fixed point.
 
     Reads ``_lyapunov_z_star`` and ``_lyapunov_x0`` saved by the most recent
@@ -3564,15 +3580,20 @@ def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2) -> float | None:
     ``rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)``, a per-element
     proxy for average squared singular value of ``J = ∂T_θ/∂z`` at ``z*``.
 
-    Returns ``None`` on any of: missing saved FP, OOM (predicted via
-    ``mem_get_info`` or runtime), or SDPA backend rejection under
-    ``enable_grad`` (the EFFICIENT/MATH SDPA backends are forced for grad
-    compatibility — flash-attention rejects grad-required bf16 inputs).
+    Returns ``None`` on missing saved FP or OOM. The predictive OOM skip
+    is calibrated against the SLICED probe size (post-``_slice_for_fp_probe``),
+    not the full saved z_star — without slicing the JVP through SharedBlock
+    needs ~32 GiB at val batch size, which is why iter 100b's K-sweep
+    reported `hutch_F: N/A` across all K (root cause: OOM, not SDPA backend
+    rejection as previously documented). With ``B_probe=1`` activation memory
+    is ~1 GiB.
 
     iter 97.5b PERMANENT (2026-04-29): hoisted from the K-sweep harness so
     val checkpoints can also report ``hutch_F``. Cost: ~2 backward passes
-    through the SharedBlock at z*; the predictive OOM skip avoids surprises
-    when grad-accum has fragmented the allocator.
+    through the SharedBlock at z* sliced to a single sequence.
+
+    iter 97.5b-fix (2026-04-29): added ``B_probe`` slicing to resolve the
+    "hutch_F shows N/A across all K" issue documented in iter 100b.
     """
     z_star = getattr(base_m, "_lyapunov_z_star", None)
     x0_lyap = getattr(base_m, "_lyapunov_x0", None)
@@ -3583,6 +3604,7 @@ def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2) -> float | None:
         target_dtype = next(sb.parameters()).dtype
     except StopIteration:
         target_dtype = z_star.dtype
+    z_star, x0_lyap = _slice_for_fp_probe(z_star, x0_lyap, B_probe)
     z_star = z_star.to(target_dtype)
     x0_lyap = x0_lyap.to(target_dtype)
     b_bar = base_m._parcae_b_bar() if base_m.use_parcae else None
@@ -3599,9 +3621,14 @@ def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2) -> float | None:
 
     try:
         torch.cuda.empty_cache()
+        # Predictive OOM check calibrated for SharedBlock JVP through 12 layers
+        # × 16+16 experts × multiple intermediate tensors. Empirically the JVP
+        # graph needs ~12-15× z_star size in fp32 saved-for-backward. At B=1
+        # this is ~1-2 GiB; the 16× multiplier gives a 25% safety margin.
         free_b, _ = torch.cuda.mem_get_info(z_star.device)
-        need_b = int(z_star.numel() * z_star.element_size() * 4)
+        need_b = int(z_star.numel() * z_star.element_size() * 16)
         if free_b < int(need_b * 1.25):
+            print(f"hutch_F skip: oom_pred need={need_b/1e9:.2f}GiB free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}", flush=True)
             return None
         samples: list[float] = []
         with ctx_factory():
@@ -3619,10 +3646,12 @@ def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2) -> float | None:
                 del v, z_b, u_b, jvp
                 torch.cuda.empty_cache()
         return sum(samples) / len(samples) if samples else None
-    except torch.cuda.OutOfMemoryError:
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"hutch_F skip: oom_runtime {e}", flush=True)
         torch.cuda.empty_cache()
         return None
-    except Exception:
+    except Exception as e:
+        print(f"hutch_F skip: {type(e).__name__}: {e}", flush=True)
         return None
 
 
@@ -4589,6 +4618,7 @@ def main() -> None:
         n_hutch: int = 8,
         n_finite_diff: int = 5,
         eps_step: float = 1e-3,
+        B_probe: int = 1,
     ) -> tuple[float | None, float | None]:
         """Two Lipschitz upper-bound probes at the saved DEQ FP z*.
 
@@ -4607,6 +4637,15 @@ def main() -> None:
         ``_lyapunov_z_star`` and ``_lyapunov_x0`` attributes (set by
         ``GPT.forward`` at L2870-2871; populated on every forward including
         eval).
+
+        iter 97.5b-fix (2026-04-29): ``B_probe=1`` slicing (default) bounds
+        the JVP/forward graph to a single sequence — without it the SharedBlock
+        forward through 12 layers × 16 attn + 16 mlp experts at full val
+        batch size needs ~32 GiB activation memory, which is the actual root
+        cause of `hutch_F: N/A` across all K-sweep entries in iter 100b
+        (NOT SDPA backend rejection as previously documented). Both probes
+        are unbiased at any batch size for an LM with translation-invariant
+        attention; B_probe=1 yields a representative spectral estimate.
         """
         z_star = getattr(base_m, '_lyapunov_z_star', None)
         x0_lyap = getattr(base_m, '_lyapunov_x0', None)
@@ -4619,6 +4658,7 @@ def main() -> None:
             target_dtype = next(sb.parameters()).dtype
         except StopIteration:
             target_dtype = z_star.dtype
+        z_star, x0_lyap = _slice_for_fp_probe(z_star, x0_lyap, B_probe)
         z_star = z_star.to(target_dtype)
         x0_lyap = x0_lyap.to(target_dtype)
         b_bar = base_m._parcae_b_bar() if base_m.use_parcae else None
@@ -4660,16 +4700,22 @@ def main() -> None:
         # Hutchinson-Frobenius probe — reduced sample count (was 8 → 2) since
         # the JVP through SharedBlock at B×T×D scales costs ~3 GiB per sample
         # and the K-sweep already pushes peak VRAM near 42 GiB on a 44 GiB
-        # cap. Variance is acceptable for a diagnostic. Predictive OOM skip:
-        # the forward retains activations for grad, budget ≈ 4× z_star bytes
-        # (z_b + u_b + jvp + grad-path scratch).
+        # cap. Variance is acceptable for a diagnostic.
+        #
+        # iter 97.5b-fix (2026-04-29): predictive OOM check calibrated for
+        # SharedBlock JVP through 12 layers × 16+16 experts × multiple
+        # intermediate tensors. Empirically ~12-15× z_star size in fp32
+        # saved-for-backward; the 16× multiplier gives a 25% safety margin.
+        # The earlier 4× multiplier was off by ~4× — predicted OK then OOM'd
+        # at runtime trying to allocate 32 GiB. With B_probe=1 slicing this
+        # is now ~1-2 GiB.
         def _hutch_F_probe() -> float | None:
             free_b, _ = torch.cuda.mem_get_info(z_star.device)
-            need_b = int(z_star.numel() * z_star.element_size() * 4)
+            need_b = int(z_star.numel() * z_star.element_size() * 16)
             if free_b < int(need_b * 1.25):
                 print(
                     f"ksweep_skip_reason:hutch_F oom_pred "
-                    f"need={need_b/1e9:.2f}GiB free={free_b/1e9:.2f}GiB",
+                    f"need={need_b/1e9:.2f}GiB free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}",
                     flush=True,
                 )
                 return None
