@@ -179,7 +179,7 @@ class Hyperparameters:
     num_refinements_ramp_frac = 0.85  # enable refinement after 85% of wallclock
     num_kv_heads = 4
     model_dim = 768  # iter 96 baseline. Iter 98 attempted 768 → 1024 but OOM'd 3× on 44 GiB L40S dev hardware (D=1024 + DEQ TBPTT exceeds VRAM cap regardless of seq/K reductions). Documented as NOT TESTED in H73; D-scaling deferred until 8× H100 80GB submission hardware (won't OOM there).
-    num_heads = 8
+    num_heads = 8  # Fix #2 (AdaSplash) attempt 2026-04-28 NOT VIABLE — even with @dynamo_disable wrapper from d7996da, AdaSplash kernel SIGABRTs at step 1 under compile+DDP+RevDEQ at head_dim=64. Reverted from 12. The `@dynamo_disable` makes the call opaque to dynamo's TRACER but doesn't isolate Triton's CUDA stream/context from DDP's NCCL streams or RevDEQ's autograd backward replay. Path forward requires either (a) torch.library.custom_op registration (more invasive) or (b) single-GPU validation harness. Defer.
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
     num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
     # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
@@ -284,7 +284,7 @@ class Hyperparameters:
     # 2026-04-28: "sliding window would significantly hurt long sequence
     # performance which should never be used alone". AdaSplash's adaptive
     # sparsity is learned per-query and preserves long-range dependencies.
-    attn_alpha_target = 1.0             # iter 104 DEFERRED: AdaSplash kernel SIGABRTs under compile+DDP at d_head=64 (and asserts H_DIM at d_head=96). Set to 1.0 to disable AdaSplash entirely; falls back to dense softmax SDPA for attention. iter 104 returns to queue when we have a torch.compiler.disable wrapper or single-GPU validation infrastructure.
+    attn_alpha_target = 1.0             # iter 104 (AdaSplash) attempt 2026-04-28 NOT VIABLE — SIGABRT at step 1 under compile+DDP+RevDEQ even with `_adasplash_kernel_call` decorated `@dynamo_disable` (commit d7996da). The dynamo-disable wrapper makes the call opaque to dynamo's TRACER but doesn't isolate Triton's CUDA stream/context from DDP's NCCL streams or RevDEQ's autograd backward replay. Set to 1.0 to disable AdaSplash entirely (falls back to dense softmax SDPA). Path forward: torch.library.custom_op registration OR single-GPU harness validation.
     attn_alpha_warmup_delay_frac = 0.3  # unused when attn_alpha_target=1.0 (path bypassed)
     attn_alpha_niter = 10               # unused when attn_alpha_target=1.0 (path bypassed)
 
@@ -2561,7 +2561,16 @@ class Block(nn.Module):
         mlp_mix = self.mlp_post_mix_norm(mlp_mix)
 
         # Dense mixture Δ = attn_mix + mlp_mix.
-        delta = (attn_mix + mlp_mix).to(dtype=z_in.dtype)
+        # Fix #3 (profile-driven, 2026-04-28): drop `.to(dtype=z_in.dtype)`
+        # on `(attn_mix + mlp_mix)` — both come from `*_post_mix_norm`
+        # (RMSNorm, dtype-preserving) whose inputs are bf16 (z_in is bf16, h is
+        # bf16-derived), so the cast is provably a no-op. PyTorch handles
+        # same-dtype `.to()` as a return-self, but emitting it as a graph node
+        # adds a fixed boundary that may inhibit Inductor fusion with the
+        # downstream `+ delta`. Removing also drops one fused-Triton kernel
+        # invocation (`triton_poi_fused__to_copy__unsafe_view_add_clone_mul_*`
+        # was 3.96% × 2 in profile_v13, partly from this cast pair).
+        delta = attn_mix + mlp_mix
 
         # Parcae input injection: T_θ = B̄ ⊙ RMSUnit(x_0) ⊙ g + Δ_θ.
         # b_bar=None ⇒ ones(D) (direct Block() in tests).  At the fixed point
@@ -2570,7 +2579,11 @@ class Block(nn.Module):
         x0_rms = F.rms_norm(x0, (x0.size(-1),), eps=1e-6) * self.x0_inject_norm_weight.to(x0.dtype)
         if b_bar is not None:
             x0_rms = b_bar.to(x0_rms.dtype) * x0_rms
-        raw_out = x0_rms.to(dtype=z_in.dtype) + delta
+        # Fix #3 (profile-driven): same dtype-preservation argument — x0 is
+        # bf16 (input from _run_solver_kernel), F.rms_norm preserves it, the
+        # x0_inject_norm_weight cast preserves it, b_bar is fp32 cast to
+        # x0_rms.dtype (= bf16). So x0_rms.dtype == z_in.dtype already.
+        raw_out = x0_rms + delta
 
         # Eager-only gate-call tracking — see helper docstring.
         self._maybe_track_gate_calls()
