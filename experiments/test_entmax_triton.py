@@ -3,6 +3,27 @@
 Validates a Triton-fused entmax-1.5 forward + backward kernel against the
 pure-PyTorch closed-form implementation in train_gpt.py::entmax_1p5.
 
+ALGORITHM VERIFICATION (2026-04-30, deep-spin/entmax cross-check):
+  - Forward formulation matches train_gpt.py::entmax_1p5, which is
+    mathematically equivalent to deep-spin/entmax Entmax15Function.forward
+    (the reference uses X' = X/2 + tau'; we use the un-halved form with
+    `0.5*(z - tau)` inside the square; algebraically tau = 2*tau').
+  - Backward formula MATCHES deep-spin/entmax Entmax15Function.backward
+    line-for-line:
+        Reference:  gppr = sqrt(Y); dX = dY*gppr;
+                    q = dX.sum(dim)/gppr.sum(dim); dX -= q * gppr
+        This kernel: s = sqrt(w); c = sum(s*grad_w)/sum(s);
+                     grad_z = s * (grad_w - c)
+    Identical (note dX.sum = sum(dY*gppr) = sum(grad_w*sqrt(w)) = sum(s*grad_w)).
+  - Reference: https://github.com/deep-spin/entmax/blob/master/entmax/activations.py
+  - Paper: Peters, Niculae, Martins (2019) "Sparse Sequence-to-Sequence Models"
+    https://arxiv.org/pdf/1905.05702 (Algorithm 2 + Proposition 2 backward).
+  - Numerical stability: our `discr.clamp_min(1e-6)` is STRICTER than the
+    reference's `clamp(delta, 0)`; this is the iter 117 v3 NaN fix
+    (sqrt(0) backward = Inf → 0×Inf = NaN propagation; ε=1e-6 caps the
+    sqrt-gradient at 500, fixing a NaN bug not present in the reference).
+
+
 The kernel is designed for the small-E regime (E=16 routed experts) where
 all E values fit in registers and a single program block handles one row.
 
