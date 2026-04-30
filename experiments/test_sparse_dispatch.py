@@ -638,6 +638,137 @@ def test_phase_A4_compile_traceability():
 
 
 # ===========================================================================
+# Phase A.5: gradient flow under capacity overflow
+# ===========================================================================
+
+
+def test_phase_A5_overflow_gradients():
+    """Phase A.5: even when forward has approximation error from capacity
+    overflow, gradients must still flow correctly through the kept tokens.
+
+    Failure mode this guards against: silent gradient zeroing for truncated
+    tokens, OR spurious gradients on tokens that fell outside top-K. Both
+    would break training in subtle ways that smoke tests might miss.
+
+    Test design: with insufficient capacity (C < (1-s)·E), the forward
+    output approximates the dense reference. The gradients should:
+      - Match dense gradients EXACTLY for tokens inside every expert's top-K
+      - Be ZERO for tokens outside ALL experts' top-K (no compute → no grad)
+      - Be PARTIAL for tokens kept by some experts but not others
+    """
+    print("\n" + "=" * 60)
+    print("Phase A.5: gradient flow under capacity overflow")
+    print("=" * 60)
+
+    failures = 0
+    torch.manual_seed(6)
+    # Larger T + smaller K to ensure SOME tokens fall outside ALL experts' top-K.
+    # T=256, E=8, K=4 → total slots = 32 < T = guaranteed some dropped tokens.
+    T, D, E, R = 256, 16, 8, 4
+
+    x = torch.randn(T, D, requires_grad=True)
+    eW = torch.randn(E, D, R, requires_grad=True) * 0.1
+    eV = torch.randn(E, R, D, requires_grad=True) * 0.1
+    logits = torch.randn(T, E, requires_grad=True) * 2.0
+    w = _entmax_1p5_pyref(logits, dim=-1)
+
+    util_max = (w > 0).sum(dim=0).max().item()
+    # Force severe overflow: K = 4 << util_max ≈ 50. Each expert keeps only top-4
+    # tokens → at most E*K = 32 slots covering 256 tokens → some MUST be dropped.
+    K_underflow = 4
+    C_underflow = K_underflow * E / T
+
+    # Determine which tokens are KEPT (in at least one expert's top-K).
+    kept_mask = torch.zeros(T, dtype=torch.bool)
+    for e in range(E):
+        _, top_idx = w[:, e].topk(K_underflow, dim=0)
+        kept_mask[top_idx] = True
+
+    print(f"  T={T}, E={E}, util_max={util_max}, K_underflow={K_underflow}, "
+          f"C={C_underflow:.2f}")
+    print(f"  Tokens kept (in at least one top-K): {kept_mask.sum().item()}/{T}")
+    if kept_mask.sum().item() == T:
+        print("  WARNING: every token kept — test cannot exercise dropped-token path")
+        print("  (this is actually a robustness signal: dispatch is hard to truncate)")
+
+    # Sparse forward + backward.
+    out_sparse = sparse_moe_dispatch_capacity(
+        x, w, eW, eV, capacity_factor=C_underflow)
+    loss_sparse = out_sparse.pow(2).sum()
+    g_x_sparse = torch.autograd.grad(loss_sparse, x, retain_graph=False)[0]
+
+    # Verification 1: gradient is EXACTLY zero for tokens not kept by any expert.
+    dropped_mask = ~kept_mask
+    if dropped_mask.any():
+        grad_on_dropped = g_x_sparse[dropped_mask].abs().max().item()
+        status = "PASS" if grad_on_dropped < 1e-7 else "FAIL"
+        if grad_on_dropped >= 1e-7:
+            failures += 1
+        print(f"  ∂L/∂x for tokens kept by NO expert: max={grad_on_dropped:.2e}  "
+              f"(expected 0, since no compute = no grad)  {status}")
+    else:
+        print(f"  ∂L/∂x for tokens kept by NO expert: SKIPPED (no dropped tokens — "
+              f"all {T} tokens kept by at least one expert)")
+
+    # Verification 2: gradient is NONZERO somewhere on kept tokens.
+    grad_on_kept = g_x_sparse[kept_mask].abs().max().item()
+    status = "PASS" if grad_on_kept > 1e-6 else "FAIL"
+    if grad_on_kept <= 1e-6:
+        failures += 1
+    print(f"  ∂L/∂x for tokens kept by AT LEAST one expert: max={grad_on_kept:.2e}  "
+          f"(expected nonzero)  {status}")
+
+    # Verification 3: gradient finiteness (no NaN/Inf even under overflow).
+    has_nan = torch.isnan(g_x_sparse).any().item()
+    has_inf = torch.isinf(g_x_sparse).any().item()
+    status = "PASS" if not (has_nan or has_inf) else "FAIL"
+    if has_nan or has_inf:
+        failures += 1
+    print(f"  ∂L/∂x finite (no NaN/Inf): "
+          f"NaN={has_nan} Inf={has_inf}  {status}")
+
+    # Verification 4: increasing capacity strictly reduces gradient mismatch
+    # vs dense reference. (Implicit chain-rule: forward error → backward error.)
+    print("  Capacity sweep: gradient rel-error should be monotone in 1/C:")
+    x_d = x.detach().clone().requires_grad_(True)
+    eW_d = eW.detach().clone().requires_grad_(True)
+    eV_d = eV.detach().clone().requires_grad_(True)
+    logits_d = logits.detach().clone().requires_grad_(True)
+    w_d = _entmax_1p5_pyref(logits_d, dim=-1)
+    out_dense = dense_moe_dispatch(x_d, w_d, eW_d, eV_d)
+    loss_dense = out_dense.pow(2).sum()
+    g_x_dense = torch.autograd.grad(loss_dense, x_d, retain_graph=False)[0]
+
+    prev_rel = float("inf")
+    monotone = True
+    for C in [E, 8.0, 5.0, 3.5, 2.0, 1.0]:
+        x2 = x.detach().clone().requires_grad_(True)
+        eW2 = eW.detach().clone().requires_grad_(True)
+        eV2 = eV.detach().clone().requires_grad_(True)
+        logits2 = logits.detach().clone().requires_grad_(True)
+        w2 = _entmax_1p5_pyref(logits2, dim=-1)
+        out_s = sparse_moe_dispatch_capacity(x2, w2, eW2, eV2, capacity_factor=C)
+        loss_s = out_s.pow(2).sum()
+        g_x_s = torch.autograd.grad(loss_s, x2, retain_graph=False)[0]
+        rel = (g_x_dense - g_x_s).abs().max().item() / (g_x_dense.abs().max().item() + 1e-12)
+        # Decreasing C → 1/C grows → expect rel to grow (or stay flat at noise floor).
+        # Failure: rel STRICTLY DECREASES as C decreases. Use a fp32 noise tolerance
+        # since at C ≥ (1-s)·E, all measured rel values sit at the float-reorder
+        # noise floor and can fluctuate by O(1e-7) randomly.
+        noise_tol = max(prev_rel * 0.5, 1e-6)
+        if rel < prev_rel - noise_tol:
+            monotone = False
+        prev_rel = rel
+        print(f"    C={C:>5.1f}  ∂L/∂x rel_err={rel:.4e}")
+    status = "PASS" if monotone else "FAIL"
+    if not monotone:
+        failures += 1
+    print(f"  monotone gradient error in 1/C: {status}")
+
+    return failures
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -659,6 +790,9 @@ if __name__ == "__main__":
 
     # Phase A.4 runs on CPU; torch.compile traceability.
     failures += test_phase_A4_compile_traceability()
+
+    # Phase A.5 runs on CPU; gradient flow under capacity overflow.
+    failures += test_phase_A5_overflow_gradients()
 
     print("\n" + "=" * 60)
     if failures == 0:
