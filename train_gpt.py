@@ -1379,7 +1379,14 @@ def entmax_1p5(z: Tensor, dim: int = -1) -> Tensor:
 
     # quadratic k τ² − 2 S τ + (S2 − 4) = 0  → τ = (S ± sqrt(S² − k(S2 − 4))) / k
     # Smaller root is τ_low = (S − sqrt(...)) / k.
-    discr = (S * S - k * (S2 - 4.0)).clamp_min(0.0)
+    # iter 117 v3 NaN fix (2026-04-29): clamp discr at small positive epsilon
+    # rather than 0. Backward gradient of sqrt(0) is 1/(2·sqrt(0)) = Inf →
+    # IEEE-754 0×Inf = NaN propagates through (1−blend)·p_entmax even when
+    # blend=1.0 zeros the forward contribution. Clamping at 1e-8 caps the
+    # sqrt gradient at 1/(2·sqrt(1e-8)) = 5000 (finite), preserving the
+    # 0-multiplication chain rule (0 × 5000 = 0, no NaN). Forward output is
+    # numerically identical for any discr ≥ 1e-8 that would arise in practice.
+    discr = (S * S - k * (S2 - 4.0)).clamp_min(1e-8)
     tau_k = (S - discr.sqrt()) / k.clamp_min(1.0)
 
     # Pick largest k with tau_k < z_sorted_k (support size).
