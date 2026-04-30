@@ -2695,3 +2695,151 @@ a process bug, not a design choice.
 - **H29 PRINCIPLE**: every gate must be input-dependent AND token-local — no `.mean(dim=batch,seq)` before any gate.  Streaming / prefix-caching invariance depends on this.  Verify any new gate with: "does chunking the sequence change this gate's value for unchanged tokens?" → must be NO.
 - **H31 PRINCIPLE**: LOSS and GATE metrics must be DIFFERENT by design — LOSS uses smooth signals (e.g. mean over all pairs); GATE uses worst-case (e.g. max over pairs). When designing a new gate, never reuse the loss metric for "consistency" — that breaks gradient flow. Cross-reference: max_pairwise (gate) vs max_mean (loss) for ortho.
 - **H32 PRINCIPLE**: LOSS focuses on TASK PERFORMANCE — don't add regularization terms that exist purely to satisfy gates. The LOSS budget is finite; every coefficient steals gradient signal from val_bpb. Gate failures are caught by the GATE; the LOSS doesn't need to also chase them. Removed: `mos_ortho_out_coef = 0` and `block_ortho_aux_coef = 0` (were 1e-3 and 1.0 — chasing the ortho gate that's now properly handled by max_pairwise > 0.9 detection + WD-driven natural diversification).
+
+---
+
+## Records-derived hypotheses (H91–H99) — appended 2026-04-30
+
+Source: problem-driven audit of `records/track_10min_16mb/` 2026-04-27 SOTA submission (val_bpb=1.0611) and predecessors. Each H-claim below identifies a concrete problem the records' SOTA stack solves, and confirms our codebase has the same problem (i.e. is not architecturally subsumed by RevDEQ + Parcae + soft-MoE). Items where our model addresses the problem differently (U-Net skips, depth recurrence, parallel decoder, LN scale 1/√(layer+1)) are deliberately NOT queued.
+
+Queue insertion: Tier 4 — Records-derived (after Tier 1 throughput iters and Tier 3 architectural sweeps). Ordered within Tier 4 by (a) impact magnitude and (b) implementation complexity.
+
+### H91: Phased Test-Time Training (TTT) closes the per-document adaptation gap
+
+**Problem:** standard LM perplexity treats each document independently, but documents have local statistics (vocabulary, style, topic) that aren't well-captured by global parameters. Records' SOTA stack uses TTT: a small LoRA adapter is fine-tuned on each document's prefix at eval time, then frozen and used to predict the suffix. Phased TTT splits this into 3 cumulative phases at doc-boundaries 833/1666/2500 (max prefix=2500 docs). LoRA per-doc reset.
+
+**Codebase status:** ZERO TTT infrastructure. We evaluate via single-pass standard perplexity. The gap closes ~0.05–0.10 BPB across all post-2026-03-23 records.
+
+**Proposal:** add `ttt_eval_enabled` Hyperparameter + `ttt_lora_rank=80`, `ttt_phases=3`, `ttt_phase_doc_boundaries=(833, 1666, 2500)`, `ttt_beta2=0.99`, `ttt_weight_decay=0.5`. New eval-loop function that, for each phase, runs LoRA-only SGD on the cumulative prefix tokens, then evaluates suffix tokens with the adapted weights, then resets LoRA at next-doc boundary. LoRA targets: Q/K/V/O/MLP/lm_head per the SOTA records.
+
+**Why it ports cleanly to RevDEQ:** TTT is purely inference-time. The base model isn't retrained; the FP iteration runs unchanged. LoRA adapts only the per-expert linears (rank-80 added on top of our existing rank-64/96 LoRA structure).
+
+**Risks:** (a) eval time extends from ~30 s → ~7 min (TTT runs ~450-510 s on H100; on dev L40S likely ~25 min). (b) per-phase LoRA reset may interact with our shared-block design (the same Block runs all 12 layers; per-doc reset is not per-block, only per-doc).
+
+**Estimated ROI:** **−0.05 to −0.10 BPB** (largest single feature in records corpus). Promotion path: implement → run iter 121 with TTT enabled at fixed-step val_bpb. If int6 BPB drops by ≥0.03, promote.
+
+**Status:** PROPOSED — Tier 4 priority **#2** (after H93 which is cheapest).
+
+### H92: Logit softcap (Gemma2-style) bounds extreme logit values
+
+**Problem:** without softcap, lm_head logits can grow unbounded during training, causing gradient spikes and bf16 numerical issues. Records use `logits = softcap * tanh(logits / softcap)` with softcap=30. Standard in every record from 2026-04+.
+
+**Codebase status:** NOT PRESENT. Our grad_norm history is healthy (0.05-0.30) and grad_clip=1.0 absorbs spikes, so the problem is mild — but the regularization effect on training dynamics is real and consistent in records.
+
+**Proposal:** one-line change in `MoSLowRankOutputHead.forward` (or wherever the final logits are produced). Add `logit_softcap = 30.0` Hyperparameter; apply `logits = softcap * tanh(logits / softcap)` if `softcap > 0`.
+
+**Estimated ROI:** **−0.005 to −0.015 BPB**. Cheapest principled win.
+
+**Status:** PROPOSED — Tier 4 priority **#3** (low-risk, easy, but small magnitude).
+
+### H93: Logit softcap is the absolute-cheapest first add (priority over even H92's positioning)
+
+This is H92 reframed: it's a one-line trivial add. Run it before TTT to reduce variance in subsequent iter measurements. Status: PROPOSED — Tier 4 priority **#1**.
+
+### H94: GPTQ + LQER int4-rank4 closes the int6 quantization-error gap
+
+**Problem:** our per-row int6 quantization uses naive scale-zero-point with no Hessian-aware error optimization. Records use GPTQ (Hessian-aware) + LQER asymmetric int4 rank-4 correction on top-3 tensors. This delivers the same artifact size at lower quantization error — directly improves `val_bpb_int6` (our promotion gate).
+
+**Codebase status:** YES, we have this problem. Our int6 round-trip costs us a fixed BPB delta (e.g., iter 117 v5: fast=1.4820 → int6=1.5122, +0.0302 quantization tax). LQER+GPTQ in records reduces the equivalent tax to ~0.005-0.010 BPB.
+
+**Proposal:** replace `_int6_quantize_per_row` with GPTQ pipeline (calibration set + Hessian update + greedy quant). Add LQER post-processing: find top-3 worst-quantized tensors by reconstruction error, compute rank-4 correction `U @ V.T` where U, V come from SVD of the quantization residual.
+
+**Estimated ROI:** **−0.02 to −0.04 BPB on int6** (target: shrink the int6 quantization tax from 0.030 to ~0.010). Affects val_bpb_int6 directly.
+
+**Risks:** GPTQ calibration adds eval-time cost. LQER correction tensors add ~50-100 KB to artifact (rank-4 × top-3 tensors). Net artifact may grow slightly.
+
+**Status:** PROPOSED — Tier 4 priority **#4**.
+
+### H95: SP1024 → SP8192 tokenizer + CaseOps closes vocab-inefficiency gap
+
+**Problem:** at vocab=1024, BPE produces ~more tokens per byte than SP8192. Even at perfect prediction, BPB is bounded above by `tokens_per_byte × per_token_perplexity`. Records use SP8192 + CaseOps lossless case preprocessing (bijective lowercase + private-use-area sentinels) which compounds the gain.
+
+**Codebase status:** YES, our `vocab_size=1024` is the smallest in the records corpus (most use 8192). CaseOps not present.
+
+**Proposal:** PAIR change. (1) Add `vocab_size=8192` config + retrain tokenizer at sp8192 on FineWeb (one-time data-prep step, ~30 min). (2) Add CaseOps preprocessing layer: bijective lowercase encode + private-use-area sentinels at training-set construction time. Decoder mirrors the encode.
+
+**Risks:** (a) embedding params grow 8× (1024×D → 8192×D). At D=768 and FP16, that's +10.5 MB embedding alone — exceeds 16 MB budget without compression help. (b) MoS prediction head also has vocab dimension. Must re-architect or use tied embeddings rigorously. (c) Re-tokenizing the dataset is one-time cost.
+
+**Estimated ROI:** **−0.02 to −0.04 BPB** (records show consistent gain from this single tokenizer axis).
+
+**Status:** PROPOSED — Tier 4 priority **#5**, **CONDITIONAL on H96 (compression) + H97 (artifact-budget audit)**. Cannot land until artifact fits.
+
+### H96: Per-group lrzip+brotli compression frees ~280 KB artifact budget
+
+**Problem:** generic stream compression (zstd-22) doesn't exploit per-tensor distributional similarity. Records' approach: bucket int6 tensors by role (qo_bank, kv_bank, mlp_up_bank), L1 nearest-neighbour similarity-sort rows within each bucket (so adjacent serialized rows are numerically close, giving entropy coder longer runs of small deltas), then lrzip-zpaq compress each group, falling back to brotli for the remainder.
+
+**Codebase status:** YES. We use zstd-22 stream compression on the entire artifact. Records' per-group approach saves ~280 KB at same model.
+
+**Proposal:** add `compressor=pergroup` option to artifact builder. Implement `_similarity_sort_l1` (uint16 permutation indices, brotli-compressed alongside the bucket data). Shell out to lrzip via subprocess for ZPAQ context-mixing back-end. lrzip system binary required.
+
+**Risks:** (a) lrzip is an external binary (apt-get install). (b) Compression time +~75 s (one-time at submission build, irrelevant for training).
+
+**Estimated ROI:** **0 BPB direct, +280 KB free artifact budget** (~2% of the 16 MB cap). Frees room for H95's bigger embeddings.
+
+**Status:** PROPOSED — Tier 4 priority **#6**.
+
+### H97: attn-gate int8-per-row quantization saves bytes at no quality cost
+
+**Problem:** attention gates have low dynamic range (sigmoid output, naturally bounded). Quantizing them at int6 wastes precision; int8-per-row is precise enough.
+
+**Codebase status:** YES. Our per-expert-per-head sigmoid gates currently quantize at int6 (default). Records use int8-per-row for the analogous `GATED_ATTN_QUANT_GATE` tensor.
+
+**Proposal:** add per-tensor quant-bit-width override for the attn-gate. Set int8-per-row for those tensors only.
+
+**Risks:** the int8 attn-gate is LARGER than int6 per row (8 vs 6 bits) — but per-row scales are FEWER bytes than the per-element saving. Net direction depends on the gate tensor shape; needs measurement.
+
+**Estimated ROI:** small artifact savings (~10-30 KB), no val_bpb effect (or marginal positive from lower quant error on the gate).
+
+**Status:** PROPOSED — Tier 4 priority **#9** (low magnitude; do only if budget is genuinely tight).
+
+### H98: Sparse attention head-output gate (window=12) sparsifies per-token head contributions
+
+**Problem:** attention heads are uniformly mixed via Wo, but some heads contribute noise per token. Records' sparse head-output gate adds a narrow window over heads and sparsifies which heads contribute.
+
+**Codebase status:** PARTIAL. We have per-expert-per-head sigmoid gates after SDPA, but it's a single sigmoid per head, not "windowed top-12 over the head dimension". The records approach is different mechanism on top.
+
+**Proposal:** add `sparse_attn_head_gate_window=12` Hyperparameter. Replace the existing per-head sigmoid with a windowed-top-K over the 8 heads × 16 experts = 128 slots; only top-12 within each window contribute. Composes with existing gated-attn structure.
+
+**Estimated ROI:** **−0.005 to −0.015 BPB**. Small gain; principled mechanism on top of what we have.
+
+**Status:** PROPOSED — Tier 4 priority **#7**.
+
+### H99: SmearGate (BOS-fixed) adds a position-mixing memory channel
+
+**Problem:** position-1 forward smear `x[1:] += g * x[:-1]` gives the model a small additional "previous token" memory channel beyond what attention provides. Records introduced it in PR #1667; PR #1797's BOS-leak fix is essential — naive smear leaks across document boundaries in packed validation streams.
+
+**Codebase status:** PARTIAL. Our DEQ + Parcae handles temporal mixing via the FP iteration (not the same mechanism). SmearGate would be additive — orthogonal signal channel.
+
+**Proposal:** add `use_smear_gate` Hyperparameter and `smear_gate` learnable scalar (per-layer). Implement: `x = torch.cat([x[:, :1], x[:, 1:] + g * x[:, :-1] * not_bos], dim=1)` where `not_bos = (input_ids[:, 1:] != BOS_ID)`. CRITICAL: must apply both in `_forward_hidden` and (if H91 lands) in `forward_ttt` to avoid eval/train mismatch.
+
+**Estimated ROI:** **−0.005 to −0.015 BPB** (records show consistent small gain).
+
+**Status:** PROPOSED — Tier 4 priority **#8**.
+
+### Records-derived priority order (within Tier 4)
+
+Sequenced for ROI/risk balance, after Tier 1 throughput iters (117b-2/3/3b) complete:
+
+| Priority | H | Iter# | Feature | ROI | Complexity |
+|---|---|---|---|---|---|
+| 1 | H93/H92 | iter 122 | Logit softcap | −0.005 to −0.015 | Trivial 1-liner |
+| 2 | H91 | iter 123 | Phased TTT eval | **−0.05 to −0.10** | High (eval-loop refactor) |
+| 3 | H94 | iter 124 | GPTQ + LQER quant | −0.02 to −0.04 (int6) | High (replace quant pipeline) |
+| 4 | H96 | iter 125 | Per-group lrzip+brotli compression | 0 (frees ~280 KB) | Medium (data prep + subprocess) |
+| 5 | H95 | iter 126 | SP1024 → SP8192 + CaseOps tokenizer upgrade | −0.02 to −0.04 | High (data retokenize, embedding scale) |
+| 6 | H98 | iter 127 | Sparse attn head-output gate (window=12) | −0.005 to −0.015 | Medium |
+| 7 | H99 | iter 128 | SmearGate (BOS-fixed) | −0.005 to −0.015 | Low |
+| 8 | H97 | iter 129 | attn-gate int8-per-row quant | 0 (~30 KB artifact) | Low |
+
+**Independence**: items #1, #2, #3, #6, #7, #8 are mostly independent. #4 (compression) enables #5 (tokenizer upgrade) by freeing artifact budget. #2 (TTT) is the largest single gain but slowest to implement.
+
+**Records-derived items NOT queued (problem subsumed or already present):**
+- U-Net encoder-decoder skips → RevDEQ shared block + x₀ injection handles cross-depth signal preservation differently
+- Depth recurrence (loop layers ×3) → RevDEQ FP iteration **is** this exactly, K=16-24
+- Parallel decoder / 2-lane parallel residuals → soft-dense MoE has E=16 parallel paths
+- LN scale 1/√(layer+1) → Parcae per-dim Ā provides depth-dependent contractive damping
+- LeakyReLU(0.5)² in gated MLP → iter 83 tested + REVERTED (regressed in our gated context, H61)
+- Polar-Express NS Muon → iter 121 NaN'd at s30; preserved gated for future revisit with lower matrix_lr
+- qk_gain init=5.0 → already at L250 (matches records)
+- EMA decay~0.997 → already enabled by default
+- Partial RoPE 16/64 dims → already split per CLAUDE.md §6.3
