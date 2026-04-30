@@ -265,7 +265,7 @@ class Hyperparameters:
     # controls how much entmax-1.5 sparsity contributes to routing — drift
     # too fast and routing collapses (NaN at iter 117 v1 step 60). 10×
     # slower LR keeps drift bounded once anneal ramps.
-    entmax_blend_lr = 0.02
+    entmax_blend_lr = 0.002
 
     # Iter 106 (NSA — Native Sparse Attention; arxiv:2502.11089). Three-branch
     # hybrid that preserves O(T) reachability while remaining sparse:
@@ -345,13 +345,15 @@ class Hyperparameters:
     # (prevents dead experts); the two regs do NOT antagonize — joint target
     # is low pertoken_entropy AND low CV.
     #
-    # iter 117b (2026-04-30): bumped 0.005 → 0.05 (10×) per H87 RESULT
-    # observation that pertoken_entropy stuck at 2.80 in iter 117 v5 — the
-    # 0.005 magnitude × 2.80 = 0.014 contribution to total_loss was dwarfed
-    # 25× by cv_loss_weight=2.0 × cv=0.20 = 0.40 (under router_health_coef
-    # 0.25 multiplier, both shrink proportionally). Bumping gives entropy
-    # reg the gradient budget to actually drive specialization.
-    router_entropy_coef = 0.05
+    # iter 117b-1 RESULT (2026-04-30): tested 10× bump 0.005 → 0.05.
+    # NOT PROMOTED — int6 +0.0007 vs iter 117 v5, hypothesis REFUTED:
+    # in soft-dense MoE, the CV-redistribution dominates over the per-token
+    # sparsity push at any reasonable entropy coef. Pertoken_entropy
+    # stabilizes around 2.6 regardless. See H87b RESULT in hypotheses.md.
+    # Config reverted to iter 117 v5 / iter 100b value (0.005). Future
+    # iters targeting specialization should use joint-reg approaches
+    # (iter 112 Gram-matrix penalty H84) rather than entropy magnitude.
+    router_entropy_coef = 0.005
     # Annealing schedule (iter 100b): scale = 0 for time_frac < warmup_delay_frac,
     # then linear ramp 0 → 1 over remaining training. Final effective coef =
     # router_entropy_coef × scale. Avoids cold-start trap (router needs free

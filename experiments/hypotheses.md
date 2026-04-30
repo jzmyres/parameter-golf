@@ -2083,6 +2083,70 @@ k_sweep_table:  128    1.5135   0.2708   0.1566   0.2212    0.0361    0.0437    
 
 **Status:** PROMOTED ★. Architecture extended with entmax-1.5 + annealed blend (CLI-gated) + `_entmax_blend_logit` learnable parameter (10×-slower LR group). Strict-gen recovery to iter 100b verified at `use_entmax_routing=False`. Iter 117b queued for actual sparsity engagement.
 
+### H87b RESULT (iter 117b-1, commit `54473aa`, 2026-04-30): NOT PROMOTED ✗ — hypothesis REFUTED, config bumps reverted
+
+**Hypothesis tested.** 10× bump of `router_entropy_coef` (0.005 → 0.05) and `entmax_blend_lr` (0.002 → 0.02) on top of iter 117 v5's blend infrastructure should drive per-token entropy down (from 2.80 toward ≤1.5) and unlock val_bpb improvement via specialization.
+
+**Result: REFUTED.** Pertoken_entropy stayed at ~2.6 throughout training, never bending below 2.5. The 10× entropy coef engaged but couldn't overcome CV-redistribution dominance in soft-dense MoE.
+
+**Final results (1000 steps, --use-entmax-routing=1):**
+- val_bpb fp32 (s1000): **1.4790** (vs iter 117 v5 1.4820, Δ −0.003)
+- val_bpb int6 roundtrip: **1.512872** (vs iter 117 v5 1.5122, **Δ +0.0007**, essentially flat)
+- artifact_bytes: 7,623,275 (47.6% of 16 MB budget)
+- step_avg: 20.62s (matches iter 117 v5)
+- peak_vram_mb: 34,598
+- 0 NaN, 0 errors
+
+**Promotion gate analysis (CLAUDE.md §11):**
+- artifact ≤ 16 MB: **PASS**
+- K=128 vs best-K Δ ≤ 0.5: **PASS** (best K=17 at 1.5124, K=128 at 1.5154 → Δ=+0.003)
+- Acyclicity primes: **GENUINE FP** (K=17→K=16: -0.0005, K=37→K=32: +0.0005, K=113→K=128: 0.0000)
+- val_bpb improvement vs current baseline (iter 117 v5 = 1.5122): **NO** (+0.0007)
+- Strict-generalization escape: **NO** (hyperparameter-only changes don't extend the function class)
+- Per §11: *"val_bpb worse/equal AND no strict-gen → git revert"*
+
+**K-sweep matrix (verbatim from run.log):**
+
+```
+   K   val_bpb  attn_cv   mlp_cv  pool_cv  attn_min   mlp_min  attn_ortho  mlp_ortho  pertoken_ent  pool_ent  shared_gate   hutch_F   rd_step  iter_conv_rel
+   4    1.7806   0.3593   0.2030   0.2918    0.0320    0.0382      0.1338     0.1992        2.5789    3.3580       0.5042    0.6981  451.4170         0.1968
+   8    1.5652   0.3493   0.2131   0.2894    0.0294    0.0352      0.1338     0.1992        2.5794    3.3574       0.5042    0.6755  450.6616         0.0835
+  16    1.5129   0.3252   0.1993   0.2697    0.0310    0.0360      0.1338     0.1992        2.5956    3.3629       0.5046    0.6759  443.8861         0.0243
+  17    1.5124   0.3246   0.1992   0.2693    0.0310    0.0360      0.1338     0.1992        2.5963    3.3630       0.5046    0.6753  441.8971         0.0216
+  24    1.5129   0.3240   0.1985   0.2687    0.0311    0.0362      0.1338     0.1992        2.5965    3.3631       0.5046    0.6767  449.0061         0.0131
+  32    1.5139   0.3226   0.1986   0.2679    0.0312    0.0362      0.1338     0.1992        2.5969    3.3634       0.5046    0.6771  438.8580         0.0108
+  37    1.5144   0.3222   0.1987   0.2676    0.0312    0.0362      0.1338     0.1992        2.5974    3.3634       0.5046    0.6761  448.5642         0.0103
+  64    1.5151   0.3207   0.1985   0.2667    0.0311    0.0362      0.1338     0.1992        2.5978    3.3637       0.5046    0.6786  445.8197         0.0102
+ 113    1.5154   0.3214   0.1989   0.2672    0.0312    0.0362      0.1338     0.1992        2.5972    3.3635       0.5046    0.6739  447.3644         0.0101
+ 128    1.5154   0.3218   0.1988   0.2675    0.0312    0.0362      0.1338     0.1992        2.5971    3.3635       0.5046    0.6737  440.0336         0.0101
+```
+
+**hutch_F + rd_step now reported per-K** (iter 97.5b-fix3 autocast wrapper working ★). Stable around 0.67/445 across all K — confirming consistent contractive FP behavior.
+
+**Val-checkpoint trajectory:**
+
+| Step | val_bpb (fast) | Δ vs iter 117 v5 | hutch_F | attn_cv | pertoken_entropy |
+|---|---|---|---|---|---|
+| s200  | 2.0238 | -0.0228 | 0.413 | 0.555 | 1.846 |
+| s400  | 1.6913 | -0.0229 | 0.538 | 0.343 | 2.452 |
+| s600  | 1.5693 | -0.0046 | 0.602 | 0.330 | 2.609 |
+| s800  | 1.5201 | -0.0047 | 0.624 | 0.300 | 2.609 |
+| s1000 | **1.4790** | **-0.0030** | **0.673** | **0.301** | **2.607** |
+
+**Trajectory pattern:** the early lead vs iter 117 v5 (-0.023 at s200/s400) NARROWED at s600 (-0.005) and stabilized through s800/s1000. The 10× entropy coef engaged in the second half (after warmup_delay_frac=0.3) but couldn't bend pertoken_entropy back below 2.5 — the CV-redistribution from the cross-batch balance reg dominates over the per-token sparsity push at this coef magnitude.
+
+**Lesson (this is the key takeaway).** In soft-dense MoE on this task, **bumping entropy_coef alone is not sufficient** to drive specialization. CV-redistribution, sigmoid gating, and entmax blend interact such that pertoken_entropy reaches a stable equilibrium around 2.6 regardless of the entropy coef. Future iters targeting per-token specialization need either:
+1. **Architectural sparsity** (entmax with smaller `entmax_blend_init_logit`, e.g., 0 → sigmoid=0.5 balanced — but iter 117 v5 already proved this approach has capacity cost)
+2. **Joint reg** like Gram-matrix penalty (iter 112 H84 — component ready) which constrains both cross-token correlation AND per-token sparsity simultaneously
+3. **Sparsemax annealing** (iter 102b H77 follow-up) which forces hard zeros after warmup
+
+**Action: REVERT config bumps, keep structural improvements.**
+- `router_entropy_coef` 0.05 → 0.005 (back to iter 117 v5 value)
+- `entmax_blend_lr` 0.02 → 0.002 (back to iter 117 v5 value)
+- KEEP: router_reg_loss group refactor (commit `54473aa` structural part), DRY `_run_hutchinson_F` helper (now reporting hutch_F + rd_step per-K in K-sweep ★ which iter 117 v5 did not), sign-clarification doc updates, H89 REFUTED documentation, X1/X2/X3 component infrastructure.
+
+**Status:** NOT PROMOTED ✗. Configs reverted. Current baseline remains **iter 117 v5** (val_bpb int6 = 1.5122). Pivoting to next queue item (iter 113 H85 `block_ortho_aux_coef` 0.1 → 0.5).
+
 ### H88: Triton-fused entmax + grouped-GEMM via custom_op (iter 118) — PROPOSED CONDITIONAL 2026-04-29
 
 **Hypothesis.** If iter 117 (path A pure-PyTorch dispatch) confirms val_bpb is preserved, the next step is a **fused Triton kernel** for `entmax_alpha + grouped_GEMM` registered via `torch.library.custom_op` (with `register_fake` + `register_autograd`). Predicted **3–4× wallclock** speedup over iter 100b dense soft-MoE, vs iter 117's 1.5–2.5× from pure-PyTorch path.
