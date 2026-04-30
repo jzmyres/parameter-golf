@@ -25,6 +25,7 @@
 - `feedback_sparsity_value_props.md` — Score sparsity iters on val_bpb / throughput / reg as 3 orthogonal axes; soft-dense routing → router sparsity has zero throughput benefit without sparse dispatch
 - `feedback_uv_install.md` — Authorized installs use `uv pip install` (user directive 2026-04-28)
 - `feedback_check_gpu_free.md` — Preflight `pgrep` + `nvidia-smi` before launching ANY GPU job (silent contention wastes time + corrupts profiles)
+- `feedback_conda_run_buffering.md` — `conda run` without `--no-capture-output` silences the child for its entire lifetime; always pass the flag (or use `source activate`) when redirecting to a log file
 - `feedback_profile_before_throughput.md` — Throughput optimization needs chrome trace; not log fragments
 - `feedback_decouple_regularizers.md` — Antagonistic regularizers → keep one as metric, the other as loss
 - `feedback_anneal_sparsity_coefs.md` — Sparsity coefs anneal from 0; warmup_delay_frac=0.3 default
