@@ -1412,6 +1412,158 @@ def entmax_1p5(z: Tensor, dim: int = -1) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Iter 117b-2: Triton entmax-1.5 kernel + torch.library.custom_op wrapper.
+# ---------------------------------------------------------------------------
+# Default OFF (`use_entmax_triton: bool = False` in Hyperparameters). When
+# enabled via `--use-entmax-triton=1`, the SoftDenseRouter dispatches entmax
+# through a Triton kernel rather than the pure-PyTorch closed form above.
+# Verified equivalent to deep-spin/entmax reference in
+# experiments/test_entmax_triton.py + experiments/test_sparse_dispatch.py
+# (both forward and backward closed-form, see Phase A.0/A.2).
+# Backward formula (matching deep-spin): grad_z = sqrt(w) * (grad_w - c)
+#   where c = sum(sqrt(w) * grad_w) / sum(sqrt(w)).
+# torch.library.custom_op wrapper makes the kernel opaque to torch.compile
+# (the modern equivalent of the older autograd.Function pattern that broke
+# AdaSplash under DDP+RevDEQ+compile per CLAUDE.md Fix #2 NOT VIABLE).
+
+_USE_ENTMAX_TRITON: bool = False  # set by main() from Hyperparameters
+
+
+def _set_entmax_triton(enabled: bool) -> None:
+    """Module-level toggle invoked from main() before model construction.
+
+    Set ONCE at startup; reading is dynamo-folded into the compiled graph.
+    """
+    global _USE_ENTMAX_TRITON
+    _USE_ENTMAX_TRITON = bool(enabled)
+
+
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_OK = True
+except Exception:
+    _TRITON_OK = False
+
+
+if _TRITON_OK:
+
+    @triton.jit
+    def _entmax_1p5_triton_fwd_kernel(
+        z_ptr,
+        w_ptr,
+        eps: tl.constexpr,
+        E_BLOCK: tl.constexpr,
+    ):
+        """One program per row; loads E values into registers (E small fixed).
+
+        Forward: shift z so max=0; sort descending via -tl.sort(-z); prefix
+        sums S, S2; candidate τ_k = (S_k - sqrt(max(S²_k - k(S2_k - 4), eps)))/k;
+        pick largest k where τ_k < z_sorted_k; output w = max(0.5(z-τ), 0)².
+        """
+        pid = tl.program_id(axis=0)
+        offs = tl.arange(0, E_BLOCK)
+        row_off = pid * E_BLOCK + offs
+        z = tl.load(z_ptr + row_off).to(tl.float32)
+        z = z - tl.max(z, axis=0)
+        z_sorted = -tl.sort(-z, dim=0)
+        S = tl.cumsum(z_sorted, axis=0)
+        S2 = tl.cumsum(z_sorted * z_sorted, axis=0)
+        k = (offs + 1).to(tl.float32)
+        discr = S * S - k * (S2 - 4.0)
+        discr = tl.maximum(discr, eps)
+        tau_k = (S - tl.sqrt(discr)) / tl.maximum(k, 1.0)
+        valid = tau_k < z_sorted
+        support = tl.sum(valid.to(tl.int32), axis=0)
+        support = tl.maximum(support, 1)
+        target_idx = support - 1
+        tau = tl.sum(tl.where(offs == target_idx, tau_k, 0.0), axis=0)
+        half = 0.5 * (z - tau)
+        half = tl.maximum(half, 0.0)
+        w = half * half
+        tl.store(w_ptr + row_off, w)
+
+    @triton.jit
+    def _entmax_1p5_triton_bwd_kernel(
+        w_ptr,
+        grad_w_ptr,
+        grad_z_ptr,
+        eps: tl.constexpr,
+        E_BLOCK: tl.constexpr,
+    ):
+        """Backward closed-form: grad_z = sqrt(w) * (grad_w - c).
+
+        Outside support, w=0 → sqrt(w)=0 → grad_z=0 automatically.
+        """
+        pid = tl.program_id(axis=0)
+        offs = tl.arange(0, E_BLOCK)
+        row_off = pid * E_BLOCK + offs
+        w = tl.load(w_ptr + row_off).to(tl.float32)
+        g = tl.load(grad_w_ptr + row_off).to(tl.float32)
+        s = tl.sqrt(tl.maximum(w, 0.0))
+        s_sum = tl.sum(s, axis=0)
+        sg_sum = tl.sum(s * g, axis=0)
+        c = sg_sum / tl.maximum(s_sum, eps)
+        grad_z = s * (g - c)
+        tl.store(grad_z_ptr + row_off, grad_z)
+
+    @torch.library.custom_op("opg::entmax_1p5_triton", mutates_args=())
+    def _entmax_1p5_triton_op(z: torch.Tensor) -> torch.Tensor:
+        """Triton-fused entmax-1.5 forward. Input shape (..., E) with E a power
+        of 2 small constant (E=16 in our routing pool). Returns (..., E) of
+        weights summing to ≤1 (with exact zeros outside support).
+        """
+        orig_shape = z.shape
+        E = orig_shape[-1]
+        if E & (E - 1) != 0:
+            raise ValueError(
+                f"entmax_1p5_triton requires E to be a power of 2, got {E}")
+        z32 = z.detach().to(torch.float32).contiguous().view(-1, E)
+        w_flat = torch.empty_like(z32)
+        B = z32.shape[0]
+        if B == 0:
+            return w_flat.view(orig_shape).to(z.dtype)
+        _entmax_1p5_triton_fwd_kernel[(B,)](z32, w_flat, eps=1e-6, E_BLOCK=E)
+        return w_flat.view(orig_shape).to(z.dtype)
+
+    @_entmax_1p5_triton_op.register_fake
+    def _entmax_1p5_triton_op_fake(z: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(z)
+
+    def _entmax_1p5_triton_setup_ctx(ctx, inputs, output):
+        ctx.save_for_backward(output)
+
+    def _entmax_1p5_triton_backward(ctx, grad_w: torch.Tensor) -> torch.Tensor:
+        (w,) = ctx.saved_tensors
+        orig_shape = w.shape
+        E = orig_shape[-1]
+        w32 = w.detach().to(torch.float32).contiguous().view(-1, E)
+        g32 = grad_w.detach().to(torch.float32).contiguous().view(-1, E)
+        grad_z = torch.empty_like(w32)
+        B = w32.shape[0]
+        if B == 0:
+            return grad_z.view(orig_shape).to(grad_w.dtype)
+        _entmax_1p5_triton_bwd_kernel[(B,)](
+            w32, g32, grad_z, eps=1e-8, E_BLOCK=E)
+        return grad_z.view(orig_shape).to(grad_w.dtype)
+
+    _entmax_1p5_triton_op.register_autograd(
+        _entmax_1p5_triton_backward,
+        setup_context=_entmax_1p5_triton_setup_ctx,
+    )
+
+
+def entmax_1p5_dispatch(z: Tensor, dim: int = -1) -> Tensor:
+    """Dispatch wrapper used by SoftDenseRouter. Default = pure-PyTorch
+    `entmax_1p5`; when `_USE_ENTMAX_TRITON=True` and Triton is available AND
+    `dim == -1` (the only routing case), uses the Triton kernel.
+    """
+    if _USE_ENTMAX_TRITON and _TRITON_OK and dim == -1:
+        return _entmax_1p5_triton_op(z)
+    return entmax_1p5(z, dim=dim)
+
+
+# ---------------------------------------------------------------------------
 # SOFT DENSE ROUTER
 # ---------------------------------------------------------------------------
 
