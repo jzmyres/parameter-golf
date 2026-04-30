@@ -339,9 +339,12 @@ class Hyperparameters:
     #   2. Anneal from 0 over first warmup_frac of training (cold-start trap
     #      avoidance, same principle as α-annealing for iter 102).
     #   3. Drop min_share_loss penalty; keep min_share as DIAGNOSTIC metric only.
-    # CV loss alone provides global-balance regularization; entropy penalty
-    # alone provides per-token sparsity push. Two forces pulling in same-axis
-    # not opposite. Cleaner gradient landscape.
+    # Per-token entropy MINIMIZATION (sign: +coef·H_pertoken added to total
+    # loss, so the optimizer drives H_pertoken → 0 → per-token specialization).
+    # CV loss operates on the orthogonal axis of global cross-batch balance
+    # (prevents dead experts); the two regs do NOT antagonize — joint target
+    # is low pertoken_entropy AND low CV. If pertoken_entropy stays high in
+    # training, the issue is magnitude, not sign — bump this coef.
     router_entropy_coef = 0.005
     # Annealing schedule (iter 100b): scale = 0 for time_frac < warmup_delay_frac,
     # then linear ramp 0 → 1 over remaining training. Final effective coef =
@@ -1692,12 +1695,15 @@ class SoftDenseRouter(nn.Module):
                 float(self.min_share_loss_weight) * hs * min_share_loss
                 + float(self.cv_loss_weight) * hs * cv_loss
             )
-            # iter 100 (2026-04-27): per-token entropy penalty on routing.
-            # Drives per-token sparsity (peakier softmax) without architectural
-            # capacity cost (vs iter 99/101 NOT PROMOTED). Renormalize routing
-            # weights per-token so the entropy is measured over a probability
-            # distribution (sum=1); softmax already does this, but sigmoid gate
-            # makes raw `p` sum to ≤1, so renormalize before entropy compute.
+            # iter 100 (2026-04-27): per-token entropy MINIMIZATION on routing.
+            # Added to total loss with POSITIVE sign (+ec_t · H), so minimizing
+            # total_loss drives H_pertoken → 0 → token concentrates routing
+            # weight on few experts → specialization. Capacity-cost-free (vs
+            # iter 99/101 architectural-sparsity attempts, NOT PROMOTED).
+            # Renormalize routing weights per-token so the entropy is measured
+            # over a probability distribution (sum=1); softmax already does
+            # this, but sigmoid gate makes raw `p` sum to ≤1, so renormalize
+            # before entropy compute.
             # Tensor-gated to avoid the per-step Python-float guard recompile
             # (coderabbit Major #1). The buffer is updated in-place by the
             # training loop's annealer; reading it as a tensor keeps dynamo
@@ -3713,7 +3719,8 @@ class GPT(nn.Module):
             r_health = getattr(r, "_health_loss", zero)
             bal = bal + float(router_weights.get(rid, 0.0)) * r_bal
             health = health + float(router_weights.get(rid, 0.0)) * r_health
-            # iter 100: per-token entropy penalty (drives sparsity loss-side).
+            # iter 100: per-token entropy MINIMIZATION term (+ec_t · H added
+            # to total loss → drives H_pertoken → 0 → per-token specialization).
             # NOT multiplied by router_weights[rid]: the pooled router is summed
             # across attn+mlp slices via id-dedup (router_weights ≈ attn_mult +
             # mlp_mult ≈ 6.0 by default), but the entropy term is per-token —
@@ -5284,12 +5291,18 @@ def main() -> None:
                 )
                 return None
             samples: list[float] = []
+            # iter 97.5b-fix3 (2026-04-30): mirror the val-checkpoint probe's
+            # autocast wrapper at L4177 — without it the SharedBlock forward
+            # at K-sweep time hits "self and mat2 must have the same dtype,
+            # but got Float and BFloat16" because target_dtype derived from
+            # `next(sb.parameters()).dtype` may be fp32 (control tensor) while
+            # most internal matmuls expect bf16. Autocast resolves the mix.
             with _grad_safe_sdpa():
                 for _ in range(min(n_hutch, 2)):
                     v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
                                        dtype=z_star.dtype) * 2.0 - 1.0)
                     z_b = z_star.detach().clone().requires_grad_(True)
-                    with torch.enable_grad():
+                    with torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
                         u_b = sb(z_b, x0_lyap, b_bar_d)
                         jvp = torch.autograd.grad(
                             (u_b * v).sum(), z_b,
@@ -5302,9 +5315,11 @@ def main() -> None:
 
         # Finite-direction random-step Lipschitz sample. Avoid `.item()`
         # GPU→CPU sync inside the loop by clamping in-place.
+        # iter 97.5b-fix3 (2026-04-30): autocast wrapper added (same reason
+        # as _hutch_F_probe above).
         def _rd_step_probe() -> float | None:
             samples: list[float] = []
-            with _grad_safe_sdpa(), torch.no_grad():
+            with _grad_safe_sdpa(), torch.no_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
                 u_base = sb(z_star, x0_lyap, b_bar_d)
                 for _ in range(n_finite_diff):
                     eps_dir = torch.randn_like(z_star)
