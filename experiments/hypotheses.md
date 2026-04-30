@@ -2287,13 +2287,13 @@ Iter 117b-1 NOT PROMOTED 2026-04-30 (H87b RESULT) — config bumps reverted. Bas
 
 **Tier 1 — Ready to launch (just config or flag, no implementation):**
 1. ~~**Iter 113 (H85)** — `block_ortho_aux_coef` 0.1 → 0.5~~ — **DROPPED 2026-04-30** ✗. iter 117 v5 K-sweep shows attn_ortho=0.1235, mlp_ortho=0.2041 — both below threshold thr=0.20, so penalty is already 0 (attn) or ~1.7e-5 (mlp negligible). 5× coef bump multiplies zero by 5 → no-op. Threshold-based design also unprincipled (arbitrary 0.20, max-pairwise heuristic). Use iter 112 (Gram penalty) instead.
-2. **Iter 110 (H82)** — Re-enable `num_refinements = 1` (currently 0 since iter 98b). One-line config. Tests refinement under iter 117 v5's blend infrastructure.
+2. **Iter 112 (H84)** — Gram-matrix orthogonality penalty. Already integrated at commit `1d0d9ac`. Launch flags: `--use-orthogonal-expansion-routing=1 --routing-gram-coef=0.01`. **NEXT TO LAUNCH 2026-04-30.**
 3. **Iter 108 (H79)** — `deq_k_eval = 16 → 10`. Throughput-only, tests forward-K reduction.
 4. **Iter 117b-2 GPU smoke** — Launch with `--use-entmax-triton=1`. Triton entmax kernel verified vs deep-spin/entmax at fp32 floor; needs DDP+compile+RevDEQ smoke before full launch.
 5. **Iter 117b-3 GPU smoke** — Launch with `--use-sparse-dispatch=1 --sparse-dispatch-capacity-factor=8`. Sparse MoE dispatch numerically equivalent to dense at C ≥ (1-s)·E; smoke at C=8 should be bit-identical, then sweep down to find break-even.
+6. **Iter 110 (H82)** — Re-enable `num_refinements = 1` (currently 0 since iter 98b). One-line config. Tests refinement under iter 117 v5's blend infrastructure. **MOVED TO END OF Tier 1** 2026-04-30 per user direction (deferred behind sparsity/joint-reg work).
 
 **Tier 2 — Component PASSED smoke, train_gpt.py integration pending (3-touchpoint pattern):**
-6. **Iter 112 (H84)** — Orthogonal-expansion routing (Gram-matrix penalty `‖G − I/E‖²_F`). Component at `experiments/components/archive/orthogonal_expansion_routing.py` (archived after iter 112 integration) PASSED 6/6 smoke. Per H87b lesson, this is the principled next step for specialization (joint-reg constrains both axes that entropy alone couldn't).
 7. **Iter 120 (H90, NEW)** — RRAttention (Liu et al. 2026, arxiv:2602.05853). Per-head round-robin block-sparse attention. Component at `experiments/components/rr_attention.py` PASSED 8/8 smoke (τ=1.0 → bit-identical to dense). Replaces head-packed SDPA; integration in CausalSelfAttention.forward.
 8. **Iter 117b-3b** — Per-expert sparse-Q attention (asymmetric analog of MLP sparse dispatch). Component at `experiments/components/sparse_attention_dispatch.py` PASSED 7/7 smoke. Saves Q + SDPA + Wo per-expert; K, V remain dense.
 
