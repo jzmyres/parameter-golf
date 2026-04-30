@@ -412,6 +412,114 @@ def test_phase_A2_gradient_correctness():
 
 
 # ===========================================================================
+# Phase A.3: edge cases
+# ===========================================================================
+
+
+def test_phase_A3_edge_cases():
+    """Phase A.3: pathological routing distributions and shape edges."""
+    print("\n" + "=" * 60)
+    print("Phase A.3: edge cases")
+    print("=" * 60)
+
+    failures = 0
+    torch.manual_seed(4)
+
+    def check(tag, w, x, eW, eV, C, atol=1e-5):
+        nonlocal failures
+        out_dense  = dense_moe_dispatch(x, w, eW, eV)
+        out_sparse = sparse_moe_dispatch_capacity(x, w, eW, eV, capacity_factor=C)
+        err = (out_dense - out_sparse).abs().max().item()
+        rel = err / (out_dense.abs().max().item() + 1e-12) if out_dense.abs().max().item() > 0 else err
+        status = "PASS" if rel < atol else "FAIL"
+        if rel >= atol:
+            failures += 1
+        print(f"  {tag:<48} max_abs={err:.2e}  rel={rel:.2e}  {status}")
+
+    T, D, E, R = 64, 16, 8, 4
+    x = torch.randn(T, D)
+    eW = torch.randn(E, D, R) * 0.1
+    eV = torch.randn(E, R, D) * 0.1
+
+    # Edge 1: all-zero routing → output is zero
+    w_zero = torch.zeros(T, E)
+    out_sparse = sparse_moe_dispatch_capacity(x, w_zero, eW, eV, capacity_factor=2.0)
+    is_zero = out_sparse.abs().max().item() < 1e-12
+    print(f"  {'all-zero routing → zero output':<48} max_abs={out_sparse.abs().max().item():.2e}  "
+          f"{'PASS' if is_zero else 'FAIL'}")
+    if not is_zero:
+        failures += 1
+
+    # Edge 2: one-hot routing per token (extreme sparsity, K_active=1) — C=1 sufficient
+    idx = torch.randint(0, E, (T,))
+    w_onehot = torch.zeros(T, E).scatter_(1, idx.unsqueeze(1), 1.0)
+    util_max = (w_onehot > 0).sum(dim=0).max().item()
+    # C must give K ≥ util_max; with random indices util_max varies
+    K_min = util_max
+    C_min = K_min * E / T
+    check(f"one-hot routing (util_max={util_max}, C={max(C_min*1.5,1.0):.2f})",
+          w_onehot, x, eW, eV, C=max(C_min*1.5, 1.0))
+
+    # Edge 3: identical weight per token (uniform, no zeros) — C=E sufficient
+    w_uniform = torch.full((T, E), 1.0/E)
+    check("uniform routing 1/E (C=E)", w_uniform, x, eW, eV, C=E)
+
+    # Edge 4: single token → smallest possible batch
+    x_one = torch.randn(1, D)
+    logits_one = torch.randn(1, E) * 2.0
+    w_one = _entmax_1p5_pyref(logits_one, dim=-1)
+    util_max_one = (w_one > 0).sum(dim=0).max().item()
+    # K = ceil(C*1/E) needs to be ≥ util_max_one (=1 since only 1 token).
+    # ceil(C/E) ≥ 1 ⇒ C ≥ 1/E ≈ 0.125. C=1 is safe.
+    check("single token (T=1)", w_one, x_one, eW, eV, C=1.0)
+
+    # Edge 5: dim mismatch → shape-correctness ground truth
+    # Just check shapes
+    out = sparse_moe_dispatch_capacity(x, w_uniform, eW, eV, capacity_factor=E)
+    shape_ok = out.shape == (T, D)
+    print(f"  {'output shape matches (T,D)':<48} got={tuple(out.shape)}  expected={(T,D)}  "
+          f"{'PASS' if shape_ok else 'FAIL'}")
+    if not shape_ok:
+        failures += 1
+
+    # Edge 6: T not divisible by E (no special handling needed since K = ceil)
+    T2 = 67  # prime
+    x2 = torch.randn(T2, D)
+    logits2 = torch.randn(T2, E) * 2.0
+    w2 = _entmax_1p5_pyref(logits2, dim=-1)
+    check(f"T not divisible by E (T={T2}, E={E}, C={E})",
+          w2, x2, eW, eV, C=E)  # C=E gives K ≥ T2
+
+    # Edge 7: capacity overflow — explicitly test that error is BOUNDED by truncated mass.
+    # If we truncate weights with sum_truncated_w, the upper bound on rel_err
+    # scales with sum_truncated_w / sum_total_w.
+    print("  capacity-overflow error bound check:")
+    logits = torch.randn(T, E) * 2.0
+    w = _entmax_1p5_pyref(logits, dim=-1)
+    util_max = (w > 0).sum(dim=0).max().item()
+    sum_total = w.sum().item()
+    # Calculate sum of truncated weights at C=2 (deliberately short)
+    K = int(math.ceil(2.0 * T / E))
+    sum_kept = 0.0
+    for e in range(E):
+        topk_w, _ = w[:, e].topk(K, dim=0)
+        sum_kept += topk_w.clamp_min(0).sum().item()
+    sum_truncated = max(sum_total - sum_kept, 0)
+    truncated_frac = sum_truncated / max(sum_total, 1e-12)
+    out_dense  = dense_moe_dispatch(x, w, eW, eV)
+    out_sparse = sparse_moe_dispatch_capacity(x, w, eW, eV, capacity_factor=2.0)
+    err_rel = (out_dense - out_sparse).abs().max().item() / (out_dense.abs().max().item() + 1e-12)
+    # Upper bound: rel_err ≤ truncated_frac × max-expert-output-norm (≈ rel_err ≤ 2-3× truncated_frac in practice)
+    bound_holds = err_rel < 5 * truncated_frac + 1e-6
+    print(f"    truncated_frac={truncated_frac:.2%}  rel_err={err_rel:.2e}  "
+          f"bound_5x: {'PASS' if bound_holds else 'FAIL'}")
+    if not bound_holds:
+        failures += 1
+
+    return failures
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -427,6 +535,9 @@ if __name__ == "__main__":
 
     # Phase A.2 runs on CPU.
     failures += test_phase_A2_gradient_correctness()
+
+    # Phase A.3 runs on CPU.
+    failures += test_phase_A3_edge_cases()
 
     print("\n" + "=" * 60)
     if failures == 0:
