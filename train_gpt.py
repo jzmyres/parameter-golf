@@ -396,6 +396,18 @@ class Hyperparameters:
     # full training launch (custom_op + DDP + compile + RevDEQ is fragile;
     # see CLAUDE.md Fix #2 NOT VIABLE for the AdaSplash precedent).
     use_entmax_triton = False
+    # iter 117b-3 (2026-04-30): capacity-padded sparse MoE dispatch.
+    # Default OFF (dense evaluation: every expert sees every token).
+    # When True, MLP and/or attention expert paths gather top-K tokens per
+    # expert (K = ceil(C * T / E)), evaluate, and scatter_add. Throughput-
+    # only change when C is sufficient (≥ (1-s)·E + headroom for sparsity s).
+    # See experiments/test_sparse_dispatch.py Phase A.0-A.5 for correctness
+    # proofs (bit-identical to dense at sufficient C, monotone approximation
+    # error otherwise). Wiring is currently inert: helper function exists but
+    # CausalSelfAttention/MLP still use dense compute. Step 3 will add the
+    # MLP-path wiring.
+    use_sparse_dispatch = False
+    sparse_dispatch_capacity_factor = 4.0
     # iter 117 v2 (post-NaN rescue 2026-04-29): the entmax blend itself is
     # ANNEALED from pure softmax (anneal=0 → blend forced to 1.0 = softmax)
     # to learnable (anneal=1 → blend = sigmoid(blend_logit)) over training.
@@ -567,7 +579,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
-        "use-polar-express-ns", "use-entmax-triton",
+        "use-polar-express-ns", "use-entmax-triton", "use-sparse-dispatch",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
@@ -586,7 +598,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
                  "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
                  "use_entmax_routing", "use_polar_express_ns",
-                 "use_entmax_triton"}
+                 "use_entmax_triton", "use_sparse_dispatch"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -4498,6 +4510,13 @@ def main() -> None:
     # set BEFORE model construction so dynamo constant-folds the dispatch
     # branch into the compiled SoftDenseRouter graph.
     _set_entmax_triton(getattr(args, "use_entmax_triton", False))
+    # iter 117b-3: sparse MoE dispatch toggle (capacity-padded gather/scatter).
+    # Module-level flag read by helper at forward time; constant-folded by
+    # dynamo when set BEFORE model construction.
+    _set_sparse_dispatch(
+        getattr(args, "use_sparse_dispatch", False),
+        getattr(args, "sparse_dispatch_capacity_factor", 4.0),
+    )
     args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
     args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
     if not getattr(args, "run_id", ""):
