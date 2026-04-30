@@ -4532,6 +4532,19 @@ def main() -> None:
         getattr(args, "use_sparse_dispatch", False),
         getattr(args, "sparse_dispatch_capacity_factor", 4.0),
     )
+    # iter 103: chained routing safety guard. The Hyperparameter exists
+    # (X3 step 1) and CLI accepts the flag, but the Block refactor is not
+    # yet implemented (X3 step 2-4 land progressively). Fail-fast here so
+    # an accidental --use-chained-routing=1 launch produces a clear error
+    # instead of silently running single-stage iter 117b-1 baseline.
+    if getattr(args, "use_chained_routing", False):
+        raise NotImplementedError(
+            "iter 103 / H77 chained 2-stage routing is not yet implemented. "
+            "Hyperparameter + CLI flag are in place but the Block refactor "
+            "(two routers, halved expert sets, chain logic) is pending. "
+            "See experiments/hypotheses.md H77 for the design spec. "
+            "Set --use-chained-routing=0 to launch with single-stage routing."
+        )
     args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
     args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
     if not getattr(args, "run_id", ""):
