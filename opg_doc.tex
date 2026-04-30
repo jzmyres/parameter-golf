@@ -162,20 +162,27 @@ locally exponentially stable attractor.
 \texttt{train\_batch\_tokens} & 524,288 & \texttt{iterations} & 1000 \\
 \texttt{max\_wallclock\_seconds} & 0 & \texttt{num\_layers} & 12 \\
 \texttt{model\_dim} & 768 & \texttt{num\_heads} & 8 \\
-\texttt{num\_kv\_heads} & 4 & \texttt{num\_experts} & 8 \\
+\texttt{num\_kv\_heads} & 4 & \texttt{num\_experts} & 16 \\
 \texttt{num\_shared\_experts} & 1 & \texttt{mlp\_mult} & 3.0 \\
-\texttt{attn\_expert\_rank} & 128 & \texttt{mlp\_expert\_rank} & 192 \\
+\texttt{attn\_expert\_rank} & 64 & \texttt{mlp\_expert\_rank} & 96 \\
 \texttt{kv\_latent\_dim} & auto $D/2$ & \texttt{tie\_embeddings} & true \\
 \texttt{bigram\_vocab\_size} & 0 & \texttt{use\_ctp} & false \\
-\texttt{num\_refinements} & 1 & \texttt{num\_refinements\_ramp\_frac} & 0.85 \\
+\texttt{num\_refinements} & 0 & \texttt{num\_refinements\_ramp\_frac} & 0.85 \\
 \texttt{use\_parcae} & true & \texttt{parcae\_init\_a\_bar} & 0.7 \\
 \texttt{deq\_backward} & revdeq & \texttt{deq\_bptt\_k} & 2 \\
-\texttt{deq\_bptt\_k\_jitter\_set} & $(2,3,4)$ & \texttt{deq\_k\_jitter\_set} & $(8,12,20)$ \\
+\texttt{deq\_k\_jitter} & true & \texttt{deq\_k\_jitter\_set} & $(16,24)$ \\
 \texttt{deq\_k\_eval} & 16 & \texttt{router\_scoring} & linear \\
 \texttt{lyapunov\_coef} & 0.0 & \texttt{lyapunov\_gamma} & 0.97 \\
 \texttt{lyapunov\_warmup\_frac} & 0.05 & \texttt{denoising\_coef} & 0.0 \\
 \texttt{denoising\_noise\_std} & 0.01 & \texttt{grad\_clip\_norm} & 1.0 \\
-\texttt{mos\_balance\_mult} & 50.0 & & \\
+\texttt{weight\_decay} & 0.01 & \texttt{mos\_balance\_mult} & 50.0 \\
+\texttt{min\_share\_loss\_weight} & 0.0 & \texttt{cv\_loss\_weight} & 2.0 \\
+\texttt{router\_entropy\_coef} & 0.005 & \texttt{router\_entropy\_warmup\_delay\_frac} & 0.3 \\
+\texttt{use\_entmax\_routing} & false & \texttt{entmax\_blend\_init\_logit} & 5.0 \\
+\texttt{use\_orthogonal\_expansion\_routing} & false & \texttt{routing\_gram\_coef} & 0.01 \\
+\texttt{routing\_gram\_warmup\_delay\_frac} & 0.3 & & \\
+\texttt{muon\_backend\_steps} & 7 & \texttt{use\_polar\_express\_ns} & true \\
+\texttt{muon\_momentum} & 0.99 & \texttt{matrix\_lr} & 0.022 \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -190,6 +197,34 @@ HyDRA finite-perturbation denoising as redundant under Parcae per-dimension
 $\bar A$, which already bounds the local spectral radius).  The penalty terms
 remain in the code path so the coefficients can be re-enabled without an
 architectural change.
+
+\subsection{Optimizer}
+\label{sec:optimizer}
+
+Matrix parameters use Muon with Polar-Express Newton--Schulz (PE-NS,
+\texttt{use\_polar\_express\_ns=true} default, \texttt{muon\_backend\_steps=7}).
+PE-NS uses minimax-tuned per-iteration polynomial coefficients that converge to
+the matrix sign function faster than the stock Schulz-3 iteration; with 7
+iterations this reaches the same tolerance as $\sim 12$ stock iterations,
+giving slightly tighter orthogonalization at the same wall-clock cost.  Scalar
+parameters use Adam ($\beta_1{=}0.85$, $\beta_2{=}0.90$); tied embeddings use
+Adam at \texttt{tied\_embed\_lr=0.03}; Parcae raw parameters use a dedicated
+\texttt{parcae\_lr=0.002}; the entmax blend logit (when entmax routing is
+enabled) uses \texttt{entmax\_blend\_lr=0.002}.  Gradient clipping is applied
+at norm $1.0$.
+
+\paragraph{Practical implementation: PE-NS variance-regularizer interaction.}
+The PE-NS default was briefly disabled in early iter 121 after iter 117 v2
+NaN'd at step 30.  Bisection in iter 117 v3 identified the actual NaN driver
+as the variance regularizer
+$\mathcal{L}_{\mathrm{var}} = -\lambda \sum_e \mathrm{Var}_t(w(e \mid t))$
+(introduced in H83) interacting with entmax-1.5: entmax produces exact-zero
+routing weights above its threshold, and the negative-coefficient variance
+term rewards larger token specialization, creating a positive feedback loop
+that PE-NS's larger update spectrum amplifies.  Removing $\mathcal{L}_{\mathrm{var}}$
+breaks the cascade; PE-NS @ 7 is then numerically stable and is the current
+default since iter 117 v5 (PROMOTED 2026-04-30).  Code keeps both NS variants
+behind \texttt{use\_polar\_express\_ns} for clean A/B comparison.
 
 \section{Notation}
 \label{sec:notation}
