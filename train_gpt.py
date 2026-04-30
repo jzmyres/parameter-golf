@@ -2785,6 +2785,32 @@ class Block(nn.Module):
         w_all = self.router(u_proj, pre_normed=True)  # (..., 2*num_routed)
         return w_all[..., :num_routed].contiguous(), w_all[..., num_routed:].contiguous()
 
+    @dynamo_disable
+    def _capture_shared_gate_diag(self, g_s_attn: Tensor, g_s_mlp: Tensor) -> None:
+        """Eager-only capture of shared-gate stats. Called from forward().
+
+        iter 117 v5 (2026-04-29): hoisted from inline `if _should_diag(...):`
+        to a `@dynamo_disable` helper to break the recompile-pressure cycle
+        observed in v4 (16-recompile budget hit at ~s30, eager fallback for
+        one resume frame, slow throughput). dynamo treats this as a single
+        opaque call — no guards on _should_diag / _ROUTER_DIAGNOSTICS_ACTIVE
+        / grad_mode toggles inside.
+
+        Inside the helper, `.detach()` already prevents gradient flow, so the
+        previous `with torch.no_grad():` was redundant — removed for clarity.
+        """
+        if _should_diag(self.training):
+            g_sf = torch.cat([g_s_attn.detach().float(), g_s_mlp.detach().float()], dim=-1)
+            self._shared_gate_mean = g_sf.mean().detach()
+            self._shared_gate_min = g_sf.min().detach()
+            self._shared_gate_std = g_sf.std(unbiased=False).detach()
+            self._shared_gate_diag_step = _ROUTER_DIAGNOSTICS_STEP
+        else:
+            self._shared_gate_mean = None
+            self._shared_gate_min = None
+            self._shared_gate_std = None
+            self._shared_gate_diag_step = None
+
     def forward(self, z_in: Tensor, x0: Tensor, b_bar: Tensor | None = None) -> Tensor:
         # h = RMSUnit(z + x_0); Δ = Σ g_s·E_shared(h) + Σ w_j·E_routed_j(h).
         # Output injection (x_0 term) is applied below via B̄ ⊙ RMSUnit(x_0).
@@ -2806,21 +2832,18 @@ class Block(nn.Module):
             h_shared_gate_mlp = h * self.shared_gate_norm_weight_mlp.to(dtype=h.dtype)
             g_s_attn = torch.sigmoid(self.shared_gate_attn(h_shared_gate_attn))  # (B, T, S)
             g_s_mlp = torch.sigmoid(self.shared_gate_mlp(h_shared_gate_mlp))      # (B, T, S)
-            if _should_diag(self.training):
-                with torch.no_grad():
-                    g_sf = torch.cat([g_s_attn.detach().float(), g_s_mlp.detach().float()], dim=-1)
-                    # Store as 0-d GPU tensors — log site (`format_expert_info`)
-                    # already calls `float(...)` for formatting, which performs
-                    # the single .item() sync OUTSIDE the micro_step loop.
-                    self._shared_gate_mean = g_sf.mean().detach()
-                    self._shared_gate_min = g_sf.min().detach()
-                    self._shared_gate_std = g_sf.std(unbiased=False).detach()
-                    self._shared_gate_diag_step = _ROUTER_DIAGNOSTICS_STEP
-            else:
-                self._shared_gate_mean = None
-                self._shared_gate_min = None
-                self._shared_gate_std = None
-                self._shared_gate_diag_step = None
+            # iter 117 v5 (2026-04-29): hoist this diagnostic block into a
+            # `@dynamo_disable` helper. Original inline pattern hit dynamo's
+            # recompile_limit (16) at ~s30: `_should_diag` is a Python-bool
+            # guard that toggles every ~10 steps for log emission, AND the
+            # `with torch.no_grad():` context flips GLOBAL_STATE grad_mode.
+            # Every log boundary burned 2 recompiles → 8 boundaries hit the
+            # 16-budget → eager fallback for one resume frame → 30-50%
+            # slower steady-state. Wrapping in `@dynamo_disable` makes it
+            # opaque to dynamo — one fixed graph break per forward (no
+            # guards on internal state). Mirrors the iter 28 `_capture_attn_out_ortho`
+            # pattern at L1860.
+            self._capture_shared_gate_diag(g_s_attn, g_s_mlp)
             attn_shared = (attn_expert_out[:, :, :S, :] * g_s_attn.unsqueeze(-1)).sum(dim=2)
             # Routed: weighted by router
             attn_routed = (attn_expert_out[:, :, S:, :] * w_attn.unsqueeze(-1)).sum(dim=2)
