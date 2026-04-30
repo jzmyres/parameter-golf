@@ -1809,25 +1809,9 @@ This forces the routing weight matrix `[w_1, w_2, ..., w_T]` (shape T × E) to h
 
 **Test:** Add `routing_gram_coef = 0.01`, `routing_gram_warmup_delay_frac = 0.3` annealed schedule. Strict-generalization (coef=0 recovers baseline). Run after iter 111.
 
-**Status:** PROPOSED — queued **HIGH PRIORITY priority 2** post-iter-98b per user direction 2026-04-29 (sequenced after iter 111 to bisect penalty strength).
+**Status:** READY — integrated into `train_gpt.py` at commit `1d0d9ac` (2026-04-30). Default OFF; CLI-enable per launch with `--use-orthogonal-expansion-routing=1 --routing-gram-coef=0.01`.
 
-**Component implementation (2026-04-30):** standalone helper landed at
-`experiments/components/orthogonal_expansion_routing.py`. Smoke tests
-PASS — penalty correctness verified analytically:
-- uniform routing (w=1/E for all): penalty = 0.109375 (= (E-1)/E²)
-- balanced one-hot (each token uses one expert, balanced across E):
-  penalty = 0.0 (the target equilibrium)
-- collapsed (all tokens → expert 0): penalty = 0.875
-  (= (1−1/E)² + (E−1)·(1/E)²)
-- gradient flows through softmax→W path
-- anneal helper validated against `progress` ∈ {0, delay, midway, 1}.
-The component exposes `compute_gram_penalty(p, coef_scale)` +
-`set_orthogonal_expansion_routing(enabled, coef, warmup_delay_frac)`
-toggle. Integration into `train_gpt.py::SoftDenseRouter._collect_routing_losses`
-pending — three-touchpoint pattern (Hyperparameters field + CLI flag +
-`compute_gram_penalty(p)` call after routing forward + add to
-`router_reg_loss` group). Will land BETWEEN iterations per the
-"clean-up between launches" discipline.
+**Component smoke (2026-04-30):** standalone helper smoke 6/6 PASS — penalty correctness verified analytically: uniform=0.109375 = (E-1)/E²; balanced one-hot=0; collapsed=0.875 = (1−1/E)² + (E−1)·(1/E)²; gradient flows through softmax→W path; anneal helper validated against `progress` ∈ {0, delay, midway, 1}. Integration into `train_gpt.py::SoftDenseRouter._collect_routing_losses` LANDED via three-touchpoint pattern (commit `1d0d9ac`): Hyperparameters fields + CLI flags + `_gram_coef` buffer/property/annealer + Gram penalty computation in router forward + `_gram_penalty_loss` folded into `router_reg_loss`. End-to-end smoke PASSED (loss 7.02 → 4.44 over 300 steps, recon stable, no NaN). Standalone helper archived at `experiments/components/archive/orthogonal_expansion_routing.py` (design notes only; canonical implementation now lives in `train_gpt.py`).
 
 ### H85: Increase block_ortho_aux_coef 0.1 → 0.5 (iter 113) — DROPPED ✗ (2026-04-30, no-op given current ortho values + threshold-design analysis)
 
@@ -1846,7 +1830,7 @@ pending — three-touchpoint pattern (Hyperparameters field + CLI flag +
 - Drop threshold entirely (active at all magnitudes, original H32 form)
 - Switch to a principled formulation: Frobenius distance from `I/E`, mutual information, or spectral regularizer
 
-**Iter 112 (H84 Gram-matrix penalty) supersedes this need.** The Gram penalty `‖G − I/E‖²_F` (where `G = (1/N) W^T W` over routing weights) is the principled alternative — no threshold, active everywhere, targets orthogonal columns of routing weight matrix directly. Component already PASSED smoke tests (`experiments/components/orthogonal_expansion_routing.py`, 6/6).
+**Iter 112 (H84 Gram-matrix penalty) supersedes this need.** The Gram penalty `‖G − I/E‖²_F` (where `G = (1/N) W^T W` over routing weights) is the principled alternative — no threshold, active everywhere, targets orthogonal columns of routing weight matrix directly. Component already PASSED smoke tests (`experiments/components/archive/orthogonal_expansion_routing.py` (archived after iter 112 integration), 6/6).
 
 **Status:** DROPPED ✗. Pivot to iter 112 (H84) for the principled orthogonality push, or iter 110 (H82, re-enable num_refinements=1) for an architectural test.
 
@@ -2309,7 +2293,7 @@ Iter 117b-1 NOT PROMOTED 2026-04-30 (H87b RESULT) — config bumps reverted. Bas
 5. **Iter 117b-3 GPU smoke** — Launch with `--use-sparse-dispatch=1 --sparse-dispatch-capacity-factor=8`. Sparse MoE dispatch numerically equivalent to dense at C ≥ (1-s)·E; smoke at C=8 should be bit-identical, then sweep down to find break-even.
 
 **Tier 2 — Component PASSED smoke, train_gpt.py integration pending (3-touchpoint pattern):**
-6. **Iter 112 (H84)** — Orthogonal-expansion routing (Gram-matrix penalty `‖G − I/E‖²_F`). Component at `experiments/components/orthogonal_expansion_routing.py` PASSED 6/6 smoke. Per H87b lesson, this is the principled next step for specialization (joint-reg constrains both axes that entropy alone couldn't).
+6. **Iter 112 (H84)** — Orthogonal-expansion routing (Gram-matrix penalty `‖G − I/E‖²_F`). Component at `experiments/components/archive/orthogonal_expansion_routing.py` (archived after iter 112 integration) PASSED 6/6 smoke. Per H87b lesson, this is the principled next step for specialization (joint-reg constrains both axes that entropy alone couldn't).
 7. **Iter 120 (H90, NEW)** — RRAttention (Liu et al. 2026, arxiv:2602.05853). Per-head round-robin block-sparse attention. Component at `experiments/components/rr_attention.py` PASSED 8/8 smoke (τ=1.0 → bit-identical to dense). Replaces head-packed SDPA; integration in CausalSelfAttention.forward.
 8. **Iter 117b-3b** — Per-expert sparse-Q attention (asymmetric analog of MLP sparse dispatch). Component at `experiments/components/sparse_attention_dispatch.py` PASSED 7/7 smoke. Saves Q + SDPA + Wo per-expert; K, V remain dense.
 

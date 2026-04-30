@@ -369,7 +369,7 @@ class Hyperparameters:
     # active everywhere (no threshold), targets exact balanced one-hot as
     # zero of penalty.
     # Default OFF; toggle with `--use-orthogonal-expansion-routing=1`.
-    # See `experiments/components/orthogonal_expansion_routing.py` for
+    # See `experiments/components/archive/orthogonal_expansion_routing.py` (archived after iter 112 integration; design notes only) for
     # standalone helper + smoke tests (6/6 PASS analytically).
     # Smoke test verified: balanced one-hot routing → penalty = 0 (target);
     # uniform routing 1/E → penalty = (E-1)/E²; collapsed → (1-1/E)² + (E-1)/E².
@@ -1727,7 +1727,7 @@ class SoftDenseRouter(nn.Module):
         # iter 112 / H84: Gram-matrix orthogonal-expansion penalty buffer.
         # Same buffer pattern as `_entropy_coef` — annealed by training loop.
         # Penalty `||G - I/E||²_F` where G = (1/N) W^T W on per-token weights.
-        # See `experiments/components/orthogonal_expansion_routing.py` for
+        # See `experiments/components/archive/orthogonal_expansion_routing.py` (archived after iter 112 integration; design notes only) for
         # standalone helper + smoke tests. Targets joint per-token sparsity
         # AND global balance (the two axes that entropy alone could not
         # enforce together — H87b lesson).
@@ -2015,7 +2015,7 @@ class SoftDenseRouter(nn.Module):
                 self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
             # iter 112 / H84: Gram-matrix orthogonal-expansion penalty.
             # ||G - I/E||²_F where G = (1/N) W^T W on per-token routing weights.
-            # See `experiments/components/orthogonal_expansion_routing.py`.
+            # See `experiments/components/archive/orthogonal_expansion_routing.py` (archived after iter 112 integration; design notes only).
             # Targets joint per-token sparsity AND global balance — the two
             # axes that entropy alone could not enforce together (H87b lesson).
             # Same buffer-gated pattern as entropy reg.
