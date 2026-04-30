@@ -1382,11 +1382,14 @@ def entmax_1p5(z: Tensor, dim: int = -1) -> Tensor:
     # iter 117 v3 NaN fix (2026-04-29): clamp discr at small positive epsilon
     # rather than 0. Backward gradient of sqrt(0) is 1/(2·sqrt(0)) = Inf →
     # IEEE-754 0×Inf = NaN propagates through (1−blend)·p_entmax even when
-    # blend=1.0 zeros the forward contribution. Clamping at 1e-8 caps the
-    # sqrt gradient at 1/(2·sqrt(1e-8)) = 5000 (finite), preserving the
-    # 0-multiplication chain rule (0 × 5000 = 0, no NaN). Forward output is
-    # numerically identical for any discr ≥ 1e-8 that would arise in practice.
-    discr = (S * S - k * (S2 - 4.0)).clamp_min(1e-8)
+    # blend=1.0 zeros the forward contribution. ε=1e-6 caps the sqrt gradient
+    # at 1/(2·sqrt(1e-6)) = 500 (finite), preserving the chain rule (any
+    # finite × 0 = 0, no NaN). Forward bias on sqrt(discr) is ~1e-3 → routing
+    # weight bias ≤ 1e-4, BELOW bf16 precision floor (~1e-3). 1e-6 chosen over
+    # 1e-8 for additional defensive margin: the smaller value's 5000 max
+    # gradient could spike under chain-rule × (1−blend)≈0.5 to 2500, while
+    # 1e-6's 500 max gives 250 worst case — 10× safer at no observable cost.
+    discr = (S * S - k * (S2 - 4.0)).clamp_min(1e-6)
     tau_k = (S - discr.sqrt()) / k.clamp_min(1.0)
 
     # Pick largest k with tau_k < z_sorted_k (support size).
