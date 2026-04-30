@@ -2286,16 +2286,26 @@ The huge integers in the shape are uninitialized memory interpreted as int64 —
 Iter 117b-1 NOT PROMOTED 2026-04-30 (H87b RESULT) — config bumps reverted. Baseline remains iter 117 v5. Structural improvements kept: `router_reg_loss` group, DRY `_run_hutchinson_F` helper (now emitting hutch_F + rd_step per-K in K-sweep), iter 117b-2 X1 Triton entmax kernel + custom_op (default OFF), iter 117b-3 X2 sparse MoE dispatch helper + MLP-path wiring (default OFF), iter 103 X3 chained-routing flag + safety guard (default OFF), all `experiments/components/` files (chained_block, orthogonal_expansion_routing, rr_attention, sparse_attention_dispatch).
 
 **Tier 1 — Ready to launch (just config or flag, no implementation):**
-1. ~~**Iter 113 (H85)** — `block_ortho_aux_coef` 0.1 → 0.5~~ — **DROPPED 2026-04-30** ✗. iter 117 v5 K-sweep shows attn_ortho=0.1235, mlp_ortho=0.2041 — both below threshold thr=0.20, so penalty is already 0 (attn) or ~1.7e-5 (mlp negligible). 5× coef bump multiplies zero by 5 → no-op. Threshold-based design also unprincipled (arbitrary 0.20, max-pairwise heuristic). Use iter 112 (Gram penalty) instead.
-2. **Iter 112 (H84)** — Gram-matrix orthogonality penalty. Already integrated at commit `1d0d9ac`. Launch flags: `--use-orthogonal-expansion-routing=1 --routing-gram-coef=0.01`. **NEXT TO LAUNCH 2026-04-30.**
-3. **Iter 108 (H79)** — `deq_k_eval = 16 → 10`. Throughput-only, tests forward-K reduction.
-4. **Iter 117b-2 GPU smoke** — Launch with `--use-entmax-triton=1`. Triton entmax kernel verified vs deep-spin/entmax at fp32 floor; needs DDP+compile+RevDEQ smoke before full launch.
-5. **Iter 117b-3 GPU smoke** — Launch with `--use-sparse-dispatch=1 --sparse-dispatch-capacity-factor=8`. Sparse MoE dispatch numerically equivalent to dense at C ≥ (1-s)·E; smoke at C=8 should be bit-identical, then sweep down to find break-even.
-6. **Iter 110 (H82)** — Re-enable `num_refinements = 1` (currently 0 since iter 98b). One-line config. Tests refinement under iter 117 v5's blend infrastructure. **MOVED TO END OF Tier 1** 2026-04-30 per user direction (deferred behind sparsity/joint-reg work).
 
-**Tier 2 — Component PASSED smoke, train_gpt.py integration pending (3-touchpoint pattern):**
-7. **Iter 120 (H90, NEW)** — RRAttention (Liu et al. 2026, arxiv:2602.05853). Per-head round-robin block-sparse attention. Component at `experiments/components/rr_attention.py` PASSED 8/8 smoke (τ=1.0 → bit-identical to dense). Replaces head-packed SDPA; integration in CausalSelfAttention.forward.
-8. **Iter 117b-3b** — Per-expert sparse-Q attention (asymmetric analog of MLP sparse dispatch). Component at `experiments/components/sparse_attention_dispatch.py` PASSED 7/7 smoke. Saves Q + SDPA + Wo per-expert; K, V remain dense.
+**Priority reshuffle 2026-04-30 (user directive — `feedback_throughput_priority.md`):** throughput-bearing sparsity iters take precedence over Gram-coef follow-up sweeps. Iter 112's Gram-penalty coef/delay sweeps (112b/c/d) are deferred to AFTER all throughput-bearing iters land.
+
+1. ~~**Iter 113 (H85)** — `block_ortho_aux_coef` 0.1 → 0.5~~ — **DROPPED 2026-04-30** ✗. iter 117 v5 K-sweep shows attn_ortho=0.1235, mlp_ortho=0.2041 — both below threshold thr=0.20, so penalty is already 0 (attn) or ~1.7e-5 (mlp negligible). 5× coef bump multiplies zero by 5 → no-op. Threshold-based design also unprincipled (arbitrary 0.20, max-pairwise heuristic). Use iter 112 (Gram penalty) instead.
+2. **Iter 112 (H84)** — Gram-matrix orthogonality penalty. Integrated at commit `1d0d9ac`. **IN FLIGHT 2026-04-30.** Launch flags: `--use-orthogonal-expansion-routing=1 --routing-gram-coef=0.01`. s200 val=2.0240 (Δ−0.023), s400 val=1.7013 (Δ−0.013). Final result + K-sweep matrix landing ~21:10.
+3. **Iter 117b-2 GPU smoke** — **THROUGHPUT-BEARING (PRIORITY).** Launch with `--use-entmax-triton=1 --use-entmax-routing=1`. Triton entmax kernel verified vs deep-spin/entmax at fp32 floor; needs DDP+compile+RevDEQ smoke. Tests fused-kernel correctness under blend.
+4. **Iter 117b-3 GPU smoke** — **THROUGHPUT-BEARING (PRIORITY).** Launch with `--use-sparse-dispatch=1 --sparse-dispatch-capacity-factor=8 --use-entmax-routing=1`. Sparse MoE dispatch numerically equivalent to dense at C ≥ (1-s)·E; smoke at C=8 should be bit-identical, then sweep capacity down to find break-even. **Strongest throughput win in the queue** (skip-zero-experts under entmax sparsity).
+5. **Iter 117b-3b** — **THROUGHPUT-BEARING (Tier 2 promoted to Tier 1).** Per-expert sparse-Q attention (asymmetric analog of MLP sparse dispatch). Component at `experiments/components/sparse_attention_dispatch.py` PASSED 7/7 smoke. Saves Q + SDPA + Wo per-expert; K, V remain dense.
+6. **Iter 120 (H90, NEW)** — **THROUGHPUT-BEARING (Tier 2 promoted to Tier 1).** RRAttention (Liu et al. 2026, arxiv:2602.05853). Per-head round-robin block-sparse attention. Component at `experiments/components/rr_attention.py` PASSED 8/8 smoke (τ=1.0 → bit-identical to dense). Replaces head-packed SDPA; integration in CausalSelfAttention.forward.
+7. **Iter 108 (H79)** — `deq_k_eval = 16 → 10`. Throughput-only, tests forward-K reduction. Lower magnitude throughput win than 117b-3 / 120 but very low-risk one-line config.
+8. **Iter 110 (H82)** — Re-enable `num_refinements = 1` (currently 0 since iter 98b). One-line config. Tests refinement under iter 117 v5's blend infrastructure. **MOVED TO END OF Tier 1** 2026-04-30 per user direction.
+
+**Deferred — coef-sweep follow-ups (post throughput iters):**
+- **Iter 112b**: Gram coef target 0.05 (5× current). Same `warmup_delay=0.3`. Tests stronger steady-state pressure. Conditional on iter 112 promotion + after 117b-2/117b-3 land.
+- **Iter 112c**: Gram `warmup_delay=0.1` + coef 0.01. Engages earlier (s100 vs s300), longer active phase. Conditional on 112 promotion.
+- **Iter 112d**: combined (`warmup_delay=0.1`, coef 0.05). Most aggressive; only if 112b/c clean.
+
+**Tier 2 — (emptied 2026-04-30; both items promoted to Tier 1 per `feedback_throughput_priority.md`):**
+- ~~Iter 120 (RRAttention)~~ → **Tier 1 #6**
+- ~~Iter 117b-3b (sparse-Q attention)~~ → **Tier 1 #5**
 
 **Tier 3 — Pending implementation (no component yet):**
 9. **Iter 117c** — Equal-weight `routing_reg_coef` refactor (collapse 3 coefs to 1, sweep at {0.1, 0.5, 1.0, 2.0}).
