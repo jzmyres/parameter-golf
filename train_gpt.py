@@ -386,6 +386,16 @@ class Hyperparameters:
     # Gradient drives this LOGIT DOWN if entmax-1.5's exact-zeros routing
     # benefits val_bpb.
     entmax_blend_init_logit = 5.0
+    # iter 117b-2 (2026-04-30): Triton-fused entmax-1.5 kernel. Default OFF
+    # (pure-PyTorch closed form via train_gpt.py::entmax_1p5). When True AND
+    # Triton is available, SoftDenseRouter's entmax path uses the custom_op
+    # registered Triton kernel (forward + closed-form backward, verified
+    # against deep-spin/entmax reference at fp32 noise floor). Throughput-
+    # only change; numerical equivalence within bf16 floor is required for
+    # promotion. Smoke test under --use-entmax-triton=1 must pass before
+    # full training launch (custom_op + DDP + compile + RevDEQ is fragile;
+    # see CLAUDE.md Fix #2 NOT VIABLE for the AdaSplash precedent).
+    use_entmax_triton = False
     # iter 117 v2 (post-NaN rescue 2026-04-29): the entmax blend itself is
     # ANNEALED from pure softmax (anneal=0 → blend forced to 1.0 = softmax)
     # to learnable (anneal=1 → blend = sigmoid(blend_logit)) over training.
@@ -557,7 +567,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
-        "use-polar-express-ns",
+        "use-polar-express-ns", "use-entmax-triton",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
@@ -575,7 +585,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
                  "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
-                 "use_entmax_routing", "use_polar_express_ns"}
+                 "use_entmax_routing", "use_polar_express_ns",
+                 "use_entmax_triton"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -1824,7 +1835,11 @@ class SoftDenseRouter(nn.Module):
             blend_learned = torch.sigmoid(self._entmax_blend_logit)
             anneal = self._entmax_blend_anneal
             blend = (1.0 - anneal) + blend_learned * anneal
-            p_entmax = entmax_1p5(logits_f32, dim=-1)
+            # iter 117b-2: dispatch routes to Triton kernel when
+            # `_USE_ENTMAX_TRITON` is set (CLI flag --use-entmax-triton=1);
+            # otherwise pure-PyTorch entmax_1p5. Default OFF preserves
+            # iter 117b-1 behavior bit-identically.
+            p_entmax = entmax_1p5_dispatch(logits_f32, dim=-1)
             p_alloc = blend * p_softmax + (1.0 - blend) * p_entmax
         else:
             p_alloc = p_softmax
@@ -4420,6 +4435,10 @@ def main() -> None:
     # torch.compile inlines the iter_coeffs call so we want the flag set by
     # the time the model is constructed and compile fires).
     _apply_ns_coefficient_choice(getattr(args, "use_polar_express_ns", False))
+    # iter 117b-2: Triton entmax kernel toggle. Same module-level pattern;
+    # set BEFORE model construction so dynamo constant-folds the dispatch
+    # branch into the compiled SoftDenseRouter graph.
+    _set_entmax_triton(getattr(args, "use_entmax_triton", False))
     args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
     args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
     if not getattr(args, "run_id", ""):
