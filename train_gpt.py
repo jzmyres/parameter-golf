@@ -292,14 +292,22 @@ class Hyperparameters:
     matrix_lr = 0.022
     scalar_lr = 0.02
     muon_momentum = 0.99
-    # iter 121 PE-NS DEFAULT (2026-04-29 user clarification): PE-NS is NOT
-    # the cause of iter 117 NaN. Diagnostic: iter 117 v1 used stock NS @ 5
-    # AND NaN'd at s60. iter 117 v2 (PE-NS @ 7) NaN'd at s30 — earlier
-    # because PE-NS amplifies an existing instability, but the instability
-    # itself originates in the entmax-blend mechanism + dropping entropy
-    # (common to both v1 and v2). PE-NS preserved as default ON @ steps=7
-    # (the empirical elbow). The `use_polar_express_ns` flag is kept for
-    # future runs that need stock NS for clean A/B comparison.
+    # iter 121b PE-NS DEFAULT (2026-04-30 user clarification, supersedes
+    # 2026-04-29 diagnosis): PE-NS NaN root cause was the iter 111 H83
+    # variance regularizer (`routing_variance_coef = -λ · Σ_e Var_token(w(e|t))`),
+    # NOT PE-NS itself. Diagnostic chain:
+    #   iter 117 v1: stock NS @ 5 + variance reg + entropy reg + entmax → NaN s60
+    #   iter 117 v2: PE-NS @ 7 + variance reg + entropy reg + entmax → NaN s30
+    #     (earlier — PE-NS amplifies the variance-reg gradient cascade, but
+    #      doesn't originate it)
+    #   iter 117 v3: REMOVE variance reg, KEEP everything else → clean run
+    #   iter 117 v5 (PROMOTED): same v3 config, ran 1000 steps clean
+    # The variance regularizer + entmax produce exact-zero routing weights,
+    # whose Var_token gradient is undefined and amplifies into a NaN cascade.
+    # Removing variance reg removes the cascade source; PE-NS @ 7 is fine.
+    # PE-NS preserved as default ON @ steps=7 (empirical elbow). The
+    # `use_polar_express_ns` flag is kept for future runs that need stock NS
+    # for clean A/B comparison via `--use-polar-express-ns=0`.
     muon_backend_steps = 7
     use_polar_express_ns = True
     muon_momentum_warmup_start = 0.92

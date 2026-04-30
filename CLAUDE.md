@@ -28,6 +28,7 @@
 - `feedback_conda_run_buffering.md` — `conda run` without `--no-capture-output` silences the child for its entire lifetime; always pass the flag (or use `source activate`) when redirecting to a log file
 - `feedback_throughput_priority.md` — Throughput-bearing iters (Triton kernels, sparse dispatch, sparse attention) take queue priority over coef-sweep follow-ups; throughput compounds research velocity
 - `feedback_sdpa_replacement_at_T2048.md` — Replacing `F.scaled_dot_product_attention` at T=2048 (NSA, RRAttention, etc.) regresses throughput; promotion needs `flex_attention` or fused Triton, OR T-scaling defer
+- `feedback_diagnosis_context.md` — When closing an iter due to instability, document FULL active config (regularizers, flags, schedules) so re-opening is automatic when triggering condition is removed (PE-NS mis-closure example)
 - `feedback_profile_before_throughput.md` — Throughput optimization needs chrome trace; not log fragments
 - `feedback_decouple_regularizers.md` — Antagonistic regularizers → keep one as metric, the other as loss
 - `feedback_anneal_sparsity_coefs.md` — Sparsity coefs anneal from 0; warmup_delay_frac=0.3 default
@@ -161,8 +162,8 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | parcae_lr | 0.002 (applied to `parcae_raw_a`, `parcae_raw_delta`, `parcae_raw_b`) |
 | entmax_blend_lr | 0.002 (iter 117 v5 baseline. Iter 117b-1 NOT PROMOTED 2026-04-30 included a 10× bump (0.002 → 0.02) to accelerate blend logit drift, but the blend stayed near pure-softmax throughout (logit init=5 too high; 10× LR over 1000 steps insufficient to overcome it). See H87b RESULT for details. Reverted.) |
 | muon_momentum | 0.99 |
-| muon_backend_steps | 5 (iter 121 PE-NS REVERTED 2026-04-29: smoke passed at steps=7 with PE-NS but full training NaN'd at step 30 — iter 117 v2 with PE-NS @ 7 NaN'd EARLIER than iter 117 v1 with stock NS @ 5 (s60). PE-NS at our DEQ scale produces larger Muon update spectra that destabilize FP iteration at training-realistic batch sizes that smoke (small B, 300 steps) doesn't capture. PE-NS code preserved at module level via `_PE_COEFFS` and `_ns_iter_coeffs`, gated by `use_polar_express_ns` (default False) for future re-investigation under modified hparam regimes.) |
-| use_polar_express_ns | False (iter 121: PE-NS off by default after iter 117 v2 NaN'd at s30 with PE-NS @ 7. Enable via `--use-polar-express-ns=1` for future investigation; will likely require lower matrix_lr to absorb PE-NS's larger update magnitude.) |
+| muon_backend_steps | 7 (iter 121b 2026-04-30 user clarification: PE-NS NaN root cause was the **variance regularizer** — iter 111 H83 `routing_variance_coef = -λ · Σ_e Var_token(w(e\|t))`. Iter 117 v3 REMOVED the variance reg and ran cleanly; iter 117 v5 promoted with PE-NS @ 7 effectively. Earlier diagnostic blamed PE-NS amplification of an "entmax + entropy" instability — that was the surface symptom; the underlying driver was variance-reg gradients producing exact-zero entmax outputs that variance gradient amplified into cascade. PE-NS @ 7 is fine in the variance-reg-removed regime.) |
+| use_polar_express_ns | True (iter 121b 2026-04-30: PE-NS DEFAULT ON. Variance regularizer was the actual NaN cause (iter 117 v3 removed it, ran clean). PE-NS preserved as default ON @ steps=7 — empirical elbow. The flag is kept for future runs that need stock NS for clean A/B comparison via `--use-polar-express-ns=0`.) |
 | muon_momentum_warmup_start | 0.92 |
 | muon_momentum_warmup_steps | 800 |
 | weight_decay | 0.01 (iter 86: 0.30 → 0.01 re-test under the iter 93 landscape; applied to both AdamW and Muon groups) |
