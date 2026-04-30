@@ -1811,6 +1811,24 @@ This forces the routing weight matrix `[w_1, w_2, ..., w_T]` (shape T × E) to h
 
 **Status:** PROPOSED — queued **HIGH PRIORITY priority 2** post-iter-98b per user direction 2026-04-29 (sequenced after iter 111 to bisect penalty strength).
 
+**Component implementation (2026-04-30):** standalone helper landed at
+`experiments/components/orthogonal_expansion_routing.py`. Smoke tests
+PASS — penalty correctness verified analytically:
+- uniform routing (w=1/E for all): penalty = 0.109375 (= (E-1)/E²)
+- balanced one-hot (each token uses one expert, balanced across E):
+  penalty = 0.0 (the target equilibrium)
+- collapsed (all tokens → expert 0): penalty = 0.875
+  (= (1−1/E)² + (E−1)·(1/E)²)
+- gradient flows through softmax→W path
+- anneal helper validated against `progress` ∈ {0, delay, midway, 1}.
+The component exposes `compute_gram_penalty(p, coef_scale)` +
+`set_orthogonal_expansion_routing(enabled, coef, warmup_delay_frac)`
+toggle. Integration into `train_gpt.py::SoftDenseRouter._collect_routing_losses`
+pending — three-touchpoint pattern (Hyperparameters field + CLI flag +
+`compute_gram_penalty(p)` call after routing forward + add to
+`router_reg_loss` group). Will land BETWEEN iterations per the
+"clean-up between launches" discipline.
+
 ### H85: Increase block_ortho_aux_coef 0.1 → 0.5 (iter 113) — PROPOSED HIGH PRIORITY (2026-04-29 user spec)
 
 **Hypothesis.** Cheap baseline test. Currently `block_ortho_aux_coef = 0.1`. Pushing to 0.5 (or 1.0) forces more orthogonal expert OUTPUTS — addresses the basis-component side of the basis-decomposition argument (vs iter 111/112 which address the routing side). Useful as a control: if increased ortho alone closes the gap, the issue was insufficient orthogonality, not uniform routing. If it doesn't close the gap, that confirms the routing-uniformity (not expert orthogonality) is the bottleneck — strengthening the case for iter 111/112.
@@ -2092,6 +2110,83 @@ k_sweep_table:  128    1.5135   0.2708   0.1566   0.2212    0.0361    0.0437    
 **Decision: drop iter 119 from queue.** Sparsity at the routing-pool level (iter 117/117b/118) is the principled axis on this stack. Layer-skip would require a fundamentally different architecture.
 
 **Status:** REFUTED ✗.
+
+### H90: RRAttention — Dynamic Block Sparse Attention via Per-Head Round-Robin Shifts (iter 120) — PROPOSED 2026-04-30
+
+**Hypothesis.** Replace dense causal SDPA with a per-head round-robin (RR) block-sparse attention pattern (Liu et al. 2026, arxiv:2602.05853). Each head samples DIFFERENT query positions within a length-S stride; collectively H heads cover the full stride. Stride-level importance estimation reduces complexity O(L²) → O(L²/S²); adaptive Top-τ block selection gives input-adaptive efficiency.
+
+**Algorithm (3-stage pipeline, see `experiments/components/rr_attention.py`):**
+1. **Round-robin query sampling**: for stride i, head h, sample position
+   `pos(i, h) = i·S + ((S-1-h) mod S)`. With H ≥ S, every position
+   within each stride is sampled by SOME head.
+2. **Stride-level importance estimation**: aggregate keys per stride
+   (`K_agg[j] = mean(K[j·S:(j+1)·S])`), compute scores
+   `I[i, j] = Q_s[i] · K_agg[j] / sqrt(d)`, softmax over key strides.
+3. **Top-τ block selection**: aggregate stride probs to block level
+   (block size B = S·strides_per_block), normalize per query block,
+   select smallest set of key blocks with cumulative mass ≥ τ. Always
+   protect the diagonal (self-attention) block.
+4. **Sparse SDPA**: standard `F.scaled_dot_product_attention` with the
+   token-level expanded mask (block-sparse pattern → token mask).
+
+**Strict-generalization.** At τ=1.0, all blocks are retained → mask is
+all-True (modulo causality) → output bit-identical to dense SDPA. The
+component's smoke test verifies `rel_err = 0.00e+00` at τ=1.0.
+
+**Expected throughput (paper).** At 128K context: 2.4× speedup over
+FlashAttention. At our T=2048: smaller absolute gain (~1.2-1.5×) since
+the L²/S² reduction is less impactful; primary value is the abstraction
+for future T-scaling.
+
+**Integration into our codebase.** Drop-in replacement for the head-packed
+`(B, E·H, T, d)` SDPA call in `CausalSelfAttention.forward`. Treats `E·H`
+as the head dimension; round-robin sampling rotates across `E·H`
+positions per stride, which is consistent with the per-expert-per-head
+independence (CLAUDE.md §6.2 hard constraint preserved).
+
+**Risks.**
+- Token-level mask + dense SDPA: until a block-sparse kernel is wired
+  (FlashAttention blocked variant or `torch.nn.attention.flex_attention`),
+  throughput gain is **purely from the lower attention compute when the
+  mask is sparse**, NOT from skipping mask-False positions in the SDPA
+  kernel itself. Net throughput at T=2048 may be neutral or slightly
+  negative until block-sparse kernel landed.
+- Causality at the block boundary: confirmed in component smoke test
+  (out[0:T/2] unchanged when Q[T/2+1:] is perturbed).
+- DEQ FP interaction: RRAttention is a self-attention substitute inside
+  T_θ, so the FP iterates over the new Q,K,V at each step. Block-mask
+  selection depends on Q,K which evolve through the FP — masks may
+  jitter across iterations. Standard K-sweep gate applies.
+
+**Component implementation (2026-04-30):** standalone helper landed at
+`experiments/components/rr_attention.py`. Smoke tests PASS:
+- shape preservation: PASS (B, H, T, d) → (B, H, T, d)
+- finiteness: PASS (no NaN/Inf)
+- causality: PASS (out[0:T/2] unchanged by Q[T/2+1:] perturbation)
+- τ=1.0 ≈ dense: rel_err = 0.00 ★ (bit-identical, confirms strict-gen)
+- τ=0.3 ≠ dense: rel_err = 0.55 (sparse, diverges as expected)
+- gradient flow: PASS through Q/K/V
+- RR sample indices: PASS (heads cover stride positions in correct order)
+- toggle setter: PASS
+
+**Test plan for the iter 120 launch (when GPU free):**
+1. Component smoke (CPU): already PASSED ✓
+2. Standalone GPU test: import in a small script, B=1 H=8 T=2048,
+   verify output finite + causal + matches dense at τ=1.
+3. Smoke test full training: `python experiments/smoke_test.py
+   --use-rr-attention=1 --rr-stride=8 --rr-block-size=64 --rr-tau=0.95`.
+4. 1000-step launch with `--use-rr-attention=1`, monitor val_bpb against
+   iter 117b-1 baseline.
+5. Promotion gate: val_bpb regression ≤ 0.03 (carry-forward standard).
+   Strict-gen unconditional path applies if τ=1.0 (recovers iter 117b-1
+   exactly), but we'd run with τ=0.95 for an actual sparsity test.
+
+**Sources:**
+- https://arxiv.org/abs/2602.05853 (Liu et al. 2026, RRAttention paper)
+- https://arxiv.org/html/2602.05853 (HTML version)
+
+**Status:** PROPOSED. Component PASSED smoke tests; train_gpt.py integration
+deferred to BETWEEN iterations per "clean-up between launches" discipline.
 
 ### iter 104 OLD ENTRY — BLOCKED on `torch.library.custom_op` registration (2026-04-29 root-caused)
 
