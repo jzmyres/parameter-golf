@@ -2293,19 +2293,21 @@ Iter 117b-1 NOT PROMOTED 2026-04-30 (H87b RESULT) — config bumps reverted. Bas
 2. **Iter 112 (H84)** — Gram-matrix orthogonality penalty. Integrated at commit `1d0d9ac`. **IN FLIGHT 2026-04-30.** Launch flags: `--use-orthogonal-expansion-routing=1 --routing-gram-coef=0.01`. s200 val=2.0240 (Δ−0.023), s400 val=1.7013 (Δ−0.013). Final result + K-sweep matrix landing ~21:10.
 3. **Iter 117b-2 GPU smoke** — **THROUGHPUT-BEARING (PRIORITY).** Launch with `--use-entmax-triton=1 --use-entmax-routing=1`. Triton entmax kernel verified vs deep-spin/entmax at fp32 floor; needs DDP+compile+RevDEQ smoke. Tests fused-kernel correctness under blend.
 4. **Iter 117b-3 GPU smoke** — **THROUGHPUT-BEARING (PRIORITY).** Launch with `--use-sparse-dispatch=1 --sparse-dispatch-capacity-factor=8 --use-entmax-routing=1`. Sparse MoE dispatch numerically equivalent to dense at C ≥ (1-s)·E; smoke at C=8 should be bit-identical, then sweep capacity down to find break-even. **Strongest throughput win in the queue** (skip-zero-experts under entmax sparsity).
-5. **Iter 117b-3b** — **THROUGHPUT-BEARING (Tier 2 promoted to Tier 1).** Per-expert sparse-Q attention (asymmetric analog of MLP sparse dispatch). Component at `experiments/components/sparse_attention_dispatch.py` PASSED 7/7 smoke. Saves Q + SDPA + Wo per-expert; K, V remain dense.
-6. **Iter 120 (H90, NEW)** — **THROUGHPUT-BEARING (Tier 2 promoted to Tier 1).** RRAttention (Liu et al. 2026, arxiv:2602.05853). Per-head round-robin block-sparse attention. Component at `experiments/components/rr_attention.py` PASSED 8/8 smoke (τ=1.0 → bit-identical to dense). Replaces head-packed SDPA; integration in CausalSelfAttention.forward.
-7. **Iter 108 (H79)** — `deq_k_eval = 16 → 10`. Throughput-only, tests forward-K reduction. Lower magnitude throughput win than 117b-3 / 120 but very low-risk one-line config.
-8. **Iter 110 (H82)** — Re-enable `num_refinements = 1` (currently 0 since iter 98b). One-line config. Tests refinement under iter 117 v5's blend infrastructure. **MOVED TO END OF Tier 1** 2026-04-30 per user direction.
+5. **Iter 117b-3b** — **THROUGHPUT-BEARING.** Per-expert sparse-Q attention (asymmetric analog of MLP sparse dispatch). Component at `experiments/components/sparse_attention_dispatch.py` PASSED 7/7 smoke. Saves Q + SDPA + Wo per-expert via capacity-padded gather/dispatch; K, V remain dense AND the SDPA call itself is preserved (smaller Q rows but same FA fusion). Net win iff entmax sparsity > gather overhead.
+6. **Iter 108 (H79)** — `deq_k_eval = 16 → 10`. Throughput-only, tests forward-K reduction. One-line config; low-risk independent of sparsity stack.
+7. **Iter 110 (H82)** — Re-enable `num_refinements = 1` (currently 0 since iter 98b). One-line config. Tests refinement under iter 117 v5's blend infrastructure.
+
+**DEMOTED 2026-04-30 — replaces SDPA at T=2048, likely throughput regression:**
+- ~~Iter 120 (RRAttention)~~ — **DEFERRED back to Tier 3 / Deferred section.** Replaces head-packed SDPA in `CausalSelfAttention.forward`; same architectural class as iter 106 NSA which was DROPPED 2026-04-29 because **NSA is 0.42× FlashAttention at T=2048** (per official fla-org benchmark, see H86). Component at `experiments/components/rr_attention.py` validates correctness only ("τ=1.0 bit-identical" is a numerics check, not a throughput check) — pure-PyTorch impl can't compete with FA SDPA at this seq length. Promotion path: re-implement on `torch.nn.attention.flex_attention` (PyTorch 2.5+) with `score_mod`/`block_mask` keeping FA fusion intact, OR defer until T scales (e.g. T=4096/8192 iter). User directive 2026-04-30: "Would RRAttention hurt throughput as the optimized SDPA is replaced?" — answered yes, demoted.
 
 **Deferred — coef-sweep follow-ups (post throughput iters):**
 - **Iter 112b**: Gram coef target 0.05 (5× current). Same `warmup_delay=0.3`. Tests stronger steady-state pressure. Conditional on iter 112 promotion + after 117b-2/117b-3 land.
 - **Iter 112c**: Gram `warmup_delay=0.1` + coef 0.01. Engages earlier (s100 vs s300), longer active phase. Conditional on 112 promotion.
 - **Iter 112d**: combined (`warmup_delay=0.1`, coef 0.05). Most aggressive; only if 112b/c clean.
 
-**Tier 2 — (emptied 2026-04-30; both items promoted to Tier 1 per `feedback_throughput_priority.md`):**
-- ~~Iter 120 (RRAttention)~~ → **Tier 1 #6**
-- ~~Iter 117b-3b (sparse-Q attention)~~ → **Tier 1 #5**
+**Tier 2 — (re-emptied 2026-04-30):**
+- ~~Iter 117b-3b (sparse-Q attention)~~ → **Tier 1 #5** (preserves SDPA call, capacity-padded gather/dispatch)
+- ~~Iter 120 (RRAttention)~~ → **DEFERRED back to Tier 3 / Deferred** — replaces SDPA, same class as iter 106 NSA (0.42× FA at T=2048). See Tier 1 demotion note above. Re-queue requires `flex_attention` reimplementation OR T-scaling.
 
 **Tier 3 — Pending implementation (no component yet):**
 9. **Iter 117c** — Equal-weight `routing_reg_coef` refactor (collapse 3 coefs to 1, sweep at {0.1, 0.5, 1.0, 2.0}).
@@ -2316,7 +2318,8 @@ Iter 117b-1 NOT PROMOTED 2026-04-30 (H87b RESULT) — config bumps reverted. Bas
 14. **Iter 118 (H88)** — Triton fused entmax + grouped-GEMM (extension of 117b-2 + 117b-3). Conditional on those smoke tests passing.
 
 **Deferred / awaiting decision:**
-- **Iter 106 (H86)** — NSA 2-branch attention. Code preserved off-by-default; revisit after iter 117b-2/117b-3 throughput baseline.
+- **Iter 106 (H86)** — NSA 2-branch attention. DROPPED 2026-04-29 — 0.42× FlashAttention at T=2048. Code preserved off-by-default for future T-scaling.
+- **Iter 120 (H90)** — RRAttention. DEFERRED 2026-04-30 (was briefly Tier 1, demoted same day per user challenge "Would RRAttention hurt throughput as the optimized SDPA is replaced?"). Same SDPA-replacement class as iter 106; pure-PyTorch component cannot compete with fused FA at T=2048. Re-queue requires `flex_attention` (PyTorch 2.5+) reimplementation with `score_mod`/`block_mask` keeping FA fusion intact, OR defer until T-scaling phase.
 - **Iter 109 (H80)** — K-jitter {10, 16}. SUPERSEDED by current default {16, 24}. Close out.
 - **Iter 98c** — D=1024 + `num_refinements=0`. AWAITING USER GO/NO-GO 2026-04-29.
 
