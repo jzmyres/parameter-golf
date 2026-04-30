@@ -1829,7 +1829,28 @@ pending — three-touchpoint pattern (Hyperparameters field + CLI flag +
 `router_reg_loss` group). Will land BETWEEN iterations per the
 "clean-up between launches" discipline.
 
-### H85: Increase block_ortho_aux_coef 0.1 → 0.5 (iter 113) — PROPOSED HIGH PRIORITY (2026-04-29 user spec)
+### H85: Increase block_ortho_aux_coef 0.1 → 0.5 (iter 113) — DROPPED ✗ (2026-04-30, no-op given current ortho values + threshold-design analysis)
+
+**Decision (2026-04-30, post-iter-117 v5 K-sweep analysis):** DROP iter 113. The proposed 5× coef bump is essentially a no-op because:
+
+1. **Iter 117 v5 K-sweep ortho values are below threshold:** `attn_ortho = 0.1235`, `mlp_ortho = 0.2041`. Threshold = 0.20. Penalty per current formula `relu(ortho − 0.20)² × coef`:
+    - `attn_b = relu(0.1235 − 0.20)² = 0` (below threshold → zero gradient)
+    - `mlp_b = relu(0.2041 − 0.20)² ≈ 1.7e-5` (just above; tiny)
+    - At `coef=0.1`: total contribution ≈ 8.4e-7 (negligible vs ntp_loss ~2.5)
+    - At `coef=0.5`: total contribution ≈ 4.2e-6 (still negligible; absolute change ~3e-6)
+2. **The K-sweep shows ortho is K-invariant** at exactly 0.1235 and 0.2041 across all K∈{4, 8, 16, 17, 24, 32, 37, 64, 113, 128} — confirming this is a PARAMETER-LEVEL property dominated by expert weight matrices. Eval-time variation is below 4-decimal display precision.
+3. **Threshold-based design is heuristic, not principled** — `thr = 0.20` is arbitrary, max-pairwise is a heuristic metric choice, and the formulation creates a flat basin (no pressure when below threshold) with no theoretical grounding.
+
+**To redesign iter 113 meaningfully**, would need to either:
+- Lower threshold (`thr = 0.20 → 0.10`) so penalty actually activates at current ortho levels
+- Drop threshold entirely (active at all magnitudes, original H32 form)
+- Switch to a principled formulation: Frobenius distance from `I/E`, mutual information, or spectral regularizer
+
+**Iter 112 (H84 Gram-matrix penalty) supersedes this need.** The Gram penalty `‖G − I/E‖²_F` (where `G = (1/N) W^T W` over routing weights) is the principled alternative — no threshold, active everywhere, targets orthogonal columns of routing weight matrix directly. Component already PASSED smoke tests (`experiments/components/orthogonal_expansion_routing.py`, 6/6).
+
+**Status:** DROPPED ✗. Pivot to iter 112 (H84) for the principled orthogonality push, or iter 110 (H82, re-enable num_refinements=1) for an architectural test.
+
+### H85 ORIGINAL (frozen for archival): Increase block_ortho_aux_coef 0.1 → 0.5 (iter 113) — PROPOSED HIGH PRIORITY (2026-04-29 user spec)
 
 **Hypothesis.** Cheap baseline test. Currently `block_ortho_aux_coef = 0.1`. Pushing to 0.5 (or 1.0) forces more orthogonal expert OUTPUTS — addresses the basis-component side of the basis-decomposition argument (vs iter 111/112 which address the routing side). Useful as a control: if increased ortho alone closes the gap, the issue was insufficient orthogonality, not uniform routing. If it doesn't close the gap, that confirms the routing-uniformity (not expert orthogonality) is the bottleneck — strengthening the case for iter 111/112.
 
@@ -2281,7 +2302,7 @@ The huge integers in the shape are uninitialized memory interpreted as int64 —
 Iter 117b-1 NOT PROMOTED 2026-04-30 (H87b RESULT) — config bumps reverted. Baseline remains iter 117 v5. Structural improvements kept: `router_reg_loss` group, DRY `_run_hutchinson_F` helper (now emitting hutch_F + rd_step per-K in K-sweep), iter 117b-2 X1 Triton entmax kernel + custom_op (default OFF), iter 117b-3 X2 sparse MoE dispatch helper + MLP-path wiring (default OFF), iter 103 X3 chained-routing flag + safety guard (default OFF), all `experiments/components/` files (chained_block, orthogonal_expansion_routing, rr_attention, sparse_attention_dispatch).
 
 **Tier 1 — Ready to launch (just config or flag, no implementation):**
-1. **Iter 113 (H85)** — `block_ortho_aux_coef` 0.1 → 0.5 (5×). One-line config. Tests stronger expert-orthogonality without entropy/sparsity escalation.
+1. ~~**Iter 113 (H85)** — `block_ortho_aux_coef` 0.1 → 0.5~~ — **DROPPED 2026-04-30** ✗. iter 117 v5 K-sweep shows attn_ortho=0.1235, mlp_ortho=0.2041 — both below threshold thr=0.20, so penalty is already 0 (attn) or ~1.7e-5 (mlp negligible). 5× coef bump multiplies zero by 5 → no-op. Threshold-based design also unprincipled (arbitrary 0.20, max-pairwise heuristic). Use iter 112 (Gram penalty) instead.
 2. **Iter 110 (H82)** — Re-enable `num_refinements = 1` (currently 0 since iter 98b). One-line config. Tests refinement under iter 117 v5's blend infrastructure.
 3. **Iter 108 (H79)** — `deq_k_eval = 16 → 10`. Throughput-only, tests forward-K reduction.
 4. **Iter 117b-2 GPU smoke** — Launch with `--use-entmax-triton=1`. Triton entmax kernel verified vs deep-spin/entmax at fp32 floor; needs DDP+compile+RevDEQ smoke before full launch.
