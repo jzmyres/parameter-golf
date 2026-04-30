@@ -1575,6 +1575,65 @@ def entmax_1p5_dispatch(z: Tensor, dim: int = -1) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Iter 117b-3: capacity-padded sparse MoE dispatch (pure-PyTorch).
+# ---------------------------------------------------------------------------
+# Default OFF (`use_sparse_dispatch: bool = False`). Replaces dense
+# (E, T, D) expert evaluation with a capacity-padded gather/scatter path:
+# each expert processes only its top-K tokens by routing weight,
+# K = ceil(C * T / E) static. Tokens with zero routing weight fall outside
+# top-K and contribute nothing to that expert's compute (operator-level
+# equivalence proven in experiments/test_sparse_dispatch.py Phase A.0-A.5).
+#
+# Equivalence:
+#   - C ≥ (1-s)·E + headroom (for sparsity s): bit-identical to dense
+#   - C smaller: monotone approximation error bounded by truncated mass
+#
+# Pure-PyTorch ops (gather + scatter_add + matmul + topk) — torch.compile
+# traces natively without custom_op wrapping (Phase A.4 verified).
+
+_USE_SPARSE_DISPATCH: bool = False  # set by main() from Hyperparameters
+_SPARSE_DISPATCH_C: float = 4.0     # default capacity factor
+
+
+def _set_sparse_dispatch(enabled: bool, capacity_factor: float = 4.0) -> None:
+    """Module-level toggle invoked from main() before model construction."""
+    global _USE_SPARSE_DISPATCH, _SPARSE_DISPATCH_C
+    _USE_SPARSE_DISPATCH = bool(enabled)
+    _SPARSE_DISPATCH_C = float(capacity_factor)
+
+
+def sparse_moe_dispatch_capacity(
+    x: Tensor,            # (T, D)
+    w: Tensor,            # (T, E)
+    expert_W: Tensor,     # (E, D, R)
+    expert_V: Tensor,     # (E, R, D)
+    capacity_factor: float,
+) -> Tensor:
+    """Capacity-padded sparse MoE forward via gather → expert → scatter_add.
+
+    out[t] = Σ_e w[t,e] · (x[t] @ W_e @ V_e) computed with each expert
+    evaluated on only its top-K tokens by w[:, e]. K = ceil(C·T/E) is
+    constant after graph construction (compile-friendly).
+
+    Bit-identical to dense when K ≥ max-per-expert-utilization. Lower K
+    truncates low-weight tokens; error bounded by truncated mass.
+    """
+    T, D = x.shape
+    E, _, R = expert_W.shape
+    K = int(math.ceil(float(capacity_factor) * T / E))
+    output = torch.zeros_like(x)
+    for e in range(E):
+        w_e = w[:, e]
+        topk_w, topk_idx = w_e.topk(K, dim=0)
+        x_e = x.index_select(0, topk_idx)
+        h_e = x_e @ expert_W[e]
+        y_e = h_e @ expert_V[e]
+        y_e = y_e * topk_w.unsqueeze(-1)
+        output.index_add_(0, topk_idx, y_e)
+    return output
+
+
+# ---------------------------------------------------------------------------
 # SOFT DENSE ROUTER
 # ---------------------------------------------------------------------------
 
