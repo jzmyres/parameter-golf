@@ -2079,13 +2079,19 @@ k_sweep_table:  128    1.5135   0.2708   0.1566   0.2212    0.0361    0.0437    
 
 **Status:** PROPOSED — HIGH PRIORITY iter 118 **conditional on iter 117 promotion**. Skip if 117 fails.
 
-### H89: Mixture-of-Depths (iter 119) — PROPOSED MEDIUM PRIORITY 2026-04-29
+### H89: Mixture-of-Depths (iter 119) — REFUTED ✗ (2026-04-30, principled architectural-incompatibility)
 
-**Hypothesis.** Mixture-of-Depths (Raposo et al. 2024, Google DeepMind) is an **orthogonal sparsity axis** to MoE expert sparsity — skip ENTIRE LAYERS for some tokens via per-layer per-token continuous score + capacity-based soft selection. Published numbers: ~50% compute reduction at <2% quality loss. Composes multiplicatively with iter 117's entmax skip: 50% layer skip × 70% expert skip → ~85% total compute reduction.
+**Hypothesis.** Mixture-of-Depths (Raposo et al. 2024, Google DeepMind) — skip ENTIRE LAYERS for some tokens via per-layer per-token continuous score + capacity-based soft selection. Published: ~50% compute reduction at <2% quality loss. Composes multiplicatively with iter 117's entmax skip.
 
-**Implementation.** Each layer (or DEQ refinement step) gets a per-token "compute-skip score" ∈ [0,1] from a small router. Tokens with score below capacity threshold bypass that layer (residual passthrough). Differentiable via continuous scores + soft mask gradient. RevDEQ-safe IFF the layer-skip selection is smooth (similar argument to entmax).
+**REFUTED — principled grounds (2026-04-30, user critique).** As proposed for our soft-dense + RevDEQ stack, MoD has a degenerate trivial solution: per-layer gates can drift to zero across all blocks → entire stack collapses to identity → no LM signal but also no capacity loss. The original Raposo et al. paper avoids this by enforcing **hard top-K capacity per block** (only top-K tokens by gate score get block compute), which forces gates into a competitive top-K selection. Our soft-dense MoE setup intentionally avoids hard top-K (CLAUDE.md §6.2: "no top-K, no token dropping" — RevDEQ requires C¹-smooth `T_θ`, and top-K introduces gradient discontinuities at the K/K+1 boundary that break the FP convergence proof). Adding the capacity scaffolding to enable MoD would require giving up the soft-dense + RevDEQ contract.
 
-**Status:** PROPOSED — MEDIUM PRIORITY iter 119, queue after iter 117 + 118 promote. Compose with entmax skip for ~85% compute reduction.
+**Anti-collapse alternatives considered + rejected:**
+- Per-block utilization regularization (analog of CV for layer gates): another reg knob; doesn't solve the fundamental issue that soft-gate MoD without top-K can drift to 0 long before reg pulls back, and the LM gradient through a near-identity stack is weak.
+- Target compute budget penalty (`L = (compute_used - target)²`): adds another antagonistic reg fighting LM loss; iter 100b H76 reframe (decoupled antagonistic regs hurt — see `feedback_decouple_regularizers.md`) argues against this.
+
+**Decision: drop iter 119 from queue.** Sparsity at the routing-pool level (iter 117/117b/118) is the principled axis on this stack. Layer-skip would require a fundamentally different architecture.
+
+**Status:** REFUTED ✗.
 
 ### iter 104 OLD ENTRY — BLOCKED on `torch.library.custom_op` registration (2026-04-29 root-caused)
 

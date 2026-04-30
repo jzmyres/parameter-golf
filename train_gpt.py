@@ -265,7 +265,7 @@ class Hyperparameters:
     # controls how much entmax-1.5 sparsity contributes to routing — drift
     # too fast and routing collapses (NaN at iter 117 v1 step 60). 10×
     # slower LR keeps drift bounded once anneal ramps.
-    entmax_blend_lr = 0.002
+    entmax_blend_lr = 0.02
 
     # Iter 106 (NSA — Native Sparse Attention; arxiv:2502.11089). Three-branch
     # hybrid that preserves O(T) reachability while remaining sparse:
@@ -343,9 +343,15 @@ class Hyperparameters:
     # loss, so the optimizer drives H_pertoken → 0 → per-token specialization).
     # CV loss operates on the orthogonal axis of global cross-batch balance
     # (prevents dead experts); the two regs do NOT antagonize — joint target
-    # is low pertoken_entropy AND low CV. If pertoken_entropy stays high in
-    # training, the issue is magnitude, not sign — bump this coef.
-    router_entropy_coef = 0.005
+    # is low pertoken_entropy AND low CV.
+    #
+    # iter 117b (2026-04-30): bumped 0.005 → 0.05 (10×) per H87 RESULT
+    # observation that pertoken_entropy stuck at 2.80 in iter 117 v5 — the
+    # 0.005 magnitude × 2.80 = 0.014 contribution to total_loss was dwarfed
+    # 25× by cv_loss_weight=2.0 × cv=0.20 = 0.40 (under router_health_coef
+    # 0.25 multiplier, both shrink proportionally). Bumping gives entropy
+    # reg the gradient budget to actually drive specialization.
+    router_entropy_coef = 0.05
     # Annealing schedule (iter 100b): scale = 0 for time_frac < warmup_delay_frac,
     # then linear ramp 0 → 1 over remaining training. Final effective coef =
     # router_entropy_coef × scale. Avoids cold-start trap (router needs free
@@ -3702,9 +3708,36 @@ class GPT(nn.Module):
         x = self._run_backbone(x)
         return self.final_norm(x)
 
-    def _collect_routing_losses(self, device: torch.device) -> tuple[Tensor, Tensor]:
+    def _collect_routing_losses(
+        self,
+        device: torch.device,
+        block_ortho_aux: Tensor | None = None,
+        eff_block_ortho_coef: float = 0.0,
+    ) -> tuple[Tensor, Tensor]:
+        """Returns (bal_loss, router_reg_loss).
+
+        ``router_reg_loss`` (iter 117b-1, 2026-04-30) groups three regs of the
+        routing-pool health objective into one named term:
+
+        - ``cv_loss × cv_loss_weight``    — global cross-batch balance
+        - ``H_pertoken × router_entropy_coef`` — per-token specialization
+        - ``block_ortho_aux × eff_block_ortho_coef`` — expert orthogonality
+
+        Internally cv + entropy are pre-multiplied by ``router_health_coef``
+        (historical structure preserved); ``block_ortho_aux`` is added with
+        its own coef. The result is bit-identical to the prior layout where
+        ``+ router_health_coef * health_loss + eff_block_ortho_coef *
+        block_ortho_aux`` were two separate terms in ``total_loss`` — they
+        are now a single named term in the return tuple, used directly as
+        ``+ router_reg_loss`` in ``forward``.
+
+        ``mos_ortho_out_coef * mos_ortho_loss`` stays separate — it lives at
+        the MoS prediction head, a different layer/object than the routing
+        pool. Refactor positions iter 117c to test single-coef equal-weight
+        scaling across all three routing-pool regs.
+        """
         zero = torch.tensor(0.0, device=device)
-        bal, health = zero, zero
+        bal, inner = zero, zero
         router_weights: dict[int, float] = {}
         routers: dict[int, SoftDenseRouter] = {}
         for r, w in [
@@ -3718,7 +3751,7 @@ class GPT(nn.Module):
             r_bal = getattr(r, "_balance_loss", zero)
             r_health = getattr(r, "_health_loss", zero)
             bal = bal + float(router_weights.get(rid, 0.0)) * r_bal
-            health = health + float(router_weights.get(rid, 0.0)) * r_health
+            inner = inner + float(router_weights.get(rid, 0.0)) * r_health
             # iter 100: per-token entropy MINIMIZATION term (+ec_t · H added
             # to total loss → drives H_pertoken → 0 → per-token specialization).
             # NOT multiplied by router_weights[rid]: the pooled router is summed
@@ -3728,7 +3761,7 @@ class GPT(nn.Module):
             # un-multiplication the documented router_entropy_coef=0.005 acts
             # as ~0.03 in effect (pr-review-toolkit M3, coderabbit follow-up).
             r_ent = getattr(r, "_pertoken_entropy_loss", zero)
-            health = health + r_ent
+            inner = inner + r_ent
         # iter 26-lb-loss: mos_balance_mult (default 50) × bal_loss_coef downstream
         # (5e-3) → effective weight 0.25 on the MoS NTP balance loss — strong enough
         # to drive dead MoS experts back toward fair share.  WD cannot fix routing-
@@ -3736,7 +3769,13 @@ class GPT(nn.Module):
         # is the principled complementary fix.  The retry-prescription path
         # recommends bumping mos_balance_mult for mos_*_min_share failures.
         bal = bal + self.mos_balance_mult * getattr(self.mos_head, '_balance_loss', zero)
-        return bal, health
+        # Build the unified router_reg_loss. cv + entropy carry the historical
+        # router_health_coef multiplier (so existing per-knob magnitudes stay
+        # comparable across iters); block_ortho carries its own effective coef.
+        router_reg_loss = self.router_health_coef * inner
+        if block_ortho_aux is not None and eff_block_ortho_coef > 0.0:
+            router_reg_loss = router_reg_loss + eff_block_ortho_coef * block_ortho_aux
+        return bal, router_reg_loss
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
@@ -3747,7 +3786,15 @@ class GPT(nn.Module):
             ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
         else:
             ctp_loss = torch.tensor(0.0, device=ntp_loss.device)
-        bal_loss, health_loss = self._collect_routing_losses(ntp_loss.device)
+        # Compute block_ortho_aux and its effective coef BEFORE collecting the
+        # routing-loss group so they can be folded into router_reg_loss.
+        block_ortho_aux = torch.tensor(0.0, device=ntp_loss.device)
+        if self.training and self._block_ortho_aux_enabled and isinstance(self._block_ortho_aux_loss, torch.Tensor):
+            block_ortho_aux = self._block_ortho_aux_loss.to(device=ntp_loss.device)
+        eff_block_ortho_coef = float(self.block_ortho_aux_coef) * float(getattr(self, "_block_ortho_aux_coef_scale", 1.0))
+        bal_loss, router_reg_loss = self._collect_routing_losses(
+            ntp_loss.device, block_ortho_aux, eff_block_ortho_coef
+        )
         self._ntp_loss_t = ntp_loss.detach()
         self._ctp_loss_t = ctp_loss.detach()
         # Backward-compatible scalar fields used by experiments/*.
@@ -3770,22 +3817,17 @@ class GPT(nn.Module):
         if getattr(self.mos_head, "_ctp_ortho_out", None) is not None and getattr(self.mos_head, "_ntp_ortho_out", None) is not None:
             mos_ortho_loss = self.mos_head._ctp_ortho_out + self.mos_head._ntp_ortho_out
 
-        block_ortho_aux = torch.tensor(0.0, device=ntp_loss.device)
-        if self.training and self._block_ortho_aux_enabled and isinstance(self._block_ortho_aux_loss, torch.Tensor):
-            block_ortho_aux = self._block_ortho_aux_loss.to(device=ntp_loss.device)
-
-        eff_block_ortho_coef = float(self.block_ortho_aux_coef) * float(getattr(self, "_block_ortho_aux_coef_scale", 1.0))
-
         # iter 45: Lyapunov penalty added externally in training loop
         # (outside compiled forward to avoid tensor metadata corruption).
-
+        # iter 117b-1 (2026-04-30): cv + entropy + block_ortho are now grouped
+        # into a single router_reg_loss term inside _collect_routing_losses;
+        # mos_ortho_loss stays separate (different layer/object).
         return (
             ntp_loss
             + ctp_weight * ctp_loss
             + self.bal_loss_coef * bal_loss
-            + self.router_health_coef * health_loss
+            + router_reg_loss
             + self.mos_ortho_out_coef * mos_ortho_loss
-            + eff_block_ortho_coef * block_ortho_aux
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -4102,6 +4144,55 @@ def _slice_for_fp_probe(z_star: Tensor, x0_lyap: Tensor, B_probe: int) -> tuple[
     return z_star[:B_probe].contiguous(), x0_lyap[:B_probe].contiguous()
 
 
+def _run_hutchinson_F(
+    z_star: Tensor,
+    x0_lyap: Tensor,
+    b_bar_d: Tensor | None,
+    sb,
+    target_dtype: torch.dtype,
+    n_samples: int,
+    ctx_factory,
+) -> float | None:
+    """Core Hutchinson-Frobenius probe loop (DRY helper, iter 117b-1).
+
+    Inputs must be pre-sliced (via ``_slice_for_fp_probe``) and pre-cast to
+    ``target_dtype``. Returns ``rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F /
+    sqrt(dim)`` or ``None`` on predictive OOM. Caller is responsible for the
+    outer try/except around runtime OOM and dtype/SDPA mismatches.
+
+    Shared by ``_hutchinson_F_at_saved_fp`` (val checkpoints) and
+    ``_compute_eval_fp_lipschitz`` (K-sweep). Eliminates the divergence
+    pattern that produced iter 97.5b-fix2 (val) + iter 97.5b-fix3 (K-sweep)
+    as separate patches for the same dtype-mismatch root cause.
+    """
+    torch.cuda.empty_cache()
+    free_b, _ = torch.cuda.mem_get_info(z_star.device)
+    need_b = int(z_star.numel() * z_star.element_size() * 16)
+    if free_b < int(need_b * 1.25):
+        print(
+            f"hutch_F skip: oom_pred need={need_b/1e9:.2f}GiB "
+            f"free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}",
+            flush=True,
+        )
+        return None
+    samples: list[float] = []
+    with ctx_factory():
+        for _ in range(max(1, n_samples)):
+            v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
+                               dtype=z_star.dtype) * 2.0 - 1.0)
+            z_b = z_star.detach().clone().requires_grad_(True)
+            with torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
+                u_b = sb(z_b, x0_lyap, b_bar_d)
+                jvp = torch.autograd.grad(
+                    (u_b * v).sum(), z_b,
+                    create_graph=False, retain_graph=False,
+                )[0]
+            samples.append(float(jvp.detach().float().pow(2).mean().sqrt().item()))
+            del v, z_b, u_b, jvp
+            torch.cuda.empty_cache()
+    return sum(samples) / len(samples) if samples else None
+
+
 def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2, B_probe: int = 1) -> float | None:
     """Hutchinson-Frobenius estimator at the model's saved DEQ fixed point.
 
@@ -4152,38 +4243,7 @@ def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2, B_probe: int = 1) -> f
         ctx_factory = nullcontext
 
     try:
-        torch.cuda.empty_cache()
-        # Predictive OOM check calibrated for SharedBlock JVP through 12 layers
-        # × 16+16 experts × multiple intermediate tensors. Empirically the JVP
-        # graph needs ~12-15× z_star size in fp32 saved-for-backward. At B=1
-        # this is ~1-2 GiB; the 16× multiplier gives a 25% safety margin.
-        free_b, _ = torch.cuda.mem_get_info(z_star.device)
-        need_b = int(z_star.numel() * z_star.element_size() * 16)
-        if free_b < int(need_b * 1.25):
-            print(f"hutch_F skip: oom_pred need={need_b/1e9:.2f}GiB free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}", flush=True)
-            return None
-        samples: list[float] = []
-        with ctx_factory():
-            for _ in range(max(1, n_samples)):
-                v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
-                                   dtype=z_star.dtype) * 2.0 - 1.0)
-                z_b = z_star.detach().clone().requires_grad_(True)
-                # iter 97.5b-fix2 (2026-04-29): wrap in autocast so that
-                # internal SharedBlock bmm ops (which can produce fp32
-                # intermediate tensors that mismatch bf16 parameter dtype)
-                # follow the same dtype contract as the training-loop forward.
-                # Without this, the probe hits "expected mat1 and mat2 to
-                # have the same dtype, but got: float != BFloat16" on bmm.
-                with torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
-                    u_b = sb(z_b, x0_lyap, b_bar_d)
-                    jvp = torch.autograd.grad(
-                        (u_b * v).sum(), z_b,
-                        create_graph=False, retain_graph=False,
-                    )[0]
-                samples.append(float(jvp.detach().float().pow(2).mean().sqrt().item()))
-                del v, z_b, u_b, jvp
-                torch.cuda.empty_cache()
-        return sum(samples) / len(samples) if samples else None
+        return _run_hutchinson_F(z_star, x0_lyap, b_bar_d, sb, target_dtype, n_samples, ctx_factory)
     except torch.cuda.OutOfMemoryError as e:
         print(f"hutch_F skip: oom_runtime {e}", flush=True)
         torch.cuda.empty_cache()
@@ -5268,50 +5328,18 @@ def main() -> None:
                 print(f"[{name} probe failed] {type(e).__name__}: {e}", flush=True)
                 return None
 
-        # Hutchinson-Frobenius probe — reduced sample count (was 8 → 2) since
-        # the JVP through SharedBlock at B×T×D scales costs ~3 GiB per sample
-        # and the K-sweep already pushes peak VRAM near 42 GiB on a 44 GiB
-        # cap. Variance is acceptable for a diagnostic.
-        #
-        # iter 97.5b-fix (2026-04-29): predictive OOM check calibrated for
-        # SharedBlock JVP through 12 layers × 16+16 experts × multiple
-        # intermediate tensors. Empirically ~12-15× z_star size in fp32
-        # saved-for-backward; the 16× multiplier gives a 25% safety margin.
-        # The earlier 4× multiplier was off by ~4× — predicted OK then OOM'd
-        # at runtime trying to allocate 32 GiB. With B_probe=1 slicing this
-        # is now ~1-2 GiB.
+        # iter 117b-1 (2026-04-30): delegate to module-level _run_hutchinson_F
+        # helper (DRY refactor — same code path as the val-checkpoint probe
+        # at _hutchinson_F_at_saved_fp). Eliminates the iter 97.5b-fix2/3
+        # divergence pattern where the same dtype-mismatch bug had to be
+        # patched in two places. n_hutch is clamped to 2 here (K-sweep peak
+        # VRAM is tighter than val checkpoints; variance is acceptable for
+        # a per-K diagnostic).
         def _hutch_F_probe() -> float | None:
-            free_b, _ = torch.cuda.mem_get_info(z_star.device)
-            need_b = int(z_star.numel() * z_star.element_size() * 16)
-            if free_b < int(need_b * 1.25):
-                print(
-                    f"ksweep_skip_reason:hutch_F oom_pred "
-                    f"need={need_b/1e9:.2f}GiB free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}",
-                    flush=True,
-                )
-                return None
-            samples: list[float] = []
-            # iter 97.5b-fix3 (2026-04-30): mirror the val-checkpoint probe's
-            # autocast wrapper at L4177 — without it the SharedBlock forward
-            # at K-sweep time hits "self and mat2 must have the same dtype,
-            # but got Float and BFloat16" because target_dtype derived from
-            # `next(sb.parameters()).dtype` may be fp32 (control tensor) while
-            # most internal matmuls expect bf16. Autocast resolves the mix.
-            with _grad_safe_sdpa():
-                for _ in range(min(n_hutch, 2)):
-                    v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
-                                       dtype=z_star.dtype) * 2.0 - 1.0)
-                    z_b = z_star.detach().clone().requires_grad_(True)
-                    with torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
-                        u_b = sb(z_b, x0_lyap, b_bar_d)
-                        jvp = torch.autograd.grad(
-                            (u_b * v).sum(), z_b,
-                            create_graph=False, retain_graph=False,
-                        )[0]
-                    samples.append(float(jvp.detach().float().pow(2).mean().sqrt().item()))
-                    del v, z_b, u_b, jvp
-                    torch.cuda.empty_cache()
-            return sum(samples) / len(samples) if samples else None
+            return _run_hutchinson_F(
+                z_star, x0_lyap, b_bar_d, sb, target_dtype,
+                min(n_hutch, 2), _grad_safe_sdpa,
+            )
 
         # Finite-direction random-step Lipschitz sample. Avoid `.item()`
         # GPU→CPU sync inside the loop by clamping in-place.
