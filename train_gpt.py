@@ -292,20 +292,16 @@ class Hyperparameters:
     matrix_lr = 0.022
     scalar_lr = 0.02
     muon_momentum = 0.99
-    # iter 121 (PE-NS adoption 2026-04-29): default 5 → 7 (the empirical elbow).
-    # Polar-Express per-iter coefficients (Bernstein et al. 2024) replace stock
-    # fixed (3.4445, -4.7750, 2.0315). At backend_steps=5 the aggressive
-    # iter-1 coefficient (8.16, -22.5, 15.9) overshoots and breaks DEQ reverse
-    # reconstruction (smoke recon 1.2e-4 → 6.8e-2). The records use steps=5
-    # because their non-DEQ models tolerate that overshoot; we cannot.
-    # Empirical sweep at steps={3,5,7,10,12,15,20,25}: 5→7 cuts rel_err 39%
-    # (0.096 → 0.059), 7→10 only cuts another 10% (0.059 → 0.053). The 7→10
-    # improvement does not justify 43% more Muon matmul. Smoke at steps=7
-    # is CLEANER than smoke at steps=10 (loss descent −2.58 vs −2.47, no
-    # iter_conv warnings). steps=7 = 14 matmul = ~3-5% step_avg overhead vs
-    # stock NS @ 5 (10 matmul) for 4× orthogonalization quality. Records'
-    # 5-iter regime is fundamentally inaccessible to us due to DEQ stability.
+    # iter 121 PE-NS DEFAULT (2026-04-29 user clarification): PE-NS is NOT
+    # the cause of iter 117 NaN. Diagnostic: iter 117 v1 used stock NS @ 5
+    # AND NaN'd at s60. iter 117 v2 (PE-NS @ 7) NaN'd at s30 — earlier
+    # because PE-NS amplifies an existing instability, but the instability
+    # itself originates in the entmax-blend mechanism + dropping entropy
+    # (common to both v1 and v2). PE-NS preserved as default ON @ steps=7
+    # (the empirical elbow). The `use_polar_express_ns` flag is kept for
+    # future runs that need stock NS for clean A/B comparison.
     muon_backend_steps = 7
+    use_polar_express_ns = True
     muon_momentum_warmup_start = 0.92
     muon_momentum_warmup_steps = 800
     beta1 = 0.85
@@ -361,7 +357,13 @@ class Hyperparameters:
     # pertoken_entropy ≈ 3.0 plateau (all tokens use same near-uniform mixture).
     # Strict-gen: 0.0 recovers iter 100b exactly. Same anneal-from-zero schedule
     # as entropy_coef (feedback_anneal_sparsity_coefs.md).
-    routing_variance_coef = 0.005
+    # iter 117 v3 (2026-04-29 user diagnostic): routing_variance_coef DISABLED
+    # (0.005 → 0.0). iter 117 v1/v2 NaN'd at s60/s30 with variance ON; testing
+    # whether variance is the destabilizer. If iter 117 v3 (entmax blend
+    # annealed + entropy KEPT + variance OFF + PE-NS) crosses s60 cleanly, the
+    # issue is in variance regularization (likely a numerical bug in the
+    # var-sum gradient under annealed-from-zero warmup). Re-enable per CLI.
+    routing_variance_coef = 0.0
     routing_variance_warmup_delay_frac = 0.3
     # iter 117a (H87 Phase 1): entmax-α routing replacement. When True, the
     # post-softmax routing weights are computed via entmax-α (closed-form
@@ -552,6 +554,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     for name in [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
+        "use-polar-express-ns",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
@@ -569,7 +572,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     out: dict[str, object] = {}
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
                  "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
-                 "use_entmax_routing"}
+                 "use_entmax_routing", "use_polar_express_ns"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -611,13 +614,35 @@ _PE_COEFFS: tuple[tuple[float, float, float], ...] = (
 )
 
 
+# Stock NS coefficients (Muon's original minimax-optimal triple, used in
+# all iters preceding 121's PE-NS investigation).
+_STOCK_NS_COEFFS: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
+
+# Module-level flag toggled by `Hyperparameters.use_polar_express_ns` at GPT
+# construction (`_apply_ns_coefficient_choice`). When False, _ns_iter_coeffs
+# returns the stock triple repeated; when True, returns the per-iter PE table.
+_USE_POLAR_EXPRESS_NS: bool = False
+
+
 def _ns_iter_coeffs(steps: int) -> tuple[tuple[float, float, float], ...]:
-    """Return `steps` (a, b, c) tuples for the NS iteration. The first
-    `min(steps, len(_PE_COEFFS))` come from the per-iter Polar-Express table;
-    any remaining iterations re-use the LAST tuple (converged regime)."""
-    if steps <= len(_PE_COEFFS):
-        return _PE_COEFFS[:steps]
-    return _PE_COEFFS + (_PE_COEFFS[-1],) * (steps - len(_PE_COEFFS))
+    """Return `steps` (a, b, c) tuples for the NS iteration. Default uses
+    the stock minimax-optimal triple repeated; setting `_USE_POLAR_EXPRESS_NS`
+    True swaps to the per-iter Polar-Express table (with the last tuple
+    repeated past `len(_PE_COEFFS)` for converged refinement)."""
+    if _USE_POLAR_EXPRESS_NS:
+        if steps <= len(_PE_COEFFS):
+            return _PE_COEFFS[:steps]
+        return _PE_COEFFS + (_PE_COEFFS[-1],) * (steps - len(_PE_COEFFS))
+    return (_STOCK_NS_COEFFS,) * steps
+
+
+def _apply_ns_coefficient_choice(use_pe: bool) -> None:
+    """Update module-level `_USE_POLAR_EXPRESS_NS` flag. Called once at
+    GPT construction from `Hyperparameters.use_polar_express_ns`. The
+    NS iteration helpers (compiled at module load) read this flag at
+    forward time."""
+    global _USE_POLAR_EXPRESS_NS
+    _USE_POLAR_EXPRESS_NS = bool(use_pe)
 
 
 def _ns5_2d(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
@@ -4195,6 +4220,11 @@ def main() -> None:
         setattr(args, k, v)
     if float(getattr(args, "max_wallclock_seconds", 0.0)) > 0.0 and "iterations" not in cli_overrides:
         args.iterations = int(1_000_000_000)
+    # iter 121 PE-NS gate: apply chosen coefficient set BEFORE building model
+    # (_ns5_2d / _ns5_batched read the module-level flag at forward time, but
+    # torch.compile inlines the iter_coeffs call so we want the flag set by
+    # the time the model is constructed and compile fires).
+    _apply_ns_coefficient_choice(getattr(args, "use_polar_express_ns", False))
     args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
     args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
     if not getattr(args, "run_id", ""):
