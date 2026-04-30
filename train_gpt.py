@@ -360,6 +360,22 @@ class Hyperparameters:
     # softmax exploration early; sparsity pressure ramps in once routing has
     # stabilized).
     router_entropy_warmup_delay_frac = 0.3
+    # iter 112 / H84 (2026-04-30): orthogonal-expansion routing — Gram-matrix
+    # penalty `||G - I/E||²_F` where G = (1/N) W^T W over per-token routing
+    # weights. Targets the JOINT structural property (per-token sparsity AND
+    # global balance) that the entropy reg + CV reg cannot enforce together
+    # (per H87b lesson — bumping entropy alone can't drive specialization
+    # because CV-redistribution dominates). The Gram penalty's gradient is
+    # active everywhere (no threshold), targets exact balanced one-hot as
+    # zero of penalty.
+    # Default OFF; toggle with `--use-orthogonal-expansion-routing=1`.
+    # See `experiments/components/orthogonal_expansion_routing.py` for
+    # standalone helper + smoke tests (6/6 PASS analytically).
+    # Smoke test verified: balanced one-hot routing → penalty = 0 (target);
+    # uniform routing 1/E → penalty = (E-1)/E²; collapsed → (1-1/E)² + (E-1)/E².
+    use_orthogonal_expansion_routing = False
+    routing_gram_coef = 0.01
+    routing_gram_warmup_delay_frac = 0.3
     # iter 117 v3 (2026-04-29): routing-variance penalty REMOVED. iter 111 H83
     # introduced `routing_variance_coef = -λ · sum_e Var_token(w(e|t))` to break
     # the symmetric trap of per-token entropy at uniform routing. iter 117 v1/v2
@@ -571,6 +587,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "min-share-loss-weight", "cv-loss-weight",
     "router-entropy-coef", "router-entropy-warmup-delay-frac",
     "entmax-blend-init-logit", "entmax-blend-warmup-delay-frac", "entmax-blend-lr",
+    # iter 112 H84 — orthogonal-expansion routing (Gram-matrix penalty)
+    "routing-gram-coef", "routing-gram-warmup-delay-frac",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
@@ -595,7 +613,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
         "use-polar-express-ns", "use-entmax-triton", "use-sparse-dispatch",
-        "use-chained-routing",
+        "use-chained-routing", "use-orthogonal-expansion-routing",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
@@ -615,7 +633,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
                  "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
                  "use_entmax_routing", "use_polar_express_ns",
                  "use_entmax_triton", "use_sparse_dispatch",
-                 "use_chained_routing"}
+                 "use_chained_routing", "use_orthogonal_expansion_routing"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -1686,7 +1704,8 @@ class SoftDenseRouter(nn.Module):
                  scoring: str = "linear", health_slices: tuple[int, ...] | None = None,
                  entropy_coef: float = 0.0,
                  use_entmax_routing: bool = False,
-                 entmax_blend_init_logit: float = 5.0):
+                 entmax_blend_init_logit: float = 5.0,
+                 gram_coef: float = 0.0):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
@@ -1705,6 +1724,14 @@ class SoftDenseRouter(nn.Module):
         # `@property` setters so legacy code/tests can write Python floats.
         self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.register_buffer("_entropy_coef", torch.tensor(float(entropy_coef), dtype=torch.float32), persistent=False)
+        # iter 112 / H84: Gram-matrix orthogonal-expansion penalty buffer.
+        # Same buffer pattern as `_entropy_coef` — annealed by training loop.
+        # Penalty `||G - I/E||²_F` where G = (1/N) W^T W on per-token weights.
+        # See `experiments/components/orthogonal_expansion_routing.py` for
+        # standalone helper + smoke tests. Targets joint per-token sparsity
+        # AND global balance (the two axes that entropy alone could not
+        # enforce together — H87b lesson).
+        self.register_buffer("_gram_coef", torch.tensor(float(gram_coef), dtype=torch.float32), persistent=False)
         # iter 117 (H87): learnable blend between softmax (init ≈ 1.0) and
         # entmax-1.5 (sparse with exact zeros). NOT a buffer — this is a
         # learnable nn.Parameter that gradient drives. Init logit=+5 →
@@ -1847,6 +1874,15 @@ class SoftDenseRouter(nn.Module):
         with torch.no_grad():
             self._entmax_blend_anneal.fill_(float(value))
 
+    @property
+    def gram_coef(self) -> float:
+        return float(self._gram_coef.item())
+
+    @gram_coef.setter
+    def gram_coef(self, value: float) -> None:
+        with torch.no_grad():
+            self._gram_coef.fill_(float(value))
+
     @torch.no_grad()
     def bias_update(self, *, lr: float, clip: float, distributed: bool) -> None:
         ms = self._mean_share_last
@@ -1977,6 +2013,23 @@ class SoftDenseRouter(nn.Module):
                 self._pertoken_entropy_loss = ec_t.to(dtype=pertoken_ent.dtype) * pertoken_ent
             else:
                 self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
+            # iter 112 / H84: Gram-matrix orthogonal-expansion penalty.
+            # ||G - I/E||²_F where G = (1/N) W^T W on per-token routing weights.
+            # See `experiments/components/orthogonal_expansion_routing.py`.
+            # Targets joint per-token sparsity AND global balance — the two
+            # axes that entropy alone could not enforce together (H87b lesson).
+            # Same buffer-gated pattern as entropy reg.
+            gc_t = self._gram_coef
+            if bool((gc_t > 0.0).item()):
+                E = p.shape[-1]
+                W = p.float().reshape(-1, E)
+                N = max(W.shape[0], 1)
+                G = (W.t() @ W) / N
+                target = torch.eye(E, device=W.device, dtype=W.dtype) / E
+                gram_penalty = (G - target).pow(2).sum()
+                self._gram_penalty_loss = gc_t.to(dtype=gram_penalty.dtype) * gram_penalty
+            else:
+                self._gram_penalty_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = mean_share.detach()
             # Record diagnostics — eager-only (dynamo-disabled); see helper docstring.
             self._maybe_record_diag(p.detach(), reduce_dims, clear_on_skip=False)
@@ -1984,6 +2037,7 @@ class SoftDenseRouter(nn.Module):
             self._balance_loss = torch.tensor(0.0, device=x.device)
             self._health_loss = torch.tensor(0.0, device=x.device)
             self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
+            self._gram_penalty_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = None
             self._maybe_record_diag(p.detach(), tuple(range(p.ndim - 1)),
                                     clear_on_skip=True)
@@ -3008,6 +3062,7 @@ class Block(nn.Module):
                  router_entropy_coef: float = 0.0,
                  use_entmax_routing: bool = False,
                  entmax_blend_init_logit: float = 5.0,
+                 routing_gram_coef: float = 0.0,
                  min_share_loss_weight: float = 0.0,
                  cv_loss_weight: float = 2.0,
                  use_nsa_attention: bool = False,
@@ -3057,7 +3112,8 @@ class Block(nn.Module):
                                       health_slices=(num_routed, num_routed),
                                       entropy_coef=router_entropy_coef,
                                       use_entmax_routing=use_entmax_routing,
-                                      entmax_blend_init_logit=entmax_blend_init_logit)
+                                      entmax_blend_init_logit=entmax_blend_init_logit,
+                                      gram_coef=routing_gram_coef)
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -3617,6 +3673,8 @@ class GPT(nn.Module):
                  use_entmax_routing: bool = False,
                  entmax_blend_init_logit: float = 5.0,
                  entmax_blend_warmup_delay_frac: float = 0.3,
+                 routing_gram_coef: float = 0.0,
+                 routing_gram_warmup_delay_frac: float = 0.3,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -3648,6 +3706,10 @@ class GPT(nn.Module):
         # 0 → 1 after this delay fraction (pure softmax during warmup).
         self._use_entmax_routing = bool(use_entmax_routing)
         self._entmax_blend_warmup_delay_frac = float(entmax_blend_warmup_delay_frac)
+        # iter 112 (H84): orthogonal-expansion routing — Gram-matrix penalty
+        # ‖G − I/E‖²_F. Annealed from 0 over warmup_delay_frac of training.
+        self._routing_gram_coef_target = float(routing_gram_coef)
+        self._routing_gram_warmup_delay_frac = float(routing_gram_warmup_delay_frac)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -3663,6 +3725,7 @@ class GPT(nn.Module):
                                    router_entropy_coef=router_entropy_coef,
                                    use_entmax_routing=use_entmax_routing,
                                    entmax_blend_init_logit=entmax_blend_init_logit,
+                                   routing_gram_coef=routing_gram_coef,
                                    # entmax_blend_warmup_delay_frac is consumed by the
                                    # training-loop annealer (not by Block/SoftDenseRouter directly)
                                    # so it doesn't need to be passed here. The router's
@@ -4115,6 +4178,10 @@ class GPT(nn.Module):
             # as ~0.03 in effect (pr-review-toolkit M3, coderabbit follow-up).
             r_ent = getattr(r, "_pertoken_entropy_loss", zero)
             inner = inner + r_ent
+            # iter 112 / H84: Gram-matrix penalty — same per-token (not
+            # slice-multiplied) treatment as entropy. coef=0 default → no-op.
+            r_gram = getattr(r, "_gram_penalty_loss", zero)
+            inner = inner + r_gram
         # iter 26-lb-loss: mos_balance_mult (default 50) × bal_loss_coef downstream
         # (5e-3) → effective weight 0.25 on the MoS NTP balance loss — strong enough
         # to drive dead MoS experts back toward fair share.  WD cannot fix routing-
@@ -4882,6 +4949,8 @@ def main() -> None:
         use_entmax_routing=args.use_entmax_routing,
         entmax_blend_init_logit=float(args.entmax_blend_init_logit),
         entmax_blend_warmup_delay_frac=float(args.entmax_blend_warmup_delay_frac),
+        routing_gram_coef=float(args.routing_gram_coef) if bool(args.use_orthogonal_expansion_routing) else 0.0,
+        routing_gram_warmup_delay_frac=float(args.routing_gram_warmup_delay_frac),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,
@@ -5289,6 +5358,17 @@ def main() -> None:
             else:
                 blend_anneal = min(max((time_frac - blend_delay) / max(1.0 - blend_delay, 1e-8), 0.0), 1.0)
             sb.router.entmax_blend_anneal = blend_anneal
+        # iter 112 (H84): anneal Gram-matrix orthogonal-expansion penalty.
+        # Same warmup-delay shape as entropy_coef. Avoids cold-start
+        # over-constraint that hurt iter 99 sparsemax (+0.16 capacity cost).
+        gram_target = float(getattr(base_model, "_routing_gram_coef_target", 0.0))
+        gram_delay = float(getattr(base_model, "_routing_gram_warmup_delay_frac", 0.3))
+        if gram_target > 0.0:
+            if time_frac < gram_delay:
+                gram_scale = 0.0
+            else:
+                gram_scale = min(max((time_frac - gram_delay) / max(1.0 - gram_delay, 1e-8), 0.0), 1.0)
+            sb.router.gram_coef = gram_target * gram_scale
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
