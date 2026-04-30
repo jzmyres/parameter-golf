@@ -2590,6 +2590,20 @@ class MLP(nn.Module):
         E, R = self.num_experts, self.expert_rank
         N = B * T
         x_flat = x.reshape(N, D)
+        # iter 117b-3 X2 step 3: when _USE_SPARSE_DISPATCH is set, the routed
+        # expert path takes the capacity-padded gather/scatter route instead
+        # of the dense bmm-then-sum below. Shared experts (if any) still run
+        # densely. Module-level flag is read once; dynamo constant-folds.
+        # See sparse_moe_dispatch_capacity (module-level helper) for the
+        # standalone reference implementation; this in-line variant is
+        # specialized to the SwiGLU MLP layout (separate gate/fc projections
+        # with per-expert RMS norm on the hidden) rather than the simpler
+        # (W, V) two-matrix form of the standalone helper.
+        if _USE_SPARSE_DISPATCH:
+            return self._mix_experts_sparse(
+                x_flat, w, num_shared=num_shared, shared_gate=shared_gate,
+                B=B, T=T, D=D, E=E, R=R, N=N,
+            )
         G = (
             self.expert_gate.to(dtype=x_flat.dtype)
             * self.gate_in_norm_weight.to(dtype=x_flat.dtype).unsqueeze(1)
@@ -2625,6 +2639,90 @@ class MLP(nn.Module):
 
         # Eager-only diagnostic — see helper docstring.
         self._capture_mlp_out_ortho(h, N, E, R)
+
+        return out.reshape(B, T, D)
+
+    def _mix_experts_sparse(
+        self,
+        x_flat: Tensor,         # (N, D) — pre-RMS-normalized input
+        w: Tensor,              # router output for routed experts (N or B*T, num_routed)
+        *,
+        num_shared: int,
+        shared_gate: Tensor | None,
+        B: int, T: int, D: int, E: int, R: int, N: int,
+    ) -> Tensor:
+        """Capacity-padded sparse MoE forward (iter 117b-3 X2 step 3).
+
+        Replaces the dense (E, N, D) bmm of `mix_experts` with a per-expert
+        gather → expert → scatter_add pattern. Each routed expert processes
+        only its top-K tokens by routing weight (K = ceil(C·N/num_routed)).
+        Shared experts (if any) still run densely on all tokens, then the
+        two outputs sum.
+
+        Bit-equivalence: when K ≥ max-per-expert-utilization, output is
+        operator-identical to the dense path within fp32 reorder noise.
+        Capacity formula: C ≥ (1-s)·E + headroom for sparsity s. With
+        entmax routing at s ≈ 0.80, default C=4.0 gives K = N/E·4 = 4N/16
+        → ~25% of tokens per expert vs all N in dense (~4× compute saving
+        on routed-expert linears).
+
+        Diagnostic capture (`_capture_mlp_out_ortho`) is skipped in sparse
+        mode — it requires the full per-expert h tensor that doesn't exist
+        here. The router-level diagnostics (cv, entropy, usage) come from
+        the SoftDenseRouter forward, which is unchanged.
+        """
+        S = int(num_shared)
+        num_routed = E - S
+        out = torch.zeros(N, D, dtype=x_flat.dtype, device=x_flat.device)
+
+        # Path A: shared experts — dense compute on all N tokens (always-on).
+        if S > 0 and shared_gate is not None:
+            G_s = (
+                self.expert_gate[:S].to(dtype=x_flat.dtype)
+                * self.gate_in_norm_weight[:S].to(dtype=x_flat.dtype).unsqueeze(1)
+            ).reshape(S * R, D)
+            F_s = (
+                self.expert_fc[:S].to(dtype=x_flat.dtype)
+                * self.fc_in_norm_weight[:S].to(dtype=x_flat.dtype).unsqueeze(1)
+            ).reshape(S * R, D)
+            gate_s = x_flat @ G_s.t()
+            fc_s = x_flat @ F_s.t()
+            h_s = F.silu(gate_s) * fc_s
+            h_s = h_s.view(N, S, R)
+            h_s = F.rms_norm(h_s, (R,), eps=1e-6) * self.hidden_norm_weight[:S].to(dtype=h_s.dtype)
+            g_s_flat = shared_gate.reshape(N, S).to(dtype=h_s.dtype)
+            h_s = h_s * g_s_flat.unsqueeze(-1)  # (N, S, R)
+            Dwn_s_T = self.expert_down[:S].to(dtype=x_flat.dtype).transpose(1, 2)  # (S, R, D)
+            out_s_e = torch.bmm(h_s.transpose(0, 1), Dwn_s_T)  # (S, N, D)
+            out = out + out_s_e.sum(dim=0)  # (N, D)
+
+        # Path B: routed experts — sparse capacity-padded compute.
+        if num_routed > 0:
+            K = int(math.ceil(_SPARSE_DISPATCH_C * N / max(num_routed, 1)))
+            K = max(min(K, N), 1)  # clamp to [1, N]
+            w_flat = w.reshape(N, num_routed).to(dtype=x_flat.dtype)
+            for e_idx in range(num_routed):
+                e_global = e_idx + S  # offset for shared experts
+                w_e = w_flat[:, e_idx]
+                topk_w, topk_idx = w_e.topk(K, dim=0)
+                x_e = x_flat.index_select(0, topk_idx)  # (K, D)
+                # Per-expert weights with prenorm scale folded in
+                ge = (
+                    self.expert_gate[e_global].to(dtype=x_e.dtype)
+                    * self.gate_in_norm_weight[e_global].to(dtype=x_e.dtype).unsqueeze(0)
+                )  # (R, D)
+                fe = (
+                    self.expert_fc[e_global].to(dtype=x_e.dtype)
+                    * self.fc_in_norm_weight[e_global].to(dtype=x_e.dtype).unsqueeze(0)
+                )  # (R, D)
+                gate_e = x_e @ ge.t()  # (K, R)
+                fc_e = x_e @ fe.t()    # (K, R)
+                h_e = F.silu(gate_e) * fc_e  # (K, R)
+                h_e = F.rms_norm(h_e, (R,), eps=1e-6) * self.hidden_norm_weight[e_global].to(dtype=h_e.dtype)
+                h_e = h_e * topk_w.unsqueeze(-1)  # (K, R) routing-weighted
+                de = self.expert_down[e_global].to(dtype=x_e.dtype).t()  # (R, D)
+                out_e = h_e @ de  # (K, D)
+                out.index_add_(0, topk_idx, out_e)
 
         return out.reshape(B, T, D)
 
