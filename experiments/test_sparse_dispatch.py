@@ -285,6 +285,133 @@ def test_phase_A1_sparse_dispatch_equivalence():
 
 
 # ===========================================================================
+# Phase A.2: gradient correctness
+# ===========================================================================
+
+
+def test_phase_A2_gradient_correctness():
+    """Phase A.2: autograd through sparse dispatch matches autograd through dense.
+
+    The dispatch uses gather + scatter_add + matmul + multiply — all
+    differentiable. With sufficient capacity (no truncation), backward
+    should give bit-identical gradients (modulo float associativity in
+    scatter_add reduction order).
+    """
+    print("\n" + "=" * 60)
+    print("Phase A.2: gradient correctness")
+    print("=" * 60)
+
+    failures = 0
+    torch.manual_seed(2)
+    T, D, E, R = 64, 16, 8, 4
+
+    def make_inputs():
+        x = torch.randn(T, D, requires_grad=True)
+        eW = torch.randn(E, D, R, requires_grad=True) * 0.1
+        eV = torch.randn(E, R, D, requires_grad=True) * 0.1
+        logits = torch.randn(T, E, requires_grad=True) * 2.0
+        return x, eW, eV, logits
+
+    def grad_relerr(g_ref, g_test, tag):
+        if g_ref is None and g_test is None:
+            return 0.0
+        if g_ref is None or g_test is None:
+            print(f"    {tag}: GRAD MISMATCH (None)")
+            return 1.0
+        err = (g_ref - g_test).abs().max().item()
+        ref_max = g_ref.abs().max().item() + 1e-12
+        return err / ref_max
+
+    # --- Test 1: softmax + C=E (sufficient capacity) — bit-identical fwd, fwd
+    # equivalence implies backward equivalence by chain rule. Verify.
+    print("\n  Backward through dense vs sparse with C=E (sufficient capacity):")
+    x, eW, eV, logits = make_inputs()
+    w_softmax = logits.softmax(dim=-1)
+
+    out_dense = dense_moe_dispatch(x, w_softmax, eW, eV)
+    loss_dense = out_dense.pow(2).sum()
+    g_x_d, g_eW_d, g_eV_d, g_logits_d = torch.autograd.grad(
+        loss_dense, [x, eW, eV, logits], retain_graph=False)
+
+    x2, eW2, eV2, logits2 = (x.detach().clone().requires_grad_(),
+                              eW.detach().clone().requires_grad_(),
+                              eV.detach().clone().requires_grad_(),
+                              logits.detach().clone().requires_grad_())
+    w_softmax2 = logits2.softmax(dim=-1)
+    out_sparse = sparse_moe_dispatch_capacity(x2, w_softmax2, eW2, eV2, capacity_factor=E)
+    loss_sparse = out_sparse.pow(2).sum()
+    g_x_s, g_eW_s, g_eV_s, g_logits_s = torch.autograd.grad(
+        loss_sparse, [x2, eW2, eV2, logits2], retain_graph=False)
+
+    for tag, gref, gtst in [("∂L/∂x",      g_x_d,      g_x_s),
+                            ("∂L/∂W",      g_eW_d,     g_eW_s),
+                            ("∂L/∂V",      g_eV_d,     g_eV_s),
+                            ("∂L/∂logits", g_logits_d, g_logits_s)]:
+        rel = grad_relerr(gref, gtst, tag)
+        # Some scatter_add reorder noise; allow 1e-4 relative
+        status = "PASS" if rel < 1e-4 else "FAIL"
+        if rel >= 1e-4:
+            failures += 1
+        print(f"    {tag:<14} rel_max={rel:.2e}  {status}")
+
+    # --- Test 2: entmax + C=8 (sufficient for sparsity 0.80) — bit-identical fwd → bit-identical bwd.
+    print("\n  Backward through dense vs sparse with entmax + C=8 (sufficient):")
+    x, eW, eV, logits = make_inputs()
+    w_entmax = _entmax_1p5_pyref(logits, dim=-1)
+
+    out_dense = dense_moe_dispatch(x, w_entmax, eW, eV)
+    loss_dense = out_dense.pow(2).sum()
+    g_x_d, g_eW_d, g_eV_d, g_logits_d = torch.autograd.grad(
+        loss_dense, [x, eW, eV, logits], retain_graph=False)
+
+    x2, eW2, eV2, logits2 = (x.detach().clone().requires_grad_(),
+                              eW.detach().clone().requires_grad_(),
+                              eV.detach().clone().requires_grad_(),
+                              logits.detach().clone().requires_grad_())
+    w_entmax2 = _entmax_1p5_pyref(logits2, dim=-1)
+    out_sparse = sparse_moe_dispatch_capacity(x2, w_entmax2, eW2, eV2, capacity_factor=E)
+    loss_sparse = out_sparse.pow(2).sum()
+    g_x_s, g_eW_s, g_eV_s, g_logits_s = torch.autograd.grad(
+        loss_sparse, [x2, eW2, eV2, logits2], retain_graph=False)
+
+    for tag, gref, gtst in [("∂L/∂x",      g_x_d,      g_x_s),
+                            ("∂L/∂W",      g_eW_d,     g_eW_s),
+                            ("∂L/∂V",      g_eV_d,     g_eV_s),
+                            ("∂L/∂logits", g_logits_d, g_logits_s)]:
+        rel = grad_relerr(gref, gtst, tag)
+        status = "PASS" if rel < 1e-4 else "FAIL"
+        if rel >= 1e-4:
+            failures += 1
+        print(f"    {tag:<14} rel_max={rel:.2e}  {status}")
+
+    # --- Test 3: gradcheck on a small case (most stringent — finite diff vs autograd).
+    print("\n  torch.autograd.gradcheck (sparse dispatch, small case, C=E):")
+    torch.manual_seed(3)
+    Tg, Dg, Eg, Rg = 4, 3, 2, 2
+    xg = torch.randn(Tg, Dg, dtype=torch.float64, requires_grad=True)
+    eWg = torch.randn(Eg, Dg, Rg, dtype=torch.float64, requires_grad=True) * 0.3
+    eVg = torch.randn(Eg, Rg, Dg, dtype=torch.float64, requires_grad=True) * 0.3
+    logits_g = torch.randn(Tg, Eg, dtype=torch.float64, requires_grad=True) * 1.5
+
+    def fn(x_, eW_, eV_, l_):
+        w_ = _entmax_1p5_pyref(l_, dim=-1)
+        return sparse_moe_dispatch_capacity(x_, w_, eW_, eV_, capacity_factor=Eg)
+
+    try:
+        ok = torch.autograd.gradcheck(fn, (xg, eWg, eVg, logits_g), eps=1e-6, atol=1e-4)
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            failures += 1
+        print(f"    gradcheck: {status}")
+    except Exception as e:
+        # gradcheck raises on failure — print and count as failure
+        print(f"    gradcheck: FAIL ({type(e).__name__}: {str(e)[:80]})")
+        failures += 1
+
+    return failures
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
@@ -298,9 +425,12 @@ if __name__ == "__main__":
     # Phase A.1 runs on CPU; later phases will need GPU.
     failures += test_phase_A1_sparse_dispatch_equivalence()
 
+    # Phase A.2 runs on CPU.
+    failures += test_phase_A2_gradient_correctness()
+
     print("\n" + "=" * 60)
     if failures == 0:
-        print("ALL PHASE A.0 + A.1 TESTS PASSED")
+        print("ALL TESTS PASSED")
     else:
         print(f"FAILED: {failures} test(s)")
         sys.exit(1)
