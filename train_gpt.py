@@ -408,6 +408,19 @@ class Hyperparameters:
     # MLP-path wiring.
     use_sparse_dispatch = False
     sparse_dispatch_capacity_factor = 4.0
+    # iter 103 / H77 (2026-04-30): chained 2-stage pooled routing.
+    # Default OFF (single-stage routing as in iter 117 v5 / iter 117b-1).
+    # When True, Block uses TWO sequentially-chained SoftDenseRouter
+    # instances inside T_θ. Each stage drives `num_routed/2` attn experts
+    # + `num_routed/2` mlp experts (independent params, no sharing across
+    # stages). Stage 1 output is used as input to stage 2; final block
+    # residual = T_2(T_1(z, x_0), x_0) + Parcae input injection.
+    # Skip-connection across the chain: out = stage_1_out + stage_2_out
+    # (preserves iter 100b strict-gen path when stage 2 zero-init).
+    # See experiments/hypotheses.md H77 for full spec + design questions.
+    # Step 1 (this commit): Hyperparameter + CLI only — Block refactor
+    # lands in step 2.
+    use_chained_routing = False
     # iter 117 v2 (post-NaN rescue 2026-04-29): the entmax blend itself is
     # ANNEALED from pure softmax (anneal=0 → blend forced to 1.0 = softmax)
     # to learnable (anneal=1 → blend = sigmoid(blend_logit)) over training.
@@ -580,6 +593,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
         "use-polar-express-ns", "use-entmax-triton", "use-sparse-dispatch",
+        "use-chained-routing",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
@@ -598,7 +612,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
                  "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
                  "use_entmax_routing", "use_polar_express_ns",
-                 "use_entmax_triton", "use_sparse_dispatch"}
+                 "use_entmax_triton", "use_sparse_dispatch",
+                 "use_chained_routing"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
