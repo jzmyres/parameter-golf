@@ -56,6 +56,10 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 # Triton kernels
 
+# Mirror train_gpt.py::_ENTMAX_TRITON_EPS — same singularity floor for both
+# forward (`sqrt(discr)` radicand) and backward (`Σ√w` divisor).
+_ENTMAX_TRITON_EPS: float = 1e-6
+
 
 @triton.jit
 def _entmax_1p5_fwd_kernel(
@@ -151,7 +155,7 @@ def entmax_1p5_triton_fwd(z: torch.Tensor) -> torch.Tensor:
     w_flat = torch.empty_like(z_flat)
     B = z_flat.shape[0]
     grid = (B,)
-    _entmax_1p5_fwd_kernel[grid](z_flat, w_flat, B, eps=1e-6, E_BLOCK=E)
+    _entmax_1p5_fwd_kernel[grid](z_flat, w_flat, B, eps=_ENTMAX_TRITON_EPS, E_BLOCK=E)
     return w_flat.view(orig_shape)
 
 
@@ -163,7 +167,7 @@ def entmax_1p5_triton_bwd(w: torch.Tensor, grad_w: torch.Tensor) -> torch.Tensor
     grad_z = torch.empty_like(w_flat)
     B = w_flat.shape[0]
     grid = (B,)
-    _entmax_1p5_bwd_kernel[grid](w_flat, g_flat, grad_z, B, eps=1e-8, E_BLOCK=E)
+    _entmax_1p5_bwd_kernel[grid](w_flat, g_flat, grad_z, B, eps=_ENTMAX_TRITON_EPS, E_BLOCK=E)
     return grad_z.view(orig_shape)
 
 

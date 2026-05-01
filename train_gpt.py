@@ -407,10 +407,12 @@ class Hyperparameters:
     # capacity-padded dispatch (true compute-skip, ~4-15 hr refactor) is
     # iter 117b conditional on 117a's val_bpb preservation.
     use_entmax_routing = False
-    # Init the blend logit to +5 so `sigmoid(5) ≈ 0.9933` → at full anneal,
-    # routing is dominated by softmax (strict-gen recovery within 1% in bf16).
-    # Gradient drives this LOGIT DOWN if entmax-1.5's exact-zeros routing
-    # benefits val_bpb.
+    # Init the blend logit to +5 so `sigmoid(5) ≈ 0.9933` → at step 0
+    # routing is ≈ pure softmax (strict-gen recovery within 1% in bf16).
+    # The blend is annealed in over the first
+    # `entmax_blend_warmup_delay_frac=0.3` of training; once anneal ramps to
+    # 1.0 the gradient drives the LOGIT DOWN if entmax-1.5's exact-zeros
+    # routing benefits val_bpb.
     entmax_blend_init_logit = 5.0
     # iter 117b-2 (2026-04-30): Triton-fused entmax-1.5 kernel. Default OFF
     # (pure-PyTorch closed form via train_gpt.py::entmax_1p5). When True AND
@@ -1514,6 +1516,13 @@ except Exception:
 
 if _TRITON_OK:
 
+    # Single source of truth for the entmax-1.5 Triton numerical floor.
+    # Forward uses it to clamp the `sqrt(discr)` radicand; backward uses it
+    # as a divisor floor for `c = Σ(√w · g) / max(Σ √w, eps)`. Both bound
+    # the same near-empty-support singularity — keeping a single constant
+    # prevents forward/backward drift on future tuning.
+    _ENTMAX_TRITON_EPS: float = 1e-6
+
     @triton.jit
     def _entmax_1p5_triton_fwd_kernel(
         z_ptr,
@@ -1589,7 +1598,7 @@ if _TRITON_OK:
         B = z32.shape[0]
         if B == 0:
             return w_flat.view(orig_shape).to(z.dtype)
-        _entmax_1p5_triton_fwd_kernel[(B,)](z32, w_flat, eps=1e-6, E_BLOCK=E)
+        _entmax_1p5_triton_fwd_kernel[(B,)](z32, w_flat, eps=_ENTMAX_TRITON_EPS, E_BLOCK=E)
         return w_flat.view(orig_shape).to(z.dtype)
 
     @_entmax_1p5_triton_op.register_fake
@@ -1610,7 +1619,7 @@ if _TRITON_OK:
         if B == 0:
             return grad_z.view(orig_shape).to(grad_w.dtype)
         _entmax_1p5_triton_bwd_kernel[(B,)](
-            w32, g32, grad_z, eps=1e-8, E_BLOCK=E)
+            w32, g32, grad_z, eps=_ENTMAX_TRITON_EPS, E_BLOCK=E)
         return grad_z.view(orig_shape).to(grad_w.dtype)
 
     _entmax_1p5_triton_op.register_autograd(

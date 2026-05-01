@@ -182,6 +182,14 @@ class ChainedBlockMixin:
     chained-specific code logically separated.
     """
 
+    # Methods that are currently NotImplementedError stubs. The smoke test
+    # asserts this set matches `dir()` so adding a method without raising
+    # cannot pass vacuously.
+    _DEFERRED_METHODS: frozenset[str] = frozenset({
+        "_init_chained_routers",
+        "_forward_chained",
+    })
+
     def _init_chained_routers(
         self,
         dim: int,
@@ -234,12 +242,56 @@ class ChainedBlockMixin:
 
 
 def _smoke_test() -> None:
+    # 1. Toggle round-trip
     assert not is_chained_routing_enabled()
     set_chained_routing(True)
     assert is_chained_routing_enabled()
     set_chained_routing(False)
     assert not is_chained_routing_enabled()
-    print("chained_block.py: toggle smoke test PASS")
+
+    # 2. Mixin contract: deferred methods MUST raise NotImplementedError, and
+    #    the set of public methods on ChainedBlockMixin must equal the
+    #    declared `_DEFERRED_METHODS`. A new public method without a
+    #    NotImplementedError stub would otherwise let the smoke pass vacuously.
+    actual_methods = frozenset(
+        name for name in dir(ChainedBlockMixin)
+        if not name.startswith("_") or name in ChainedBlockMixin._DEFERRED_METHODS
+    ) - {"_DEFERRED_METHODS"}
+    assert actual_methods == ChainedBlockMixin._DEFERRED_METHODS, (
+        f"ChainedBlockMixin method set drifted: declared "
+        f"{set(ChainedBlockMixin._DEFERRED_METHODS)}, got {set(actual_methods)}. "
+        f"Either implement the new method (and remove its NotImplementedError "
+        f"stub + drop it from _DEFERRED_METHODS) or add it to _DEFERRED_METHODS."
+    )
+
+    class _DummyHost(ChainedBlockMixin):
+        pass
+
+    host = _DummyHost()
+    try:
+        host._init_chained_routers(dim=8, num_routed_total=4)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("_init_chained_routers should raise NotImplementedError")
+
+    z = torch.zeros(1, 4, 8)
+    try:
+        host._forward_chained(z, z)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("_forward_chained should raise NotImplementedError")
+
+    # 3. Iso-expert-count split is well-defined for both even and odd totals
+    #    (stage 2 holds the remainder).
+    for total in (2, 3, 4, 5, 8, 16):
+        s1 = total // 2
+        s2 = total - s1
+        assert s1 + s2 == total
+        assert s2 >= s1  # stage 2 absorbs the +1 on odd totals
+
+    print("chained_block.py: 3/3 smoke checks PASS")
 
 
 if __name__ == "__main__":

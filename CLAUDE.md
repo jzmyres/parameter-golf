@@ -12,41 +12,41 @@
 - `user_profile.md` — ML researcher, Parameter Golf, RevDEQ/MoE/MLA focus, L40S dev hardware
 
 **Feedback (durable rules — overrides default behavior)** — read before any action:
-- `feedback_hypotheses_sync.md` — Update hypotheses.md IN REAL TIME for any queue/baseline/status change
-- `feedback_pre_commit_review.md` — Pre-commit chain: /simplify + 3 code reviews + fix valid issues
-- `feedback_simplify_before_commit.md` — /simplify before each iteration commit
-- `feedback_dry_fixes.md` — When fixing a bug class, audit ALL instances in same commit
-- `feedback_arch_exploration.md` — Prioritize architecture over hyperparameter tuning
-- `feedback_compile_training.md` — Disable torch.compile for dev runs
-- `feedback_always_ddp.md` — Always use all GPUs with DDP, never single-GPU
-- `feedback_wakeup_cadence.md` — 5-min wakeups after failure → 20-min after 3 healthy checks
+- `feedback_hypotheses_sync.md` — sync hypotheses.md in real time
+- `feedback_pre_commit_review.md` — /simplify + 3 reviews
+- `feedback_simplify_before_commit.md` — /simplify each iter
+- `feedback_dry_fixes.md` — fix all instances of a bug class
+- `feedback_arch_exploration.md` — architecture > hyperparameter tuning
+- `feedback_compile_training.md` — disable torch.compile for dev
+- `feedback_always_ddp.md` — always all GPUs with DDP
+- `feedback_wakeup_cadence.md` — 5-min after failure → 20-min after 3 healthy
 - `feedback_lipschitz_in_ksweep.md` — Lipschitz + acyclicity primes permanent in K-sweep
-- `feedback_per_wallclock_override.md` — val_bpb gate can be overridden on per-wallclock grounds (H72)
-- `feedback_sparsity_value_props.md` — Score sparsity iters on val_bpb / throughput / reg as 3 orthogonal axes; soft-dense routing → router sparsity has zero throughput benefit without sparse dispatch
-- `feedback_uv_install.md` — Authorized installs use `uv pip install` (user directive 2026-04-28)
-- `feedback_check_gpu_free.md` — Preflight `pgrep` + `nvidia-smi` before launching ANY GPU job (silent contention wastes time + corrupts profiles)
-- `feedback_conda_run_buffering.md` — `conda run` without `--no-capture-output` silences the child for its entire lifetime; always pass the flag (or use `source activate`) when redirecting to a log file
-- `feedback_throughput_priority.md` — Throughput-bearing iters (Triton kernels, sparse dispatch, sparse attention) take queue priority over coef-sweep follow-ups; throughput compounds research velocity
-- `feedback_sdpa_replacement_at_T2048.md` — Replacing `F.scaled_dot_product_attention` at T=2048 (NSA, RRAttention, etc.) regresses throughput; promotion needs `flex_attention` or fused Triton, OR T-scaling defer
-- `feedback_diagnosis_context.md` — When closing an iter due to instability, document FULL active config (regularizers, flags, schedules) so re-opening is automatic when triggering condition is removed (PE-NS mis-closure example)
-- `feedback_profile_before_throughput.md` — Throughput optimization needs chrome trace; not log fragments
-- `feedback_decouple_regularizers.md` — Antagonistic regularizers → keep one as metric, the other as loss
-- `feedback_anneal_sparsity_coefs.md` — Sparsity coefs anneal from 0; warmup_delay_frac=0.3 default
-- `feedback_deq_convergence.md` — DEQ as true fixed point; K=64 extrapolation; stability over task perf
-- `feedback_expert_collapse.md` — Full-dim low-rank experts; no split-dim; router on pre-attention input
-- `feedback_mla_preferred.md` — MLA is preferred attention; do not replace with MHA/GQA
-- `feedback_mos_routing.md` — MoS uses pure softmax routing (no sigmoid gates)
-- `feedback_refinement_decoupled.md` — Refinement step must be separate independent forward pass
+- `feedback_per_wallclock_override.md` — val_bpb may yield to per-wallclock (H72)
+- `feedback_sparsity_value_props.md` — sparsity scored on val_bpb / throughput / reg
+- `feedback_uv_install.md` — `uv pip install`, NOT `pip install`
+- `feedback_check_gpu_free.md` — pgrep + nvidia-smi preflight
+- `feedback_conda_run_buffering.md` — `conda run --no-capture-output`
+- `feedback_throughput_priority.md` — throughput-bearing iters take priority
+- `feedback_sdpa_replacement_at_T2048.md` — SDPA replacements regress at T=2048
+- `feedback_diagnosis_context.md` — record full active config when closing an iter
+- `feedback_profile_before_throughput.md` — chrome trace, not log fragments
+- `feedback_decouple_regularizers.md` — antagonistic regularizers: one as metric
+- `feedback_anneal_sparsity_coefs.md` — sparsity coefs anneal from 0
+- `feedback_deq_convergence.md` — DEQ as true fixed point
+- `feedback_expert_collapse.md` — full-dim low-rank experts
+- `feedback_mla_preferred.md` — MLA, not MHA/GQA
+- `feedback_mos_routing.md` — MoS pure softmax
+- `feedback_refinement_decoupled.md` — refinement is a separate forward pass
 
 **Project (current state, lessons)** — read for context on running work:
-- `project_autoresearch.md` — Autoresearch setup + experiment loop protocol
-- `project_group_f_lessons.md` — H71-H75 trio: architectural sparsity closed; iter 96 near-optimal
-- `project_experiment_results.md` — Ongoing experiment log + insights
-- `project_phase0_learnings.md` — Phase 0 takeaways: hyperparameter landscape
-- `project_phase4_throughput_first.md` — Throughput micro-opts first; numerical equivalence required
-- `project_deq_depth_insight.md` — DEQ effective depth = 1; soft sparsity could unlock real depth
+- `project_autoresearch.md` — autoresearch setup + protocol
+- `project_group_f_lessons.md` — H71-H75 architectural sparsity closed
+- `project_experiment_results.md` — experiment log + insights
+- `project_phase0_learnings.md` — Phase 0 takeaways
+- `project_phase4_throughput_first.md` — throughput micro-opts first
+- `project_deq_depth_insight.md` — DEQ effective depth = 1
 - `project_architecture_ideas.md` — XSA, GPTQ-lite, Late QAT, DiffAttn, DeltaNet
-- `project_fix_later.md` — Deferred tech debt
+- `project_fix_later.md` — deferred tech debt
 
 **When adding a new memory file**: append it under the right section here AND to `MEMORY.md`. Both must be touched in the same commit, otherwise future sessions miss the directive.
 
@@ -115,7 +115,7 @@ torchrun --standalone --nproc_per_node=2 train_gpt.py
 
 **Evaluate**: `grep "val_bpb:\|peak_vram_mb:\|artifact.*bytes" run.log`.
 
-**Fair-comparison principle.** When configs have different throughput, compare at equal **step count**, not wall-clock. The default (1000 iters, no wallclock) implements this by construction; wall-clock matters only for the competition submission.
+**Fair-comparison principle.** Compare at equal **step count** (not wall-clock); the default 1000-iter run enforces this. Wall-clock only matters for the submission.
 
 ## 5. Current Architecture
 
@@ -125,32 +125,32 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | num_layers | 12 |
-| model_dim | 768 (iter 96 baseline. Iter 98b D=1024 attempt NOT PROMOTED on dev hardware 2026-04-29 — micro-batch halving fit D=1024 in VRAM but val_bpb int6 1.5018 vs iter 100b 1.4893 (Δ +0.0125 regression) AND step_avg 25.1s vs 24.5s (+2.6% slower per-wallclock; refinement at D=1024 amplified to +70% step cost). D-scaling deferred to 8× H100 submission hardware. See H73 retry section in hypotheses.md.) |
+| model_dim | 768 (D=1024 attempted iter 98b NOT PROMOTED on per-wallclock; H73) |
 | num_heads | 8 |
 | num_kv_heads | 4 |
-| num_experts | 16 (iter 96 baseline H71; iter 97 E=20 attempt NOT PROMOTED on per-wallclock grounds, see H72 — E-scaling past 16 closed) |
+| num_experts | 16 (E=20 attempted iter 97 NOT PROMOTED on per-wallclock; H72) |
 | num_shared_experts | 1 (DeepSeek shared expert, always-on with sigmoid gate) |
 | mlp_mult | 3.0 (hidden = D × 3 / num_experts via low-rank experts) |
 | train_seq_len | 2048 |
 | train_batch_tokens | 524,288 |
-| grad_accum_multiplier | 1 (iter 98b retired this default 2 → 1 after NOT PROMOTED. Field retained for future use; setting >1 multiplies base grad_accum_steps to halve per-step activation memory at constant effective batch. No LR/WD rescaling needed.) |
+| grad_accum_multiplier | 1 (>1 halves per-step activation memory at constant effective batch; no LR/WD rescaling) |
 | vocab_size | 1024 |
 | tie_embeddings | yes |
 | deq_beta | 0.50 (fallback when `use_parcae=False`) |
-| use_parcae | True (per-dim Ā and B̄; supersedes scalar beta/jitter when active) |
-| parcae_init_a_bar | 0.7 (initial Ā per dim; β₀ = 1−Ā₀ = 0.3) |
-| parcae_init_b_bar | 0.3 (B̄₀ ≈ 1−Ā₀ at step 0; iter 66b continuity with iter 66a) |
-| parcae_reversibility_floor | 0.1 (correctness constant — Ā ≥ this bound for RevDEQ backward safety, NOT a tuning knob) |
-| deq_bptt_k | 2 (truncated BPTT: backward reconstructs only last 2 DEQ iters) |
-| num_refinements | 0 (2026-04-29 user directive: disable refinement by default after iter 98b showed +70% step cost at D=1024 / +6% at D=768 with no directly-ablated val_bpb benefit; iter 110 queued to test re-enable as a clean ablation. CLAUDE.md §6.5 still defines the architectural form for when re-enabled.) |
-| use_ctp | False (iter 94: CTP head disabled — NTP-only; CTP param banks not allocated) |
-| use_nsa_attention | False (iter 106 default off; CLI-enabled per launch. When True, replaces dense causal SDPA with the 2-branch NSA mixer — compression branch (mean-pool K/V over `nsa_compress_block_size` blocks at `nsa_compress_block_sliding_stride` stride) + sliding-window branch (last `nsa_sliding_window_size` tokens). Selection branch (3rd NSA branch) deferred to iter 106b: gated by `nsa_num_selected_blocks > 0`, currently 0. Per-expert-per-head learnable softmax mixer `nsa_branch_gate (E*H, 2)` initialized to `nsa_branch_gate_init=0.0` (uniform mix). See H86 in hypotheses.md.) |
-| nsa_compress_block_size | 32 (only used when `use_nsa_attention=True`) |
+| use_parcae | True (per-dim Ā and B̄; supersedes scalar β/jitter when active) |
+| parcae_init_a_bar | 0.7 (Ā₀; β₀ = 1−Ā₀ = 0.3) |
+| parcae_init_b_bar | 0.3 (B̄₀ ≈ 1−Ā₀ at step 0) |
+| parcae_reversibility_floor | 0.1 (correctness constant — Ā ≥ bound for RevDEQ backward; NOT a tuning knob — see §10) |
+| deq_bptt_k | 2 (truncated BPTT) |
+| num_refinements | 0 (default off; iter 110 queued as clean re-enable ablation; §6.5 still defines architectural form) |
+| use_ctp | False (NTP-only; CTP param banks not allocated; H60) |
+| use_nsa_attention | False (CLI-enable. When True: 2-branch NSA mixer (compression block-pool + sliding-window). Selection branch deferred to iter 106b. H86.) |
+| nsa_compress_block_size | 32 |
 | nsa_compress_block_sliding_stride | 16 |
-| nsa_selection_block_size | 64 (selection branch deferred — iter 106b knob) |
-| nsa_num_selected_blocks | 0 (0 disables selection branch; 4 enables it for iter 106b) |
+| nsa_selection_block_size | 64 (iter 106b knob) |
+| nsa_num_selected_blocks | 0 (0 disables selection branch) |
 | nsa_sliding_window_size | 256 |
-| nsa_branch_gate_init | 0.0 (logits init to 0 → uniform softmax over branches at init) |
+| nsa_branch_gate_init | 0.0 (uniform softmax at init) |
 
 ### Optimizer
 | Parameter | Value |
@@ -160,48 +160,48 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | tied_embed_lr | 0.03 |
 | embed_lr | 0.6 |
 | parcae_lr | 0.002 (applied to `parcae_raw_a`, `parcae_raw_delta`, `parcae_raw_b`) |
-| entmax_blend_lr | 0.002 (iter 117 v5 baseline. Iter 117b-1 NOT PROMOTED 2026-04-30 included a 10× bump (0.002 → 0.02) to accelerate blend logit drift, but the blend stayed near pure-softmax throughout (logit init=5 too high; 10× LR over 1000 steps insufficient to overcome it). See H87b RESULT for details. Reverted.) |
+| entmax_blend_lr | 0.002 (iter 117 v5; 10× bump in 117b-1 NOT PROMOTED — H87b) |
 | muon_momentum | 0.99 |
-| muon_backend_steps | 7 (iter 121b 2026-04-30 user clarification: PE-NS NaN root cause was the **variance regularizer** — iter 111 H83 `routing_variance_coef = -λ · Σ_e Var_token(w(e\|t))`. Iter 117 v3 REMOVED the variance reg and ran cleanly; iter 117 v5 promoted with PE-NS @ 7 effectively. Earlier diagnostic blamed PE-NS amplification of an "entmax + entropy" instability — that was the surface symptom; the underlying driver was variance-reg gradients producing exact-zero entmax outputs that variance gradient amplified into cascade. PE-NS @ 7 is fine in the variance-reg-removed regime.) |
-| use_polar_express_ns | True (iter 121b 2026-04-30: PE-NS DEFAULT ON. Variance regularizer was the actual NaN cause (iter 117 v3 removed it, ran clean). PE-NS preserved as default ON @ steps=7 — empirical elbow. The flag is kept for future runs that need stock NS for clean A/B comparison via `--use-polar-express-ns=0`.) |
+| muon_backend_steps | 7 (PE-NS empirical elbow; root-cause clarified — see `EXPERIENCE.md#variance-reg-ns-cascade`) |
+| use_polar_express_ns | True (default ON; `--use-polar-express-ns=0` reverts to stock NS for A/B) |
 | muon_momentum_warmup_start | 0.92 |
 | muon_momentum_warmup_steps | 800 |
-| weight_decay | 0.01 (iter 86: 0.30 → 0.01 re-test under the iter 93 landscape; applied to both AdamW and Muon groups) |
+| weight_decay | 0.01 (applied to both AdamW and Muon groups) |
 | grad_clip_norm | 1.0 |
 | warmdown_frac | 0.72 |
 
 ### Routing & Expert Ranks
 | Parameter | Value |
 |---|---|
-| router_scoring | linear (dot-product logits, iter 70) |
-| mos_balance_mult | 50.0 (iter 26-lb-loss: hardcoded multiplier promoted to a Hyperparameter; multiplies MoS-NTP balance loss inside `_collect_routing_losses` — the principled fix for `mos_*_min_share` failures since H26) |
-| min_share_loss_weight | 0.0 (iter 100b: dropped to 0; CV loss alone provides smooth global-balance regularization without the hard-floor antagonism that hurt iter 100. min_share remains a diagnostic metric — sentinel: `min_share < 0.005` sustained → intervene. See H76.) |
-| cv_loss_weight | 2.0 (iter 100b: 0.10 → 2.0, 20× to compensate for dropping min_share floor; CV-only global balance VALIDATED at this weight. See H76.) |
-| router_entropy_coef | 0.005 (iter 100b / iter 117 v5 baseline. Iter 117b-1 NOT PROMOTED ✗ 2026-04-30: 10× bump (0.005 → 0.05) tested but pertoken_entropy stabilized at ~2.6 throughout, val_bpb +0.0007 essentially flat → REVERTED. Lesson: in soft-dense MoE, CV-redistribution dominates over per-token sparsity push at any reasonable entropy coef magnitude. Future specialization push should use joint-reg (iter 112 Gram penalty H84) instead. See H87b RESULT.) |
-| router_entropy_warmup_delay_frac | 0.3 (iter 100b: anneal entropy_coef from 0 over training, ramping linearly 0→target after 30% of wallclock; avoids cold-start trap that hurt iter 99/101 architectural sparsity attempts. See H76 + `feedback_anneal_sparsity_coefs.md`.) |
-| use_entmax_routing | False (iter 117 H87 default off; CLI-enable per launch via `--use-entmax-routing=1`. When True, `SoftDenseRouter` returns `sigmoid(blend_logit) * softmax + (1 − sigmoid(blend_logit)) * entmax_1p5` where `blend_logit` is a learnable scalar parameter — gradient drives blend toward entmax-1.5 if sparse routing benefits val_bpb. Strict-gen: with `entmax_blend_init_logit=+5`, sigmoid(5)≈0.9933 ≈ pure softmax at init → recovers iter 100b within bf16 floor. Variance penalty (iter 111 H83) provides the bootstrap gradient signal that rewards token specialization.) |
-| entmax_blend_init_logit | 5.0 (init blend logit; sigmoid(5)=0.9933 → ≈ softmax at init for strict-gen; CLI override `--entmax-blend-init-logit=…` for sweeps) |
-| use_orthogonal_expansion_routing | False (iter 112 H84 default off; CLI-enable per launch via `--use-orthogonal-expansion-routing=1`. When True, `SoftDenseRouter` adds the Gram-matrix orthogonality penalty `λ · ‖G − I/E‖²_F` where `G = (1/N) · W^T · W` over the (B·T, E) routing weight tensor. Penalty is zero at balanced one-hot routing and non-zero for both uniform routing and dead-expert collapse — drives joint per-token sparsity AND global utilization balance. Strict-gen: `routing_gram_coef=0` recovers iter 117 v5 baseline exactly. See H84 + `experiments/components/archive/orthogonal_expansion_routing.py` (archived after integration).) |
-| routing_gram_coef | 0.01 (iter 112 H84 target coef; effective only when `use_orthogonal_expansion_routing=True`. CLI override `--routing-gram-coef=…`. Annealed 0 → target over `routing_gram_warmup_delay_frac` of training to avoid cold-start over-constraint that hurt iter 99 sparsemax (+0.16 capacity cost).) |
-| routing_gram_warmup_delay_frac | 0.3 (iter 112 H84 warmup-delay; same shape as `router_entropy_warmup_delay_frac`. Linear ramp 0 → target after 30% of training elapsed.) |
-| attn_expert_rank | 64 (iter 96 baseline, unchanged through iter 100b) |
-| mlp_expert_rank | 96 (iter 96 baseline, unchanged through iter 100b) |
-| bigram_vocab_size | 0 (iter 93: BigramHash disabled; see H64) |
+| router_scoring | linear (dot-product logits) |
+| mos_balance_mult | 50.0 (multiplies MoS-NTP balance loss in `_collect_routing_losses`; the principled fix for `mos_*_min_share` failures, H26) |
+| min_share_loss_weight | 0.0 (CV loss alone covers global balance; `min_share` stays a diagnostic — sentinel `< 0.005` sustained → intervene; H76) |
+| cv_loss_weight | 2.0 (compensates dropped min_share floor; H76) |
+| router_entropy_coef | 0.005 (iter 117 v5 baseline; 10× bump in 117b-1 NOT PROMOTED — H87b) |
+| router_entropy_warmup_delay_frac | 0.3 (linear ramp 0→target after 30 % of wallclock; cold-start trap mitigation per `feedback_anneal_sparsity_coefs.md`) |
+| use_entmax_routing | False (CLI-enable. When True: `sigmoid(blend) * softmax + (1−sigmoid(blend)) * entmax_1p5` with learnable scalar `blend_logit`. Strict-gen at `entmax_blend_init_logit=+5`. H87.) |
+| entmax_blend_init_logit | 5.0 (sigmoid(5) ≈ 0.9933 ⇒ ≈ pure softmax at init; CLI override `--entmax-blend-init-logit=…`) |
+| use_orthogonal_expansion_routing | False (CLI-enable. Adds Gram-matrix penalty `λ · ‖G − I/E‖²_F` over the routing-weight tensor. Strict-gen at `routing_gram_coef=0`. H84.) |
+| routing_gram_coef | 0.01 (effective when `use_orthogonal_expansion_routing=True`; annealed 0 → target) |
+| routing_gram_warmup_delay_frac | 0.3 (same shape as `router_entropy_warmup_delay_frac`) |
+| attn_expert_rank | 64 |
+| mlp_expert_rank | 96 |
+| bigram_vocab_size | 0 (BigramHash disabled; H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
-| deq_k_jitter_set | (16, 24) — 2026-04-29 user directive: K-jitter RE-ENABLED with set {16, 24} after iter 98b K-sweep showed val_bpb is essentially CONVERGED at K=16 (K=16: 1.5018, K=128: 1.5039, Δ=+0.0021 — FP found at K=16). The previous K=24 OOM (profile_v8 2026-04-28) has been re-confirmed as RevDEQ-memory-O(1)-in-K via the iter 97.5b-fix diagnostic loop; no OOM concern at K=24. Adding K=24 to both training-jitter and the K-sweep matrix tests whether wider FP-depth jitter regularizes (analog of H12 VERIFIED). `deq_k_jitter=True`, `deq_k_max=24`, `deq_k_eval=16`. |
-| lyapunov_coef | 0.0 (iter 88: λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
-| lyapunov_gamma | 0.97 (target spectral radius threshold) |
-| lyapunov_warmup_frac | 0.05 (ramp over first 5% of wallclock) |
-| denoising_coef | 0.0 (iter 89: HyDRA denoising disabled — same Parcae-redundancy logic as iter 88) |
-| denoising_noise_std | 0.01 (Gaussian noise σ for denoising penalty) |
+| deq_k_jitter_set | (16, 24) (FP found at K=16 per iter 98b K-sweep; K=24 adds wider FP-depth jitter — analog of H12 VERIFIED) |
+| lyapunov_coef | 0.0 (λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
+| lyapunov_gamma | 0.97 |
+| lyapunov_warmup_frac | 0.05 |
+| denoising_coef | 0.0 (HyDRA denoising disabled — Parcae-redundancy logic) |
+| denoising_noise_std | 0.01 |
 
 ### Quantization & Techniques
 - int6 per-row quantization + zstd-22 compression
 - FP16 tied embeddings
 - BigramHash(4096+) + OrthoInit
-- SWA disabled (iter 1: dragged gates toward identity at 1 h budget)
 - Sliding-window eval (stride = 64)
+- SWA disabled — see `EXPERIENCE.md#disabled-techniques` for the reason trail.
 
 ## 6. Architectural Invariants
 
@@ -215,7 +215,7 @@ Paper: arxiv:2509.12917. Reference impl: see §2.
   - **Refinement** (`num_refinements`): predict → soft_embed → re-solve. Total block calls = `(1 + num_refinements) × num_layers × 2`.
 - **Warm start**: `z₀ = x` (one-hot token embedding); on refinement, `z₀ = x0_refined`.
 - **fp64 accumulators** for add/sub — required for exact reversibility.
-- **`deq_recon_err` semantic under TBPTT (NOT decision-grade).** Whenever `deq_bptt_k < num_layers` (the default since iter 28-tbptt) the reverse loop stops at iteration `K_fwd − K_bwd`, not at `z_0`. The logged metric (`((z_rec − z_0).norm() + (y_rec − z_0).norm()) / ||z_0||`) then measures how far the forward FP *travelled* in the un-reconstructed iterations — a "distance travelled" gauge, **not** a numerical reconstruction error. Expect values O(1) once the FP is non-trivial; do not gate divergence / promotion on its absolute magnitude. To measure true RevDEQ reconstruction error (target near fp64 precision, ~1e-12), set `deq_bptt_k = 0` (full BPTT) and re-run; only that regime makes recon_err comparable to the fp64 floor.
+- **`deq_recon_err` under TBPTT is "distance travelled", NOT decision-grade.** Under default `deq_bptt_k < num_layers` the metric reports forward-FP travel, not reconstruction error. Do not gate divergence / promotion on it. Set `deq_bptt_k = 0` for true reconstruction (~1e-12 floor). See `EXPERIENCE.md#deq-recon-err-interpretation`.
 - Fixed-point behavior is desired: monitor `||z_T − z_{T−1}|| / ||z_T||` (i.e. `deq_iter_conv_rel`, which IS informative under TBPTT) and residuals; improve if it does not harm expert health or val_bpb.
 - Smoke test asserts: recon near precision *(only valid when smoke runs full BPTT)* · loss decreasing · convergence not exploding · no NaN/Inf · expert routing healthy.
 
@@ -230,16 +230,11 @@ Paper: Soft MoE (arxiv:2308.00951). Mixtape (NeurIPS 2019) for MoS softmax.
 - **MoS routing**: pure softmax (convex combination summing to 1).
 - **Applied to**: attention output, MLP hidden, MoS output heads.
 - **Expert-health metrics** (min-share / CV) are computed on **renormalized** per-component shares; total routed mass is logged separately.
-- **Two distinct entropies — do not confuse them.** Both are reported under similar names but they answer different questions:
-  - **Global utilization entropy** (`expert_entropy` / `attn_entropy` / `mlp_entropy` in logs): `H_global = -Σ_e p̄_e log p̄_e` where `p̄_e` is the batch-averaged renormalized share for expert `e`. **HIGH = uniform usage across batch = no dead experts ✓.** This is the dead-expert sentinel; it should stay close to `log(N_routed)`.
-  - **Per-token routing entropy** (NEW under iter 99: `attn_pertoken_entropy` / `mlp_pertoken_entropy` in logs): `H_pertoken = mean_token(-Σ_e w(e|token) log w(e|token))` averaged over tokens. **LOW = each token concentrates weight on a few experts = specialization ✓.** This is the per-token sparsity / specialization signal; we want it driven down.
-  - You can have HIGH global *and* LOW per-token simultaneously — that's the target regime: every expert gets used somewhere in the batch (no waste), but each individual token uses only a few experts strongly (specialization).
-  - HIGH per-token entropy + HIGH global entropy = uniform smoothing, no specialization (current pre-iter-99 state).
-  - LOW per-token entropy + LOW global entropy = winner-take-all collapse with dead experts (bad — `min_share_loss_weight` exists to prevent this).
-- **Regularization** (iter 117b-1 grouped into a single named **`router_reg_loss`** term in `_collect_routing_losses`; three orthogonal regs of the same routing-pool health objective. Each enforces a distinct objective; coefs are independent — do not collapse magnitudes in a commit. MoS prediction-head ortho stays separate, different layer/object):
-  - **Per-token sparsity / specialization**: per-token entropy MINIMIZATION term `+entropy_coef · H_pertoken` added to total loss with POSITIVE sign (iter 99). Optimizer drives `H_pertoken → 0` → each token concentrates routing weight on few experts. The CV reg below operates on a DIFFERENT axis (global cross-batch balance) and does NOT fight this — joint target is low pertoken_entropy AND low CV. Optionally paired with softmax temperature `τ > 1`.
-  - **Global balance / dead-expert prevention**: `min_share_loss_weight` (forces every expert above a min share floor) + `cv_loss_weight` (penalizes CV across experts). Drives `H_global → log(N)`.
-  - **Expert orthogonality**: `block_ortho_aux_coef × ||cos_sim||` — drives expert OUTPUT directions to be different (`|cos_sim| → 0` between experts post-mix `mu_e`). Lives in `router_reg_loss` group as of iter 117b-1.
+- **Two distinct routing entropies** — *global utilization* (`H_global` over batch-averaged shares; HIGH = no dead experts; sentinel) and *per-token concentration* (`H_pertoken` averaged over tokens; LOW = specialization). Target: HIGH global AND LOW per-token. Full definitions, axes, and failure modes in §7 metrics table.
+- **Regularization** — three orthogonal regs grouped under `router_reg_loss` in `_collect_routing_losses`; coefs are independent (do not collapse magnitudes in a single commit):
+  - **Per-token specialization**: `+entropy_coef · H_pertoken` (POSITIVE sign drives `H_pertoken → 0`).
+  - **Global balance / dead-expert prevention**: `min_share_loss_weight` (floor) + `cv_loss_weight` (CV penalty). Drives `H_global → log(N)`.
+  - **Expert orthogonality**: `block_ortho_aux_coef × ‖cos_sim‖` between expert OUTPUT means.
 - Fully differentiable, no discrete decisions.
 
 ### 6.3 Per-Expert MLA + Gated Attention (full-D LoRA-style — architectural standard)
@@ -259,7 +254,7 @@ Papers: DeepSeek-V2 MLA (arxiv:2405.04434); Gated Attention (arxiv:2505.06708, N
 
 **Optional sparse-attention path — NSA (iter 106, default off).** When `use_nsa_attention=True`, the head-packed `(B, E·H, T, d)` SDPA call is replaced by a two-branch Native Sparse Attention mixer (arxiv:2502.11089): (1) **compression branch** mean-pools K/V over fixed-size sliding blocks then attends with a rectangular causal mask; (2) **sliding-window branch** attends to the last W tokens with a band-causal mask. A per-expert-per-head learnable softmax gate (`nsa_branch_gate` shape `(E·H, 2)`) mixes the two outputs. Gated attention (post-SDPA per-head sigmoid) is preserved unchanged. The third NSA branch (selection — top-K per-query block selection) is deferred to iter 106b via `nsa_num_selected_blocks=0`. **Strict-generalization (CLAUDE.md §11):** `nsa_compress_block_size=1`, `nsa_compress_block_sliding_stride=1`, `nsa_sliding_window_size=T`, `nsa_branch_gate_init=0` recovers full causal SDPA exactly within bf16 numerical floor — promotion is unconditional on val_bpb improvement.
 
-**Discarded alternative — bottleneck experts (iter 90, 91+92)**. The "low-dim bottleneck" rewrite (BottleneckIn `D→proj_rank→r` + ExpertBody at small `r` + BottleneckOut `r→proj_rank→D`) was tested as Group D and NOT PROMOTED. Empirically it underperformed full-D LoRA on **per-param efficiency** (`bpb/param 1.49 vs full-D LoRA's 1.17 — ~27% worse`, H70) AND on **SDPA throughput** (forces `d_head ≤ 48` at any `r ≤ 192` with `H_in ≥ 4`, off the FA tensorcore sweet spot of 64+). Both penalties compound when scaling N_expert. **Do not re-introduce bottleneck-style experts as a scaling axis.** The bottleneck infrastructure is preserved for archival reference at git tag `iter-91+92-bottleneck-NOT-PROMOTED` (commit `3e35655`) and side branch `autoresearch/bottleneck-rescue` (`proj_rank=48/64` rescue workspace). The iter 96 PROMOTED axis — full-D LoRA with rank-halving / E-doubling at iso-cost on linears — supersedes it (H71). See §6.2 for the routing semantics that this expert layout feeds into.
+**Discarded alternative — bottleneck experts.** Do NOT re-introduce bottleneck-style experts (BottleneckIn/Out around a small `r`) as a scaling axis. Per-param efficiency and SDPA throughput both regress vs full-D LoRA. Full rationale + the archival reference: `EXPERIENCE.md#bottleneck-experts-closed`.
 
 ### 6.4 FSQ in MoS Head
 Paper: FSQ (arxiv:2309.15505).
@@ -300,7 +295,7 @@ Reference impl: see §2.
 9. Log to `results.tsv` (do NOT commit `results.tsv`).
 10. **Always** run `bash experiments/update_results.sh` (rotates `current.log`/`current/weights` → `previous`, copies `run.log` → `current.log`, regenerates plots).
 11. Apply §11 Promotion Rules.
-12. **Update `experiments/hypotheses.md`** — record results, update statuses, note confounds. The H-claim section MUST include a FULL eval result subsection (user directive 2026-04-28, K-sweep matrix mandate strengthened 2026-04-29): (a) roundtrip int6 val_bpb + val_loss; (b) **K-sweep matrix — ALWAYS print the FULL `k_sweep_table:` matrix (header row + one data row per K) verbatim from run.log, NOT just summary text**. The 14 columns are: K, val_bpb, attn_cv, mlp_cv, pool_cv, attn_min, mlp_min, attn_ortho, mlp_ortho, pertoken_ent, pool_ent, shared_gate, hutch_F, rd_step, iter_conv_rel. This protocol is non-optional — every iter that completes a K-sweep gets its matrix copied into hypotheses.md, no exceptions. Acyclicity primes (17 / 37 / 113) are bolded. (c) trajectory table — val_bpb at each in-training val checkpoint with Δ from prev; (d) acyclicity prime check results (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP). Numbers must be grep-able from run.log. See `feedback_hypotheses_sync.md`.
+12. **Update `experiments/hypotheses.md`** — record results, statuses, confounds. The H-claim section MUST include: (a) roundtrip int6 val_bpb + val_loss; (b) the FULL `k_sweep_table:` matrix verbatim from run.log (header + one row per K; 15 cols including acyclicity primes 17/37/113 in bold) — non-optional, no exceptions; (c) trajectory table (val_bpb per val checkpoint with Δ); (d) acyclicity-prime check (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP). All numbers must be grep-able from run.log. See `feedback_hypotheses_sync.md`.
 13. Track consecutive non-improvements. **STOP after 100** and seek user guidance.
 
 ### Logging, Weights & Plotting (every iteration)
@@ -311,19 +306,17 @@ Reference impl: see §2.
 
 #### Required routing-health metrics (ALL must be reported every train+val log line)
 
-| Metric | Target | What it tracks | Pool prefix? |
-|---|---|---|---|
-| **`pertoken_entropy`** (sparsity, iter 99+) | **LOW** ≈ 1.0 nat | Per-token routing concentration: `−Σ_e w(e\|token) log w(e\|token)` averaged over tokens. LOW = each token uses few experts strongly = specialization | **NO** — single pooled router-output value; pool-level by construction |
-| **`attn_entropy` / `mlp_entropy` / `pool_entropy`** (global utilization, iter 100b+) | **HIGH** ≈ log(N_routed) per slice; pool ≈ log(2·N_routed) | Global cross-batch entropy `−Σ_e p̄_e log p̄_e` computed on (a) the per-slice renormalized batch-averaged shares (attn / mlp) and (b) the full unrenormalized pool. Comparing slice values against pool diagnoses cross-slice dominance: pool >> max(attn_slice, mlp_slice) means total mass is well-spread across attn+mlp; pool ≈ slice means one slice carries most mass | **YES** — three distinct values, attn ≠ mlp ≠ pool |
-| **`min_expert_contribution`** | **≥ 0.005** (0.5%) | `min_e p̄_e` — smallest batch-averaged share across the routed-expert pool. Sentinel for dead experts. Should report explicitly per pool slice (attn min, mlp min) | **YES** — `attn_min_share` / `mlp_min_share` differ because the per-component shares differ across pool slices |
-| **`attn_cv` / `mlp_cv` / `pool_cv`** (coefficient of variation, iter 100b+) | **LOW** ≈ 0.2-0.3 per slice | Per-slice CV uses the renormalized within-slice distribution; pool CV uses the full 2R unrenormalized distribution. Per-slice CVs measure within-role imbalance independently; pool CV captures BOTH within-slice imbalance AND any tilt of total mass between attn and mlp slices. Diagnostic: large gap between attn_cv and mlp_cv = role-asymmetric routing (e.g., iter 100b s120 attn_cv≈1.07, mlp_cv≈0.18 — attn winner-take-all, MLP uniform). Large pool_cv with small per-slice CVs = cross-slice dominance | **YES** — three distinct values |
-| **`ortho`** (expert orthogonality) | **LOW** ≈ 0.1-0.2 | `max\|cos_sim\|` between expert OUTPUT means. Low cosine = experts represent different directions | **YES** — `attn_ortho` / `mlp_ortho` differ because attention experts and MLP experts produce DIFFERENT outputs even with shared router; per-pool computation is required |
-| **`router_mass`** | 0.7-0.95 typical | Mean `sigmoid(gate)` value — total routed contribution per token. Drops as the model gates the mixture down | NO — single gate, single value |
-| **`hutch_F`** (FP spectral, iter 97.5b PERMANENT 2026-04-29) | LOW + decreasing across val checkpoints | Hutchinson-Frobenius estimator at the saved DEQ FP `z*`: `rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)` for `J = ∂T_θ/∂z`. Distinguishes contractive attractor (rho_F < 1, decreasing with training) from marginal stability (rho_F ≈ 1) or trivial dynamics (rho_F → 0). Emitted on val log lines AND in the K-sweep table per-K. Probe runs at `B_probe=1` slice of saved z*/x0 (set by iter 97.5b-fix 2026-04-29 to bound activation memory to ~1-2 GiB; previously the unsliced full-val-batch JVP OOM'd at 32 GiB on the 44 GB dev cap, misattributed to "SDPA backend rejection" in earlier iter 100b documentation). Silently skipped (no `hutch_F:` field in log) on OOM-pred guard / runtime OOM / SDPA-grad-incompatibility | NO — single global value at the FP |
+| Metric | Target | Decomposition |
+|---|---|---|
+| **`pertoken_entropy`** | **LOW** ≈ 1.0 nat (specialization) | single pool-level value |
+| **`attn_entropy` / `mlp_entropy` / `pool_entropy`** | **HIGH** ≈ log(N_routed) per slice; pool ≈ log(2·N_routed) | per-slice renormalized + full pool |
+| **`attn_min_share` / `mlp_min_share`** | **≥ 0.005** (dead-expert sentinel) | per slice |
+| **`attn_cv` / `mlp_cv` / `pool_cv`** | **LOW** ≈ 0.2-0.3 per slice | per slice + full pool (cross-slice dominance) |
+| **`attn_ortho` / `mlp_ortho`** | **LOW** ≈ 0.1-0.2 (`max\|cos_sim\|` of expert OUTPUT means) | per slice |
+| **`router_mass`** | 0.7-0.95 (mean `sigmoid(gate)`) | single value |
+| **`hutch_F`** (FP spectral) | LOW + decreasing across val | single value at FP; skipped on OOM/SDPA-grad-reject |
 
-**Prefix convention** (updated 2026-04-27, iter 100b): the SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components (per CLAUDE.md §6.2 and the iter 35 router consolidation). Logging now decomposes routing-distribution metrics into THREE values: `attn_*` (per-slice renormalized within attn experts), `mlp_*` (per-slice renormalized within mlp experts), and `pool_*` (full 2R distribution without slice renormalization). The three values diagnose distinct phenomena: per-slice within-role imbalance (attn_cv vs mlp_cv asymmetry), cross-slice dominance (pool_cv vs max(per-slice)), and the relationship between them. Metrics derived from **expert outputs** (usage arrays, orthogonality, min_share per slice) keep their `attn_*`/`mlp_*` prefix as before. `pertoken_entropy` remains a single pool-level value (per-token entropy is a pool-level quantity by construction — each token has ONE distribution).
-
-**K-sweep tabular emission** (PERMANENT 2026-04-28, iter 100b user directive): the eval K-sweep emits a `k_sweep_table:` row per K value with 14 fixed-width columns: `K val_bpb attn_cv mlp_cv pool_cv attn_min mlp_min attn_ortho mlp_ortho pertoken_ent pool_ent shared_gate hutch_F rd_step iter_conv_rel`. A header row precedes the data rows. `N/A` indicates an unavailable field (most commonly Hutchinson/Lipschitz when SDPA backend rejects under enable_grad — known iter 97.6 limitation). The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[...] router_gate_iter:[...] iter_conv_rel:... residual:...` line is preserved for backward compatibility with `experiments/plot_metrics.py`. Use the `k_sweep_table:` rows for cross-K and cross-iter routing-health comparisons; use `k_sweep:` for per-iteration gate trajectories.
+Definitions, axis interpretations, the iter-99 / iter-100b decomposition rationale, and the `k_sweep_table:` 14-column schema (incl. legacy `k_sweep:` line for plot back-compat) live in `EXPERIENCE.md#routing-health-metrics`.
 
 - Detailed comparison: 2 configs only — baseline vs current.
 - **Prioritize architecture exploration** over hyperparameter tuning; cite papers/repos.
@@ -381,7 +374,7 @@ New auto-memory files (feedback / project / user / reference) go in `/home/mzhon
 
 ## 9. Code-Quality Audit Checklist
 
-Run before every commit that touches `train_gpt.py`. Each row is one-line enforcement; click the anchor for the full incident.
+Run before every commit that touches `train_gpt.py` OR `CLAUDE.md`. Each row is one-line enforcement; click the anchor for the full incident.
 
 - **Single-source-of-truth (Hyperparameters)** — every tunable knob lives in `train_gpt.py::Hyperparameters` and is plumbed from there. Tests assert against `args.<field>`, not literals. CLAUDE.md §5 mirrors edits in the same commit. → [`EXPERIENCE.md#config-drift`](EXPERIENCE.md#config-drift)
 - **Permutation consistency** — `grep -n 'permute(' train_gpt.py | grep -v '#'`; related groups (e.g. `(E,B,T,H,d) → (B,E·H,T,d)`) must use the same index tuple. A single outlier is almost certainly a silent transposition. → [`EXPERIENCE.md#permutation-consistency`](EXPERIENCE.md#permutation-consistency)
@@ -397,6 +390,7 @@ Run before every commit that touches `train_gpt.py`. Each row is one-line enforc
 - **Doc-Code Invariant** — when `opg_doc.tex` describes an algorithm and `train_gpt.py` implements a different (better) variant, the doc MUST note the deviation in a "Practical implementation" paragraph. Pseudocode is theoretical; code is the source of truth. → [`EXPERIENCE.md#doc-code-invariant`](EXPERIENCE.md#doc-code-invariant)
 - **Diagnostic-gate component awareness** — when a feature flag disables a code path (e.g. `use_ctp=False`), the corresponding diagnostic emission MUST be gated on the same flag, and any retry prescription for that component MUST recommend a component-specific lever (e.g. `mos_balance_mult` for MoS routing collapse, NOT global `weight_decay`). `grep -n 'mos_ctp\|use_ctp' train_gpt.py` — every diagnostic spec referencing a CTP-only attribute lives behind a `mos_head.use_ctp` guard. → [`EXPERIENCE.md#diagnostic-gate-component-awareness`](EXPERIENCE.md#diagnostic-gate-component-awareness)
 - **Hyperparameter fan-out** — every documented knob lives in `Hyperparameters`, is reachable via `_parse_cli_overrides`, and its consumer reads `args.<field>` (no constructor literal that shadows the dataclass). Four-touch rule for new knobs: (1) `Hyperparameters` field, (2) `args.<field>` read at consumer, (3) CLAUDE.md §5 row, (4) `opg_doc.tex` parameter table or "Practical implementation" note. When effective magnitude differs from documented magnitude (e.g. via balance-mult dedup), document the effective value or fix the multiplication. → [`EXPERIENCE.md#hyperparameter-fanout`](EXPERIENCE.md#hyperparameter-fanout)
+- **CLAUDE.md size budget** — `wc -c CLAUDE.md` < 40 000. Iter-history annotations ("iter X NOT PROMOTED because Y") route to `experiments/hypotheses.md` H## or `EXPERIENCE.md` §2; CLAUDE.md keeps invariants only. → [`EXPERIENCE.md#claude-md-size-budget`](EXPERIENCE.md#claude-md-size-budget)
 
 ## 10. RevDEQ Specifics
 

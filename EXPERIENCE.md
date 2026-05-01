@@ -29,6 +29,8 @@ This file has two roles, in this order:
 | (pre-arch) | [#permutation-consistency](#permutation-consistency)         | k_rope outlier permute index produced silent transposition (commit ec1048b) |
 | (pre-arch) | [#doc-code-invariant](#doc-code-invariant)                   | Pseudocode in `opg_doc.tex` diverged from implementation; required co-update |
 | 2026-04-28 | [#hyperparameter-fanout](#hyperparameter-fanout)             | Five "tunable" knobs documented in CLAUDE.md §5 were hardcoded inside constructors |
+| 2026-04-30 | [#claude-md-size-budget](#claude-md-size-budget)             | CLAUDE.md hit 51 887 chars (>40k perf warning) from accreted iter-history annotations |
+| 2026-04-30 | [#variance-reg-ns-cascade](#variance-reg-ns-cascade)         | Iter 117 NaN cascade attributed to PE-NS was actually variance-reg gradients on entmax exact-zeros |
 
 ### Section template
 
@@ -436,6 +438,47 @@ When effective magnitude differs from documented magnitude (as with the entropy 
 
 ---
 
+### claude-md-size-budget
+
+**Date:** 2026-04-30 review
+**Rule in CLAUDE.md:** §9 audit checklist row "CLAUDE.md size budget"
+
+**What happened.** CLAUDE.md grew to 51 887 chars and triggered Claude Code's "Large CLAUDE.md will impact performance (>40 000 chars)" warning. Almost every knob in §5 had accreted a multi-line iter-history annotation ("iter 96 baseline; iter 97 attempt NOT PROMOTED on per-wallclock grounds, see H72…"); §6.3 carried a paragraph-long postmortem of the bottleneck-experts approach; §7 metrics-table prose duplicated definitions already living in `experiments/hypotheses.md`.
+
+**Root cause.** Promotion etiquette put a "why this knob has its current value" annotation on the knob itself. Each annotation was reasonable in isolation; together they coupled a stable rule file (CLAUDE.md) to an unstable narrative file (`hypotheses.md`). Stories about *past* iterations don't compose with rules about the *current* state — they only accumulate.
+
+**The rule.**
+
+> `wc -c CLAUDE.md` < 40 000. Iter-history prose ("iter X NOT PROMOTED because Y") is **content rot in CLAUDE.md** — it belongs in `experiments/hypotheses.md` (per-iter narrative) or `EXPERIENCE.md` §2 (durable lessons). Before adding to CLAUDE.md, ask: "is this an *invariant* (current state) or a *story* (history)?". Invariants stay; stories go elsewhere with a one-line pointer left behind.
+
+**Verification recipe.**
+- Pre-commit: `wc -c CLAUDE.md` returns < 40 000.
+- Anchor resolution: `grep -oE 'EXPERIENCE.md#[a-z-]+' CLAUDE.md | sort -u`; each anchor has a matching `### <slug>` heading in this file.
+- Knob-row size cap (informal): a §5 row's annotation should fit in ≤ 1 line of prose; longer annotations route to `hypotheses.md` H## with `(see H##)` left in CLAUDE.md.
+
+**Cross-references.** [#config-drift](#config-drift), [#hyperparameter-fanout](#hyperparameter-fanout) — both share the "single source of truth" theme; this rule applies it to *narrative* drift, not numeric drift.
+
+---
+
+### variance-reg-ns-cascade
+
+**Date:** 2026-04-30 review (post-iter 121b)
+**Rule in CLAUDE.md:** §5 Optimizer (`muon_backend_steps` row), `feedback_diagnosis_context.md`
+
+**What happened.** Iter 117 v2 hit a NaN cascade and an early diagnostic blamed the **Polar-Express Newton-Schulz** (PE-NS) orthogonalizer at `muon_backend_steps=10` (later 7), with the proximate symptom "entmax + entropy" instability. PE-NS was about to be reverted from the default. Re-investigation showed the actual driver was the **variance regularizer** introduced in iter 111 H83 (`routing_variance_coef = -λ · Σ_e Var_token(w(e|t))`): once entmax-1.5 produced exact-zero routing weights, the variance gradient amplified those zeros into a Newton-Schulz blow-up. Iter 117 v3 *removed* the variance reg and ran cleanly with PE-NS @ 7; iter 117 v5 promoted on that combination.
+
+**Root cause.** A surface symptom (NS amplification of bad gradients) was treated as the cause without isolating the gradient *source*. The triggering condition (entmax + variance reg) was a regression of an unrelated commit; the orthogonalizer was a passive amplifier.
+
+**The rule.** When closing an iter due to instability, document the **full active config** at the moment of failure — every regularizer coef, every flag, every annealing schedule — so re-opening is automatic when one of the triggering conditions is removed. Don't write "iter 121 closed: PE-NS instability" if the actual story is "iter 121 closed under (variance_coef=λ, use_entmax=True, PE-NS @ 7) — closure is conditional on the active regularization stack". See `feedback_diagnosis_context.md`.
+
+**Verification recipe.**
+- Iter-closure note must list the active regularization stack, not just the suspected component.
+- Re-open the closed knob whenever a triggering condition is removed; do NOT treat closure as permanent.
+
+**Cross-references.** [#dead-code-tracking](#dead-code-tracking) (the variance reg was eventually removed, becoming dead code that needed full purging).
+
+---
+
 ## §2. Lessons Learned
 
 Generic guardrails distilled from research-process experience. Not tied to specific code paths or dated incidents — background principles, not enforcement.
@@ -526,3 +569,64 @@ Generic guardrails distilled from research-process experience. Not tied to speci
 
 ### Distributed
 - Any rank-conditional control flow around collectives is a correctness bug; all ranks must execute collectives in the same order.
+
+---
+
+### Routing Health Metrics
+
+CLAUDE.md §7 lists the targets and decompositions; the prose below is the rationale (moved out of CLAUDE.md to keep the file under the 40k budget — see [#claude-md-size-budget](#claude-md-size-budget)).
+
+- **`pertoken_entropy`** — `H_pertoken = mean_token(−Σ_e w(e|t) log w(e|t))`. LOW means each token concentrates on few experts → specialization. Single pool-level value (per-token entropy is a pool-level quantity by construction — each token has ONE distribution).
+- **`*_entropy`** (global utilization) — `H_global = −Σ_e p̄_e log p̄_e` over batch-averaged shares `p̄_e`. HIGH ≈ log(N_routed) means uniform usage across batch — no dead experts. Reported per-slice (attn / mlp, renormalized within-slice) AND pool (full unrenormalized 2R distribution).
+- **You can have HIGH global *and* LOW per-token simultaneously** — that's the target regime. Every expert gets used somewhere in the batch; each individual token uses only a few experts strongly.
+- **`*_min_share`** — `min_e p̄_e`. Sentinel for dead experts; report per-slice because the per-component shares differ.
+- **`*_cv`** — coefficient of variation. Per-slice CV uses the renormalized within-slice distribution; pool CV uses the full 2R unrenormalized distribution. Diagnostic: large gap between attn_cv and mlp_cv = role-asymmetric routing (e.g. iter 100b s120 attn_cv≈1.07 / mlp_cv≈0.18: attn winner-take-all, MLP uniform). Large pool_cv with small per-slice CVs = cross-slice dominance.
+- **`*_ortho`** — `max|cos_sim|` between expert OUTPUT means. Reported per-slice because attn experts and MLP experts produce DIFFERENT outputs even with the shared (pooled) router.
+- **`router_mass`** — mean `sigmoid(gate)`. Drops when the model gates the mixture down.
+- **`hutch_F`** — Hutchinson-Frobenius estimator at the saved DEQ FP `z*`: `rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)` for `J = ∂T_θ/∂z`. Distinguishes contractive attractor (`rho_F < 1`, decreasing with training), marginal stability (`rho_F ≈ 1`), and trivial dynamics (`rho_F → 0`). Probe runs at `B_probe=1` slice of saved `z*/x0` to bound activation memory to ~1-2 GiB; silently skipped on OOM-pred guard / runtime OOM / SDPA-grad-incompatibility.
+
+**Prefix convention** (iter 100b). The SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components. Routing-distribution metrics decompose into THREE values: `attn_*` (per-slice renormalized), `mlp_*` (per-slice renormalized), and `pool_*` (full 2R distribution). Metrics derived from **expert outputs** (usage, ortho, min_share per slice) keep `attn_*`/`mlp_*` only — there is no pool variant.
+
+**K-sweep tabular emission** (PERMANENT iter 100b). The eval K-sweep emits a `k_sweep_table:` row per K with 15 fixed-width columns: `K val_bpb attn_cv mlp_cv pool_cv attn_min mlp_min attn_ortho mlp_ortho pertoken_ent pool_ent shared_gate hutch_F rd_step iter_conv_rel`. A header row precedes data rows. `N/A` indicates an unavailable field (most commonly Hutchinson when SDPA backend rejects under `enable_grad`). The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[…] router_gate_iter:[…] iter_conv_rel:… residual:…` line is preserved for `experiments/plot_metrics.py` back-compat. Use `k_sweep_table:` for cross-K and cross-iter routing-health comparisons; use `k_sweep:` for per-iter gate trajectories.
+
+---
+
+### Bottleneck Experts (closed)
+
+**Decision.** Do NOT re-introduce bottleneck-style experts (`BottleneckIn` `D→proj_rank→r` + `ExpertBody` at small `r` + `BottleneckOut` `r→proj_rank→D`) as a scaling axis. Tested as Group D (iter 90, 91+92) and NOT PROMOTED.
+
+**Why.** Two compounding penalties:
+1. **Per-param efficiency**: bpb/param 1.49 vs full-D LoRA's 1.17 — ~27 % worse (H70).
+2. **SDPA throughput**: `proj_rank ≤ 192` with `H_in ≥ 4` forces `d_head ≤ 48`, off the FlashAttention tensorcore sweet spot (64+).
+
+Both penalties compound when scaling `N_expert`. The iter 96 PROMOTED axis — full-D LoRA with rank-halving / E-doubling at iso-cost on linears (H71) — supersedes it.
+
+**Archival.** Bottleneck infrastructure preserved at git tag `iter-91+92-bottleneck-NOT-PROMOTED` (commit `3e35655`) and side branch `autoresearch/bottleneck-rescue` (`proj_rank=48/64` rescue workspace). Routing semantics it would feed into are unchanged — see CLAUDE.md §6.2.
+
+---
+
+### deq-recon-err-interpretation
+
+Whenever `deq_bptt_k < num_layers` (the default since iter 28-tbptt) the RevDEQ reverse loop stops at iteration `K_fwd − K_bwd`, NOT at `z_0`. The logged metric
+
+```
+deq_recon_err = (‖z_rec − z_0‖ + ‖y_rec − z_0‖) / ‖z_0‖
+```
+
+then measures how far the forward FP *travelled* in the un-reconstructed iterations — a "distance travelled" gauge, NOT a numerical reconstruction error. Expect values O(1) once the FP is non-trivial; do NOT gate divergence / promotion on its absolute magnitude. To measure true RevDEQ reconstruction error (target near fp64 precision, ~1e-12), set `deq_bptt_k = 0` (full BPTT) and re-run; only that regime makes `recon_err` comparable to the fp64 floor.
+
+**Smoke-test caveat.** The smoke test asserts "recon near precision" — that assertion is only valid when the smoke runs **full BPTT**. Under TBPTT-default the smoke must use a different stability check (loss decreasing · `deq_iter_conv_rel` not exploding · no NaN/Inf · expert routing healthy).
+
+---
+
+### Disabled Techniques
+
+Maintained here so removed/disabled techniques don't accrete annotations on the §5 Quantization & Techniques row.
+
+- **SWA (Sliding-Window Attention)** — disabled iter 1: dragged gates toward identity at the 1 h budget. Sliding-window EVAL (stride = 64) is unrelated and stays enabled.
+- **BigramHash** — `bigram_vocab_size = 0` (iter 93 / H64). Code retained behind the flag.
+- **FSQ in MoS head** — `fsq_levels = 0` (iter 62 / H53). Low-rank MoS projection alone is sufficient; FSQ code retained for re-enabling.
+- **Lyapunov regularizer** — `lyapunov_coef = 0.0` (iter 88). Parcae per-dim Ā already bounds spectral radius.
+- **HyDRA denoising** — `denoising_coef = 0.0` (iter 89). Same Parcae-redundancy logic as iter 88.
+- **CTP head** — `use_ctp = False` (iter 94 / H60). NTP-only; CTP param banks not allocated.
+- **Variance regularizer** — removed entirely (iter 117 v3). Was the underlying driver of the iter 121 PE-NS NaN cascade — see [#variance-reg-ns-cascade](#variance-reg-ns-cascade).
