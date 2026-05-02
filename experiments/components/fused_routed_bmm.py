@@ -583,26 +583,32 @@ torch.library.register_autograd(
 def fused_routed_bmm(
     scores: Tensor, gate: Tensor, x: Tensor, expert_W: Tensor
 ) -> Tensor:
-    """Fused routing+bmm — dispatches by `requires_grad`.
+    """Fused routing+bmm — dispatches by `torch.is_grad_enabled()`.
 
-    - Training (any input has requires_grad=True): pure eager via
-      `fused_routed_bmm_eager`. PyTorch's autograd machinery is the
-      fastest backward path at our shapes (verified empirically — Triton
-      backward kernels for d_W/d_w are ~150 lines of complex code that
-      end up close to or slower than autograd anyway). Gradient
-      consistency with the forward map is by construction (eager
-      gradients of eager forward).
-    - Inference (no requires_grad): Triton kernel via custom_op.
-      Memory-bandwidth fusion + H101-safe sparsity skip deliver
-      1.4× (dense) to 5.4× (87.5% sparse) speedup. Used for val_bpb
-      checkpoints, K-sweep matrix, and any forward-only path.
+    Critical: check `is_grad_enabled()`, NOT just tensor `requires_grad`
+    flags. `expert_W` is an `nn.Parameter` with `requires_grad=True`
+    permanently; tensor-flag-only check would route to eager even inside
+    `torch.no_grad()` context, defeating the kernel's value during
+    RevDEQ's no_grad forward FP iteration and reverse-pass reconstruction.
 
-    Rationale: the Triton kernel's wins (memory bandwidth, sparsity skip)
-    apply purely to forward; backward via eager re-forward + autograd.grad
-    has overhead that exceeds those wins at training time. Splitting use
-    cases by `requires_grad` lets each path use its best implementation.
+    - **Autograd-enabled context** with at least one grad-requiring input:
+      → `fused_routed_bmm_eager` (PyTorch autograd machinery, fastest
+      backward path at our shapes; gradient consistency by construction).
+      Hits the **TBPTT window** (last `tbptt_k` iters of the FP solve)
+      and any non-DEQ training callsites.
+    - **`torch.no_grad()` context** OR no grad-requiring inputs:
+      → Triton kernel via custom_op. Memory-bandwidth fusion + H101-safe
+      sparsity skip deliver 1.4× (dense) to 5.4× (87.5% sparse) speedup.
+      Hits **most of RevDEQ training** — the (K - tbptt_k) no_grad
+      forward FP iters, the (K - tbptt_k) reverse-pass reconstructions,
+      val_bpb checkpoints, K-sweep, generation.
+
+    For K=16, tbptt_k=3: ~26/29 ≈ 90% of expert dispatch calls per Block
+    invocation hit the Triton path during training.
     """
-    if any(t.requires_grad for t in (scores, gate, x, expert_W)):
+    if torch.is_grad_enabled() and any(
+        t.requires_grad for t in (scores, gate, x, expert_W)
+    ):
         return fused_routed_bmm_eager(scores, gate, x, expert_W)
     return torch.ops.opg_fused.fused_routed_bmm(scores, gate, x, expert_W)
 
