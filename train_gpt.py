@@ -1854,6 +1854,10 @@ class SoftDenseRouter(nn.Module):
         return torch.cat(chunks, dim=-1)
 
     def _component_health_losses(self, mean_mass: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        # H100 (2026-05-02): operate on combined `p = softmax × sigmoid(gate)` directly,
+        # no per-slice renorm. CV is mathematically scale-invariant so unchanged; `bal`
+        # MSE becomes gate-aware (penalizes both shape imbalance AND gate suppression);
+        # min_share is dead-path (weight=0). Strict-gen at gate_mean=1: identical to old.
         bal = mean_mass.new_zeros(())
         min_loss = mean_mass.new_zeros(())
         cv_loss = mean_mass.new_zeros(())
@@ -1861,7 +1865,6 @@ class SoftDenseRouter(nn.Module):
         for start, end in self._component_ranges():
             width = max(end - start, 1)
             share = mean_mass[..., start:end]
-            share = share / share.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             target = torch.full_like(share, 1.0 / float(width))
             bal = bal + F.mse_loss(share, target)
             lb = float(self.min_share_frac) / float(width)

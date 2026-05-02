@@ -2344,19 +2344,110 @@ File "train_gpt.py", line 1607, in _entmax_1p5_triton_op
 
 **Status:** NOT-VIABLE ✗. Queued as **iter 117b-2-fix** for after iter 117b-3 + 117b-3b (don't block sparsity throughput sequence on a kernel patch). Proceeding to iter 117b-3 (sparse MoE dispatch — different code path, no power-of-2 constraint).
 
-### H88: Triton-fused entmax + grouped-GEMM via custom_op (iter 118) — PROPOSED CONDITIONAL 2026-04-29
+### H88: Unified primitive — fused routing+bmm Triton kernel (iter 118) — REFRAMED 2026-05-02 v2
 
-**Hypothesis.** If iter 117 (path A pure-PyTorch dispatch) confirms val_bpb is preserved, the next step is a **fused Triton kernel** for `entmax_alpha + grouped_GEMM` registered via `torch.library.custom_op` (with `register_fake` + `register_autograd`). Predicted **3–4× wallclock** speedup over iter 100b dense soft-MoE, vs iter 117's 1.5–2.5× from pure-PyTorch path.
+**Reframe v2 (2026-05-02, post-H101).** v1 proposed `eps>0` skip-empty per tile; that mechanism is **architecturally forbidden** by H101 (top-K / magnitude-skip dispatch breaks RevDEQ reversibility — see H101 below). v2 splits iter 118 into **two phases**, both RevDEQ-safe:
 
-**Why custom_op (not autograd.Function).** iter 104 (AdaSplash) DROPPED 2026-04-29 because `torch.autograd.Function` is incompatible with torch.compile's AOTAutograd functionalization (`_functionalization.apply_view_meta_sequence` corruption at step 2). The PyTorch-recommended path is `torch.library.custom_op` with FakeTensor backward — the standard remediation pattern. iter 118 follows this pattern from the start.
+#### Phase A (iter 118a): Fuse routing+bmm at eps=0 — bit-identical to dense soft-MoE
 
-**Implementation order:**
-1. Verify iter 117 (path A) preserves val_bpb on iter 100b's 1000-step regime
-2. Implement Triton kernel: input (B*T, E) scores → output (B*T, E) entmax weights, fused with the per-expert grouped GEMM dispatch
-3. Register via custom_op + FakeTensor backward
-4. Smoke test, 10-iter, full 1000-step
+Triton kernel `fused_routed_bmm(scores: (N,E), x: (N,D), W: (E,D,D'), bias: (E,D'))` that:
+1. Applies the routing transform (softmax / entmax-blend / sigmoid-gate combine) inline in registers — never materializes the `(N, E)` weight tensor to HBM.
+2. Applies `weights[t,e] · expert_e(x[t])` and accumulates over experts in registers.
+3. Writes one `(N, D')` output tensor.
 
-**Status:** PROPOSED — HIGH PRIORITY iter 118 **conditional on iter 117 promotion**. Skip if 117 fails.
+Mathematically identical to dense soft-MoE: `out[t] = Σ_e w[t,e] · expert_e(x[t])`. No skip, no truncation, no discrete decisions. Forward map preserved bit-identically up to bf16 reduction-order noise → RevDEQ reversibility intact.
+
+**Throughput source: memory bandwidth + kernel launch.** Current eager path materializes `p = softmax · sigmoid` (memory write), then a second pass reads `p` and per-expert outputs to compute the weighted sum (memory read). Fused kernel does both in registers, halving HBM traffic on the routing tensor + saving one kernel launch per layer.
+
+**Predicted throughput.** 10–30% per-layer speedup. Modest but **architecturally honest** — every gain compounds across the 12 layers + per-step DEQ iteration, so even 15% per-layer ≈ 15% per-step.
+
+**Strict-gen recovery.** `use_unified_routed_bmm=False` (CLI default) keeps the eager path; flag flip is the only difference. Promotion unconditional on val_bpb non-regression (per CLAUDE.md §11 strict-gen rule).
+
+#### Phase B (iter 118b): RevDEQ-safe sparsity primitives — design candidates
+
+After Phase A lands, explore continuous-relaxation paths to translate routing sparsity into kernel skips WITHOUT breaking smoothness:
+
+**B1 — Sinkhorn-balanced routing** (Mixture-of-Routers-with-Sinkhorn, arxiv:2009.13239 / CLIP-MoE):
+- Apply 3-5 Sinkhorn-Knopp normalization iterations to the (T, E) routing matrix to enforce row sums = 1 AND column sums = T/E (load-balance built-in, replaces CV reg).
+- Output is **continuous** — no top-K, no thresholds. Differentiable end-to-end. RevDEQ-smooth.
+- Throughput: doesn't sparsify per se, but the column-balance lets the kernel use **fixed K = T/E** per expert deterministically — every expert sees exactly T/E tokens, no capacity overflow, no waste. Forward map is approximate (Sinkhorn fixed-point, not the original routing) but converges to a smooth limit as iterations → ∞.
+- Risk: changes the routing's expressive capacity; iter 99/101 showed sparsemax/entmax architectural-sparsity hurts val_bpb. Sinkhorn could too.
+
+**B2 — Gumbel-softmax with annealed temperature** (Jang+Gu+Poole 2017):
+- Add Gumbel noise to logits, take softmax(τ·logits) instead of argmax-via-Gumbel.
+- At high τ: smooth softmax-equivalent. At low τ: approaches one-hot per token.
+- Anneal τ → small over training; routing becomes near-one-hot but stays continuously differentiable.
+- Throughput: kernel checks `‖weights[t,e]‖ < bf16_floor` (≈ 4e-3). Skipped weights are below the bf16 mantissa precision, so skipping is approximately bit-identical to including them — the discontinuity is below numerical noise. **This is the principled threshold**: precision-floor skip, NOT a tunable knob.
+- RevDEQ-safety condition: skip threshold ε ≤ ε_bf16 (mantissa precision, ~3.9e-3). Any contribution below this is below numerical noise of the data type, so the discontinuity is invisible to the FP iteration.
+- Risk: anneal schedule needs careful tuning; too-fast anneal kills capacity (iter 102 H77 lesson).
+
+**B3 — Polysparse Lipschitz routing** (research-novel):
+- Use a smooth saturating nonlinearity on the routing logits that has **bounded Lipschitz constant** AND produces near-zero outputs for low logits: e.g. `relu(logits − τ).square() / (1 + ε)` followed by per-token L1-renorm.
+- Mathematically smooth (C¹), exact zeros possible only at the τ threshold (measure-zero set), Lipschitz-bounded gradient → RevDEQ-compatible per H32 contraction-preserving rule.
+- Tunable saturation point τ controls sparsity continuously.
+
+**Selection criterion**: Phase B candidate must satisfy ALL of:
+1. C¹-smooth forward map (no kinks, no discrete decisions in the support).
+2. Bounded Lipschitz gradient (no `1/x` style explosions).
+3. Strict-gen recovery to dense soft-MoE at some parameter setting.
+4. Compatible with the iter 118a fused kernel (no graph break).
+
+**Implementation order (~2 days for Phase A, +3 days for Phase B):**
+1. Phase A: kernel signature + FakeTensor shapes; smoke at eps=0 vs eager.
+2. Phase A: register backward via `register_autograd`.
+3. Phase A: wire into `Block.forward` behind CLI flag; full 1000-step run.
+4. Phase B: prototype B1/B2/B3 in `experiments/components/`; measure forward-map smoothness via `‖∂T/∂z‖` at boundary samples.
+5. Phase B: pick the cleanest one; full 1000-step run vs iter 95 baseline.
+
+**Why custom_op (not autograd.Function).** iter 104 (AdaSplash) DROPPED 2026-04-29 because `torch.autograd.Function` is incompatible with torch.compile's AOTAutograd functionalization. PyTorch-recommended path: `torch.library.custom_op` with `register_fake` + `register_autograd`.
+
+**Status:** Phase A PROPOSED — HIGH PRIORITY iter 118a, kicks off immediately (iter 117b-3 KILLED-ARCHITECTURAL 2026-05-02 per H101). Phase B PROPOSED CONDITIONAL on Phase A landing. ~2+3 days focused implementation. Throughput-honest (10-30% from kernel fusion alone), with optional sparsity speedup from Phase B's continuous-relaxation path.
+
+### H101: Top-K / magnitude-skip dispatch breaks RevDEQ reversibility — PERMANENT RULE 2026-05-02
+
+**Rule.** Any routing or dispatch mechanism that introduces **discrete decisions** (top-K selection, hard threshold skip, capacity-bounded gather, argmax-style decisions) is **architecturally incompatible** with RevDEQ. The forbidden mechanisms include:
+
+1. Per-expert top-K dispatch (iter 117b-3 `_capacity_padded_sparse_moe`).
+2. Magnitude threshold skip with `eps > 0` in any tile-skip kernel (iter 118 v1 proposal).
+3. Per-token top-K MoE (Switch-style, GShard-style).
+4. Capacity-overflow drop (token dropped when bucket is full).
+5. Hard sparsemax `(threshold − logits)+` if used as the only routing path (no smooth blend).
+
+**Why — three layered failures:**
+
+#### Failure 1: Forward map is piecewise-smooth, not C¹
+RevDEQ's fixed-point convergence proof (Bai+Kolter+Koltun 2019, our Phase 5+) and our Lyapunov contraction argument both require `T_θ(z, x₀)` to be Lipschitz-smooth. A top-K boundary is a measure-zero kink: as `z_n` evolves during the FP iteration, a token's routing weight crosses the K/(K+1) threshold and abruptly changes which experts contribute. The Jacobian `∂T_θ/∂z` is undefined there.
+
+#### Failure 2: Reverse-pass reconstruction interacts catastrophically with the discontinuity
+RevDEQ reverse iteration `y_n = (y_{n+1} − β·T(z_{n-1}, x₀)) / (1 − β)` reconstructs `z_{n-1}` to bounded precision: `(1/Ā)^K · ε_fp64`. With `Ā ≥ 0.1` (CLAUDE.md §10 floor) and `K=12` → reconstruction floor ≈ **1e-3**.
+
+For T tokens softmax-routing near uniform (`weight ≈ 1/E`), order-statistic gap at the K-th routing weight is `~1/T` ≈ 5e-4 < 1e-3 reconstruction noise. **Boundary flips during reverse → reconstructed activations correspond to a different routing pattern than the original forward → silently corrupted gradients.**
+
+Worse under entmax/sparsemax: hundreds of tokens tied at exactly zero weight; any rounding noise picks a different K-token subset.
+
+#### Failure 3: Truncation magnitude is non-trivial
+At C=8, E=15, T=2048: K = ceil(8·T/E) = 1093. Per-token mean weight per expert ≈ 1/E = 0.067. Each expert truncates 47% of tokens by weight; per-expert truncated mass ≈ 64. **~47% of total routing mass dropped** — not a small perturbation. Iter 117b-3 healthcheck at s40 showed `ntp_loss=4.4` vs iter 95 baseline ~3.5-4.0 at the same step — the truncation is biting.
+
+**Permitted alternatives** (smooth + Lipschitz-bounded):
+
+1. **Soft routing weights** with `softmax`, `entmax_α` (α ∈ [1, 2]), `sparsemax` — all smooth in the simplex interior. Hard zeros at the boundary are measure-zero and don't bite RevDEQ since the reverse iteration sees the same input as forward.
+2. **Sinkhorn-Knopp** balanced routing (smooth, no thresholds).
+3. **Gumbel-softmax** with annealed τ (smooth at any τ > 0).
+4. **Magnitude skip below precision floor** (`ε ≤ ε_bf16 ≈ 4e-3`): the discontinuity is below the data type's mantissa, so it's invisible to the FP iteration.
+
+**Strict-generalization is a NECESSARY but not SUFFICIENT condition.** A top-K dispatch with `K = T` recovers the dense forward map exactly (bit-identical strict-gen) but ANY `K < T` introduces the discontinuity at the boundary. Strict-gen at one setting doesn't repair the architectural class.
+
+**Audit row** (CLAUDE.md §9): added 2026-05-02 — `grep -nE 'topk|top_k|capacity_factor.*ceil|hard.*threshold|sparsemax_only' train_gpt.py` — every match must be inside a flag-gated path that is OFF when `use_revdeq=True` (always-on currently).
+
+**Iter 117b-3 disposition.** KILLED at s80 on architectural grounds (commit pending). The val_bpb result was contaminated (gradients computed against a different forward map than the forward pass) and would have misled iter 118's eps schedule. Architectural-grounds kill is the principled call regardless of throughput delivery.
+
+**Iter 117b-3b (sparse-Q attention).** DROPPED — same architectural class.
+
+**Iter 99b (sparse expert dispatch).** DROPPED — same architectural class.
+
+**Iter 118 v1 skip-empty.** DROPPED — replaced by H88-v2 Phase A (eps=0 fuse only) + Phase B (continuous-relaxation).
+
+**Status:** PERMANENT RULE — forbids a class of architectural shortcuts. Any future iter proposing routing/dispatch sparsity must explicitly cite this rule in its hypothesis and demonstrate satisfying ALL four "permitted alternatives" criteria.
 
 ### H89: Mixture-of-Depths (iter 119) — REFUTED ✗ (2026-04-30, principled architectural-incompatibility)
 
@@ -2552,7 +2643,7 @@ Revised ordering reflects this analysis (L_ent removal first as cleanest, others
 11. **Iter 107 (H78)** — attn:mlp expert-count ratio sweep (router refactor for asymmetric pool).
 12. **Iter 97.7** — PROFILE-driven throughput retry (proper chrome-trace + fix top 5 bottlenecks). **Note 2026-05-01**: this iter is now ALSO the gating profile for iter 95b (fp32 TBPTT accumulators) — chrome trace must check whether fp64 accumulators show in the hotspot top-5.
 13. ~~Iter 95~~ — **MOVED TO TIER 1 #3** as `deq_bptt_k=2→3` fixed test (2026-05-01, post grad_norm=0.07 observation in iter 112+122). The original exhaustive sweep `(1,2,3,4,5,6,8,12)` is descoped — fixed-3 is the cleanest single-variable test; broader sweep only after fixed-3 result.
-14. **Iter 118 (H88)** — Triton fused entmax + grouped-GEMM (extension of 117b-2 + 117b-3). Conditional on those smoke tests passing.
+14. **Iter 118 (H88) REFRAMED 2026-05-02 — unified primitive `fused_routed_bmm` Triton kernel** (sparse-as-special-case-of-dense; eps=0 strict-gen recovers iter 100b dense soft-MoE bit-identical bf16). PRIORITY: **NEXT major implementation block AFTER iter 117b-3 verification finishes** (user directive 2026-05-02). ~2 days focused work. Strongest long-term ROI — every subsequent sparsity iter (gram coef sweeps, entmax-blend sweeps, capacity sweeps) inherits the kernel without separate dispatch path. See H88 above for full hypothesis + implementation order + predicted throughput.
 
 **Deferred / awaiting decision:**
 - **Iter 106 (H86)** — NSA 2-branch attention. DROPPED 2026-04-29 — 0.42× FlashAttention at T=2048. Code preserved off-by-default for future T-scaling.
@@ -3052,6 +3143,25 @@ This is H92 reframed: it's a one-line trivial add. Run it before TTT to reduce v
 **Estimated ROI:** **−0.005 to −0.015 BPB** (records show consistent small gain).
 
 **Status:** PROPOSED — Tier 4 priority **#8**.
+
+### H100: Routing-reg input invariant — all routing penalties on combined `softmax × sigmoid` (iter 130) — PROPOSED 2026-05-02
+
+**Hypothesis.** ALL routing regularizers (gram, entropy, CV, min_share) MUST operate on the combined gate-modulated weight `p = softmax(allocation) × sigmoid(gate)`, NOT on per-slice renormalized shares. Current state violates this invariant for two of four:
+
+- ✓ Gram: `train_gpt.py:2057` `W = p.float().reshape(-1, E)` — uses `p` directly
+- ✓ Per-token entropy: `train_gpt.py:2042` renormalizes per-token (mathematically required for entropy of a distribution) but starts from `p`, so the gate still appears in the renorm denominator
+- ✗ **CV**: `_component_health_losses` line 1864 `share / share.sum(-1)` strips per-slice gate magnitude — gate-blind
+- ✗ **min_share**: same per-slice renorm — gate-blind
+
+**Why this matters.** The sigmoid gate's role is to let the model globally suppress the mixture (`T(z, x₀) → 0`); regs that strip gate magnitude can't see this axis. CV currently reads "balanced" even when one expert dominates AND the gate is half-suppressed (the renorm hides the joint state). Gram's superiority over CV in iter 112+122 is partly because it sees the joint `(allocation, gate)` shape.
+
+**Fix.** Drop `share / share.sum(-1, keepdim=True)` in `_component_health_losses`. CV is scale-invariant (std/mean) so under a balanced gate the dynamics are identical; under gate suppression, CV correctly amplifies imbalance in the suppressed regime.
+
+**Strict-generalization recovery.** At `gate_act ≡ 1.0` (no gate suppression), per-slice non-renormalized `share = mean_mass[..., start:end]` differs from the renormalized version only by the constant scaling `gate_mean ≈ 1`; CV (std/mean) is identical. Promotion is unconditional on val_bpb non-regression — any val_bpb delta is an optimization-landscape artifact (the new CV signal couples to gate dynamics differently).
+
+**Folded into iter 118 plan.** The unified-primitive kernel work (H88) and this convention fix land in the same commit block — iter 118 changes the routing dispatch path; the convention fix consolidates the routing-reg input contract once. Smoke test asserts at gate_mean=1 the loss values match the old impl within bf16 floor.
+
+**Status:** PROPOSED — folded into iter 118 implementation block; lands as iter 130 within the iter 118 commit series.
 
 ### Records-derived priority order (within Tier 4)
 

@@ -127,10 +127,10 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | num_layers | 12 |
-| model_dim | 768 (D=1024 attempted iter 98b NOT PROMOTED on per-wallclock; H73) |
+| model_dim | 768 (H73) |
 | num_heads | 8 |
 | num_kv_heads | 4 |
-| num_experts | 16 (E=20 attempted iter 97 NOT PROMOTED on per-wallclock; H72) |
+| num_experts | 16 (H72) |
 | num_shared_experts | 1 (DeepSeek shared expert, always-on with sigmoid gate) |
 | mlp_mult | 3.0 (hidden = D × 3 / num_experts via low-rank experts) |
 | train_seq_len | 2048 |
@@ -162,9 +162,9 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | tied_embed_lr | 0.03 |
 | embed_lr | 0.6 |
 | parcae_lr | 0.002 (applied to `parcae_raw_a`, `parcae_raw_delta`, `parcae_raw_b`) |
-| entmax_blend_lr | 0.002 (iter 117 v5; 10× bump in 117b-1 NOT PROMOTED — H87b) |
+| entmax_blend_lr | 0.002 (H87b) |
 | muon_momentum | 0.99 |
-| muon_backend_steps | 7 (PE-NS empirical elbow; root-cause clarified — see `EXPERIENCE.md#variance-reg-ns-cascade`) |
+| muon_backend_steps | 7 (PE-NS empirical elbow; see `EXPERIENCE.md#variance-reg-ns-cascade`) |
 | use_polar_express_ns | True (default ON; `--use-polar-express-ns=0` reverts to stock NS for A/B) |
 | muon_momentum_warmup_start | 0.92 |
 | muon_momentum_warmup_steps | 800 |
@@ -225,7 +225,7 @@ Paper: arxiv:2509.12917. Reference impl: see §2.
 ### 6.2 Soft Dense Routing (Dense MoE on ALL components)
 Paper: Soft MoE (arxiv:2308.00951). Mixtape (NeurIPS 2019) for MoS softmax.
 
-- ALL experts process ALL tokens — no top-k, no token dropping.
+- ALL experts process ALL tokens — no top-k, no token dropping. **HARD architectural constraint** — discrete-decision dispatch (top-K gather, threshold skip, capacity drop, argmax routing) breaks RevDEQ reversibility. See H101.
 - **Router routes on component INPUT** (pre-computation), consistent across all components.
 - **Full-dim low-rank experts**: every expert operates on the FULL hidden dim. Use low-rank matrices (`dim → rank → dim`); do NOT partition dimensions across experts.
 - **Expert independence (HARD CONSTRAINT)**: every expert is fully independent — **zero shared trainable parameters** within the expert computation path. All projections (Q/K/V/Wo/gate/fc/down/MoS A-bank), all learned norms (RMSNorm scales) are per-expert (shape `(E, ...)`). Only the **router** itself and **non-learned ops** (RoPE tables, activations) may be shared. Adding a new param to the expert path: shape MUST start with `E`. See §9 "Prenorm scale independence (HARD)".
@@ -393,10 +393,12 @@ Run before every commit that touches `train_gpt.py` OR `CLAUDE.md`. Each row is 
 - **Identifier uniqueness across wrappers** — no name may be both a method and an attribute on sibling classes in the same call graph. `grep -n '\.<new_name>\b' train_gpt.py tests/ experiments/` before adding. → [`EXPERIENCE.md#identifier-uniqueness`](EXPERIENCE.md#identifier-uniqueness)
 - **Prenorm scale independence (HARD)** — `grep -n '_norm_weight' train_gpt.py`; every learned scale conditions exactly one linear weight. Shape follows the linear (E-prefixed for per-expert; bare D for shared linears that route to experts but aren't themselves per-expert). → [`EXPERIENCE.md#prenorm-scale-independence`](EXPERIENCE.md#prenorm-scale-independence)
 - **Doc-Code Invariant** — when `opg_doc.tex` describes an algorithm and `train_gpt.py` implements a different (better) variant, the doc MUST note the deviation in a "Practical implementation" paragraph. Pseudocode is theoretical; code is the source of truth. → [`EXPERIENCE.md#doc-code-invariant`](EXPERIENCE.md#doc-code-invariant)
-- **Diagnostic-gate component awareness** — when a feature flag disables a code path (e.g. `use_ctp=False`), the corresponding diagnostic emission MUST be gated on the same flag, and any retry prescription for that component MUST recommend a component-specific lever (e.g. `mos_balance_mult` for MoS routing collapse, NOT global `weight_decay`). `grep -n 'mos_ctp\|use_ctp' train_gpt.py` — every diagnostic spec referencing a CTP-only attribute lives behind a `mos_head.use_ctp` guard. → [`EXPERIENCE.md#diagnostic-gate-component-awareness`](EXPERIENCE.md#diagnostic-gate-component-awareness)
-- **Hyperparameter fan-out** — every documented knob lives in `Hyperparameters`, is reachable via `_parse_cli_overrides`, and its consumer reads `args.<field>` (no constructor literal that shadows the dataclass). Four-touch rule for new knobs: (1) `Hyperparameters` field, (2) `args.<field>` read at consumer, (3) CLAUDE.md §5 row, (4) `opg_doc.tex` parameter table or "Practical implementation" note. When effective magnitude differs from documented magnitude (e.g. via balance-mult dedup), document the effective value or fix the multiplication. → [`EXPERIENCE.md#hyperparameter-fanout`](EXPERIENCE.md#hyperparameter-fanout)
+- **Diagnostic-gate component awareness** — feature-flagged code paths must gate their diagnostic emission AND retry prescriptions on the same flag (component-specific levers, e.g. `mos_balance_mult` for MoS collapse, NOT global `weight_decay`). `grep -n 'use_ctp' train_gpt.py` — every CTP-attribute diagnostic lives behind a `mos_head.use_ctp` guard. → [`EXPERIENCE.md#diagnostic-gate-component-awareness`](EXPERIENCE.md#diagnostic-gate-component-awareness)
+- **Hyperparameter fan-out** — every knob lives in `Hyperparameters`, reachable via `_parse_cli_overrides`, consumer reads `args.<field>` (no shadowing literal). Four-touch rule for new knobs: (1) `Hyperparameters` field, (2) `args.<field>` read, (3) CLAUDE.md §5 row, (4) `opg_doc.tex` parameter table. Document effective vs documented magnitude when they differ. → [`EXPERIENCE.md#hyperparameter-fanout`](EXPERIENCE.md#hyperparameter-fanout)
 - **CLAUDE.md size budget** — `wc -c CLAUDE.md` < 40 000. Iter-history annotations ("iter X NOT PROMOTED because Y") route to `experiments/hypotheses.md` H## or `EXPERIENCE.md` §2; CLAUDE.md keeps invariants only. → [`EXPERIENCE.md#claude-md-size-budget`](EXPERIENCE.md#claude-md-size-budget)
 - **Cumulative-vs-instantaneous metric distinction (HARD)** — `step_avg = train_time/step` is cumulative. Compute per-step delta `Δ_t = train_time[t] − train_time[t−1]` for throughput decisions before s50. Loss/grad: take latest, not cumulative. → [`EXPERIENCE.md#cumulative-metric-misread`](EXPERIENCE.md#cumulative-metric-misread)
+- **Routing-reg input invariant (HARD)** — all routing regs operate on combined `p = softmax × sigmoid(gate)`. `grep -nE 'share / share\.sum\(' train_gpt.py` — zero hits in routing-reg paths. MoS exempt (§6.2). See H100 in `experiments/hypotheses.md`.
+- **No-top-K-dispatch (HARD)** — RevDEQ forbids discrete-decision routing/dispatch. `grep -nE 'topk\(.*expert|capacity_factor.*ceil|argmax.*router' train_gpt.py` — every match must be flag-gated OFF under RevDEQ. Permitted: soft routing, Sinkhorn, Gumbel-softmax, ε-skip with `ε ≤ ε_bf16`. See H101.
 
 ## 10. RevDEQ Specifics
 
