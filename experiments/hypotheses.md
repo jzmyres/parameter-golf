@@ -2305,6 +2305,34 @@ k_sweep_table:  128    1.5005   0.4007   0.2008   0.3169    0.0267    0.0380    
 
 **Status:** PROMOTED ★. Baseline updated. 7,447,773-byte artifact rotated to `experiments/weights/baseline/`. Plots regenerated. Continuing autonomous Tier 1: iter 117b-2 (Triton entmax) next per Tier 1 reorder.
 
+### Iter 117b-3 NOT THROUGHPUT-DELIVERING (2026-05-02): sparse MoE dispatch + eager entmax slower than fused dense bmm
+
+**Outcome:** KILLED ✗ at s10 (~11min after launch). NOT a correctness failure; a throughput-economics finding.
+
+**Launch attempt:** 2026-05-02 15:25, run_id `8b92feab`, flags `--use-entmax-routing=1 --use-sparse-dispatch=1 --sparse-dispatch-capacity-factor=8`. Required CLI fix `d9bce1c` to register `--sparse-dispatch-capacity-factor` in `_CLI_TUNABLE_KNOBS`.
+
+**step_avg trajectory (s1–s10): 111s → 66 → 54 → 46 → 41 → 39 → 37 → 35 → 34 → 33.2s**. Slowing but converging to ~28-30s steady-state — **42% slower than dense iter 95 baseline (23.5s)**. Estimated 1000-step run = 8.3h (vs iter 95 6.5h). NOT ACCEPTABLE for what was supposed to be a "≈ dense bit-identical" verification step.
+
+**Throughput economics analysis (the principled finding):**
+- Dense MoE: total compute = E × N tokens via fused `bmm` over (E, N, D) — single kernel, highly optimized.
+- Sparse dispatch at capacity factor C: total compute = C × N tokens via gather/scatter + grouped GEMM.
+  - At C=8 with E=15: 8N total dispatched (vs 15N dense) — fewer tokens but...
+  - Gather/scatter ops have O(N) overhead INDEPENDENT OF C (the routing always happens)
+  - Grouped GEMM has worse memory access patterns than fused dense bmm
+  - Net: 8N tokens × per-token + gather/scatter overhead > 15N × per-token-fused-bmm
+- **For sparse dispatch to win on throughput**: requires C ≤ 1 AND/OR Triton-fused dispatch kernel. Eager-mode sparse dispatch at any reasonable C is throughput-neutral or negative versus fused dense bmm.
+
+**Implication for queue:**
+- iter 117b-3 itself is not promotable as-is (eager-mode sparse-dispatch-on-MLP doesn't deliver throughput at any C).
+- The sparse-MoE-dispatch axis only delivers throughput if **fused via Triton** (= H88 iter 118 territory).
+- iter 117b-2-fix (Triton entmax with E=30→32 padding) is now the prerequisite for any sparsity throughput win — promote its priority.
+
+**Distinguishes from iter 117b-2 NOT-VIABLE**: that was a kernel input-shape constraint (fixable). This is an algorithmic/architectural finding (eager sparse dispatch is structurally throughput-negative).
+
+**Status:** NOT-PROMOTED ✗ at C=8 (would-be verification too expensive). Capacity sweep down to C=2/C=1 abandoned because the eager-mode overhead floor dominates regardless of C. Sparse dispatch path PARKED until iter 117b-2-fix (Triton entmax) lands and a fused-dispatch kernel can be designed alongside.
+
+**Implication for Tier 1**: skipping iter 117b-3b (sparse-Q attention) — same code path class, will hit the same eager-overhead ceiling. Proceeding to iter 117b-2-fix (Triton kernel padding) as the throughput-delivering iter.
+
 ### Iter 117b-2 NOT VIABLE (2026-05-02): Triton entmax kernel rejects E=30 (non-power-of-2)
 
 **Outcome:** NOT VIABLE ✗ (kernel design constraint, not a stack-compatibility failure).
