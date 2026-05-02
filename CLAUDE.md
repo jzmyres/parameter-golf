@@ -29,6 +29,7 @@
 - `feedback_throughput_priority.md` — throughput-bearing iters take priority
 - `feedback_sdpa_replacement_at_T2048.md` — SDPA replacements regress at T=2048
 - `feedback_diagnosis_context.md` — record full active config when closing an iter
+- `feedback_ntp_descent_rate_metric.md` — ntp descent rate (per-step + per-wallclock, windowed) is permanent H-claim metric
 - `feedback_profile_before_throughput.md` — chrome trace, not log fragments
 - `feedback_decouple_regularizers.md` — antagonistic regularizers: one as metric
 - `feedback_anneal_sparsity_coefs.md` — sparsity coefs anneal from 0
@@ -296,7 +297,7 @@ Reference impl: see §2.
 9. Log to `results.tsv` (do NOT commit `results.tsv`).
 10. **Always** run `bash experiments/update_results.sh` (rotates `current.log`/`current/weights` → `previous`, copies `run.log` → `current.log`, regenerates plots).
 11. Apply §11 Promotion Rules.
-12. **Update `experiments/hypotheses.md`** — record results, statuses, confounds. The H-claim section MUST include: (a) roundtrip int6 val_bpb + val_loss; (b) the FULL `k_sweep_table:` matrix verbatim from run.log (header + one row per K; 15 cols including acyclicity primes 17/37/113 in bold) — non-optional, no exceptions; (c) trajectory table (val_bpb per val checkpoint with Δ); (d) acyclicity-prime check (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP). All numbers must be grep-able from run.log. See `feedback_hypotheses_sync.md`.
+12. **Update `experiments/hypotheses.md`** — record results, statuses, confounds. The H-claim section MUST include: (a) roundtrip int6 val_bpb + val_loss; (b) the FULL `k_sweep_table:` matrix verbatim from run.log (header + one row per K; 15 cols including acyclicity primes 17/37/113 in bold) — non-optional, no exceptions; (c) trajectory table (val_bpb per val checkpoint with Δ); (d) acyclicity-prime check (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP); (e) **ntp_loss descent rate** (per-step Δntp / 10 steps over windows s30-s100, s100-s200, s200-s400, s400-s600, s600-s800, s800-s1000) AND **per-wallclock equivalent** (Δntp/sec = Δntp/step ÷ step_avg) — both reported alongside baseline comparison. Permanent metric per user directive 2026-05-02. All numbers must be grep-able from run.log. See `feedback_hypotheses_sync.md`.
 13. Track consecutive non-improvements. **STOP after 100** and seek user guidance.
 
 ### Logging, Weights & Plotting (every iteration)
