@@ -141,7 +141,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | parcae_init_a_bar | 0.7 (Ā₀; β₀ = 1−Ā₀ = 0.3) |
 | parcae_init_b_bar | 0.3 (B̄₀ ≈ 1−Ā₀ at step 0) |
 | parcae_reversibility_floor | 0.1 (correctness constant — Ā ≥ bound for RevDEQ backward; NOT a tuning knob — see §10) |
-| deq_bptt_k | 2 (truncated BPTT) |
+| deq_bptt_k | 3 (iter 95 2026-05-02: TBPTT=2→3 to add ~50% backward gradient depth under WD=0.01 + K-jitter (16,24) regime; triggered by grad_norm 0.07 headroom obs in iter 112+122) |
 | num_refinements | 0 (default off; iter 110 queued as clean re-enable ablation; §6.5 still defines architectural form) |
 | use_ctp | False (NTP-only; CTP param banks not allocated; H60) |
 | use_nsa_attention | False (CLI-enable. When True: 2-branch NSA mixer (compression block-pool + sliding-window). Selection branch deferred to iter 106b. H86.) |
