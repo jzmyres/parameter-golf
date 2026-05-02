@@ -612,6 +612,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "routing-gram-coef", "routing-gram-warmup-delay-frac",
     # iter 122 H93 — logit softcap (Gemma2-style)
     "logit-softcap",
+    # iter 117b-3 — sparse MoE dispatch capacity factor
+    "sparse-dispatch-capacity-factor",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
