@@ -190,8 +190,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | bigram_vocab_size | 0 (BigramHash disabled; H64) |
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
-| deq_k_jitter_set | (10, 24) (iter 108: training K=10 lower bound matches fast-eval K=10. K=24 preserves H12 K-jitter wide range. K-sweep matrix unchanged for diagnostic depth coverage.) |
-| deq_k_eval | 10 (iter 108: fast-eval K=10 matches train K-jitter lower bound; no extrapolation at eval time) |
+| deq_k_jitter_set | (16, 24) (FP found at K=16 per iter 98b K-sweep; K=24 adds wider FP-depth jitter — analog of H12 VERIFIED) |
 | lyapunov_coef | 0.0 (λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
 | lyapunov_gamma | 0.97 |
 | lyapunov_warmup_frac | 0.05 |

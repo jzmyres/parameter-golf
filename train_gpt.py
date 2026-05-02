@@ -543,8 +543,8 @@ class Hyperparameters:
     deq_k_min = 4
     deq_k_max = 24
     deq_k_step = 4
-    deq_k_jitter_set = (10, 24)  # iter 108 (H79, 2026-05-02): training K=10 lower bound matches fast-eval K=10. K=24 preserves H12 K-jitter wide range.
-    deq_k_eval = 10  # iter 108 (H79, 2026-05-02): fast-eval K=10 matches train K-jitter lower bound (no extrapolation at eval). K-sweep matrix unchanged (still 4, 8, 16, 17, 24, 32, 37, 64, 113, 128 for diagnostic depth coverage).
+    deq_k_jitter_set = (16, 24)
+    deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
 
     # Architecture knobs
     # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
