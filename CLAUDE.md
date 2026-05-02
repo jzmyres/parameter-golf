@@ -18,29 +18,29 @@
 - `feedback_dry_fixes.md` — fix all instances of a bug class
 - `feedback_arch_exploration.md` — architecture > hyperparameter tuning
 - `feedback_compile_training.md` — disable torch.compile for dev
-- `feedback_always_ddp.md` — always all GPUs with DDP
+- `feedback_always_ddp.md` — always all GPUs DDP
 - `feedback_wakeup_cadence.md` — 5-min after failure → 20-min after 3 healthy
-- `feedback_lipschitz_in_ksweep.md` — Lipschitz + acyclicity primes permanent in K-sweep
-- `feedback_per_wallclock_override.md` — val_bpb may yield to per-wallclock (H72)
-- `feedback_sparsity_value_props.md` — sparsity scored on val_bpb / throughput / reg
-- `feedback_uv_install.md` — `uv pip install`, NOT `pip install`
+- `feedback_lipschitz_in_ksweep.md` — Lipschitz + acyclicity primes in K-sweep
+- `feedback_per_wallclock_override.md` — val_bpb may yield to per-wallclock
+- `feedback_sparsity_value_props.md` — sparsity: val_bpb / throughput / reg
+- `feedback_uv_install.md` — `uv pip install`
 - `feedback_check_gpu_free.md` — pgrep + nvidia-smi preflight
 - `feedback_conda_run_buffering.md` — `conda run --no-capture-output`
-- `feedback_throughput_priority.md` — throughput-bearing iters take priority
+- `feedback_throughput_priority.md` — throughput iters take priority
 - `feedback_sdpa_replacement_at_T2048.md` — SDPA replacements regress at T=2048
-- `feedback_diagnosis_context.md` — record full active config when closing an iter
-- `feedback_ntp_descent_rate_metric.md` — ntp descent rate (per-step + per-wallclock, windowed) is permanent H-claim metric
-- `feedback_cumulative_vs_instantaneous_metrics.md` — cumulative averages lie about steady state; compute per-step deltas before s50 (iter 117b-3 incident)
+- `feedback_diagnosis_context.md` — record full active config when closing
+- `feedback_ntp_descent_rate_metric.md` — ntp descent rate is permanent H-claim metric
+- `feedback_cumulative_vs_instantaneous_metrics.md` — cumulative averages lie about steady state; compute per-step deltas
 - `feedback_routing_metric_axes.md` — load-balance ≠ sparsity; CV is balance, pertoken_entropy is sparsity
 - `feedback_grad_enabled_vs_requires_grad.md` — dispatch on `is_grad_enabled() AND requires_grad`
 - `feedback_profile_before_throughput.md` — chrome trace, not log fragments
-- `feedback_decouple_regularizers.md` — antagonistic regularizers: one as metric
+- `feedback_decouple_regularizers.md` — antagonistic regs: one as metric
 - `feedback_anneal_sparsity_coefs.md` — sparsity coefs anneal from 0
-- `feedback_deq_convergence.md` — DEQ as true fixed point
+- `feedback_deq_convergence.md` — DEQ as fixed point
 - `feedback_expert_collapse.md` — full-dim low-rank experts
 - `feedback_mla_preferred.md` — MLA, not MHA/GQA
 - `feedback_mos_routing.md` — MoS pure softmax
-- `feedback_refinement_decoupled.md` — refinement is a separate forward pass
+- `feedback_refinement_decoupled.md` — refinement separate forward pass
 
 **Project (current state, lessons)** — read for context on running work:
 - `project_autoresearch.md` — autoresearch setup + protocol
@@ -257,7 +257,7 @@ Papers: DeepSeek-V2 MLA (arxiv:2405.04434); Gated Attention (arxiv:2505.06708, N
 - **Decoupled RoPE**: split heads into RoPE and non-RoPE components.
 - **Gated Attention**: query-dependent per-expert-per-head sigmoid gate after SDPA. Gate logits from per-expert Q projection (appended to Q output); each token gets its own gate value per head per expert.
 
-**Optional sparse-attention path — NSA (iter 106, default off).** When `use_nsa_attention=True`, the head-packed `(B, E·H, T, d)` SDPA call is replaced by a two-branch Native Sparse Attention mixer (arxiv:2502.11089): (1) **compression branch** mean-pools K/V over fixed-size sliding blocks then attends with a rectangular causal mask; (2) **sliding-window branch** attends to the last W tokens with a band-causal mask. A per-expert-per-head learnable softmax gate (`nsa_branch_gate` shape `(E·H, 2)`) mixes the two outputs. Gated attention (post-SDPA per-head sigmoid) is preserved unchanged. The third NSA branch (selection — top-K per-query block selection) is deferred to iter 106b via `nsa_num_selected_blocks=0`. **Strict-generalization (CLAUDE.md §11):** `nsa_compress_block_size=1`, `nsa_compress_block_sliding_stride=1`, `nsa_sliding_window_size=T`, `nsa_branch_gate_init=0` recovers full causal SDPA exactly within bf16 numerical floor — promotion is unconditional on val_bpb improvement.
+**Optional sparse-attention path — NSA (iter 106, default off).** When `use_nsa_attention=True`, head-packed SDPA is replaced by a 2-branch Native Sparse Attention mixer (arxiv:2502.11089): compression (block-pool K/V + rectangular causal mask) + sliding-window (last W tokens, band causal). Per-expert-per-head softmax gate `nsa_branch_gate` shape `(E·H, 2)` mixes branches. Gated attention preserved. Selection branch (top-K per-query) deferred via `nsa_num_selected_blocks=0`. Strict-gen at `block_size=stride=1, window=T, gate_init=0` recovers SDPA within bf16 floor.
 
 **Discarded alternative — bottleneck experts.** Do NOT re-introduce bottleneck-style experts (BottleneckIn/Out around a small `r`) as a scaling axis. Per-param efficiency and SDPA throughput both regress vs full-D LoRA. Full rationale + the archival reference: `EXPERIENCE.md#bottleneck-experts-closed`.
 
@@ -401,6 +401,7 @@ Run before every commit that touches `train_gpt.py` OR `CLAUDE.md`. Each row is 
 - **Cumulative-vs-instantaneous metric distinction (HARD)** — `step_avg = train_time/step` is cumulative. Compute per-step delta `Δ_t = train_time[t] − train_time[t−1]` for throughput decisions before s50. Loss/grad: take latest, not cumulative. → [`EXPERIENCE.md#cumulative-metric-misread`](EXPERIENCE.md#cumulative-metric-misread)
 - **Routing-reg input invariant (HARD)** — all routing regs operate on combined `p = softmax × sigmoid(gate)`. `grep -nE 'share / share\.sum\(' train_gpt.py` — zero hits in routing-reg paths. MoS exempt (§6.2). See H100 in `experiments/hypotheses.md`.
 - **No-top-K-dispatch (HARD)** — RevDEQ forbids discrete-decision routing/dispatch. `grep -nE 'topk\(.*expert|capacity_factor.*ceil|argmax.*router' train_gpt.py` — every match must be flag-gated OFF under RevDEQ. Permitted: soft routing, Sinkhorn, Gumbel-softmax, ε-skip with `ε ≤ ε_bf16`. See H101.
+- **`is_grad_enabled` vs `requires_grad` (HARD)** — fast-path dispatch checks `torch.is_grad_enabled() AND any(requires_grad)`. `nn.Parameter.requires_grad` is True permanently → flag-only check defeats kernels in no_grad code (RevDEQ FP iter). See `feedback_grad_enabled_vs_requires_grad.md`.
 
 ## 10. RevDEQ Specifics
 
