@@ -153,7 +153,13 @@ def _fused_routed_bmm_fwd_kernel(
         )
         gate_act = 1.0 / (1.0 + tl.exp(-gate_blk))
         weights = p_alloc * gate_act
-    weights = tl.where(e_mask[None, :], weights, 0.0)
+    # Mask invalid (n, e) positions to 0. Without n_mask: padded n rows
+    # (rows beyond N) have all -inf scores → softmax produces NaN → corrupts
+    # the per-expert max-abs reduction below → spurious skip predicate fires
+    # → VALID rows in the same boundary tile lose their output. Using both
+    # n_mask AND e_mask is correctness-critical when N is not a multiple of
+    # BLOCK_N (or E is not E_PAD).
+    weights = tl.where(n_mask[:, None] & e_mask[None, :], weights, 0.0)
 
     # ---- Step 4: weighted bmm accumulation with H101-safe sparsity skip ----
     # Loop order: D OUTER, E INNER. x is loaded once per D-chunk and reused
@@ -647,6 +653,21 @@ def _smoke_test() -> None:
     rel_e = (fused_e.float() - eager_e.float()).abs().max().item() / max(eager_e.float().abs().max().item(), 1e-6)
     assert rel_e < 5e-2
     print(f"PASS: per-expert gate path matches eager (rel {rel_e:.3e})")
+
+    # ---- boundary-tile correctness: N not a multiple of BLOCK_N ----
+    # Regression test for NaN-propagation bug from padded n rows whose
+    # all-(-inf) softmax produces NaN that corrupts the skip predicate.
+    # Pre-fix: this would zero out valid output rows in the boundary tile.
+    Nb = 100  # not a multiple of BLOCK_N=64; last tile has 36 valid + 28 padded rows
+    sb = torch.randn(Nb, E, dtype=torch.float32, device=device)
+    gb = torch.randn(Nb, 1, dtype=torch.float32, device=device)
+    xb = torch.randn(Nb, D, dtype=torch.bfloat16, device=device)
+    fused_b = fused_routed_bmm(sb, gb, xb, expert_W)
+    eager_b = fused_routed_bmm_eager(sb, gb, xb, expert_W)
+    assert torch.isfinite(fused_b).all(), "boundary tile contains NaN/Inf"
+    rel_b = (fused_b.float() - eager_b.float()).abs().max().item() / max(eager_b.float().abs().max().item(), 1e-6)
+    assert rel_b < 5e-2, f"boundary-tile rel {rel_b:.3e} > 5e-2 (NaN propagation regression?)"
+    print(f"PASS: boundary tile (N=100, not divisible by BLOCK_N=64) finite + matches eager (rel {rel_b:.3e})")
 
 
 if __name__ == "__main__":
