@@ -513,7 +513,7 @@ class Hyperparameters:
     # per-iter VJP magnitudes decay geometrically toward x0, so the last few
     # iters should dominate the total param gradient.  If the hypothesis
     # holds, throughput scales ~ K_fwd / (K_fwd + K_bwd) improvement.
-    deq_bptt_k = 3  # iter 95 (2026-05-02): TBPTT=2 → 3 under iter 112+122 baseline. Triggered by grad_norm=0.07 in mid-flight of iter 112+122 (well below clip=1.0 → headroom for deeper backward). Backward coverage at K=16 increases 12.5%→19%. Expected ~+10% wallclock cost. Iter 85 (H63) PROMOTED stochastic {2,3,4} earlier but at WD=0.30 / K-jitter (4,6,10) era — different regime; this is fixed=3 retest under WD=0.01 / K-jitter (16,24).
+    deq_bptt_k = 3  # iter 95 (2026-05-02): TBPTT=2 → 3 PROMOTED ★ under iter 112+122 baseline. Triggered by grad_norm=0.07 in mid-flight of iter 112+122 (well below clip=1.0 → headroom for deeper backward). Backward coverage at K=16 increases 12.5%→19%. Cost ~+10% wallclock; val_bpb int6 1.5001 (Δ-0.0164 vs iter 112+122) and K-sweep tightening confirmed.
     # Iter 85 enabled stochastic TBPTT {2,3,4} as a K-jitter analog (H63
     # PROMOTED ★ narrow margin). 2026-04-28 PROFILE-driven revert: H63 itself
     # noted +0.0054 val_bpb regression vs fixed k=2 AND +21% throughput cost,
