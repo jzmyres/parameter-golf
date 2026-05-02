@@ -138,25 +138,30 @@ def _fused_routed_bmm_fwd_kernel(
         weights = p_alloc * gate_act
     weights = tl.where(e_mask[None, :], weights, 0.0)
 
-    # ---- Step 4: per-expert weighted bmm accumulation ----
+    # ---- Step 4: weighted bmm accumulation ----
+    # Loop order: D OUTER, E INNER. x is loaded once per D-chunk and reused
+    # across all E experts; saves ~E×× HBM traffic on x. The expert loop is
+    # Python `range` (NOT `tl.range`) so the loop unrolls at compile time AND
+    # `e` is a constexpr — `(offs_e == e)` mask folds to a constant at compile,
+    # letting the masked-reduction `w_e` extraction compile to direct register
+    # access (no runtime mask op).
     out_acc = tl.zeros((BLOCK_N, BLOCK_D_OUT), dtype=tl.float32)
 
-    for e in tl.range(0, E_REAL):
-        # weight per token for this expert (BLOCK_N,)
-        w_e = tl.sum(weights * (offs_e == e)[None, :], axis=1)  # (BLOCK_N,)
+    for d_start in tl.range(0, D, BLOCK_D, num_stages=3):
+        offs_d = d_start + tl.arange(0, BLOCK_D)
+        d_mask = offs_d < D
 
-        # Inner D-loop: accumulate proj = x @ W[e]
-        proj = tl.zeros((BLOCK_N, BLOCK_D_OUT), dtype=tl.float32)
-        for d_start in tl.range(0, D, BLOCK_D):
-            offs_d = d_start + tl.arange(0, BLOCK_D)
-            d_mask = offs_d < D
+        # Load x[block_n, d_block] ONCE (BLOCK_N, BLOCK_D); reuse across all E
+        x_off = offs_n[:, None] * D + offs_d[None, :]
+        x_blk = tl.load(
+            x_ptr + x_off,
+            mask=n_mask[:, None] & d_mask[None, :],
+            other=0.0,
+        )
 
-            x_off = offs_n[:, None] * D + offs_d[None, :]
-            x_blk = tl.load(
-                x_ptr + x_off,
-                mask=n_mask[:, None] & d_mask[None, :],
-                other=0.0,
-            )
+        for e in range(E_REAL):
+            # `e` is constexpr (Python loop unrolls), so this mask folds.
+            w_e = tl.sum(weights * (offs_e == e)[None, :], axis=1)  # (BLOCK_N,)
 
             w_off = (
                 e * (D * D_out)
@@ -168,9 +173,8 @@ def _fused_routed_bmm_fwd_kernel(
                 mask=d_mask[:, None] & d_out_mask[None, :],
                 other=0.0,
             )
-            proj += tl.dot(x_blk, w_blk)
-
-        out_acc += proj * w_e[:, None]
+            proj_de = tl.dot(x_blk, w_blk)  # (BLOCK_N, BLOCK_D_OUT) fp32
+            out_acc += proj_de * w_e[:, None]
 
     # ---- Step 5: store ----
     out_off = offs_n[:, None] * D_out + offs_d_out[None, :]
@@ -239,6 +243,8 @@ def _fused_routed_bmm_triton(
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
         BLOCK_D_OUT=BLOCK_D_OUT,
+        num_warps=4,
+        num_stages=3,
     )
     return out
 
