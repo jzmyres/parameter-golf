@@ -2305,6 +2305,33 @@ k_sweep_table:  128    1.5005   0.4007   0.2008   0.3169    0.0267    0.0380    
 
 **Status:** PROMOTED ★. Baseline updated. 7,447,773-byte artifact rotated to `experiments/weights/baseline/`. Plots regenerated. Continuing autonomous Tier 1: iter 117b-2 (Triton entmax) next per Tier 1 reorder.
 
+### Iter 117b-2 NOT VIABLE (2026-05-02): Triton entmax kernel rejects E=30 (non-power-of-2)
+
+**Outcome:** NOT VIABLE ✗ (kernel design constraint, not a stack-compatibility failure).
+
+**Launch attempt:** 2026-05-02 15:17, run_id `43093f1a`, flags `--use-entmax-routing=1 --use-entmax-triton=1`.
+
+**Error at startup (before step 1):**
+```
+ValueError: entmax_1p5_triton requires E to be a power of 2, got 30
+File "train_gpt.py", line 1607, in _entmax_1p5_triton_op
+```
+
+**Root cause:** pool E = num_experts × 2 (attn slice + mlp slice) = 15×2 = 30 logits per token after the routing softmax pool. The Triton kernel was designed assuming E is a power of 2 (likely for block-tile alignment). Our pool size hits 30 (or 32 if we change num_experts) — the kernel rejects it cleanly.
+
+**Distinct from iter 104 AdaSplash failure:** that was SIGABRT under DDP+compile+RevDEQ at step 1 (functionalization corruption). This is a clean ValueError from the kernel itself — the stack is fine, just the kernel input shape is unsupported.
+
+**Fix path (queueable):**
+1. Pad input scores `s ∈ R^{N×30}` to `s_padded ∈ R^{N×32}` with `-inf` in 2 slots (entmax_1p5 maps `-inf → 0` exactly).
+2. Run kernel on padded input → `out_padded ∈ R^{N×32}` with 0 in padded slots.
+3. Slice back: `out = out_padded[:, :30]`.
+4. Cost: 6.7% kernel waste (2/30 unused slots) — still much faster than PyTorch entmax fallback.
+5. Smoke test vs PyTorch reference, verify exact zeros in padded slots, check gradient flow.
+
+**Implementation effort:** ~30-60 min. 5-10 lines in `_entmax_1p5_triton_op` + smoke test.
+
+**Status:** NOT-VIABLE ✗. Queued as **iter 117b-2-fix** for after iter 117b-3 + 117b-3b (don't block sparsity throughput sequence on a kernel patch). Proceeding to iter 117b-3 (sparse MoE dispatch — different code path, no power-of-2 constraint).
+
 ### H88: Triton-fused entmax + grouped-GEMM via custom_op (iter 118) — PROPOSED CONDITIONAL 2026-04-29
 
 **Hypothesis.** If iter 117 (path A pure-PyTorch dispatch) confirms val_bpb is preserved, the next step is a **fused Triton kernel** for `entmax_alpha + grouped_GEMM` registered via `torch.library.custom_op` (with `register_fake` + `register_autograd`). Predicted **3–4× wallclock** speedup over iter 100b dense soft-MoE, vs iter 117's 1.5–2.5× from pure-PyTorch path.
