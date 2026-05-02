@@ -31,6 +31,7 @@ This file has two roles, in this order:
 | 2026-04-28 | [#hyperparameter-fanout](#hyperparameter-fanout)             | Five "tunable" knobs documented in CLAUDE.md §5 were hardcoded inside constructors |
 | 2026-04-30 | [#claude-md-size-budget](#claude-md-size-budget)             | CLAUDE.md hit 51 887 chars (>40k perf warning) from accreted iter-history annotations |
 | 2026-04-30 | [#variance-reg-ns-cascade](#variance-reg-ns-cascade)         | Iter 117 NaN cascade attributed to PE-NS was actually variance-reg gradients on entmax exact-zeros |
+| 2026-05-02 | [#cumulative-metric-misread](#cumulative-metric-misread)     | Iter 117b-3 erroneously killed at s10 because cumulative `step_avg` was misread as instantaneous step time |
 
 ### Section template
 
@@ -477,6 +478,58 @@ When effective magnitude differs from documented magnitude (as with the entropy 
 
 **Cross-references.** [#dead-code-tracking](#dead-code-tracking) (the variance reg was eventually removed, becoming dead code that needed full purging).
 
+### cumulative-metric-misread
+
+**Date:** 2026-05-02 review of iter 117b-3 (sparse MoE dispatch C=8) erroneous kill.
+**Rule in CLAUDE.md:** §9 audit checklist row "Cumulative-vs-instantaneous metric distinction (HARD)" + the §9 META-PRINCIPLE above the checklist.
+
+**What happened.** At iter 117b-3 healthcheck #1 (s10 of 1000-step run, ~11 min after launch), the agent read `step_avg = 33.2s` and concluded sparse dispatch was 42% slower than dense iter 95 baseline (23.5s). Killed iter 117b-3 mid-run. Wrote a "throughput-economics" incident report claiming sparse dispatch was structurally throughput-negative, pulled iter 117b-3b out of the queue under the same theory, and pivoted to the TBPTT scaling sweep instead.
+
+The user immediately questioned: *"Would the high step time be due to compile not yet amortized?"* They were right. Looking at per-step deltas from train_time:
+- s1 → s2: 22s
+- s2 → s3: 28s (K=24 sample)
+- s5 → s6: 21s
+- s9 → s10: 28s
+
+Per-step deltas were 21-28s (mean ~24s) — only ~5% slower than baseline. The 33.2s `step_avg` reading was almost entirely the 111s s1 compile-init amortized over 10 steps. Over 1000 steps, the compile cost amortizes to <0.1s/step — negligible.
+
+The claimed "throughput-economics" math was also wrong: at C=8 with E=15, sparse dispatch handles ~`C × N` tokens (= 8N for balanced routing), not `C × E × N`. That's FEWER tokens than dense's `15N` — sparse should be faster, not slower, at steady state.
+
+iter 117b-3 was relaunched with the corrected reading; the NOT-PROMOTED documentation was reverted to KILLED-PREMATURELY-RELAUNCH-PENDING.
+
+**Root cause.** Two layered errors:
+1. **Surface error**: confused two different metrics (`step_avg = total_train_time / step` cumulative vs. `Δ_t = train_time[t] − train_time[t-1]` instantaneous). The former is sample-mean-with-outliers, the latter is per-step rate. They only agree when `t » outlier_cost / asymptotic_rate`.
+2. **Deeper error**: didn't read the metric definition before drawing conclusions. `step_avg` is computed and emitted by `train_gpt.py` as cumulative (`train_time / step`). Treating its value as if it were the instantaneous step time skips the "what does this number mean" check that should precede every conclusion.
+
+The META-failure is the deeper one. The cumulative-vs-instantaneous distinction is just one common instance.
+
+**The rule.**
+
+**META-PRINCIPLE: Read the definition before reading the value.** Every derived metric (running average, windowed smooth, normalized score, post-softmax probability, log-loss, etc.) is a *function* of raw signals. Before concluding anything from its value, explicitly write down:
+- (a) which raw signal(s) it derives from
+- (b) what transformation is applied
+- (c) when the derived value is within ε of the underlying truth you actually care about
+
+For step_avg specifically: source = `train_time` cumulative + step counter; transform = `total / N`; convergence to asymptotic rate = `t » outlier_cost / asymptotic_step ≈ 200 steps for our typical compile init`.
+
+**Decision rule for healthchecks before s50**: ALWAYS compute and report per-step delta `Δ_t = train_time[t] − train_time[t-1]` over the last 5-10 steps. The cumulative `step_avg` is only the right metric past `t > 200` OR when there's no compile/warmup/recompile activity.
+
+**Bayesian prior on user feedback**: when the user questions a conclusion, the prior should be that they spotted a real issue. Verify by re-deriving from raw signals BEFORE defending the original reading.
+
+**Verification recipe.**
+
+```bash
+# Per-step throughput delta (correct):
+grep -E "^step:[0-9]+/" run.log | grep -oE "step:[0-9]+/|train_time:[0-9.]+" | paste -d',' - - | awk -F'[,:]' 'NR==1{prev=$NF; next} {print $2, ($NF-prev); prev=$NF}'
+
+# Cumulative step_avg (only valid past t>200):
+grep -E "^step:[0-9]+/" run.log | grep -oE "step:[0-9]+/|step_avg:[0-9.]+" | paste -d',' - -
+```
+
+The first command gives instantaneous per-step latency. The second gives cumulative — only trust it once enough samples (≥200) have washed out the warmup outliers.
+
+**Cross-references.** This incident generalizes [#hot-path-sync](#hot-path-sync) (also a "look at the actual cost, not the documented intent" failure) and [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (also a "stale assumption applied to current state" pattern). The unifying theme: **don't trust a derived value without re-checking how it's computed**.
+
 ---
 
 ## §2. Lessons Learned
@@ -484,6 +537,34 @@ When effective magnitude differs from documented magnitude (as with the entropy 
 Generic guardrails distilled from research-process experience. Not tied to specific code paths or dated incidents — background principles, not enforcement.
 
 - Learned parameters inside an expert path, including norm scales and output heads, must be per-expert.
+
+### Reading derived metrics
+
+Every metric you read in a healthcheck or postmortem is a *function* of raw signals: a running average, a windowed smooth, a per-batch normalization, a post-softmax probability, a cumulative count divided by step number, a log-loss in some unit. Treating the displayed value as if it were the underlying signal is the most common analysis-error class on this project (see [#cumulative-metric-misread](#cumulative-metric-misread) for the canonical 2026-05-02 incident).
+
+**The principle** distills to three sentences:
+
+1. **Read the definition before the value.** Before concluding anything from a derived metric, write down (a) which raw signal it derives from, (b) what transformation is applied, (c) when the derived value is within ε of the underlying truth you actually care about. Skip step (c) and you will mistake convergence-time artifacts for real signals.
+
+2. **When in doubt, compute from raw.** Every derived metric has a raw counterpart you can reconstruct from log lines (e.g. `Δ_t = train_time[t] − train_time[t−1]` instead of `step_avg[t] = train_time[t]/t`). The raw signal is always interpretable. If two readings disagree about whether the system is healthy, the raw signal is right and the derived one is missing context.
+
+3. **User pushback is a Bayesian prior, not a debate.** When the user questions a conclusion, the correct first action is to verify by re-deriving from raw, not to defend the original reading. The user typically has domain context (compile init costs, K-jitter expectations, optimizer warmup) that closes the gap between the derived metric's value and the underlying truth.
+
+**Concrete examples of the trap on this codebase:**
+
+- `step_avg = train_time/step`: cumulative average; converges to per-step rate only past `t » outlier_cost / asymptotic_step`. For our compile-init ~100s and asymptotic ~25s, that's `t ≥ 200`. Healthchecks before s50 must compute per-step delta. ([#cumulative-metric-misread](#cumulative-metric-misread))
+- `step_avg_w50`: windowed over last 50 steps; still cold-start-contaminated when `step < 50` (the window includes warmup samples).
+- `deq_recon_err` under TBPTT: not a true reconstruction error when `deq_bptt_k < num_layers` — see [#deq-recon-err-interpretation](#deq-recon-err-interpretation).
+- `attn_ortho` / `mlp_ortho` train-time vs val-time: train uses smaller batch averaging, val uses full-batch — the val signal is more stable and is the diagnostic-grade reading.
+- `pertoken_entropy` vs `pool_entropy`: per-token concentration vs global utilization, completely different axes despite both being entropy-of-routing-weights.
+- Bits vs nats vs bpb: easy to read a "loss = 2.5" without checking units; if it's ntp_loss in nats, that's bpb ≈ 1.45; if bits, bpb ≈ 0.43.
+
+**Recovery protocol when an analysis error is suspected:**
+
+1. Identify the metric that drove the conclusion.
+2. Re-derive from raw signals (`grep` the underlying values from `run.log`).
+3. If raw and derived disagree, raw wins.
+4. Update the conclusion AND document the misread in the relevant EXPERIENCE.md section so the same trap is closed for future sessions.
 
 ### Metrics
 - Track and compare the *scored* metric (post-quant) separately from any in-training validation.
