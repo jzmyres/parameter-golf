@@ -82,6 +82,7 @@ def _fused_routed_bmm_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_D_OUT: tl.constexpr,
+    GROUP_SIZE_N: tl.constexpr,
 ):
     """Fused (softmax × sigmoid × bmm × weighted-sum) over experts.
 
@@ -98,8 +99,23 @@ def _fused_routed_bmm_fwd_kernel(
          out_acc[block_n, block_d_out] += weight[block_n, e] * proj
       5. Store out_acc cast to bf16.
     """
-    pid_n = tl.program_id(0)
-    pid_d_out = tl.program_id(1)
+    # ---- L2 cache swizzling (grouped launch order) ----
+    # Default row-major pid traversal evicts x tiles between pid_d_out passes
+    # because num_pid_n x-tiles get loaded before revisiting any tile. Grouped
+    # ordering reuses x tiles across `GROUP_SIZE_N` consecutive programs that
+    # share pid_n: x[block_n] is loaded once, reused for GROUP_SIZE_N programs
+    # walking across pid_d_out. Standard Triton matmul tutorial swizzle —
+    # 1.33× speedup + 60% L2 hit-rate gain on grouped GEMMs (PyTorch MoE blog,
+    # 2026). https://pytorch.org/blog/accelerating-moes-with-a-triton-persistent-cache-aware-grouped-gemm-kernel/
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_d_out = tl.cdiv(D_out, BLOCK_D_OUT)
+    num_pid_in_group = GROUP_SIZE_N * num_pid_d_out
+    group_id = pid // num_pid_in_group
+    first_pid_n = group_id * GROUP_SIZE_N
+    group_size_n = min(num_pid_n - first_pid_n, GROUP_SIZE_N)
+    pid_n = first_pid_n + ((pid % num_pid_in_group) % group_size_n)
+    pid_d_out = (pid % num_pid_in_group) // group_size_n
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d_out = pid_d_out * BLOCK_D_OUT + tl.arange(0, BLOCK_D_OUT)
@@ -230,9 +246,11 @@ def _fused_routed_bmm_triton(
     BLOCK_N = 64
     BLOCK_D = 64
     BLOCK_D_OUT = 64
+    GROUP_SIZE_N = 8
     E_PAD = max(_next_pow2(E), 16)
 
-    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D_out, BLOCK_D_OUT))
+    # 1D grid; kernel decomposes via L2-cache swizzle.
+    grid = (triton.cdiv(N, BLOCK_N) * triton.cdiv(D_out, BLOCK_D_OUT),)
 
     _fused_routed_bmm_fwd_kernel[grid](
         scores, gate, x, expert_W, out,
@@ -243,6 +261,7 @@ def _fused_routed_bmm_triton(
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
         BLOCK_D_OUT=BLOCK_D_OUT,
+        GROUP_SIZE_N=GROUP_SIZE_N,
         num_warps=4,
         num_stages=3,
     )
