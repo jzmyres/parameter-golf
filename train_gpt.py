@@ -384,6 +384,17 @@ class Hyperparameters:
     use_orthogonal_expansion_routing = False
     routing_gram_coef = 0.01
     routing_gram_warmup_delay_frac = 0.3
+    # iter 122 / H93 (2026-05-01): logit softcap (Gemma2-style).
+    # `logits = softcap * tanh(logits / softcap)` bounds extreme logit values,
+    # smoothing gradient spikes and reducing bf16 numerical issues. Applied
+    # in `MoSHead._head_forward` to per-expert logits BEFORE log_softmax — the
+    # tanh saturates per-token-per-expert, the convex log-softmax mixture is
+    # unaffected by an additive shift but the shape of the logit cloud is
+    # reshaped (extreme positives/negatives saturate). Default 0 = disabled
+    # (strict-gen recovery: tanh(x)*softcap → x as softcap→∞; we treat 0 as
+    # the "off" sentinel via early-return). Records use 30.0 since 2026-04+;
+    # smoke test in `experiments/components/logit_softcap.py` (6/6 PASS).
+    logit_softcap = 0.0
     # iter 117 v3 (2026-04-29): routing-variance penalty REMOVED. iter 111 H83
     # introduced `routing_variance_coef = -λ · sum_e Var_token(w(e|t))` to break
     # the symmetric trap of per-token entropy at uniform routing. iter 117 v1/v2
@@ -599,6 +610,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "entmax-blend-init-logit", "entmax-blend-warmup-delay-frac", "entmax-blend-lr",
     # iter 112 H84 — orthogonal-expansion routing (Gram-matrix penalty)
     "routing-gram-coef", "routing-gram-warmup-delay-frac",
+    # iter 122 H93 — logit softcap (Gemma2-style)
+    "logit-softcap",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
@@ -2861,7 +2874,7 @@ class MoSHead(nn.Module):
     """
     def __init__(self, d_model: int, vocab_size: int, rank: int = 256,
                  num_shared: int = 2, num_specialized: int = 1, fsq_levels: int = 8,
-                 use_ctp: bool = True):
+                 use_ctp: bool = True, logit_softcap: float = 0.0):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
@@ -2871,6 +2884,7 @@ class MoSHead(nn.Module):
         self.num_experts = num_shared + num_specialized
         self.fsq_levels = fsq_levels
         self.use_ctp = bool(use_ctp)
+        self.logit_softcap = float(logit_softcap)
         self.gate_ntp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
         self.gate_ntp_norm_weight = nn.Parameter(torch.ones(d_model))
         self.ntp_a_norm_weight = nn.Parameter(torch.ones(self.num_experts, d_model))
@@ -2969,6 +2983,12 @@ class MoSHead(nn.Module):
             u_all.permute(1, 0, 2).to(B.dtype),
             B.transpose(1, 2),
         ).permute(1, 0, 2).float()  # (N, E, V)
+
+        # Iter 122 / H93: logit softcap (Gemma2-style). Reshape extreme tails
+        # via tanh saturation. Strict-gen recovery at logit_softcap == 0.
+        if self.logit_softcap > 0:
+            sc = self.logit_softcap
+            logits_all = sc * torch.tanh(logits_all / sc)
 
         # Mixture of softmaxes in log space (vectorized logaddexp)
         log_p_experts = F.log_softmax(logits_all, dim=-1)  # (N, E, V)
@@ -3692,6 +3712,7 @@ class GPT(nn.Module):
                  entmax_blend_warmup_delay_frac: float = 0.3,
                  routing_gram_coef: float = 0.0,
                  routing_gram_warmup_delay_frac: float = 0.3,
+                 logit_softcap: float = 0.0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
                  lyapunov_gamma: float = 0.9,
@@ -3810,7 +3831,8 @@ class GPT(nn.Module):
         # tensor so the Hutchinson penalty block stays pure-tensor (no .item()
         # GPU→CPU sync in the hot path). Initialized lazily on first use.
         self._lyapunov_rho_hat_buf: Tensor | None = None
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0, use_ctp=self.use_ctp)  # Phase 9 iter 62 (H53): disabled FSQ. Iter 94: use_ctp threads through to skip CTP.
+        self.logit_softcap = float(logit_softcap)
+        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0, use_ctp=self.use_ctp, logit_softcap=self.logit_softcap)  # Phase 9 iter 62 (H53): disabled FSQ. Iter 94: use_ctp threads through to skip CTP. Iter 122 (H93): logit_softcap.
         self.final_norm = RMSNorm(model_dim)
         # Embedding/final norms remain learnable shared scales outside T_theta.
         self.embed_norm = RMSNorm(model_dim)
@@ -4968,6 +4990,7 @@ def main() -> None:
         entmax_blend_warmup_delay_frac=float(args.entmax_blend_warmup_delay_frac),
         routing_gram_coef=float(args.routing_gram_coef) if bool(args.use_orthogonal_expansion_routing) else 0.0,
         routing_gram_warmup_delay_frac=float(args.routing_gram_warmup_delay_frac),
+        logit_softcap=float(args.logit_softcap),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_warmup_frac=args.lyapunov_warmup_frac,

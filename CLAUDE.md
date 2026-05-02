@@ -184,6 +184,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | use_orthogonal_expansion_routing | False (CLI-enable. Adds Gram-matrix penalty `λ · ‖G − I/E‖²_F` over the routing-weight tensor. Strict-gen at `routing_gram_coef=0`. H84.) |
 | routing_gram_coef | 0.01 (effective when `use_orthogonal_expansion_routing=True`; annealed 0 → target) |
 | routing_gram_warmup_delay_frac | 0.3 (same shape as `router_entropy_warmup_delay_frac`) |
+| logit_softcap | 0.0 (CLI-enable. When > 0, applies `softcap·tanh(logits/softcap)` to per-expert MoS logits before log_softmax. Strict-gen at 0. Records use 30.0; H93.) |
 | attn_expert_rank | 64 |
 | mlp_expert_rank | 96 |
 | bigram_vocab_size | 0 (BigramHash disabled; H64) |

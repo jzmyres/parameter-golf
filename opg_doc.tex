@@ -497,6 +497,17 @@ for both API outputs, and \texttt{GPT.forward} sets the CTP loss weight to zero.
 If \texttt{use\_ctp=True}, the older CTP head and CTP loss path remain
 available for ablation.
 
+\paragraph{Practical implementation: logit softcap (iter 122 / H93).}  When
+\texttt{logit\_softcap} $>0$, per-expert logits are reshaped through a tanh
+saturation \emph{before} the per-expert log-softmax,
+\[
+  \tilde\ell_{n,e,w}
+    = c\,\tanh(\ell_{n,e,w}/c),\qquad c=\texttt{logit\_softcap},
+\]
+which bounds extreme logit magnitudes (Gemma2-style) and damps gradient
+spikes without altering the convex log-softmax mixture identity.  Strict
+generalization holds at $c=0$ (no-op short-circuit); records use $c=30$.
+
 Refinement is an outer loop around the DEQ solve.  It is disabled for the first
 85\% of training by default.  Once enabled, the model predicts from $z^\star$,
 forms a sparse top-$k$ soft embedding from shifted NTP probabilities, and
