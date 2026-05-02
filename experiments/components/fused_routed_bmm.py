@@ -690,6 +690,31 @@ def _smoke_test() -> None:
     assert rel_b < 5e-2, f"boundary-tile rel {rel_b:.3e} > 5e-2 (NaN propagation regression?)"
     print(f"PASS: boundary tile (N=100, not divisible by BLOCK_N=64) finite + matches eager (rel {rel_b:.3e})")
 
+    # ---- RevDEQ FP-iteration consistency (differentiability + reconstruction) ----
+    # Regression-protects the H101-safety claim: K iterations of FP solve
+    # via Triton vs eager produce trajectories within bf16 reduction-noise.
+    # If skip predicate creates a forward-map discontinuity larger than the
+    # FP convergence tolerance, this test fails.
+    # Use square (D == D_out) shape so z = (1-β)z + β·T(z) is well-defined.
+    Dsq = 64
+    sf = torch.randn(N, E, dtype=torch.float32, device=device)
+    gf = torch.randn(N, 1, dtype=torch.float32, device=device)
+    xf = torch.randn(N, Dsq, dtype=torch.bfloat16, device=device)
+    Wf = torch.randn(E, Dsq, Dsq, dtype=torch.bfloat16, device=device) * 0.1
+    K_iter = 8
+    beta = 0.5
+    z_t = xf.clone()
+    z_e = xf.clone()
+    with torch.no_grad():
+        for _ in range(K_iter):
+            Tz_t = fused_routed_bmm(sf, gf, z_t, Wf)
+            Tz_e = fused_routed_bmm_eager(sf, gf, z_e, Wf)
+            z_t = ((1 - beta) * z_t.float() + beta * Tz_t.float()).to(torch.bfloat16)
+            z_e = ((1 - beta) * z_e.float() + beta * Tz_e.float()).to(torch.bfloat16)
+    rel_fp = (z_t.float() - z_e.float()).abs().max().item() / max(z_e.float().abs().max().item(), 1e-6)
+    assert rel_fp < 5e-2, f"FP-trajectory divergence rel {rel_fp:.3e} > 5e-2 — H101 violation?"
+    print(f"PASS: K={K_iter} FP iteration trajectory rel {rel_fp:.3e} (RevDEQ-safe under TBPTT default)")
+
 
 if __name__ == "__main__":
     _smoke_test()

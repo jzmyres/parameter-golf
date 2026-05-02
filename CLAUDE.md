@@ -31,7 +31,8 @@
 - `feedback_diagnosis_context.md` — record full active config when closing an iter
 - `feedback_ntp_descent_rate_metric.md` — ntp descent rate (per-step + per-wallclock, windowed) is permanent H-claim metric
 - `feedback_cumulative_vs_instantaneous_metrics.md` — cumulative averages lie about steady state; compute per-step deltas before s50 (iter 117b-3 incident)
-- `feedback_routing_metric_axes.md` — load-balance ≠ sparsity; CV is balance, pertoken_entropy is sparsity (iter 130 wakeup-prompt incident)
+- `feedback_routing_metric_axes.md` — load-balance ≠ sparsity; CV is balance, pertoken_entropy is sparsity
+- `feedback_grad_enabled_vs_requires_grad.md` — dispatch on `is_grad_enabled() AND requires_grad`
 - `feedback_profile_before_throughput.md` — chrome trace, not log fragments
 - `feedback_decouple_regularizers.md` — antagonistic regularizers: one as metric
 - `feedback_anneal_sparsity_coefs.md` — sparsity coefs anneal from 0
