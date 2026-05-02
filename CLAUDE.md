@@ -30,6 +30,7 @@
 - `feedback_sdpa_replacement_at_T2048.md` — SDPA replacements regress at T=2048
 - `feedback_diagnosis_context.md` — record full active config when closing an iter
 - `feedback_ntp_descent_rate_metric.md` — ntp descent rate (per-step + per-wallclock, windowed) is permanent H-claim metric
+- `feedback_cumulative_vs_instantaneous_metrics.md` — cumulative averages lie about steady state; compute per-step deltas before s50 (iter 117b-3 incident)
 - `feedback_profile_before_throughput.md` — chrome trace, not log fragments
 - `feedback_decouple_regularizers.md` — antagonistic regularizers: one as metric
 - `feedback_anneal_sparsity_coefs.md` — sparsity coefs anneal from 0
@@ -393,6 +394,7 @@ Run before every commit that touches `train_gpt.py` OR `CLAUDE.md`. Each row is 
 - **Diagnostic-gate component awareness** — when a feature flag disables a code path (e.g. `use_ctp=False`), the corresponding diagnostic emission MUST be gated on the same flag, and any retry prescription for that component MUST recommend a component-specific lever (e.g. `mos_balance_mult` for MoS routing collapse, NOT global `weight_decay`). `grep -n 'mos_ctp\|use_ctp' train_gpt.py` — every diagnostic spec referencing a CTP-only attribute lives behind a `mos_head.use_ctp` guard. → [`EXPERIENCE.md#diagnostic-gate-component-awareness`](EXPERIENCE.md#diagnostic-gate-component-awareness)
 - **Hyperparameter fan-out** — every documented knob lives in `Hyperparameters`, is reachable via `_parse_cli_overrides`, and its consumer reads `args.<field>` (no constructor literal that shadows the dataclass). Four-touch rule for new knobs: (1) `Hyperparameters` field, (2) `args.<field>` read at consumer, (3) CLAUDE.md §5 row, (4) `opg_doc.tex` parameter table or "Practical implementation" note. When effective magnitude differs from documented magnitude (e.g. via balance-mult dedup), document the effective value or fix the multiplication. → [`EXPERIENCE.md#hyperparameter-fanout`](EXPERIENCE.md#hyperparameter-fanout)
 - **CLAUDE.md size budget** — `wc -c CLAUDE.md` < 40 000. Iter-history annotations ("iter X NOT PROMOTED because Y") route to `experiments/hypotheses.md` H## or `EXPERIENCE.md` §2; CLAUDE.md keeps invariants only. → [`EXPERIENCE.md#claude-md-size-budget`](EXPERIENCE.md#claude-md-size-budget)
+- **Cumulative-vs-instantaneous metric distinction (HARD)** — *cumulative averages lie about steady state*. Any metric of the form `total_X / N` (e.g. `step_avg = train_time/step`) converges to the asymptotic rate only after `N » outlier_cost / asymptotic_rate`. For our typical compile init ~100s and asymptotic ~25s/step, cumulative `step_avg` is within 1% of true rate only past **t ≥ ~200 steps**. **Decision rule**: when assessing throughput in a healthcheck, ALWAYS compute per-step delta `Δ_t = train_time[t] − train_time[t−1]`, NOT `step_avg[t]`. Reading the cumulative average as instantaneous-rate caused the iter 117b-3 erroneous-kill at s10 (2026-05-02). For loss/grad metrics: take latest step value, not cumulative. → [`EXPERIENCE.md#cumulative-metric-misread`](EXPERIENCE.md#cumulative-metric-misread)
 
 ## 10. RevDEQ Specifics
 
