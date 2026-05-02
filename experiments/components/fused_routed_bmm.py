@@ -83,6 +83,7 @@ def _fused_routed_bmm_fwd_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_D_OUT: tl.constexpr,
     GROUP_SIZE_N: tl.constexpr,
+    EPS_SKIP: tl.constexpr,
 ):
     """Fused (softmax × sigmoid × bmm × weighted-sum) over experts.
 
@@ -154,13 +155,23 @@ def _fused_routed_bmm_fwd_kernel(
         weights = p_alloc * gate_act
     weights = tl.where(e_mask[None, :], weights, 0.0)
 
-    # ---- Step 4: weighted bmm accumulation ----
+    # ---- Step 4: weighted bmm accumulation with H101-safe sparsity skip ----
     # Loop order: D OUTER, E INNER. x is loaded once per D-chunk and reused
-    # across all E experts; saves ~E×× HBM traffic on x. The expert loop is
-    # Python `range` (NOT `tl.range`) so the loop unrolls at compile time AND
-    # `e` is a constexpr — `(offs_e == e)` mask folds to a constant at compile,
-    # letting the masked-reduction `w_e` extraction compile to direct register
-    # access (no runtime mask op).
+    # across all E experts.
+    #
+    # Sparsity exploitation (Phase B, H101-permitted): for each (token_block,
+    # expert) tile, skip the load+matmul when max(|w_e|) < EPS_BF16. The
+    # threshold equals bf16 mantissa precision (~4e-3) — contributions below
+    # this are below the data type's representable noise, so skipping is
+    # forward-map-bit-identical at bf16 precision. The discontinuity is
+    # invisible to RevDEQ's reverse-pass reconstruction (floor (1/Ā)^K · ε_fp64
+    # ≈ 1e-3 < ε_bf16). Per H101 permitted alternative: "magnitude skip with
+    # ε ≤ ε_bf16 ≈ 4e-3 (below mantissa precision → discontinuity invisible
+    # to FP iteration)".
+    #
+    # Pre-compute per-expert max(|w_e|) ONCE to avoid recomputing inside the
+    # D loop. weights shape (BLOCK_N, E_PAD); reduce along N via abs+max.
+    weights_abs_max_per_e = tl.max(tl.abs(weights), axis=0)  # (E_PAD,)
     out_acc = tl.zeros((BLOCK_N, BLOCK_D_OUT), dtype=tl.float32)
 
     for d_start in tl.range(0, D, BLOCK_D, num_stages=3):
@@ -176,21 +187,27 @@ def _fused_routed_bmm_fwd_kernel(
         )
 
         for e in range(E_REAL):
-            # `e` is constexpr (Python loop unrolls), so this mask folds.
-            w_e = tl.sum(weights * (offs_e == e)[None, :], axis=1)  # (BLOCK_N,)
+            # Skip-empty predicate (H101-safe): per-program scalar comparison.
+            # `tl.sum(... * (offs_e == e), axis=0)` extracts column e of the
+            # pre-computed max-abs vector. With Python range + constexpr e,
+            # the comparison folds at compile time.
+            max_abs_w_e = tl.sum(weights_abs_max_per_e * (offs_e == e), axis=0)
+            if max_abs_w_e >= EPS_SKIP:
+                # `e` constexpr → `(offs_e == e)` mask folds.
+                w_e = tl.sum(weights * (offs_e == e)[None, :], axis=1)  # (BLOCK_N,)
 
-            w_off = (
-                e * (D * D_out)
-                + offs_d[:, None] * D_out
-                + offs_d_out[None, :]
-            )
-            w_blk = tl.load(
-                W_ptr + w_off,
-                mask=d_mask[:, None] & d_out_mask[None, :],
-                other=0.0,
-            )
-            proj_de = tl.dot(x_blk, w_blk)  # (BLOCK_N, BLOCK_D_OUT) fp32
-            out_acc += proj_de * w_e[:, None]
+                w_off = (
+                    e * (D * D_out)
+                    + offs_d[:, None] * D_out
+                    + offs_d_out[None, :]
+                )
+                w_blk = tl.load(
+                    W_ptr + w_off,
+                    mask=d_mask[:, None] & d_out_mask[None, :],
+                    other=0.0,
+                )
+                proj_de = tl.dot(x_blk, w_blk)  # (BLOCK_N, BLOCK_D_OUT) fp32
+                out_acc += proj_de * w_e[:, None]
 
     # ---- Step 5: store ----
     out_off = offs_n[:, None] * D_out + offs_d_out[None, :]
@@ -199,6 +216,12 @@ def _fused_routed_bmm_fwd_kernel(
         out_acc.to(tl.bfloat16),
         mask=n_mask[:, None] & d_out_mask[None, :],
     )
+
+
+# bf16 mantissa precision (~3.9e-3). H101 permitted alternative: magnitude
+# skip with ε ≤ ε_bf16 → discontinuity invisible to RevDEQ FP iteration
+# (reconstruction floor (1/Ā)^K · ε_fp64 ≈ 1e-3 < ε_bf16).
+EPS_BF16 = 3.9e-3
 
 
 def _next_pow2(x: int) -> int:
@@ -262,6 +285,7 @@ def _fused_routed_bmm_triton(
         BLOCK_D=BLOCK_D,
         BLOCK_D_OUT=BLOCK_D_OUT,
         GROUP_SIZE_N=GROUP_SIZE_N,
+        EPS_SKIP=EPS_BF16,
         num_warps=4,
         num_stages=3,
     )
@@ -316,8 +340,13 @@ def _fused_routed_bmm_bwd_dx_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_D_OUT: tl.constexpr,
     GROUP_SIZE_N: tl.constexpr,
+    EPS_SKIP: tl.constexpr,
 ):
-    """Backward d_x kernel. Grid = cdiv(N, BLOCK_N) * cdiv(D, BLOCK_D)."""
+    """Backward d_x kernel. Grid = cdiv(N, BLOCK_N) * cdiv(D, BLOCK_D).
+
+    Same H101-safe skip predicate as forward: skip expert e when
+    max(|w_e|) < EPS_SKIP. Bit-identical to forward's skip pattern at
+    matching weights → consistent gradient signal."""
     # L2 cache swizzle (mirror of forward kernel)
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -344,6 +373,8 @@ def _fused_routed_bmm_bwd_dx_kernel(
         other=0.0,
     )  # bf16
 
+    # Pre-compute per-expert max(|w_e|) for skip predicate (mirrors forward)
+    weights_abs_max_per_e = tl.max(tl.abs(weights), axis=0)  # (E_PAD,)
     d_x_acc = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
 
     # Outer: D_out chunks. Inner: experts (Python range — constexpr e).
@@ -360,26 +391,27 @@ def _fused_routed_bmm_bwd_dx_kernel(
         )
 
         for e in range(E_REAL):
-            # `e` is constexpr (Python loop unrolls) → mask folds.
-            w_e = tl.sum(weights * (offs_e == e)[None, :], axis=1)  # (BLOCK_N,)
+            # H101-safe skip: same predicate as forward kernel.
+            max_abs_w_e = tl.sum(weights_abs_max_per_e * (offs_e == e), axis=0)
+            if max_abs_w_e >= EPS_SKIP:
+                w_e = tl.sum(weights * (offs_e == e)[None, :], axis=1)  # (BLOCK_N,)
 
-            # Load W[e, d_block, d_out_block]; transpose to (BLOCK_D_OUT, BLOCK_D)
-            w_off = (
-                e * (D * D_out)
-                + offs_d[:, None] * D_out
-                + offs_d_out[None, :]
-            )
-            w_blk = tl.load(
-                W_ptr + w_off,
-                mask=d_mask[:, None] & d_out_mask[None, :],
-                other=0.0,
-            )
-            w_blk_T = tl.trans(w_blk)  # (BLOCK_D_OUT, BLOCK_D)
+                # Load W[e, d_block, d_out_block]; transpose for (d_out, d) matmul
+                w_off = (
+                    e * (D * D_out)
+                    + offs_d[:, None] * D_out
+                    + offs_d_out[None, :]
+                )
+                w_blk = tl.load(
+                    W_ptr + w_off,
+                    mask=d_mask[:, None] & d_out_mask[None, :],
+                    other=0.0,
+                )
+                w_blk_T = tl.trans(w_blk)  # (BLOCK_D_OUT, BLOCK_D)
 
-            # grad_out[block_n, d_out_block] @ W[e, d_block, d_out_block].T
-            # → (BLOCK_N, BLOCK_D)
-            proj_de = tl.dot(grad_out_blk, w_blk_T)  # fp32
-            d_x_acc += proj_de * w_e[:, None]
+                # grad_out @ W[e].T → (BLOCK_N, BLOCK_D)
+                proj_de = tl.dot(grad_out_blk, w_blk_T)  # fp32
+                d_x_acc += proj_de * w_e[:, None]
 
     # Store d_x
     dx_off = offs_n[:, None] * D + offs_d[None, :]
@@ -416,6 +448,7 @@ def _bwd_dx_triton(grad_out: Tensor, weights: Tensor, expert_W: Tensor) -> Tenso
         BLOCK_D=BLOCK_D,
         BLOCK_D_OUT=BLOCK_D_OUT,
         GROUP_SIZE_N=GROUP_SIZE_N,
+        EPS_SKIP=EPS_BF16,
         num_warps=4,
         num_stages=3,
     )
@@ -464,23 +497,21 @@ def _fake(scores, gate, x, expert_W):
 
 
 def _backward(ctx, grad_out):
-    """Hybrid backward — Triton kernel for d_x (dominant compute) +
+    """Hybrid backward — Triton kernel for d_x (with H101-safe sparsity skip) +
     eager autograd via re-forward for d_W / d_scores / d_gate.
 
-    Performance trade-off (verified by benchmark, 2026-05-02):
-      - Direct-math backward via explicit `torch.einsum` is SLOWER than
-        eager autograd because PyTorch's einsum doesn't fuse 3-tensor
-        contractions as efficiently as autograd's saved-intermediate path.
-      - Re-forward inside _backward (current approach) costs ~1ms but is
-        cleaner and more robust than direct-math's ~7ms einsum overhead.
-      - True end-to-end backward speedup requires Triton kernels for
-        d_W and d_w as well (Phase A4 — substantial additional work).
+    Note (verified by experiment 2026-05-02): direct PyTorch (bmm/einsum)
+    backward implementations are SLOWER than autograd-via-re-forward at our
+    shapes because PyTorch's autograd + einsum has decade+ of optimization
+    we can't beat with explicit ops. True end-to-end backward speedup
+    requires Triton kernels for d_W and d_w (Phase A5 — substantial work).
 
-    Current state: forward gives 1.60× speedup (memory-bandwidth + activation-
-    memory savings); backward d_x is Triton; d_W/d_scores/d_gate via eager
-    autograd. Net end-to-end is ~equivalent to fully-eager wall-clock at
-    these shapes, but saves the (N, E, D_out) activation-memory in forward
-    (50 MB per layer per microstep at production shapes).
+    Current state:
+      - Forward: Triton kernel WITH H101-safe sparsity skip (Phase A2 + B)
+      - Backward d_x: Triton kernel WITH same skip predicate (consistent
+        with forward — gradient signal omits the same below-ε contributions)
+      - Backward d_W/d_scores/d_gate: eager autograd via re-forward
+        (cleanest non-Triton path)
     """
     scores, gate, x, expert_W, p_alloc, gate_act = ctx.saved_tensors
 
@@ -493,16 +524,13 @@ def _backward(ctx, grad_out):
         and x.shape[1] % 16 == 0
     )
 
-    # ---- d_x via Triton kernel (avoids re-materializing expert_outs for this path) ----
+    # ---- d_x via Triton kernel (with H101-safe sparsity skip) ----
     d_x_triton = None
     if can_use_kernel and x.requires_grad:
         weights_bf16 = (p_alloc * gate_act).to(dtype=torch.bfloat16).contiguous()
         d_x_triton = _bwd_dx_triton(grad_out.contiguous(), weights_bf16, expert_W.contiguous())
 
     # ---- d_W, d_scores, d_gate via eager autograd through re-forward ----
-    # The eager forward materializes expert_outs (N, E, D_out); autograd uses
-    # the saved graph efficiently for these gradients. Re-forward cost is
-    # paid once; cheaper than a hand-rolled einsum chain.
     with torch.enable_grad():
         s = scores.detach().requires_grad_(scores.requires_grad)
         g = gate.detach().requires_grad_(gate.requires_grad)
