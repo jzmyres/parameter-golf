@@ -3338,6 +3338,36 @@ Trajectory matches baseline within ~10%. Per-wallclock advantage from −3.3% st
 
 **New current baseline:** iter 133, val_bpb int6 = 1.4930.
 
+### Tier 1 sparsity-prioritized queue (post iter 133, 2026-05-03 user directive)
+
+**Premise:** iter 133's pertoken_entropy = 2.7183 (= 98% of `log(16) = 2.773` max) means routing is essentially uniform → kernel skip predicate `max(|w|) over BLOCK_N=64 < 3.9e-3` fires for ~0% of (block, expert) pairs → kernel only achieves dense memory-bandwidth fusion (-3.4% step_avg), not sparse 5–7× regime. **Sparsity now Tier 1 priority** for both regularization (val_bpb) and throughput (kernel skip).
+
+**Iter 104 AdaSplash α-entmax attention — DEFERRED INDEFINITELY** (user directive 2026-05-03): kernel incompatible with torch.compile under DDP+RevDEQ (commit `d7996da` plumbing remains as dead code; do not test). Phase A3 fused_routed_down already provides MoE-routing speedup via its own custom_op path; AdaSplash for SDPA attention is a separate concern that requires either flex_attention rewrite (iter 120 RRAttention) or compile-disable wrapper that breaks throughput.
+
+**New Tier 1 sparsity items (autonomous-suitable, single-knob each):**
+
+| Iter | Change | Mechanism | Strict-gen at default? |
+|---|---|---|---|
+| **134** | `--entmax-blend-init-logit=0` (vs 5.0) | sigmoid(0)=0.5 → 50/50 softmax+entmax-1.5 init blend; entmax produces hard zeros on low-logit experts | ✓ — at logit=5.0 recovers iter 133 forward map exactly |
+| 135 | `--entmax-blend-init-logit=-3` | sigmoid(-3)=0.05 → entmax-dominated init (95% entmax-1.5) | ✓ |
+| 136 | `--entmax-blend-lr=0.02` (10× from 0.002) | faster blend convergence; routing can move from softmax → entmax during training | ✓ |
+| 137 | `--router-entropy-coef=0.05 --router-entropy-warmup-delay-frac=0.5` | entropy reg with delayed ramp (mitigates iter 117b-1 cold-start trap) | ✓ at coef=0 |
+
+**Existing Tier 1 (re-eval under gram=0.3 baseline):**
+| Iter | Change |
+|---|---|
+| 112e | `block_ortho_aux_coef 0.1→0` |
+| 112f | `cv_loss_weight 1.0→0` (under iter 133 cv=1.0) |
+| 112g | `router_entropy_coef 0.005→0` |
+| 112h | joint cv=0 + entropy=0 + block_ortho=0 |
+| 112i | block_ortho threshold → output-mean Frobenius gram dual |
+| 117c | single `routing_reg_coef` (equal-weight test) |
+| 117b-2-fix | pad Triton entmax kernel input E=30→32 |
+
+**Pre-condition for iter 134+**: instrument kernel skip-rate per dispatch site so we can correlate pertoken_entropy descent with actual kernel speedup measured in-flight (planned add for next refactor pass).
+
+**Verdict path**: val_bpb int6 ≤ 1.4930 + 0.03 = 1.4960 (CLAUDE.md §11 floor) AND step_avg ≤ 22.7s (no throughput regression) AND pertoken_entropy < 2.5 (sparsity actually achieved, not just attempted) → promote.
+
 ### Records-derived priority order (within Tier 4)
 
 Sequenced for ROI/risk balance, after Tier 1 throughput iters (117b-2/3/3b) complete:
