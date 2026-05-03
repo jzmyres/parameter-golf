@@ -550,7 +550,7 @@ class Hyperparameters:
     deq_k_min = 4
     deq_k_max = 24
     deq_k_step = 4
-    deq_k_jitter_set = (32, 48)  # iter 131 retry: doubled K min — let run to s1000 (kill trigger +0.5)
+    deq_k_jitter_set = (16, 24)
     deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
 
     # Architecture knobs
