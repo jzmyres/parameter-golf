@@ -447,6 +447,13 @@ class Hyperparameters:
     # MLP-path wiring.
     use_sparse_dispatch = False
     sparse_dispatch_capacity_factor = 4.0
+    # iter 118a Phase A3 (2026-05-03): fused Triton routed-down kernel for
+    # MLP-down dispatch. Default OFF; enable with --use-unified-routed-down=1.
+    # When True AND torch.is_grad_enabled() is False, MLP.mix_experts calls
+    # `fused_routed_down(h_pre, w_combined, expert_down)` instead of the eager
+    # path. Kernel bench: 2.86× dense, 7.36× at 87.5% sparse (per H101 ε ≤ ε_bf16).
+    # Training (grad-enabled) and TBPTT window unaffected (eager path).
+    use_unified_routed_down = False
     # iter 103 / H77 (2026-04-30): chained 2-stage pooled routing.
     # Default OFF (single-stage routing as in iter 117 v5 / iter 117b-1).
     # When True, Block uses TWO sequentially-chained SoftDenseRouter
@@ -657,7 +664,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
                  "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
                  "use_entmax_routing", "use_polar_express_ns",
-                 "use_entmax_triton", "use_sparse_dispatch",
+                 "use_entmax_triton", "use_sparse_dispatch", "use_unified_routed_down",
                  "use_chained_routing", "use_orthogonal_expansion_routing"}
     for k, v in vars(ns).items():
         if v is not None:
@@ -1679,6 +1686,20 @@ def _set_sparse_dispatch(enabled: bool, capacity_factor: float = 4.0) -> None:
     global _USE_SPARSE_DISPATCH, _SPARSE_DISPATCH_C
     _USE_SPARSE_DISPATCH = bool(enabled)
     _SPARSE_DISPATCH_C = float(capacity_factor)
+
+
+# iter 118a Phase A3: Triton fused routed-down kernel for MLP-down dispatch.
+# When True AND torch.is_grad_enabled() is False (RevDEQ FP iter, eval, K-sweep),
+# `MLP.mix_experts` calls `fused_routed_down(h_pre, w_combined, expert_down)`
+# instead of the eager (h * w + bmm + sum_e) path. Bench: 2.86× dense, up to
+# 7.36× at 87.5% sparse. RevDEQ-safe per H101 (skip ε ≤ ε_bf16).
+_USE_UNIFIED_ROUTED_DOWN: bool = False
+
+
+def _set_unified_routed_down(enabled: bool) -> None:
+    """Module-level toggle invoked from main() before model construction."""
+    global _USE_UNIFIED_ROUTED_DOWN
+    _USE_UNIFIED_ROUTED_DOWN = bool(enabled)
 
 
 def sparse_moe_dispatch_capacity(
@@ -2712,6 +2733,36 @@ class MLP(nn.Module):
         h = F.rms_norm(h, (R,), eps=1e-6) * self.hidden_norm_weight.to(dtype=h.dtype)  # (E, R) broadcasts over (N, E, R)
         # Phase 9 iter 51: shared experts (sigmoid-gated) + routed experts
         S = int(num_shared)
+
+        # iter 118a Phase A3: when _USE_UNIFIED_ROUTED_DOWN flag is set AND
+        # autograd is disabled (RevDEQ no_grad FP iter, eval, K-sweep), call
+        # the fused Triton kernel instead of (h * w + bmm + sum_e). Combines
+        # shared sigmoid gate + routed router weights into one (N, E) weight
+        # tensor; kernel handles the per-expert weighted contraction with
+        # H101-safe sparsity skip. Bench: 2.86× dense, 7.36× at 87.5% sparse.
+        # Training (grad enabled) and any non-bf16 path fall through to eager.
+        if (
+            _USE_UNIFIED_ROUTED_DOWN
+            and not torch.is_grad_enabled()
+            and h.dtype == torch.bfloat16
+            and self.expert_down.dtype == torch.bfloat16
+            and D % 16 == 0
+            and h.shape[2] <= 128       # R_PAD register-pressure bound
+            and E <= 64
+        ):
+            from experiments.components.fused_routed_down import fused_routed_down
+            if S > 0 and shared_gate is not None:
+                num_routed = E - S
+                w_combined = torch.empty(N, E, dtype=h.dtype, device=h.device)
+                w_combined[:, :S] = shared_gate.reshape(N, S).to(dtype=h.dtype)
+                w_combined[:, S:] = w.reshape(N, num_routed).to(dtype=h.dtype)
+            else:
+                w_combined = w.reshape(N, E).to(dtype=h.dtype)
+            out = fused_routed_down(h, w_combined, self.expert_down)
+            # Diagnostic capture is eager-only; skipped in fused path.
+            return out.reshape(B, T, D)
+
+        # Eager fallback (training path with grad, or non-aligned shapes).
         if S > 0 and shared_gate is not None:
             num_routed = E - S
             # Shared: gated by per-token sigmoid (same gate as attention path)
@@ -4743,6 +4794,8 @@ def main() -> None:
         getattr(args, "use_sparse_dispatch", False),
         getattr(args, "sparse_dispatch_capacity_factor", 4.0),
     )
+    # iter 118a Phase A3: fused routed-down kernel toggle. Same pattern.
+    _set_unified_routed_down(getattr(args, "use_unified_routed_down", False))
     # iter 103: chained routing safety guard. The Hyperparameter exists
     # (X3 step 1) and CLI accepts the flag, but the Block refactor is not
     # yet implemented (X3 step 2-4 land progressively). Fail-fast here so
