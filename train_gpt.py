@@ -550,7 +550,7 @@ class Hyperparameters:
     deq_k_min = 4
     deq_k_max = 24
     deq_k_step = 4
-    deq_k_jitter_set = (32, 48)  # iter 131: doubled K min — deeper FP under iter 133 kernel ROI
+    deq_k_jitter_set = (16, 24)
     deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
 
     # Architecture knobs

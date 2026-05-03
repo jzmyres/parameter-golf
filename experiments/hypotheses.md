@@ -3245,6 +3245,28 @@ Trajectory tracks baseline within ~10% across all windows — no descent-rate re
 
 **New current baseline (2026-05-02)**: iter 130, val_bpb int6 = 1.4951. Superseded by iter 133 on 2026-05-03 (see iter 133 result section below).
 
+### Iter 131 RESULT (2026-05-03 launched 07:24, KILLED 13:41 at s600) — NOT-PROMOTED ✗
+
+**Config tested:** `deq_k_jitter_set = (16, 24) → (32, 48)` on top of iter 133 baseline (gram=0.3 + cv=1.0 + Phase A3 kernel).
+
+**Headline metrics:**
+| Metric | iter 131 | iter 133 baseline | Δ |
+|---|---|---|---|
+| step_avg | 37.0s | 22.7s | **+62.6%** ✗ |
+| s200 val_bpb | 1.9912 | 1.9810 | +0.010 |
+| s400 val_bpb | 1.6824 | 1.6657 | +0.017 |
+| s600 val_bpb | **1.5914** | **1.5437** | **+0.048** ✗ kill-trigger |
+
+Trajectory **monotonically widening** (s200 +0.010 → s400 +0.017 → s600 +0.048). At s600, exceeded the +0.05 anomaly gate vs iter 133 baseline. Combined with +62.6% wallclock cost, deeper FP iteration (K=32-48 vs K=16-24) was clearly net-negative on the per-wallclock signal even before reaching s1000.
+
+**Routing health was excellent throughout** (pool_cv 0.28-0.49, attn_ortho 0.10-0.13). The regression is in val_bpb itself, not stability — deeper FP isn't paying back at this training-step budget under the current capacity.
+
+**Decision:** killed at s600 to free GPU for next experiment per `feedback_per_wallclock_override.md` (val_bpb yields to per-wallclock signal when both are negative). Reverted `deq_k_jitter_set` to `(16, 24)`, no weight rotation (iter 133 weights remain canonical).
+
+**Hypothesis update — H12 deeper-K-jitter, refined:** iter 131 refutes the simplistic "deeper K is better" reading of H12. The true gain comes from K-jitter *spread*, not K-floor — wider jitter (e.g. {16, 24} → {12, 32}) explores more FP depths, but raising the *floor* without widening hurts more than it helps. Future K-jitter iters should sweep range, not floor.
+
+**New current baseline:** iter 133 (unchanged), val_bpb int6 = 1.4930.
+
 ### Iter 133 RESULT (2026-05-03 launched ~01:40, finished 07:00, K-sweep done 07:17) — PROMOTED ★
 
 **Config (iter 132 reg-rebalance + Phase A3 kernel):**
