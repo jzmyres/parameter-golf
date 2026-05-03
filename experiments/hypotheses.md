@@ -2562,7 +2562,9 @@ The huge integers in the shape are uninitialized memory interpreted as int64 —
 
 ### Next up — recommended ordering after iter 100b
 
-**Current baseline:** **iter 95** (`046235f` (promote-rotate, 2026-05-02), val_bpb int6 = 1.5001) — last promoted iter (H63 RESULT). One-line config: `Hyperparameters.deq_bptt_k = 2 → 3` on top of iter 112+122 (gram=0.1 + softcap=30). Per-token backward unrolls 3 iterations instead of 2 — cleaner gradient via more chain-rule samples averaged → better val_bpb generalization despite essentially-tied training-loss descent. Cost: +12.9% step_avg (23.49s vs iter 112+122 20.79s). val_bpb int6 1.5001 vs iter 112+122 1.5165 → Δ −0.0164 (vs gate 1.5465 → 0.046 margin). K-sweep K=8→K=128 Δ=−0.098 (88% tighter than iter 112+122 −0.052); all 3 acyclicity primes confirm genuine FP. K=24 best=1.4988. Artifact 7.45 MB (47% of 16 MB budget).
+**Current baseline:** **iter 130** (promoted 2026-05-02 ~23:30, val_bpb int6 = 1.4951) — H100 fix + sparsity-reg warmup pull jointly delivered −0.0050 vs iter 95 (1.5001). Best K-sweep K=24 = 1.4942. Genuine FP confirmed at all 3 acyclicity primes (17, 37, 113). artifact 7.6 MB. step_avg 23.5s (no overhead). Run launch CLI: `--use-entmax-routing=1 --use-orthogonal-expansion-routing=1 --routing-gram-coef=0.1 --routing-gram-warmup-delay-frac=0.05 --entmax-blend-warmup-delay-frac=0.05 --logit-softcap=30`.
+
+**Previous baseline:** iter 95 (`046235f`, val_bpb int6 = 1.5001) — H63 RESULT. One-line config: `Hyperparameters.deq_bptt_k = 2 → 3` on top of iter 112+122 (gram=0.1 + softcap=30). Per-token backward unrolls 3 iterations instead of 2 — cleaner gradient via more chain-rule samples averaged → better val_bpb generalization despite essentially-tied training-loss descent. Cost: +12.9% step_avg (23.49s vs iter 112+122 20.79s). val_bpb int6 1.5001 vs iter 112+122 1.5165 → Δ −0.0164 (vs gate 1.5465 → 0.046 margin). K-sweep K=8→K=128 Δ=−0.098 (88% tighter than iter 112+122 −0.052); all 3 acyclicity primes confirm genuine FP. K=24 best=1.4988. Artifact 7.45 MB (47% of 16 MB budget).
 
 **Historical baseline (superseded by iter 95):** **iter 112+122 MERGED** (`fb15a48` from launch commit `ec4cb19`, val_bpb int6 = 1.5165) — promoted 2026-05-02 (H84+H93 RESULT). Added Gram-matrix orthogonal-expansion routing (`routing_gram_coef=0.1`, `‖G − I/E‖²_F`) + Gemma2-style logit softcap (`logit_softcap=30`).
 
@@ -3178,7 +3180,68 @@ This is H92 reframed: it's a one-line trivial add. Run it before TTT to reduce v
 
 **Folded into iter 118 plan.** The unified-primitive kernel work (H88) and this convention fix land in the same commit block — iter 118 changes the routing dispatch path; the convention fix consolidates the routing-reg input contract once. Smoke test asserts at gate_mean=1 the loss values match the old impl within bf16 floor.
 
-**Status:** PROPOSED — folded into iter 118 implementation block; lands as iter 130 within the iter 118 commit series.
+**Status:** VERIFIED ★ 2026-05-02 — iter 130 PROMOTED. val_bpb int6 = **1.4951** vs baseline iter 95 = 1.5001 → **−0.0050** (within bf16 noise of CLAUDE.md §11 promotion threshold).
+
+**iter 130 RESULT (2026-05-02 launched 16:35, finished 23:30):**
+
+Config (single iter combining H100 + sparsity-reg warmup pull):
+- Code: H100 fix (drop per-slice renorm in `_component_health_losses`)
+- CLI: `--use-entmax-routing=1 --use-orthogonal-expansion-routing=1 --routing-gram-coef=0.1 --routing-gram-warmup-delay-frac=0.05 --entmax-blend-warmup-delay-frac=0.05 --logit-softcap=30`
+
+Headline metrics:
+| Metric | iter 130 | iter 95 baseline | Δ |
+|---|---|---|---|
+| **val_bpb int6 (roundtrip K=16)** | **1.4951** | **1.5001** | **−0.0050** ✓ PROMOTE |
+| val_bpb fast (s1000) | 1.4638 | 1.4720 | −0.008 |
+| step_avg | 23.5s | 23.5s | == (no overhead) |
+| artifact_bytes | 7,637,857 (7.6 MB) | 7,591,678 | +0.6% (well under 16 MB) |
+| peak_vram_mb | 34,605 | 34,330 | ≈ same |
+| pertoken_entropy (s1000) | 2.7348 | 2.7906 | similar (gram-driven ortho > per-token concentration; see Q&A 2026-05-02 deep-dive) |
+| attn_ortho (s1000) | 0.1035 | 0.1514 | −0.05 ✓ better specialization |
+| pool_cv (s1000) | 0.2467 | 0.2960 | −0.05 ✓ better load balance |
+
+K-sweep matrix (int6, after roundtrip_verification):
+```
+k_sweep_table:    K   val_bpb  attn_cv   mlp_cv  pool_cv  attn_min   mlp_min  attn_ortho  mlp_ortho  pertoken_ent  pool_ent  shared_gate   hutch_F   rd_step  iter_conv_rel
+k_sweep_table:    4    1.8230   0.3796   0.1668   0.2932    0.0259    0.0505      0.1035     0.2178        2.7095    3.3570       0.2743    0.7793  474.8136         0.2367
+k_sweep_table:    8    1.5611   0.3722   0.1823   0.2930    0.0239    0.0505      0.1035     0.2178        2.7008    3.3562       0.2553    0.7539  449.5706         0.1147
+k_sweep_table:   16    1.4951   0.3609   0.1775   0.2844    0.0242    0.0494      0.1035     0.2178        2.7066    3.3586       0.2492    0.7546  447.0168         0.0329
+k_sweep_table:   17    1.4944   0.3587   0.1775   0.2830    0.0243    0.0494      0.1035     0.2178        2.7090    3.3590       0.2487    0.7576  461.8882         0.0289
+k_sweep_table:   24    1.4942   0.3618   0.1785   0.2853    0.0241    0.0493      0.1035     0.2178        2.7109    3.3583       0.2467    0.7568  446.9844         0.0178
+k_sweep_table:   32    1.4950   0.3614   0.1788   0.2851    0.0240    0.0493      0.1035     0.2178        2.7129    3.3583       0.2462    0.7583  460.0732         0.0155
+k_sweep_table:   37    1.4953   0.3620   0.1787   0.2855    0.0240    0.0493      0.1035     0.2178        2.7132    3.3582       0.2462    0.7620  460.8362         0.0153
+k_sweep_table:   64    1.4960   0.3622   0.1788   0.2856    0.0240    0.0493      0.1035     0.2178        2.7137    3.3582       0.2459    0.7521  451.2026         0.0150
+k_sweep_table:  113    1.4962   0.3624   0.1790   0.2858    0.0240    0.0492      0.1035     0.2178        2.7137    3.3581       0.2458    0.7540  454.4963         0.0152
+k_sweep_table:  128    1.4962   0.3628   0.1790   0.2860    0.0240    0.0493      0.1035     0.2178        2.7136    3.3580       0.2458    0.7580  448.6310         0.0151
+```
+
+**Genuine FP convergence verified (acyclicity primes):**
+- K=17 vs K=16: Δ = −0.0007 ✓
+- K=37 vs K=32: Δ = +0.0003 ✓
+- K=113 vs K=64: Δ = +0.0002 ✓
+
+Best K = 24 at 1.4942 (Δ = −0.0009 vs K=16 training depth) — supports iter 131 (`deq_k_jitter_set → (32, 48)`) hypothesis: deeper FP gives modest val_bpb gain.
+
+**ntp descent rate (Δntp / 10 steps, iter 130 vs baseline):**
+
+| Window | iter 130 Δntp/10 | baseline Δntp/10 | Match |
+|---|---|---|---|
+| s30→s100 | -0.0777 | -0.0840 | similar |
+| s100→s200 | -0.0656 | -0.0670 | similar |
+| s200→s400 | -0.0396 | -0.0383 | similar |
+| s400→s600 | +0.0104 | +0.0090 | similar (warmup transition) |
+| s600→s800 | -0.0141 | -0.0142 | identical |
+| s800→s1000 | -0.0021 | -0.0025 | similar (warmdown) |
+
+Trajectory tracks baseline within ~10% across all windows — no descent-rate regression.
+
+**Diagnostic gates (post-iter eval at high K):** attn_ortho=0.6172 fired (collapse warning) and mos_ntp_min_share=0.1941 fired (mos collapse warning) at K=128 eval. Per CLAUDE.md §11 ("Diagnostic-gate failures DO NOT block promotion"), these are recorded as `validated_with_diagnostic_fail` retry-hint.json prescriptions for the NEXT iter (post-Phase-A3 launches), not blockers for iter 130.
+
+**Attribution**: H100 fix (drop per-slice renorm in `_component_health_losses`) + sparsity-reg warmup pull (gram + entmax-blend at s50 instead of s300) jointly delivered the −0.0050 val_bpb gain. Hard to disentangle without ablation; H100 alone (no warmup pull) would be the clean isolation test if needed in future.
+
+**Companion observation re Q&A 2026-05-02 sparsity question:** iter 130 H_pertoken plateaued at ~2.81 (≈50% active per pool, ~2.6× kernel speedup territory when integrated). Softmax routing has a hard sparsity floor; gram penalty can't push H_pertoken below it. Iter 132 (gram↑ + cv↓) will test whether reg rebalance alone can drive sparsity to the 3-5× kernel territory while keeping dense init.
+
+**New current baseline**: iter 130 (this commit), val_bpb int6 = 1.4951.
 
 ### Records-derived priority order (within Tier 4)
 
