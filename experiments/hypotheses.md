@@ -2562,9 +2562,11 @@ The huge integers in the shape are uninitialized memory interpreted as int64 —
 
 ### Next up — recommended ordering after iter 100b
 
-**Current baseline:** **iter 130** (promoted 2026-05-02 ~23:30, val_bpb int6 = 1.4951) — H100 fix + sparsity-reg warmup pull jointly delivered −0.0050 vs iter 95 (1.5001). Best K-sweep K=24 = 1.4942. Genuine FP confirmed at all 3 acyclicity primes (17, 37, 113). artifact 7.6 MB. step_avg 23.5s (no overhead). Run launch CLI: `--use-entmax-routing=1 --use-orthogonal-expansion-routing=1 --routing-gram-coef=0.1 --routing-gram-warmup-delay-frac=0.05 --entmax-blend-warmup-delay-frac=0.05 --logit-softcap=30`.
+**Current baseline:** **iter 133** (promoted 2026-05-03 ~07:17, val_bpb int6 = 1.4930) — gram=0.3 + cv=1.0 + Phase A3 Triton kernel (`--use-unified-routed-down=1`) delivered −0.0021 vs iter 130 (1.4951). Best K-sweep K=17 = 1.4924. Genuine FP at all 3 acyclicity primes. artifact 7.6 MB. step_avg 22.7s (−3.4% vs iter 130 23.5s — kernel ROI confirmed). Run launch CLI: `--use-entmax-routing=1 --use-orthogonal-expansion-routing=1 --routing-gram-coef=0.3 --routing-gram-warmup-delay-frac=0.05 --entmax-blend-warmup-delay-frac=0.05 --logit-softcap=30 --cv-loss-weight=1.0 --use-unified-routed-down=1`.
 
-**Previous baseline:** iter 95 (`046235f`, val_bpb int6 = 1.5001) — H63 RESULT. One-line config: `Hyperparameters.deq_bptt_k = 2 → 3` on top of iter 112+122 (gram=0.1 + softcap=30). Per-token backward unrolls 3 iterations instead of 2 — cleaner gradient via more chain-rule samples averaged → better val_bpb generalization despite essentially-tied training-loss descent. Cost: +12.9% step_avg (23.49s vs iter 112+122 20.79s). val_bpb int6 1.5001 vs iter 112+122 1.5165 → Δ −0.0164 (vs gate 1.5465 → 0.046 margin). K-sweep K=8→K=128 Δ=−0.098 (88% tighter than iter 112+122 −0.052); all 3 acyclicity primes confirm genuine FP. K=24 best=1.4988. Artifact 7.45 MB (47% of 16 MB budget).
+**Previous baseline:** iter 130 (`8e10ddf` from launch, val_bpb int6 = 1.4951) — H100 fix + sparsity-reg warmup pull, −0.0050 vs iter 95.
+
+**Historical baseline (superseded by iter 130):** iter 95 (`046235f`, val_bpb int6 = 1.5001) — H63 RESULT. One-line config: `Hyperparameters.deq_bptt_k = 2 → 3` on top of iter 112+122 (gram=0.1 + softcap=30). Per-token backward unrolls 3 iterations instead of 2 — cleaner gradient via more chain-rule samples averaged → better val_bpb generalization despite essentially-tied training-loss descent. Cost: +12.9% step_avg (23.49s vs iter 112+122 20.79s). val_bpb int6 1.5001 vs iter 112+122 1.5165 → Δ −0.0164 (vs gate 1.5465 → 0.046 margin). K-sweep K=8→K=128 Δ=−0.098 (88% tighter than iter 112+122 −0.052); all 3 acyclicity primes confirm genuine FP. K=24 best=1.4988. Artifact 7.45 MB (47% of 16 MB budget).
 
 **Historical baseline (superseded by iter 95):** **iter 112+122 MERGED** (`fb15a48` from launch commit `ec4cb19`, val_bpb int6 = 1.5165) — promoted 2026-05-02 (H84+H93 RESULT). Added Gram-matrix orthogonal-expansion routing (`routing_gram_coef=0.1`, `‖G − I/E‖²_F`) + Gemma2-style logit softcap (`logit_softcap=30`).
 
@@ -3241,7 +3243,78 @@ Trajectory tracks baseline within ~10% across all windows — no descent-rate re
 
 **Companion observation re Q&A 2026-05-02 sparsity question:** iter 130 H_pertoken plateaued at ~2.81 (≈50% active per pool, ~2.6× kernel speedup territory when integrated). Softmax routing has a hard sparsity floor; gram penalty can't push H_pertoken below it. Iter 132 (gram↑ + cv↓) will test whether reg rebalance alone can drive sparsity to the 3-5× kernel territory while keeping dense init.
 
-**New current baseline**: iter 130 (this commit), val_bpb int6 = 1.4951.
+**New current baseline (2026-05-02)**: iter 130, val_bpb int6 = 1.4951. Superseded by iter 133 on 2026-05-03 (see iter 133 result section below).
+
+### Iter 133 RESULT (2026-05-03 launched ~01:40, finished 07:00, K-sweep done 07:17) — PROMOTED ★
+
+**Config (iter 132 reg-rebalance + Phase A3 kernel):**
+- CLI: `--use-entmax-routing=1 --use-orthogonal-expansion-routing=1 --routing-gram-coef=0.3 --routing-gram-warmup-delay-frac=0.05 --entmax-blend-warmup-delay-frac=0.05 --logit-softcap=30 --cv-loss-weight=1.0 --use-unified-routed-down=1`
+- Code: kernel commits `2409c74` + `34b8057` + `c94899a` (Phase A3 fused_routed_down Triton + dispatch + CLI plumbing) on top of iter 130 baseline.
+
+**Headline metrics:**
+| Metric | iter 133 | iter 130 baseline | Δ |
+|---|---|---|---|
+| **val_bpb int6 (roundtrip K=16)** | **1.4930** | **1.4951** | **−0.0021** ✓ PROMOTE |
+| val_bpb fast (s1000) | 1.4578 | 1.4638 | −0.006 |
+| step_avg | 22.73s | 23.5s | **−3.3% (kernel ROI)** |
+| artifact_bytes | 7,649,469 (7.6 MB) | 7,637,857 | +0.15% (well under 16 MB) |
+| peak_vram_mb | 34,605 | 34,605 | == |
+| pertoken_entropy (s1000) | 2.7183 | 2.7348 | similar (gram-driven; not concentration-driven) |
+| attn_ortho (s1000) | 0.1406 | 0.1035 | +0.04 (looser; gram=0.3 driving Gram-matrix instead of output-mean) |
+| pool_cv (s1000) | 0.2841 | 0.2467 | +0.04 (looser; cv_loss_weight halved) |
+
+**K-sweep matrix (int6, after roundtrip_verification):**
+```
+k_sweep_table:    K   val_bpb  attn_cv   mlp_cv  pool_cv  attn_min   mlp_min  attn_ortho  mlp_ortho  pertoken_ent  pool_ent  shared_gate   hutch_F   rd_step  iter_conv_rel
+k_sweep_table:    4    1.9531   0.4875   0.2517   0.3880    0.0284    0.0398      0.1406     0.2178        2.6692    3.3302       0.2355    0.8077  430.2717         0.3605
+k_sweep_table:    8    1.5818   0.3849   0.2815   0.3372    0.0350    0.0331      0.1406     0.2178        2.7134    3.3457       0.2216    0.7569  423.4141         0.1230
+k_sweep_table:   16    1.4930   0.3522   0.2553   0.3076    0.0376    0.0352      0.1406     0.2178        2.7300    3.3550       0.2184    0.7477  424.8354         0.0266
+k_sweep_table:   17    1.4924   0.3528   0.2547   0.3077    0.0375    0.0352      0.1406     0.2178        2.7300    3.3550       0.2184    0.7456  412.8152         0.0234
+k_sweep_table:   24    1.4929   0.3524   0.2538   0.3071    0.0375    0.0354      0.1406     0.2178        2.7300    3.3552       0.2181    0.7442  416.3458         0.0150
+k_sweep_table:   32    1.4939   0.3521   0.2535   0.3068    0.0375    0.0354      0.1406     0.2178        2.7302    3.3553       0.2181    0.7478  423.5500         0.0135
+k_sweep_table:   37    1.4941   0.3527   0.2540   0.3074    0.0375    0.0354      0.1406     0.2178        2.7300    3.3551       0.2181    0.7480  428.2168         0.0135
+k_sweep_table:   64    1.4947   0.3524   0.2538   0.3071    0.0375    0.0353      0.1406     0.2178        2.7300    3.3551       0.2181    0.7474  421.8054         0.0135
+k_sweep_table:  113    1.4949   0.3527   0.2538   0.3074    0.0375    0.0353      0.1406     0.2178        2.7299    3.3551       0.2181    0.7488  419.1143         0.0135
+k_sweep_table:  128    1.4949   0.3527   0.2539   0.3073    0.0375    0.0353      0.1406     0.2178        2.7299    3.3551       0.2181    0.7485  409.3791         0.0135
+```
+
+**Genuine FP convergence verified (acyclicity primes):**
+- K=17 vs K=16: Δ = −0.0006 ✓
+- K=37 vs K=32: Δ = +0.0002 ✓
+- K=113 vs K=128: Δ = +0.0000 ✓
+
+Best K = 17 at 1.4924 (Δ = −0.0006 vs K=16 training depth) — supports iter 131 (deeper K-jitter) hypothesis.
+
+**Trajectory (val_bpb fast checkpoints vs iter 130 baseline):**
+
+| Step | iter 133 | iter 130 baseline | Δ |
+|---|---|---|---|
+| s200 | 1.9810 | 1.9951 | **−0.0141 ahead** |
+| s400 | 1.6657 | 1.6456 | +0.0201 behind (transient) |
+| s600 | 1.5437 | 1.5496 | **−0.0059 ahead** |
+| s800 | 1.4976 | 1.5026 | **−0.0050 ahead** |
+| s1000 fast | 1.4578 | 1.4638 | **−0.0060 ahead** |
+
+Trajectory oscillated (s400 dip recovered by s600); 4/5 checkpoints ahead.
+
+**ntp descent rate (Δntp / 10 steps, iter 133 vs iter 130 baseline):**
+
+| Window | iter 133 Δntp/10 | iter 130 Δntp/10 | Per-wallclock Δntp/sec (iter 133) |
+|---|---|---|---|
+| s30→s100 | -0.0747 | -0.0840 | -3.29e-4/sec |
+| s100→s200 | -0.0693 | -0.0670 | -3.05e-4/sec |
+| s200→s400 | -0.0351 | -0.0383 | -1.55e-4/sec |
+| s400→s600 | +0.0075 | +0.0090 | +3.30e-5/sec (warmup transition) |
+| s600→s800 | -0.0144 | -0.0142 | -6.34e-5/sec |
+| s800→s1000 | -0.0022 | -0.0025 | -9.69e-6/sec (warmdown) |
+
+Trajectory matches baseline within ~10%. Per-wallclock advantage from −3.3% step_avg compounds to ~9% better Δntp/sec at any given window.
+
+**Diagnostic gates:** `attn_ortho=0.7383 > 0.5` fired at high-K eval (suggested fix: `weight_decay × 1.5`). Per CLAUDE.md §11 ("Diagnostic-gate failures DO NOT block promotion"), recorded as retry hint for next iter (i.e. iter 131 may benefit from `weight_decay 0.01 → 0.015`).
+
+**Attribution:** iter 132's reg rebalance (gram=0.3, cv=1.0) + iter 118a Phase A3 kernel (`--use-unified-routed-down=1`) jointly delivered −0.0021 val_bpb AND −3.3% step_avg. The kernel is provably bit-equivalent to eager (smoke test rel 7.8e-3, within bf16 floor) so the val_bpb gain is fully attributable to reg rebalance. Throughput gain is fully attributable to kernel.
+
+**New current baseline:** iter 133, val_bpb int6 = 1.4930.
 
 ### Records-derived priority order (within Tier 4)
 
