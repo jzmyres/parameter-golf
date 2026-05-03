@@ -3344,14 +3344,36 @@ Trajectory matches baseline within ~10%. Per-wallclock advantage from −3.3% st
 
 **Iter 104 AdaSplash α-entmax attention — DEFERRED INDEFINITELY** (user directive 2026-05-03): kernel incompatible with torch.compile under DDP+RevDEQ (commit `d7996da` plumbing remains as dead code; do not test). Phase A3 fused_routed_down already provides MoE-routing speedup via its own custom_op path; AdaSplash for SDPA attention is a separate concern that requires either flex_attention rewrite (iter 120 RRAttention) or compile-disable wrapper that breaks throughput.
 
-**New Tier 1 sparsity items (autonomous-suitable, single-knob each):**
+**Tier 1.A — Unification + ablation series (NEW 2026-05-03 user directive, supersedes 134/135/136/137 sparsity-individual sweeps):**
 
-| Iter | Change | Mechanism | Strict-gen at default? |
-|---|---|---|---|
-| **134** | `--entmax-blend-init-logit=0` (vs 5.0) | sigmoid(0)=0.5 → 50/50 softmax+entmax-1.5 init blend; entmax produces hard zeros on low-logit experts | ✓ — at logit=5.0 recovers iter 133 forward map exactly |
-| 135 | `--entmax-blend-init-logit=-3` | sigmoid(-3)=0.05 → entmax-dominated init (95% entmax-1.5) | ✓ |
-| 136 | `--entmax-blend-lr=0.02` (10× from 0.002) | faster blend convergence; routing can move from softmax → entmax during training | ✓ |
-| 137 | `--router-entropy-coef=0.05 --router-entropy-warmup-delay-frac=0.5` | entropy reg with delayed ramp (mitigates iter 117b-1 cold-start trap) | ✓ at coef=0 |
+Premise: the 4 routing regs in iter 133 have wildly different scales (gram=0.3, cv=1.0, entropy=0.005, block_ortho=0.1) and antagonistic directions (gram + cv pull toward uniform, entropy pulls toward concentration, block_ortho pulls toward output-mean orthogonality). Iter 133's pertoken_entropy trajectory (s30=2.58 → s100=1.91 PEAK SPARSITY → s1000=2.72 NEAR-UNIFORM) shows the equilibrium is gram+CV-dominated. **Unify all 4 at equal coefficient, then ablate one at a time** to surface the actual marginal contribution of each.
+
+| Iter | Change | Notes |
+|---|---|---|
+| **138** | Unified routing regs at coef=0.1: `--routing-gram-coef=0.1 --cv-loss-weight=0.1 --router-entropy-coef=0.1 --block-ortho-aux-coef=0.1 --router-entropy-warmup-delay-frac=0.5` | **Equal-weight baseline**; entropy keeps warmup delay for cold-start safety. All 4 regs in same numeric weight; gradient magnitudes still differ but coefs are now uniform. |
+| 138a | iter 138 minus gram: `--routing-gram-coef=0` | drop gram → measures gram's contribution |
+| 138b | iter 138 minus cv: `--cv-loss-weight=0` | drop CV → does gram alone subsume load-balance? |
+| 138c | iter 138 minus entropy: `--router-entropy-coef=0` | drop entropy → quantifies sparsity-reg contribution |
+| 138d | iter 138 minus block_ortho: `--block-ortho-aux-coef=0` | drop block_ortho → quantifies macro-orthogonality reg |
+
+**Analysis pattern (after 5 runs):**
+- Largest val_bpb regression on drop → most-important reg → keep + maybe boost in iter 139 series
+- Smallest regression (or improvement) on drop → redundant or antagonistic → permanently remove, simplifies architecture
+- pertoken_entropy at s1000 across the 5 runs identifies which reg drives the uniform-pull (and which drives sparsity)
+
+**Pre-iter-138 abandonments (per ablation supersede):**
+- ~~iter 134~~ (`entmax_blend_init_logit=0`) — abandoned mid-launch; violated cold-start safety
+- ~~iter 137~~ (`router_entropy_coef=0.02 + warmup 0.5`) — stopped mid-run; superseded by iter 138c (entropy ablation)
+- ~~iter 112e/f/g/h~~ — superseded by iter 138a-d (same ablations under unified baseline)
+
+**Deferred to Tier 1.B (run only if iter 138 series doesn't unlock sparsity / val_bpb gain):**
+
+| Iter | Change | Notes |
+|---|---|---|
+| 135 | `--entmax-blend-init-logit=-3` (entmax-dominated init) | aggressive — risky cold-start; only if Tier 1.A regs can't drive sparsity |
+| 136 | `--entmax-blend-lr=0.02` (10×) | gate-mobility; only if Tier 1.A reveals blend gate is stuck |
+| 102b | sparsemax_anneal router (closed-form) | routing-fn change |
+| 105 | α-jitter {1.0, 1.5, 2.0} per-step | stochastic α |
 
 **Existing Tier 1 (re-eval under gram=0.3 baseline):**
 | Iter | Change |
