@@ -2601,6 +2601,21 @@ Iter 117b-1 NOT PROMOTED 2026-04-30 (H87b RESULT) — config bumps reverted. Bas
 10. ~~**Iter 108 (H79 reframed)**~~ — **DROPPED 2026-05-02** (user directive). Iter 108 was K=10 (lower depth); user has reversed direction since iter 118a kernel landed — the kernel's forward throughput win (1.4-5× depending on sparsity, ~90% of training-time dispatch sites benefit per `feedback_grad_enabled_vs_requires_grad.md`) creates headroom for DEEPER FP iteration, not shallower. Iter 108 + iter 109 (K-jitter {10, 16}) are both DROPPED — testing K < 16 is no longer useful when kernel makes K = 32+ throughput-feasible.
 
 11. **Iter 131 (NEW 2026-05-02) — Double K min: `deq_k_jitter_set = (16, 24) → (32, 48)`.** Uses iter 118a kernel's throughput win (1.4-5× forward, ~90% of train-time expert dispatch hits Triton path under `is_grad_enabled()` dispatch — H_pertoken at iter 130 s290 ≈ 2.40, half-sparse-equivalent → ~2.5× kernel speedup). Doubling K should be roughly throughput-neutral (kernel gain ≈ K-doubling cost). Deeper FP → cleaner fixed point → potentially better val_bpb + tighter K-sweep extrapolation tail. **Pre-condition**: iter 118a kernel integrated into Block.forward (NOT yet — Phase A3 integration pending). Until kernel is wired, this iter would be ~2× slower per step. **Verdict path**: val_bpb int6 ≤ baseline (currently iter 95 = 1.5001) by ≥ 0.005 AND step_avg ≤ 1.10× baseline → promote. Companion: optionally bump `deq_k_eval = 16 → 32` for eval-train consistency. K-sweep matrix unchanged (still tests K∈{4,8,16,17,24,32,37,64,113,128} — but training is now centered at K=32-48 instead of K=16-24, so K=4,8 measure extrapolation BELOW training depth, K=128 measures extrapolation ABOVE).
+
+12. **Iter 132 (NEW 2026-05-02) — Sparsity reg rebalance + kernel integration: `routing_gram_coef = 0.1 → 0.3` AND `cv_loss_weight = 2.0 → 1.0`.** Uses iter 118a kernel's H101-safe sparsity skip (5× kernel speedup at 87.5% sparse, 2.6× at 50% sparse). Goal: push iter 130's H_pertoken plateau (~2.81 = ~50% active per pool) toward stronger sparsity to unlock the kernel's 3-5× regime.
+
+    **Why this combination (user directive 2026-05-02, NOT entmax_blend_init_logit ↓):**
+    - Keep `entmax_blend_init_logit = 5.0` so routing starts dense and ALL experts get useful gradients in early training (cold-start trap mitigation per `feedback_anneal_sparsity_coefs.md`).
+    - Sparsity emerges over training via reg pressure, not from routing-function-domain change.
+    - **gram_coef ↑ (0.1 → 0.3, 3×):** stronger pull toward `G = I/E` target (sparse-uniform-distributed routing). Multi-axis: simultaneously orthogonality + load-balance + sparsity. Current contribution ~0.006 of total loss → 0.018 (still small but 3× more).
+    - **cv_loss_weight ↓ (2.0 → 1.0, 0.5×):** relax load-balance brake. CV is currently near-target (pool_cv ≈ 0.3 at iter 130), so the active gradient is small — but as gram drives sparsity, CV may rise; lower coef gives gram more authority. Joint move keeps overall reg budget similar.
+    - Avoids the H87b regression path (`router_entropy_coef ↑` alone produces capacity loss).
+
+    **Pre-condition: iter 118a Phase A3 (Block.forward integration) MUST land first.** Without integration, sparsity skip can't fire because the kernel isn't called from training. Order: iter 130 finishes → Phase A3 integration commit → iter 132 launch.
+
+    **Verdict path:** val_bpb int6 ≤ baseline (iter 130 result if promoted, else iter 95 = 1.5001) AND step_avg < baseline (kernel + sparsity-driven skips → throughput win) → promote. Diagnostic: check that H_pertoken descends below iter 130's 2.81 plateau toward ~2.0-2.3 (= 75-95% sparser per-pool, unlocking 3-5× kernel territory).
+
+    **Companion data to capture**: kernel skip-rate per dispatch site (not currently logged — add to diagnostic emission during Phase A3 integration). This lets us correlate H_pertoken descent with actual kernel speedup measured in flight.
 **Gradient-magnitude analysis 2026-05-02 (revises sequential ablation order)** — rigorous derivation of pairwise gram-vs-existing-reg dynamics shows:
 - `∂L_G/∂w_t = (4 c_G / N) · (G − I/E) w_t` (matrix form, per-token)
 - `∂L_CV/∂w_t[a] = (2 c_CV / N) (p[a] − 1/E)` (uniform across tokens)
