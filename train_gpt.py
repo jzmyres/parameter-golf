@@ -646,6 +646,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
         "use-polar-express-ns", "use-entmax-triton", "use-sparse-dispatch",
         "use-chained-routing", "use-orthogonal-expansion-routing",
+        "use-unified-routed-down",  # iter 118a Phase A3
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
