@@ -3392,7 +3392,7 @@ Anchor: iter 133, val_bpb int6 K=16 = 1.4930, step_avg = 22.7s, pertoken_ent_s10
 | Iter | val_bpb K=16 | Δ vs 133 | pertoken_ent s1000 | eff_experts | attn_ortho | mlp_ortho | attn_cv | mlp_cv | pool_cv | step_avg | artifact_bytes |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | **138** unified (all=0.1) | **1.5161** | **+0.0231** | 2.4560 | 11.66 | 0.1318 | 0.2158 | 0.6026 | 0.1231 | 0.4349 | 22.62s | 7,674,907 |
-| 138a (drop gram) | — | — | — | — | — | — | — | — | — | — | — |
+| 138a (drop gram) | **1.5101** | **+0.0171** | 2.7654 | 15.89 | 0.1187 | 0.2305 | 0.3542 | 0.0972 | 0.2597 | 22.61s | 7,577,324 |
 | 138b (drop cv) | — | — | — | — | — | — | — | — | — | — | — |
 | 138c (drop entropy) | — | — | — | — | — | — | — | — | — | — | — |
 | 138d (drop block_ortho) | — | — | — | — | — | — | — | — | — | — | — |
