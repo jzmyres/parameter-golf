@@ -393,6 +393,13 @@ class Hyperparameters:
     expert_gram_coef = 0.0
     expert_gram_warmup_delay_frac = 0.3
     expert_gram_max_tokens = 64  # subsample tokens per block for cost control
+    # iter 129 / H99 (NEW 2026-05-04): SmearGate — position-mixing memory channel.
+    # `x[t] += g · x[t-1] · not_bos_mask` after embedding lookup. BOS-fixed
+    # (mask suppresses leak across packed-doc boundaries; SP BOS_ID=1).
+    # Default OFF; strict-gen at coef=0 → exact recovery (no x-mixing).
+    use_smear_gate = False
+    smear_gate_init = 0.1
+    smear_gate_bos_id = 1  # SentencePiece BOS
     # iter 122 / H93 (2026-05-01): logit softcap (Gemma2-style).
     # `logits = softcap * tanh(logits / softcap)` bounds extreme logit values,
     # smoothing gradient spikes and reducing bf16 numerical issues. Applied
@@ -628,6 +635,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "routing-gram-coef", "routing-gram-warmup-delay-frac",
     # iter 141 — per-token expert-output Gram penalty
     "expert-gram-coef", "expert-gram-warmup-delay-frac", "expert-gram-max-tokens",
+    # iter 129 / H99 — SmearGate (default off; --use-smear-gate=1 to enable)
+    "smear-gate-init", "smear-gate-bos-id",
     # iter 122 H93 — logit softcap (Gemma2-style)
     "logit-softcap",
     # iter 117b-3 — sparse MoE dispatch capacity factor
@@ -658,6 +667,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "use-polar-express-ns", "use-entmax-triton", "use-sparse-dispatch",
         "use-chained-routing", "use-orthogonal-expansion-routing",
         "use-unified-routed-down",  # iter 118a Phase A3
+        "use-smear-gate",  # iter 129 / H99
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
@@ -677,7 +687,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
                  "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
                  "use_entmax_routing", "use_polar_express_ns",
                  "use_entmax_triton", "use_sparse_dispatch", "use_unified_routed_down",
-                 "use_chained_routing", "use_orthogonal_expansion_routing"}
+                 "use_chained_routing", "use_orthogonal_expansion_routing",
+                 "use_smear_gate"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -3811,6 +3822,9 @@ class GPT(nn.Module):
                  expert_gram_coef: float = 0.0,
                  expert_gram_warmup_delay_frac: float = 0.3,
                  expert_gram_max_tokens: int = 64,
+                 use_smear_gate: bool = False,
+                 smear_gate_init: float = 0.1,
+                 smear_gate_bos_id: int = 1,
                  logit_softcap: float = 0.0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
@@ -3855,6 +3869,14 @@ class GPT(nn.Module):
         self._expert_gram_max_tokens = int(expert_gram_max_tokens)
         self._expert_gram_coef_scale = 1.0  # set per-step by annealer
         self._expert_gram_loss: Tensor | None = None
+        # iter 129 / H99: SmearGate — single learnable scalar shared across the
+        # entire backbone (we have one shared Block; per-layer doesn't apply).
+        # `x[1:] += g · x[:-1] · not_bos_mask` after token embedding lookup.
+        # Strict-gen at use_smear_gate=False → no parameter, no compute.
+        self.use_smear_gate = bool(use_smear_gate)
+        self.smear_gate_bos_id = int(smear_gate_bos_id)
+        if self.use_smear_gate:
+            self.smear_gate = nn.Parameter(torch.tensor(float(smear_gate_init)))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -4287,6 +4309,12 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
+        # iter 129 / H99: SmearGate. `x[1:] += g · x[:-1] · not_bos`.
+        # not_bos_mask suppresses leak across packed-doc boundaries.
+        if self.use_smear_gate:
+            not_bos = (input_ids[:, 1:] != self.smear_gate_bos_id).to(dtype=x.dtype).unsqueeze(-1)
+            smeared_tail = x[:, 1:] + self.smear_gate.to(dtype=x.dtype) * x[:, :-1] * not_bos
+            x = torch.cat([x[:, :1], smeared_tail], dim=1)
         # Phase 9 iter 71g: learnable embed norm.
         x = self.embed_norm(x)
         x = self._run_backbone(x)
@@ -4588,6 +4616,10 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
     scalar_params.extend(mos_params)
     scalar_params.append(base_model.final_norm.weight)
     scalar_params.append(base_model.embed_norm.weight)
+    # iter 129 / H99: SmearGate scalar lives at GPT level (single scalar shared
+    # across the entire backbone). Routed to scalar group when active.
+    if getattr(base_model, "use_smear_gate", False):
+        scalar_params.append(base_model.smear_gate)
 
     parcae_params: list[nn.Parameter] = []
     if getattr(base_model, "use_parcae", False):
@@ -5141,6 +5173,9 @@ def main() -> None:
         expert_gram_coef=float(args.expert_gram_coef),
         expert_gram_warmup_delay_frac=float(args.expert_gram_warmup_delay_frac),
         expert_gram_max_tokens=int(args.expert_gram_max_tokens),
+        use_smear_gate=bool(args.use_smear_gate),
+        smear_gate_init=float(args.smear_gate_init),
+        smear_gate_bos_id=int(args.smear_gate_bos_id),
         logit_softcap=float(args.logit_softcap),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
