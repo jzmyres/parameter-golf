@@ -3434,6 +3434,20 @@ Coefficient: `routing_gram_coef` reused (semantics change but knob name stays). 
 
 **Post-condition**: iter 140 launches AFTER the 5-row ablation matrix is complete.
 
+**PRINCIPLED-TESTING PROTOCOL for iter 140** (per user directive 2026-05-04):
+
+1. **Single-knob change anchored to iter 133**: replace `W^T W` with `(p^T p)/N` while keeping all other reg coefs at iter 133 promoted values: gram=0.3, cv=1.0, entropy=0.005, block_ortho=0.1. Only the *operand* of gram changes; the *coefficient* stays at iter 133's value. This isolates the operand-swap effect from coefficient changes.
+2. **Strict-generalization argument**: at gram_coef=0, both forms (W^T W and p^T p) contribute zero loss → iter 140 with coef=0 = iter 133 with coef=0 = baseline forward map. Any deviation from baseline at coef>0 is a directed move; weight-space pulled away from desired direction (uniform-pull on anisotropic inputs), output-space pulls toward desired direction (one-hot sparsity).
+3. **Smoke test before launch** (CLAUDE.md §7 mandatory): `python experiments/smoke_test.py` with `--routing-gram-output=1` flag — verify loss decreases, no NaN, recon_err normal. The new loss is just `(p_flat.T @ p_flat / N - I/E).pow(2).sum()` — well-behaved arithmetic.
+4. **Diagnostic instrumentation** (verify reg is doing what it should): emit per-block `routing_gram_out_loss` value at every train log line. Add `effective_experts = exp(pertoken_entropy)` as a derived metric. We want to see this drop from iter 133's 15.16 toward 4–7 as training progresses.
+5. **Rollback plan**: if val_bpb regresses > 0.03 at s400 vs iter 133, kill at s400 (don't run to s1000 wasting 4h). Document NOT-PROMOTED reason: "output-space gram direction wrong / over-aggressive at coef=0.3".
+
+**Code changes required** (4-touch rule per CLAUDE.md §9):
+1. `Hyperparameters` field: `use_routing_gram_output: bool = False` (CLI flag, strict-gen at False = iter 133 forward map)
+2. `_parse_cli_overrides`: add `"use-routing-gram-output"` to bool-flags
+3. `_collect_routing_losses` or wherever current gram is computed: branch on flag, replace W^T W with (p_flat.T @ p_flat) / p_flat.size(0)
+4. CLAUDE.md §5: document the new flag and its semantic meaning
+
 ### Iter 141 (NEW 2026-05-04 user directive): Per-token expert-output gram
 
 **Premise**: An orthogonal complement to iter 140's output-space ROUTING gram. iter 140 constrains *which* experts each token picks; iter 141 constrains *what* each expert computes per input. Both can coexist.
@@ -3468,6 +3482,37 @@ Coefficient: `routing_gram_coef` reused (semantics change but knob name stays). 
 - block_ortho = 0 does NOT imply iter 141 = 0 (mean diversity allows per-token redundancy)
 
 Cost comparison: ~16× per layer over block_ortho (`max|cos|`), but absolute overhead at our compute scale is **~1-2% of step_avg** (block_ortho ~50M ops/layer × 12 layers + bwd → ~1.2G ops/step; iter 141 ~800M ops/layer × 12 layers + bwd → ~19.2G ops/step). Total step compute ~1.5T ops, so 18G extra ≈ 1.2% step-time overhead.
+
+**PRINCIPLED-TESTING PROTOCOL for iter 141** (per user directive 2026-05-04):
+
+1. **Single-knob change anchored to iter 133**: replace `block_ortho_aux_coef × max|cos(μ_i, μ_j)|` with `block_ortho_aux_coef × E_t[‖Y_t^T Y_t / scale_t − I/E‖²_F]`. Set block_ortho_aux_coef to iter 133's value 0.1 (DO NOT keep both — they're nested per Jensen). This isolates the form-swap effect from coefficient changes.
+2. **Strict-generalization argument**: at block_ortho_aux_coef=0, both forms contribute zero → iter 141 with coef=0 = iter 133 with coef=0 = baseline forward map. Any deviation at coef>0 is a directed move toward stronger (per-token) diversity vs current weaker (mean-only) diversity.
+3. **Smoke test before launch**: verify einsum `('btED,btFD->btEF')` produces finite values, no OOM at our memory budget (B=2, T=2048, E=16, D=768 → 4 MB per layer intermediate × 12 layers = 48 MB extra peak vram, well within budget).
+4. **Diagnostic instrumentation**: emit per-block `per_token_gram_loss`, log `attn_ortho` and `mlp_ortho` (existing) — verify these drop further than iter 133's 0.10/0.22 as iter 141 reg engages. Want attn_ortho/mlp_ortho < 0.05 as evidence the per-token form is working.
+5. **Rollback plan**: if val_bpb regresses > 0.03 at s400, kill early. Per-token form may be too aggressive — fallback to weaker target (e.g., scale_t = `Y_t.norm()²` instead of fixed `D/E`) or revert to iter 133 block_ortho.
+
+**Code changes required**:
+1. `Hyperparameters` field: `use_per_token_expert_gram: bool = False` (strict-gen at False)
+2. CLI flag plumbing
+3. `_collect_routing_losses` or `Block.forward`: compute `Y_t^T Y_t` per token, take Frobenius distance from `I/E*scale`, average over tokens
+4. CLAUDE.md §5 row + opg_doc.tex parameter table
+
+**Sequence**: iter 140 first (cheaper, more directly motivated by 138a evidence). Iter 141 second IF iter 140 succeeds (then test additivity) OR if iter 140 fails to drive sparsity (then test diversity-axis alternative).
+
+### Principled-testing summary for iter 140 + 141
+
+| Aspect | iter 140 (routing-output gram) | iter 141 (per-token expert-output gram) |
+|---|---|---|
+| Operand swap | `W^T W` → `(p^T p)/N` | `μ^T μ` → per-token `Y_t^T Y_t` |
+| Coefficient | iter 133 value (gram=0.3) | iter 133 value (block_ortho=0.1) |
+| Strict-gen at coef=0 | ✓ both forms = 0 | ✓ both forms = 0 |
+| Cost vs iter 133 | ~equivalent (matrix mul on smaller tensor) | +1-2% step_avg |
+| Mechanism | Sparsity-pull on routing distribution | Diversity-pull on expert outputs |
+| Subsumes | (no — different axis) | block_ortho (Jensen-nested) |
+| Independent test | YES — single knob change | YES — single knob change |
+| Sequence | First (cheaper, motivated by 138a) | Second (orthogonal axis) |
+| Combined test | iter 140+141 simultaneous = iter 142 (NEW), conditional on both individually beating iter 133 | — |
+| Rollback gate | val_bpb regression > 0.03 at s400 → kill | same |
 
 **Existing Tier 1 (re-eval under gram=0.3 baseline):**
 | Iter | Change |
