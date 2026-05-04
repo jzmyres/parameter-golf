@@ -384,6 +384,15 @@ class Hyperparameters:
     use_orthogonal_expansion_routing = False
     routing_gram_coef = 0.01
     routing_gram_warmup_delay_frac = 0.3
+    # iter 141 (NEW 2026-05-04): per-token expert-OUTPUT Gram penalty.
+    # Operand: stack of expert outputs Y_t = [y_1(x_t), ..., y_E(x_t)] ∈ ℝ^{E×D}.
+    # Penalty: E_t[‖(Y_t Y_t^T)/D − I/E‖²_F]. Pulls expert *computations* per
+    # input toward orthogonality (subsumes block_ortho via Jensen). Distinct
+    # from `routing_gram_coef` which operates on routing-distribution `(p^T p)/N`.
+    # Strict-gen at 0 (zero contribution) → recovers iter 133 forward map exactly.
+    expert_gram_coef = 0.0
+    expert_gram_warmup_delay_frac = 0.3
+    expert_gram_max_tokens = 64  # subsample tokens per block for cost control
     # iter 122 / H93 (2026-05-01): logit softcap (Gemma2-style).
     # `logits = softcap * tanh(logits / softcap)` bounds extreme logit values,
     # smoothing gradient spikes and reducing bf16 numerical issues. Applied
@@ -617,6 +626,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "entmax-blend-init-logit", "entmax-blend-warmup-delay-frac", "entmax-blend-lr",
     # iter 112 H84 — orthogonal-expansion routing (Gram-matrix penalty)
     "routing-gram-coef", "routing-gram-warmup-delay-frac",
+    # iter 141 — per-token expert-output Gram penalty
+    "expert-gram-coef", "expert-gram-warmup-delay-frac", "expert-gram-max-tokens",
     # iter 122 H93 — logit softcap (Gemma2-style)
     "logit-softcap",
     # iter 117b-3 — sparse MoE dispatch capacity factor
@@ -3244,7 +3255,9 @@ class Block(nn.Module):
         self._shared_gate_std: Tensor | float | None = None
         self._shared_gate_diag_step: int | None = None
 
-    def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256) -> tuple[Tensor, Tensor]:
+    def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256,
+                   compute_per_token_gram: bool = False
+                   ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         bsz, seqlen, dim = z_in.shape
         t = int(min(max(1, int(max_tokens)), seqlen))
         z_sub = z_in[:, :t]
@@ -3273,7 +3286,8 @@ class Block(nn.Module):
         gate = x_flat @ G.t()
         fc = x_flat @ Fm.t()
         h_mlp = F.silu(gate) * fc
-        mu_h2 = h_mlp.reshape(N, E2, R2).mean(dim=0).to(dtype=torch.float32)
+        h_mlp_per_expert = h_mlp.reshape(N, E2, R2)  # (N, E, R) — per-token, per-expert hidden
+        mu_h2 = h_mlp_per_expert.mean(dim=0).to(dtype=torch.float32)
         down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).transpose(1, 2)  # (E, R, D)
         mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
         mlp_ortho = mean_abs_offdiag_cosine(mu_mlp)
@@ -3288,7 +3302,32 @@ class Block(nn.Module):
         # Blend: 50% output-level ortho + 50% weight-level KV subspace ortho
         attn_ortho = 0.5 * attn_ortho + 0.5 * kv_subspace_ortho
 
-        return attn_ortho, mlp_ortho
+        # iter 141 (NEW 2026-05-04): per-token expert-OUTPUT Gram penalty.
+        # G_t = (Y_t Y_t^T) / D where Y_t ∈ ℝ^{E×D} stacks expert outputs at
+        # token t. Penalty = E_t[‖G_t − I/E‖²_F]. Pulls per-token expert
+        # computations toward orthogonality with bounded norm. Subsumes
+        # block_ortho via Jensen (E_t[G_t] mean → block_ortho is the lower-
+        # bound objective). Compute only when requested (gated on coef>0
+        # at the annealer, then propagated by GPT.forward).
+        attn_gram_pt: Tensor | None = None
+        mlp_gram_pt: Tensor | None = None
+        if compute_per_token_gram:
+            E_attn = attn_expert_out.shape[2]
+            target_attn = torch.eye(E_attn, device=attn_expert_out.device,
+                                     dtype=torch.float32) / float(E_attn)
+            Y_attn = attn_expert_out.float()  # (B, t, E, D)
+            G_attn = torch.einsum("bted,btfd->btef", Y_attn, Y_attn) / float(dim)
+            attn_gram_pt = (G_attn - target_attn).pow(2).sum(dim=(-2, -1)).mean()
+
+            target_mlp = torch.eye(E2, device=h_mlp.device, dtype=torch.float32) / float(E2)
+            # Per-token MLP expert outputs: (N, E, R) @ (E, R, D) → (N, E, D).
+            Y_mlp = torch.einsum("ner,erd->ned",
+                                  h_mlp_per_expert.float(),
+                                  down_T.float())  # (N, E, D)
+            G_mlp = torch.einsum("ned,nfd->nef", Y_mlp, Y_mlp) / float(dim)
+            mlp_gram_pt = (G_mlp - target_mlp).pow(2).sum(dim=(-2, -1)).mean()
+
+        return attn_ortho, mlp_ortho, attn_gram_pt, mlp_gram_pt
 
     def _route_pooled(self, u_proj: Tensor) -> tuple[Tensor, Tensor]:
         """Compute pooled routing weights for ROUTED experts only.
@@ -3769,6 +3808,9 @@ class GPT(nn.Module):
                  entmax_blend_warmup_delay_frac: float = 0.3,
                  routing_gram_coef: float = 0.0,
                  routing_gram_warmup_delay_frac: float = 0.3,
+                 expert_gram_coef: float = 0.0,
+                 expert_gram_warmup_delay_frac: float = 0.3,
+                 expert_gram_max_tokens: int = 64,
                  logit_softcap: float = 0.0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 1.0,
@@ -3805,6 +3847,14 @@ class GPT(nn.Module):
         # ‖G − I/E‖²_F. Annealed from 0 over warmup_delay_frac of training.
         self._routing_gram_coef_target = float(routing_gram_coef)
         self._routing_gram_warmup_delay_frac = float(routing_gram_warmup_delay_frac)
+        # iter 141 (NEW 2026-05-04): per-token expert-OUTPUT Gram penalty.
+        # E_t[‖(Y_t Y_t^T)/D − I/E‖²_F] over expert outputs Y_t ∈ ℝ^{E×D}.
+        # Subsumes block_ortho via Jensen. Strict-gen at coef=0 (no contribution).
+        self._expert_gram_coef_target = float(expert_gram_coef)
+        self._expert_gram_warmup_delay_frac = float(expert_gram_warmup_delay_frac)
+        self._expert_gram_max_tokens = int(expert_gram_max_tokens)
+        self._expert_gram_coef_scale = 1.0  # set per-step by annealer
+        self._expert_gram_loss: Tensor | None = None
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -4197,17 +4247,39 @@ class GPT(nn.Module):
         self._lyapunov_x0 = x0_refined.detach()
 
         if self.training:
-            if self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0:
-                max_tokens = int(getattr(self, "_block_ortho_aux_tokens_override", self.block_ortho_aux_tokens))
-                attn_o, mlp_o = self.shared_block.ortho_aux(z, x0_refined, max_tokens=max_tokens)
+            need_block_ortho = (
+                self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0
+            )
+            need_expert_gram = (
+                getattr(self, "_expert_gram_aux_enabled", False)
+                and self._expert_gram_coef_target > 0.0
+            )
+            if need_block_ortho or need_expert_gram:
+                if need_expert_gram:
+                    max_tokens_eg = int(getattr(self, "_expert_gram_max_tokens", 64))
+                else:
+                    max_tokens_eg = self.block_ortho_aux_tokens
+                max_tokens = int(getattr(
+                    self,
+                    "_block_ortho_aux_tokens_override",
+                    max(self.block_ortho_aux_tokens, max_tokens_eg),
+                ))
+                attn_o, mlp_o, attn_gram_pt, mlp_gram_pt = self.shared_block.ortho_aux(
+                    z, x0_refined,
+                    max_tokens=max_tokens,
+                    compute_per_token_gram=need_expert_gram,
+                )
                 # T-opt 15: defer .item() to log time — store GPU tensors only.
                 # Hot-path sync prohibition: no .item()/.cpu() in forward/backward.
                 self.shared_block.attn._out_ortho_cos_sim_t = attn_o.detach()
                 self.shared_block.mlp._out_ortho_cos_sim_t = mlp_o.detach()
-                thr = 0.20
-                attn_b = F.relu(attn_o - thr).pow(2)
-                mlp_b = F.relu(mlp_o - thr).pow(2)
-                self._block_ortho_aux_loss = 0.5 * (attn_b + mlp_b)
+                if need_block_ortho:
+                    thr = 0.20
+                    attn_b = F.relu(attn_o - thr).pow(2)
+                    mlp_b = F.relu(mlp_o - thr).pow(2)
+                    self._block_ortho_aux_loss = 0.5 * (attn_b + mlp_b)
+                if need_expert_gram and attn_gram_pt is not None and mlp_gram_pt is not None:
+                    self._expert_gram_loss = 0.5 * (attn_gram_pt + mlp_gram_pt)
 
         return z
 
@@ -4225,6 +4297,8 @@ class GPT(nn.Module):
         device: torch.device,
         block_ortho_aux: Tensor | None = None,
         eff_block_ortho_coef: float = 0.0,
+        expert_gram_loss: Tensor | None = None,
+        eff_expert_gram_coef: float = 0.0,
     ) -> tuple[Tensor, Tensor]:
         """Returns (bal_loss, router_reg_loss).
 
@@ -4291,6 +4365,10 @@ class GPT(nn.Module):
         router_reg_loss = self.router_health_coef * inner
         if block_ortho_aux is not None and eff_block_ortho_coef > 0.0:
             router_reg_loss = router_reg_loss + eff_block_ortho_coef * block_ortho_aux
+        # iter 141 (NEW 2026-05-04): per-token expert-output Gram penalty.
+        # Mirrors block_ortho coef-handling but on a different operand.
+        if expert_gram_loss is not None and eff_expert_gram_coef > 0.0:
+            router_reg_loss = router_reg_loss + eff_expert_gram_coef * expert_gram_loss
         return bal, router_reg_loss
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -4308,8 +4386,19 @@ class GPT(nn.Module):
         if self.training and self._block_ortho_aux_enabled and isinstance(self._block_ortho_aux_loss, torch.Tensor):
             block_ortho_aux = self._block_ortho_aux_loss.to(device=ntp_loss.device)
         eff_block_ortho_coef = float(self.block_ortho_aux_coef) * float(getattr(self, "_block_ortho_aux_coef_scale", 1.0))
+        # iter 141: per-token expert-output gram. Mirror block_ortho gating.
+        expert_gram_loss = torch.tensor(0.0, device=ntp_loss.device)
+        eff_expert_gram_coef = 0.0
+        if (self.training and getattr(self, "_expert_gram_aux_enabled", False)
+                and isinstance(self._expert_gram_loss, torch.Tensor)):
+            expert_gram_loss = self._expert_gram_loss.to(device=ntp_loss.device)
+            eff_expert_gram_coef = (
+                float(self._expert_gram_coef_target)
+                * float(getattr(self, "_expert_gram_coef_scale", 1.0))
+            )
         bal_loss, router_reg_loss = self._collect_routing_losses(
-            ntp_loss.device, block_ortho_aux, eff_block_ortho_coef
+            ntp_loss.device, block_ortho_aux, eff_block_ortho_coef,
+            expert_gram_loss, eff_expert_gram_coef,
         )
         self._ntp_loss_t = ntp_loss.detach()
         self._ctp_loss_t = ctp_loss.detach()
@@ -5049,6 +5138,9 @@ def main() -> None:
         entmax_blend_warmup_delay_frac=float(args.entmax_blend_warmup_delay_frac),
         routing_gram_coef=float(args.routing_gram_coef) if bool(args.use_orthogonal_expansion_routing) else 0.0,
         routing_gram_warmup_delay_frac=float(args.routing_gram_warmup_delay_frac),
+        expert_gram_coef=float(args.expert_gram_coef),
+        expert_gram_warmup_delay_frac=float(args.expert_gram_warmup_delay_frac),
+        expert_gram_max_tokens=int(args.expert_gram_max_tokens),
         logit_softcap=float(args.logit_softcap),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
@@ -5468,6 +5560,18 @@ def main() -> None:
             else:
                 gram_scale = min(max((time_frac - gram_delay) / max(1.0 - gram_delay, 1e-8), 0.0), 1.0)
             sb.router.gram_coef = gram_target * gram_scale
+        # iter 141: anneal per-token expert-output Gram penalty. Same shape
+        # as routing_gram. coef stored on GPT (model-level), not on router.
+        eg_target = float(getattr(base_model, "_expert_gram_coef_target", 0.0))
+        eg_delay = float(getattr(base_model, "_expert_gram_warmup_delay_frac", 0.3))
+        if eg_target > 0.0:
+            if time_frac < eg_delay:
+                eg_scale = 0.0
+            else:
+                eg_scale = min(max((time_frac - eg_delay) / max(1.0 - eg_delay, 1e-8), 0.0), 1.0)
+            base_model._expert_gram_coef_scale = eg_scale
+        else:
+            base_model._expert_gram_coef_scale = 0.0
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
@@ -5507,6 +5611,15 @@ def main() -> None:
                 base_model._block_ortho_aux_tokens_override = int(args.block_ortho_aux_tokens)
                 if args.block_ortho_aux_coef > 0.0 and micro_step == grad_accum_steps - 1:
                     base_model._block_ortho_aux_enabled = bool(
+                        args.block_ortho_aux_every > 0 and (next_step % int(args.block_ortho_aux_every) == 0))
+                # iter 141: per-token expert-output gram. Same cadence as
+                # block_ortho_aux (every N steps, last micro-step only) since
+                # the per-token einsum is the dominant cost; hot-path cost
+                # stays flat when block_ortho_aux_every aligns.
+                base_model._expert_gram_aux_enabled = False
+                base_model._expert_gram_loss = None
+                if args.expert_gram_coef > 0.0 and micro_step == grad_accum_steps - 1:
+                    base_model._expert_gram_aux_enabled = bool(
                         args.block_ortho_aux_every > 0 and (next_step % int(args.block_ortho_aux_every) == 0))
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
