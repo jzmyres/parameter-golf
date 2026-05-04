@@ -3434,6 +3434,35 @@ Coefficient: `routing_gram_coef` reused (semantics change but knob name stays). 
 
 **Post-condition**: iter 140 launches AFTER the 5-row ablation matrix is complete.
 
+### Iter 141 (NEW 2026-05-04 user directive): Per-token expert-output gram
+
+**Premise**: An orthogonal complement to iter 140's output-space ROUTING gram. iter 140 constrains *which* experts each token picks; iter 141 constrains *what* each expert computes per input. Both can coexist.
+
+**Math**:
+- For each token `t`, stack expert outputs `Y_t = [y_1(x_t), ..., y_E(x_t)] ∈ ℝ^{D × E}`
+- Per-token Gram: `G_t = Y_t^T Y_t ∈ ℝ^{E × E}` with `G_t[i,j] = y_i(x_t)^T y_j(x_t)`
+- Penalty: `L = (1/N) Σ_t ‖G_t / scale_t − target‖²_F`
+- `target = I × c` (orthogonal expert outputs per token, with norm constraint `c`)
+- Or scale-invariant variant: divide each `G_t` by its trace before comparing to `I/E`
+
+**What it constrains**: per-token diversity of expert COMPUTATIONS. Experts must produce different outputs on each input, not just different mean outputs (which `block_ortho` already captures).
+
+**Cost**: O(B·T·E²·D) per layer per step ≈ 800M ops/layer/step at our shapes. Estimated **5–10% throughput overhead** (12 layers × forward+backward). Memory: `(B, T, E, E)` intermediate ≈ 4 MB.
+
+**Comparison to existing regs**:
+| | Operand space | Drives | Cost |
+|---|---|---|---|
+| weight-gram (iter 133) | weights `W^T W` | Routing weight orthogonality | cheap (E·D · E) |
+| **iter 140 routing-gram** | routing dist `(p^T p)/N` | One-hot routing (sparsity+balance) | cheapest (N·E²) |
+| **iter 141 per-token expert-output gram** | `Y_t^T Y_t` per token | Expert computation diversity per input | moderate (B·T·E²·D) |
+| block_ortho | `μ^T μ` of expert mean outputs | Mean-output orthogonality | cheap (E·D + E²) |
+
+**Pre-condition**: iter 140 results in. iter 141 is the FOLLOW-UP if iter 140 succeeds and more sparsity/specialization is desired, OR if iter 140 fails to drive sparsity (different mechanism may help via diversity axis instead).
+
+**Verdict path**: val_bpb int6 ≤ baseline + 0.03 AND step_avg ≤ baseline × 1.10 (allowing 10% throughput overhead) AND attn_ortho/mlp_ortho < 0.10 (expert diversification verified) → promote.
+
+**Risk**: over-constraining expert computations may hurt val_bpb (artificial diversity beats natural redundancy when redundancy is informative). If val_bpb regresses > 0.03, the per-token form is too aggressive — could try weaker `c` (lower norm target) or move to averaged form (= block_ortho with Frobenius instead of max cos).
+
 **Existing Tier 1 (re-eval under gram=0.3 baseline):**
 | Iter | Change |
 |---|---|
