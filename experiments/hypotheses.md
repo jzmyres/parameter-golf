@@ -3463,6 +3463,12 @@ Coefficient: `routing_gram_coef` reused (semantics change but knob name stays). 
 
 **Risk**: over-constraining expert computations may hurt val_bpb (artificial diversity beats natural redundancy when redundancy is informative). If val_bpb regresses > 0.03, the per-token form is too aggressive — could try weaker `c` (lower norm target) or move to averaged form (= block_ortho with Frobenius instead of max cos).
 
+**iter 141 SUBSUMES block_ortho** — by Jensen's inequality, `‖E_t[Y_t^T Y_t] − target‖²_F ≤ E_t[‖Y_t^T Y_t − target‖²_F]`. The block_ortho objective is a lower-bound (weaker version) of iter 141. Adopting iter 141 → DROP block_ortho_aux_coef (set to 0 simultaneously). The constraint sets are nested:
+- iter 141 = 0 implies block_ortho = 0 (per-token diversity → mean diversity)
+- block_ortho = 0 does NOT imply iter 141 = 0 (mean diversity allows per-token redundancy)
+
+Cost comparison: ~16× per layer over block_ortho (`max|cos|`), but absolute overhead at our compute scale is **~1-2% of step_avg** (block_ortho ~50M ops/layer × 12 layers + bwd → ~1.2G ops/step; iter 141 ~800M ops/layer × 12 layers + bwd → ~19.2G ops/step). Total step compute ~1.5T ops, so 18G extra ≈ 1.2% step-time overhead.
+
 **Existing Tier 1 (re-eval under gram=0.3 baseline):**
 | Iter | Change |
 |---|---|
