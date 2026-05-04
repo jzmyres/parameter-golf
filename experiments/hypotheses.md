@@ -3385,6 +3385,20 @@ Premise: the 4 routing regs in iter 133 have wildly different scales (gram=0.3, 
 
 **Verdict path**: val_bpb int6 ≤ baseline + 0.03 AND step_avg ≤ baseline × 1.30 (allowing for K-doubling cost) → promote. If step_avg ratio > 1.30 OR val_bpb regresses > 0.03 → revert.
 
+### Tier 1.A Ablation Matrix (in progress)
+
+Anchor: iter 133, val_bpb int6 K=16 = 1.4930, step_avg = 22.7s, pertoken_ent_s1000 = 2.7183, eff_experts = 15.16.
+
+| Iter | val_bpb K=16 | Δ vs 133 | pertoken_ent s1000 | eff_experts | attn_ortho | mlp_ortho | attn_cv | mlp_cv | pool_cv | step_avg | artifact_bytes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **138** unified (all=0.1) | **1.5161** | **+0.0231** | 2.4560 | 11.66 | 0.1318 | 0.2158 | 0.6026 | 0.1231 | 0.4349 | 22.62s | 7,674,907 |
+| 138a (drop gram) | — | — | — | — | — | — | — | — | — | — | — |
+| 138b (drop cv) | — | — | — | — | — | — | — | — | — | — | — |
+| 138c (drop entropy) | — | — | — | — | — | — | — | — | — | — | — |
+| 138d (drop block_ortho) | — | — | — | — | — | — | — | — | — | — | — |
+
+**iter 138 observation**: unified-at-0.1 underperforms iter 133 (+0.023 behind) — coefficient unification weakened the dominant gram (0.3→0.1) and CV (1.0→0.1) without proportional sparsity-pull boost. Best K=24 at 1.5134 still behind baseline. pertoken_entropy descended from iter 133's 2.7183 to 2.4560 (= 13.6% sparser per token, eff_experts 15.16→11.66) but val_bpb cost was higher than the routing improvement. The val_bpb regression is the price of anti-uniform-pull weakening; ablations 138a-d will reveal whether dropping any one of the 4 regs *recovers* val_bpb (= that reg was net-harmful) or *worsens* it further (= that reg was net-helpful).
+
 **Existing Tier 1 (re-eval under gram=0.3 baseline):**
 | Iter | Change |
 |---|---|
