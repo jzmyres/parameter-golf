@@ -3399,6 +3399,41 @@ Anchor: iter 133, val_bpb int6 K=16 = 1.4930, step_avg = 22.7s, pertoken_ent_s10
 
 **iter 138 observation**: unified-at-0.1 underperforms iter 133 (+0.023 behind) — coefficient unification weakened the dominant gram (0.3→0.1) and CV (1.0→0.1) without proportional sparsity-pull boost. Best K=24 at 1.5134 still behind baseline. pertoken_entropy descended from iter 133's 2.7183 to 2.4560 (= 13.6% sparser per token, eff_experts 15.16→11.66) but val_bpb cost was higher than the routing improvement. The val_bpb regression is the price of anti-uniform-pull weakening; ablations 138a-d will reveal whether dropping any one of the 4 regs *recovers* val_bpb (= that reg was net-harmful) or *worsens* it further (= that reg was net-helpful).
 
+**iter 138a early observation (s200)**: dropping gram recovers val_bpb to **1.9810** = exactly iter 133's s200 value. iter 138 (unified, gram=0.1) was 1.9916 (+0.011 vs iter 133). The −0.011 val_bpb gap of iter 138 is attributable to weight-space gram. This confirms the architectural critique (gram-on-weights operates in the wrong space for routing-distribution control) and motivates iter 140.
+
+### Iter 140 (NEW 2026-05-04 user directive): Output-space gram dual
+
+**Premise**: iter 138a empirically shows weight-space gram costs val_bpb. The principled fix is to swap to **output-space gram** that operates on the routing distribution `p[t,e]` directly (instead of the routing-weight matrix `W`).
+
+**Math**:
+- Old (weight-space): `L_gram = ‖W^T W − I/E‖²_F` where `W` is the routing-linear weight matrix `(D, E)`
+- New (output-space): `L_gram_out = ‖(p^T p) / N − I/E‖²_F` where `p = softmax(scores) × sigmoid(gate)` is the actual routing output `(N, E)` (N = B·T flattened)
+
+**Direction reversal**: Both forms target `I/E` as the Gram, but in different spaces:
+- Weight-space `I/E` target → orthogonal W columns with norm 1/E. Under anisotropic inputs (typical LM), produces NEAR-UNIFORM routing (uniform-pull).
+- Output-space `I/E` target → routing distribution Gram = `(1/E) I`. Achieved exactly by ONE-HOT balanced routing (each token picks one expert, balanced across experts). **Sparsity-pull AND load-balance simultaneously in one term.**
+
+**Implementation** (single function in `_collect_routing_losses`):
+```python
+p_flat = p.reshape(-1, E)                     # (N, E), N = B*T
+G_out = (p_flat.T @ p_flat) / p_flat.size(0)  # (E, E)
+target = torch.eye(E, device=G_out.device) / E
+L_gram_out = ((G_out - target) ** 2).sum()    # Frobenius²
+```
+
+Coefficient: `routing_gram_coef` reused (semantics change but knob name stays). `routing_gram_warmup_delay_frac` reused.
+
+**Expected effect on iter 138 if rerun with output-space gram (predicted)**:
+- pertoken_entropy s1000: ~1.5-2.0 (vs current 2.456) → eff_experts ~4-7 → kernel skip predicate fires
+- val_bpb: at minimum recovers iter 133 baseline (1.4930); plausibly improves due to sparsity benefit
+- Throughput: kernel ROI in the 5–7× regime → step_avg < 22.7s
+
+**Strict-generalization argument**: at `routing_gram_coef = 0`, both forms are equivalent (zero contribution). Any deviation comes from non-zero coef in different directions — output-space points the way we want; weight-space pointed the wrong way.
+
+**Pre-condition**: complete iter 138 ablation series (138a/b/c/d) first to confirm the marginal contribution analysis. If 138a shows largest val_bpb improvement (= gram drop is best), iter 140 (output-gram) is the principled rescue. If a different reg shows larger marginal contribution, may need to reconsider.
+
+**Post-condition**: iter 140 launches AFTER the 5-row ablation matrix is complete.
+
 **Existing Tier 1 (re-eval under gram=0.3 baseline):**
 | Iter | Change |
 |---|---|
