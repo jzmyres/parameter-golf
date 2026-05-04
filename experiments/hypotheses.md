@@ -3375,6 +3375,16 @@ Premise: the 4 routing regs in iter 133 have wildly different scales (gram=0.3, 
 | 102b | sparsemax_anneal router (closed-form) | routing-fn change |
 | 105 | α-jitter {1.0, 1.5, 2.0} per-step | stochastic α |
 
+**Conditional follow-up — iter 142 (NEW 2026-05-03 user directive):**
+
+| Iter | Change | Pre-condition |
+|---|---|---|
+| **142** | `deq_k_jitter_set = (32, 48)` on top of sparsity-effective config | **Pre-condition**: pertoken_entropy at s1000 ≤ ~2.0 (= effective_experts ≤ ~7.4 = "desirable sparsity"). Run only after some iter (138 series, 1.B, or post-sparsity) reaches this threshold. |
+
+**Rationale**: iter 131 retry at K=(32,48) NOT-PROMOTED because routing was DENSE (eff_experts ≈ 15) — deeper FP cost wasn't amortized. The iter 131 retry data point shows that deeper FP under dense routing costs +62.6% wallclock without val_bpb gain. **But**: under sparse routing (eff_experts ≤ 7), the Triton kernel skip predicate fires more often → kernel speedup partially compensates for the K-doubling cost. AND deeper FP iteration may give cleaner fixed-point convergence when combined with the sharper specialized routing of a sparsity-effective regime. This iter tests the synergy: sparsity unlocks kernel ROI, then deeper K can ride on the recovered throughput.
+
+**Verdict path**: val_bpb int6 ≤ baseline + 0.03 AND step_avg ≤ baseline × 1.30 (allowing for K-doubling cost) → promote. If step_avg ratio > 1.30 OR val_bpb regresses > 0.03 → revert.
+
 **Existing Tier 1 (re-eval under gram=0.3 baseline):**
 | Iter | Change |
 |---|---|
