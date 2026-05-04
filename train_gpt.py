@@ -1627,23 +1627,42 @@ if _TRITON_OK:
         grad_z = s * (g - c)
         tl.store(grad_z_ptr + row_off, grad_z)
 
+    def _next_pow2(n: int) -> int:
+        return 1 if n <= 1 else 1 << (n - 1).bit_length()
+
     @torch.library.custom_op("opg::entmax_1p5_triton", mutates_args=())
     def _entmax_1p5_triton_op(z: torch.Tensor) -> torch.Tensor:
-        """Triton-fused entmax-1.5 forward. Input shape (..., E) with E a power
-        of 2 small constant (E=16 in our routing pool). Returns (..., E) of
-        weights summing to ≤1 (with exact zeros outside support).
+        """Triton-fused entmax-1.5 forward. Input shape (..., E). Pads E to the
+        next power of 2 with -inf so non-power-of-2 vocabularies (e.g. E=30 for
+        attn+mlp pooled router with num_routed=15 each) work too — entmax of -inf
+        is 0, so padding doesn't bias the support. Returns (..., E) original
+        shape, weights summing to ≤1 (with exact zeros outside support).
+        Iter 117b-2-fix (2026-05-04): pad E=30→32 (was raising ValueError).
         """
         orig_shape = z.shape
         E = orig_shape[-1]
-        if E & (E - 1) != 0:
-            raise ValueError(
-                f"entmax_1p5_triton requires E to be a power of 2, got {E}")
+        E_pad = _next_pow2(E) if E > 0 else 1
         z32 = z.detach().to(torch.float32).contiguous().view(-1, E)
-        w_flat = torch.empty_like(z32)
         B = z32.shape[0]
         if B == 0:
-            return w_flat.view(orig_shape).to(z.dtype)
-        _entmax_1p5_triton_fwd_kernel[(B,)](z32, w_flat, eps=_ENTMAX_TRITON_EPS, E_BLOCK=E)
+            w_out = torch.empty_like(z32)
+            return w_out.view(orig_shape).to(z.dtype)
+        if E_pad != E:
+            # Pad with -inf along last dim; entmax(-inf) = 0.
+            pad_cols = E_pad - E
+            pad_buf = torch.full((B, pad_cols), float("-inf"),
+                                  dtype=torch.float32, device=z32.device)
+            z32_pad = torch.cat([z32, pad_buf], dim=1)
+            w_pad = torch.empty_like(z32_pad)
+            _entmax_1p5_triton_fwd_kernel[(B,)](z32_pad, w_pad,
+                                                 eps=_ENTMAX_TRITON_EPS,
+                                                 E_BLOCK=E_pad)
+            w_flat = w_pad[:, :E].contiguous()
+        else:
+            w_flat = torch.empty_like(z32)
+            _entmax_1p5_triton_fwd_kernel[(B,)](z32, w_flat,
+                                                 eps=_ENTMAX_TRITON_EPS,
+                                                 E_BLOCK=E)
         return w_flat.view(orig_shape).to(z.dtype)
 
     @_entmax_1p5_triton_op.register_fake
@@ -1657,14 +1676,28 @@ if _TRITON_OK:
         (w,) = ctx.saved_tensors
         orig_shape = w.shape
         E = orig_shape[-1]
+        E_pad = _next_pow2(E) if E > 0 else 1
         w32 = w.detach().to(torch.float32).contiguous().view(-1, E)
         g32 = grad_w.detach().to(torch.float32).contiguous().view(-1, E)
-        grad_z = torch.empty_like(w32)
         B = w32.shape[0]
         if B == 0:
+            grad_z = torch.empty_like(w32)
             return grad_z.view(orig_shape).to(grad_w.dtype)
-        _entmax_1p5_triton_bwd_kernel[(B,)](
-            w32, g32, grad_z, eps=_ENTMAX_TRITON_EPS, E_BLOCK=E)
+        if E_pad != E:
+            # Pad both w and grad with zeros — outside-support contributes nothing.
+            pad_cols = E_pad - E
+            zeros = torch.zeros((B, pad_cols), dtype=torch.float32, device=w32.device)
+            w_pad = torch.cat([w32, zeros], dim=1)
+            g_pad = torch.cat([g32, zeros], dim=1)
+            grad_z_pad = torch.empty_like(w_pad)
+            _entmax_1p5_triton_bwd_kernel[(B,)](
+                w_pad, g_pad, grad_z_pad,
+                eps=_ENTMAX_TRITON_EPS, E_BLOCK=E_pad)
+            grad_z = grad_z_pad[:, :E].contiguous()
+        else:
+            grad_z = torch.empty_like(w32)
+            _entmax_1p5_triton_bwd_kernel[(B,)](
+                w32, g32, grad_z, eps=_ENTMAX_TRITON_EPS, E_BLOCK=E)
         return grad_z.view(orig_shape).to(grad_w.dtype)
 
     _entmax_1p5_triton_op.register_autograd(
