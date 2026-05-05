@@ -185,9 +185,6 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | router_entropy_warmup_delay_frac | 0.3 (linear ramp 0→target after 30 % of wallclock; cold-start trap mitigation per `feedback_anneal_sparsity_coefs.md`) |
 | use_entmax_routing | False (CLI-enable. When True: `sigmoid(blend) * softmax + (1−sigmoid(blend)) * entmax_1p5` with learnable scalar `blend_logit`. Strict-gen at `entmax_blend_init_logit=+5`. H87.) |
 | entmax_blend_init_logit | 5.0 (sigmoid(5) ≈ 0.9933 ⇒ ≈ pure softmax at init; CLI override `--entmax-blend-init-logit=…`) |
-| use_orthogonal_expansion_routing | False (CLI-enable. Adds Gram-matrix penalty `λ · ‖G − I/E‖²_F` over the routing-OUTPUT distribution `p`. Strict-gen at `routing_gram_coef=0`. H84.) |
-| routing_gram_coef | 0.01 (effective when `use_orthogonal_expansion_routing=True`; annealed 0 → target). Operand: routing-distribution OUTPUT `(p_flat^T p_flat) / N` with target `I/E` — pulls toward one-hot balanced (sparsity + balance), NOT toward orthogonal weight columns. |
-| routing_gram_warmup_delay_frac | 0.3 (same shape as `router_entropy_warmup_delay_frac`) |
 | expert_gram_coef | 0.0 (CLI-enable. iter 141 NEW 2026-05-04. Per-token expert-OUTPUT Gram penalty: `E_t[‖(Y_t Y_t^T)/D − I/E‖²_F]` over expert outputs `Y_t ∈ ℝ^{E×D}`. Subsumes block_ortho via Jensen. Strict-gen at 0 → exact recovery of iter 133 forward map. Piggybacks `block_ortho_aux_every` cadence.) |
 | expert_gram_warmup_delay_frac | 0.3 |
 | expert_gram_max_tokens | 64 |
