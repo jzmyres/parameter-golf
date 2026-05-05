@@ -3732,3 +3732,85 @@ nonlinear contraction.
 **Next:** iter-142a turns on `--expert-gram-coef=0.1` with default
 frobenius. iter-142b same with `--expert-diversity-kind=cosine`. Both
 build on this verified refactor commit.
+
+---
+
+### iter 143 — K_bwd 3 → 4 (TBPTT depth bump under iter-142-refactor baseline)
+
+**Claim.** Bumping TBPTT depth from K_bwd=3 to K_bwd=4 captures one more
+Neumann-series term in the implicit gradient `dz*/dx0` and the implicit
+parameter gradients, and stays within the bf16 reversibility budget.
+Expected: tighter `tbptt_recon_loss` headroom, marginally better embedding
++ parameter gradient quality, ≤ +33% backward cost (one extra grad-iter
+of `f_theta` forward + autograd.grad call).
+
+**Motivation.** Iter 95 promoted K_bwd 2→3 based on `grad_norm = 0.07`
+(well below `grad_clip=1.0`) — clear gradient-magnitude headroom. Under
+the iter-142-refactor regularization regime the same headroom analysis
+applies; if grad_norm has stayed comparably low, K_bwd=4 is the natural
+next step. bf16 budget for the gradient path: `(1/Ā)^4 × ε_bf16 ≈
+1.43^4 × 7e-3 ≈ 0.03` worst-case relative drift, ~3 orders below the
+0.1 ceiling and only marginally tighter than K_bwd=3 (0.02). Smoke at
+default config (CLAUDE.md §6.1, post-iter 142-batch) reports
+`tbptt_recon_loss ≈ 6e-7` at K_bwd=3 — comfortable headroom for the
+bump.
+
+**Test plan.** 100-step controlled comparison vs iter-142-refactor
+baseline (5026978). Single CLI override `--deq-bptt-k=4`. All other
+hyperparameters at default. Diagnostics: `tbptt_recon_loss` should
+remain at fp-precision floor; per-step `step_avg` should rise by ≤+33%
+(empirical measurement); val_bpb @ s100 expected to match or beat
+baseline (±0.05 noise band).
+
+**Status.** PROPOSED.
+
+**Rollback.** If `tbptt_recon_loss > 1e-3` at any point, or step_avg
+penalty > +50%, revert to K_bwd=3.
+
+---
+
+### iter 144 — IFT adjoint gradient (complement TBPTT for embedding signal)
+
+**Claim.** Adding an implicit-function-theorem (IFT) adjoint solve at the
+DEQ fixed point recovers the truncated embedding gradient that TBPTT
+zeros out (`z_init_grad = 0` under truncation, `train_gpt.py:3833`).
+The IFT solve is a Neumann fixed-point iteration at the converged FP
+state — not a trajectory reverse — so it sidesteps the bf16 reversibility
+budget that limits full-K reverse. Expected: cleaner embedding gradient,
+better val_bpb under fixed compute budget; ~2× backward cost when the
+adjoint converges in ≤5 iters.
+
+**Mechanism.** Replace `z_init_grad = torch.zeros_like(x0)` with the
+solution of `(I − ∂f/∂z|_z*)ᵀ · v = g` where:
+- `g = bar_y + bar_z` at the truncation boundary (current `z_init_grad`
+  signal that we throw away).
+- `v` is found by Neumann fixed-point: `v_{n+1} = (∂f/∂z|_z*)ᵀ v_n + g`,
+  iterated at the FIXED terminal state `z*` (= `z_terminal` saved on
+  forward) until `‖v_{n+1} − v_n‖ < tol`.
+- Each adjoint iter = one VJP through `f_theta(z*, x0, b_bar)` — same
+  cost as one TBPTT grad-iter, but the state is fixed so no trajectory
+  reverse needed and the bf16-budget constraint that caps full-K reverse
+  does NOT apply here.
+- Use converged `v` as the new `z_init_grad`. Trajectory grad-iters
+  (existing K_bwd=3 loop) keep handling parameter grads — this only
+  fixes the embedding/input grad.
+
+**Cost.** ~3–5 adjoint iters typical for well-conditioned FPs. Net
+backward cost: K_bwd + adjoint_iters ≈ 6–8 grad-iters ≈ ~2× current.
+Memory: O(1) extra (state-shape `v` and `g`). Runs in bf16 like the
+rest of training.
+
+**Test plan.** Layered against iter 143 (or current iter-142-refactor
+baseline if 143 doesn't promote). 100-step comparison; primary signal
+is val_bpb improvement at equal step count. Strict-generalization claim:
+`adjoint_max_iters=0` recovers current behavior exactly (z_init_grad
+stays zero). Default `adjoint_max_iters=5`, `tol=1e-3`. CLI knob
+`--ift-adjoint-max-iters=N` for sweeps.
+
+**Risks.** (a) Poorly conditioned FP → adjoint diverges or fails to
+converge in budget — guard with `tol` and `max_iters`, fall back to zero
+on non-convergence. (b) Throughput penalty if adjoint averages >5 iters —
+log per-step adjoint iter count; if average >7, deprioritize.
+
+**Status.** PROPOSED. References: Bai et al. "Deep Equilibrium Models"
+(NeurIPS 2019) §3.2 "Backward Pass via Implicit Differentiation".

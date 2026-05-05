@@ -33,6 +33,7 @@
 - `feedback_cumulative_vs_instantaneous_metrics.md` — cumulative averages lie about steady state; compute per-step deltas
 - `feedback_routing_metric_axes.md` — load-balance ≠ sparsity; CV is balance, pertoken_entropy is sparsity
 - `feedback_grad_enabled_vs_requires_grad.md` — dispatch on `is_grad_enabled() AND requires_grad`
+- `feedback_bf16_training_default.md` — bf16 always for training-path autocast; never fp32/fp64
 - `feedback_profile_before_throughput.md` — chrome trace, not log fragments
 - `feedback_decouple_regularizers.md` — antagonistic regs: one as metric
 - `feedback_anneal_sparsity_coefs.md` — sparsity coefs anneal from 0

@@ -12,6 +12,7 @@ Hard requirements:
 5. Expert balance CV decreasing (routing converging to balanced usage)
 6. Expert entropy reasonable (not collapsed to single expert)
 """
+import os
 import numpy as np
 import torch
 import sys
@@ -99,6 +100,16 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         use_ctp=args.use_ctp,
         deq_bptt_k=args.deq_bptt_k,
     ).cuda()
+
+    # K_forward defaults to model.num_layers (12). Override via `SMOKE_K=N
+    # python smoke_test.py` to sweep K (e.g. K=16/24/32 to probe the bf16
+    # reversibility budget for x0_recon_loss). Smaller K stays well within
+    # bf16 headroom; >24 saturates the no_grad x0 reverse trajectory.
+    smoke_k = os.environ.get("SMOKE_K")
+    if smoke_k is not None:
+        model._deq_k_override = int(smoke_k)
+    print(f"smoke config: K_forward={int(getattr(model, '_deq_k_override', 0)) or model.num_layers} "
+          f"K_bwd={args.deq_bptt_k}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     losses, ntp_losses, ctp_losses = [], [], []
