@@ -51,8 +51,14 @@ class TestOptimizerCoverage(unittest.TestCase):
         )
         args = types.SimpleNamespace(tie_embeddings=True, tied_embed_lr=0.03, embed_lr=0.6)
 
-        tok_groups, matrix_params, scalar_params, parcae_params = _build_optimizer_param_lists(model, args)
-        grouped = _flatten_param_groups(tok_groups) + matrix_params + scalar_params + parcae_params
+        groups = _build_optimizer_param_lists(model, args)
+        grouped = (
+            _flatten_param_groups(groups.tok)
+            + groups.matrix
+            + groups.scalar
+            + groups.parcae
+            + groups.entmax_blend
+        )
         grouped_ids = [id(p) for p in grouped if p.requires_grad]
 
         self.assertEqual(len(grouped_ids), len(set(grouped_ids)))

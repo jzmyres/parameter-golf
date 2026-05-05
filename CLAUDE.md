@@ -60,7 +60,7 @@ OpenAI Parameter Golf challenge (March 18 – April 30, 2026; $1M OpenAI compute
 
 **Hard constraints** (enforced):
 - Artifact ≤ 16,000,000 bytes (code + compressed model).
-- Submission training ≤ 600 s on 8×H100 SXM (must opt in via `--max-wallclock-seconds=600` — never the default).
+- Submission training ≤ 600 s on 8×H100 SXM (`--max-training-seconds=600`; alias `--max-wallclock-seconds` still resolves for one cycle). Timer reserves `eval_reservation_seconds` (default 120 s) for post-loop int6 + K-sweep + sliding val.
 - FineWeb validation set; SentencePiece BPE tokenizer, vocab = 1024.
 
 **Baseline pointer.** This repo's working baseline (true int6, dev hardware) is tracked in `experiments/hypotheses.md` (latest promoted iter row). Update that line in the same commit that promotes a new baseline.
@@ -107,7 +107,7 @@ torchrun --standalone --nproc_per_node=gpu train_gpt.py
 
 **Submission run (8× H100 SXM, 600 s competition cap)** — must opt in:
 ```bash
-torchrun --standalone --nproc_per_node=8 train_gpt.py --max-wallclock-seconds=600
+torchrun --standalone --nproc_per_node=8 train_gpt.py --max-training-seconds=600
 ```
 
 **Explicit GPU count** (if `gpu` alias is unsupported):

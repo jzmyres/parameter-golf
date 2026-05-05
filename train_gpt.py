@@ -25,6 +25,7 @@ import uuid
 import warnings
 import zlib
 from collections import Counter, deque
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -200,12 +201,16 @@ class Hyperparameters:
     train_log_every = 10  # log every 10 steps (~85s at 8.5s/step) for better progress visibility
     auto_plot_on_val = True
 
-    iterations = 1000  # default training budget: step-count-governed, DDP with all GPUs; submission runs override via --max-wallclock-seconds=600
+    iterations = 1000  # default training budget: step-count-governed, DDP with all GPUs; submission runs override via --max-training-seconds=600
     warmdown_frac = 0.72  # fraction of total steps for warmdown
-    warmup_steps = 0
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    max_wallclock_seconds = 0  # 0 = disabled; step-count governs default runs. Submission runs MUST pass --max-wallclock-seconds=600 (8xH100 competition hard cap).
+    # Training timer is training-only (excludes post-loop val / quantization /
+    # K-sweep). Process wallclock = max_training_seconds + eval_reservation_seconds.
+    max_training_seconds = 0
+    max_wallclock_seconds = 0  # deprecated one-cycle alias for max_training_seconds
+    eval_reservation_seconds = 120
+    final_full_validation = False
     # Iter 98b (2026-04-28) NOT PROMOTED ✗ (closed 2026-04-29). The
     # micro-batch-halving rescue successfully fit D=1024 (peak VRAM 23 GiB
     # vs iter 98's 47 GiB OOM), but val_bpb int6 = 1.5018 vs iter 100b
@@ -616,9 +621,10 @@ class Hyperparameters:
 # CLAUDE.md §5 row in the same commit (EXPERIENCE.md#hyperparameter-fanout).
 _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "data-path", "tokenizer-path", "run-id", "seed", "iterations",
-    "warmup-steps", "train-batch-tokens", "train-seq-len",
+    "train-batch-tokens", "train-seq-len",
     "val-batch-size", "val-loss-every", "train-log-every",
-    "max-wallclock-seconds", "grad-accum-multiplier",
+    "max-training-seconds", "max-wallclock-seconds",  # max-wallclock-seconds is a deprecated alias
+    "grad-accum-multiplier",
     "num-heads", "num-kv-heads",
     "attn-balance-mult", "mlp-balance-mult",
     "mos-balance-mult", "bal-loss-coef", "router-health-coef",
@@ -642,6 +648,9 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     # iter 117b-3 — sparse MoE dispatch capacity factor
     "sparse-dispatch-capacity-factor",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
+    "denoising-coef", "denoising-noise-std",
+    "lyapunov-coef", "lyapunov-gamma", "lyapunov-warmup-frac",
+    "eval-reservation-seconds",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
     "nsa-compress-block-size", "nsa-compress-block-sliding-stride",
@@ -668,6 +677,8 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "use-chained-routing", "use-orthogonal-expansion-routing",
         "use-unified-routed-down",  # iter 118a Phase A3
         "use-smear-gate",  # iter 129 / H99
+        "use-parcae", "deq-beta-jitter",
+        "final-full-validation",
     ]:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
@@ -688,7 +699,9 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
                  "use_entmax_routing", "use_polar_express_ns",
                  "use_entmax_triton", "use_sparse_dispatch", "use_unified_routed_down",
                  "use_chained_routing", "use_orthogonal_expansion_routing",
-                 "use_smear_gate"}
+                 "use_smear_gate",
+                 "use_parcae", "deq_beta_jitter",
+                 "final_full_validation"}
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -1841,6 +1854,9 @@ class SoftDenseRouter(nn.Module):
         # AND global balance (the two axes that entropy alone could not
         # enforce together — H87b lesson).
         self.register_buffer("_gram_coef", torch.tensor(float(gram_coef), dtype=torch.float32), persistent=False)
+        # Python-attribute gate so dynamo constant-folds the gram branch when
+        # disabled. A tensor-coef check would force a GPU→host sync per FP iter.
+        self._gram_enabled: bool = bool(float(gram_coef) > 0.0)
         # iter 117 (H87): learnable blend between softmax (init ≈ 1.0) and
         # entmax-1.5 (sparse with exact zeros). NOT a buffer — this is a
         # learnable nn.Parameter that gradient drives. Init logit=+5 →
@@ -2113,33 +2129,27 @@ class SoftDenseRouter(nn.Module):
             # over a probability distribution (sum=1); softmax already does
             # this, but sigmoid gate makes raw `p` sum to ≤1, so renormalize
             # before entropy compute.
-            # Tensor-gated to avoid the per-step Python-float guard recompile
-            # (coderabbit Major #1). The buffer is updated in-place by the
-            # training loop's annealer; reading it as a tensor keeps dynamo
-            # from recompiling on every value change.
-            ec_t = self._entropy_coef
-            if bool((ec_t > 0.0).item()):  # one-time guard at trace, not per-step
-                p_norm = p.float() / p.float().sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                # H_pertoken = -Σ_e w(e|t) log w(e|t), averaged over tokens.
-                pertoken_ent = -(p_norm * (p_norm + 1e-8).log()).sum(dim=-1).mean()
-                self._pertoken_entropy_loss = ec_t.to(dtype=pertoken_ent.dtype) * pertoken_ent
-            else:
-                self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
+            # Always-compute entropy (E-dim sum + log per token) so a `.item()`
+            # gate doesn't sit inside the DEQ FP iter. Annealer updates
+            # `_entropy_coef` in-place; multiply by 0 is gradient-free.
+            p_f = p.float()
+            p_norm = p_f / p_f.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            # H_pertoken = -Σ_e w(e|t) log w(e|t), averaged over tokens.
+            pertoken_ent = -(p_norm * (p_norm + 1e-8).log()).sum(dim=-1).mean()
+            self._pertoken_entropy_loss = self._entropy_coef.to(dtype=pertoken_ent.dtype) * pertoken_ent
             # iter 112 / H84: Gram-matrix orthogonal-expansion penalty.
             # ||G - I/E||²_F where G = (1/N) W^T W on per-token routing weights.
             # See `experiments/components/archive/orthogonal_expansion_routing.py` (archived after iter 112 integration; design notes only).
             # Targets joint per-token sparsity AND global balance — the two
             # axes that entropy alone could not enforce together (H87b lesson).
-            # Same buffer-gated pattern as entropy reg.
-            gc_t = self._gram_coef
-            if bool((gc_t > 0.0).item()):
+            if self._gram_enabled:
                 E = p.shape[-1]
                 W = p.float().reshape(-1, E)
                 N = max(W.shape[0], 1)
                 G = (W.t() @ W) / N
                 target = torch.eye(E, device=W.device, dtype=W.dtype) / E
                 gram_penalty = (G - target).pow(2).sum()
-                self._gram_penalty_loss = gc_t.to(dtype=gram_penalty.dtype) * gram_penalty
+                self._gram_penalty_loss = self._gram_coef.to(dtype=gram_penalty.dtype) * gram_penalty
             else:
                 self._gram_penalty_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = mean_share.detach()
@@ -4604,9 +4614,18 @@ def _assert_optimizer_param_coverage(model: nn.Module,
         raise RuntimeError("Optimizer parameter coverage error: " + "; ".join(msg_parts))
 
 
-def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
-    list[dict[str, object]], list[nn.Parameter], list[nn.Parameter], list[nn.Parameter]
-]:
+@dataclass(frozen=True)
+class OptimizerParamLists:
+    """Named return for _build_optimizer_param_lists — eliminates positional
+    unpack drift between the producer, consumers, and tests."""
+    tok: list[dict[str, object]]
+    matrix: list[nn.Parameter]
+    scalar: list[nn.Parameter]
+    parcae: list[nn.Parameter]
+    entmax_blend: list[nn.Parameter]
+
+
+def _build_optimizer_param_lists(base_model: nn.Module, args) -> OptimizerParamLists:
     sb = _unwrap_compiled_module(base_model.shared_block)
     block_named_params = list(sb.named_parameters())
     # All ndim >= 2 block params (incl. router prototypes/weights) -> Muon;
@@ -4669,7 +4688,13 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> tuple[
         ("parcae", parcae_params),
         ("entmax_blend", entmax_blend_params),
     ])
-    return tok_params, matrix_params, scalar_params, parcae_params, entmax_blend_params
+    return OptimizerParamLists(
+        tok=tok_params,
+        matrix=matrix_params,
+        scalar=scalar_params,
+        parcae=parcae_params,
+        entmax_blend=entmax_blend_params,
+    )
 
 
 def _prescribe_failure_fix(failure: str) -> dict:
@@ -4923,6 +4948,52 @@ def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2, B_probe: int = 1) -> f
         return None
 
 
+def _resolve_training_seconds_alias(args, cli_overrides: dict[str, object]) -> None:
+    """Bridge --max-wallclock-seconds (deprecated) onto args.max_training_seconds.
+    Downstream timer logic reads only max_training_seconds after this."""
+    legacy = float(getattr(args, "max_wallclock_seconds", 0.0))
+    canonical = float(getattr(args, "max_training_seconds", 0.0))
+    saw_legacy = "max_wallclock_seconds" in cli_overrides
+    saw_canonical = "max_training_seconds" in cli_overrides
+    if saw_legacy and not saw_canonical:
+        # Defer the warning until log0 exists post-distributed-init.
+        args.max_training_seconds = legacy
+        args._max_wallclock_seconds_deprecated = True
+    elif saw_legacy and saw_canonical and legacy != canonical:
+        raise SystemExit(
+            f"--max-wallclock-seconds={legacy} (deprecated) and "
+            f"--max-training-seconds={canonical} disagree; pass only one."
+        )
+
+
+def _validate_hyperparameters(args) -> None:
+    """Fail-fast architecture/config validation — catches malformed combos
+    at startup rather than as opaque reshape errors deep in SDPA forward."""
+    md, nh, nkv = int(args.model_dim), int(args.num_heads), int(args.num_kv_heads)
+    if md % nh != 0:
+        raise SystemExit(f"model_dim ({md}) must be divisible by num_heads ({nh})")
+    if nh % nkv != 0:
+        raise SystemExit(f"num_heads ({nh}) must be divisible by num_kv_heads ({nkv}) for GQA")
+    if int(args.num_layers) <= 0:
+        raise SystemExit(f"num_layers ({args.num_layers}) must be positive")
+    nE, nS = int(args.num_experts), int(args.num_shared_experts)
+    if nE < 0:
+        raise SystemExit(f"num_experts ({nE}) must be non-negative")
+    if nS < 0:
+        raise SystemExit(f"num_shared_experts ({nS}) must be non-negative")
+    if nE + nS == 0:
+        raise SystemExit("at least one of (num_experts, num_shared_experts) must be > 0")
+    if int(args.train_seq_len) <= 0:
+        raise SystemExit(f"train_seq_len ({args.train_seq_len}) must be positive")
+    if int(args.train_batch_tokens) % int(args.train_seq_len) != 0:
+        raise SystemExit(
+            f"train_batch_tokens ({args.train_batch_tokens}) must be divisible "
+            f"by train_seq_len ({args.train_seq_len})"
+        )
+    if int(args.grad_accum_multiplier) <= 0:
+        raise SystemExit(f"grad_accum_multiplier ({args.grad_accum_multiplier}) must be positive")
+
+
 def main() -> None:
     global zeropower_via_newtonschulz5
 
@@ -4931,7 +5002,9 @@ def main() -> None:
     args = Hyperparameters()
     for k, v in cli_overrides.items():
         setattr(args, k, v)
-    if float(getattr(args, "max_wallclock_seconds", 0.0)) > 0.0 and "iterations" not in cli_overrides:
+    _resolve_training_seconds_alias(args, cli_overrides)
+    _validate_hyperparameters(args)
+    if float(getattr(args, "max_training_seconds", 0.0)) > 0.0 and "iterations" not in cli_overrides:
         args.iterations = int(1_000_000_000)
     # iter 121 PE-NS gate: apply chosen coefficient set BEFORE building model
     # (_ns5_2d / _ns5_batched read the module-level flag at forward time, but
@@ -5059,6 +5132,26 @@ def main() -> None:
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
+
+    if getattr(args, "_max_wallclock_seconds_deprecated", False):
+        log0(
+            f"deprecation_warning: --max-wallclock-seconds is now an alias for "
+            f"--max-training-seconds (timer measures training-only seconds, "
+            f"reserves {int(args.eval_reservation_seconds)}s for post-loop work). "
+            f"Update record commands to --max-training-seconds={int(args.max_training_seconds)}."
+        )
+
+    # train_batch_tokens divisibility depends on world_size, so it lives here
+    # rather than in _validate_hyperparameters which runs pre-distributed-init.
+    _T = int(args.train_seq_len)
+    _gam = int(getattr(args, "grad_accum_multiplier", 1))
+    _per_step_tokens = _T * world_size * _gam
+    if int(args.train_batch_tokens) % _per_step_tokens != 0:
+        raise SystemExit(
+            f"train_batch_tokens ({args.train_batch_tokens}) must be divisible by "
+            f"train_seq_len * world_size * grad_accum_multiplier "
+            f"({_T} * {world_size} * {_gam} = {_per_step_tokens})"
+        )
 
     def _best_effort_update_plots(reason: str) -> None:
         if not master_process or not bool(getattr(args, "auto_plot_on_val", False)):
@@ -5296,7 +5389,12 @@ def main() -> None:
     )
 
     # OPTIMIZER SETUP
-    tok_params, matrix_params, scalar_params, parcae_params, entmax_blend_params = _build_optimizer_param_lists(base_model, args)
+    _opt_groups = _build_optimizer_param_lists(base_model, args)
+    tok_params = _opt_groups.tok
+    matrix_params = _opt_groups.matrix
+    scalar_params = _opt_groups.scalar
+    parcae_params = _opt_groups.parcae
+    entmax_blend_params = _opt_groups.entmax_blend
 
     optimizer_tok = torch.optim.AdamW(tok_params, betas=(args.beta1, args.beta2),
                                        eps=args.adam_eps, weight_decay=args.weight_decay, fused=True)
@@ -5335,17 +5433,26 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    # Training-only cap. Subtract eval_reservation_seconds so post-loop
+    # int6 roundtrip + K-sweep + sliding val fit under the process wallclock.
+    _max_train_s = float(getattr(args, "max_training_seconds", 0.0))
+    _eval_res_s = float(getattr(args, "eval_reservation_seconds", 0.0))
+    if _max_train_s > 0.0:
+        _train_budget_s = max(_max_train_s - max(_eval_res_s, 0.0), 1.0)
+        max_training_ms: float | None = 1000.0 * _train_budget_s
+    else:
+        max_training_ms = None
+    max_wallclock_ms = max_training_ms  # deprecated alias for downstream log-grep compat
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if max_wallclock_ms is None:
+        if max_training_ms is None:
             return 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_frac = float(getattr(args, "warmdown_frac", 0.72))
-        total_est_steps = max_wallclock_ms / max(step_ms, 1e-9)
+        total_est_steps = max_training_ms / max(step_ms, 1e-9)
         warmdown_steps = warmdown_frac * total_est_steps
         warmdown_ms = warmdown_steps * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        remaining_ms = max(max_training_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     def format_deq_info(m: nn.Module) -> str:
@@ -5524,8 +5631,12 @@ def main() -> None:
 
     # MAIN TRAINING LOOP
     training_time_ms = 0.0
-    # Rolling window of step durations for a recent step_avg (vs lifetime mean).
+    # Rolling window of per-step latency. Appended once per completed training
+    # step and reset alongside `t0` post-val so plotting/eval overhead stays
+    # out of the measurement. The 50-step window absorbs CUDA-launch-vs-completion
+    # noise without forcing a per-step `torch.cuda.synchronize()`.
     _step_dt_window: deque[float] = deque(maxlen=50)
+    _step_t_prev: float | None = None
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
@@ -5535,6 +5646,7 @@ def main() -> None:
         log0(f"ema:enabled decay:{args.ema_decay:.4f} update_every:{args.ema_update_every}")
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    _step_t_prev = t0
 
     step = 0
     while True:
@@ -5550,7 +5662,6 @@ def main() -> None:
             torch.cuda.synchronize()
             _step_dt_ms = 1000.0 * (time.perf_counter() - t0)
             training_time_ms += _step_dt_ms
-            _step_dt_window.append(_step_dt_ms)
             val_loss, val_bpb = run_validation(
                 args, model, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
@@ -5577,6 +5688,7 @@ def main() -> None:
             _best_effort_update_plots("val")
             torch.cuda.synchronize()
             t0 = time.perf_counter()
+            _step_t_prev = t0
 
         if last_step:
             if stop_after_step is not None and step < args.iterations:
@@ -5765,6 +5877,13 @@ def main() -> None:
             update_ema_state_(ema_state, base_model.state_dict(), decay=args.ema_decay)
 
         step += 1
+        # Per-step latency for step_avg_w50. No sync — the 50-step window
+        # averages out CUDA-launch-vs-completion noise; adding a per-step
+        # synchronize() would cost ~1-2% throughput.
+        _step_now = time.perf_counter()
+        if _step_t_prev is not None:
+            _step_dt_window.append(1000.0 * (_step_now - _step_t_prev))
+        _step_t_prev = _step_now
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
@@ -6632,6 +6751,19 @@ def main() -> None:
         )
         log0(f"sliding_validation:done val_bpb:{sliding_bpb:.6f}")
 
+    # Opt-in full-set validation. Default roundtrip uses full_validation=False
+    # (capped at eval_batch_seqs) for dev wallclock; submission runs set
+    # --final-full-validation=1 so meta_json["val_bpb"] is the full-set score.
+    full_val_bpb: float | None = None
+    if bool(getattr(args, "final_full_validation", False)):
+        log0("final_full_validation:start")
+        _, full_val_bpb = run_validation(
+            args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            full_validation=True,
+        )
+        log0(f"final_full_validation:done val_bpb:{full_val_bpb:.6f}")
+
     # Master-only: update meta.json with the final val_bpb AND flip
     # run_valid=true (if all hard assertions passed).  Writing both atomically
     # at the very end — after sliding val + all eval passes — ensures a crash
@@ -6640,7 +6772,10 @@ def main() -> None:
     if master_process and meta_path is not None:
         with open(meta_path, "r") as f:
             meta_json = json.load(f)
-        meta_json["val_bpb"] = val_bpb_q
+        # Persist both: fast_val_bpb is always the int6 roundtrip score; val_bpb
+        # is the full-set score when --final-full-validation=1, else the fast score.
+        meta_json["fast_val_bpb"] = float(val_bpb_q)
+        meta_json["val_bpb"] = float(full_val_bpb if full_val_bpb is not None else val_bpb_q)
         # POLICY (val_bpb-primary): run_valid=true whenever val_bpb is
         # written, regardless of gate failures.  Promotion criterion is val_bpb
         # improvement + 16MB budget; diagnostic-gate failures are recorded as
