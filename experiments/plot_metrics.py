@@ -82,7 +82,7 @@ def parse_log(logpath: str) -> dict:
         "val_steps": [], "val_loss": [], "val_bpb": [],
         "val_train_time_ms": [], "val_step_avg_ms": [],
         # Validation-time diagnostics (sparse unless VAL_LOSS_EVERY is small)
-        "deq_residual": [], "deq_recon": [], "deq_iter_conv": [], "deq_iter_conv_rel": [],
+        "deq_residual": [], "deq_recon": [], "tbptt_recon": [], "deq_fp_travel": [], "deq_iter_conv": [], "deq_iter_conv_rel": [],
         "gg_iter": [],
         "gg_mean": [],
         # Combined expert metrics (backward compat)
@@ -99,7 +99,7 @@ def parse_log(logpath: str) -> dict:
         # Orthogonality (expert_ortho is block-level weighted expert contribution orthogonality)
         "mos_ctp_ortho": [], "mos_ntp_ortho": [], "mos_ortho": [],
         # Train-time diagnostics (dense, logged alongside train_loss when enabled)
-        "deq_residual_train": [], "deq_recon_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
+        "deq_residual_train": [], "deq_recon_train": [], "tbptt_recon_train": [], "deq_fp_travel_train": [], "deq_iter_conv_train": [], "deq_iter_conv_rel_train": [],
         "gg_iter_train": [],
         "gg_mean_train": [],
         **{f"{p}_{s}_train": [] for p in ("mos_ctp", "mos_ntp") for s in ("usage", "entropy", "cv")},
@@ -187,6 +187,8 @@ def parse_log(logpath: str) -> dict:
             for key, pat in [
                 ("deq_residual_train", rf"deq_residual:{_FLOAT}"),
                 ("deq_recon_train", rf"deq_recon_err:{_FLOAT}"),
+                ("tbptt_recon_train", rf"tbptt_recon:{_FLOAT}"),
+                ("deq_fp_travel_train", rf"deq_fp_travel:{_FLOAT}"),
                 ("deq_iter_conv_train", rf"deq_iter_conv:{_FLOAT}"),
                 ("deq_iter_conv_rel_train", rf"deq_iter_conv_rel:{_FLOAT}"),
                 ("block_ortho_train", rf"block_ortho:{_FLOAT}"),
@@ -252,6 +254,8 @@ def parse_log(logpath: str) -> dict:
             for key, pat in [
                 ("deq_residual", rf"deq_residual:{_FLOAT}"),
                 ("deq_recon", rf"deq_recon_err:{_FLOAT}"),
+                ("tbptt_recon", rf"tbptt_recon:{_FLOAT}"),
+                ("deq_fp_travel", rf"deq_fp_travel:{_FLOAT}"),
                 ("deq_iter_conv", rf"deq_iter_conv:{_FLOAT}"),
                 ("deq_iter_conv_rel", rf"deq_iter_conv_rel:{_FLOAT}"),
                 ("expert_entropy", rf"(?<!\w_)expert_entropy:{_FLOAT}"),

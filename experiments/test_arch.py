@@ -323,8 +323,8 @@ def test_revdeq_reversibility():
             loss = model(x, y)
     loss.backward()
 
-    recon = getattr(model.shared_block, "_deq_distance_travelled_last_bwd", None)
-    assert recon is not None, "Must produce RevDEQ backward distance diagnostic"
+    recon = getattr(model.shared_block, "_deq_x0_recon_error_last_bwd", None)
+    assert recon is not None, "Must produce RevDEQ backward x0 recon diagnostic"
     assert float(recon) >= 0.0
     assert float(recon) < 1.0
     print(f"Reconstruction error: {float(recon):.6f}")
@@ -363,8 +363,8 @@ def test_revdeq_reconstruction_at_a_bar_floor():
             loss = model(x, y)
     loss.backward()
 
-    recon = getattr(model.shared_block, "_deq_distance_travelled_last_bwd", None)
-    assert recon is not None, "Expected RevDEQ distance diagnostic even at Ā=ε_rev"
+    recon = getattr(model.shared_block, "_deq_x0_recon_error_last_bwd", None)
+    assert recon is not None, "Expected RevDEQ x0 recon diagnostic even at Ā=ε_rev"
     recon_f = float(recon)
     # Correctness claim: ε_rev prevents the backward from hitting division by
     # zero / overflow / NaN. Recon accuracy (< 1) holds in the normal training

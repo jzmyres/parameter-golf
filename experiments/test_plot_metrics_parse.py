@@ -60,7 +60,7 @@ class TestPlotMetricsParse(unittest.TestCase):
                 "parcae_delta_mean:1.000000 parcae_delta_max:1.010000 "
                 "parcae_recon_amp_log10:3.550000 "
                 "train_time:10.0ms step_avg:10.0ms "
-                "deq_residual:1.0 deq_recon_err:0.0 deq_iter_conv:0.1 gg_iter:[0.9,0.8,0.7,0.6] "
+                "deq_residual:1.0 deq_recon_err:0.0 tbptt_recon:0.0 deq_fp_travel:0.42 deq_iter_conv:0.1 gg_iter:[0.9,0.8,0.7,0.6] "
                 "expert_ortho:0.25 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
                 "block_entropy:0.65 block_cv:0.015 block_usage:[0.45,0.55] "
                 "mlp_entropy:0.7 attn_entropy:0.6 mos_ctp_entropy:0.8 mos_ntp_entropy:0.9 "
@@ -77,6 +77,8 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["train_steps"], [10])
         self.assertEqual(d["deq_residual_train"], [1.0])
         self.assertEqual(d["deq_recon_train"], [0.0])
+        self.assertEqual(d["tbptt_recon_train"], [0.0])
+        self.assertAlmostEqual(d["deq_fp_travel_train"][0], 0.42, places=5)
         self.assertEqual(d["deq_iter_conv_train"], [0.1])
         self.assertEqual(d["gg_iter_train"], [[0.9, 0.8, 0.7, 0.6]])
         self.assertEqual(d["router_cv_loss"], [0.12])
@@ -136,7 +138,7 @@ class TestPlotMetricsParse(unittest.TestCase):
             [
                 "step:1/10 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 train_time:10.0ms step_avg:10.0ms",
                 "step:1/10 val_loss:3.1 val_bpb:1.50 train_time:10ms step_avg:10.0ms "
-                "deq_residual:1.0 deq_recon_err:0.0 deq_iter_conv:0.1 gg_iter:[0.1,0.2] "
+                "deq_residual:1.0 deq_recon_err:0.0 tbptt_recon:0.0 deq_iter_conv:0.1 gg_iter:[0.1,0.2] "
                 "block_ortho:0.27 expert_ortho:0.25 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
                 "block_entropy:0.65 block_cv:0.015 block_usage:[0.45,0.55] "
                 "mlp_entropy:0.7 attn_entropy:0.6 mos_ctp_entropy:0.8 mos_ntp_entropy:0.9 "
