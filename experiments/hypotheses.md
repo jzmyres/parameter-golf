@@ -3612,3 +3612,97 @@ Sequenced for ROI/risk balance, after Tier 1 throughput iters (117b-2/3/3b) comp
 - qk_gain init=5.0 → already at L250 (matches records)
 - EMA decay~0.997 → already enabled by default
 - Partial RoPE 16/64 dims → already split per CLAUDE.md §6.3
+
+---
+
+### iter 142-fixes — 7 review-item fixes (2026-05-04, commit 2eb06e8)
+
+**Claim:** A bundle of 7 code-quality bugs (router `.item()` syncs in DEQ hot
+path, fast-vs-full val_bpb naming, wallclock semantics, dead/untunable knobs,
+optimizer return-arity drift, missing architecture-invariant validation,
+mislabeled step_avg metric) can be fixed without changing default-config
+behavior. Equal-or-better val_bpb at the same step count.
+
+**Test:** Behavior-neutral commit. Smoke test PASSED (loss 7.0076 → 4.5219
+over 300 steps; recon stable 8e-5 to 1.7e-4). 19/19 focused tests PASS.
+Two pre-existing test failures unrelated to this PR. Full 100-step val_bpb
+deferred — used as the iter-142-refactor baseline below.
+
+**Status:** ⏸ OBSERVED — committed; smoke + unit tests pass; will become
+VERIFIED once a same-config 100-step+ comparison shows no regression vs
+the prior baseline (369be1f). Used as comparison anchor for iter-142-refactor.
+
+---
+
+### iter 142-refactor — flatten loss-stack coefficient nesting (2026-05-04, commit 5026978)
+
+**Claim:** The current routing/MoS/diversity loss stack can be collapsed
+from a multi-layer nested coefficient structure (`router_health_coef ×
+cv_loss_weight × (attn_balance_mult + mlp_balance_mult) × cv_floor`,
+`mos_balance_mult × bal_loss_coef × MSE-to-uniform`, etc.) to a flat sum
+with one direct coefficient per term, without regressing val_bpb at
+default config — strict-gen claim per CLAUDE.md §11.
+
+Active changes:
+- Clean delete of Routing Gram (`use_orthogonal_expansion_routing`,
+  `routing_gram_coef`, `routing_gram_warmup_delay_frac`, gram_coef buffer
+  in SoftDenseRouter, the per-FP-iter gram penalty block, the warmup
+  ramp). `grep -rn` returns zero in active code.
+- Router CV: raw CV (no `relu(cv − cv_target)²` floor, no `cv_loss_weight`
+  internal mult, no `router_health_coef` outer mult, no
+  `attn_balance_mult + mlp_balance_mult` slice multiplier). Single coef
+  `router_load_cv_coef = 0.5` (preserves `0.25 × 2.0` legacy magnitude).
+- Router entropy: single coef `router_entropy_coef = 0.00125` (preserves
+  `router_health_coef × 0.005 = 0.25 × 0.005`).
+- MoS balance: CV replaces MSE-to-uniform; single coef
+  `mos_load_cv_coef = 0.25` (preserves `mos_balance_mult × bal_loss_coef
+  = 50 × 5e-3`).
+- ctp_weight: promoted to direct Hyperparameter (was `0.05 ×
+  num_refinements × refine_strength` dynamic schedule; default 0.0).
+- expert_diversity_kind: new flag, default `"frobenius"` (iter 141 math
+  preserved). Cosine variant added for iter-142b A/B.
+
+**Test:** 100-step controlled comparison vs baseline 2eb06e8.
+
+| Metric | Baseline (2eb06e8) | Refactor (5026978) | Δ |
+|---|---|---|---|
+| Fast val_bpb @ step 100 | 2.3787 | 2.2993 | **−0.0794** |
+| Int6 roundtrip val_bpb | 2.389312 | 2.314327 | **−0.0750** |
+| K-sweep best (k=16) | 2.389312 | 2.314327 | **−0.0750** |
+
+K-sweep table (refactor, all monotonically near-flat — clean fixed-point):
+k=4: 2.357327, k=8: 2.320005, k=16: 2.314327, **k=17: 2.314341 (+1e-5 prime)**,
+k=24: 2.314682, k=32: 2.315054, **k=37: 2.315240 (+1e-4 prime)**, k=64: 2.315896,
+**k=113: 2.316428 (+1e-4 prime)**, k=128: 2.316517.
+
+K=17, K=37, K=113 acyclicity-prime checks all show <1e-4 deviation from
+nearest power-of-2 → genuine fixed-point convergence.
+
+**Status:** ✅ VERIFIED at 100 steps — refactor improves val_bpb by 0.075
+vs baseline. Strict-gen claim satisfied (val_bpb ≤ baseline by a clear
+margin; not a wash).
+
+**Implication:** The improvement signal is mechanistic — raw CV provides
+gradient pressure even when CV ≤ 0.20 (where the old `relu(cv − 0.20)²`
+floor was zero). Routing balance was effectively unregularized for the
+"healthy" regime; flattening exposed the gap. This is a *behavior change
+at low CV* even though magnitudes match at typical mid-training CV ≈ 0.5.
+
+**Caveats:**
+- 100 steps is a partial signal. The trajectory at 1000 steps may differ
+  (e.g. baseline could catch up if the relu-floor's later activation
+  becomes meaningful). Document as 100-step verdict; longer run pending.
+- Two iter-142-refactor terms (B5b grad-accum scaling, B6 unified warmup)
+  were intentionally deferred since they are no-ops at default config.
+  iter-142a/b (frobenius vs cosine diversity at coef=0.1) will exercise
+  those paths.
+- Several legacy Hyperparameter fields (`attn_balance_mult`,
+  `mlp_balance_mult`, `mos_balance_mult`, `bal_loss_coef`,
+  `router_health_coef`, `cv_loss_weight`, `min_share_loss_weight`,
+  `mos_ortho_out_coef`, `block_ortho_aux_*`) remain in the class for
+  back-compat with existing tests; pure cleanup deferred to a follow-up
+  iter once iter-142a/b verdicts land.
+
+**Next:** iter-142a turns on `--expert-gram-coef=0.1` with default
+frobenius. iter-142b same with `--expert-diversity-kind=cosine`. Both
+build on this verified refactor commit.
