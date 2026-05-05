@@ -175,13 +175,103 @@ else
 fi
 
 # --- Summary ---
+extract_aux_terms() {
+    python3 - "$1" <<'PY' 2>/dev/null || true
+import math
+import re
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, errors="ignore") as f:
+        train_lines = [line for line in f if line.startswith("step:") and " train_loss:" in line]
+except OSError:
+    train_lines = []
+if not train_lines:
+    raise SystemExit(0)
+line = train_lines[-1]
+float_pat = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+
+def value(key):
+    match = re.search(rf"{re.escape(key)}:{float_pat}", line)
+    return float(match.group(1)) if match else math.nan
+
+pairs = [
+    ("rcv", "router_cv_loss", "router_cv_coef_eff"),
+    ("rent", "router_entropy_loss", "router_entropy_coef_eff"),
+    ("mcv", "mos_cv_loss", "mos_cv_coef_eff"),
+    ("ediv", "expert_diversity_loss", "expert_diversity_coef_eff"),
+    ("mdiv", "mos_diversity_loss", "mos_diversity_coef_eff"),
+]
+parts = []
+for label, loss_key, coef_key in pairs:
+    loss = value(loss_key)
+    coef = value(coef_key)
+    if math.isfinite(loss) and math.isfinite(coef):
+        parts.append(f"{label}={loss * coef:.4g}")
+print(" ".join(parts))
+PY
+}
+
+extract_parcae_state() {
+    python3 - "$1" <<'PY' 2>/dev/null || true
+import math
+import re
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, errors="ignore") as f:
+        train_lines = [line for line in f if line.startswith("step:") and " train_loss:" in line]
+except OSError:
+    train_lines = []
+if not train_lines:
+    raise SystemExit(0)
+line = train_lines[-1]
+float_pat = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+
+def value(key):
+    match = re.search(rf"{re.escape(key)}:{float_pat}", line)
+    return float(match.group(1)) if match else math.nan
+
+keys = [
+    "parcae_a_bar_min", "parcae_a_bar_mean", "parcae_a_bar_max",
+    "parcae_a_bar_core_max",
+    "parcae_beta_mean", "parcae_beta_max",
+    "parcae_b_bar_mean", "parcae_b_bar_max",
+    "parcae_delta_mean", "parcae_delta_max",
+    "parcae_recon_amp_log10",
+]
+vals = {key: value(key) for key in keys}
+if not any(math.isfinite(v) for v in vals.values()):
+    raise SystemExit(0)
+
+def fmt(key):
+    v = vals[key]
+    return f"{v:.4g}" if math.isfinite(v) else "?"
+
+parts = [
+    f"abar={fmt('parcae_a_bar_min')}/{fmt('parcae_a_bar_mean')}/{fmt('parcae_a_bar_max')}",
+    f"core={fmt('parcae_a_bar_core_max')}",
+    f"beta={fmt('parcae_beta_mean')}/{fmt('parcae_beta_max')}",
+    f"bbar={fmt('parcae_b_bar_mean')}/{fmt('parcae_b_bar_max')}",
+    f"delta={fmt('parcae_delta_mean')}/{fmt('parcae_delta_max')}",
+    f"amp_log10={fmt('parcae_recon_amp_log10')}",
+]
+print(" ".join(parts))
+PY
+}
+
 echo ""
 echo "=== Experiment Files ==="
 echo "Logs:"
 for f in baseline.log previous.log current.log; do
     if [ -f "$LOGDIR/$f" ]; then
         bpb=$(grep -oP 'val_bpb:\K[\d.]+' "$LOGDIR/$f" | tail -1 || true)
-        echo "  $f  val_bpb=${bpb:-?}"
+        router_reg=$(grep -oP 'router_reg_loss:\K[-+0-9.eE]+' "$LOGDIR/$f" | tail -1 || true)
+        aux_terms=$(extract_aux_terms "$LOGDIR/$f")
+        parcae_state=$(extract_parcae_state "$LOGDIR/$f")
+        echo "  $f  val_bpb=${bpb:-?}  router_reg=${router_reg:-?}  aux_terms=${aux_terms:-?}  parcae=${parcae_state:-?}"
     fi
 done
 echo "Weights:"

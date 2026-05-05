@@ -48,9 +48,15 @@ import math
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 import triton
 import triton.language as tl
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Triton entmax kernel tests require CUDA",
+)
 
 
 # ---------------------------------------------------------------------------

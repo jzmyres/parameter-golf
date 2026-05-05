@@ -9,7 +9,7 @@ import torch
 
 
 class TestRouterHealthLoss(unittest.TestCase):
-    def test_min_share_barrier_penalizes_collapse(self) -> None:
+    def test_cv_hinge_penalizes_collapse(self) -> None:
         from train_gpt import SoftDenseRouter
 
         torch.manual_seed(0)
@@ -24,7 +24,7 @@ class TestRouterHealthLoss(unittest.TestCase):
             router.router.weight.zero_()
             router.expert_bias.zero_()
         _ = router(x)
-        loss_uniform = float(router._health_loss.detach().cpu().item())
+        loss_uniform = float(router._cv_loss_raw.detach().cpu().item())
 
         # Collapsed routing: push almost all mass to expert 0
         with torch.no_grad():
@@ -32,7 +32,7 @@ class TestRouterHealthLoss(unittest.TestCase):
             router.router.weight[0].fill_(+10.0)
             router.expert_bias.zero_()
         _ = router(x)
-        loss_collapse = float(router._health_loss.detach().cpu().item())
+        loss_collapse = float(router._cv_loss_raw.detach().cpu().item())
 
         self.assertGreater(loss_collapse, loss_uniform + 1e-6)
 
@@ -55,8 +55,9 @@ class TestRouterHealthLoss(unittest.TestCase):
             p = router(x)
 
         self.assertAlmostEqual(float(p.detach().sum(dim=-1).mean().item()), 0.5, places=5)
-        self.assertLess(float(router._health_loss.detach().cpu().item()), 1e-8)
-        self.assertLess(float(router._balance_loss.detach().cpu().item()), 1e-8)
+        self.assertLess(float(router._cv_loss_raw.detach().cpu().item()), 1e-8)
+        self.assertFalse(hasattr(router, "_health_loss"))
+        self.assertFalse(hasattr(router, "_balance_loss"))
         self.assertAlmostEqual(sum(router._expert_usage), 1.0, places=5)
         self.assertAlmostEqual(float(router._expert_total_mass), 0.5, places=5)
 

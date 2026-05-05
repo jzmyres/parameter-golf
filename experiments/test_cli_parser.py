@@ -21,8 +21,8 @@ class TestCliParser(unittest.TestCase):
             self.assertEqual(ov["use_ctp"], expected)
 
     def test_float_parsing(self):
-        ov = _parse_cli_overrides(["--cv-loss-weight", "3.5"])
-        self.assertEqual(ov["cv_loss_weight"], 3.5)
+        ov = _parse_cli_overrides(["--router-load-cv-coef", "3.5"])
+        self.assertEqual(ov["router_load_cv_coef"], 3.5)
 
     def test_int_parsing(self):
         ov = _parse_cli_overrides(["--bigram-vocab-size", "4096"])
@@ -34,8 +34,8 @@ class TestCliParser(unittest.TestCase):
 
     def test_positional_passthrough(self):
         # Wrapper / profile harnesses inject positionals; parser must not reject.
-        ov = _parse_cli_overrides(["my-positional", "--cv-loss-weight", "1.5"])
-        self.assertEqual(ov["cv_loss_weight"], 1.5)
+        ov = _parse_cli_overrides(["my-positional", "--router-load-cv-coef", "1.5"])
+        self.assertEqual(ov["router_load_cv_coef"], 1.5)
 
     def test_no_deq_backward_field(self):
         # User directive 2026-04-28: only revdeq is supported.

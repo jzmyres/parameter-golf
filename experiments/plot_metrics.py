@@ -5,8 +5,10 @@ Shows full training curves for ALL diagnostic metrics:
 - Row 2: NTP Loss, CTP Loss, Pre-clip Grad Norm
 - Row 3: DEQ Residual, DEQ Iter Conv (absolute), DEQ Iter Convergence (relative)
 - Row 4: Expert Usage (min per component), Expert Entropy, Expert Orthogonality
-- Row 5: Expert Balance CV (per component), DEQ Recon Error, Final Post-Quant Val BPB
-- Row 6: GG by DEQ iter, Summary, (spare)
+- Row 5: Expert Balance CV (per component), DEQ Recon Error, GG by DEQ iter
+- Row 6: Auxiliary raw losses, weighted terms + total, effective coefficients
+- Row 7: Parcae Ā/core, Parcae β/B̄/Δ, Parcae recon amplification
+- Row 8: Final Post-Quant Val BPB, Summary, (spare)
 
 All subplots use consistent colors: blue for Baseline, orange for Current.
 Components (mlp/attn/mos_ctp/mos_ntp) are encoded with line styles.
@@ -28,6 +30,23 @@ COMP_LINESTYLES = {
     "transformer_block": "-.",
     "mos_ctp": ":",
     "mos_ntp": (0, (3, 1, 1, 1)),  # dash-dot-dot
+    "router_cv": "-",
+    "router_entropy": "--",
+    "mos_cv": ":",
+    "expert_diversity": "-.",
+    "mos_diversity": (0, (3, 1, 1, 1)),
+    "router_reg": (0, (1, 1)),
+    "parcae_a_bar_min": ":",
+    "parcae_a_bar_mean": "-",
+    "parcae_a_bar_max": "--",
+    "parcae_a_bar_core_max": "-.",
+    "parcae_beta_mean": "-",
+    "parcae_beta_max": "--",
+    "parcae_b_bar_mean": ":",
+    "parcae_b_bar_max": (0, (3, 1, 1, 1)),
+    "parcae_delta_mean": "-.",
+    "parcae_delta_max": (0, (1, 1)),
+    "parcae_recon_amp_log10": "-",
 }
 
 COMP_SCATTER_SIZE = 72
@@ -45,6 +64,19 @@ def parse_log(logpath: str) -> dict:
         "config_line": None,
         "train_batch_tokens": None,
         "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
+        "router_cv_loss": [], "router_entropy_loss": [], "mos_cv_loss": [],
+        "expert_diversity_loss": [], "mos_diversity_loss": [], "router_reg_loss": [],
+        "router_cv_coef_eff": [], "router_entropy_coef_eff": [],
+        "mos_cv_coef_eff": [], "expert_diversity_coef_eff": [],
+        "mos_diversity_coef_eff": [],
+        "parcae_a_bar_min": [], "parcae_a_bar_mean": [], "parcae_a_bar_max": [],
+        "parcae_a_bar_core_max": [],
+        "parcae_beta_mean": [], "parcae_beta_max": [],
+        "parcae_b_bar_mean": [], "parcae_b_bar_max": [],
+        "parcae_delta_mean": [], "parcae_delta_max": [],
+        "parcae_recon_amp_log10": [],
+        "router_cv_term": [], "router_entropy_term": [], "mos_cv_term": [],
+        "expert_diversity_term": [], "mos_diversity_term": [],
         "grad_norm": [],
         "step_avg_ms": [], "train_time_ms": [],
         "val_steps": [], "val_loss": [], "val_bpb": [],
@@ -130,6 +162,21 @@ def parse_log(logpath: str) -> dict:
             data["ntp_loss"].append(float(m_ntp.group(1)) if m_ntp else math.nan)
             m_ctp = re.search(rf"ctp_loss:{_FLOAT}", line)
             data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else math.nan)
+            for key in [
+                "router_cv_loss", "router_entropy_loss", "mos_cv_loss",
+                "expert_diversity_loss", "mos_diversity_loss", "router_reg_loss",
+                "router_cv_coef_eff", "router_entropy_coef_eff",
+                "mos_cv_coef_eff", "expert_diversity_coef_eff",
+                "mos_diversity_coef_eff",
+                "parcae_a_bar_min", "parcae_a_bar_mean", "parcae_a_bar_max",
+                "parcae_a_bar_core_max",
+                "parcae_beta_mean", "parcae_beta_max",
+                "parcae_b_bar_mean", "parcae_b_bar_max",
+                "parcae_delta_mean", "parcae_delta_max",
+                "parcae_recon_amp_log10",
+            ]:
+                m_loss = re.search(rf"{key}:{_FLOAT}", line)
+                data[key].append(float(m_loss.group(1)) if m_loss else math.nan)
             # Parse pre-clip gradient norm
             m_gn = re.search(rf"grad_norm:{_FLOAT}", line)
             data["grad_norm"].append(float(m_gn.group(1)) if m_gn else math.nan)
@@ -254,7 +301,37 @@ def parse_log(logpath: str) -> dict:
                 [float(v.strip()) for v in m_gg.group(1).split(",") if v.strip()] if m_gg else []
             )
 
+    _populate_aux_terms(data)
     return data
+
+
+def _value_at(data: dict, key: str, idx: int) -> float:
+    vals = data.get(key, [])
+    if idx >= len(vals):
+        return math.nan
+    try:
+        return float(vals[idx])
+    except Exception:
+        return math.nan
+
+
+def _populate_aux_terms(data: dict) -> None:
+    """Derive weighted auxiliary contributions from raw losses and effective coefs."""
+    specs = [
+        ("router_cv_term", "router_cv_loss", "router_cv_coef_eff"),
+        ("router_entropy_term", "router_entropy_loss", "router_entropy_coef_eff"),
+        ("mos_cv_term", "mos_cv_loss", "mos_cv_coef_eff"),
+        ("expert_diversity_term", "expert_diversity_loss", "expert_diversity_coef_eff"),
+        ("mos_diversity_term", "mos_diversity_loss", "mos_diversity_coef_eff"),
+    ]
+    n = len(data.get("train_steps", []))
+    for out_key, loss_key, coef_key in specs:
+        terms: list[float] = []
+        for idx in range(n):
+            loss = _value_at(data, loss_key, idx)
+            coef = _value_at(data, coef_key, idx)
+            terms.append(loss * coef if _is_finite(loss) and _is_finite(coef) else math.nan)
+        data[out_key] = terms
 
 
 def usage_min_series(data: dict, key: str) -> list[float]:
@@ -449,8 +526,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
             return "train_steps", train_key
         return "val_steps", val_key
 
-    # Wide landscape aspect so the 6×3 grid is readable in typical image viewers.
-    fig, axes = plt.subplots(6, 3, figsize=(26, 16))
+    # Wide landscape aspect so the 8×3 grid is readable in typical image viewers.
+    fig, axes = plt.subplots(8, 3, figsize=(26, 21.0))
     fig.suptitle("Baseline vs Current Experiment — Full Diagnostics", fontsize=16, fontweight="bold")
 
     # Global legend (colors = run, line style = component)
@@ -707,9 +784,107 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         hi = max(vals)
         ax_recon.set_ylim(max(lo * 0.3, 1e-16), max(hi * 3.0, 1e-15))
 
+    # Row 6: objective auxiliary components, their weighted contributions, and coefficients.
+    aux_raw_series = [
+        ("router_cv", b.get("router_cv_loss", []), c.get("router_cv_loss", [])),
+        ("router_entropy", b.get("router_entropy_loss", []), c.get("router_entropy_loss", [])),
+        ("mos_cv", b.get("mos_cv_loss", []), c.get("mos_cv_loss", [])),
+        ("expert_diversity", b.get("expert_diversity_loss", []), c.get("expert_diversity_loss", [])),
+        ("mos_diversity", b.get("mos_diversity_loss", []), c.get("mos_diversity_loss", [])),
+    ]
+    _plot_components(
+        axes[5, 0],
+        b,
+        c,
+        "train_steps",
+        aux_raw_series,
+        "Aux Raw Loss Components",
+        ylabel="raw loss",
+    )
+
+    aux_weighted_series = [
+        ("router_reg", b.get("router_reg_loss", []), c.get("router_reg_loss", [])),
+        ("router_cv", b.get("router_cv_term", []), c.get("router_cv_term", [])),
+        ("router_entropy", b.get("router_entropy_term", []), c.get("router_entropy_term", [])),
+        ("mos_cv", b.get("mos_cv_term", []), c.get("mos_cv_term", [])),
+        ("expert_diversity", b.get("expert_diversity_term", []), c.get("expert_diversity_term", [])),
+        ("mos_diversity", b.get("mos_diversity_term", []), c.get("mos_diversity_term", [])),
+    ]
+    _plot_components(
+        axes[5, 1],
+        b,
+        c,
+        "train_steps",
+        aux_weighted_series,
+        "Aux Weighted Terms + Total",
+        ylabel="loss contribution",
+    )
+
+    aux_coef_series = [
+        ("router_cv", b.get("router_cv_coef_eff", []), c.get("router_cv_coef_eff", [])),
+        ("router_entropy", b.get("router_entropy_coef_eff", []), c.get("router_entropy_coef_eff", [])),
+        ("mos_cv", b.get("mos_cv_coef_eff", []), c.get("mos_cv_coef_eff", [])),
+        ("expert_diversity", b.get("expert_diversity_coef_eff", []), c.get("expert_diversity_coef_eff", [])),
+        ("mos_diversity", b.get("mos_diversity_coef_eff", []), c.get("mos_diversity_coef_eff", [])),
+    ]
+    _plot_components(
+        axes[5, 2],
+        b,
+        c,
+        "train_steps",
+        aux_coef_series,
+        "Aux Effective Coefficients",
+        ylabel="coefficient",
+    )
+
+    # Row 7: Parcae-style diagonal ZOH state used by the RevDEQ solver blend.
+    parcae_a_series = [
+        ("parcae_a_bar_min", b.get("parcae_a_bar_min", []), c.get("parcae_a_bar_min", [])),
+        ("parcae_a_bar_mean", b.get("parcae_a_bar_mean", []), c.get("parcae_a_bar_mean", [])),
+        ("parcae_a_bar_max", b.get("parcae_a_bar_max", []), c.get("parcae_a_bar_max", [])),
+        ("parcae_a_bar_core_max", b.get("parcae_a_bar_core_max", []), c.get("parcae_a_bar_core_max", [])),
+    ]
+    _plot_components(
+        axes[6, 0],
+        b,
+        c,
+        "train_steps",
+        parcae_a_series,
+        "Parcae Ā / Core",
+        ylabel="value",
+    )
+
+    parcae_gain_series = [
+        ("parcae_beta_mean", b.get("parcae_beta_mean", []), c.get("parcae_beta_mean", [])),
+        ("parcae_beta_max", b.get("parcae_beta_max", []), c.get("parcae_beta_max", [])),
+        ("parcae_b_bar_mean", b.get("parcae_b_bar_mean", []), c.get("parcae_b_bar_mean", [])),
+        ("parcae_b_bar_max", b.get("parcae_b_bar_max", []), c.get("parcae_b_bar_max", [])),
+        ("parcae_delta_mean", b.get("parcae_delta_mean", []), c.get("parcae_delta_mean", [])),
+        ("parcae_delta_max", b.get("parcae_delta_max", []), c.get("parcae_delta_max", [])),
+    ]
+    _plot_components(
+        axes[6, 1],
+        b,
+        c,
+        "train_steps",
+        parcae_gain_series,
+        "Parcae β / B̄ / Δ",
+        ylabel="value",
+    )
+    _plot_line(
+        axes[6, 2],
+        b,
+        c,
+        "parcae_recon_amp_log10",
+        "parcae_recon_amp_log10",
+        "train_steps",
+        "train_steps",
+        "Parcae Recon Amplification",
+        ylabel="log10((1 / min Ā)^K)",
+    )
+
     # Pre vs post-quant val_bpb (post-quant is the scored metric)
-    # (Requested swap) Put this bar chart in Row 6 left.
-    ax_postq = axes[5, 0]
+    ax_postq = axes[7, 0]
     ax_postq.set_title("Val BPB (Pre vs Post-Quant)", fontsize=11)
     b_pre = b["val_bpb"][-1] if b.get("val_bpb") else None
     c_pre = c["val_bpb"][-1] if c.get("val_bpb") else None
@@ -780,7 +955,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_postq.set_xticks([])
         ax_postq.set_yticks([])
 
-    # Row 6: Summary + spare
+    # Row 8: Summary + spare
     def _prefer_train_listlist(train_key: str, val_key: str) -> tuple[str, str]:
         if any(len(v) for v in b.get(train_key, [])) or any(len(v) for v in c.get(train_key, [])):
             return "train_steps", train_key
@@ -856,8 +1031,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         ax_gg.set_ylim(0.0, 1.0)
         ax_gg.legend(handles=style_handles, loc="upper right", fontsize=8, frameon=False, title="Representative k")
 
-    axes[5, 1].axis("off")
-    axes[5, 2].axis("off")
+    axes[7, 1].axis("off")
+    axes[7, 2].axis("off")
 
     summary_lines = []
     # Run metadata + config deltas (if logged)
@@ -907,6 +1082,18 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         summary_lines.append(f"CTP Loss:   {b['ctp_loss'][-1]:.4f} vs {c['ctp_loss'][-1]:.4f}")
     if b["grad_norm"] and c["grad_norm"] and any(v > 0 for v in b["grad_norm"] + c["grad_norm"]):
         summary_lines.append(f"Grad Norm:  {b['grad_norm'][-1]:.4f} vs {c['grad_norm'][-1]:.4f}")
+    b_a_bar = _last_finite(b.get("parcae_a_bar_mean", []))
+    c_a_bar = _last_finite(c.get("parcae_a_bar_mean", []))
+    if _is_finite(b_a_bar) and _is_finite(c_a_bar):
+        summary_lines.append(f"Parcae Abar:{b_a_bar:.4f} vs {c_a_bar:.4f}")
+    b_b_bar = _last_finite(b.get("parcae_b_bar_mean", []))
+    c_b_bar = _last_finite(c.get("parcae_b_bar_mean", []))
+    if _is_finite(b_b_bar) and _is_finite(c_b_bar):
+        summary_lines.append(f"Parcae Bbar:{b_b_bar:.4f} vs {c_b_bar:.4f}")
+    b_amp = _last_finite(b.get("parcae_recon_amp_log10", []))
+    c_amp = _last_finite(c.get("parcae_recon_amp_log10", []))
+    if _is_finite(b_amp) and _is_finite(c_amp):
+        summary_lines.append(f"Parcae Amp: {b_amp:.2f} vs {c_amp:.2f} log10")
     if b["deq_residual"] and c["deq_residual"]:
         summary_lines.append(f"DEQ Res:    {b['deq_residual'][-1]:.0f} vs {c['deq_residual'][-1]:.0f}")
     if b["deq_recon"] and c["deq_recon"]:
@@ -978,19 +1165,18 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         if tparts:
             summary_lines.append(f"{name} HC:  " + " ".join(tparts))
     summary = "\n".join(summary_lines)
-    # (Requested swap) Put summary text into Row 6 middle.
-    summary_text = axes[5, 1].text(
+    summary_text = axes[7, 1].text(
         0.0,
         0.5,
         summary,
         fontsize=11,
         family="monospace",
         verticalalignment="center",
-        transform=axes[5, 1].transAxes,
+        transform=axes[7, 1].transAxes,
     )
     # Exclude summary panel from tight_layout geometry calculation.
     summary_text.set_in_layout(False)
-    axes[5, 1].set_in_layout(False)
+    axes[7, 1].set_in_layout(False)
 
     # Reserve top margin for suptitle/legend without squeezing columns.
     fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.93])

@@ -134,7 +134,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt.py
 
 By default, `train_gpt.py` keeps its ~10 minute wallclock cap. If you want a longer run, override it explicitly, for example `MAX_WALLCLOCK_SECONDS=0`.
 
-By default, this command prints `train_loss` step logs during training and prints `val_loss`, `val_bpb`, and compressed model size in the final `final_int8_zlib_roundtrip` lines at the end. If you want periodic validation logs during the run, set `VAL_LOSS_EVERY`, for example `VAL_LOSS_EVERY=200`. For the baseline config, the final `val_bpb` should land around ~1.2 with a compressed model size under 16MB.
+By default, this command prints `train_loss` step logs during training, including NTP/CTP, auxiliary loss components, and Parcae/RevDEQ damping diagnostics. The auxiliary fields include `router_reg_loss`, raw components (`router_cv_loss`, `router_entropy_loss`, `mos_cv_loss`, `expert_diversity_loss`, `mos_diversity_loss`), and effective coefficients (`*_coef_eff`) so comparison plots can show raw and weighted terms separately. The Parcae fields track `Ā`, `β`, `B̄`, `Δ`, and reconstruction amplification. It then prints `val_loss`, `val_bpb`, and compressed model size in the final `final_int8_zlib_roundtrip` lines at the end. If you want periodic validation logs during the run, set `VAL_LOSS_EVERY`, for example `VAL_LOSS_EVERY=200`. For the baseline config, the final `val_bpb` should land around ~1.2 with a compressed model size under 16MB.
 
 For dataset export, tokenizer export, and docs-cache rebuild instructions, see [data/README.md](data/README.md).
 

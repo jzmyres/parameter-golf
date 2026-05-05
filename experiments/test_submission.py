@@ -20,6 +20,13 @@ MAX_ARTIFACT_BYTES = 16_000_000  # 16MB hard limit
 MAX_QUANT_DEGRADATION = 0.05     # max allowed val_loss increase from quantization
 
 
+def _cuda_available_or_skip(name: str) -> bool:
+    if torch.cuda.is_available():
+        return True
+    print(f"=== SKIP: {name} requires CUDA ===")
+    return False
+
+
 def _build_model():
     """Build model with the production Hyperparameters.
 
@@ -40,30 +47,40 @@ def _build_model():
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
         deq_beta=args.deq_beta,
-        attn_balance_mult=args.attn_balance_mult,
-        mlp_balance_mult=args.mlp_balance_mult,
-        mos_balance_mult=args.mos_balance_mult,
-        bal_loss_coef=args.bal_loss_coef,
-        router_health_coef=args.router_health_coef,
-        mos_ortho_out_coef=args.mos_ortho_out_coef,
         deq_bptt_k=args.deq_bptt_k,
-        block_ortho_aux_coef=args.block_ortho_aux_coef,
-        block_ortho_aux_every=args.block_ortho_aux_every,
-        block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         router_scoring=args.router_scoring,
         router_entropy_coef=args.router_entropy_coef,
-        router_entropy_warmup_delay_frac=args.router_entropy_warmup_delay_frac,
+        use_entmax_routing=args.use_entmax_routing,
+        entmax_blend_init_logit=args.entmax_blend_init_logit,
+        entmax_blend_warmup_delay_frac=args.entmax_blend_warmup_delay_frac,
         num_experts=args.num_experts,
         num_shared_experts=args.num_shared_experts,
+        use_smear_gate=args.use_smear_gate,
+        smear_gate_init=args.smear_gate_init,
+        smear_gate_bos_id=args.smear_gate_bos_id,
+        logit_softcap=args.logit_softcap,
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
-        lyapunov_warmup_frac=args.lyapunov_warmup_frac,
         use_parcae=args.use_parcae,
         parcae_init_a_bar=args.parcae_init_a_bar,
         parcae_init_b_bar=args.parcae_init_b_bar,
-        min_share_loss_weight=args.min_share_loss_weight,
-        cv_loss_weight=args.cv_loss_weight,
         use_ctp=args.use_ctp,
+        ctp_weight=args.ctp_weight,
+        router_load_cv_coef=args.router_load_cv_coef,
+        mos_load_cv_coef=args.mos_load_cv_coef,
+        cv_target=args.cv_target,
+        mos_cv_target=args.mos_cv_target,
+        expert_diversity_kind=args.expert_diversity_kind,
+        expert_output_diversity_coef=args.expert_output_diversity_coef,
+        expert_diversity_every=args.expert_diversity_every,
+        expert_diversity_max_tokens=args.expert_diversity_max_tokens,
+        mos_output_diversity_coef=args.mos_output_diversity_coef,
+        regularizer_warmup_frac=args.regularizer_warmup_frac,
+        use_nsa_attention=args.use_nsa_attention,
+        nsa_compress_block_size=args.nsa_compress_block_size,
+        nsa_compress_block_sliding_stride=args.nsa_compress_block_sliding_stride,
+        nsa_sliding_window_size=args.nsa_sliding_window_size,
+        nsa_branch_gate_init=args.nsa_branch_gate_init,
     ).cuda()
     return model, args
 
@@ -121,6 +138,8 @@ def _decompress_and_load(model, quant_blob, sd_cpu):
 
 def test_artifact_size():
     """Test that quantized + compressed artifact fits within 16MB."""
+    if not _cuda_available_or_skip("Artifact Size"):
+        return None
     print("=== Test: Artifact Size ===")
     model, args = _build_model()
     model = _train_few_steps(model, num_steps=5)
@@ -149,6 +168,8 @@ def test_artifact_size():
 
 def test_quantization_roundtrip():
     """Test that quantized model performance matches unquantized within tolerance."""
+    if not _cuda_available_or_skip("Quantization Roundtrip Fidelity"):
+        return None
     print("=== Test: Quantization Roundtrip Fidelity ===")
     model, args = _build_model()
     model = _train_few_steps(model, num_steps=20)
@@ -182,6 +203,8 @@ def test_quantization_roundtrip():
 
 def test_roundtrip_deterministic():
     """Test that quantize -> decompress -> re-quantize produces stable sizes."""
+    if not _cuda_available_or_skip("Roundtrip Determinism"):
+        return None
     print("=== Test: Roundtrip Determinism ===")
     model, _ = _build_model()
     model = _train_few_steps(model, num_steps=5)

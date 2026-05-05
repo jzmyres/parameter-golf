@@ -97,11 +97,21 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
         num_experts=args.num_experts,
         num_shared_experts=args.num_shared_experts,
         use_ctp=args.use_ctp,
+        deq_bptt_k=args.deq_bptt_k,
     ).cuda()
 
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
     losses, ntp_losses, ctp_losses = [], [], []
-    recon_errors, iter_convs, residuals = [], [], []
+    # Two RevDEQ-reversibility recon terms (CLAUDE.md §6.1):
+    #  - `x0_recon_loss`: ||z_rec - z_0|| / ||z_0||. Reverse-result vs initial
+    #    state. Under full BPTT (K_bwd == K) this is true reconstruction error;
+    #    under TBPTT this becomes the FP-travel gauge (reverse doesn't reach
+    #    x0). Stays informative as a "FP has moved" signal.
+    #  - `tbptt_recon_loss`: ||z_rec - z_snap|| / ||z_snap|| where z_snap is
+    #    captured during forward at iter `K - K_bwd`, the state where backward
+    #    will land. True reversibility error within the TBPTT window — fp64
+    #    floor when math is sound; honest "broken-budget" signal otherwise.
+    x0_recon_loss, tbptt_recon_loss, iter_convs, residuals = [], [], [], []
     expert_snapshots = []
     has_bad_grad = False  # accumulate across ALL steps (not just last)
 
@@ -137,21 +147,29 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
                     model.forward_logits(ex)
             r = model._deq_residuals[0] if model._deq_residuals else 0.0
             residuals.append(r)
-            # Under TBPTT (deq_bptt_k > 0), the metric is "distance travelled"
-            # not true reconstruction. The attr was renamed accordingly; fall
-            # back to the legacy name for forward-compat.
-            recon_err = getattr(model.shared_block, "_deq_distance_travelled_last_bwd", None)
-            if recon_err is None:
-                recon_err = getattr(model.shared_block, "_deq_recon_error_last_bwd", None)
-            if hasattr(recon_err, "item"):
-                recon_err = recon_err.item()
-            recon_errors.append(recon_err)
-            iter_convs.append(model._deq_iter_convergence)
+            # `tbptt_recon_loss` ← `_deq_recon_error_last_bwd` (snapshot-based)
+            # `x0_recon_loss`    ← `_deq_distance_travelled_last_bwd` (vs z_0)
+            def _scalar(attr: str):
+                t = getattr(model.shared_block, attr, None)
+                return t.item() if isinstance(t, torch.Tensor) else t
+            tb = _scalar("_deq_recon_error_last_bwd")
+            x0 = _scalar("_deq_distance_travelled_last_bwd")
+            tbptt_recon_loss.append(tb)
+            x0_recon_loss.append(x0)
+            # Use relative iter convergence ||z_T - z_{T-1}|| / ||z_T||; the
+            # absolute version grows with ||z_T|| during training even when
+            # the relative FP approach stays tight (CLAUDE.md §6.1).
+            iter_conv_rel = getattr(model, "_deq_iter_convergence_rel", None)
+            if iter_conv_rel is None:
+                iter_conv_rel = model._deq_iter_convergence
+            iter_convs.append(iter_conv_rel)
             diag = _get_expert_diagnostics(model)
             expert_snapshots.append(diag)
-            recon_str = f"{recon_err:.2e}" if recon_err is not None else "N/A"
+            tb_str = f"{tb:.2e}" if tb is not None else "N/A"
+            x0_str = f"{x0:.2e}" if x0 is not None else "N/A"
             print(f"  step {i+1}: loss={losses[-1]:.4f} ntp={ntp_losses[-1]:.4f} ctp={ctp_losses[-1]:.4f} "
-                  f"recon={recon_str} iter_conv={model._deq_iter_convergence:.1f} residual={r:.1f}")
+                  f"x0_recon_loss={x0_str} tbptt_recon_loss={tb_str} "
+                  f"iter_conv_rel={iter_conv_rel:.4f} residual={r:.1f}")
             if "mlp_usage" in diag:
                 print(f"    mlp: usage={diag['mlp_usage']} entropy={diag['mlp_entropy']:.4f} "
                       f"balance_cv={diag['mlp_balance_cv']:.4f} ortho={diag.get('mlp_ortho', 0):.4f}")
@@ -170,8 +188,9 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
     print(f"Total loss:        {losses[0]:.4f} -> {losses[-1]:.4f} (delta={losses[-1]-losses[0]:+.4f})")
     print(f"NTP loss:          {ntp_losses[0]:.4f} -> {ntp_losses[-1]:.4f} (delta={ntp_losses[-1]-ntp_losses[0]:+.4f})")
     print(f"CTP loss:          {ctp_losses[0]:.4f} -> {ctp_losses[-1]:.4f} (delta={ctp_losses[-1]-ctp_losses[0]:+.4f})")
-    print(f"Recon errors:      {' -> '.join(f'{e:.2e}' if e is not None else 'N/A' for e in recon_errors)}")
-    print(f"Iter convergence:  {' -> '.join(f'{c:.1f}' for c in iter_convs)}")
+    print(f"x0_recon_loss:     {' -> '.join(f'{e:.2e}' if e is not None else 'N/A' for e in x0_recon_loss)}")
+    print(f"tbptt_recon_loss:  {' -> '.join(f'{e:.2e}' if e is not None else 'N/A' for e in tbptt_recon_loss)}")
+    print(f"Iter conv (rel):   {' -> '.join(f'{c:.4f}' for c in iter_convs)}")
     print(f"DEQ residuals:     {' -> '.join(f'{r:.1f}' for r in residuals)}")
 
     ok = True
@@ -188,24 +207,27 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
             else:
                 print(f"WARN: {name} loss not decreasing (first_q={first_q_avg:.4f} -> last_q={last_q_avg:.4f})")
 
-    # 2. Reconstruction error gate — bf16-aware.
-    # The smoke test trains in bf16 autocast so the precision floor is ~1e-3, not 1e-8.
-    # What we actually care about is that reversibility is not diverging: if recon_err
-    # stays in a small band over training, the RevDEQ fp64 accumulators are working as
-    # designed (the residual is a pure bf16 forward-precision limit). If recon_err is
-    # catastrophically large or growing, the reversibility invariant is broken.
-    if any(e is None for e in recon_errors):
-        print("FAIL: reconstruction error missing in RevDEQ mode")
+    # 2. Reconstruction error gate — bf16-aware, snapshot-based (CLAUDE.md §6.1).
+    # `tbptt_recon_loss` is the snapshot-based ||z_rec - z_snap||/||z_snap||,
+    # the decision-grade reversibility signal under any K_bwd. Smoke runs bf16
+    # autocast, so the precision floor is ~1e-3 not 1e-12. Catastrophic
+    # divergence (>1e-1) or unbounded growth (>5x first sample) means the
+    # RevDEQ math is broken or the bf16 budget is exceeded for this K.
+    # `x0_recon_loss` (||z_rec - z_0||) is informational only — it's expected
+    # to grow as the model learns and the FP moves further from z_init under
+    # TBPTT (where it's FP travel rather than true recon).
+    if any(e is None for e in tbptt_recon_loss):
+        print("FAIL: tbptt_recon_loss missing in RevDEQ mode")
         ok = False
     else:
         # Absolute ceiling: > 1e-1 means reversibility is clearly broken even for bf16.
-        if any(e > 1e-1 for e in recon_errors):
-            print(f"FAIL: reconstruction error > 1e-1 (got {max(recon_errors):.2e}) — reversibility broken")
+        if any(e > 1e-1 for e in tbptt_recon_loss):
+            print(f"FAIL: tbptt_recon_loss > 1e-1 (got {max(tbptt_recon_loss):.2e}) — reversibility broken")
             ok = False
 
         # Divergence check: last > 5x first means recon is growing unboundedly.
-        if len(recon_errors) >= 2 and recon_errors[-1] > max(recon_errors[0] * 5, 1e-10):
-            print(f"FAIL: reconstruction error diverging ({recon_errors[0]:.2e} -> {recon_errors[-1]:.2e})")
+        if len(tbptt_recon_loss) >= 2 and tbptt_recon_loss[-1] > max(tbptt_recon_loss[0] * 5, 1e-10):
+            print(f"FAIL: tbptt_recon_loss diverging ({tbptt_recon_loss[0]:.2e} -> {tbptt_recon_loss[-1]:.2e})")
             ok = False
 
     # 4. Convergence MUST decrease: DEQ model must be trained to find a fixed point.

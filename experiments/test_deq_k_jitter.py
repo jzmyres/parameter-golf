@@ -1,9 +1,8 @@
 """K-jitter / sampler tests aligned to current defaults.
 
-User directive 2026-04-28: K-jitter is disabled, K fixed at 16. The shuffle-bag
-sampler is retained for future re-enable but is short-circuited at runtime when
-`deq_k_jitter=False`. Tests cover the SAMPLER mechanics (independent of the
-flag) and the Hyperparameters defaults that gate it.
+Current baseline enables forward-K jitter over {16, 24}; TBPTT-k jitter remains
+disabled with fixed k=3. Tests cover the sampler mechanics and the
+Hyperparameters defaults that gate it.
 """
 import os
 import sys
@@ -21,18 +20,18 @@ class TestDeqKJitterDefaults(unittest.TestCase):
         # Required fields.
         for f in ("deq_k_jitter", "deq_k_min", "deq_k_max", "deq_k_eval", "deq_k_jitter_set"):
             self.assertTrue(hasattr(Hyperparameters, f), f"missing field: {f}")
-        # Current baseline: jitter disabled, K fixed at 16 (matches deq_k_eval).
-        self.assertEqual(Hyperparameters.deq_k_jitter, False)
-        self.assertEqual(Hyperparameters.deq_k_max, 16)
+        # Current baseline: forward-K jitter over {16, 24}; eval remains K=16.
+        self.assertEqual(Hyperparameters.deq_k_jitter, True)
+        self.assertEqual(Hyperparameters.deq_k_max, 24)
         self.assertEqual(Hyperparameters.deq_k_eval, 16)
-        self.assertEqual(Hyperparameters.deq_k_jitter_set, (16,))
+        self.assertEqual(Hyperparameters.deq_k_jitter_set, (16, 24))
         self.assertGreaterEqual(Hyperparameters.deq_k_min, 2)
 
     def test_bptt_k_jitter_defaults(self):
-        # User directive 2026-04-28: TBPTT-k jitter also disabled, k=2 fixed.
+        # TBPTT-k jitter is disabled; fixed k=3 is the promoted default.
         self.assertFalse(Hyperparameters.deq_bptt_k_jitter)
-        self.assertEqual(Hyperparameters.deq_bptt_k_jitter_set, (2,))
-        self.assertEqual(Hyperparameters.deq_bptt_k, 2)
+        self.assertEqual(Hyperparameters.deq_bptt_k_jitter_set, (3,))
+        self.assertEqual(Hyperparameters.deq_bptt_k, 3)
 
     def test_cli_override_parses_bool(self):
         ov = _parse_cli_overrides(["--deq-k-jitter", "0"])

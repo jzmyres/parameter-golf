@@ -39,7 +39,7 @@ class TestRouterDiagnostics(unittest.TestCase):
 
         Ensure we still get:
         - dense (train-step) mlp/attn router diagnostics when enabled
-        - balance regularizers that carry gradients (not detached)
+        - CV load regularizers that carry gradients (not detached)
         """
         from train_gpt import GPT, router_diagnostics
 
@@ -61,7 +61,6 @@ class TestRouterDiagnostics(unittest.TestCase):
             bigram_dim=0,
             kv_latent_dim=0,
             num_refinements=1,
-            deq_backward="revdeq",
         ).cuda().bfloat16()
         model.train(True)
 
@@ -77,10 +76,10 @@ class TestRouterDiagnostics(unittest.TestCase):
         attn_r = model.shared_block.attn.attn_router
         self.assertIsInstance(mlp_r._expert_usage, list)
         self.assertIsInstance(attn_r._expert_usage, list)
-        self.assertIsNotNone(mlp_r._balance_loss)
-        self.assertIsNotNone(attn_r._balance_loss)
-        self.assertTrue(getattr(mlp_r._balance_loss, "requires_grad", False))
-        self.assertTrue(getattr(attn_r._balance_loss, "requires_grad", False))
+        self.assertIsNotNone(mlp_r._cv_loss_raw)
+        self.assertIsNotNone(attn_r._cv_loss_raw)
+        self.assertTrue(getattr(mlp_r._cv_loss_raw, "requires_grad", False))
+        self.assertTrue(getattr(attn_r._cv_loss_raw, "requires_grad", False))
 
 
 if __name__ == "__main__":

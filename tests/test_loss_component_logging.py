@@ -1,0 +1,103 @@
+import os
+import sys
+import unittest
+
+import torch
+
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+
+class TestLossComponentLogging(unittest.TestCase):
+    def test_router_cv_uses_combined_allocation_and_gate_mass(self) -> None:
+        from train_gpt import SoftDenseRouter
+
+        router = SoftDenseRouter(dim=4, num_experts=4, cv_target=0.0)
+        router.train()
+        x = torch.zeros(2, 3, 4)
+        with torch.no_grad():
+            router.router.weight.zero_()
+            router.expert_bias.zero_()
+            router.router_gate.weight.zero_()
+            router.router_gate.bias.fill_(-5.0)
+        _ = router(x)
+        uniform_low_mass = float(router._cv_loss_raw.detach().item())
+
+        with torch.no_grad():
+            router.router_gate.bias[:] = torch.tensor([5.0, 5.0, 5.0, -5.0])
+        _ = router(x)
+        gated_imbalance = float(router._cv_loss_raw.detach().item())
+
+        self.assertLess(uniform_low_mass, 1e-8)
+        self.assertGreater(gated_imbalance, 1e-3)
+
+    def test_gpt_exposes_detached_loss_component_tensors(self) -> None:
+        from train_gpt import GPT
+
+        torch.manual_seed(0)
+        model = GPT(
+            vocab_size=32, num_layers=1, model_dim=32, num_heads=4,
+            num_kv_heads=2, mlp_mult=1.0, tie_embeddings=False,
+            tied_embed_init_std=0.01, rope_base=10000.0, qk_gain_init=1.0,
+            bigram_vocab_size=0, bigram_dim=8, kv_latent_dim=0,
+            num_refinements=0, attn_expert_rank=4, mlp_expert_rank=4,
+            num_experts=4, num_shared_experts=1, use_ctp=False,
+            router_entropy_coef=0.01, expert_output_diversity_coef=0.1,
+            expert_diversity_max_tokens=4,
+        )
+        model.train()
+        model._expert_diversity_aux_enabled = True
+        model._expert_diversity_coef_scale = 0.5
+        model._aux_grad_accum_scale = 2.0
+        model._expert_diversity_token_start = 1
+
+        input_ids = torch.randint(0, 32, (1, 6))
+        target_ids = torch.randint(0, 32, (1, 6))
+        loss = model(input_ids, target_ids)
+
+        self.assertTrue(loss.requires_grad)
+        for name in [
+            "_router_cv_loss_t", "_router_entropy_loss_t", "_mos_cv_loss_t",
+            "_expert_diversity_loss_t", "_mos_diversity_loss_t", "_router_reg_loss_t",
+            "_router_cv_coef_eff_t", "_router_entropy_coef_eff_t",
+            "_mos_cv_coef_eff_t", "_expert_diversity_coef_eff_t",
+            "_mos_diversity_coef_eff_t",
+        ]:
+            t = getattr(model, name)
+            self.assertIsInstance(t, torch.Tensor, name)
+            self.assertEqual(tuple(t.shape), (), name)
+            self.assertFalse(t.requires_grad, name)
+            self.assertTrue(torch.isfinite(t.detach()).item(), name)
+
+        self.assertAlmostEqual(float(model._router_cv_coef_eff_t.item()), 0.5)
+        self.assertAlmostEqual(float(model._router_entropy_coef_eff_t.item()), 0.01)
+        self.assertAlmostEqual(float(model._mos_cv_coef_eff_t.item()), 0.25)
+        self.assertAlmostEqual(float(model._expert_diversity_coef_eff_t.item()), 0.1)
+        self.assertAlmostEqual(float(model._mos_diversity_coef_eff_t.item()), 0.0)
+        expected_router_reg = (
+            float(model._router_cv_loss_t.item()) * float(model._router_cv_coef_eff_t.item())
+            + float(model._router_entropy_loss_t.item()) * float(model._router_entropy_coef_eff_t.item())
+            + float(model._mos_cv_loss_t.item()) * float(model._mos_cv_coef_eff_t.item())
+            + float(model._expert_diversity_loss_t.item()) * float(model._expert_diversity_coef_eff_t.item())
+            + float(model._mos_diversity_loss_t.item()) * float(model._mos_diversity_coef_eff_t.item())
+        )
+        self.assertAlmostEqual(float(model._router_reg_loss_t.item()), expected_router_reg, places=6)
+
+    def test_deterministic_token_window_start_is_stable_and_bounded(self) -> None:
+        from train_gpt import _deterministic_token_window_start
+
+        first = _deterministic_token_window_start(seed=42, step=8, seqlen=128, max_tokens=64)
+        second = _deterministic_token_window_start(seed=42, step=8, seqlen=128, max_tokens=64)
+        self.assertEqual(first, second)
+        self.assertGreaterEqual(first, 0)
+        self.assertLessEqual(first, 64)
+        self.assertEqual(_deterministic_token_window_start(42, 8, seqlen=32, max_tokens=64), 0)
+        starts = {
+            _deterministic_token_window_start(seed=42, step=step, seqlen=128, max_tokens=64)
+            for step in range(8, 80, 8)
+        }
+        self.assertGreater(len(starts), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

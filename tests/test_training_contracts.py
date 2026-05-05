@@ -57,6 +57,78 @@ class TestTrainingContracts(unittest.TestCase):
         self.assertEqual(len(bpb_lines), 1)
         self.assertIn("|| true", bpb_lines[0])
 
+    def test_training_log_emits_auxiliary_loss_components(self) -> None:
+        text = TRAIN_GPT.read_text()
+        required_fields = [
+            "router_cv_loss:",
+            "router_entropy_loss:",
+            "mos_cv_loss:",
+            "expert_diversity_loss:",
+            "mos_diversity_loss:",
+            "router_reg_loss:",
+            "router_cv_coef_eff:",
+            "router_entropy_coef_eff:",
+            "mos_cv_coef_eff:",
+            "expert_diversity_coef_eff:",
+            "mos_diversity_coef_eff:",
+        ]
+        for field in required_fields:
+            self.assertIn(field, text)
+        self.assertIn("router_reg_loss:{_log_tensor_attr('_router_reg_loss_t')", text)
+
+    def test_training_log_emits_parcae_diagnostics(self) -> None:
+        text = TRAIN_GPT.read_text()
+        required_fields = [
+            "parcae_a_bar_min:",
+            "parcae_a_bar_mean:",
+            "parcae_a_bar_max:",
+            "parcae_a_bar_core_max:",
+            "parcae_beta_mean:",
+            "parcae_beta_max:",
+            "parcae_b_bar_mean:",
+            "parcae_b_bar_max:",
+            "parcae_delta_mean:",
+            "parcae_delta_max:",
+            "parcae_recon_amp_log10:",
+        ]
+        for field in required_fields:
+            self.assertIn(field, text)
+        self.assertIn("def parcae_diagnostics", text)
+
+    def test_update_results_log_summary_tolerates_missing_auxiliary_fields(self) -> None:
+        text = UPDATE_RESULTS.read_text()
+        router_reg_lines = [line for line in text.splitlines() if "router_reg_loss:\\K" in line]
+        self.assertEqual(len(router_reg_lines), 1)
+        self.assertIn("|| true", router_reg_lines[0])
+        self.assertIn("extract_aux_terms", text)
+        for key in [
+            "router_cv_loss",
+            "router_entropy_loss",
+            "mos_cv_loss",
+            "expert_diversity_loss",
+            "mos_diversity_loss",
+        ]:
+            self.assertIn(key, text)
+
+    def test_update_results_log_summary_tolerates_missing_parcae_fields(self) -> None:
+        text = UPDATE_RESULTS.read_text()
+        self.assertIn("extract_parcae_state", text)
+        self.assertIn("parcae=${parcae_state:-?}", text)
+        for key in [
+            "parcae_a_bar_min",
+            "parcae_a_bar_mean",
+            "parcae_a_bar_max",
+            "parcae_a_bar_core_max",
+            "parcae_beta_mean",
+            "parcae_beta_max",
+            "parcae_b_bar_mean",
+            "parcae_b_bar_max",
+            "parcae_delta_mean",
+            "parcae_delta_max",
+            "parcae_recon_amp_log10",
+        ]:
+            self.assertIn(key, text)
+
 
 if __name__ == "__main__":
     unittest.main()

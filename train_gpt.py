@@ -97,6 +97,24 @@ def _unwrap_compiled_module(m: nn.Module) -> nn.Module:
     return cur
 
 
+def _deterministic_token_window_start(seed: int, step: int, seqlen: int, max_tokens: int) -> int:
+    """Deterministically choose a contiguous token window start for aux losses."""
+    seqlen_i = max(int(seqlen), 0)
+    if seqlen_i <= 0:
+        return 0
+    window = min(max(1, int(max_tokens)), seqlen_i)
+    span = seqlen_i - window + 1
+    if span <= 1:
+        return 0
+    mask = (1 << 64) - 1
+    x = (int(seed) & mask) ^ ((int(step) * 0x9E3779B97F4A7C15) & mask) ^ 0xD1B54A32D192ED03
+    x &= mask
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask
+    x = (x ^ (x >> 31)) & mask
+    return int(x % span)
+
+
 @contextlib.contextmanager
 def _temporary_deq_k_override(model: nn.Module, k: int):
     base_m = _unwrap_compiled_module(model)
@@ -330,18 +348,10 @@ class Hyperparameters:
     tied_embed_init_std = 0.005
 
     # Routing
-    attn_balance_mult = 5.0
-    mlp_balance_mult = 1.0
-    # iter 26-lb-loss: 50× multiplier on MoS NTP balance loss fixed dead-expert
-    # collapse where WD could not (H26).  Promoted from hardcoded literal so the
-    # retry-prescription path can recommend bumping it for mos_*_min_share.
-    mos_balance_mult = 50.0
-    bal_loss_coef = 5e-3
-    router_health_coef = 0.25
-    block_ortho_aux_coef = 0.1  # partial restore from 0 (H32 was too aggressive — attn/mlp ortho drifted to 0.82, near the 0.9 gate fail). 0.1 keeps gradient pressure without dominating, preserves H32's "loss shouldn't chase gates" spirit while keeping experts apart.
-    block_ortho_aux_every = 8  # T-opt 19: double interval (4→8) to halve ortho_aux cost
-    block_ortho_aux_tokens = 64
-    router_bias_update = True
+    # CV hinge is the canonical anti-collapse mechanism. Keep the no-grad
+    # router-bias controller disabled by default; re-enable only if CV alone
+    # proves insufficient to prevent dead experts.
+    router_bias_update = False
     router_bias_lr = 0.10
     router_bias_clip = 10.0
     # Phase 9 iter 70: switch L2→linear dot-product routing for effective depth.
@@ -371,35 +381,34 @@ class Hyperparameters:
     # Config reverted to iter 117 v5 / iter 100b value (0.005). Future
     # iters targeting specialization should use joint-reg approaches
     # (iter 112 Gram-matrix penalty H84) rather than entropy magnitude.
-    # iter-142-refactor: direct coef on per-token H_pertoken in the flat loss
-    # assembly. Default preserves the historical effective magnitude
-    # (router_health_coef × router_entropy_coef = 0.25 × 0.005 = 0.00125).
-    router_entropy_coef = 0.00125
-    # iter-142-refactor: direct coef on the raw routing CV (sum across slices).
-    # Default approximates the historical effective magnitude under typical
-    # mid-training CV; was nested as router_health_coef × cv_loss_weight.
+    # Direct coefficients in the flat regularization assembly. The full
+    # objective is:
+    #   loss = ntp + ctp_weight · ctp
+    #        + router_load_cv_coef · Σ_r relu(cv_r − cv_target)²
+    #        + mos_load_cv_coef    · Σ_h relu(cv_h − mos_cv_target)²
+    #        + router_entropy_coef · Σ_r H_pertoken(r)
+    #        + expert_output_diversity_coef · diversity(expert outputs)
+    #        + mos_output_diversity_coef    · diversity(MoS low-rank states)
+    # CV losses are active from step 0; entropy + diversity ramp from 0 over
+    # `regularizer_warmup_frac` of training.
     router_load_cv_coef = 0.5
-    # iter-142-refactor: direct coef on MoS gate CV. Default preserves the
-    # legacy mos_balance_mult × bal_loss_coef = 50 × 5e-3 = 0.25 magnitude.
     mos_load_cv_coef = 0.25
-    # Annealing schedule (iter 100b): scale = 0 for time_frac < warmup_delay_frac,
-    # then linear ramp 0 → 1 over remaining training. Final effective coef =
-    # router_entropy_coef × scale. Avoids cold-start trap (router needs free
-    # softmax exploration early; sparsity pressure ramps in once routing has
-    # stabilized).
-    router_entropy_warmup_delay_frac = 0.3
-    # Per-token expert-OUTPUT diversity penalty (iter 141 + iter-142-refactor).
-    # Operand: stack of expert outputs Y_t = [y_1(x_t), ..., y_E(x_t)] ∈ ℝ^{E×D}.
-    # `expert_diversity_kind` selects the formulation:
-    #   frobenius: G = (Y_t Y_t^T)/D; loss = E_t[‖G − I/E‖²_F]. Subsumes
-    #             block_ortho via Jensen; couples direction + per-expert norm.
-    #   cosine:    Y' = normalize(Y_t); G = Y' Y'^T; loss = mean(off_diag²).
-    #             Scale-invariant; only direction.
-    # Strict-gen at coef=0 → recovers pre-iter-141 forward map exactly.
-    expert_diversity_kind = "frobenius"
-    expert_gram_coef = 0.0
-    expert_gram_warmup_delay_frac = 0.3
-    expert_gram_max_tokens = 64  # subsample tokens per block for cost control
+    router_entropy_coef = 0.00125
+    # Per-token expert-OUTPUT diversity (replaces block_ortho_aux + iter 141 expert_gram).
+    # `expert_diversity_kind`:
+    #   cosine    (default): Y' = normalize(Y); loss = mean(off_diag(Y' Y'^T)²).
+    #             Scale-invariant; penalizes direction only — preferred since
+    #             norm is the optimizer's responsibility.
+    #   frobenius: G = (Y Y^T)/D; loss = E_t[‖G − I/E‖²_F]. Couples direction
+    #             AND per-expert norm; useful for explicit norm regularization.
+    expert_diversity_kind = "cosine"
+    expert_output_diversity_coef = 0.1
+    expert_diversity_every = 8       # cadence: aux fires every N optimizer steps
+    expert_diversity_max_tokens = 64
+    mos_output_diversity_coef = 0.0  # per-token Gram on MoS low-rank states; default off
+    cv_target = 0.20      # router CV hinge: relu(cv − cv_target)²
+    mos_cv_target = 0.20  # MoS CV hinge
+    regularizer_warmup_frac = 0.30  # shared linear ramp for entropy + diversity
     # iter 129 / H99 (NEW 2026-05-04): SmearGate — position-mixing memory channel.
     # `x[t] += g · x[t-1] · not_bos_mask` after embedding lookup. BOS-fixed
     # (mask suppresses leak across packed-doc boundaries; SP BOS_ID=1).
@@ -499,35 +508,27 @@ class Hyperparameters:
     # step 0 is now EXACT (anneal=0 → pure softmax = iter 100b forward map).
     # Mirrors the entropy/variance warmup_delay_frac=0.3 pattern.
     entmax_blend_warmup_delay_frac = 0.3
-    # SoftDenseRouter loss weights — promoted from hardcoded literals (Block.__init__
-    # at L2415-2416) to Hyperparameters per §9 single-source-of-truth + the
-    # hyperparameter fan-out invariant (EXPERIENCE.md#hyperparameter-fanout).
-    # Iter 100b: min_share floor dropped (entropy decoupled from CV); CV weight
-    # raised 0.10 → 2.0 to compensate (H76).
-    min_share_loss_weight = 0.0
-    cv_loss_weight = 2.0
-    mos_ortho_out_coef = 0.0  # disabled — same rationale as block_ortho_aux_coef (loss focuses on task; max_pairwise GATE catches collapse)
 
     # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
     # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
     # power-iteration VJP. One boundary forward + one VJP per step.
     # Phase 9 iter 88 (2026-04-25): Lyapunov hinge penalty disabled (0.01 → 0).
-    # Hypothesis: under iter-66b Parcae per-dim Ā, the spectral radius is
-    # already bounded away from 1 by construction (Ā ∈ [0.1, 1) via the
-    # reversibility floor + softplus reparam), so the Hutchinson-Frobenius
-    # ρ(J)<γ hinge has nothing to grip on at training time.  Set λ_jac = 0;
+    # Hypothesis: under iter-66b Parcae per-dim Ā, the solver's
+    # reversibility/stability is improved by the bounded decay path; contraction
+    # of the full nonlinear block remains empirical and is monitored by K-sweep
+    # / fixed-point diagnostics. The Hutchinson-Frobenius probe was redundant in
+    # practice. Set λ_jac = 0;
     # if val_bpb regresses by > 0.03 OR K-sweep widens > 0.5, restore.
     lyapunov_coef = 0.0        # λ_jac: weight of hinge penalty (iter 88: disabled)
     lyapunov_gamma = 0.97      # iter 74b: raise from 0.9 — preserve faster warmup observed at γ=0.95 (H57)
-    lyapunov_warmup_frac = 0.05 # T-opt 20: shorter warmup (10%→5%) — penalty near zero during warmup anyway
     # Phase 9 iter 55: Denoising regularization (HyDRA 2026, Efficient DEQ 2025).
     # ||f(z*+ε, x0) - z*||² penalizes contraction failure at finite perturbation.
     # Complements Hutchinson (which penalizes ||J||²_F at infinitesimal scale).
     # Phase 9 iter 89 (2026-04-25): HyDRA denoising disabled (0.01 → 0).
     # Same hypothesis as iter 88 for the finite-perturbation contraction probe:
-    # under iter-66b Parcae per-dim Ā, the spectral radius is bounded away
-    # from 1 by construction, so ||f(z*+ε, x0) - z*||² has nothing to grip
-    # on at training time.  If the hypothesis holds, denoising contributes
+    # Parcae-style damping improves solver reversibility/stability, but does not
+    # certify contraction of the full nonlinear block; contraction remains
+    # empirically monitored. If the probe is redundant, denoising contributes
     # only noise + one extra block forward per step.  Code path retained
     # (commented-out future cleanup permitted per user directive 2026-04-25).
     denoising_coef = 0.0       # weight of denoising loss (iter 89: disabled)
@@ -555,7 +556,7 @@ class Hyperparameters:
     # sampler short-circuits to `args.deq_bptt_k` when `deq_bptt_k_jitter=False`
     # — the singleton set below is kept for state-dict / config compat.
     deq_bptt_k_jitter = False
-    deq_bptt_k_jitter_set = (2,)
+    deq_bptt_k_jitter_set = (3,)  # tracks deq_bptt_k=3; jitter disabled, value is state-dict/config cosmetic
     # TBPTT investigation (28-28d) concluded; best point was 28c (val_bpb
     # 1.925, K=128 Δ=0.015 vs baseline 0.039).  Machinery retained in code
     # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
@@ -628,19 +629,13 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "max-training-seconds", "max-wallclock-seconds",  # max-wallclock-seconds is a deprecated alias
     "grad-accum-multiplier",
     "num-heads", "num-kv-heads",
-    "attn-balance-mult", "mlp-balance-mult",
-    "mos-balance-mult", "bal-loss-coef", "router-health-coef",
-    "mos-ortho-out-coef", "block-ortho-aux-coef", "block-ortho-aux-every",
-    "block-ortho-aux-tokens", "bigram-vocab-size", "bigram-dim",
+    "bigram-vocab-size", "bigram-dim",
     "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
     "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
     "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
     "warmdown-frac", "num-refinements-ramp-frac",
-    "min-share-loss-weight", "cv-loss-weight",
-    "router-entropy-coef", "router-entropy-warmup-delay-frac",
+    "router-entropy-coef",
     "entmax-blend-init-logit", "entmax-blend-warmup-delay-frac", "entmax-blend-lr",
-    # iter 141 — per-token expert-output Gram penalty
-    "expert-gram-coef", "expert-gram-warmup-delay-frac", "expert-gram-max-tokens",
     # iter 129 / H99 — SmearGate (default off; --use-smear-gate=1 to enable)
     "smear-gate-init", "smear-gate-bos-id",
     # iter 122 H93 — logit softcap (Gemma2-style)
@@ -649,11 +644,15 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "sparse-dispatch-capacity-factor",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     "denoising-coef", "denoising-noise-std",
-    "lyapunov-coef", "lyapunov-gamma", "lyapunov-warmup-frac",
+    "lyapunov-coef", "lyapunov-gamma",
     "eval-reservation-seconds",
     "ctp-weight",
     "router-load-cv-coef", "mos-load-cv-coef",
+    "cv-target", "mos-cv-target",
     "expert-diversity-kind",
+    "expert-output-diversity-coef", "expert-diversity-every", "expert-diversity-max-tokens",
+    "mos-output-diversity-coef",
+    "regularizer-warmup-frac",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
     "nsa-compress-block-size", "nsa-compress-block-sliding-stride",
@@ -1825,7 +1824,6 @@ class SoftDenseRouter(nn.Module):
     """
     def __init__(self, dim: int, num_experts: int, *,
                  min_share_frac: float = 0.6, cv_target: float = 0.20,
-                 min_share_loss_weight: float = 0.0, cv_loss_weight: float = 2.0,
                  scoring: str = "linear", health_slices: tuple[int, ...] | None = None,
                  entropy_coef: float = 0.0,
                  use_entmax_routing: bool = False,
@@ -1834,19 +1832,14 @@ class SoftDenseRouter(nn.Module):
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
         self.cv_target = float(cv_target)
-        self.min_share_loss_weight = float(min_share_loss_weight)
-        self.cv_loss_weight = float(cv_loss_weight)
         self.scoring = str(scoring)
         assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
         self.health_slices = tuple(int(v) for v in (health_slices or (num_experts,)))
         if sum(self.health_slices) != int(num_experts) or any(v <= 0 for v in self.health_slices):
             raise ValueError(f"health_slices={self.health_slices} must partition {num_experts} experts")
-        # Tensor buffers to avoid Python-float guards inside torch.compile graphs.
-        # The training loop annealer writes `entropy_coef` every step after the
-        # warmup-delay frac elapses; without a buffer that's a per-step dynamo
-        # guard fail → recompile cascade (coderabbit Major #1). Kept behind
-        # `@property` setters so legacy code/tests can write Python floats.
-        self.register_buffer("_health_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        # Tensor buffer for entropy coef so the training loop's annealer can
+        # update it without triggering a per-step dynamo recompile. Set via the
+        # `entropy_coef` @property so legacy callers can write Python floats.
         self.register_buffer("_entropy_coef", torch.tensor(float(entropy_coef), dtype=torch.float32), persistent=False)
         # iter 117 (H87): learnable blend between softmax (init ≈ 1.0) and
         # entmax-1.5 (sparse with exact zeros). NOT a buffer — this is a
@@ -1898,8 +1891,7 @@ class SoftDenseRouter(nn.Module):
         # a per-step recompile of the compiled block.forward (profile, 2026-04-28).
         self._router_gate_last_mean: Tensor | None = None
         self._mean_share_last: Tensor | None = None
-        self._balance_loss = None
-        self._health_loss = None
+        self._cv_loss_raw: Tensor | None = None
         self._expert_usage = None
         self._expert_entropy = None
         self._expert_sparsity = None
@@ -1937,43 +1929,12 @@ class SoftDenseRouter(nn.Module):
             chunks.append(torch.full_like(ref[..., start:end], 1.0 / float(width)))
         return torch.cat(chunks, dim=-1)
 
-    def _component_health_losses(self, mean_mass: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        # H100 (2026-05-02): operate on combined `p = softmax × sigmoid(gate)` directly,
-        # no per-slice renorm. CV is mathematically scale-invariant so unchanged; `bal`
-        # MSE becomes gate-aware (penalizes both shape imbalance AND gate suppression);
-        # min_share is dead-path (weight=0). Strict-gen at gate_mean=1: identical to old.
-        bal = mean_mass.new_zeros(())
-        min_loss = mean_mass.new_zeros(())
-        cv_loss = mean_mass.new_zeros(())
-        n = float(len(self.health_slices))
-        for start, end in self._component_ranges():
-            width = max(end - start, 1)
-            share = mean_mass[..., start:end]
-            target = torch.full_like(share, 1.0 / float(width))
-            bal = bal + F.mse_loss(share, target)
-            lb = float(self.min_share_frac) / float(width)
-            if lb > 0.0:
-                min_loss = min_loss + torch.relu(share.new_tensor(lb) - share).pow(2).mean()
-            if self.cv_target > 0.0:
-                cv = share.std(dim=-1, unbiased=False) / share.mean(dim=-1).clamp_min(1e-8)
-                cv_loss = cv_loss + torch.relu(cv - share.new_tensor(self.cv_target)).pow(2).mean()
-        return bal / n, min_loss / n, cv_loss / n
-
     def _component_balance_cv(self, share: Tensor) -> Tensor:
         vals = []
         for start, end in self._component_ranges():
             s = share[..., start:end]
             vals.append(s.std(dim=-1, unbiased=False) / s.mean(dim=-1).clamp_min(1e-8))
         return torch.stack(vals).mean()
-
-    @property
-    def health_scale(self) -> float:
-        return float(self._health_scale.item())
-
-    @health_scale.setter
-    def health_scale(self, value: float) -> None:
-        with torch.no_grad():
-            self._health_scale.fill_(float(value))
 
     @property
     def entropy_coef(self) -> float:
@@ -2095,46 +2056,29 @@ class SoftDenseRouter(nn.Module):
             reduce_dims = tuple(range(p.ndim - 1))
             mean_mass = p.mean(dim=reduce_dims)
             mean_share = self._normalized_component_shares(mean_mass.float()).to(dtype=mean_mass.dtype)
-            mse, min_share_loss, cv_loss = self._component_health_losses(mean_mass.float())
-            hs = self._health_scale.to(dtype=min_share_loss.dtype)
-            self._balance_loss = mse
-            self._health_loss = (
-                float(self.min_share_loss_weight) * hs * min_share_loss
-                + float(self.cv_loss_weight) * hs * cv_loss
-            )
-            # iter-142-refactor: raw CV (no relu(cv-target)² floor, no
-            # cv_loss_weight) for the new flat router_load_cv_coef path. Sum
-            # across slices so CV is comparable to the legacy pooled magnitude.
-            cv_raw = mean_mass.new_zeros(())
+            # Routing CV hinge: relu(cv - cv_target)² summed across slices.
+            # Hinge prevents over-constraint when routing is already healthy.
+            cv_target_t = mean_mass.new_tensor(self.cv_target)
+            cv_hinge = mean_mass.new_zeros(())
             for start, end in self._component_ranges():
                 share_s = mean_mass[..., start:end].float()
-                cv_raw = cv_raw + (share_s.std(dim=-1, unbiased=False)
-                                   / share_s.mean(dim=-1).clamp_min(1e-8))
-            self._cv_loss_raw = cv_raw
-            # iter 100 (2026-04-27): per-token entropy MINIMIZATION on routing.
-            # Added to total loss with POSITIVE sign (+ec_t · H), so minimizing
-            # total_loss drives H_pertoken → 0 → token concentrates routing
-            # weight on few experts → specialization. Capacity-cost-free (vs
-            # iter 99/101 architectural-sparsity attempts, NOT PROMOTED).
-            # Renormalize routing weights per-token so the entropy is measured
-            # over a probability distribution (sum=1); softmax already does
-            # this, but sigmoid gate makes raw `p` sum to ≤1, so renormalize
-            # before entropy compute.
-            # Always-compute entropy (E-dim sum + log per token) so a `.item()`
-            # gate doesn't sit inside the DEQ FP iter. Annealer updates
-            # `_entropy_coef` in-place; multiply by 0 is gradient-free.
+                cv_s = (share_s.std(dim=-1, unbiased=False)
+                        / share_s.mean(dim=-1).clamp_min(1e-8))
+                cv_hinge = cv_hinge + torch.relu(cv_s - cv_target_t).pow(2)
+            self._cv_loss_raw = cv_hinge
+            # Per-token entropy minimization. Always-compute (no `.item()` gate
+            # so the FP iter stays sync-free). Annealer writes `_entropy_coef`
+            # in-place; multiply by 0 is gradient-free.
             p_f = p.float()
             p_norm = p_f / p_f.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            # H_pertoken = -Σ_e w(e|t) log w(e|t), averaged over tokens.
             pertoken_ent = -(p_norm * (p_norm + 1e-8).log()).sum(dim=-1).mean()
+            self._pertoken_entropy_raw_loss = pertoken_ent
             self._pertoken_entropy_loss = self._entropy_coef.to(dtype=pertoken_ent.dtype) * pertoken_ent
             self._mean_share_last = mean_share.detach()
-            # Record diagnostics — eager-only (dynamo-disabled); see helper docstring.
             self._maybe_record_diag(p.detach(), reduce_dims, clear_on_skip=False)
         else:
-            self._balance_loss = torch.tensor(0.0, device=x.device)
-            self._health_loss = torch.tensor(0.0, device=x.device)
             self._cv_loss_raw = torch.tensor(0.0, device=x.device)
+            self._pertoken_entropy_raw_loss = torch.tensor(0.0, device=x.device)
             self._pertoken_entropy_loss = torch.tensor(0.0, device=x.device)
             self._mean_share_last = None
             self._maybe_record_diag(p.detach(), tuple(range(p.ndim - 1)),
@@ -2972,7 +2916,9 @@ class MoSHead(nn.Module):
     """
     def __init__(self, d_model: int, vocab_size: int, rank: int = 256,
                  num_shared: int = 2, num_specialized: int = 1, fsq_levels: int = 8,
-                 use_ctp: bool = True, logit_softcap: float = 0.0):
+                 use_ctp: bool = True, logit_softcap: float = 0.0,
+                 mos_cv_target: float = 0.20,
+                 mos_output_diversity_kind: str = "cosine"):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
@@ -2983,6 +2929,13 @@ class MoSHead(nn.Module):
         self.fsq_levels = fsq_levels
         self.use_ctp = bool(use_ctp)
         self.logit_softcap = float(logit_softcap)
+        self.mos_cv_target = float(mos_cv_target)
+        self.mos_output_diversity_kind = str(mos_output_diversity_kind)
+        if self.mos_output_diversity_kind not in ("frobenius", "cosine"):
+            raise ValueError(
+                f"mos_output_diversity_kind must be 'frobenius' or 'cosine'; "
+                f"got {self.mos_output_diversity_kind!r}"
+            )
         self.gate_ntp = nn.Linear(d_model, num_shared + num_specialized, bias=True)
         self.gate_ntp_norm_weight = nn.Parameter(torch.ones(d_model))
         self.ntp_a_norm_weight = nn.Parameter(torch.ones(self.num_experts, d_model))
@@ -3001,6 +2954,7 @@ class MoSHead(nn.Module):
         self._diag_step: int | None = None
         self._ctp_ortho_out: Tensor | None = None
         self._ntp_ortho_out: Tensor | None = None
+        self._diversity_aux_enabled = False
         # GPU-resident diagnostics for DDP-safe reductions (avoid per-forward CPU sync).
         self._ctp_expert_usage_gpu: Tensor | None = None
         self._ntp_expert_usage_gpu: Tensor | None = None
@@ -3055,7 +3009,7 @@ class MoSHead(nn.Module):
 
     def _head_forward(self, x: Tensor, gate: nn.Linear, gate_norm_weight: Tensor,
                       A_shared: Tensor, A_spec: Tensor, a_norm_weight: Tensor,
-                      B: Tensor, rank_norm_weight: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+                      B: Tensor, rank_norm_weight: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         N = x.shape[0]
         E_s, E_p = A_shared.shape[0], A_spec.shape[0]
         E = E_s + E_p
@@ -3068,9 +3022,26 @@ class MoSHead(nn.Module):
         A_all = A_all * a_norm_weight.to(dtype=A_all.dtype).unsqueeze(-1)
         t_all = self._project_A(x, A_all)  # (N, E, R)
 
-        # Ortho diagnostic from mean expert projections
+        # Ortho diagnostic from mean expert projections (kept as readout only).
         mu_groups = t_all.float().mean(dim=0)  # (E, R)
         ortho_out = max_mean_abs_offdiag_cosine(mu_groups) if E >= 2 else x.new_zeros(())
+
+        # Per-token expert-state diversity loss. Same kind as block-side
+        # (cosine default). Coef applied externally as `mos_output_diversity_coef`.
+        if self.training and E >= 2 and bool(getattr(self, "_diversity_aux_enabled", False)):
+            t_f = t_all.float()  # (N, E, R)
+            R = t_f.shape[-1]
+            if self.mos_output_diversity_kind == "cosine":
+                t_n = F.normalize(t_f, dim=-1, eps=1e-6)
+                G = torch.einsum("ner,nfr->nef", t_n, t_n)
+                off = G - torch.eye(E, device=G.device, dtype=G.dtype)
+                diversity = off.pow(2).sum(dim=(-2, -1)).mean() / float(max(E * (E - 1), 1))
+            else:  # frobenius
+                G = torch.einsum("ner,nfr->nef", t_f, t_f) / float(R)
+                target = torch.eye(E, device=G.device, dtype=G.dtype) / float(E)
+                diversity = (G - target).pow(2).sum(dim=(-2, -1)).mean()
+        else:
+            diversity = x.new_zeros(())
 
         # FSQ + per-expert rank prenorm + logits:
         # (N, E, R) → FSQ/RMS → per-expert B → (N, E, V)
@@ -3094,53 +3065,45 @@ class MoSHead(nn.Module):
         log_p_unnorm = torch.logsumexp(log_p_weighted, dim=1)  # (N, V)
         log_p = log_p_unnorm - torch.logsumexp(log_p_unnorm, dim=-1, keepdim=True)
 
-        return log_p, alpha, ortho_out
+        return log_p, alpha, ortho_out, diversity
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         orig_shape = h.shape[:-1]
         x = h.reshape(-1, self.d_model)
-        log_p_n, alpha_n, ortho_ntp = self._head_forward(
+        log_p_n, alpha_n, ortho_ntp, div_ntp = self._head_forward(
             x, self.gate_ntp, self.gate_ntp_norm_weight,
             self.A_ntp_shared, self.A_ntp, self.ntp_a_norm_weight,
             self.B_NTP, self.ntp_rank_norm_weight,
         )
         if self.use_ctp:
-            log_p_d, alpha_d, ortho_ctp = self._head_forward(
+            log_p_d, alpha_d, ortho_ctp, div_ctp = self._head_forward(
                 x, self.gate_ctp, self.gate_ctp_norm_weight,
                 self.A_ctp_shared, self.A_ctp, self.ctp_a_norm_weight,
                 self.B_denoise, self.ctp_rank_norm_weight,
             )
         else:
-            # NTP-only: alias CTP outputs to NTP for API compatibility.
-            # Downstream GPT.forward zeros ctp_loss/ctp_weight, and the
-            # refinement path uses p_ntp only (see _get_soft_embedding).
             log_p_d = log_p_n
             alpha_d = alpha_n
             ortho_ctp = x.new_zeros(())
+            div_ctp = x.new_zeros(())
         self._ctp_ortho_out = ortho_ctp
         self._ntp_ortho_out = ortho_ntp
 
         if self.training:
-            # iter-142-refactor: replace MSE-to-uniform balance with CV. Same
-            # decision (push gate usage toward uniform) but linear-in-deviation
-            # rather than quadratic-around-target. Coef set externally as
-            # `mos_load_cv_coef` (default 0.25, preserves legacy magnitude).
-            cv_sum = torch.tensor(0.0, device=x.device)
-            mse_sum = torch.tensor(0.0, device=x.device)
+            # MoS load CV with hinge — relu(cv - mos_cv_target)² across heads.
+            cv_target_t = x.new_tensor(self.mos_cv_target)
+            cv_hinge = torch.tensor(0.0, device=x.device)
             alphas = [alpha_n] if not self.use_ctp else [alpha_d, alpha_n]
             for alpha_soft in alphas:
                 mean_a = alpha_soft.mean(dim=0).float()
-                cv_sum = cv_sum + (mean_a.std(unbiased=False)
-                                   / mean_a.mean().clamp_min(1e-8))
-                target = torch.ones_like(mean_a) / alpha_soft.shape[-1]
-                mse_sum = mse_sum + F.mse_loss(mean_a, target)
-            self._cv_loss_raw = cv_sum
-            # _balance_loss kept as-is (MSE) for diagnostic continuity; the
-            # active loss path uses _cv_loss_raw via _collect_routing_losses.
-            self._balance_loss = mse_sum
+                cv_a = mean_a.std(unbiased=False) / mean_a.mean().clamp_min(1e-8)
+                cv_hinge = cv_hinge + torch.relu(cv_a - cv_target_t).pow(2)
+            self._cv_loss_raw = cv_hinge
+            # MoS per-token expert-state diversity (replaces mean-projection ortho).
+            self._diversity_loss = (div_ntp + div_ctp) if self.use_ctp else div_ntp
         else:
             self._cv_loss_raw = torch.tensor(0.0, device=x.device)
-            self._balance_loss = torch.tensor(0.0, device=x.device)
+            self._diversity_loss = torch.tensor(0.0, device=x.device)
 
         # Eager-only diagnostic capture — see helper docstring.
         self._capture_mos_diagnostics(alpha_d, alpha_n)
@@ -3208,8 +3171,7 @@ class Block(nn.Module):
                  router_entropy_coef: float = 0.0,
                  use_entmax_routing: bool = False,
                  entmax_blend_init_logit: float = 5.0,
-                 min_share_loss_weight: float = 0.0,
-                 cv_loss_weight: float = 2.0,
+                 cv_target: float = 0.20,
                  use_nsa_attention: bool = False,
                  nsa_compress_block_size: int = 32,
                  nsa_compress_block_sliding_stride: int = 16,
@@ -3245,14 +3207,11 @@ class Block(nn.Module):
             for g in (self.shared_gate_attn, self.shared_gate_mlp):
                 nn.init.zeros_(g.weight)
                 nn.init.constant_(g.bias, 1.0)  # init near-open (matches pre-iter-84)
-        # Router only covers routed experts (not shared).
-        # iter 100b (2026-04-27): drop min_share_loss penalty (was 10.0).
-        # min_share remains in diagnostics; CV loss alone provides global
-        # balance regularization. Decouples from entropy-penalty axis.
-        # Loss weights threaded from Hyperparameters per §9 single-source-of-truth.
+        # Router only covers routed experts (not shared). Routing-balance
+        # regularization is the per-slice CV hinge inside SoftDenseRouter
+        # (cv_target threshold), aggregated by GPT._collect_routing_losses.
         self.router = SoftDenseRouter(dim, 2 * num_routed,
-                                      min_share_loss_weight=min_share_loss_weight,
-                                      cv_loss_weight=cv_loss_weight,
+                                      cv_target=cv_target,
                                       scoring=router_scoring,
                                       health_slices=(num_routed, num_routed),
                                       entropy_coef=router_entropy_coef,
@@ -3295,13 +3254,19 @@ class Block(nn.Module):
         self._shared_gate_diag_step: int | None = None
 
     def ortho_aux(self, z_in: Tensor, x0: Tensor, *, max_tokens: int = 256,
+                   token_start: int | None = None,
                    compute_per_token_gram: bool = False,
                    per_token_gram_kind: str = "frobenius"
                    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         bsz, seqlen, dim = z_in.shape
         t = int(min(max(1, int(max_tokens)), seqlen))
-        z_sub = z_in[:, :t]
-        x0_sub = x0[:, :t]
+        if t >= int(seqlen):
+            start = 0
+        else:
+            max_start = int(seqlen) - t
+            start = int(token_start or 0) % (max_start + 1)
+        z_sub = z_in[:, start:start + t]
+        x0_sub = x0[:, start:start + t]
         x = z_sub + x0_sub
         h = _rms_unit(x)
 
@@ -3327,6 +3292,10 @@ class Block(nn.Module):
         fc = x_flat @ Fm.t()
         h_mlp = F.silu(gate) * fc
         h_mlp_per_expert = h_mlp.reshape(N, E2, R2)  # (N, E, R) — per-token, per-expert hidden
+        h_mlp_per_expert = (
+            F.rms_norm(h_mlp_per_expert, (R2,), eps=1e-6)
+            * self.mlp.hidden_norm_weight.to(dtype=h_mlp_per_expert.dtype)
+        )
         mu_h2 = h_mlp_per_expert.mean(dim=0).to(dtype=torch.float32)
         down_T = self.mlp.expert_down.to(dtype=mu_h2.dtype).transpose(1, 2)  # (E, R, D)
         mu_mlp = torch.einsum("er,erd->ed", mu_h2, down_T)
@@ -3609,9 +3578,24 @@ class RevDEQFunction(torch.autograd.Function):
         z_prev_state = z_state
         z_init_state = z_state.detach()
 
+        # TBPTT recon snapshot — captures (y, z) at the iter index where
+        # backward will land after K_bwd reverse steps, so the diagnostic can
+        # measure true reversibility within the window. CLAUDE.md §6.1.
+        K_bwd = int(bptt_k) if bptt_k else 0
+        if K_bwd <= 0 or K_bwd >= K:
+            K_bwd = K
+        snap_iter = K - K_bwd
+        y_snap_state: Tensor | None = None
+        z_snap_state: Tensor | None = None
+
         with torch.no_grad():
+            if bool(ctx.do_recon_diag) and snap_iter == 0:
+                # Full BPTT: snapshot is the initial state — recover today's
+                # legacy comparison without an extra clone.
+                y_snap_state = z_init_state
+                z_snap_state = z_init_state
             out_y = None
-            for _ in range(K):
+            for i in range(K):
                 z_prev_state = z_state
                 y_acc = y_state.to(acc_dtype) * beta_inv
                 with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
@@ -3624,6 +3608,10 @@ class RevDEQFunction(torch.autograd.Function):
                     out_y = f_theta(y_state.to(compute_dtype), x0, b_bar)
                 z_acc = z_acc + out_y.to(acc_dtype) * beta
                 z_state = z_acc.to(state_dtype)
+
+                if bool(ctx.do_recon_diag) and (i + 1) == snap_iter:
+                    y_snap_state = y_state.detach().clone()
+                    z_snap_state = z_state.detach().clone()
 
             if out_y is not None:
                 if bool(ctx.do_recon_diag):
@@ -3642,6 +3630,8 @@ class RevDEQFunction(torch.autograd.Function):
         ctx.save_for_backward(x0.detach(), y_state.detach(), z_state.detach(),
                               z_prev_state.detach())
         ctx.z_init_state = z_init_state
+        ctx.y_snap_state = y_snap_state
+        ctx.z_snap_state = z_snap_state
         ctx.f_theta = f_theta
         # Store as fp64 tensors for backward precision.
         ctx.beta = beta if isinstance(beta, torch.Tensor) else torch.tensor(beta, dtype=torch.float64)
@@ -3790,23 +3780,49 @@ class RevDEQFunction(torch.autograd.Function):
 
             y_next64, z_next64 = y_n64, z_n64
 
+        y_snap_state = getattr(ctx, "y_snap_state", None)
+        z_snap_state = getattr(ctx, "z_snap_state", None)
         if bool(getattr(ctx, "do_recon_diag", False)) and isinstance(z_init_state, torch.Tensor):
             try:
-                z0 = z_init_state.to(dtype=state_dtype)
-                denom = z0.norm().clamp(min=1.0)
-                z_rec = z_next64.to(dtype=state_dtype)
-                y_rec = y_next64.to(dtype=state_dtype)
-                # Under TBPTT (deq_bptt_k < num_layers), the reverse loop stops
-                # at iter (K_fwd − K_bwd), NOT at z_0 — so this metric measures
-                # the FP "distance travelled" during the un-reconstructed
-                # iterations, NOT a reconstruction error. Only when bptt_k == 0
-                # (full BPTT) does z_rec actually approximate z_0 and the value
-                # become a true reconstruction error. Naming reflects this:
-                # `_deq_distance_travelled_last_bwd` under TBPTT, with the
-                # full-BPTT case detected at log time and routed differently.
-                recon_err_t = ((z_rec - z0).norm() + (y_rec - z0).norm()) / denom
+                # Two true-recon diagnostics (CLAUDE.md §6.1). Both are gated
+                # on `do_recon_diag` (≡ `_ROUTER_DIAGNOSTICS_ACTIVE`) which
+                # production training only enables on log-step boundaries —
+                # the no_grad x0 reverse below otherwise adds (K − K_bwd) extra
+                # f_theta calls per backward and ~3 GB of snapshot memory at
+                # full B·T scale.
                 _target = _unwrap_compiled_module(f_theta)
-                setattr(_target, "_deq_distance_travelled_last_bwd", recon_err_t.detach())
+                z0 = z_init_state.to(dtype=state_dtype)
+                denom_0 = z0.norm().clamp(min=1.0)
+
+                # tbptt_recon_loss: in-window snapshot comparison
+                if isinstance(y_snap_state, torch.Tensor) and isinstance(z_snap_state, torch.Tensor):
+                    y_snap = y_snap_state.to(dtype=state_dtype)
+                    z_snap = z_snap_state.to(dtype=state_dtype)
+                    denom_s = z_snap.norm().clamp(min=1.0)
+                    z_rec_in = z_next64.to(dtype=state_dtype)
+                    y_rec_in = y_next64.to(dtype=state_dtype)
+                    recon_err_t = ((z_rec_in - z_snap).norm() + (y_rec_in - y_snap).norm()) / denom_s
+                    setattr(_target, "_deq_recon_error_last_bwd", recon_err_t.detach())
+
+                # x0_recon_loss: continue reverse to z_0 under no_grad
+                K_remaining = K - K_bwd
+                y_full64 = y_next64
+                z_full64 = z_next64
+                if K_remaining > 0:
+                    with torch.no_grad():
+                        for _ in range(K_remaining):
+                            y_local = y_full64.to(compute_dtype)
+                            with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                                out_y = f_theta(y_local, x0, b_bar_local_base)
+                            z_full64 = (z_full64 - out_y.to(acc_dtype) * beta) / beta_inv
+                            z_local = z_full64.to(compute_dtype)
+                            with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                                out_z = f_theta(z_local, x0, b_bar_local_base)
+                            y_full64 = (y_full64 - out_z.to(acc_dtype) * beta) / beta_inv
+                z_rec_full = z_full64.to(dtype=state_dtype)
+                y_rec_full = y_full64.to(dtype=state_dtype)
+                dist_t = ((z_rec_full - z0).norm() + (y_rec_full - z0).norm()) / denom_0
+                setattr(_target, "_deq_distance_travelled_last_bwd", dist_t.detach())
             except Exception:
                 pass
 
@@ -3850,40 +3866,35 @@ class GPT(nn.Module):
                  qk_gain_init: float, bigram_vocab_size: int = 0, bigram_dim: int = 128,
                  kv_latent_dim: int = 0, num_refinements: int = 1,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 deq_beta: float = 0.35, attn_balance_mult: float = 5.0,
-                 mlp_balance_mult: float = 1.0, mos_balance_mult: float = 50.0,
-                 bal_loss_coef: float = 5e-3,
-                 router_health_coef: float = 0.25, mos_ortho_out_coef: float = 0.0,
+                 deq_beta: float = 0.35,
                  deq_bptt_k: int = 0,
-                 block_ortho_aux_coef: float = 0.0,
-                 block_ortho_aux_every: int = 0, block_ortho_aux_tokens: int = 64,
                  router_scoring: str = "linear",
                  router_entropy_coef: float = 0.0,
-                 router_entropy_warmup_delay_frac: float = 0.0,
                  use_entmax_routing: bool = False,
                  entmax_blend_init_logit: float = 5.0,
                  entmax_blend_warmup_delay_frac: float = 0.3,
-                 expert_gram_coef: float = 0.0,
-                 expert_gram_warmup_delay_frac: float = 0.3,
-                 expert_gram_max_tokens: int = 64,
                  use_smear_gate: bool = False,
                  smear_gate_init: float = 0.1,
                  smear_gate_bos_id: int = 1,
                  logit_softcap: float = 0.0,
                  num_experts: int = 8, num_shared_experts: int = 0,
-                 lyapunov_coef: float = 1.0,
-                 lyapunov_gamma: float = 0.9,
-                 lyapunov_warmup_frac: float = 0.1,
+                 lyapunov_coef: float = 0.0,
+                 lyapunov_gamma: float = 0.97,
                  use_parcae: bool = True,
                  parcae_init_a_bar: float = 0.7,
                  parcae_init_b_bar: float | None = None,
-                 min_share_loss_weight: float = 0.0,
-                 cv_loss_weight: float = 2.0,
                  use_ctp: bool = True,
                  ctp_weight: float = 0.0,
                  router_load_cv_coef: float = 0.5,
                  mos_load_cv_coef: float = 0.25,
-                 expert_diversity_kind: str = "frobenius",
+                 cv_target: float = 0.20,
+                 mos_cv_target: float = 0.20,
+                 expert_diversity_kind: str = "cosine",
+                 expert_output_diversity_coef: float = 0.1,
+                 expert_diversity_every: int = 8,
+                 expert_diversity_max_tokens: int = 64,
+                 mos_output_diversity_coef: float = 0.0,
+                 regularizer_warmup_frac: float = 0.30,
                  use_nsa_attention: bool = False,
                  nsa_compress_block_size: int = 32,
                  nsa_compress_block_sliding_stride: int = 16,
@@ -3904,24 +3915,36 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.num_layers = num_layers
         self.num_refinements = num_refinements
-        # iter 100b: store entropy-coef target + warmup-delay for the
-        # training-loop annealing hook to read. Router's entropy_coef is set
-        # dynamically per-step via these values.
+        # Entropy + diversity coefficients are annealed by a single
+        # `regularizer_warmup_frac` schedule in the training loop. CV losses
+        # are active from step 0 (no warmup).
         self._router_entropy_coef_target = float(router_entropy_coef)
-        self._router_entropy_warmup_delay_frac = float(router_entropy_warmup_delay_frac)
-        # iter 117 v2: entmax blend anneal warmup delay. The router's
-        # entmax_blend_anneal buffer is set by the same annealer to ramp
-        # 0 → 1 after this delay fraction (pure softmax during warmup).
+        self.regularizer_warmup_frac = float(regularizer_warmup_frac)
+        # entmax_blend_anneal still has its own delay (it's a routing-form
+        # behavior, not a loss-coefficient ramp; keep separate).
         self._use_entmax_routing = bool(use_entmax_routing)
         self._entmax_blend_warmup_delay_frac = float(entmax_blend_warmup_delay_frac)
-        # iter 141 (NEW 2026-05-04): per-token expert-OUTPUT Gram penalty.
-        # E_t[‖(Y_t Y_t^T)/D − I/E‖²_F] over expert outputs Y_t ∈ ℝ^{E×D}.
-        # Subsumes block_ortho via Jensen. Strict-gen at coef=0 (no contribution).
-        self._expert_gram_coef_target = float(expert_gram_coef)
-        self._expert_gram_warmup_delay_frac = float(expert_gram_warmup_delay_frac)
-        self._expert_gram_max_tokens = int(expert_gram_max_tokens)
-        self._expert_gram_coef_scale = 1.0  # set per-step by annealer
-        self._expert_gram_loss: Tensor | None = None
+        # Per-token expert-output diversity targets + scratch.
+        self._expert_diversity_coef_target = float(expert_output_diversity_coef)
+        self._expert_diversity_every = int(expert_diversity_every)
+        self._expert_diversity_max_tokens = int(expert_diversity_max_tokens)
+        self._expert_diversity_coef_scale = 1.0  # set per-step by annealer
+        self._expert_diversity_loss: Tensor | None = None
+        self._expert_diversity_token_start = 0
+        # MoS per-token output-diversity (mirrors block-side; default off via coef=0).
+        self.mos_output_diversity_coef = float(mos_output_diversity_coef)
+        self._mos_diversity_loss: Tensor | None = None
+        self._router_cv_loss_t: Tensor | None = None
+        self._router_entropy_loss_t: Tensor | None = None
+        self._mos_cv_loss_t: Tensor | None = None
+        self._expert_diversity_loss_t: Tensor | None = None
+        self._mos_diversity_loss_t: Tensor | None = None
+        self._router_cv_coef_eff_t: Tensor | None = None
+        self._router_entropy_coef_eff_t: Tensor | None = None
+        self._mos_cv_coef_eff_t: Tensor | None = None
+        self._expert_diversity_coef_eff_t: Tensor | None = None
+        self._mos_diversity_coef_eff_t: Tensor | None = None
+        self._router_reg_loss_t: Tensor | None = None
         # iter 129 / H99: SmearGate — single learnable scalar shared across the
         # entire backbone (we have one shared Block; per-layer doesn't apply).
         # `x[1:] += g · x[:-1] · not_bos_mask` after token embedding lookup.
@@ -3945,13 +3968,7 @@ class GPT(nn.Module):
                                    router_entropy_coef=router_entropy_coef,
                                    use_entmax_routing=use_entmax_routing,
                                    entmax_blend_init_logit=entmax_blend_init_logit,
-                                   # entmax_blend_warmup_delay_frac is consumed by the
-                                   # training-loop annealer (not by Block/SoftDenseRouter directly)
-                                   # so it doesn't need to be passed here. The router's
-                                   # _entmax_blend_anneal buffer starts at 0 and is updated
-                                   # by the annealer reading GPT._entmax_blend_warmup_delay_frac.
-                                   min_share_loss_weight=min_share_loss_weight,
-                                   cv_loss_weight=cv_loss_weight,
+                                   cv_target=cv_target,
                                    use_nsa_attention=use_nsa_attention,
                                    nsa_compress_block_size=nsa_compress_block_size,
                                    nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
@@ -3959,8 +3976,9 @@ class GPT(nn.Module):
                                    nsa_branch_gate_init=nsa_branch_gate_init,
                                    )
         self.deq_beta = float(deq_beta)
-        # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping with
-        # independent input gain (arXiv:2604.12946, Mamba-style ZOH).
+        # Phase 9 iter 66b: Parcae-style per-dim diagonal damping with
+        # independent input gain (arXiv:2604.12946, Mamba-style ZOH),
+        # adapted to RevDEQ's reversible two-state solver.
         #   Δ  = softplus(parcae_raw_delta) + ε_min       (step size)
         #   A  = -(softplus(parcae_raw_a)   + ε_min)      (decay, < 0)
         #   B  =   softplus(parcae_raw_b)   + ε_min       (input gain, > 0)
@@ -3990,30 +4008,21 @@ class GPT(nn.Module):
             self.parcae_raw_a = nn.Parameter(torch.full((model_dim,), raw_a_init))
             self.parcae_raw_delta = nn.Parameter(torch.full((model_dim,), raw_delta_init))
             self.parcae_raw_b = nn.Parameter(torch.full((model_dim,), raw_b_init))
-        self.attn_balance_mult = float(attn_balance_mult)
-        self.mlp_balance_mult = float(mlp_balance_mult)
-        self.mos_balance_mult = float(mos_balance_mult)
-        self.bal_loss_coef = float(bal_loss_coef)
-        self.router_health_coef = float(router_health_coef)
-        self.mos_ortho_out_coef = float(mos_ortho_out_coef)
         self.deq_bptt_k = int(deq_bptt_k)
-        self.block_ortho_aux_coef = float(block_ortho_aux_coef)
-        self.block_ortho_aux_every = int(block_ortho_aux_every)
-        self.block_ortho_aux_tokens = int(block_ortho_aux_tokens)
-        self._block_ortho_aux_enabled = False
-        self._block_ortho_aux_loss: Tensor | None = None
-        # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
+        # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty (default OFF).
         # Two-forward approach: VJP for ρ̂ + surrogate loss for ∇_θ.
         self.lyapunov_coef = float(lyapunov_coef)
         self.lyapunov_gamma = float(lyapunov_gamma)
-        self.lyapunov_warmup_frac = float(lyapunov_warmup_frac)
-        self._lyapunov_v_buf: Tensor | None = None  # persistent power-iter vector (EMA)
-        # GPU-resident EMA of spectral radius estimate. Stored as a 0-dim CUDA
-        # tensor so the Hutchinson penalty block stays pure-tensor (no .item()
-        # GPU→CPU sync in the hot path). Initialized lazily on first use.
+        self._lyapunov_v_buf: Tensor | None = None
         self._lyapunov_rho_hat_buf: Tensor | None = None
         self.logit_softcap = float(logit_softcap)
-        self.mos_head = MoSHead(model_dim, vocab_size, rank=256, num_shared=2, num_specialized=1, fsq_levels=0, use_ctp=self.use_ctp, logit_softcap=self.logit_softcap)  # Phase 9 iter 62 (H53): disabled FSQ. Iter 94: use_ctp threads through to skip CTP. Iter 122 (H93): logit_softcap.
+        self.mos_head = MoSHead(
+            model_dim, vocab_size, rank=256,
+            num_shared=2, num_specialized=1, fsq_levels=0,
+            use_ctp=self.use_ctp, logit_softcap=self.logit_softcap,
+            mos_cv_target=mos_cv_target,
+            mos_output_diversity_kind=expert_diversity_kind,  # follow same kind
+        )
         self.final_norm = RMSNorm(model_dim)
         # Embedding/final norms remain learnable shared scales outside T_theta.
         self.embed_norm = RMSNorm(model_dim)
@@ -4072,6 +4081,34 @@ class GPT(nn.Module):
         delta = self._parcae_delta()
         b_mag = F.softplus(self.parcae_raw_b.float()) + float(self.parcae_min_rate)
         return delta * b_mag
+
+    def parcae_diagnostics(self, k_override: int | None = None) -> dict[str, Tensor]:
+        """Detached scalar diagnostics for the Parcae-style RevDEQ damping state."""
+        if not self.use_parcae:
+            return {}
+        delta = self._parcae_delta().detach().float()
+        a_mag = F.softplus(self.parcae_raw_a.detach().float()) + float(self.parcae_min_rate)
+        a_bar_core = torch.exp(-(delta * a_mag))
+        eps_rev = float(self.parcae_reversibility_floor)
+        a_bar = eps_rev + (1.0 - eps_rev) * a_bar_core
+        beta = 1.0 - a_bar
+        b_mag = F.softplus(self.parcae_raw_b.detach().float()) + float(self.parcae_min_rate)
+        b_bar = delta * b_mag
+        k = int(k_override or getattr(self, "_deq_k_override", 0) or self.num_layers)
+        a_bar_min = a_bar.min().clamp_min(1e-12)
+        return {
+            "parcae_a_bar_min": a_bar.min(),
+            "parcae_a_bar_mean": a_bar.mean(),
+            "parcae_a_bar_max": a_bar.max(),
+            "parcae_a_bar_core_max": a_bar_core.max(),
+            "parcae_beta_mean": beta.mean(),
+            "parcae_beta_max": beta.max(),
+            "parcae_b_bar_mean": b_bar.mean(),
+            "parcae_b_bar_max": b_bar.max(),
+            "parcae_delta_mean": delta.mean(),
+            "parcae_delta_max": delta.max(),
+            "parcae_recon_amp_log10": a_bar_min.reciprocal().log10() * float(max(k, 1)),
+        }
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -4132,7 +4169,7 @@ class GPT(nn.Module):
 
     def _deq_solve(self, x0: Tensor, z_init: Tensor):
         global _DEQ_SOLVE_ACTIVE
-        # Phase 9 iter 66b: Parcae-paper-faithful per-dim damping + Parcae input gain.
+        # Phase 9 iter 66b: Parcae-style per-dim damping + Parcae input gain.
         #   β = 1 − Ā  (solver blend, carries grad → parcae_raw_a / raw_delta)
         #   B̄ = Δ · B (Block.forward input gain, carries grad → parcae_raw_b / raw_delta)
         if self.use_parcae:
@@ -4248,7 +4285,7 @@ class GPT(nn.Module):
         self._deq_k_last = None
         prev_soft_embed = x0
         x0_refined = x0
-        self._block_ortho_aux_loss = None
+        self._expert_diversity_loss = None
 
         for r in range(1 + self.num_refinements):
             if r > 0:
@@ -4321,40 +4358,27 @@ class GPT(nn.Module):
         self._lyapunov_x0 = x0_refined.detach()
 
         if self.training:
-            need_block_ortho = (
-                self._block_ortho_aux_enabled and self.block_ortho_aux_coef > 0.0
+            # Per-token expert-output diversity: gated by training-loop annealer
+            # via `_expert_diversity_aux_enabled` (every-N + last-micro-step).
+            need_diversity = (
+                getattr(self, "_expert_diversity_aux_enabled", False)
+                and self._expert_diversity_coef_target > 0.0
             )
-            need_expert_gram = (
-                getattr(self, "_expert_gram_aux_enabled", False)
-                and self._expert_gram_coef_target > 0.0
-            )
-            if need_block_ortho or need_expert_gram:
-                if need_expert_gram:
-                    max_tokens_eg = int(getattr(self, "_expert_gram_max_tokens", 64))
-                else:
-                    max_tokens_eg = self.block_ortho_aux_tokens
-                max_tokens = int(getattr(
-                    self,
-                    "_block_ortho_aux_tokens_override",
-                    max(self.block_ortho_aux_tokens, max_tokens_eg),
-                ))
+            if need_diversity:
+                max_tokens = int(self._expert_diversity_max_tokens)
+                token_start = int(getattr(self, "_expert_diversity_token_start", 0))
                 attn_o, mlp_o, attn_gram_pt, mlp_gram_pt = self.shared_block.ortho_aux(
                     z, x0_refined,
                     max_tokens=max_tokens,
-                    compute_per_token_gram=need_expert_gram,
-                    per_token_gram_kind=str(getattr(self, "expert_diversity_kind", "frobenius")),
+                    token_start=token_start,
+                    compute_per_token_gram=True,
+                    per_token_gram_kind=str(self.expert_diversity_kind),
                 )
-                # T-opt 15: defer .item() to log time — store GPU tensors only.
-                # Hot-path sync prohibition: no .item()/.cpu() in forward/backward.
+                # Diagnostic mean-cosine readout for log time (no sync here).
                 self.shared_block.attn._out_ortho_cos_sim_t = attn_o.detach()
                 self.shared_block.mlp._out_ortho_cos_sim_t = mlp_o.detach()
-                if need_block_ortho:
-                    thr = 0.20
-                    attn_b = F.relu(attn_o - thr).pow(2)
-                    mlp_b = F.relu(mlp_o - thr).pow(2)
-                    self._block_ortho_aux_loss = 0.5 * (attn_b + mlp_b)
-                if need_expert_gram and attn_gram_pt is not None and mlp_gram_pt is not None:
-                    self._expert_gram_loss = 0.5 * (attn_gram_pt + mlp_gram_pt)
+                if attn_gram_pt is not None and mlp_gram_pt is not None:
+                    self._expert_diversity_loss = 0.5 * (attn_gram_pt + mlp_gram_pt)
 
         return z
 
@@ -4376,29 +4400,22 @@ class GPT(nn.Module):
     def _collect_routing_losses(
         self,
         device: torch.device,
-        block_ortho_aux: Tensor | None = None,
-        eff_block_ortho_coef: float = 0.0,
-        expert_gram_loss: Tensor | None = None,
-        eff_expert_gram_coef: float = 0.0,
+        diversity_loss: Tensor | None = None,
+        eff_diversity_coef: float = 0.0,
+        mos_diversity_loss: Tensor | None = None,
+        eff_mos_diversity_coef: float = 0.0,
     ) -> Tensor:
-        """Build the flat router-side regularization term.
-
-        Sum over de-aliased routers (one entry per unique router instance —
-        attn_router and mlp_router are the same instance under the pooled
-        design):
+        """Flat router-side regularization assembly:
 
             router_reg_loss
-              = router_load_cv_coef × Σ_r cv_raw(r)
-              + Σ_r H_pertoken(r)        (entropy_coef already inside)
-              + mos_load_cv_coef × mos_cv_raw
-              + eff_expert_gram_coef × expert_gram_loss
-              + eff_block_ortho_coef × block_ortho_aux
+              = router_load_cv_coef        × Σ_r cv_hinge(r)
+              + router_entropy_coef_eff    × Σ_r H_pertoken(r)
+              + mos_load_cv_coef           × mos_cv_hinge
+              + eff_diversity_coef         × per_token_expert_diversity
+              + eff_mos_diversity_coef     × mos_per_token_expert_diversity
 
-        Old structure (iter 117b-1) had cv + entropy nested inside
-        router_health_coef and the routed slices multiplied by
-        attn_balance_mult + mlp_balance_mult before the outer multiply. Each
-        of those layers had its own knob; flatten makes ablation a single
-        coefficient sweep per term.
+        `eff_*_coef` already includes the grad_accum_steps compensation for
+        last-micro-step gating (multiplied by `_aux_grad_accum_scale`).
         """
         zero = torch.tensor(0.0, device=device)
         routers: dict[int, SoftDenseRouter] = {}
@@ -4406,23 +4423,51 @@ class GPT(nn.Module):
             routers[id(r)] = r
         cv_sum = zero
         ent_sum = zero
+        ent_raw_sum = zero
+        ent_coef_sum = zero
+        ent_count = 0
         for r in routers.values():
             cv_sum = cv_sum + getattr(r, "_cv_loss_raw", zero)
             ent_sum = ent_sum + getattr(r, "_pertoken_entropy_loss", zero)
-        mos_cv_raw = getattr(self.mos_head, "_cv_loss_raw", zero)
+            ent_raw_sum = ent_raw_sum + getattr(r, "_pertoken_entropy_raw_loss", zero)
+            ent_coef_sum = ent_coef_sum + r._entropy_coef.to(device=device, dtype=torch.float32)
+            ent_count += 1
+        mos_cv = getattr(self.mos_head, "_cv_loss_raw", zero)
         router_reg_loss = (
             self.router_load_cv_coef * cv_sum
             + ent_sum
-            + self.mos_load_cv_coef * mos_cv_raw
+            + self.mos_load_cv_coef * mos_cv
         )
-        if block_ortho_aux is not None and eff_block_ortho_coef > 0.0:
-            router_reg_loss = router_reg_loss + eff_block_ortho_coef * block_ortho_aux
-        if expert_gram_loss is not None and eff_expert_gram_coef > 0.0:
-            router_reg_loss = router_reg_loss + eff_expert_gram_coef * expert_gram_loss
+        if diversity_loss is not None and eff_diversity_coef > 0.0:
+            router_reg_loss = router_reg_loss + eff_diversity_coef * diversity_loss
+        if mos_diversity_loss is not None and eff_mos_diversity_coef > 0.0:
+            router_reg_loss = router_reg_loss + eff_mos_diversity_coef * mos_diversity_loss
+        self._router_cv_loss_t = cv_sum.detach()
+        self._router_entropy_loss_t = ent_raw_sum.detach()
+        self._mos_cv_loss_t = mos_cv.detach()
+        self._expert_diversity_loss_t = (
+            diversity_loss.detach() if isinstance(diversity_loss, torch.Tensor) else zero.detach()
+        )
+        self._mos_diversity_loss_t = (
+            mos_diversity_loss.detach() if isinstance(mos_diversity_loss, torch.Tensor) else zero.detach()
+        )
+        self._router_cv_coef_eff_t = zero.new_tensor(float(self.router_load_cv_coef)).detach()
+        self._router_entropy_coef_eff_t = (
+            (ent_coef_sum / float(max(ent_count, 1))).detach()
+        )
+        self._mos_cv_coef_eff_t = zero.new_tensor(float(self.mos_load_cv_coef)).detach()
+        self._expert_diversity_coef_eff_t = zero.new_tensor(float(eff_diversity_coef)).detach()
+        self._mos_diversity_coef_eff_t = zero.new_tensor(float(eff_mos_diversity_coef)).detach()
+        self._router_reg_loss_t = router_reg_loss.detach()
         return router_reg_loss
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
+        self.mos_head._diversity_aux_enabled = bool(
+            self.training
+            and self.mos_output_diversity_coef > 0.0
+            and float(self._expert_diversity_coef_scale) > 0.0
+        )
         log_p_ctp, log_p_ntp = self.mos_head(x)
         V = self.tok_emb.num_embeddings
         ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_ids.reshape(-1))
@@ -4430,29 +4475,43 @@ class GPT(nn.Module):
             ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_ids.reshape(-1))
         else:
             ctp_loss = torch.tensor(0.0, device=ntp_loss.device)
-        # Compute block_ortho_aux and its effective coef BEFORE collecting the
-        # routing-loss group so they can be folded into router_reg_loss.
-        block_ortho_aux = torch.tensor(0.0, device=ntp_loss.device)
-        if self.training and self._block_ortho_aux_enabled and isinstance(self._block_ortho_aux_loss, torch.Tensor):
-            block_ortho_aux = self._block_ortho_aux_loss.to(device=ntp_loss.device)
-        eff_block_ortho_coef = float(self.block_ortho_aux_coef) * float(getattr(self, "_block_ortho_aux_coef_scale", 1.0))
-        # iter 141: per-token expert-output gram. Mirror block_ortho gating.
-        expert_gram_loss = torch.tensor(0.0, device=ntp_loss.device)
-        eff_expert_gram_coef = 0.0
-        if (self.training and getattr(self, "_expert_gram_aux_enabled", False)
-                and isinstance(self._expert_gram_loss, torch.Tensor)):
-            expert_gram_loss = self._expert_gram_loss.to(device=ntp_loss.device)
-            eff_expert_gram_coef = (
-                float(self._expert_gram_coef_target)
-                * float(getattr(self, "_expert_gram_coef_scale", 1.0))
+        # Per-token expert-output diversity: gated to last-micro-step + every-N
+        # by the training loop. Multiplied by `_aux_grad_accum_scale` so the
+        # documented coefficient holds despite the global `loss / grad_accum_steps`
+        # division before backward.
+        aux_gas = float(getattr(self, "_aux_grad_accum_scale", 1.0))
+        diversity_loss = torch.tensor(0.0, device=ntp_loss.device)
+        eff_diversity_coef = 0.0
+        if (self.training and getattr(self, "_expert_diversity_aux_enabled", False)
+                and isinstance(self._expert_diversity_loss, torch.Tensor)):
+            diversity_loss = self._expert_diversity_loss.to(device=ntp_loss.device)
+            eff_diversity_coef = (
+                float(self._expert_diversity_coef_target)
+                * float(self._expert_diversity_coef_scale)
+                * aux_gas
+            )
+        # MoS per-token diversity (mirrors expert side; default off via coef=0).
+        mos_diversity_loss = torch.tensor(0.0, device=ntp_loss.device)
+        eff_mos_diversity_coef = 0.0
+        mos_div_t = getattr(self.mos_head, "_diversity_loss", None)
+        if (self.training and self.mos_output_diversity_coef > 0.0
+                and isinstance(mos_div_t, torch.Tensor)):
+            mos_diversity_loss = mos_div_t.to(device=ntp_loss.device)
+            # Scaled by warmup (annealer writes _expert_diversity_coef_scale).
+            # Computed every micro-step (coef=0 gates the work upstream), so no
+            # grad-accum compensation is needed here.
+            eff_mos_diversity_coef = (
+                float(self.mos_output_diversity_coef)
+                * float(self._expert_diversity_coef_scale)
             )
         router_reg_loss = self._collect_routing_losses(
-            ntp_loss.device, block_ortho_aux, eff_block_ortho_coef,
-            expert_gram_loss, eff_expert_gram_coef,
+            ntp_loss.device,
+            diversity_loss, eff_diversity_coef,
+            mos_diversity_loss, eff_mos_diversity_coef,
         )
         self._ntp_loss_t = ntp_loss.detach()
         self._ctp_loss_t = ctp_loss.detach()
-        # Backward-compatible scalar fields used by experiments/*.
+        # Back-compat scalar fields used by experiments/*.
         if (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE):
             try:
                 self._ntp_loss = float(self._ntp_loss_t.float().item())
@@ -4461,28 +4520,15 @@ class GPT(nn.Module):
                 self._ntp_loss = float(ntp_loss.detach().float().mean().item())
                 self._ctp_loss = float(ctp_loss.detach().float().mean().item())
         else:
-            # Avoid per-forward sync in the training hot path.
             self._ntp_loss = 0.0
             self._ctp_loss = 0.0
         ctp_weight = float(getattr(self, "ctp_weight", 0.0)) if self.use_ctp else 0.0
-
-        mos_ortho_loss = torch.tensor(0.0, device=ntp_loss.device)
-        if getattr(self.mos_head, "_ctp_ortho_out", None) is not None and getattr(self.mos_head, "_ntp_ortho_out", None) is not None:
-            mos_ortho_loss = self.mos_head._ctp_ortho_out + self.mos_head._ntp_ortho_out
-
-        # Lyapunov + denoising auxiliaries are added in the training loop
-        # (outside compiled forward to keep tensor metadata clean). MoS-head
-        # orthogonality keeps its dedicated coef — different layer/object than
-        # the routing-pool group.
-        return (
-            ntp_loss
-            + ctp_weight * ctp_loss
-            + router_reg_loss
-            + self.mos_ortho_out_coef * mos_ortho_loss
-        )
+        # Lyapunov + denoising auxiliaries are added in the training loop.
+        return ntp_loss + ctp_weight * ctp_loss + router_reg_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
+        self.mos_head._diversity_aux_enabled = False
         _, log_p_ntp = self.mos_head(x)
         return log_p_ntp
 
@@ -4673,88 +4719,51 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> OptimizerParamL
 
 
 def _prescribe_failure_fix(failure: str) -> dict:
-    """Map a post-int6 diagnostic failure string to its hypothesis-verified fix.
+    """Map a post-int6 diagnostic failure string to a fix prescription.
 
-    Pure function — exposed at module level for direct unit testing
-    (`experiments/test_arch.py::test_prescribe_min_share_routes_to_balance_loss`).
-
-    Routing rules (component-aware — see EXPERIENCE.md §1
-    `diagnostic-gate-component-awareness`):
-      - `mos_*_min_share`        → mos_balance_mult (H26: balance loss is the
-                                   routing-space lever; WD made it worse in iter 24)
-      - `attn_*_min_share`       → attn_balance_mult
-      - `mlp_*_min_share`        → mlp_balance_mult
-      - `mos_*_ortho`            → mos_ortho_out_coef (head-internal regularizer)
-      - `attn_*_ortho` / `mlp_*` → weight_decay (weight-space collinearity, H5
-                                   stands for ortho — only ortho — failures)
-      - `k-sweep…`               → widen K jitter
-      - `iter_conv_rel`          → WD or lower deq_beta
-      - `deq_recon_err`          → check determinism, lower deq_beta, raise WD
-                                   (only emitted under full BPTT — see §6.1)
+    After the iter-142-refactor flatten, the routing/MoS balance levers are:
+      - router_load_cv_coef        — covers attn/mlp slice CV
+      - mos_load_cv_coef           — covers MoS gate CV
+      - expert_output_diversity_coef — covers attn/mlp expert orthogonality
+      - mos_output_diversity_coef    — covers MoS expert orthogonality
+      - weight_decay                — last resort for weight-space collinearity
     """
     low = failure.lower()
     first_token = low.split("=", 1)[0].split()[0] if low else ""
 
-    # Dead-expert: split by component because the FIX differs.
     if "min_share" in first_token:
         if first_token.startswith("mos_"):
             return {
                 "failure": failure,
                 "category": "mos_router_collapse",
-                "hypothesis": "H26 VERIFIED — MoS balance loss controls dead-MoS-expert (iter 26-lb-loss)",
-                "fix": "Increase mos_balance_mult by 1.5× (e.g. 50→75). WD does NOT reach "
-                       "MoS routing collapse — iter 24 (H5) showed WD bump worsened "
-                       "mos_ntp_min_share (0.008→0.006). The MoS-internal balance loss "
-                       "is the principled fix.",
-                "config_change": {"mos_balance_mult_mult": 1.5},
+                "hypothesis": "MoS gate concentrating; bump MoS load-CV pressure",
+                "fix": "Increase mos_load_cv_coef by 1.5× (e.g. 0.25→0.375).",
+                "config_change": {"mos_load_cv_coef_mult": 1.5},
             }
-        if first_token.startswith("attn_"):
-            return {
-                "failure": failure,
-                "category": "attn_router_collapse",
-                "hypothesis": "H26 family — per-component balance loss is the routing-space lever",
-                "fix": "Increase attn_balance_mult by 1.5×. WD shrinks expert weights but "
-                       "doesn't move router logits — only the balance loss does.",
-                "config_change": {"attn_balance_mult_mult": 1.5},
-            }
-        if first_token.startswith("mlp_"):
-            return {
-                "failure": failure,
-                "category": "mlp_router_collapse",
-                "hypothesis": "H26 family — per-component balance loss is the routing-space lever",
-                "fix": "Increase mlp_balance_mult by 1.5×. WD shrinks expert weights but "
-                       "doesn't move router logits — only the balance loss does.",
-                "config_change": {"mlp_balance_mult_mult": 1.5},
-            }
-        # Unknown prefix shouldn't happen — defensive fallback.
         return {
             "failure": failure,
-            "category": "dead_expert_unknown_component",
-            "hypothesis": "unrecognized min_share prefix — manual triage required",
-            "fix": "Identify the failing component from the prefix and apply the "
-                   "corresponding `<component>_balance_mult` increase.",
-            "config_change": {},
+            "category": "router_collapse",
+            "hypothesis": "Routing slice CV under-regularized",
+            "fix": "Increase router_load_cv_coef by 1.5× (e.g. 0.5→0.75).",
+            "config_change": {"router_load_cv_coef_mult": 1.5},
         }
-    # MoS head ortho is a DIFFERENT failure mode from attn/mlp expert ortho.
-    # MoS has fixed num_shared+num_specialized; the fix is regularization on the
-    # head, not the expert-count knob.  Check MoS-prefixed first.
     if first_token.startswith("mos_") and "ortho" in first_token:
         return {
             "failure": failure,
             "category": "mos_head_collapse",
-            "hypothesis": "MoSHead orthogonality under-regularized",
-            "fix": "Increase mos_ortho_out_coef by 1.5× (currently 1e-3 → 1.5e-3). "
-                   "If no effect, shrink mos_rank or add a lightweight orthogonality loss inside the head.",
-            "config_change": {"mos_ortho_out_coef_mult": 1.5},
+            "hypothesis": "MoS expert orthogonality under-regularized",
+            "fix": "Enable mos_output_diversity_coef (default 0.0); start at 0.05.",
+            "config_change": {"mos_output_diversity_coef": 0.05},
         }
-    if "ortho" in first_token:  # attn_ortho / mlp_ortho only — weight-space collinearity
+    if "ortho" in first_token:
         return {
             "failure": failure,
             "category": "expert_collapse",
-            "hypothesis": "H5 — weight-space collinearity is WD-fixable (ortho only, not min_share)",
-            "fix": "Increase weight_decay by 1.5× (applied to both Muon and AdamW groups). "
-                   "If no effect, drop num_experts by 1 step.",
-            "config_change": {"weight_decay_mult": 1.5},
+            "hypothesis": "Expert outputs collapsing toward parallel directions",
+            "fix": "Increase expert_output_diversity_coef by 1.5× (e.g. 0.1→0.15) "
+                   "or fall back to weight_decay × 1.5 if direction-only pressure fails.",
+            "config_change": {"expert_output_diversity_coef_mult": 1.5,
+                              "weight_decay_mult": 1.5},
         }
     if low.startswith("k-sweep"):
         return {
@@ -5255,40 +5264,35 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         kv_latent_dim=args.kv_latent_dim, num_refinements=args.num_refinements,
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
-        deq_beta=args.deq_beta, attn_balance_mult=args.attn_balance_mult,
-        mlp_balance_mult=args.mlp_balance_mult, mos_balance_mult=args.mos_balance_mult,
-        bal_loss_coef=args.bal_loss_coef,
-        router_health_coef=args.router_health_coef, mos_ortho_out_coef=args.mos_ortho_out_coef,
+        deq_beta=args.deq_beta,
         deq_bptt_k=args.deq_bptt_k,
-        block_ortho_aux_coef=args.block_ortho_aux_coef,
-        block_ortho_aux_every=args.block_ortho_aux_every, block_ortho_aux_tokens=args.block_ortho_aux_tokens,
         num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
         router_entropy_coef=float(args.router_entropy_coef),
-        router_entropy_warmup_delay_frac=float(args.router_entropy_warmup_delay_frac),
         use_entmax_routing=args.use_entmax_routing,
         entmax_blend_init_logit=float(args.entmax_blend_init_logit),
         entmax_blend_warmup_delay_frac=float(args.entmax_blend_warmup_delay_frac),
-        expert_gram_coef=float(args.expert_gram_coef),
-        expert_gram_warmup_delay_frac=float(args.expert_gram_warmup_delay_frac),
-        expert_gram_max_tokens=int(args.expert_gram_max_tokens),
         use_smear_gate=bool(args.use_smear_gate),
         smear_gate_init=float(args.smear_gate_init),
         smear_gate_bos_id=int(args.smear_gate_bos_id),
         logit_softcap=float(args.logit_softcap),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
-        lyapunov_warmup_frac=args.lyapunov_warmup_frac,
         use_parcae=args.use_parcae,
         parcae_init_a_bar=args.parcae_init_a_bar,
         parcae_init_b_bar=args.parcae_init_b_bar,
-        min_share_loss_weight=args.min_share_loss_weight,
-        cv_loss_weight=args.cv_loss_weight,
         use_ctp=args.use_ctp,
-        ctp_weight=float(getattr(args, "ctp_weight", 0.0)),
-        router_load_cv_coef=float(getattr(args, "router_load_cv_coef", 0.5)),
-        mos_load_cv_coef=float(getattr(args, "mos_load_cv_coef", 0.25)),
-        expert_diversity_kind=str(getattr(args, "expert_diversity_kind", "frobenius")),
+        ctp_weight=float(args.ctp_weight),
+        router_load_cv_coef=float(args.router_load_cv_coef),
+        mos_load_cv_coef=float(args.mos_load_cv_coef),
+        cv_target=float(args.cv_target),
+        mos_cv_target=float(args.mos_cv_target),
+        expert_diversity_kind=str(args.expert_diversity_kind),
+        expert_output_diversity_coef=float(args.expert_output_diversity_coef),
+        expert_diversity_every=int(args.expert_diversity_every),
+        expert_diversity_max_tokens=int(args.expert_diversity_max_tokens),
+        mos_output_diversity_coef=float(args.mos_output_diversity_coef),
+        regularizer_warmup_frac=float(args.regularizer_warmup_frac),
         use_nsa_attention=args.use_nsa_attention,
         nsa_compress_block_size=args.nsa_compress_block_size,
         nsa_compress_block_sliding_stride=args.nsa_compress_block_sliding_stride,
@@ -5678,46 +5682,32 @@ def main() -> None:
         else:
             time_frac = min(max(step / max(int(args.iterations), 1), 0.0), 1.0)
 
-        late_frac = min(max((time_frac - 0.70) / 0.30, 0.0), 1.0)
-        health_scale = 1.0 + 4.0 * float(late_frac)
         # Compile-wrapper-safe: always write through unwrapped module.
         sb = _unwrap_compiled_module(base_model.shared_block)
-        sb.router.health_scale = float(health_scale)
-        # iter 100b: anneal entropy_coef. scale = 0 for time_frac<delay,
-        # then linear ramp 0 → 1 over remaining training. Final coef
-        # = target × scale. Avoids cold-start trap that hurt iter 99/100.
-        ent_target = float(getattr(base_model, "_router_entropy_coef_target", 0.0))
-        ent_delay = float(getattr(base_model, "_router_entropy_warmup_delay_frac", 0.0))
+        # Single shared regularizer ramp: 0 → 1 linearly over the first
+        # `regularizer_warmup_frac` fraction of training. Applied to entropy
+        # and per-token diversity (the schedule-sensitive regs). CV losses
+        # are active from step 0; entmax-blend keeps its own anneal because
+        # it gates routing form, not loss magnitude.
+        reg_warm = float(base_model.regularizer_warmup_frac)
+        reg_scale = (
+            min(max(time_frac / max(reg_warm, 1e-8), 0.0), 1.0) if reg_warm > 0 else 1.0
+        )
+        ent_target = float(base_model._router_entropy_coef_target)
         if ent_target > 0.0:
-            if time_frac < ent_delay:
-                ent_scale = 0.0
-            else:
-                ent_scale = min(max((time_frac - ent_delay) / max(1.0 - ent_delay, 1e-8), 0.0), 1.0)
-            sb.router.entropy_coef = ent_target * ent_scale
-        # iter 117 v2 (H87 rescue): anneal entmax blend. anneal=0 → pure
-        # softmax (strict-gen exact). After warmup_delay, ramps 0 → 1 so the
-        # learnable blend_logit takes over. Avoids the cold-start NaN cascade
-        # observed in iter 117 v1 (CV concentration cascade at s60 from 0.7%
-        # entmax contribution before training stabilized).
+            sb.router.entropy_coef = ent_target * reg_scale
         if bool(getattr(base_model, "_use_entmax_routing", False)):
-            blend_delay = float(getattr(base_model, "_entmax_blend_warmup_delay_frac", 0.3))
+            blend_delay = float(base_model._entmax_blend_warmup_delay_frac)
             if time_frac < blend_delay:
                 blend_anneal = 0.0
             else:
                 blend_anneal = min(max((time_frac - blend_delay) / max(1.0 - blend_delay, 1e-8), 0.0), 1.0)
             sb.router.entmax_blend_anneal = blend_anneal
-        # iter 141: anneal per-token expert-output Gram penalty.
-        # coef stored on GPT (model-level), not on router.
-        eg_target = float(getattr(base_model, "_expert_gram_coef_target", 0.0))
-        eg_delay = float(getattr(base_model, "_expert_gram_warmup_delay_frac", 0.3))
-        if eg_target > 0.0:
-            if time_frac < eg_delay:
-                eg_scale = 0.0
-            else:
-                eg_scale = min(max((time_frac - eg_delay) / max(1.0 - eg_delay, 1e-8), 0.0), 1.0)
-            base_model._expert_gram_coef_scale = eg_scale
+        # Per-token expert-output diversity ramp shares `reg_scale`.
+        if base_model._expert_diversity_coef_target > 0.0:
+            base_model._expert_diversity_coef_scale = reg_scale
         else:
-            base_model._expert_gram_coef_scale = 0.0
+            base_model._expert_diversity_coef_scale = 0.0
 
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
@@ -5752,36 +5742,42 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 diag_enabled = master_process and will_log_train and micro_step == grad_accum_steps - 1
-                base_model._block_ortho_aux_enabled = False
-                base_model._block_ortho_aux_coef_scale = 1.0
-                base_model._block_ortho_aux_tokens_override = int(args.block_ortho_aux_tokens)
-                if args.block_ortho_aux_coef > 0.0 and micro_step == grad_accum_steps - 1:
-                    base_model._block_ortho_aux_enabled = bool(
-                        args.block_ortho_aux_every > 0 and (next_step % int(args.block_ortho_aux_every) == 0))
-                # iter 141: per-token expert-output gram. Same cadence as
-                # block_ortho_aux (every N steps, last micro-step only) since
-                # the per-token einsum is the dominant cost; hot-path cost
-                # stays flat when block_ortho_aux_every aligns.
-                base_model._expert_gram_aux_enabled = False
-                base_model._expert_gram_loss = None
-                if args.expert_gram_coef > 0.0 and micro_step == grad_accum_steps - 1:
-                    base_model._expert_gram_aux_enabled = bool(
-                        args.block_ortho_aux_every > 0 and (next_step % int(args.block_ortho_aux_every) == 0))
+                # Compensates the global `loss * grad_scale = loss / grad_accum_steps`
+                # for last-only auxiliaries (expert-output diversity, etc.). On
+                # other micro-steps these aux contributions are zero anyway, so
+                # the scale is a no-op there.
+                base_model._aux_grad_accum_scale = (
+                    float(grad_accum_steps) if micro_step == grad_accum_steps - 1 else 1.0
+                )
+                # Per-token expert-output diversity: every-N + last-micro-step.
+                base_model._expert_diversity_aux_enabled = False
+                base_model._expert_diversity_loss = None
+                base_model._expert_diversity_token_start = 0
+                _div_every = int(args.expert_diversity_every)
+                if (args.expert_output_diversity_coef > 0.0
+                        and micro_step == grad_accum_steps - 1
+                        and _div_every > 0
+                        and (next_step % _div_every == 0)):
+                    base_model._expert_diversity_aux_enabled = True
+                    base_model._expert_diversity_token_start = _deterministic_token_window_start(
+                        int(args.seed), int(next_step), int(x.shape[1]), int(args.expert_diversity_max_tokens)
+                    )
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
 
                 # Lyapunov + denoising auxiliaries: hard-gated on coefs > 0
-                # (both default 0.0 since iter 88/89 — Parcae per-dim Ā already
-                # bounds spectral radius below 1, so these probes have nothing
-                # to grip on at training time). Code retained behind a single
+                # (both default 0.0 since iter 88/89 — Parcae-style damping
+                # improves solver reversibility/stability, while contraction of
+                # the full nonlinear block remains empirically monitored). Code
+                # retained behind a single
                 # flag so the eval-time Hutchinson harness in the K-sweep can
                 # still recompute ρ̂ on demand. The aggressive zero-skip means
                 # disabled-by-default = zero forward/backward cost.
                 lyap_coef = float(base_model.lyapunov_coef)
                 dn_coef = float(args.denoising_coef)
                 if (lyap_coef > 0.0 or dn_coef > 0.0) and micro_step == grad_accum_steps - 1:
-                    lyap_warmup_frac = float(base_model.lyapunov_warmup_frac)
-                    lyap_scale = min(time_frac / max(lyap_warmup_frac, 1e-8), 1.0) if lyap_warmup_frac > 0 else 1.0
+                    # Lyapunov / denoising share the same regularizer ramp.
+                    lyap_scale = float(reg_scale)
                     z_star = getattr(base_model, '_lyapunov_z_star', None)
                     x0_lyap = getattr(base_model, '_lyapunov_x0', None)
                     if z_star is not None and x0_lyap is not None and lyap_scale > 0.0:
@@ -5807,14 +5803,18 @@ def main() -> None:
                             v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
                             u_b2 = sb(z_star.detach(), x0_lyap, aux_b_bar)
                             surrogate = (u_b2 * v_dir).sum().abs()
-                            loss = loss + lyap_scale * lyap_coef * scale_t.to(dtype=surrogate.dtype) * surrogate
+                            # Multiply by grad_accum_steps so the per-optimizer-step
+                            # gradient contribution matches the documented coef
+                            # (last-only aux otherwise gets attenuated by 1/N
+                            # via the global grad_scale division below).
+                            loss = loss + grad_accum_steps * lyap_scale * lyap_coef * scale_t.to(dtype=surrogate.dtype) * surrogate
                         if dn_coef > 0.0:
                             dn_std = float(args.denoising_noise_std)
                             eps_noise = torch.randn_like(z_star) * dn_std
                             z_noisy = z_star.detach() + eps_noise
                             f_noisy = sb(z_noisy, x0_lyap, aux_b_bar)
                             dn_loss = (f_noisy - z_star.detach()).float().pow(2).mean()
-                            loss = loss + lyap_scale * dn_coef * dn_loss
+                            loss = loss + grad_accum_steps * lyap_scale * dn_coef * dn_loss
 
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -5835,7 +5835,7 @@ def main() -> None:
             opt.step()
 
         if args.router_bias_update:
-            bias_lr = float(args.router_bias_lr) * (1.0 + 4.0 * float(late_frac))
+            bias_lr = float(args.router_bias_lr)
             sb.router.bias_update(lr=bias_lr, clip=float(args.router_bias_clip), distributed=distributed)
         zero_grad_all()
 
@@ -5867,12 +5867,52 @@ def main() -> None:
             ctp_t = getattr(base_model, '_ctp_loss_t', None)
             ntp = float(ntp_t.detach().float().item()) if isinstance(ntp_t, torch.Tensor) else 0.0
             ctp = float(ctp_t.detach().float().item()) if isinstance(ctp_t, torch.Tensor) else 0.0
+            def _log_tensor_attr(name: str) -> float:
+                t = getattr(base_model, name, None)
+                return float(t.detach().float().item()) if isinstance(t, torch.Tensor) else 0.0
+
+            parcae_info = ""
+            if getattr(base_model, "use_parcae", False):
+                parcae_diag = base_model.parcae_diagnostics()
+
+                def _log_parcae(name: str) -> float:
+                    t = parcae_diag.get(name)
+                    return float(t.detach().float().item()) if isinstance(t, torch.Tensor) else 0.0
+
+                parcae_info = (
+                    f"parcae_a_bar_min:{_log_parcae('parcae_a_bar_min'):.6f} "
+                    f"parcae_a_bar_mean:{_log_parcae('parcae_a_bar_mean'):.6f} "
+                    f"parcae_a_bar_max:{_log_parcae('parcae_a_bar_max'):.6f} "
+                    f"parcae_a_bar_core_max:{_log_parcae('parcae_a_bar_core_max'):.6f} "
+                    f"parcae_beta_mean:{_log_parcae('parcae_beta_mean'):.6f} "
+                    f"parcae_beta_max:{_log_parcae('parcae_beta_max'):.6f} "
+                    f"parcae_b_bar_mean:{_log_parcae('parcae_b_bar_mean'):.6f} "
+                    f"parcae_b_bar_max:{_log_parcae('parcae_b_bar_max'):.6f} "
+                    f"parcae_delta_mean:{_log_parcae('parcae_delta_mean'):.6f} "
+                    f"parcae_delta_max:{_log_parcae('parcae_delta_max'):.6f} "
+                    f"parcae_recon_amp_log10:{_log_parcae('parcae_recon_amp_log10'):.6f} "
+                )
+            loss_info = (
+                f"router_cv_loss:{_log_tensor_attr('_router_cv_loss_t'):.6f} "
+                f"router_entropy_loss:{_log_tensor_attr('_router_entropy_loss_t'):.6f} "
+                f"mos_cv_loss:{_log_tensor_attr('_mos_cv_loss_t'):.6f} "
+                f"expert_diversity_loss:{_log_tensor_attr('_expert_diversity_loss_t'):.6f} "
+                f"mos_diversity_loss:{_log_tensor_attr('_mos_diversity_loss_t'):.6f} "
+                f"router_reg_loss:{_log_tensor_attr('_router_reg_loss_t'):.6f} "
+                f"router_cv_coef_eff:{_log_tensor_attr('_router_cv_coef_eff_t'):.6g} "
+                f"router_entropy_coef_eff:{_log_tensor_attr('_router_entropy_coef_eff_t'):.6g} "
+                f"mos_cv_coef_eff:{_log_tensor_attr('_mos_cv_coef_eff_t'):.6g} "
+                f"expert_diversity_coef_eff:{_log_tensor_attr('_expert_diversity_coef_eff_t'):.6g} "
+                f"mos_diversity_coef_eff:{_log_tensor_attr('_mos_diversity_coef_eff_t'):.6g} "
+            )
             base_model._deq_distance_travelled = getattr(base_model.shared_block, "_deq_distance_travelled_last_bwd", None)
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step, require_step_match=True) if master_process else ""
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"ntp_loss:{ntp:.4f} ctp_loss:{ctp:.4f} "
+                f"{loss_info}"
+                f"{parcae_info}"
                 f"grad_norm:{float(_preclip_t.item()) if _preclip_t is not None else 0.0:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
                 f"{deq_info}{expert_info}"

@@ -2,6 +2,7 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+import torch.nn.functional as F
 
 
 def _get_device() -> torch.device:
@@ -239,6 +240,46 @@ def test_parcae_init_recovers_target_a_bar():
         f"B̄₀={b_bar.mean():.4f}, expected ≈ {1.0 - target}"
 
 
+def test_parcae_diagnostics_match_zoh_formulas():
+    """Logged Parcae diagnostics must match the diagonal ZOH damping formulas."""
+    model = _make_model(use_parcae=True, num_layers=3)
+    dev = _get_device()
+    n = model.parcae_raw_a.numel()
+    with torch.no_grad():
+        dtype = model.parcae_raw_a.dtype
+        model.parcae_raw_a.copy_(torch.linspace(-0.5, 0.5, n, device=dev, dtype=dtype))
+        model.parcae_raw_delta.copy_(torch.linspace(-0.25, 0.25, n, device=dev, dtype=dtype))
+        model.parcae_raw_b.copy_(torch.linspace(-0.1, 0.3, n, device=dev, dtype=dtype))
+
+        delta = F.softplus(model.parcae_raw_delta.float()) + float(model.parcae_min_rate)
+        a_mag = F.softplus(model.parcae_raw_a.float()) + float(model.parcae_min_rate)
+        a_bar_core = torch.exp(-(delta * a_mag))
+        eps_rev = float(model.parcae_reversibility_floor)
+        a_bar = eps_rev + (1.0 - eps_rev) * a_bar_core
+        beta = 1.0 - a_bar
+        b_mag = F.softplus(model.parcae_raw_b.float()) + float(model.parcae_min_rate)
+        b_bar = delta * b_mag
+        diag = model.parcae_diagnostics(k_override=3)
+
+    expected = {
+        "parcae_a_bar_min": a_bar.min(),
+        "parcae_a_bar_mean": a_bar.mean(),
+        "parcae_a_bar_max": a_bar.max(),
+        "parcae_a_bar_core_max": a_bar_core.max(),
+        "parcae_beta_mean": beta.mean(),
+        "parcae_beta_max": beta.max(),
+        "parcae_b_bar_mean": b_bar.mean(),
+        "parcae_b_bar_max": b_bar.max(),
+        "parcae_delta_mean": delta.mean(),
+        "parcae_delta_max": delta.max(),
+        "parcae_recon_amp_log10": a_bar.min().clamp_min(1e-12).reciprocal().log10() * 3.0,
+    }
+    for key, value in expected.items():
+        assert key in diag, f"missing diagnostic {key}"
+        assert torch.allclose(diag[key], value, atol=1e-6, rtol=1e-6), (
+            f"{key}: got {diag[key].item():.8f}, expected {value.item():.8f}")
+
+
 def test_revdeq_convergence():
     """Test RevDEQ coupled-state iteration converges."""
     model = _make_model(num_layers=8)
@@ -265,7 +306,7 @@ def test_revdeq_convergence():
 
 def test_revdeq_reversibility():
     """Test RevDEQ backward reconstruction quality."""
-    model = _make_model(bigram_vocab_size=0, deq_backward="revdeq")
+    model = _make_model(bigram_vocab_size=0)
 
     dev = _get_device()
     x = torch.randint(0, 1024, (1, 16), device=dev)
@@ -282,8 +323,8 @@ def test_revdeq_reversibility():
             loss = model(x, y)
     loss.backward()
 
-    recon = getattr(model.shared_block, "_deq_recon_error_last_bwd", None)
-    assert recon is not None, "Must produce reconstruction diagnostic under RevDEQ backward"
+    recon = getattr(model.shared_block, "_deq_distance_travelled_last_bwd", None)
+    assert recon is not None, "Must produce RevDEQ backward distance diagnostic"
     assert float(recon) >= 0.0
     assert float(recon) < 1.0
     print(f"Reconstruction error: {float(recon):.6f}")
@@ -302,7 +343,7 @@ def test_revdeq_reconstruction_at_a_bar_floor():
     Note: reconstruction error compounds as (1/Ā)^K across K backward steps,
     so ε_rev is sized to keep the worst-case amplification tractable in fp64.
     """
-    model = _make_model(bigram_vocab_size=0, deq_backward="revdeq")
+    model = _make_model(bigram_vocab_size=0)
     eps_rev = float(model.parcae_reversibility_floor)
     with torch.no_grad():
         model.parcae_raw_a.fill_(100.0)  # → Ā saturates to ε_rev
@@ -322,8 +363,8 @@ def test_revdeq_reconstruction_at_a_bar_floor():
             loss = model(x, y)
     loss.backward()
 
-    recon = getattr(model.shared_block, "_deq_recon_error_last_bwd", None)
-    assert recon is not None, "Expected recon diagnostic even at Ā=ε_rev"
+    recon = getattr(model.shared_block, "_deq_distance_travelled_last_bwd", None)
+    assert recon is not None, "Expected RevDEQ distance diagnostic even at Ā=ε_rev"
     recon_f = float(recon)
     # Correctness claim: ε_rev prevents the backward from hitting division by
     # zero / overflow / NaN. Recon accuracy (< 1) holds in the normal training
@@ -388,51 +429,45 @@ def test_post_int6_gate_skips_mos_ctp_when_disabled():
         "so any 'mos_ctp_min_share' failure would be fake.")
 
 
-def test_prescribe_min_share_routes_to_balance_loss():
-    """Issue 4: min_share failures map to component-specific balance_mult, not WD.
-
-    Iter 24 (H5): controlled WD bump worsened mos_ntp_min_share (0.008→0.006).
-    Iter 26 (H26-lb-loss): MoS balance loss 50× fixed dead expert.
-    Therefore _prescribe_failure_fix must map mos_*_min_share → mos_balance_mult,
-    NOT weight_decay.  Same logic for attn/mlp.
-    """
+def test_prescribe_min_share_routes_to_cv_loss():
+    """min_share failures map to direct CV-load coefficients, not legacy knobs."""
     from train_gpt import _prescribe_failure_fix
 
     p_mos = _prescribe_failure_fix(
         "mos_ntp_min_share=0.005 < 0.150 (expert below 60% of fair share 1/4)")
     assert p_mos["category"] == "mos_router_collapse"
-    assert "mos_balance_mult_mult" in p_mos["config_change"], (
-        f"mos_*_min_share must prescribe mos_balance_mult bump, got {p_mos['config_change']}")
+    assert "mos_load_cv_coef_mult" in p_mos["config_change"], (
+        f"mos_*_min_share must prescribe mos_load_cv_coef bump, got {p_mos['config_change']}")
     assert "weight_decay_mult" not in p_mos["config_change"], (
-        "WD must NOT be prescribed for MoS routing collapse — H5 verified WD makes it worse.")
+        "WD must NOT be prescribed for MoS routing collapse.")
 
     p_attn = _prescribe_failure_fix("attn_min_share=0.01 < 0.150 (...)")
-    assert p_attn["category"] == "attn_router_collapse"
-    assert "attn_balance_mult_mult" in p_attn["config_change"]
+    assert p_attn["category"] == "router_collapse"
+    assert "router_load_cv_coef_mult" in p_attn["config_change"]
 
     p_mlp = _prescribe_failure_fix("mlp_min_share=0.01 < 0.150 (...)")
-    assert p_mlp["category"] == "mlp_router_collapse"
-    assert "mlp_balance_mult_mult" in p_mlp["config_change"]
+    assert p_mlp["category"] == "router_collapse"
+    assert "router_load_cv_coef_mult" in p_mlp["config_change"]
 
-    # Ortho failures still get WD (weight-space collinearity is the H5 territory).
+    # Ortho failures use output-diversity first and keep WD as fallback.
     p_ortho = _prescribe_failure_fix("attn_ortho=0.71 > 0.5 (max pairwise |cos| ...)")
     assert p_ortho["category"] == "expert_collapse"
+    assert "expert_output_diversity_coef_mult" in p_ortho["config_change"]
     assert "weight_decay_mult" in p_ortho["config_change"]
 
 
-def test_mos_balance_mult_is_a_hyperparameter():
-    """Sub-task of Issue 4: 50.0 literal promoted to a Hyperparameter.
-
-    Asserts the knob exists on Hyperparameters AND on the GPT instance, and
-    that the default value preserves the iter 26-lb-loss baseline (50.0)."""
+def test_direct_cv_coefficients_are_hyperparameters():
+    """Direct load-CV coefficients are the canonical routing balance knobs."""
     from train_gpt import Hyperparameters
-    assert hasattr(Hyperparameters, "mos_balance_mult")
-    assert float(Hyperparameters.mos_balance_mult) == 50.0, (
-        "Default must preserve iter 26-lb-loss baseline; changing it is an architecture iter, "
-        "not a diagnostic-cleanup commit.")
+    assert hasattr(Hyperparameters, "router_load_cv_coef")
+    assert hasattr(Hyperparameters, "mos_load_cv_coef")
+    assert float(Hyperparameters.router_load_cv_coef) == 0.5
+    assert float(Hyperparameters.mos_load_cv_coef) == 0.25
     model = _make_model(num_experts=4)
-    assert hasattr(model, "mos_balance_mult")
-    assert float(model.mos_balance_mult) == 50.0
+    assert hasattr(model, "router_load_cv_coef")
+    assert hasattr(model, "mos_load_cv_coef")
+    assert float(model.router_load_cv_coef) == 0.5
+    assert float(model.mos_load_cv_coef) == 0.25
 
 
 if __name__ == "__main__":
@@ -444,11 +479,12 @@ if __name__ == "__main__":
     test_parcae_b_bar_is_strictly_positive()
     test_parcae_ab_share_only_delta()
     test_parcae_init_recovers_target_a_bar()
+    test_parcae_diagnostics_match_zoh_formulas()
     test_revdeq_convergence()
     test_revdeq_reversibility()
     test_revdeq_reconstruction_at_a_bar_floor()
     test_ntp_only_baseline_skips_ctp_param_banks()
     test_post_int6_gate_skips_mos_ctp_when_disabled()
-    test_prescribe_min_share_routes_to_balance_loss()
-    test_mos_balance_mult_is_a_hyperparameter()
+    test_prescribe_min_share_routes_to_cv_loss()
+    test_direct_cv_coefficients_are_hyperparameters()
     print("\nAll tests passed!")

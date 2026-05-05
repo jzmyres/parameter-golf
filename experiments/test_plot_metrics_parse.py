@@ -8,7 +8,7 @@ import math
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-from experiments.plot_metrics import parse_log, usage_min_series
+from experiments.plot_metrics import parse_log, plot_comparison, usage_min_series
 
 
 class TestPlotMetricsParse(unittest.TestCase):
@@ -36,6 +36,11 @@ class TestPlotMetricsParse(unittest.TestCase):
         # Only the second run should remain.
         self.assertEqual(d["train_steps"], [1])
         self.assertEqual(d["train_loss"], [2.2])
+        self.assertEqual(len(d["router_reg_loss"]), 1)
+        self.assertTrue(math.isnan(d["router_reg_loss"][0]))
+        self.assertTrue(math.isnan(d["router_cv_term"][0]))
+        self.assertEqual(len(d["parcae_a_bar_mean"]), 1)
+        self.assertTrue(math.isnan(d["parcae_a_bar_mean"][0]))
         self.assertEqual(d["val_steps"], [1])
         self.assertEqual(d["val_bpb"], [1.25])
         self.assertEqual(d["final_postquant_val_bpb"], 1.35)
@@ -45,6 +50,15 @@ class TestPlotMetricsParse(unittest.TestCase):
             [
                 # Train log line includes diagnostics we want plotted densely.
                 "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
+                "router_cv_loss:0.120000 router_entropy_loss:2.300000 mos_cv_loss:0.040000 "
+                "expert_diversity_loss:0.500000 mos_diversity_loss:0.000000 router_reg_loss:0.091625 "
+                "router_cv_coef_eff:0.5 router_entropy_coef_eff:0.00125 mos_cv_coef_eff:0.25 "
+                "expert_diversity_coef_eff:0.0375 mos_diversity_coef_eff:0 "
+                "parcae_a_bar_min:0.600000 parcae_a_bar_mean:0.700000 parcae_a_bar_max:0.800000 "
+                "parcae_a_bar_core_max:0.777778 parcae_beta_mean:0.300000 parcae_beta_max:0.400000 "
+                "parcae_b_bar_mean:0.300000 parcae_b_bar_max:0.310000 "
+                "parcae_delta_mean:1.000000 parcae_delta_max:1.010000 "
+                "parcae_recon_amp_log10:3.550000 "
                 "train_time:10.0ms step_avg:10.0ms "
                 "deq_residual:1.0 deq_recon_err:0.0 deq_iter_conv:0.1 gg_iter:[0.9,0.8,0.7,0.6] "
                 "expert_ortho:0.25 mos_ctp_ortho:0.10 mos_ntp_ortho:0.20 "
@@ -65,6 +79,33 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["deq_recon_train"], [0.0])
         self.assertEqual(d["deq_iter_conv_train"], [0.1])
         self.assertEqual(d["gg_iter_train"], [[0.9, 0.8, 0.7, 0.6]])
+        self.assertEqual(d["router_cv_loss"], [0.12])
+        self.assertEqual(d["router_entropy_loss"], [2.3])
+        self.assertEqual(d["mos_cv_loss"], [0.04])
+        self.assertEqual(d["expert_diversity_loss"], [0.5])
+        self.assertEqual(d["mos_diversity_loss"], [0.0])
+        self.assertEqual(d["router_reg_loss"], [0.091625])
+        self.assertEqual(d["router_cv_coef_eff"], [0.5])
+        self.assertEqual(d["router_entropy_coef_eff"], [0.00125])
+        self.assertEqual(d["mos_cv_coef_eff"], [0.25])
+        self.assertEqual(d["expert_diversity_coef_eff"], [0.0375])
+        self.assertEqual(d["mos_diversity_coef_eff"], [0.0])
+        self.assertAlmostEqual(d["router_cv_term"][0], 0.06)
+        self.assertAlmostEqual(d["router_entropy_term"][0], 0.002875)
+        self.assertAlmostEqual(d["mos_cv_term"][0], 0.01)
+        self.assertAlmostEqual(d["expert_diversity_term"][0], 0.01875)
+        self.assertAlmostEqual(d["mos_diversity_term"][0], 0.0)
+        self.assertEqual(d["parcae_a_bar_min"], [0.6])
+        self.assertEqual(d["parcae_a_bar_mean"], [0.7])
+        self.assertEqual(d["parcae_a_bar_max"], [0.8])
+        self.assertAlmostEqual(d["parcae_a_bar_core_max"][0], 0.777778, places=5)
+        self.assertEqual(d["parcae_beta_mean"], [0.3])
+        self.assertEqual(d["parcae_beta_max"], [0.4])
+        self.assertEqual(d["parcae_b_bar_mean"], [0.3])
+        self.assertEqual(d["parcae_b_bar_max"], [0.31])
+        self.assertEqual(d["parcae_delta_mean"], [1.0])
+        self.assertEqual(d["parcae_delta_max"], [1.01])
+        self.assertEqual(d["parcae_recon_amp_log10"], [3.55])
         self.assertEqual(d["mos_ctp_ortho_train"], [0.10])
         self.assertEqual(d["mos_ntp_ortho_train"], [0.20])
         self.assertEqual(d["block_entropy_train"], [0.65])
@@ -134,6 +175,34 @@ class TestPlotMetricsParse(unittest.TestCase):
             d = parse_log(p)
 
         self.assertEqual(d["expert_ortho"], [0.33])
+
+    def test_plot_comparison_smoke_with_auxiliary_terms(self):
+        train_line = (
+            "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
+            "router_cv_loss:0.120000 router_entropy_loss:2.300000 mos_cv_loss:0.040000 "
+            "expert_diversity_loss:0.500000 mos_diversity_loss:0.000000 router_reg_loss:0.091625 "
+            "router_cv_coef_eff:0.5 router_entropy_coef_eff:0.00125 mos_cv_coef_eff:0.25 "
+            "expert_diversity_coef_eff:0.0375 mos_diversity_coef_eff:0 "
+            "parcae_a_bar_min:0.600000 parcae_a_bar_mean:0.700000 parcae_a_bar_max:0.800000 "
+            "parcae_a_bar_core_max:0.777778 parcae_beta_mean:0.300000 parcae_beta_max:0.400000 "
+            "parcae_b_bar_mean:0.300000 parcae_b_bar_max:0.310000 "
+            "parcae_delta_mean:1.000000 parcae_delta_max:1.010000 "
+            "parcae_recon_amp_log10:3.550000 "
+            "train_time:10.0ms step_avg:10.0ms"
+        )
+        val_line = "step:10/20 val_loss:3.1 val_bpb:1.50 train_time:10ms step_avg:10.0ms"
+        log = "\n".join([train_line, val_line, "final_int6_zstd_roundtrip_exact val_loss:3.0 val_bpb:1.49"])
+        with tempfile.TemporaryDirectory() as td:
+            baseline = os.path.join(td, "baseline.log")
+            current = os.path.join(td, "current.log")
+            with open(baseline, "w", encoding="utf-8") as f:
+                f.write(log)
+            with open(current, "w", encoding="utf-8") as f:
+                f.write(log)
+            ok = plot_comparison(baseline, current, td)
+            if not ok:
+                self.skipTest("matplotlib not available")
+            self.assertTrue(os.path.exists(os.path.join(td, "metrics_comparison.png")))
 
 
 if __name__ == "__main__":

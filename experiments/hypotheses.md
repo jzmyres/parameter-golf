@@ -682,7 +682,7 @@ x (B, T, D)
 
 **The `k=4` improvement (1.7869 → 1.7506, -0.036)** is noteworthy — at k=4 (off-training-distribution since K-jitter set is {8,12,20}), iter 89 generalizes BETTER than iter 88. Plausible mechanism: removing the denoising MSE removes a finite-scale regularizer that was effectively asking the model to be insensitive to perturbations of σ=0.01 around z*. With that gone, the model fits training-K behavior more sharply, and that sharpness happens to extrapolate slightly better to shallow K. Not a load-bearing claim — could easily be noise — but it's at least not evidence of K-robustness loss.
 
-**Implication:** The two iter-66b-pre-Parcae regularizers (λ_jac + denoising MSE) were both redundant once Parcae's per-dim Ā took over spectral-radius control. With both off, the loss is now `task_loss + bal_loss + ortho_loss + router_health`, with no spectral-bound auxiliary losses. The contraction in fact *tightens* — see K=8→K=128 Δ trajectory iter 87 (-0.003) → iter 88 (-0.0041) → iter 89 (-0.0036) — and throughput recovers.
+**Implication:** The two iter-66b-pre-Parcae regularizers (λ_jac + denoising MSE) were both redundant once Parcae-style per-dim Ā/B̄ improved solver reversibility/stability. With both off, the loss is now `task_loss + bal_loss + ortho_loss + router_health`, with no spectral-bound auxiliary losses. Full nonlinear contraction is still empirical; the K=8→K=128 Δ trajectory tightened iter 87 (-0.003) → iter 88 (-0.0041) → iter 89 (-0.0036), and throughput recovered.
 
 **Why we kept the code instead of deleting:** per user directive 2026-04-25, dead-code cleanup uses comment-out, not deletion. Both Lyapunov and denoising paths remain in `train_gpt.py` behind `coef > 0.0` guards. They could re-activate via CLI flag if a future architectural change reintroduces a need for explicit ρ(J) bounding.
 
@@ -690,7 +690,7 @@ x (B, T, D)
 
 ### H67: Disable Lyapunov hinge penalty λ_jac (iter 88) — PROMOTED ★ (2026-04-25)
 
-**Claim:** Under iter-66b Parcae per-dim Ā, the spectral radius is already bounded away from 1 by construction (`Ā ∈ [0.1, 1)` via the reversibility floor + softplus reparam), so the Hutchinson-Frobenius `ρ(J) < γ` hinge penalty has nothing to grip on at training time. λ_jac contributes only Hutchinson-probe noise to the gradient and one VJP per step worth of compute.
+**Claim:** Under iter-66b Parcae-style per-dim Ā/B̄, solver reversibility/stability is improved by the bounded decay path, while contraction of the full nonlinear block remains empirically monitored. The Hutchinson-Frobenius `ρ(J) < γ` hinge penalty had nothing useful to grip on in the observed runs. λ_jac contributes only Hutchinson-probe noise to the gradient and one VJP per step worth of compute.
 
 **Test:** iter 88 — `lyapunov_coef = 0.01 → 0.0`. The hot-path block at L3649 short-circuits on `lyap_coef > 0.0`, so the Hutchinson VJP and surrogate skip entirely. Code path retained (commented-out future cleanup permitted; deletion not). Commit `ceb7dfa`. Promoted commit `45af5bf`.
 
@@ -2708,7 +2708,7 @@ Run ordering rationale (preserved for posterity): low-risk → higher-risk, acti
 
 | New # | Old # | One-line | Rationale |
 |---|---|---|---|
-| **88** | old 66b queue | Disable Lyapunov Hutchinson penalty (λ_jac 0.01 → 0) | **PROMOTED ★ (commit `45af5bf`)** — int6 Δ=+0.0050 (≤ 0.03 ✓), K=8→K=128 Δ tightened -0.003 → **-0.0041** (still negative — deep K BETTER), artifact -57 KB, step_avg **-2.9% (~3% throughput recovery)**. Hypothesis confirmed: Parcae per-dim Ā already bounds spectral radius; λ_jac contributed only noise + one VJP/step. Code path retained (commented-out future cleanup permitted, never delete). See H67. |
+| **88** | old 66b queue | Disable Lyapunov Hutchinson penalty (λ_jac 0.01 → 0) | **PROMOTED ★ (commit `45af5bf`)** — int6 Δ=+0.0050 (≤ 0.03 ✓), K=8→K=128 Δ tightened -0.003 → **-0.0041** (still negative — deep K BETTER), artifact -57 KB, step_avg **-2.9% (~3% throughput recovery)**. Interpretation updated: Parcae-style per-dim Ā improves solver reversibility/stability; full nonlinear contraction remains empirically monitored. λ_jac contributed only noise + one VJP/step in this run. Code path retained (commented-out future cleanup permitted, never delete). See H67. |
 | **89** | old 66c queue | Disable HyDRA denoising regularization (denoising_coef 0.01 → 0) | **PROMOTED ★ (commit `aeba34a`)** — int6 Δ=+0.0026 (≤ 0.03 ✓), K=8→K=128 Δ -0.0041 → -0.0036 (still negative — deep K BETTER), artifact +49 KB (zstd-compression diff, no params changed), step_avg -2%, peak_vram -301 MB. Same Parcae-redundancy hypothesis as iter 88 confirmed for the finite-perturbation probe. Cumulative iter 88+89 reclaims ~5% step time and ~1.5% peak VRAM. Code path retained per user directive. See H68. |
 
 #### Group D — architectural scale-up (CLOSED 2026-04-25; bottleneck DISCARDED — superseded by iter 96 full-D LoRA)
@@ -3648,10 +3648,12 @@ Active changes:
   `routing_gram_coef`, `routing_gram_warmup_delay_frac`, gram_coef buffer
   in SoftDenseRouter, the per-FP-iter gram penalty block, the warmup
   ramp). `grep -rn` returns zero in active code.
-- Router CV: raw CV (no `relu(cv − cv_target)²` floor, no `cv_loss_weight`
-  internal mult, no `router_health_coef` outer mult, no
-  `attn_balance_mult + mlp_balance_mult` slice multiplier). Single coef
-  `router_load_cv_coef = 0.5` (preserves `0.25 × 2.0` legacy magnitude).
+- Router CV: per-slice CV hinge `relu(cv − cv_target)²` computed on the
+  combined routed mass `softmax/entmax × sigmoid(gate)` (no per-slice
+  renormalization, no `cv_loss_weight` internal mult, no `router_health_coef`
+  outer mult, no `attn_balance_mult + mlp_balance_mult` slice multiplier).
+  Single coef `router_load_cv_coef = 0.5` (preserves `0.25 × 2.0` legacy
+  magnitude).
 - Router entropy: single coef `router_entropy_coef = 0.00125` (preserves
   `router_health_coef × 0.005 = 0.25 × 0.005`).
 - MoS balance: CV replaces MSE-to-uniform; single coef
@@ -3659,8 +3661,9 @@ Active changes:
   = 50 × 5e-3`).
 - ctp_weight: promoted to direct Hyperparameter (was `0.05 ×
   num_refinements × refine_strength` dynamic schedule; default 0.0).
-- expert_diversity_kind: new flag, default `"frobenius"` (iter 141 math
-  preserved). Cosine variant added for iter-142b A/B.
+- expert_diversity_kind: new flag, default `"cosine"` (scale-invariant
+  expert-output diversity). Frobenius variant remains available for norm-coupled
+  ablations.
 
 **Test:** 100-step controlled comparison vs baseline 2eb06e8.
 
@@ -3678,6 +3681,20 @@ k=24: 2.314682, k=32: 2.315054, **k=37: 2.315240 (+1e-4 prime)**, k=64: 2.315896
 K=17, K=37, K=113 acyclicity-prime checks all show <1e-4 deviation from
 nearest power-of-2 → genuine fixed-point convergence.
 
+**ntp descent rate (Δntp / 10 steps, iter-142-refactor vs older proxy baseline):**
+
+| Window | refactor Δntp/10 | proxy Δntp/10 | refactor Δntp/sec | proxy Δntp/sec | Notes |
+|---|---|---|---|---|---|
+| s30→s60 | 0.0810 | 0.0763 | 3.5e-4 | 3.3e-4 | partial; current.log truncated past s60; proxy is older 1000-step run, not 2eb06e8 |
+
+Refactor descending ~6% faster per step and ~5% faster per wallclock vs
+the proxy baseline at the same window. This is a sanity-check window, not
+a like-for-like comparison: the 2eb06e8 100-step `run.log` was rotated by
+`update_results.sh` before this entry was written, and `baseline.log`
+points at an older 1000-step config. iter-142a will re-emit the full
+windowed table (s30–s100, s100–s200, …) against a freshly captured
+2eb06e8 baseline.
+
 **Status:** ✅ VERIFIED at 100 steps — refactor improves val_bpb by 0.075
 vs baseline. Strict-gen claim satisfied (val_bpb ≤ baseline by a clear
 margin; not a wash).
@@ -3687,6 +3704,15 @@ gradient pressure even when CV ≤ 0.20 (where the old `relu(cv − 0.20)²`
 floor was zero). Routing balance was effectively unregularized for the
 "healthy" regime; flattening exposed the gap. This is a *behavior change
 at low CV* even though magnitudes match at typical mid-training CV ≈ 0.5.
+The implementation now tracks the flattened objective explicitly: train logs
+emit `router_reg_loss`, raw auxiliary components, and effective coefficients;
+`experiments/plot_metrics.py` derives weighted terms for the 8×3 comparison
+grid, and `experiments/update_results.sh` summarizes final router-reg and
+weighted aux terms per baseline/previous/current log. The same diagnostics
+pass now logs Parcae state (`Ā`, `β`, `B̄`, `Δ`, reconstruction amplification)
+without changing runtime behavior; this records the RevDEQ-adapted Parcae
+ZOH damping state as observability, not as a promotion gate or a proof of
+nonlinear contraction.
 
 **Caveats:**
 - 100 steps is a partial signal. The trajectory at 1000 steps may differ

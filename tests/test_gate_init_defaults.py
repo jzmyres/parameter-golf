@@ -122,8 +122,8 @@ class TestLyapunovArchDefaults(unittest.TestCase):
             expected = (x0 * rms) * b.x0_inject_norm_weight
         self.assertTrue(torch.allclose(out, expected, atol=1e-5, rtol=1e-5))
 
-    def test_revdeq_default_trains_parcae_b_bar(self) -> None:
-        """Default RevDEQ path must expose B̄ to autograd, not hide it in module state."""
+    def test_revdeq_default_trains_parcae_parameters(self) -> None:
+        """Default RevDEQ path must expose Ā/B̄/Δ parameters to autograd."""
         from train_gpt import GPT
 
         torch.manual_seed(0)
@@ -146,7 +146,6 @@ class TestLyapunovArchDefaults(unittest.TestCase):
             num_experts=2,
             num_shared_experts=0,
             use_parcae=True,
-            deq_backward="revdeq",
         )
         model.train()
         x = torch.randint(0, 64, (1, 6))
@@ -155,10 +154,11 @@ class TestLyapunovArchDefaults(unittest.TestCase):
         loss = model(x, y)
         loss.backward()
 
-        grad = model.parcae_raw_b.grad
-        self.assertIsNotNone(grad, "parcae_raw_b.grad must not be hidden by RevDEQFunction.")
-        self.assertTrue(torch.isfinite(grad).all())
-        self.assertGreater(float(grad.abs().sum()), 0.0)
+        for name in ("parcae_raw_a", "parcae_raw_delta", "parcae_raw_b"):
+            grad = getattr(model, name).grad
+            self.assertIsNotNone(grad, f"{name}.grad must not be hidden by RevDEQFunction.")
+            self.assertTrue(torch.isfinite(grad).all())
+            self.assertGreater(float(grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":

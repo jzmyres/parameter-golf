@@ -32,6 +32,7 @@ This file has two roles, in this order:
 | 2026-04-30 | [#claude-md-size-budget](#claude-md-size-budget)             | CLAUDE.md hit 51 887 chars (>40k perf warning) from accreted iter-history annotations |
 | 2026-04-30 | [#variance-reg-ns-cascade](#variance-reg-ns-cascade)         | Iter 117 NaN cascade attributed to PE-NS was actually variance-reg gradients on entmax exact-zeros |
 | 2026-05-02 | [#cumulative-metric-misread](#cumulative-metric-misread)     | Iter 117b-3 erroneously killed at s10 because cumulative `step_avg` was misread as instantaneous step time |
+| 2026-05-05 | [#partial-preview-completeness](#partial-preview-completeness) | iter-142-refactor 100-step preview silently skipped the descent-rate component because the run was "partial"  |
 
 ### Section template
 
@@ -529,6 +530,23 @@ grep -E "^step:[0-9]+/" run.log | grep -oE "step:[0-9]+/|step_avg:[0-9.]+" | pas
 The first command gives instantaneous per-step latency. The second gives cumulative — only trust it once enough samples (≥200) have washed out the warmup outliers.
 
 **Cross-references.** This incident generalizes [#hot-path-sync](#hot-path-sync) (also a "look at the actual cost, not the documented intent" failure) and [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (also a "stale assumption applied to current state" pattern). The unifying theme: **don't trust a derived value without re-checking how it's computed**.
+
+---
+
+### partial-preview-completeness
+
+**Date:** 2026-05-05 review of iter 142-refactor
+**Rule in CLAUDE.md:** §9 audit checklist row · §7 step 12 (Hypothesis Log)
+
+**What happened.** The iter-142-refactor entry in `experiments/hypotheses.md` (commit `3e62655`) reported a 100-step preview verdict with components (a) roundtrip int6, (b) k_sweep_table, (c) trajectory, (d) acyclicity-prime check — but silently omitted (e) `ntp_loss` descent rate, the permanent-metric component mandated by user directive 2026-05-02. The author implicitly granted themselves an exemption because "100 steps is a partial signal" (per the entry's Caveats) and a longer run was pending. Caught during pre-commit review (this file).
+
+**Root cause.** The five-component requirement was framed assuming a 1000-step run with the canonical descent windows (s30-s100, s100-s200, …). When an iter publishes a verdict from fewer steps, no rule said how to behave — the author silently skipped rather than emitting partial windows. Same shape will recur on every short-budget preview, K-sweep skipped on OOM, log-rotation race, etc.
+
+**The rule.** Partial-step previews are NOT exempt from the 5-component report. Emit the partial windows that are computable (e.g. one s30–s60 row instead of the full s30→s1000 table). If a component is genuinely uncomputable from the run.log (logs rotated, OOM during K-sweep, etc.), state it explicitly under **Caveats** with a recovery plan ("iter-Xa will re-emit"). Silently omitting shifts a tracked debt into an untracked one. **Generalizes**: graceful-degradation > silent-skip for any mandated artifact (k_sweep_table on partial K-coverage, log_summary on missing fields, etc.).
+
+**Verification recipe.** `grep -E "^### iter " experiments/hypotheses.md | tail -5` then inspect the most recent entries. Each must show all 5 §7-step-12 components or an explicit Caveats note for the missing one. Pre-commit reviewers should specifically check that "longer run pending" is paired with whatever partial data IS available, not used as a wholesale exemption.
+
+**Cross-references.** Related: [#cumulative-metric-misread](#cumulative-metric-misread) (also a "convenient simplification eats a required signal" pattern), [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (also a "stale exemption survived a regime change" pattern). The unifying theme: **mandated artifacts degrade gracefully; they do not silently skip.**
 
 ---
 

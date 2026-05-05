@@ -178,16 +178,17 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | Parameter | Value |
 |---|---|
 | router_scoring | linear (dot-product logits) |
-| mos_balance_mult | 50.0 (multiplies MoS-NTP balance loss in `_collect_routing_losses`; the principled fix for `mos_*_min_share` failures, H26) |
-| min_share_loss_weight | 0.0 (CV loss alone covers global balance; `min_share` stays a diagnostic — sentinel `< 0.005` sustained → intervene; H76) |
-| cv_loss_weight | 2.0 (compensates dropped min_share floor; H76) |
-| router_entropy_coef | 0.005 (iter 117 v5 baseline; 10× bump in 117b-1 NOT PROMOTED — H87b) |
-| router_entropy_warmup_delay_frac | 0.3 (linear ramp 0→target after 30 % of wallclock; cold-start trap mitigation per `feedback_anneal_sparsity_coefs.md`) |
+| router_load_cv_coef | 0.5 (direct coefficient on pooled router CV hinge over combined `softmax/entmax * sigmoid` mass) |
+| mos_load_cv_coef | 0.25 (direct coefficient on MoS softmax-gate CV hinge) |
+| cv_target / mos_cv_target | 0.20 / 0.20 (`relu(cv - target)^2`; CV losses active from step 0) |
+| router_entropy_coef | 0.00125 (direct coefficient on per-token router entropy; linearly ramped over `regularizer_warmup_frac`) |
+| regularizer_warmup_frac | 0.30 (shared 0->1 ramp for router entropy and diversity losses; CV is not warmed up) |
 | use_entmax_routing | False (CLI-enable. When True: `sigmoid(blend) * softmax + (1−sigmoid(blend)) * entmax_1p5` with learnable scalar `blend_logit`. Strict-gen at `entmax_blend_init_logit=+5`. H87.) |
 | entmax_blend_init_logit | 5.0 (sigmoid(5) ≈ 0.9933 ⇒ ≈ pure softmax at init; CLI override `--entmax-blend-init-logit=…`) |
-| expert_gram_coef | 0.0 (CLI-enable. iter 141 NEW 2026-05-04. Per-token expert-OUTPUT Gram penalty: `E_t[‖(Y_t Y_t^T)/D − I/E‖²_F]` over expert outputs `Y_t ∈ ℝ^{E×D}`. Subsumes block_ortho via Jensen. Strict-gen at 0 → exact recovery of iter 133 forward map. Piggybacks `block_ortho_aux_every` cadence.) |
-| expert_gram_warmup_delay_frac | 0.3 |
-| expert_gram_max_tokens | 64 |
+| expert_output_diversity_coef | 0.1 (per-token expert-output diversity; default cosine Gram over a deterministic contiguous token window every `expert_diversity_every` steps) |
+| expert_diversity_kind | cosine (`frobenius` remains available for norm-coupled diversity) |
+| expert_diversity_every / expert_diversity_max_tokens | 8 / 64 (set max tokens >= sequence length to compute the full sequence on the same cadence) |
+| mos_output_diversity_coef | 0.0 (MoS low-rank-state diversity; disabled by default) |
 | logit_softcap | 0.0 (CLI-enable. When > 0, applies `softcap·tanh(logits/softcap)` to per-expert MoS logits before log_softmax. Strict-gen at 0. Records use 30.0; H93.) |
 | attn_expert_rank | 64 |
 | mlp_expert_rank | 96 |
@@ -195,7 +196,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | bigram_dim | 128 |
 | deq_beta_jitter | True (sample β from {0.3, 0.5, 0.7} per step when `use_parcae=False`) |
 | deq_k_jitter_set | (16, 24) (FP found at K=16 per iter 98b K-sweep; K=24 adds wider FP-depth jitter — analog of H12 VERIFIED. Iter 131 retried (32,48) NOT-PROMOTED; reverted) |
-| lyapunov_coef | 0.0 (λ_jac disabled — Parcae per-dim Ā already bounds spectral radius) |
+| lyapunov_coef | 0.0 (λ_jac disabled; Parcae-style damping improves solver reversibility/stability, while contraction is empirically monitored) |
 | lyapunov_gamma | 0.97 |
 | lyapunov_warmup_frac | 0.05 |
 | denoising_coef | 0.0 (HyDRA denoising disabled — Parcae-redundancy logic) |
@@ -234,12 +235,15 @@ Paper: Soft MoE (arxiv:2308.00951). Mixtape (NeurIPS 2019) for MoS softmax.
 - **Attn/MLP routing**: `softmax(allocation) × sigmoid(gate)` (`SoftDenseRouter`). Weights sum to ≤ 1 (NOT renormalized). The sigmoid gate lets the model globally suppress the mixture (`T(z, x₀) ≈ 0` when all paths close).
 - **MoS routing**: pure softmax (convex combination summing to 1).
 - **Applied to**: attention output, MLP hidden, MoS output heads.
-- **Expert-health metrics** (min-share / CV) are computed on **renormalized** per-component shares; total routed mass is logged separately.
+- **Expert-health diagnostics** normalize usage shares for readability; total routed mass is logged separately. **Routing regularization** uses the combined routed mass `p = softmax/entmax(allocation) * sigmoid(gate)` directly. CV does not require a probability distribution and must not renormalize away gate effects.
 - **Two distinct routing entropies** — *global utilization* (`H_global` over batch-averaged shares; HIGH = no dead experts; sentinel) and *per-token concentration* (`H_pertoken` averaged over tokens; LOW = specialization). Target: HIGH global AND LOW per-token. Full definitions, axes, and failure modes in §7 metrics table.
-- **Regularization** — three orthogonal regs grouped under `router_reg_loss` in `_collect_routing_losses`; coefs are independent (do not collapse magnitudes in a single commit):
-  - **Per-token specialization**: `+entropy_coef · H_pertoken` (POSITIVE sign drives `H_pertoken → 0`).
-  - **Global balance / dead-expert prevention**: `min_share_loss_weight` (floor) + `cv_loss_weight` (CV penalty). Drives `H_global → log(N)`.
-  - **Expert orthogonality**: `block_ortho_aux_coef × ‖cos_sim‖` between expert OUTPUT means.
+- **Regularization** — flat objective in `_collect_routing_losses`; each term has a direct coefficient and is logged separately:
+  - **Router load balance**: `router_load_cv_coef * Σ_r relu(cv_r - cv_target)^2`.
+  - **Per-token specialization**: `router_entropy_coef_eff * Σ_r H_pertoken(r)` (positive sign drives `H_pertoken -> 0`).
+  - **MoS load balance**: `mos_load_cv_coef * relu(cv_mos - mos_cv_target)^2`.
+  - **Expert diversity**: `expert_output_diversity_coef_eff * diversity(expert outputs)`.
+  - **MoS diversity**: `mos_output_diversity_coef_eff * diversity(MoS low-rank states)`, default off.
+- **Loss + Parcae tracking** — train logs emit raw components (`router_cv_loss`, `router_entropy_loss`, `mos_cv_loss`, `expert_diversity_loss`, `mos_diversity_loss`), `router_reg_loss`, effective coefficients (`*_coef_eff`), and Parcae state (`parcae_a_bar_min/mean/max`, `parcae_a_bar_core_max`, `parcae_beta_mean/max`, `parcae_b_bar_mean/max`, `parcae_delta_mean/max`, `parcae_recon_amp_log10`). `experiments/plot_metrics.py` derives weighted terms as `raw × effective_coef` and plots Parcae state for comparison.
 - Fully differentiable, no discrete decisions.
 
 ### 6.3 Per-Expert MLA + Gated Attention (full-D LoRA-style — architectural standard)
@@ -276,7 +280,7 @@ Reference impl: see §2.
   - Step 1+: predict from `z*` → build soft embedding → DEQ solve with `x₀ + soft_embed`.
   - Soft embedding: average CTP[i] and NTP[i−1] logits, top-k sparse embed, EMA blending.
   - `num_refinements` controls predict→refine cycles.
-- **NTP-only MoS prediction** (iter 94 baseline): `Hyperparameters.use_ctp = False`. CTP param banks not allocated; `MoSHead.forward` returns `(log_p_ntp, log_p_ntp)`; `GPT.forward` sets `ctp_loss = 0`; `_get_soft_embedding` uses `p_mix = p_ntp`. Historical dual-head design preserved behind `--use-ctp=1`. Iter-94 metrics, removed param banks, and rationale: see H60 in `experiments/hypotheses.md`.
+- **NTP-only default with CTP preserved as an ablation path**: `Hyperparameters.use_ctp = False` and `ctp_weight = 0.0`. CTP param banks are not allocated by default; `MoSHead.forward` returns `(log_p_ntp, log_p_ntp)`, `GPT.forward` sets `ctp_loss = 0`, and `_get_soft_embedding` uses `p_mix = p_ntp`. The dual-head CTP path remains behind `--use-ctp=1` for future diffusion/flow-matching plus AR unification experiments; keep it disabled in baseline promotion runs unless explicitly ablated.
 - NTP MoS head: 2 shared + 1 specialized expert, xavier init, rank = 256.
 
 ## 7. Autoresearch Protocol
@@ -300,13 +304,13 @@ Reference impl: see §2.
 9. Log to `results.tsv` (do NOT commit `results.tsv`).
 10. **Always** run `bash experiments/update_results.sh` (rotates `current.log`/`current/weights` → `previous`, copies `run.log` → `current.log`, regenerates plots).
 11. Apply §11 Promotion Rules.
-12. **Update `experiments/hypotheses.md`** — record results, statuses, confounds. The H-claim section MUST include: (a) roundtrip int6 val_bpb + val_loss; (b) the FULL `k_sweep_table:` matrix verbatim from run.log (header + one row per K; 15 cols including acyclicity primes 17/37/113 in bold) — non-optional, no exceptions; (c) trajectory table (val_bpb per val checkpoint with Δ); (d) acyclicity-prime check (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP); (e) **ntp_loss descent rate** (per-step Δntp / 10 steps over windows s30-s100, s100-s200, s200-s400, s400-s600, s600-s800, s800-s1000) AND **per-wallclock equivalent** (Δntp/sec = Δntp/step ÷ step_avg) — both reported alongside baseline comparison. Permanent metric per user directive 2026-05-02. All numbers must be grep-able from run.log. See `feedback_hypotheses_sync.md`.
+12. **Update `experiments/hypotheses.md`** — record results, statuses, confounds. The H-claim section MUST include: (a) roundtrip int6 val_bpb + val_loss; (b) the FULL `k_sweep_table:` matrix verbatim from run.log (header + one row per K; 15 cols including acyclicity primes 17/37/113 in bold) — non-optional, no exceptions; (c) trajectory table (val_bpb per val checkpoint with Δ); (d) acyclicity-prime check (Δ vs nearest power-of-2 in 0.01-0.02 = genuine FP); (e) **ntp_loss descent rate** (per-step Δntp / 10 steps over windows s30-s100, s100-s200, s200-s400, s400-s600, s600-s800, s800-s1000) AND **per-wallclock equivalent** (Δntp/sec = Δntp/step ÷ step_avg) — both reported alongside baseline comparison. Permanent metric per user directive 2026-05-02. All numbers must be grep-able from run.log. **Partial-step previews are NOT exempt** — emit the partial windows that ARE computable; missing components require an explicit Caveats line + recovery plan, never silent-skip. See `feedback_hypotheses_sync.md` and `EXPERIENCE.md#partial-preview-completeness`.
 13. Track consecutive non-improvements. **STOP after 100** and seek user guidance.
 
 ### Logging, Weights & Plotting (every iteration)
 - **Training logs**: `experiments/training_logs/{baseline,previous,current}.log`.
 - **Model weights**: `experiments/weights/{baseline,previous,current}/`.
-- **Metrics comparison**: `python experiments/plot_metrics.py` → `experiments/metrics_comparison.png` (4×3 grid: train_loss · val_bpb · step_avg_ms / DEQ residual · recon_err · iter_conv / expert_usage · entropy · ortho / summary text).
+- **Metrics comparison**: `python experiments/plot_metrics.py` → `experiments/metrics_comparison.png` (8×3 grid: train/val/speed · NTP/CTP/grad · DEQ convergence · expert usage/entropy/ortho · balance/recon/GG · aux raw/weighted/coefs · Parcae state/recon amplification · post-quant/summary).
 - **Progress plots**: `python experiments/plot_progress.py` → `experiments/progress.png`, `progress_full.png`.
 
 #### Required routing-health metrics (ALL must be reported every train+val log line)
@@ -320,6 +324,8 @@ Reference impl: see §2.
 | **`attn_ortho` / `mlp_ortho`** | **LOW** ≈ 0.1-0.2 (`max\|cos_sim\|` of expert OUTPUT means) | per slice |
 | **`router_mass`** | 0.7-0.95 (mean `sigmoid(gate)`) | single value |
 | **`hutch_F`** (FP spectral) | LOW + decreasing across val | single value at FP; skipped on OOM/SDPA-grad-reject |
+
+Train log objective diagnostics that must remain grep-able: `router_reg_loss`; raw terms `router_cv_loss`, `router_entropy_loss`, `mos_cv_loss`, `expert_diversity_loss`, `mos_diversity_loss`; and effective coefficients `router_cv_coef_eff`, `router_entropy_coef_eff`, `mos_cv_coef_eff`, `expert_diversity_coef_eff`, `mos_diversity_coef_eff`. Parcae diagnostics must also remain grep-able: `parcae_a_bar_min`, `parcae_a_bar_mean`, `parcae_a_bar_max`, `parcae_a_bar_core_max`, `parcae_beta_mean`, `parcae_beta_max`, `parcae_b_bar_mean`, `parcae_b_bar_max`, `parcae_delta_mean`, `parcae_delta_max`, `parcae_recon_amp_log10`.
 
 Definitions, axis interpretations, the iter-99 / iter-100b decomposition rationale, and the `k_sweep_table:` 14-column schema (incl. legacy `k_sweep:` line for plot back-compat) live in `EXPERIENCE.md#routing-health-metrics`.
 
@@ -395,13 +401,14 @@ Run before every commit that touches `train_gpt.py` OR `CLAUDE.md`. Each row is 
 - **Identifier uniqueness across wrappers** — no name may be both a method and an attribute on sibling classes in the same call graph. `grep -n '\.<new_name>\b' train_gpt.py tests/ experiments/` before adding. → [`EXPERIENCE.md#identifier-uniqueness`](EXPERIENCE.md#identifier-uniqueness)
 - **Prenorm scale independence (HARD)** — `grep -n '_norm_weight' train_gpt.py`; every learned scale conditions exactly one linear weight. Shape follows the linear (E-prefixed for per-expert; bare D for shared linears that route to experts but aren't themselves per-expert). → [`EXPERIENCE.md#prenorm-scale-independence`](EXPERIENCE.md#prenorm-scale-independence)
 - **Doc-Code Invariant** — when `opg_doc.tex` describes an algorithm and `train_gpt.py` implements a different (better) variant, the doc MUST note the deviation in a "Practical implementation" paragraph. Pseudocode is theoretical; code is the source of truth. → [`EXPERIENCE.md#doc-code-invariant`](EXPERIENCE.md#doc-code-invariant)
-- **Diagnostic-gate component awareness** — flag-gated code paths must gate diagnostic emission AND retry prescriptions on the same flag (component-specific levers, e.g. `mos_balance_mult` for MoS collapse, NOT global `weight_decay`). → [`EXPERIENCE.md#diagnostic-gate-component-awareness`](EXPERIENCE.md#diagnostic-gate-component-awareness)
+- **Diagnostic-gate component awareness** — flag-gated code paths must gate diagnostic emission AND retry prescriptions on the same flag (component-specific levers, e.g. `mos_load_cv_coef` for MoS load imbalance, NOT global `weight_decay`). → [`EXPERIENCE.md#diagnostic-gate-component-awareness`](EXPERIENCE.md#diagnostic-gate-component-awareness)
 - **Hyperparameter fan-out** — every knob lives in `Hyperparameters`, reachable via `_parse_cli_overrides`, consumer reads `args.<field>` (no shadowing literal). Four-touch rule for new knobs: (1) `Hyperparameters` field, (2) `args.<field>` read, (3) CLAUDE.md §5 row, (4) `opg_doc.tex` parameter table. Document effective vs documented magnitude when they differ. → [`EXPERIENCE.md#hyperparameter-fanout`](EXPERIENCE.md#hyperparameter-fanout)
 - **CLAUDE.md size budget** — `wc -c CLAUDE.md` < 40 000. Iter-history annotations ("iter X NOT PROMOTED because Y") route to `experiments/hypotheses.md` H## or `EXPERIENCE.md` §2; CLAUDE.md keeps invariants only. → [`EXPERIENCE.md#claude-md-size-budget`](EXPERIENCE.md#claude-md-size-budget)
 - **Cumulative-vs-instantaneous metric distinction (HARD)** — `step_avg = train_time/step` is cumulative. Compute per-step delta `Δ_t = train_time[t] − train_time[t−1]` for throughput decisions before s50. Loss/grad: take latest, not cumulative. → [`EXPERIENCE.md#cumulative-metric-misread`](EXPERIENCE.md#cumulative-metric-misread)
 - **Routing-reg input invariant (HARD)** — all routing regs operate on combined `p = softmax × sigmoid(gate)`. `grep -nE 'share / share\.sum\(' train_gpt.py` — zero hits in routing-reg paths. MoS exempt (§6.2). See H100 in `experiments/hypotheses.md`.
 - **No-top-K-dispatch (HARD)** — RevDEQ forbids discrete-decision routing/dispatch. `grep -nE 'topk\(.*expert|capacity_factor.*ceil|argmax.*router' train_gpt.py` — every match must be flag-gated OFF under RevDEQ. Permitted: soft routing, Sinkhorn, Gumbel-softmax, ε-skip with `ε ≤ ε_bf16`. See H101.
 - **`is_grad_enabled` vs `requires_grad` (HARD)** — fast-path dispatch checks `torch.is_grad_enabled() AND any(requires_grad)`. `nn.Parameter.requires_grad` is True permanently → flag-only check defeats kernels in no_grad code (RevDEQ FP iter). See `feedback_grad_enabled_vs_requires_grad.md`.
+- **Partial-preview component completeness** — every iter entry in `experiments/hypotheses.md`, even short-budget previews, emits all 5 mandatory components per §7 step 12 (or explicitly Caveats the missing one with a recovery plan). Generalizes: graceful-degradation > silent-skip for any mandated artifact. → [`EXPERIENCE.md#partial-preview-completeness`](EXPERIENCE.md#partial-preview-completeness)
 
 ## 10. RevDEQ Specifics
 
@@ -415,6 +422,8 @@ T_θ(z, x_0) = B̄ ⊙ RMSNorm_learn(x_0) + Δ(z, x_0)
 ```
 
 `B̄` is independent of the solver's `β = 1 − Ā` except through the shared per-dim step size `Δ`. Pass it explicitly through `RevDEQFunction.apply` (see §9 "Custom autograd inputs"). Any change to this equation must update `train_gpt.py`, `opg_doc.tex` §eq:Tx_new, and the regression tests in `tests/test_gate_init_defaults.py` in the same commit.
+
+The current code adopts the Parcae paper's diagonal zero-order-hold parameterization principle inside RevDEQ's solver blend; it does not implement the full Parcae architecture or inherit a proof of nonlinear contraction. Treat Parcae state as diagnostic evidence for solver reversibility/stability, while contraction remains empirically monitored through K-sweep, DEQ residual, and related diagnostics.
 
 ### RevDEQ Reversibility Floor
 Any per-dim coefficient that divides the RevDEQ backward reconstruction MUST be lower-bounded by a correctness constant. The reverse step is:
@@ -447,7 +456,7 @@ Promotion policy is **val_bpb-primary**: if val_bpb improved AND artifact ≤ 16
 2. Promote: `bash experiments/update_results.sh --promote`.
 3. **Always review + `/simplify` before committing improvements** — keeps code clean.
 
-**Diagnostic-gate failures DO NOT block promotion.** Failures in ortho / K-sweep / gg / inj / recon_err diagnostics are recorded as `validated_with_diagnostic_fail` in `meta_json["status"]` and surfaced as retry prescriptions for the *next* iter. Promotion is gated only on val_bpb improvement + 16 MB budget. Mechanism: the train script writes `run_valid=true` whenever val_bpb is recorded; diagnostic failures populate `failure_categories` + `retry_hint.json` for the next iter but don't block `--promote`.
+**Diagnostic-gate failures DO NOT block promotion.** Failures in ortho / K-sweep / gg / inj / recon_err diagnostics are recorded as `validated_with_diagnostic_fail` in `meta_json["status"]` and surfaced as retry prescriptions for the *next* iter. Auxiliary-loss regressions are diagnostic inputs for ablations/debugging, not promotion blockers. Promotion is gated only on val_bpb improvement + 16 MB budget. Mechanism: the train script writes `run_valid=true` whenever val_bpb is recorded; diagnostic failures populate `failure_categories` + `retry_hint.json` for the next iter but don't block `--promote`.
 
 **Strict-generalization unconditional promote** — when the new iter's functional class **strictly subsumes** the baseline's (there exists a setting of the new params where the iter *exactly* recovers the baseline's forward map), promote unconditionally regardless of val_bpb delta. Any regression is by construction an optimization-landscape artifact (init, LR, gradient topology), not a capacity loss — tune the new params, do NOT revert. If val_bpb regresses, tune in this order: (i) LR of new params, (ii) init (try matching baseline at step 0), (iii) gradient flow paths.
 
