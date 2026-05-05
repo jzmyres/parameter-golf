@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import sys
 sys.path.insert(0, ".")
-from train_gpt import GPT, Hyperparameters, router_diagnostics
+from train_gpt import GPT, Hyperparameters, router_diagnostics, Muon, _build_optimizer_param_lists
 
 
 def _load_real_data(vocab_size, total_tokens=65536, seq=128):
@@ -114,7 +114,32 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
     print(f"smoke config: K_forward={int(getattr(model, '_deq_k_override', 0)) or model.num_layers} "
           f"K_bwd={model.deq_bptt_k}")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    # Mirror the production optimizer setup so smoke gradients are predictive
+    # of full training: Muon for ndim>=2 block matrices, AdamW for tok/scalar/
+    # parcae/entmax_blend with the same per-group base LRs as
+    # `Hyperparameters` (CLAUDE.md §5). lr_mul warmdown is a no-op outside
+    # the wallclock-capped submission run, so smoke uses base LRs throughout.
+    opt_groups = _build_optimizer_param_lists(model, args)
+    optimizers = [
+        torch.optim.AdamW(opt_groups.tok, betas=(args.beta1, args.beta2),
+                           eps=args.adam_eps, weight_decay=args.weight_decay, fused=True),
+        Muon(opt_groups.matrix, lr=args.matrix_lr, momentum=args.muon_momentum,
+             backend_steps=args.muon_backend_steps, weight_decay=args.weight_decay),
+        torch.optim.AdamW(
+            [{"params": opt_groups.scalar, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps,
+            weight_decay=args.weight_decay, fused=True),
+    ]
+    if model.use_parcae and opt_groups.parcae:
+        optimizers.append(torch.optim.AdamW(
+            [{"params": opt_groups.parcae, "lr": args.parcae_lr, "base_lr": args.parcae_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True))
+    if opt_groups.entmax_blend:
+        optimizers.append(torch.optim.AdamW(
+            [{"params": opt_groups.entmax_blend, "lr": args.entmax_blend_lr,
+              "base_lr": args.entmax_blend_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=0.0, fused=True))
+
     losses, ntp_losses, ctp_losses = [], [], []
     # Two RevDEQ-reversibility recon terms (CLAUDE.md §6.1):
     #  - `x0_recon_loss`: ||z_rec - z_0|| / ||z_0||. Reverse-result vs initial
@@ -147,8 +172,11 @@ def smoke_test(num_steps: int = 300, eval_every: int = 50):
                 has_bad_grad = True
                 break
 
-        opt.step()
-        opt.zero_grad()
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+        for opt in optimizers:
+            opt.step()
+            opt.zero_grad()
         losses.append(loss.item())
         ntp_losses.append(getattr(model, '_ntp_loss', 0.0))
         ctp_losses.append(getattr(model, '_ctp_loss', 0.0))
