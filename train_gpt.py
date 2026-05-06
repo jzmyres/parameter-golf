@@ -400,11 +400,17 @@ class Hyperparameters:
     router_entropy_coef = 0.00125
     # Per-token expert-OUTPUT diversity (replaces block_ortho_aux + iter 141 expert_gram).
     # `expert_diversity_kind`:
-    #   cosine    (default): Y' = normalize(Y); loss = mean(off_diag(Y' Y'^T)²).
-    #             Scale-invariant; penalizes direction only — preferred since
-    #             norm is the optimizer's responsibility.
-    #   frobenius: G = (Y Y^T)/D; loss = E_t[‖G − I/E‖²_F]. Couples direction
-    #             AND per-expert norm; useful for explicit norm regularization.
+    #   cosine    (default): Y' = normalize(Y); loss = mean(off_diag(Y' Y'^T)²)
+    #             / (E·(E−1)). Scale-invariant; penalizes direction only —
+    #             preferred under iter-142-refactor since CV handles usage and
+    #             optimizer handles norm (separation of concerns; cosine is
+    #             also blind to expert-output collapse, which CV catches via
+    #             routing-mass imbalance).
+    #   frobenius: G = (Y Y^T)/D; loss = E_t[‖G − I/E‖²_F] / E². Couples
+    #             direction AND per-expert norm; bundles a norm-target onto
+    #             the diversity penalty. The /E² is for magnitude parity
+    #             with cosine — without it, "same coef" means ~30× more
+    #             gradient pressure than cosine.
     expert_diversity_kind = "cosine"
     expert_output_diversity_coef = 0.1
     expert_diversity_every = 8       # cadence: aux fires every N optimizer steps
@@ -3041,10 +3047,10 @@ class MoSHead(nn.Module):
                 G = torch.einsum("ner,nfr->nef", t_n, t_n)
                 off = G - torch.eye(E, device=G.device, dtype=G.dtype)
                 diversity = off.pow(2).sum(dim=(-2, -1)).mean() / float(max(E * (E - 1), 1))
-            else:  # frobenius
+            else:  # frobenius (E²-normalized for magnitude parity with cosine)
                 G = torch.einsum("ner,nfr->nef", t_f, t_f) / float(R)
                 target = torch.eye(E, device=G.device, dtype=G.dtype) / float(E)
-                diversity = (G - target).pow(2).sum(dim=(-2, -1)).mean()
+                diversity = (G - target).pow(2).sum(dim=(-2, -1)).mean() / float(E * E)
         else:
             diversity = x.new_zeros(())
 
@@ -3349,14 +3355,18 @@ class Block(nn.Module):
                 off_mlp = G_mlp - torch.eye(E2, device=G_mlp.device, dtype=G_mlp.dtype)
                 mlp_gram_pt = off_mlp.pow(2).sum(dim=(-2, -1)).mean() / float(max(E2 * (E2 - 1), 1))
             else:  # frobenius
+                # Per-entry mean (divide by E²) so the loss magnitude is
+                # comparable to cosine's per-pair-mean rather than ~30× larger.
+                # Without this, "same coef" between the two kinds means ~30×
+                # more frobenius gradient pressure — apples vs oranges.
                 target_attn = torch.eye(E_attn, device=attn_expert_out.device,
                                          dtype=torch.float32) / float(E_attn)
                 G_attn = torch.einsum("bted,btfd->btef", Y_attn, Y_attn) / float(dim)
-                attn_gram_pt = (G_attn - target_attn).pow(2).sum(dim=(-2, -1)).mean()
+                attn_gram_pt = (G_attn - target_attn).pow(2).sum(dim=(-2, -1)).mean() / float(E_attn * E_attn)
 
                 target_mlp = torch.eye(E2, device=h_mlp.device, dtype=torch.float32) / float(E2)
                 G_mlp = torch.einsum("ned,nfd->nef", Y_mlp, Y_mlp) / float(dim)
-                mlp_gram_pt = (G_mlp - target_mlp).pow(2).sum(dim=(-2, -1)).mean()
+                mlp_gram_pt = (G_mlp - target_mlp).pow(2).sum(dim=(-2, -1)).mean() / float(E2 * E2)
 
         return attn_ortho, mlp_ortho, attn_gram_pt, mlp_gram_pt
 
