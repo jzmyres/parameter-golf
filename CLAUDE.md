@@ -148,6 +148,7 @@ Run before commits that touch `train_gpt.py`, model tests, `CLAUDE.md`, `EXPERIE
 - **Grad-enabled checks.** Fast dispatch uses `torch.is_grad_enabled()` and actual grad requirements; `Parameter.requires_grad` alone is not a runtime-mode predicate. Details: [`EXPERIENCE.md#grad-enabled-vs-requires-grad`](EXPERIENCE.md#grad-enabled-vs-requires-grad).
 - **Partial previews are complete.** Short runs still report every mandated component they can compute, with Caveats for missing artifacts. Details: [`EXPERIENCE.md#partial-preview-completeness`](EXPERIENCE.md#partial-preview-completeness).
 - **Move means tracked.** When relocating files (`active/` → `archive/`, package reshuffles, etc.), the destination MUST be `git add`-ed in the same commit as the source deletion. Verify with `git status --short | grep "^??"` before staging — any `??` paths inside the moved tree are silent dataloss risks. Details: [`EXPERIENCE.md#move-tracked-invariant`](EXPERIENCE.md#move-tracked-invariant).
+- **Loss-form changes are triple-touch.** When the *functional form* of a loss term changes (not just its magnitude), the same commit must touch implementation, the assembly docstring + `Hyperparameters` formula comment, and `opg_doc.tex` equation + parameter table. Details: [`EXPERIENCE.md#loss-form-triple-touch`](EXPERIENCE.md#loss-form-triple-touch).
 
 ## Promotion Rules
 

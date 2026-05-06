@@ -34,6 +34,7 @@ This file has two roles, in this order:
 | 2026-05-02 | [#cumulative-metric-misread](#cumulative-metric-misread)     | Iter 117b-3 erroneously killed at s10 because cumulative `step_avg` was misread as instantaneous step time |
 | 2026-05-05 | [#partial-preview-completeness](#partial-preview-completeness) | iter-142-refactor 100-step preview silently skipped the descent-rate component because the run was "partial"  |
 | 2026-05-06 | [#move-tracked-invariant](#move-tracked-invariant)           | Components-archive move staged 9 deletions but left destinations untracked; archive-not-gitignored copies would have vanished |
+| 2026-05-06 | [#loss-form-triple-touch](#loss-form-triple-touch)           | iter 142b cv² promotion shipped with stale `cv_hinge` docstring + stale `opg_doc.tex` parameter table & loss equation; magnitude-only audit didn't catch the structural change |
 
 ### Section template
 
@@ -569,6 +570,35 @@ The first command gives instantaneous per-step latency. The second gives cumulat
 4. If a directory is intended to be ignored (true scratch), add it to `.gitignore` in the same commit and document the intent.
 
 **Cross-references.** Related: [#dead-code-tracking](#dead-code-tracking) (companion rule: removals must purge all references in the same commit), [#config-drift](#config-drift) (sibling rule: source-of-truth integrity). The unifying theme: **partial automation is worse than none — `git add -u` is convenient until silent omissions accrue cost.**
+
+---
+
+### loss-form-triple-touch
+
+**Date:** 2026-05-06 review of iter 142b cv² promotion
+**Rule in CLAUDE.md:** Audit Checklist row · "Loss-form changes are triple-touch"
+
+**What happened.** Iter 142b replaced the routing-balance loss form `relu(cv − cv_target)²` with continuous `cv²` (and removed the `cv_target` / `mos_cv_target` knobs entirely). The implementation in `train_gpt.py::SoftDenseRouter._update_health` and `MoSHead._head_forward` was correct, but a pre-commit review found that several adjacent surfaces still described the old form: the `_collect_routing_losses` docstring still said `Σ_r cv_hinge(r)` and `mos_cv_hinge`; `opg_doc.tex` parameter table still listed `cv_target = 0.20`, `mos_cv_target = 0.20` and the old coef magnitudes; and `opg_doc.tex` loss equation still wrote `λ_rcv·Σ[CV(m_r) − τ_cv]_+²`. Stale diagnostic prescriptions in `_prescribe_failure_fix` also cited old default values (`0.5→0.75`, `0.25→0.375`, `0.1→0.15`), which would have been emitted into `run.log` and persisted into `meta_json["failure_categories"]` — surfacing a wrong recovery recipe to anyone reading a future failure.
+
+**Root cause.** The "Four-touch new knobs" hyperparameter rule covers magnitude tuning (`Hyperparameters` field, CLI parser, consumer reads `args`, doc mirror). It does NOT cover *structural* changes to a loss term — replacing a hinge with a quadratic, swapping a sum for a mean, dropping a target threshold. Structural changes leave the field name unchanged so the magnitude-touch checklist passes; meanwhile the formula-bearing surfaces (loss-assembly docstring, paper-facing equation, prescription strings that name old defaults) silently drift.
+
+**The rule.** When the *functional form* of a loss term changes (not just its coefficient — e.g., hinge → quadratic, sum → mean, L2 → L1, removing or adding a target threshold), the change must touch in the same commit:
+1. Implementation in `train_gpt.py`.
+2. The assembly docstring describing the loss (`_collect_routing_losses` doc comment, the `Hyperparameters` formula comment block) and any `_prescribe_failure_fix` prescription strings that cite default magnitudes.
+3. `opg_doc.tex` paper-facing equation **and** parameter table.
+
+Magnitude-only edits keep using the existing four-touch hyperparameter rule. Structural edits use this triple-touch rule.
+
+**Verification recipe.**
+1. After any structural loss-form change, list the old-form tokens (e.g., `cv_target`, `cv_hinge`, `relu(cv`, the dropped knob name) and grep them across the three surfaces:
+   ```bash
+   grep -nE "cv_target|cv_hinge|relu\(cv" train_gpt.py opg_doc.tex CLAUDE.md
+   ```
+2. Zero matches outside an explicit deviation note (e.g., a row in `experiments/hypotheses.md` documenting why the equation surface intentionally lags) is the post-condition.
+3. If `_prescribe_failure_fix` cites default magnitudes inline, refactor to read defaults dynamically from `Hyperparameters` (drift-proof: `f"{Hyperparameters.foo:g}→{Hyperparameters.foo * mult:g}"`).
+4. Add or rename a focused test that exercises the new form's distinguishing property (e.g., `test_cv_squared_has_gradient_below_old_target` — the old hinge was silent in this regime; the new form is not).
+
+**Cross-references.** Related: [#hyperparameter-fanout](#hyperparameter-fanout) (sibling rule for magnitude-only changes), [#doc-code-invariant](#doc-code-invariant) (parent principle: paper-facing pseudocode must track implementation), [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (companion: prescriptions must reflect current defaults, not historical ones), [#strict-generalization](#strict-generalization) (form changes are usually NOT strict generalizations — promotion gating must use the standard `val_bpb` rule, not the auto-promote shortcut, and the deviation must be recorded in `experiments/hypotheses.md`).
 
 ---
 

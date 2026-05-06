@@ -61,13 +61,13 @@ class TestTrainingContracts(unittest.TestCase):
         text = TRAIN_GPT.read_text()
         required_fields = [
             "router_cv_loss:",
-            "router_entropy_loss:",
+            "router_pertoken_entropy_loss:",
             "mos_cv_loss:",
             "expert_diversity_loss:",
             "mos_diversity_loss:",
             "router_reg_loss:",
             "router_cv_coef_eff:",
-            "router_entropy_coef_eff:",
+            "router_pertoken_entropy_coef_eff:",
             "mos_cv_coef_eff:",
             "expert_diversity_coef_eff:",
             "mos_diversity_coef_eff:",
@@ -103,7 +103,7 @@ class TestTrainingContracts(unittest.TestCase):
         self.assertIn("extract_aux_terms", text)
         for key in [
             "router_cv_loss",
-            "router_entropy_loss",
+            "router_pertoken_entropy_loss",
             "mos_cv_loss",
             "expert_diversity_loss",
             "mos_diversity_loss",

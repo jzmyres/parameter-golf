@@ -461,13 +461,17 @@ def test_direct_cv_coefficients_are_hyperparameters():
     from train_gpt import Hyperparameters
     assert hasattr(Hyperparameters, "router_load_cv_coef")
     assert hasattr(Hyperparameters, "mos_load_cv_coef")
-    assert float(Hyperparameters.router_load_cv_coef) == 0.5
-    assert float(Hyperparameters.mos_load_cv_coef) == 0.25
+    assert float(Hyperparameters.router_load_cv_coef) == 1.0
+    assert float(Hyperparameters.mos_load_cv_coef) == 1.0
+    # Regression guard: iter 142b dropped the relu(cv − cv_target)² hinge in
+    # favor of continuous cv²; the old target knobs must NOT come back.
+    assert not hasattr(Hyperparameters, "cv_target")
+    assert not hasattr(Hyperparameters, "mos_cv_target")
     model = _make_model(num_experts=4)
     assert hasattr(model, "router_load_cv_coef")
     assert hasattr(model, "mos_load_cv_coef")
-    assert float(model.router_load_cv_coef) == 0.5
-    assert float(model.mos_load_cv_coef) == 0.25
+    assert float(model.router_load_cv_coef) == 1.0
+    assert float(model.mos_load_cv_coef) == 1.0
 
 
 if __name__ == "__main__":

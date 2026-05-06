@@ -198,7 +198,7 @@ def value(key):
 
 pairs = [
     ("rcv", "router_cv_loss", "router_cv_coef_eff"),
-    ("rent", "router_entropy_loss", "router_entropy_coef_eff"),
+    ("rent", "router_pertoken_entropy_loss", "router_pertoken_entropy_coef_eff"),
     ("mcv", "mos_cv_loss", "mos_cv_coef_eff"),
     ("ediv", "expert_diversity_loss", "expert_diversity_coef_eff"),
     ("mdiv", "mos_diversity_loss", "mos_diversity_coef_eff"),

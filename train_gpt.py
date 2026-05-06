@@ -376,30 +376,39 @@ class Hyperparameters:
     # Per-token entropy MINIMIZATION (sign: +coef·H_pertoken added to total
     # loss, so the optimizer drives H_pertoken → 0 → per-token specialization).
     # CV loss operates on the orthogonal axis of global cross-batch balance
-    # (prevents dead experts); the two regs do NOT antagonize — joint target
-    # is low pertoken_entropy AND low CV.
+    # (prevents dead experts).
     #
     # iter 117b-1 RESULT (2026-04-30): tested 10× bump 0.005 → 0.05.
     # NOT PROMOTED — int6 +0.0007 vs iter 117 v5, hypothesis REFUTED:
     # in soft-dense MoE, the CV-redistribution dominates over the per-token
     # sparsity push at any reasonable entropy coef. Pertoken_entropy
     # stabilizes around 2.6 regardless. See H87b RESULT in hypotheses.md.
-    # Config reverted to iter 117 v5 / iter 100b value (0.005). Future
-    # iters targeting specialization should use joint-reg approaches
-    # (iter 112 Gram-matrix penalty H84) rather than entropy magnitude.
+    # 2026-05-06 user override: all reg coefs unified at 1.0; supersedes the
+    # H87b 0.005 entropy-coef result (different operating regime).
     # Direct coefficients in the flat regularization assembly. The full
     # objective is:
     #   loss = ntp + ctp_weight · ctp
-    #        + router_load_cv_coef · Σ_r relu(cv_r − cv_target)²
-    #        + mos_load_cv_coef    · Σ_h relu(cv_h − mos_cv_target)²
-    #        + router_entropy_coef · Σ_r H_pertoken(r)
+    #        + router_load_cv_coef · Σ_r cv_r²              # always-on balance
+    #        + mos_load_cv_coef    · Σ_h cv_h²              # always-on balance
+    #        + router_pertoken_entropy_coef · Σ_r H_pertoken(r)
     #        + expert_output_diversity_coef · diversity(expert outputs)
     #        + mos_output_diversity_coef    · diversity(MoS low-rank states)
     # CV losses are active from step 0; entropy + diversity ramp from 0 over
-    # `regularizer_warmup_frac` of training.
-    router_load_cv_coef = 0.5
-    mos_load_cv_coef = 0.25
-    router_entropy_coef = 0.00125
+    # `regularizer_warmup_frac` of training. CV uses cv² (no relu / no
+    # target threshold) so the term keeps pushing CV → 0 even when balance
+    # is already acceptable.
+    # CV² and per-token entropy ARE antagonistic on the routing distribution
+    # axis (CV pushes toward balance; entropy toward specialization). At
+    # coef=1.0 each, iter 142b shows entropy currently winning (attn_cv 0.72
+    # final vs 0.35 baseline; router_collapse diagnostic flag) — chosen
+    # operating point as of 2026-05-06 user override; revisit if attn_cv
+    # exceeds 1.0 at s ≥ 500 in any future run.
+    router_load_cv_coef = 1.0   # 2026-05-06 user override: uniform 1.0 stack.
+    mos_load_cv_coef = 1.0      # 2026-05-06 user override: uniform 1.0 stack.
+    # 2026-05-06 user override: ~800× stronger than the prior 0.00125. Per-token
+    # entropy at this magnitude drives H → 0 (specialization) hard from step 0;
+    # the antagonism note above documents the resulting operating point.
+    router_pertoken_entropy_coef = 1.0
     # Per-token expert-OUTPUT diversity (replaces block_ortho_aux + iter 141 expert_gram).
     # `expert_diversity_kind`:
     #   cosine    (default): Y' = normalize(Y); loss = mean(off_diag(Y' Y'^T)²)
@@ -414,13 +423,23 @@ class Hyperparameters:
     #             with cosine — without it, "same coef" means ~30× more
     #             gradient pressure than cosine.
     expert_diversity_kind = "cosine"
-    expert_output_diversity_coef = 0.1
+    # iter 142b PROMOTED 2026-05-06 user override. REGRESSION (intentional, see
+    # hypotheses.md iter 142b row): val_bpb 1.5009 full / 1.5063 K=24 best at
+    # 1000 steps is +0.0079 vs c94899a-era baseline 1.4930. Promoted because
+    # the prior baseline ran on the pre-iter-142-refactor stack with the
+    # legacy nested gram penalty — not a comparable optimization path.
+    expert_output_diversity_coef = 1.0
     expert_diversity_every = 8       # cadence: aux fires every N optimizer steps
     expert_diversity_max_tokens = 64
     mos_output_diversity_coef = 0.0  # per-token Gram on MoS low-rank states; default off
-    cv_target = 0.20      # router CV hinge: relu(cv − cv_target)²
-    mos_cv_target = 0.20  # MoS CV hinge
-    regularizer_warmup_frac = 0.10  # shared linear ramp for entropy + diversity (lowered from 0.30 — short runs were spending 30% on warmup)
+    # iter 142b PROMOTED 2026-05-06 user override: warmup=0 (CV active from
+    # step 0; entropy + diversity at full strength immediately). This is a
+    # controlled deviation from CLAUDE.md "Anneal sparsity coefficients from
+    # zero unless a controlled test justifies full-strength cold start" — kept
+    # because the 1000-step run did not exhibit the cold-start training spike
+    # documented in iter 99/100. Re-enable warmup (~0.1) if any future iter
+    # shows loss instability at s ≤ 100.
+    regularizer_warmup_frac = 0.0
     # iter 129 / H99 (NEW 2026-05-04): SmearGate — position-mixing memory channel.
     # `x[t] += g · x[t-1] · not_bos_mask` after embedding lookup. BOS-fixed
     # (mask suppresses leak across packed-doc boundaries; SP BOS_ID=1).
@@ -647,7 +666,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
     "warmdown-frac", "num-refinements-ramp-frac",
     "muon-momentum-warmup-frac", "muon-momentum-warmup-steps",
-    "router-entropy-coef",
+    "router-pertoken-entropy-coef",
     "entmax-blend-init-logit", "entmax-blend-warmup-delay-frac", "entmax-blend-lr",
     # iter 129 / H99 — SmearGate (default off; --use-smear-gate=1 to enable)
     "smear-gate-init", "smear-gate-bos-id",
@@ -661,7 +680,6 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "eval-reservation-seconds",
     "ctp-weight",
     "router-load-cv-coef", "mos-load-cv-coef",
-    "cv-target", "mos-cv-target",
     "expert-diversity-kind",
     "expert-output-diversity-coef", "expert-diversity-every", "expert-diversity-max-tokens",
     "mos-output-diversity-coef",
@@ -1836,7 +1854,7 @@ class SoftDenseRouter(nn.Module):
         fixed at 1.0 initially (not learnable), can be promoted later.
     """
     def __init__(self, dim: int, num_experts: int, *,
-                 min_share_frac: float = 0.6, cv_target: float = 0.20,
+                 min_share_frac: float = 0.6,
                  scoring: str = "linear", health_slices: tuple[int, ...] | None = None,
                  entropy_coef: float = 0.0,
                  use_entmax_routing: bool = False,
@@ -1844,7 +1862,6 @@ class SoftDenseRouter(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
-        self.cv_target = float(cv_target)
         self.scoring = str(scoring)
         assert self.scoring in ("linear", "l2", "sips"), f"unknown scoring: {scoring}"
         self.health_slices = tuple(int(v) for v in (health_slices or (num_experts,)))
@@ -2069,16 +2086,18 @@ class SoftDenseRouter(nn.Module):
             reduce_dims = tuple(range(p.ndim - 1))
             mean_mass = p.mean(dim=reduce_dims)
             mean_share = self._normalized_component_shares(mean_mass.float()).to(dtype=mean_mass.dtype)
-            # Routing CV hinge: relu(cv - cv_target)² summed across slices.
-            # Hinge prevents over-constraint when routing is already healthy.
-            cv_target_t = mean_mass.new_tensor(self.cv_target)
-            cv_hinge = mean_mass.new_zeros(())
+            # Routing CV²: continuous balance pressure (no relu / no target).
+            # iter 142b promotion follow-up 2026-05-06 user directive: drop the
+            # relu(cv − cv_target)² hinge so the term keeps pushing CV → 0
+            # rather than going silent at the old cv_target=0.20. Per-axis story:
+            # CV² → balance, pertoken_entropy → sparsity, no antagonism.
+            cv_sum = mean_mass.new_zeros(())
             for start, end in self._component_ranges():
                 share_s = mean_mass[..., start:end].float()
                 cv_s = (share_s.std(dim=-1, unbiased=False)
                         / share_s.mean(dim=-1).clamp_min(1e-8))
-                cv_hinge = cv_hinge + torch.relu(cv_s - cv_target_t).pow(2)
-            self._cv_loss_raw = cv_hinge
+                cv_sum = cv_sum + cv_s.pow(2)
+            self._cv_loss_raw = cv_sum
             # Per-token entropy minimization. Always-compute (no `.item()` gate
             # so the FP iter stays sync-free). Annealer writes `_entropy_coef`
             # in-place; multiply by 0 is gradient-free.
@@ -2930,7 +2949,6 @@ class MoSHead(nn.Module):
     def __init__(self, d_model: int, vocab_size: int, rank: int = 256,
                  num_shared: int = 2, num_specialized: int = 1, fsq_levels: int = 8,
                  use_ctp: bool = True, logit_softcap: float = 0.0,
-                 mos_cv_target: float = 0.20,
                  mos_output_diversity_kind: str = "cosine"):
         super().__init__()
         self.d_model = d_model
@@ -2942,7 +2960,6 @@ class MoSHead(nn.Module):
         self.fsq_levels = fsq_levels
         self.use_ctp = bool(use_ctp)
         self.logit_softcap = float(logit_softcap)
-        self.mos_cv_target = float(mos_cv_target)
         self.mos_output_diversity_kind = str(mos_output_diversity_kind)
         if self.mos_output_diversity_kind not in ("frobenius", "cosine"):
             raise ValueError(
@@ -3103,15 +3120,17 @@ class MoSHead(nn.Module):
         self._ntp_ortho_out = ortho_ntp
 
         if self.training:
-            # MoS load CV with hinge — relu(cv - mos_cv_target)² across heads.
-            cv_target_t = x.new_tensor(self.mos_cv_target)
-            cv_hinge = torch.tensor(0.0, device=x.device)
+            # MoS load CV²: continuous balance pressure (no relu / no target).
+            # iter 142b promotion follow-up 2026-05-06: same change as the
+            # router-side CV — drop the relu hinge for uniform always-on
+            # balance pressure under the unified coef=1.0 reg stack.
+            cv_sum = torch.tensor(0.0, device=x.device)
             alphas = [alpha_n] if not self.use_ctp else [alpha_d, alpha_n]
             for alpha_soft in alphas:
                 mean_a = alpha_soft.mean(dim=0).float()
                 cv_a = mean_a.std(unbiased=False) / mean_a.mean().clamp_min(1e-8)
-                cv_hinge = cv_hinge + torch.relu(cv_a - cv_target_t).pow(2)
-            self._cv_loss_raw = cv_hinge
+                cv_sum = cv_sum + cv_a.pow(2)
+            self._cv_loss_raw = cv_sum
             # MoS per-token expert-state diversity (replaces mean-projection ortho).
             self._diversity_loss = (div_ntp + div_ctp) if self.use_ctp else div_ntp
         else:
@@ -3181,10 +3200,9 @@ class Block(nn.Module):
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 8, num_shared_experts: int = 0,
                  router_scoring: str = "linear",
-                 router_entropy_coef: float = 0.0,
+                 router_pertoken_entropy_coef: float = 0.0,
                  use_entmax_routing: bool = False,
                  entmax_blend_init_logit: float = 5.0,
-                 cv_target: float = 0.20,
                  use_nsa_attention: bool = False,
                  nsa_compress_block_size: int = 32,
                  nsa_compress_block_sliding_stride: int = 16,
@@ -3221,13 +3239,13 @@ class Block(nn.Module):
                 nn.init.zeros_(g.weight)
                 nn.init.constant_(g.bias, 1.0)  # init near-open (matches pre-iter-84)
         # Router only covers routed experts (not shared). Routing-balance
-        # regularization is the per-slice CV hinge inside SoftDenseRouter
-        # (cv_target threshold), aggregated by GPT._collect_routing_losses.
+        # regularization is the per-slice CV² loss inside SoftDenseRouter
+        # (no relu hinge / no target — continuous balance pressure),
+        # aggregated by GPT._collect_routing_losses.
         self.router = SoftDenseRouter(dim, 2 * num_routed,
-                                      cv_target=cv_target,
                                       scoring=router_scoring,
                                       health_slices=(num_routed, num_routed),
-                                      entropy_coef=router_entropy_coef,
+                                      entropy_coef=router_pertoken_entropy_coef,
                                       use_entmax_routing=use_entmax_routing,
                                       entmax_blend_init_logit=entmax_blend_init_logit)
         self.attn_router = self.router  # alias for backward-compat diagnostics
@@ -3889,7 +3907,7 @@ class GPT(nn.Module):
                  deq_beta: float = 0.35,
                  deq_bptt_k: int = 0,
                  router_scoring: str = "linear",
-                 router_entropy_coef: float = 0.0,
+                 router_pertoken_entropy_coef: float = 0.0,
                  use_entmax_routing: bool = False,
                  entmax_blend_init_logit: float = 5.0,
                  entmax_blend_warmup_delay_frac: float = 0.3,
@@ -3905,16 +3923,14 @@ class GPT(nn.Module):
                  parcae_init_b_bar: float | None = None,
                  use_ctp: bool = True,
                  ctp_weight: float = 0.0,
-                 router_load_cv_coef: float = 0.5,
-                 mos_load_cv_coef: float = 0.25,
-                 cv_target: float = 0.20,
-                 mos_cv_target: float = 0.20,
+                 router_load_cv_coef: float = 1.0,
+                 mos_load_cv_coef: float = 1.0,
                  expert_diversity_kind: str = "cosine",
-                 expert_output_diversity_coef: float = 0.1,
+                 expert_output_diversity_coef: float = 1.0,
                  expert_diversity_every: int = 8,
                  expert_diversity_max_tokens: int = 64,
                  mos_output_diversity_coef: float = 0.0,
-                 regularizer_warmup_frac: float = 0.30,
+                 regularizer_warmup_frac: float = 0.0,
                  use_nsa_attention: bool = False,
                  nsa_compress_block_size: int = 32,
                  nsa_compress_block_sliding_stride: int = 16,
@@ -3938,7 +3954,7 @@ class GPT(nn.Module):
         # Entropy + diversity coefficients are annealed by a single
         # `regularizer_warmup_frac` schedule in the training loop. CV losses
         # are active from step 0 (no warmup).
-        self._router_entropy_coef_target = float(router_entropy_coef)
+        self._router_pertoken_entropy_coef_target = float(router_pertoken_entropy_coef)
         self.regularizer_warmup_frac = float(regularizer_warmup_frac)
         # entmax_blend_anneal still has its own delay (it's a routing-form
         # behavior, not a loss-coefficient ramp; keep separate).
@@ -3955,12 +3971,12 @@ class GPT(nn.Module):
         self.mos_output_diversity_coef = float(mos_output_diversity_coef)
         self._mos_diversity_loss: Tensor | None = None
         self._router_cv_loss_t: Tensor | None = None
-        self._router_entropy_loss_t: Tensor | None = None
+        self._router_pertoken_entropy_loss_t: Tensor | None = None
         self._mos_cv_loss_t: Tensor | None = None
         self._expert_diversity_loss_t: Tensor | None = None
         self._mos_diversity_loss_t: Tensor | None = None
         self._router_cv_coef_eff_t: Tensor | None = None
-        self._router_entropy_coef_eff_t: Tensor | None = None
+        self._router_pertoken_entropy_coef_eff_t: Tensor | None = None
         self._mos_cv_coef_eff_t: Tensor | None = None
         self._expert_diversity_coef_eff_t: Tensor | None = None
         self._mos_diversity_coef_eff_t: Tensor | None = None
@@ -3985,10 +4001,9 @@ class GPT(nn.Module):
                                    num_experts=self.num_experts,
                                    num_shared_experts=self.num_shared_experts,
                                    router_scoring=router_scoring,
-                                   router_entropy_coef=router_entropy_coef,
+                                   router_pertoken_entropy_coef=router_pertoken_entropy_coef,
                                    use_entmax_routing=use_entmax_routing,
                                    entmax_blend_init_logit=entmax_blend_init_logit,
-                                   cv_target=cv_target,
                                    use_nsa_attention=use_nsa_attention,
                                    nsa_compress_block_size=nsa_compress_block_size,
                                    nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
@@ -4040,7 +4055,6 @@ class GPT(nn.Module):
             model_dim, vocab_size, rank=256,
             num_shared=2, num_specialized=1, fsq_levels=0,
             use_ctp=self.use_ctp, logit_softcap=self.logit_softcap,
-            mos_cv_target=mos_cv_target,
             mos_output_diversity_kind=expert_diversity_kind,  # follow same kind
         )
         self.final_norm = RMSNorm(model_dim)
@@ -4430,9 +4444,9 @@ class GPT(nn.Module):
         """Flat router-side regularization assembly:
 
             router_reg_loss
-              = router_load_cv_coef        × Σ_r cv_hinge(r)
-              + router_entropy_coef_eff    × Σ_r H_pertoken(r)
-              + mos_load_cv_coef           × mos_cv_hinge
+              = router_load_cv_coef        × Σ_r cv²(r)
+              + router_pertoken_entropy_coef_eff    × Σ_r H_pertoken(r)
+              + mos_load_cv_coef           × mos_cv²
               + eff_diversity_coef         × per_token_expert_diversity
               + eff_mos_diversity_coef     × mos_per_token_expert_diversity
 
@@ -4465,7 +4479,7 @@ class GPT(nn.Module):
         if mos_diversity_loss is not None and eff_mos_diversity_coef > 0.0:
             router_reg_loss = router_reg_loss + eff_mos_diversity_coef * mos_diversity_loss
         self._router_cv_loss_t = cv_sum.detach()
-        self._router_entropy_loss_t = ent_raw_sum.detach()
+        self._router_pertoken_entropy_loss_t = ent_raw_sum.detach()
         self._mos_cv_loss_t = mos_cv.detach()
         self._expert_diversity_loss_t = (
             diversity_loss.detach() if isinstance(diversity_loss, torch.Tensor) else zero.detach()
@@ -4474,7 +4488,7 @@ class GPT(nn.Module):
             mos_diversity_loss.detach() if isinstance(mos_diversity_loss, torch.Tensor) else zero.detach()
         )
         self._router_cv_coef_eff_t = zero.new_tensor(float(self.router_load_cv_coef)).detach()
-        self._router_entropy_coef_eff_t = (
+        self._router_pertoken_entropy_coef_eff_t = (
             (ent_coef_sum / float(max(ent_count, 1))).detach()
         )
         self._mos_cv_coef_eff_t = zero.new_tensor(float(self.mos_load_cv_coef)).detach()
@@ -4755,18 +4769,20 @@ def _prescribe_failure_fix(failure: str) -> dict:
 
     if "min_share" in first_token:
         if first_token.startswith("mos_"):
+            cur = float(Hyperparameters.mos_load_cv_coef)
             return {
                 "failure": failure,
                 "category": "mos_router_collapse",
                 "hypothesis": "MoS gate concentrating; bump MoS load-CV pressure",
-                "fix": "Increase mos_load_cv_coef by 1.5× (e.g. 0.25→0.375).",
+                "fix": f"Increase mos_load_cv_coef by 1.5× (e.g. {cur:g}→{cur * 1.5:g}).",
                 "config_change": {"mos_load_cv_coef_mult": 1.5},
             }
+        cur = float(Hyperparameters.router_load_cv_coef)
         return {
             "failure": failure,
             "category": "router_collapse",
             "hypothesis": "Routing slice CV under-regularized",
-            "fix": "Increase router_load_cv_coef by 1.5× (e.g. 0.5→0.75).",
+            "fix": f"Increase router_load_cv_coef by 1.5× (e.g. {cur:g}→{cur * 1.5:g}).",
             "config_change": {"router_load_cv_coef_mult": 1.5},
         }
     if first_token.startswith("mos_") and "ortho" in first_token:
@@ -4778,12 +4794,13 @@ def _prescribe_failure_fix(failure: str) -> dict:
             "config_change": {"mos_output_diversity_coef": 0.05},
         }
     if "ortho" in first_token:
+        cur = float(Hyperparameters.expert_output_diversity_coef)
         return {
             "failure": failure,
             "category": "expert_collapse",
             "hypothesis": "Expert outputs collapsing toward parallel directions",
-            "fix": "Increase expert_output_diversity_coef by 1.5× (e.g. 0.1→0.15) "
-                   "or fall back to weight_decay × 1.5 if direction-only pressure fails.",
+            "fix": (f"Increase expert_output_diversity_coef by 1.5× (e.g. {cur:g}→{cur * 1.5:g}) "
+                    "or fall back to weight_decay × 1.5 if direction-only pressure fails."),
             "config_change": {"expert_output_diversity_coef_mult": 1.5,
                               "weight_decay_mult": 1.5},
         }
@@ -5267,7 +5284,7 @@ def main() -> None:
         deq_bptt_k=args.deq_bptt_k,
         num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
-        router_entropy_coef=float(args.router_entropy_coef),
+        router_pertoken_entropy_coef=float(args.router_pertoken_entropy_coef),
         use_entmax_routing=args.use_entmax_routing,
         entmax_blend_init_logit=float(args.entmax_blend_init_logit),
         entmax_blend_warmup_delay_frac=float(args.entmax_blend_warmup_delay_frac),
@@ -5284,8 +5301,6 @@ def main() -> None:
         ctp_weight=float(args.ctp_weight),
         router_load_cv_coef=float(args.router_load_cv_coef),
         mos_load_cv_coef=float(args.mos_load_cv_coef),
-        cv_target=float(args.cv_target),
-        mos_cv_target=float(args.mos_cv_target),
         expert_diversity_kind=str(args.expert_diversity_kind),
         expert_output_diversity_coef=float(args.expert_output_diversity_coef),
         expert_diversity_every=int(args.expert_diversity_every),
@@ -5703,7 +5718,7 @@ def main() -> None:
         reg_scale = (
             min(max(time_frac / max(reg_warm, 1e-8), 0.0), 1.0) if reg_warm > 0 else 1.0
         )
-        ent_target = float(base_model._router_entropy_coef_target)
+        ent_target = float(base_model._router_pertoken_entropy_coef_target)
         if ent_target > 0.0:
             sb.router.entropy_coef = ent_target * reg_scale
         if bool(getattr(base_model, "_use_entmax_routing", False)):
@@ -5913,13 +5928,13 @@ def main() -> None:
                 )
             loss_info = (
                 f"router_cv_loss:{_log_tensor_attr('_router_cv_loss_t'):.6f} "
-                f"router_entropy_loss:{_log_tensor_attr('_router_entropy_loss_t'):.6f} "
+                f"router_pertoken_entropy_loss:{_log_tensor_attr('_router_pertoken_entropy_loss_t'):.6f} "
                 f"mos_cv_loss:{_log_tensor_attr('_mos_cv_loss_t'):.6f} "
                 f"expert_diversity_loss:{_log_tensor_attr('_expert_diversity_loss_t'):.6f} "
                 f"mos_diversity_loss:{_log_tensor_attr('_mos_diversity_loss_t'):.6f} "
                 f"router_reg_loss:{_log_tensor_attr('_router_reg_loss_t'):.6f} "
                 f"router_cv_coef_eff:{_log_tensor_attr('_router_cv_coef_eff_t'):.6g} "
-                f"router_entropy_coef_eff:{_log_tensor_attr('_router_entropy_coef_eff_t'):.6g} "
+                f"router_pertoken_entropy_coef_eff:{_log_tensor_attr('_router_pertoken_entropy_coef_eff_t'):.6g} "
                 f"mos_cv_coef_eff:{_log_tensor_attr('_mos_cv_coef_eff_t'):.6g} "
                 f"expert_diversity_coef_eff:{_log_tensor_attr('_expert_diversity_coef_eff_t'):.6g} "
                 f"mos_diversity_coef_eff:{_log_tensor_attr('_mos_diversity_coef_eff_t'):.6g} "

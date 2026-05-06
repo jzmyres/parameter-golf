@@ -31,7 +31,7 @@ COMP_LINESTYLES = {
     "mos_ctp": ":",
     "mos_ntp": (0, (3, 1, 1, 1)),  # dash-dot-dot
     "router_cv": "-",
-    "router_entropy": "--",
+    "router_pertoken_entropy": "--",
     "mos_cv": ":",
     "expert_diversity": "-.",
     "mos_diversity": (0, (3, 1, 1, 1)),
@@ -64,9 +64,9 @@ def parse_log(logpath: str) -> dict:
         "config_line": None,
         "train_batch_tokens": None,
         "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
-        "router_cv_loss": [], "router_entropy_loss": [], "mos_cv_loss": [],
+        "router_cv_loss": [], "router_pertoken_entropy_loss": [], "mos_cv_loss": [],
         "expert_diversity_loss": [], "mos_diversity_loss": [], "router_reg_loss": [],
-        "router_cv_coef_eff": [], "router_entropy_coef_eff": [],
+        "router_cv_coef_eff": [], "router_pertoken_entropy_coef_eff": [],
         "mos_cv_coef_eff": [], "expert_diversity_coef_eff": [],
         "mos_diversity_coef_eff": [],
         "parcae_a_bar_min": [], "parcae_a_bar_mean": [], "parcae_a_bar_max": [],
@@ -75,7 +75,7 @@ def parse_log(logpath: str) -> dict:
         "parcae_b_bar_mean": [], "parcae_b_bar_max": [],
         "parcae_delta_mean": [], "parcae_delta_max": [],
         "parcae_recon_amp_log10": [],
-        "router_cv_term": [], "router_entropy_term": [], "mos_cv_term": [],
+        "router_cv_term": [], "router_pertoken_entropy_term": [], "mos_cv_term": [],
         "expert_diversity_term": [], "mos_diversity_term": [],
         "grad_norm": [],
         "step_avg_ms": [], "train_time_ms": [],
@@ -163,9 +163,9 @@ def parse_log(logpath: str) -> dict:
             m_ctp = re.search(rf"ctp_loss:{_FLOAT}", line)
             data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else math.nan)
             for key in [
-                "router_cv_loss", "router_entropy_loss", "mos_cv_loss",
+                "router_cv_loss", "router_pertoken_entropy_loss", "mos_cv_loss",
                 "expert_diversity_loss", "mos_diversity_loss", "router_reg_loss",
-                "router_cv_coef_eff", "router_entropy_coef_eff",
+                "router_cv_coef_eff", "router_pertoken_entropy_coef_eff",
                 "mos_cv_coef_eff", "expert_diversity_coef_eff",
                 "mos_diversity_coef_eff",
                 "parcae_a_bar_min", "parcae_a_bar_mean", "parcae_a_bar_max",
@@ -323,7 +323,7 @@ def _populate_aux_terms(data: dict) -> None:
     """Derive weighted auxiliary contributions from raw losses and effective coefs."""
     specs = [
         ("router_cv_term", "router_cv_loss", "router_cv_coef_eff"),
-        ("router_entropy_term", "router_entropy_loss", "router_entropy_coef_eff"),
+        ("router_pertoken_entropy_term", "router_pertoken_entropy_loss", "router_pertoken_entropy_coef_eff"),
         ("mos_cv_term", "mos_cv_loss", "mos_cv_coef_eff"),
         ("expert_diversity_term", "expert_diversity_loss", "expert_diversity_coef_eff"),
         ("mos_diversity_term", "mos_diversity_loss", "mos_diversity_coef_eff"),
@@ -791,7 +791,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     # Row 6: objective auxiliary components, their weighted contributions, and coefficients.
     aux_raw_series = [
         ("router_cv", b.get("router_cv_loss", []), c.get("router_cv_loss", [])),
-        ("router_entropy", b.get("router_entropy_loss", []), c.get("router_entropy_loss", [])),
+        ("router_pertoken_entropy", b.get("router_pertoken_entropy_loss", []), c.get("router_pertoken_entropy_loss", [])),
         ("mos_cv", b.get("mos_cv_loss", []), c.get("mos_cv_loss", [])),
         ("expert_diversity", b.get("expert_diversity_loss", []), c.get("expert_diversity_loss", [])),
         ("mos_diversity", b.get("mos_diversity_loss", []), c.get("mos_diversity_loss", [])),
@@ -809,7 +809,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     aux_weighted_series = [
         ("router_reg", b.get("router_reg_loss", []), c.get("router_reg_loss", [])),
         ("router_cv", b.get("router_cv_term", []), c.get("router_cv_term", [])),
-        ("router_entropy", b.get("router_entropy_term", []), c.get("router_entropy_term", [])),
+        ("router_pertoken_entropy", b.get("router_pertoken_entropy_term", []), c.get("router_pertoken_entropy_term", [])),
         ("mos_cv", b.get("mos_cv_term", []), c.get("mos_cv_term", [])),
         ("expert_diversity", b.get("expert_diversity_term", []), c.get("expert_diversity_term", [])),
         ("mos_diversity", b.get("mos_diversity_term", []), c.get("mos_diversity_term", [])),
@@ -826,7 +826,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
 
     aux_coef_series = [
         ("router_cv", b.get("router_cv_coef_eff", []), c.get("router_cv_coef_eff", [])),
-        ("router_entropy", b.get("router_entropy_coef_eff", []), c.get("router_entropy_coef_eff", [])),
+        ("router_pertoken_entropy", b.get("router_pertoken_entropy_coef_eff", []), c.get("router_pertoken_entropy_coef_eff", [])),
         ("mos_cv", b.get("mos_cv_coef_eff", []), c.get("mos_cv_coef_eff", [])),
         ("expert_diversity", b.get("expert_diversity_coef_eff", []), c.get("expert_diversity_coef_eff", [])),
         ("mos_diversity", b.get("mos_diversity_coef_eff", []), c.get("mos_diversity_coef_eff", [])),

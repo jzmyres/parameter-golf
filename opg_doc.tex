@@ -172,11 +172,10 @@ equilibrium is a locally exponentially stable attractor.
 \texttt{lyapunov\_coef} & 0.0 & \texttt{lyapunov\_gamma} & 0.97 \\
 \texttt{lyapunov\_warmup\_frac} & 0.05 & \texttt{denoising\_coef} & 0.0 \\
 \texttt{denoising\_noise\_std} & 0.01 & \texttt{grad\_clip\_norm} & 1.0 \\
-\texttt{weight\_decay} & 0.01 & \texttt{router\_load\_cv\_coef} & 0.5 \\
-\texttt{mos\_load\_cv\_coef} & 0.25 & \texttt{router\_entropy\_coef} & 0.00125 \\
-\texttt{expert\_diversity\_kind} & cosine & \texttt{expert\_output\_diversity\_coef} & 0.1 \\
-\texttt{mos\_output\_diversity\_coef} & 0.0 & \texttt{regularizer\_warmup\_frac} & 0.10 \\
-\texttt{cv\_target} & 0.20 & \texttt{mos\_cv\_target} & 0.20 \\
+\texttt{weight\_decay} & 0.01 & \texttt{router\_load\_cv\_coef} & 1.0 \\
+\texttt{mos\_load\_cv\_coef} & 1.0 & \texttt{router\_pertoken\_entropy\_coef} & 1.0 \\
+\texttt{expert\_diversity\_kind} & cosine & \texttt{expert\_output\_diversity\_coef} & 1.0 \\
+\texttt{mos\_output\_diversity\_coef} & 0.0 & \texttt{regularizer\_warmup\_frac} & 0.0 \\
 \texttt{use\_entmax\_routing} & false & \texttt{entmax\_blend\_init\_logit} & 5.0 \\
 \texttt{use\_nsa\_attention} & false & \texttt{use\_smear\_gate} & false \\
 \texttt{muon\_backend\_steps} & 7 & \texttt{use\_polar\_express\_ns} & true \\
@@ -542,10 +541,10 @@ task term contributes.  The router/diversity term is
 \begin{aligned}
   \mathcal{L}_{\rm router}
     &= \lambda_{\rm rcv}\sum_{r\in\{\mathrm{attn},\mathrm{mlp}\}}
-       [\operatorname{CV}(m_r)-\tau_{\rm cv}]_+^2 \\
+       \operatorname{CV}(m_r)^2 \\
     &\quad
      + \lambda_{\rm ent}(t)\sum_r H_{\rm pertoken}(m_r)
-     + \lambda_{\rm mcv}[\operatorname{CV}(m_{\rm MoS})-\tau_{\rm mcv}]_+^2 \\
+     + \lambda_{\rm mcv}\operatorname{CV}(m_{\rm MoS})^2 \\
     &\quad
      + \lambda_{\rm div}(t)\mathcal{D}_{\rm experts}
      + \lambda_{\rm mosdiv}(t)\mathcal{D}_{\rm MoS}.
@@ -556,19 +555,24 @@ Here $m_r$ is the combined routed mass
   m_r = \operatorname{route\_prob}_r(z,x_0)\odot \sigma(g_r(z,x_0)),
 \]
 i.e. softmax or entmax routing probability multiplied by the learned sigmoid
-gate.  CV penalties are active from step 0.  Entropy and diversity coefficients
-ramp linearly from zero over \texttt{regularizer\_warmup\_frac=0.10}.  Current
-defaults are
+gate.  CV penalties use unbounded quadratic pressure (no target threshold), so
+the term keeps pushing $\operatorname{CV}\to0$ even when balance is already
+acceptable; this replaces the earlier hinge form $[\operatorname{CV}-\tau]_+^2$
+which went silent below a fixed target.  After the iter~142b promotion
+(2026-05-06 user override), all router-side coefficients run at full strength
+from step~0 (\texttt{regularizer\_warmup\_frac=0.0}); previous variants annealed
+entropy and diversity coefficients linearly over the first
+\texttt{regularizer\_warmup\_frac} of training.  Current defaults are
 \[
-\lambda_{\rm rcv}=0.5,\quad
-\lambda_{\rm ent}=0.00125,\quad
-\lambda_{\rm mcv}=0.25,\quad
-\lambda_{\rm div}=0.1,\quad
-\lambda_{\rm mosdiv}=0.0,
+\lambda_{\rm rcv}=1.0,\quad
+\lambda_{\rm ent}=1.0,\quad
+\lambda_{\rm mcv}=1.0,\quad
+\lambda_{\rm div}=1.0,\quad
+\lambda_{\rm mosdiv}=0.0.
 \]
-with $\tau_{\rm cv}=\tau_{\rm mcv}=0.20$.  The default expert diversity is
-scale-invariant cosine diversity; the Frobenius variant remains a controlled
-ablation that bundles direction and norm pressure into one term.
+The default expert diversity is scale-invariant cosine diversity; the Frobenius
+variant remains a controlled ablation that bundles direction and norm pressure
+into one term.
 
 \section{Jacobian and Denoising Regularization}
 \label{sec:regularization}\label{sec:reg}

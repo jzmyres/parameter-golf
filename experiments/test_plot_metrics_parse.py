@@ -50,9 +50,9 @@ class TestPlotMetricsParse(unittest.TestCase):
             [
                 # Train log line includes diagnostics we want plotted densely.
                 "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
-                "router_cv_loss:0.120000 router_entropy_loss:2.300000 mos_cv_loss:0.040000 "
+                "router_cv_loss:0.120000 router_pertoken_entropy_loss:2.300000 mos_cv_loss:0.040000 "
                 "expert_diversity_loss:0.500000 mos_diversity_loss:0.000000 router_reg_loss:0.091625 "
-                "router_cv_coef_eff:0.5 router_entropy_coef_eff:0.00125 mos_cv_coef_eff:0.25 "
+                "router_cv_coef_eff:0.5 router_pertoken_entropy_coef_eff:0.00125 mos_cv_coef_eff:0.25 "
                 "expert_diversity_coef_eff:0.0375 mos_diversity_coef_eff:0 "
                 "parcae_a_bar_min:0.600000 parcae_a_bar_mean:0.700000 parcae_a_bar_max:0.800000 "
                 "parcae_a_bar_core_max:0.777778 parcae_beta_mean:0.300000 parcae_beta_max:0.400000 "
@@ -82,18 +82,18 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["deq_iter_conv_train"], [0.1])
         self.assertEqual(d["gg_iter_train"], [[0.9, 0.8, 0.7, 0.6]])
         self.assertEqual(d["router_cv_loss"], [0.12])
-        self.assertEqual(d["router_entropy_loss"], [2.3])
+        self.assertEqual(d["router_pertoken_entropy_loss"], [2.3])
         self.assertEqual(d["mos_cv_loss"], [0.04])
         self.assertEqual(d["expert_diversity_loss"], [0.5])
         self.assertEqual(d["mos_diversity_loss"], [0.0])
         self.assertEqual(d["router_reg_loss"], [0.091625])
         self.assertEqual(d["router_cv_coef_eff"], [0.5])
-        self.assertEqual(d["router_entropy_coef_eff"], [0.00125])
+        self.assertEqual(d["router_pertoken_entropy_coef_eff"], [0.00125])
         self.assertEqual(d["mos_cv_coef_eff"], [0.25])
         self.assertEqual(d["expert_diversity_coef_eff"], [0.0375])
         self.assertEqual(d["mos_diversity_coef_eff"], [0.0])
         self.assertAlmostEqual(d["router_cv_term"][0], 0.06)
-        self.assertAlmostEqual(d["router_entropy_term"][0], 0.002875)
+        self.assertAlmostEqual(d["router_pertoken_entropy_term"][0], 0.002875)
         self.assertAlmostEqual(d["mos_cv_term"][0], 0.01)
         self.assertAlmostEqual(d["expert_diversity_term"][0], 0.01875)
         self.assertAlmostEqual(d["mos_diversity_term"][0], 0.0)
@@ -181,9 +181,9 @@ class TestPlotMetricsParse(unittest.TestCase):
     def test_plot_comparison_smoke_with_auxiliary_terms(self):
         train_line = (
             "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
-            "router_cv_loss:0.120000 router_entropy_loss:2.300000 mos_cv_loss:0.040000 "
+            "router_cv_loss:0.120000 router_pertoken_entropy_loss:2.300000 mos_cv_loss:0.040000 "
             "expert_diversity_loss:0.500000 mos_diversity_loss:0.000000 router_reg_loss:0.091625 "
-            "router_cv_coef_eff:0.5 router_entropy_coef_eff:0.00125 mos_cv_coef_eff:0.25 "
+            "router_cv_coef_eff:0.5 router_pertoken_entropy_coef_eff:0.00125 mos_cv_coef_eff:0.25 "
             "expert_diversity_coef_eff:0.0375 mos_diversity_coef_eff:0 "
             "parcae_a_bar_min:0.600000 parcae_a_bar_mean:0.700000 parcae_a_bar_max:0.800000 "
             "parcae_a_bar_core_max:0.777778 parcae_beta_mean:0.300000 parcae_beta_max:0.400000 "
