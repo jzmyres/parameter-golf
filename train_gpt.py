@@ -339,7 +339,11 @@ class Hyperparameters:
     muon_backend_steps = 7
     use_polar_express_ns = True
     muon_momentum_warmup_start = 0.92
-    muon_momentum_warmup_steps = 800
+    muon_momentum_warmup_steps = 800  # absolute cap; effective = min(this, frac × iterations)
+    # Adaptive cap: shorter runs auto-scale the ramp so we don't spend training
+    # at the start-of-warmup momentum the entire short trajectory. 0.8 = the
+    # historical 800/1000 ratio at the canonical 1000-iter run.
+    muon_momentum_warmup_frac = 0.8
     beta1 = 0.85
     beta2 = 0.90
     adam_eps = 1e-8
@@ -408,7 +412,7 @@ class Hyperparameters:
     mos_output_diversity_coef = 0.0  # per-token Gram on MoS low-rank states; default off
     cv_target = 0.20      # router CV hinge: relu(cv − cv_target)²
     mos_cv_target = 0.20  # MoS CV hinge
-    regularizer_warmup_frac = 0.30  # shared linear ramp for entropy + diversity
+    regularizer_warmup_frac = 0.10  # shared linear ramp for entropy + diversity (lowered from 0.30 — short runs were spending 30% on warmup)
     # iter 129 / H99 (NEW 2026-05-04): SmearGate — position-mixing memory channel.
     # `x[t] += g · x[t-1] · not_bos_mask` after embedding lookup. BOS-fixed
     # (mask suppresses leak across packed-doc boundaries; SP BOS_ID=1).
@@ -634,6 +638,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
     "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
     "warmdown-frac", "num-refinements-ramp-frac",
+    "muon-momentum-warmup-frac", "muon-momentum-warmup-steps",
     "router-entropy-coef",
     "entmax-blend-init-logit", "entmax-blend-warmup-delay-frac", "entmax-blend-lr",
     # iter 129 / H99 — SmearGate (default off; --use-smear-gate=1 to enable)
@@ -5839,7 +5844,12 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+        # Effective warmup = min(absolute cap, frac × iterations). Long-run prod
+        # uses the legacy 800-step cap unchanged; short comparison runs auto-scale.
+        _abs_cap = int(args.muon_momentum_warmup_steps) if args.muon_momentum_warmup_steps else 0
+        _adaptive = max(1, int(float(getattr(args, "muon_momentum_warmup_frac", 0.8)) * float(args.iterations)))
+        _mom_steps = min(_abs_cap, _adaptive) if _abs_cap > 0 else _adaptive
+        frac = min(step / max(_mom_steps, 1), 1.0)
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum

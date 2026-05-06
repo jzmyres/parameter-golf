@@ -170,7 +170,8 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | muon_backend_steps | 7 (PE-NS empirical elbow; see `EXPERIENCE.md#variance-reg-ns-cascade`) |
 | use_polar_express_ns | True (default ON; `--use-polar-express-ns=0` reverts to stock NS for A/B) |
 | muon_momentum_warmup_start | 0.92 |
-| muon_momentum_warmup_steps | 800 |
+| muon_momentum_warmup_steps | 800 (absolute cap) |
+| muon_momentum_warmup_frac | 0.8 (adaptive cap: effective = min(steps, frac × iterations); long-run unchanged, short comparison runs auto-scale) |
 | weight_decay | 0.01 (applied to both AdamW and Muon groups) |
 | grad_clip_norm | 1.0 |
 | warmdown_frac | 0.72 |
@@ -183,7 +184,7 @@ Single source of truth: `train_gpt.py::Hyperparameters`. The tables below MUST m
 | mos_load_cv_coef | 0.25 (direct coefficient on MoS softmax-gate CV hinge) |
 | cv_target / mos_cv_target | 0.20 / 0.20 (`relu(cv - target)^2`; CV losses active from step 0) |
 | router_entropy_coef | 0.00125 (direct coefficient on per-token router entropy; linearly ramped over `regularizer_warmup_frac`) |
-| regularizer_warmup_frac | 0.30 (shared 0->1 ramp for router entropy and diversity losses; CV is not warmed up) |
+| regularizer_warmup_frac | 0.10 (shared 0->1 ramp for router entropy and diversity losses; CV is not warmed up. Lowered from 0.30 to leave more steady-state time in short comparison runs) |
 | use_entmax_routing | False (CLI-enable. When True: `sigmoid(blend) * softmax + (1−sigmoid(blend)) * entmax_1p5` with learnable scalar `blend_logit`. Strict-gen at `entmax_blend_init_logit=+5`. H87.) |
 | entmax_blend_init_logit | 5.0 (sigmoid(5) ≈ 0.9933 ⇒ ≈ pure softmax at init; CLI override `--entmax-blend-init-logit=…`) |
 | expert_output_diversity_coef | 0.1 (per-token expert-output diversity; default cosine Gram over a deterministic contiguous token window every `expert_diversity_every` steps) |
