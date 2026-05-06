@@ -82,7 +82,7 @@ Three touchpoints:
    the existing per-expert-per-head independence.
 
 This file provides the standalone helper `rr_attention(q, k, v, ...)`.
-Smoke test via `python experiments/components/rr_attention.py`.
+Smoke test via `python experiments/components/archive/rr_attention.py`.
 
 Sources:
 - https://arxiv.org/abs/2602.05853 (RRAttention paper, 2026-02-05)

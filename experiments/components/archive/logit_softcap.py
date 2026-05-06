@@ -36,7 +36,7 @@ Two touchpoints:
 2. After the final logits computation in `MoSLowRankOutputHead.forward`, wrap:
        logits = softcap_logits(logits, args.logit_softcap)
 
-Smoke-test with `python experiments/components/logit_softcap.py`.
+Smoke-test with `python experiments/components/archive/logit_softcap.py`.
 """
 import torch
 from torch import Tensor

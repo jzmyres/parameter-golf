@@ -60,7 +60,7 @@ Three touchpoints:
        y = y * g[..., None]
        y = F.linear(y.reshape(...), out_w)                    # output projection
 
-Smoke-test: `python experiments/components/sparse_attn_head_gate.py`.
+Smoke-test: `python experiments/components/archive/sparse_attn_head_gate.py`.
 """
 import torch
 import torch.nn as nn

@@ -76,7 +76,7 @@ requires:
 4. Modify the artifact loader to dequantize via `Q.float() * s + lqer_A @ lqer_B`
    when LQER factors are present.
 
-Smoke-test: `python experiments/components/gptq_lqer.py`.
+Smoke-test: `python experiments/components/archive/gptq_lqer.py`.
 """
 import math
 from typing import Tuple

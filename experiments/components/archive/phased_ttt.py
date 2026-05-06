@@ -65,7 +65,7 @@ per-block linears the records use. Two paths:
 Path (b) is the records-faithful design. Path (a) gives finer control but
 costs more eval-time memory.
 
-Smoke-test: `python experiments/components/phased_ttt.py`.
+Smoke-test: `python experiments/components/archive/phased_ttt.py`.
 """
 import math
 import os

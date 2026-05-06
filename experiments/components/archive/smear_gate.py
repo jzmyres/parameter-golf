@@ -50,7 +50,7 @@ Three touchpoints:
 3. Apply in `_forward_hidden` after `tok_emb`, before the first encoder layer.
    For TTT (when iter 123 H91 lands), apply identically in `forward_ttt`.
 
-Smoke-test: `python experiments/components/smear_gate.py`.
+Smoke-test: `python experiments/components/archive/smear_gate.py`.
 """
 import torch
 import torch.nn as nn
