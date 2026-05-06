@@ -2,10 +2,10 @@
 
 This file has two roles, in this order:
 
-1. **Incident-Driven Rules Archive (§1)** — dated postmortems, ported from former `CLAUDE.md` §Development Practices. Each section documents one bug class that shipped, the root cause, and the verification recipe. `CLAUDE.md` §9 audit checklist cites these by anchor.
+1. **Incident-Driven Rules Archive (§1)** — dated postmortems, ported from former `CLAUDE.md` development-practice text. Each section documents one bug class that shipped, the root cause, and the verification recipe. `CLAUDE.md` cites these from its audit checklist.
 2. **Lessons Learned (§2)** — generic guardrails from research-process experience, not tied to specific code paths. Background reading; not enforcement.
 
-`CLAUDE.md` is the **enforcement surface** (terse rule + grep command). This file is the **historical record** (why the rule exists). New rules from pre-commit reviews are added to §1, then cited from `CLAUDE.md` §9 — they MUST NOT accrete in `CLAUDE.md` itself.
+`CLAUDE.md` is the **enforcement surface** (principle + concise rationale + reference). This file is the **historical record and detail store** (why the rule exists, examples, verification recipes, and runbook detail). New rules from pre-commit reviews are added to §1, then cited from the `CLAUDE.md` audit checklist — they MUST NOT accrete in `CLAUDE.md` itself.
 
 ---
 
@@ -33,6 +33,7 @@ This file has two roles, in this order:
 | 2026-04-30 | [#variance-reg-ns-cascade](#variance-reg-ns-cascade)         | Iter 117 NaN cascade attributed to PE-NS was actually variance-reg gradients on entmax exact-zeros |
 | 2026-05-02 | [#cumulative-metric-misread](#cumulative-metric-misread)     | Iter 117b-3 erroneously killed at s10 because cumulative `step_avg` was misread as instantaneous step time |
 | 2026-05-05 | [#partial-preview-completeness](#partial-preview-completeness) | iter-142-refactor 100-step preview silently skipped the descent-rate component because the run was "partial"  |
+| 2026-05-06 | [#move-tracked-invariant](#move-tracked-invariant)           | Components-archive move staged 9 deletions but left destinations untracked; archive-not-gitignored copies would have vanished |
 
 ### Section template
 
@@ -40,7 +41,7 @@ This file has two roles, in this order:
 ### <slug>
 
 **Date:** YYYY-MM-DD review of iter NN
-**Rule in CLAUDE.md:** §9 audit checklist row · §<N> <Section name>
+**Rule in CLAUDE.md:** audit checklist row · <section name>
 
 **What happened.** <Concrete description: code paths, symptom, how it was caught.>
 
@@ -68,13 +69,13 @@ This file has two roles, in this order:
 
 1. **Add to Hyperparameters first**, then thread through `GPT.__init__` → `Block.__init__` → leaf modules. Never introduce a new knob whose only home is a constructor default.
 2. **Tests assert against the config, not a literal**. `assert model.num_experts == args.num_experts` is allowed; `assert model.num_experts == 6` (or `>= 2`) is forbidden — the first catches drift, the second hides it.
-3. **CLAUDE.md "Current Architecture" table is mirror-only**. Edits to `Hyperparameters` and edits to that table MUST land in the same commit.
+3. **The documentation mirror is mirror-only**. Edits to `Hyperparameters` and the current orientation mirror (now [`#current-architecture-reference`](#current-architecture-reference), formerly `CLAUDE.md` §5) MUST land together when the mirror covers the changed knob.
 4. **`opg_doc.tex` §2.1 and the "Current SOTA"/"working baseline" lines are dated artifacts**. A PR that mutates `Block.forward`, the DEQ equation, or the promoted baseline MUST update these in the same commit, or open a `TODO(paper)` ticket noting the divergence.
 
 **Verification recipe.** Before committing any change to architectural knobs:
 - `grep -n 'num_experts\|num_layers\|model_dim' train_gpt.py` — confirm constructors read from `args.<field>`, not literals.
 - Tests: `assert model.<field> == args.<field>`; never compare to a hard-coded number.
-- CLAUDE.md §5 table updated in the same commit as `Hyperparameters`.
+- Documentation mirror updated in the same commit as `Hyperparameters` when the changed knob appears in that mirror.
 
 **Cross-references.** Sibling family with [#router-alias](#router-alias) and [#routing-predicate-migration](#routing-predicate-migration) — all share the partial-migration root cause.
 
@@ -232,7 +233,7 @@ Optional tensor inputs (e.g. `b_bar` when `use_parcae=False`) MUST be stored on 
 - Tune in decreasing order of suspicion: (i) LR of the new params, (ii) initialization (try matching baseline at step 0 exactly), (iii) gradient flow paths if the new params sit behind a chain of reparametrizations.
 - Record the diagnostic in `experiments/hypotheses.md` but continue running the next queued iter on top of the new baseline.
 
-**Verification recipe.** No grep — this is a promotion-policy invariant. The commit message for any strict-generalization iter must include the three items above, and CLAUDE.md §11 enforces "do not revert".
+**Verification recipe.** No grep — this is a promotion-policy invariant. The commit message for any strict-generalization iter must include the three items above, and `CLAUDE.md` Promotion Rules enforce "do not revert".
 
 **Cross-references.** Independent of the audit-rule family; this is a workflow rule, not a code-shape rule.
 
@@ -265,7 +266,7 @@ For each scale, verify every usage multiplies the SAME linear weight — i.e. th
 
 Contract tests `test_expert_path_parameters_are_expert_independent` and `TestOptimizerCoverage.test_all_trainable_parameters_are_grouped_once` together catch missing scales and check per-expert shapes. The grep audit is the first line of defense against cross-linear sharing.
 
-**Cross-references.** Adjacent to the soft-dense-routing "expert independence" hard constraint in CLAUDE.md §6 — both enforce that no shared trainable parameter couples expert/projection paths.
+**Cross-references.** Adjacent to the soft-dense-routing "expert independence" hard constraint in `CLAUDE.md` Architecture Principles — both enforce that no shared trainable parameter couples expert/projection paths.
 
 ---
 
@@ -380,7 +381,7 @@ Verify all groups of related permutes use the same index tuple. A single outlier
 - The grep above; manually inspect groups of related permutes for shared index tuple.
 - Add a unit test that asserts the post-permute layout matches an `einsum`-derived reference tensor (not just shape).
 
-**Cross-references.** Adjacent to the "Tensor Layout" guidance in §9 (manual flatten/reshape needs einsum equivalence) — both stem from "shape is not semantics".
+**Cross-references.** Adjacent to the audit-checklist tensor-layout guidance (manual flatten/reshape needs einsum equivalence) — both stem from "shape is not semantics".
 
 ---
 
@@ -406,7 +407,7 @@ Verify all groups of related permutes use the same index tuple. A single outlier
 ### hyperparameter-fanout
 
 **Date:** 2026-04-28 review of Phase 9 cleanup
-**Rule in CLAUDE.md:** §9 row "Hyperparameter fan-out" · §5 Single-source-of-truth
+**Rule in CLAUDE.md:** audit row "Hyperparameter fan-out" · source-of-truth principle
 
 **What happened.** A multi-agent pre-commit review of the Phase 9 throughput chain found five knobs documented in CLAUDE.md §5 (Routing & Expert Ranks table) as `Hyperparameters` fields that were ACTUALLY hardcoded as constructor literals deep inside `SoftDenseRouter` / `Block` / `MoSHead` / `_parcae_init_raw_values`:
 
@@ -426,15 +427,15 @@ In the same review, the per-token entropy loss term was found to be silently sca
 
 1. Field in `Hyperparameters` with the documented default.
 2. `args.<field>` read at the consumer site — NO constructor literal default that shadows it.
-3. Row in CLAUDE.md §5 mirroring the dataclass default.
+3. Documentation mirror row or note when the knob belongs in [`#current-architecture-reference`](#current-architecture-reference).
 4. Row in `opg_doc.tex` parameter table (or a "Practical implementation" deviation note per the doc-code-invariant rule).
 
-When effective magnitude differs from documented magnitude (as with the entropy loss × balance-mult dedup), document the *effective* value in §5 OR fix the multiplication so documented = effective. Do not silently leave readers with the wrong mental model.
+When effective magnitude differs from documented magnitude (as with the entropy loss × balance-mult dedup), document the *effective* value in the config mirror OR fix the multiplication so documented = effective. Do not silently leave readers with the wrong mental model.
 
 **Verification recipe.**
-- Pre-commit grep: every CLAUDE.md §5 row name must match `args.<row>` somewhere in `train_gpt.py`.
+- Pre-commit grep: every documented config-mirror row name must match `args.<row>` somewhere in `train_gpt.py`.
 - `experiments/test_cli_parser.py::test_default_parity` iterates the documented routing knobs and asserts each is reachable through `_parse_cli_overrides` with the documented default.
-- Reviewers reading a PR that adds a knob should grep CLAUDE.md §5 + `_parse_cli_overrides` for the new field name BEFORE approving.
+- Reviewers reading a PR that adds a knob should grep `Hyperparameters`, `_parse_cli_overrides`, and the config mirror for the new field name BEFORE approving.
 
 **Cross-references.** [#config-drift](#config-drift) (parent pattern), [#doc-code-invariant](#doc-code-invariant) (the doc-side enforcement).
 
@@ -456,7 +457,7 @@ When effective magnitude differs from documented magnitude (as with the entropy 
 **Verification recipe.**
 - Pre-commit: `wc -c CLAUDE.md` returns < 40 000.
 - Anchor resolution: `grep -oE 'EXPERIENCE.md#[a-z-]+' CLAUDE.md | sort -u`; each anchor has a matching `### <slug>` heading in this file.
-- Knob-row size cap (informal): a §5 row's annotation should fit in ≤ 1 line of prose; longer annotations route to `hypotheses.md` H## with `(see H##)` left in CLAUDE.md.
+- Knob-row size cap (informal): any config-mirror annotation should fit in one line of prose; longer annotations route to `hypotheses.md` H## with a short pointer left in the mirror.
 
 **Cross-references.** [#config-drift](#config-drift), [#hyperparameter-fanout](#hyperparameter-fanout) — both share the "single source of truth" theme; this rule applies it to *narrative* drift, not numeric drift.
 
@@ -547,6 +548,27 @@ The first command gives instantaneous per-step latency. The second gives cumulat
 **Verification recipe.** `grep -E "^### iter " experiments/hypotheses.md | tail -5` then inspect the most recent entries. Each must show all 5 §7-step-12 components or an explicit Caveats note for the missing one. Pre-commit reviewers should specifically check that "longer run pending" is paired with whatever partial data IS available, not used as a wholesale exemption.
 
 **Cross-references.** Related: [#cumulative-metric-misread](#cumulative-metric-misread) (also a "convenient simplification eats a required signal" pattern), [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (also a "stale exemption survived a regime change" pattern). The unifying theme: **mandated artifacts degrade gracefully; they do not silently skip.**
+
+---
+
+### move-tracked-invariant
+
+**Date:** 2026-05-06 review of components-archive move
+**Rule in CLAUDE.md:** Audit Checklist row · "Move means tracked"
+
+**What happened.** Pre-commit review of branch `autoresearch/phase2-optimization` found 9 untracked files at `experiments/components/archive/` paired with 9 staged deletions at `experiments/components/`. The archive copies were created via `cp + rm` (or `mv` outside git), leaving the destinations as untracked while the sources appeared as staged-deleted. `.gitignore` listed `experiments/archive/` — *not* `experiments/components/archive/` — so the new files were not ignored, just unstaged. A routine `git add -u` followed by commit would have shipped only the deletions, dropping the 9 archived scaffolds from history. The archive directory had previously contained only `orthogonal_expansion_routing.py` (commit `3e74393`), so there was no precedent of these files surviving a deletion-only commit.
+
+**Root cause.** "Archive, don't delete" is a documentation pattern that depends on git tracking the destination. The pattern fails silently when the move is performed outside git: the source's deletion is staged automatically by `git add -u`, but the destination requires an explicit `git add` that no rule was forcing. The named iters in the active hypothesis queue (H91 TTT, H94 GPTQ+LQER, iter 120 RRAttention, etc.) all reference scaffolds that were about to be lost.
+
+**The rule.** A file move from path A to path B requires `git add B` in the same commit as the deletion of A. `cp + delete` and `mv` outside git both leave B as untracked while A appears as staged-deleted; a routine `git add -u` then commits the deletion alone, dropping B from history.
+
+**Verification recipe.**
+1. After any rename / move / archive operation, run `git status --short | grep "^??"`.
+2. Any untracked path inside or below the moved tree must be explicitly `git add`-ed (not relying on `git add -u` or `git add .` which can drag in unrelated cruft).
+3. Prefer `git mv` for renames so both sides are staged atomically. For bulk moves, `git mv` each file then verify with `git status --short`.
+4. If a directory is intended to be ignored (true scratch), add it to `.gitignore` in the same commit and document the intent.
+
+**Cross-references.** Related: [#dead-code-tracking](#dead-code-tracking) (companion rule: removals must purge all references in the same commit), [#config-drift](#config-drift) (sibling rule: source-of-truth integrity). The unifying theme: **partial automation is worse than none — `git add -u` is convenient until silent omissions accrue cost.**
 
 ---
 
@@ -673,7 +695,7 @@ Every metric you read in a healthcheck or postmortem is a *function* of raw sign
 
 ### Routing Health Metrics
 
-CLAUDE.md §7 lists the targets and decompositions; the prose below is the rationale (moved out of CLAUDE.md to keep the file under the 40k budget — see [#claude-md-size-budget](#claude-md-size-budget)).
+`CLAUDE.md` keeps the concise metric principle; this section holds the definitions, targets, and decompositions (moved out of `CLAUDE.md` to keep it concise — see [#claude-md-size-budget](#claude-md-size-budget)).
 
 - **`pertoken_entropy`** — `H_pertoken = mean_token(−Σ_e w(e|t) log w(e|t))`. LOW means each token concentrates on few experts → specialization. Single pool-level value (per-token entropy is a pool-level quantity by construction — each token has ONE distribution).
 - **`*_entropy`** (global utilization) — `H_global = −Σ_e p̄_e log p̄_e` over batch-averaged shares `p̄_e`. HIGH ≈ log(N_routed) means uniform usage across batch — no dead experts. Reported per-slice (attn / mlp, renormalized within-slice) AND pool (full unrenormalized 2R distribution).
@@ -690,6 +712,209 @@ CLAUDE.md §7 lists the targets and decompositions; the prose below is the ratio
 
 ---
 
+## Operational Reference
+
+Detailed operational material lives here so `CLAUDE.md` can stay limited to principles and short rationale. If this section disagrees with code, `train_gpt.py::Hyperparameters` and the runnable scripts win; update this section as documentation debt.
+
+### pre-action-memory
+
+Memory directory: `/home/mzhong4/.claude/projects/-project-ylin-mzhong4-research-opg-parameter-golf/memory/`.
+
+Before changing code, docs, launches, or commits, read the memory index and then the relevant files. The durable categories are:
+
+- User profile: `user_profile.md`.
+- Feedback rules: hypothesis sync, pre-commit review chain, simplify-before-commit, dry fixes, architecture-over-hparams, compile-disabled-for-dev, DDP default, wakeup cadence, Lipschitz/K-sweep, per-wallclock override, sparsity value props, `uv` installs, GPU preflight, `conda run --no-capture-output`, throughput priority, SDPA replacement caution at T=2048, diagnosis context, NTP descent-rate metric, cumulative-vs-instantaneous metrics, routing metric axes, grad-enabled checks, bf16 training default, profile-before-throughput, decoupled regularizers, annealed sparsity coefficients, DEQ fixed-point framing, full-dim experts, MLA preference, MoS softmax routing, and decoupled refinement.
+- Project state: autoresearch protocol, Group-F lessons, experiment results, phase learnings, throughput-first notes, DEQ depth insight, architecture ideas, and deferred tech debt.
+
+When adding a memory file, add it to the memory index and to the appropriate category documentation in the same commit so future sessions discover it.
+
+### project-constraints
+
+OpenAI Parameter Golf target: train the best small LM that fits in a 16 MB artifact, trains in no more than 10 minutes on 8xH100 SXM, and scores by FineWeb validation `val_bpb`. Lower is better.
+
+Hard constraints:
+
+- Artifact: code plus compressed model must be no more than 16,000,000 bytes.
+- Submission training: no more than 600 seconds on 8xH100 SXM. `--max-training-seconds=600` is the explicit submission opt-in; evaluation reservation time is part of the loop budget.
+- Data/tokenizer: FineWeb validation with SentencePiece BPE vocab 1024.
+- Baseline pointer: the active promoted baseline is recorded in `experiments/hypotheses.md`; update that entry when promoting.
+
+### environment-and-files
+
+- Conda env: `conda activate opg` before training or tests.
+- Dependencies: `requirements.txt`; do not add packages unless explicitly authorized. Authorized installs use `uv pip install <pkg>` and update requirements in the same commit.
+- Data: `./data/datasets/fineweb10B_sp1024/` is read-only. Tokenizer: `./data/tokenizers/fineweb_1024_bpe.model`.
+- Main implementation: `train_gpt.py`.
+- Research log: `experiments/hypotheses.md`.
+- Incident/rationale archive: `EXPERIENCE.md`.
+- Plot/log rotation: `experiments/update_results.sh`.
+- Untracked runtime files: `results.tsv`, `run.log`, `experiments/training_logs/*`, and `experiments/weights/*`.
+- Historical submissions: `records/` is read-only.
+- Paper-facing algorithm doc: `opg_doc.tex`; update it when implementation intentionally diverges.
+- Reference implementations: RevDEQ at `/home/mzhong4/work/research/rdeq/WIP-ARWDEQ/code/arwdeq/qwen3_utmoe_revdeq.py`; TSU/CTP/NTP/MoS at `/home/mzhong4/work/research/tsu/WIP-TSU/code/model.py`.
+
+### runbook
+
+Default dev run, all visible GPUs, step-governed:
+
+```bash
+conda activate opg
+torchrun --standalone --nproc_per_node=gpu train_gpt.py
+```
+
+Shorter dev run: add `--iterations=N`. Explicit GPU count: `torchrun --standalone --nproc_per_node=2 train_gpt.py`. Single-GPU `python train_gpt.py` is debug-only.
+
+Submission-style run:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train_gpt.py --max-training-seconds=600
+```
+
+Evaluate a run log quickly:
+
+```bash
+grep "val_bpb:\|peak_vram_mb:\|artifact.*bytes" run.log
+```
+
+Fair comparison default: compare equal step count. Use wall-clock comparisons only for submission or explicit throughput iterations, and compute instantaneous per-step deltas before trusting early `step_avg`.
+
+### experiment-loop-details
+
+Canonical iteration loop:
+
+1. Read git state, recent logs, `results.tsv`, and relevant hypotheses.
+2. State the hypothesis and make one focused change unless explicitly testing a bundle.
+3. Add or update focused tests before implementation when behavior changes.
+4. Run smoke before long training.
+5. Run training with output captured to `run.log`.
+6. Inspect scored metrics, K-sweep, artifact bytes, peak VRAM, and failure diagnostics.
+7. Run `bash experiments/update_results.sh` after every iteration to rotate logs/weights and regenerate plots.
+8. Apply promotion rules.
+9. Update `experiments/hypotheses.md` immediately with evidence, status, and confounds.
+10. Stop after 100 consecutive non-improvements and ask for direction.
+
+Logging/plot artifacts:
+
+- Training logs: `experiments/training_logs/{baseline,previous,current}.log`.
+- Weights: `experiments/weights/{baseline,previous,current}/`.
+- Metric plots: `experiments/metrics_comparison.png`, `experiments/progress.png`, `experiments/progress_full.png`.
+
+### hypothesis-log-detail
+
+Each iteration entry must include the complete evidence packet when available:
+
+- roundtrip int6 `val_bpb` and validation loss;
+- the full `k_sweep_table:` matrix from `run.log`, including acyclicity primes 17, 37, and 113 when emitted;
+- validation trajectory by checkpoint with deltas;
+- acyclicity-prime check against nearest power-of-two K;
+- NTP descent rate as per-step `Δntp / 10 steps` and per-wallclock equivalent over computable windows.
+
+Partial previews are not exempt. Emit the windows and components that exist; put missing components under `Caveats` with a recovery plan. This rule prevents useful short-run evidence from silently dropping mandatory diagnostics.
+
+### current-architecture-reference
+
+The authoritative defaults live in `train_gpt.py::Hyperparameters`. This mirror is for orientation only and should be refreshed when a promoted config changes.
+
+Current high-level shape:
+
+- 12-layer RevDEQ-style shared block, `model_dim=768`, sequence length 2048, vocab 1024, tied embeddings.
+- Dense soft MoE with 16 experts plus one always-on shared expert, full-D LoRA-style expert internals, MLA attention, and NTP MoS output by default.
+- Parcae-style per-dimension damping/injection enabled; scalar beta path is fallback only.
+- Default training uses K-jitter and TBPTT; default comparison is 1000 iterations unless overridden.
+- int6 per-row quantization plus zstd-22 compression is the scored artifact path.
+
+Current default families to check in code before launch:
+
+- Core dimensions: layers, heads/KV heads, expert count, ranks, sequence length, batch tokens, refinement count, CTP flag, NSA flag.
+- Solver: Parcae init/floor, `deq_bptt_k`, K-jitter set, beta fallback/jitter, Lyapunov/denoising disabled state.
+- Optimizer: Muon/AdamW grouping, LRs, PE-NS backend, momentum warmup, weight decay, gradient clipping, warmdown.
+- Routing/loss stack: router CV, MoS CV, per-token entropy, expert/MoS diversity, entmax blend, logit softcap, routing mass diagnostics.
+- Quantization/eval: int6 roundtrip, sliding-window eval, artifact byte accounting.
+
+### revdeq-architecture-details
+
+RevDEQ model class:
+
+- The DEQ solver loop updates coupled states and should be treated as a fixed-point solve, not as a stack of independent transformer layers.
+- Optional refinement is a separate predict -> soft-embed -> re-solve loop. `num_refinements=0` keeps it off by default; preserving the path enables future diffusion/AR experiments without changing the solver definition.
+- Warm start uses token embedding `x0`; refinement warm start uses the refined input.
+- Add/sub reconstruction uses fp64 because reversibility is a numerical correctness requirement.
+- Smoke must check loss descent, finite gradients, non-exploding convergence, and routing health. True precision-level reconstruction is only expected under full-BPTT smoke.
+
+Full-D MLA standard:
+
+- Every expert owns its Q/KV/K-rope/Wo, MLP, norms, and MoS A-bank parameters.
+- Low-rank factors constrain parameter count, but activations and SDPA stay at full model dimension with tensor-core-friendly head dims.
+- Expert index is packed into the head dimension for one SDPA call where possible.
+- Decoupled RoPE and per-expert gated attention are part of the standard attention path.
+- NSA/sparse attention variants remain default-off unless explicitly ablated; replacing optimized SDPA at T=2048 requires profiling evidence.
+
+MoS/refinement defaults:
+
+- MoS routing is pure softmax.
+- CTP is preserved behind a flag but disabled by default; NTP-only is the promoted baseline behavior.
+- FSQ in the MoS intermediate projection is disabled by default; low-rank projection alone is sufficient under current evidence.
+
+### revdeq-reversibility-floor
+
+Any coefficient used as a divisor in RevDEQ backward reconstruction needs a lower bound. For Parcae-style damping, the relevant term is `A_bar = 1 - beta`; the floor controls worst-case amplification across reverse steps.
+
+Current invariant:
+
+```text
+A_bar = eps_rev + (1 - eps_rev) * exp(delta * A)
+eps_rev = parcae_reversibility_floor = 0.1
+```
+
+`eps_rev` is a correctness constant, not a tuning knob. Changing it requires a same-commit update to the Hyperparameter/default, reconstruction-floor test, smoke tolerance, and `opg_doc.tex` remark. Coefficients that do not divide the reverse reconstruction, such as `B_bar` inside `T_theta`, must not receive artificial floors.
+
+### routing-reg-input-invariant
+
+Router regularizers must see the combined routed mass:
+
+```text
+p = softmax_or_entmax(allocation_logits) * sigmoid(gate_logits)
+```
+
+The principle is simple: if the sigmoid gate suppresses an expert path, load-balance and sparsity losses must see that suppression. Renormalizing shares before the loss hides gate effects and optimizes a different distribution. MoS is exempt because it is intentionally a pure softmax convex combination.
+
+Useful audit:
+
+```bash
+grep -nE 'share / share\.sum\(' train_gpt.py
+```
+
+Hits in routing-regularization paths require review.
+
+### no-top-k-dispatch
+
+Hard discrete routing decisions are not RevDEQ-safe in the learned fixed-point map. Top-K gather, argmax routing, capacity drop, and hard threshold skips make the forward map piecewise/discontinuous and can make reverse reconstruction depend on a different branch than the forward pass.
+
+Permitted categories:
+
+- dense soft routing;
+- smooth relaxations such as softmax/entmax, Sinkhorn, or Gumbel-softmax when used differentiably;
+- epsilon skips only when the truncation is below bf16 numerical floor and proven not to change reconstruction decisions;
+- discrete logic outside the RevDEQ path or guarded off under RevDEQ.
+
+Useful audit:
+
+```bash
+grep -nE 'topk\(.*expert|capacity_factor.*ceil|argmax.*router' train_gpt.py
+```
+
+Every match must be either outside RevDEQ, default-off, or justified by a smooth/reconstruction-safe argument.
+
+### grad-enabled-vs-requires-grad
+
+`nn.Parameter.requires_grad` is a static property, not a runtime-mode signal. A fast path chosen only from `requires_grad` can incorrectly disable inference/no-grad kernels because parameters still have `requires_grad=True` during `torch.no_grad()` fixed-point evaluation.
+
+Dispatch rules:
+
+- use `torch.is_grad_enabled()` for runtime autograd mode;
+- combine it with actual tensor/parameter grad requirements when deciding whether a custom kernel must preserve gradients;
+- test both training and no-grad/validation paths.
+
 ### Bottleneck Experts (closed)
 
 **Decision.** Do NOT re-introduce bottleneck-style experts (`BottleneckIn` `D→proj_rank→r` + `ExpertBody` at small `r` + `BottleneckOut` `r→proj_rank→D`) as a scaling axis. Tested as Group D (iter 90, 91+92) and NOT PROMOTED.
@@ -700,7 +925,7 @@ CLAUDE.md §7 lists the targets and decompositions; the prose below is the ratio
 
 Both penalties compound when scaling `N_expert`. The iter 96 PROMOTED axis — full-D LoRA with rank-halving / E-doubling at iso-cost on linears (H71) — supersedes it.
 
-**Archival.** Bottleneck infrastructure preserved at git tag `iter-91+92-bottleneck-NOT-PROMOTED` (commit `3e35655`) and side branch `autoresearch/bottleneck-rescue` (`proj_rank=48/64` rescue workspace). Routing semantics it would feed into are unchanged — see CLAUDE.md §6.2.
+**Archival.** Bottleneck infrastructure preserved at git tag `iter-91+92-bottleneck-NOT-PROMOTED` (commit `3e35655`) and side branch `autoresearch/bottleneck-rescue` (`proj_rank=48/64` rescue workspace). Routing semantics it would feed into are unchanged — see `CLAUDE.md` Architecture Principles.
 
 ---
 
@@ -720,7 +945,7 @@ then measures how far the forward FP *travelled* in the un-reconstructed iterati
 
 ### Disabled Techniques
 
-Maintained here so removed/disabled techniques don't accrete annotations on the §5 Quantization & Techniques row.
+Maintained here so removed/disabled techniques don't accrete annotations in `CLAUDE.md` or the config mirror.
 
 - **SWA (Sliding-Window Attention)** — disabled iter 1: dragged gates toward identity at the 1 h budget. Sliding-window EVAL (stride = 64) is unrelated and stays enabled.
 - **BigramHash** — `bigram_vocab_size = 0` (iter 93 / H64). Code retained behind the flag.

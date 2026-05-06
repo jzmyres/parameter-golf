@@ -38,7 +38,7 @@
 \title{OPG (parameter-golf): Code-Aligned RevDEQ/Parcae Note\\
 \large Dense expert routing, independent MLA/MLP experts, and local stability notation}
 \author{Project document for \texttt{train\_gpt.py}}
-\date{2026-04-24}
+\date{2026-05-06}
 
 \begin{document}
 \maketitle
@@ -51,22 +51,22 @@ evaluated by validation bits per byte.  The active backbone is a reversible
 deep-equilibrium (RevDEQ) solve over one shared transformer-like block.  The
 block uses dense soft routing over fully independent attention and MLP expert
 banks, Parcae per-dimension damping and input gain, an NTP-only
-mixture-of-softmaxes output head by default, int6 round-trip quantization, and
-post-training fixed-point diagnostics.
+mixture-of-softmaxes output head by default, a flattened routing/diversity
+regularization stack, int6 round-trip quantization, and post-training
+fixed-point diagnostics.
 
 The stability objective is local, not global: the code does not enforce a
 global Banach contraction with ball projections or spectral-normalization caps.
 The Jacobian-spectral-radius and finite-perturbation denoising regularizers
 described in Section~\ref{sec:reg} (with coefficients
 $\lambda_J=\texttt{lyapunov\_coef}$, $\lambda_D=\texttt{denoising\_coef}$) are
-\emph{disabled by default} in the iter-89 baseline (both coefficients are
-$0.0$); empirically the Parcae per-dimension $\bar A$ already bounds the local
-spectral radius, making these explicit penalties redundant.  The terms remain
-in code so they can be re-enabled without an architectural change.  The
-theorem in Section~\ref{sec:lyapunov} records the self-contained mathematical
-guarantee: if the Jacobian of the fixed-point map has spectral radius below
-one at an equilibrium, that equilibrium is a local exponentially stable
-attractor.
+\emph{disabled by default} (both coefficients are $0.0$); empirically the
+Parcae per-dimension $\bar A$ already provides the useful local damping signal.
+The terms remain in code so they can be re-enabled without an architectural
+change.  The theorem in Section~\ref{sec:lyapunov} records the self-contained
+mathematical guarantee: if the Jacobian of the fixed-point map has spectral
+radius below one at an equilibrium, that equilibrium is a local exponentially
+stable attractor.
 \end{abstract}
 
 \tableofcontents
@@ -130,22 +130,16 @@ $\bar B$ is not floored because it is only an input gain inside
 $T_\theta$.
 
 The output head maps $h_{\rm out}=\RMSNorm(z^\star)$ to logits, with an
-NTP-only mixture-of-softmaxes head by default.  The training objective is
-\[
-  \mathcal{L}
-    = \mathcal{L}_{\rm main}
-    + \mathcal{L}_{\rm jac}
-    + \mathcal{L}_{\rm denoise}.
-\]
-Let $J^\star=\nabla_zT_\theta(z^\star,x_0;\bar B)$.  The Jacobian term uses a
-Hutchinson probe $q=(J^\star)^\top v$ to estimate local sensitivity, then adds
-a first-order surrogate through a live re-evaluation of $T_\theta$.  The
-denoising term penalizes
-$T_\theta(\stopgrad(z^\star)+\xi,x_0;\bar B)-\stopgrad(z^\star)$ for small
-Gaussian $\xi$.  After training, validation checks the int6 round-trip artifact
-and a fixed-point iteration-count sweep.  The stability guarantee is local:
-if the spectral radius of $J^\star$ is below one, the reached equilibrium is a
-locally exponentially stable attractor.
+NTP-only mixture-of-softmaxes head by default.  The active training objective
+is the NTP loss plus a flat router/diversity stack.  CTP, Jacobian, and
+denoising terms are present as ablation paths gated by both a feature flag
+(\texttt{use\_ctp}, etc.) and a coefficient (\texttt{ctp\_weight},
+\texttt{lyapunov\_coef}, \texttt{denoising\_coef}); all flags default off and
+all coefficients default zero.  After training, validation checks the int6 round-trip
+artifact and a fixed-point iteration-count sweep.  The stability guarantee is
+local: if the spectral radius of
+$J^\star=\nabla_zT_\theta(z^\star,x_0;\bar B)$ is below one, the reached
+equilibrium is a locally exponentially stable attractor.
 
 \section{Current Defaults}
 \label{sec:config}
@@ -160,7 +154,8 @@ locally exponentially stable attractor.
 \midrule
 \texttt{vocab\_size} & 1024 & \texttt{train\_seq\_len} & 2048 \\
 \texttt{train\_batch\_tokens} & 524,288 & \texttt{iterations} & 1000 \\
-\texttt{max\_wallclock\_seconds} & 0 & \texttt{num\_layers} & 12 \\
+\texttt{max\_training\_seconds} & 0 & \texttt{eval\_reservation\_seconds} & 120 \\
+\texttt{max\_wallclock\_seconds} & deprecated alias & \texttt{num\_layers} & 12 \\
 \texttt{model\_dim} & 768 & \texttt{num\_heads} & 8 \\
 \texttt{num\_kv\_heads} & 4 & \texttt{num\_experts} & 16 \\
 \texttt{num\_shared\_experts} & 1 & \texttt{mlp\_mult} & 3.0 \\
@@ -169,32 +164,39 @@ locally exponentially stable attractor.
 \texttt{bigram\_vocab\_size} & 0 & \texttt{use\_ctp} & false \\
 \texttt{num\_refinements} & 0 & \texttt{num\_refinements\_ramp\_frac} & 0.85 \\
 \texttt{use\_parcae} & true & \texttt{parcae\_init\_a\_bar} & 0.7 \\
-\texttt{deq\_backward} & revdeq & \texttt{deq\_bptt\_k} & 2 \\
+\texttt{parcae\_init\_b\_bar} & 0.3 & \texttt{parcae\_lr} & 0.002 \\
+\texttt{deq\_backward} & revdeq only & \texttt{deq\_bptt\_k} & 3 \\
+\texttt{deq\_bptt\_k\_jitter} & false & \texttt{deq\_bptt\_k\_jitter\_set} & $(3)$ \\
 \texttt{deq\_k\_jitter} & true & \texttt{deq\_k\_jitter\_set} & $(16,24)$ \\
 \texttt{deq\_k\_eval} & 16 & \texttt{router\_scoring} & linear \\
 \texttt{lyapunov\_coef} & 0.0 & \texttt{lyapunov\_gamma} & 0.97 \\
 \texttt{lyapunov\_warmup\_frac} & 0.05 & \texttt{denoising\_coef} & 0.0 \\
 \texttt{denoising\_noise\_std} & 0.01 & \texttt{grad\_clip\_norm} & 1.0 \\
-\texttt{weight\_decay} & 0.01 & \texttt{mos\_balance\_mult} & 50.0 \\
-\texttt{min\_share\_loss\_weight} & 0.0 & \texttt{cv\_loss\_weight} & 2.0 \\
-\texttt{router\_entropy\_coef} & 0.005 & \texttt{router\_entropy\_warmup\_delay\_frac} & 0.3 \\
+\texttt{weight\_decay} & 0.01 & \texttt{router\_load\_cv\_coef} & 0.5 \\
+\texttt{mos\_load\_cv\_coef} & 0.25 & \texttt{router\_entropy\_coef} & 0.00125 \\
+\texttt{expert\_diversity\_kind} & cosine & \texttt{expert\_output\_diversity\_coef} & 0.1 \\
+\texttt{mos\_output\_diversity\_coef} & 0.0 & \texttt{regularizer\_warmup\_frac} & 0.10 \\
+\texttt{cv\_target} & 0.20 & \texttt{mos\_cv\_target} & 0.20 \\
 \texttt{use\_entmax\_routing} & false & \texttt{entmax\_blend\_init\_logit} & 5.0 \\
-\texttt{use\_orthogonal\_expansion\_routing} & false & \texttt{routing\_gram\_coef} & 0.01 \\
-\texttt{routing\_gram\_warmup\_delay\_frac} & 0.3 & & \\
+\texttt{use\_nsa\_attention} & false & \texttt{use\_smear\_gate} & false \\
 \texttt{muon\_backend\_steps} & 7 & \texttt{use\_polar\_express\_ns} & true \\
 \texttt{muon\_momentum} & 0.99 & \texttt{matrix\_lr} & 0.022 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Default runs are step-count governed.  Submission-like runs must explicitly set
-\texttt{--max-wallclock-seconds=600}.  Scalar \texttt{deq\_beta} and beta
-jitter are fallback paths used only when \texttt{use\_parcae=False}.
+Default runs are step-count governed.  Submission-like runs should explicitly
+set \texttt{--max-training-seconds=600}; the deprecated
+\texttt{--max-wallclock-seconds} flag is bridged onto
+\texttt{max\_training\_seconds} for older commands.  The process wall clock is
+the training cap plus \texttt{eval\_reservation\_seconds}, which reserves time
+for validation, quantization, and the K-sweep.  Scalar \texttt{deq\_beta} and
+beta jitter are fallback paths used only when \texttt{use\_parcae=False}.
 
-The \texttt{lyapunov\_coef} and \texttt{denoising\_coef} defaults are zero in
-the iter-89 baseline (Phase~9 iters 88, 89 disabled the Jacobian hinge and
-HyDRA finite-perturbation denoising as redundant under Parcae per-dimension
-$\bar A$, which already bounds the local spectral radius).  The penalty terms
+The \texttt{lyapunov\_coef} and \texttt{denoising\_coef} defaults remain zero
+after the Phase~9 iters that disabled the Jacobian hinge and HyDRA
+finite-perturbation denoising as redundant under Parcae per-dimension
+$\bar A$, which provides the useful local damping signal.  The penalty terms
 remain in the code path so the coefficients can be re-enabled without an
 architectural change.
 
@@ -433,9 +435,14 @@ to the fixed-point equation
 \]
 
 The default training step samples the forward iteration count from
-$K\in\{4,6,10\}$ using a shuffle-bag sampler.  Evaluation defaults to
+$K\in\{16,24\}$ using a shuffle-bag sampler.  Evaluation defaults to
 $K=16$, and the final diagnostic sweep evaluates
-$K\in\{4,8,16,32,64,128\}$ after int6 round-trip.
+\[
+  K\in\{4,8,16,17,24,32,37,64,113,128\}
+\]
+after int6 round-trip.  The prime values $17$, $37$, and $113$ are acyclicity
+checks: a stable fixed point should not show special behavior only at powers
+of two or multiples of the training jitter values.
 
 \subsection{Reversible Backward and Gradients}
 \label{sec:revdeq_backward_combined}
@@ -464,9 +471,11 @@ gradients to $r_b$ and $r_\delta$ through each re-evaluation of
 $T_\theta(z,x_0;\bar B)$.  Hiding $\bar B$ as mutable module state would break
 this chain; it must cross the custom-autograd boundary as an explicit tensor.
 
-Default backward is truncated: each step samples
-$K_{\rm bptt}\in\{2,3,4\}$.  Earlier forward iterations do not receive task
-gradient when truncation is active.
+Default backward is truncated to the last $K_{\rm bptt}=3$ forward
+iterations.  Earlier forward iterations do not receive task gradient when
+truncation is active.  The old stochastic TBPTT sampler remains in the
+configuration surface, but \texttt{deq\_bptt\_k\_jitter=false} by default to
+avoid multiplying the compile-cache axis by the forward K-jitter axis.
 
 \section{Head, Refinement, and Losses}
 \label{sec:head}
@@ -508,10 +517,11 @@ which bounds extreme logit magnitudes (Gemma2-style) and damps gradient
 spikes without altering the convex log-softmax mixture identity.  Strict
 generalization holds at $c=0$ (no-op short-circuit); records use $c=30$.
 
-Refinement is an outer loop around the DEQ solve.  It is disabled for the first
-85\% of training by default.  Once enabled, the model predicts from $z^\star$,
-forms a sparse top-$k$ soft embedding from shifted NTP probabilities, and
-solves again with the refined input
+Refinement is an optional outer loop around the DEQ solve.  It is disabled by
+default because \texttt{num\_refinements=0}; the 85\% ramp only matters when a
+future run explicitly re-enables refinements.  Once enabled, the model predicts
+from $z^\star$, forms a sparse top-$k$ soft embedding from shifted NTP
+probabilities, and solves again with the refined input
 \[
   x_0^{\rm new}
     = \alpha_{\rm ref}\, \operatorname{SoftEmbed}(z^\star)
@@ -519,19 +529,46 @@ solves again with the refined input
 \]
 where $\alpha_{\rm ref}$ ramps from $0$ to $0.5$.
 
-The task-side training loss is
+The task-side training loss is now a flat coefficient stack:
+\[
+  \mathcal{L}_{\rm task}
+    = \mathcal{L}_{\rm NTP}
+    + \lambda_{\rm CTP}\mathcal{L}_{\rm CTP}
+    + \mathcal{L}_{\rm router}.
+\]
+With default \texttt{use\_ctp=False} and \texttt{ctp\_weight=0.0}, no CTP
+task term contributes.  The router/diversity term is
 \[
 \begin{aligned}
-  \mathcal{L}_{\rm main}
-    &= \mathcal{L}_{\rm NTP}
-     + \lambda_{\rm bal}\mathcal{L}_{\rm router\_bal}
-     + \lambda_{\rm health}\mathcal{L}_{\rm router\_health} \\
+  \mathcal{L}_{\rm router}
+    &= \lambda_{\rm rcv}\sum_{r\in\{\mathrm{attn},\mathrm{mlp}\}}
+       [\operatorname{CV}(m_r)-\tau_{\rm cv}]_+^2 \\
     &\quad
-     + \lambda_{\rm mos}\mathcal{L}_{\rm mos\_ortho}
-     + \lambda_{\rm block}\mathcal{L}_{\rm block\_ortho}.
+     + \lambda_{\rm ent}(t)\sum_r H_{\rm pertoken}(m_r)
+     + \lambda_{\rm mcv}[\operatorname{CV}(m_{\rm MoS})-\tau_{\rm mcv}]_+^2 \\
+    &\quad
+     + \lambda_{\rm div}(t)\mathcal{D}_{\rm experts}
+     + \lambda_{\rm mosdiv}(t)\mathcal{D}_{\rm MoS}.
 \end{aligned}
 \]
-With default \texttt{use\_ctp=False}, no CTP task term contributes.
+Here $m_r$ is the combined routed mass
+\[
+  m_r = \operatorname{route\_prob}_r(z,x_0)\odot \sigma(g_r(z,x_0)),
+\]
+i.e. softmax or entmax routing probability multiplied by the learned sigmoid
+gate.  CV penalties are active from step 0.  Entropy and diversity coefficients
+ramp linearly from zero over \texttt{regularizer\_warmup\_frac=0.10}.  Current
+defaults are
+\[
+\lambda_{\rm rcv}=0.5,\quad
+\lambda_{\rm ent}=0.00125,\quad
+\lambda_{\rm mcv}=0.25,\quad
+\lambda_{\rm div}=0.1,\quad
+\lambda_{\rm mosdiv}=0.0,
+\]
+with $\tau_{\rm cv}=\tau_{\rm mcv}=0.20$.  The default expert diversity is
+scale-invariant cosine diversity; the Frobenius variant remains a controlled
+ablation that bundles direction and norm pressure into one term.
 
 \section{Jacobian and Denoising Regularization}
 \label{sec:regularization}\label{sec:reg}
@@ -540,10 +577,9 @@ The code stores $z^\star$ and the active $x_0$ detached after the DEQ solve.
 On the final micro-step only, it adds two local-stability regularizers outside
 the compiled model forward.  As noted in the abstract and Section~\ref{sec:summary},
 both coefficients ($\lambda_J=\texttt{lyapunov\_coef}$,
-$\lambda_D=\texttt{denoising\_coef}$) default to $0.0$ in the iter-89 baseline,
-so neither penalty contributes to the training loss as configured; the rest of
-this section describes the code path that activates when the coefficients are
-set positive.
+$\lambda_D=\texttt{denoising\_coef}$) default to $0.0$, so neither penalty
+contributes to the training loss as configured; the rest of this section
+describes the code path that activates when the coefficients are set positive.
 
 \paragraph{Hutchinson-Frobenius surrogate.}
 Draw a Rademacher probe $v\in\{-1,+1\}^{B\times T\times D}$ and set
@@ -579,10 +615,12 @@ The trainable first-order surrogate re-evaluates the block with live $\bar B$:
       \right\rangle\right|.
   \label{eq:ljac}
 \end{equation}
-Here $\gamma=0.97$, $\lambda_{\rm jac}=0.01$, and $s(t)$ ramps linearly over
-the first 5\% of training.  This avoids \texttt{create\_graph=True} and
+Here $\gamma=0.97$, and $s(t)$ ramps linearly over the first 5\% of training.
+This avoids \texttt{create\_graph=True} and
 \texttt{retain\_graph=True}; gradients reach $\theta$ and Parcae's live
-$\bar B$ through the second block evaluation.
+$\bar B$ through the second block evaluation.  The coefficient
+$\lambda_{\rm jac}$ is the runtime value of \texttt{lyapunov\_coef}; it is
+$0.0$ by default.
 
 \paragraph{Finite-perturbation denoising.}
 With $\xi\sim\mathcal{N}(0,\sigma^2I)$ and $\sigma=0.01$,
@@ -593,14 +631,15 @@ With $\xi\sim\mathcal{N}(0,\sigma^2I)$ and $\sigma=0.01$,
         T_\theta(\stopgrad(z^\star)+\xi,x_0;\bar B)-\stopgrad(z^\star)
       \right\|_2^2/(BTD),
 \]
-where $\lambda_{\rm denoise}=0.01$.  This regularizes finite perturbations
-around the reached equilibrium and complements the infinitesimal Jacobian
-surrogate.
+where $\lambda_{\rm denoise}$ is the runtime value of
+\texttt{denoising\_coef}; it is $0.0$ by default.  This regularizes finite
+perturbations around the reached equilibrium and complements the infinitesimal
+Jacobian surrogate when explicitly enabled.
 
 The total loss used for backpropagation is
 \[
   \mathcal{L}
-    = \mathcal{L}_{\rm main}
+    = \mathcal{L}_{\rm task}
     + \mathcal{L}_{\rm jac}
     + \mathcal{L}_{\rm denoise}.
 \]
@@ -620,7 +659,7 @@ validated after round-trip.
 
 The fixed-point diagnostic sweep evaluates the quantized model at
 \[
-  K\in\{4,8,16,32,64,128\}.
+  K\in\{4,8,16,17,24,32,37,64,113,128\}.
 \]
 The hard checks are intentionally coarse enough to avoid treating finite-$K$
 noise as failure:
@@ -730,6 +769,10 @@ the following change:
   \item the block equation \eqref{eq:Tx_new};
   \item Parcae definitions \eqref{eq:parcae} or the reversibility floor;
   \item router normalization or pooled-router layout;
+  \item flattened router/diversity loss coefficients or warmup semantics;
+  \item training timer semantics
+        (\texttt{max\_training\_seconds}, \texttt{eval\_reservation\_seconds},
+        deprecated \texttt{max\_wallclock\_seconds});
   \item default CTP, BigramHash, FSQ, refinement, Lyapunov, denoising, or
         TBPTT settings;
   \item post-int6 validation gates or K-sweep values.

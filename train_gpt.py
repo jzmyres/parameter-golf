@@ -7,7 +7,6 @@ Architecture: RevDEQ + Soft Dense MoE + MLA + Gated Attention + FSQ/MoS + Diffus
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import glob
 import io
@@ -16,8 +15,6 @@ import json
 import math
 import os
 import random
-import signal
-import shutil
 import subprocess
 import sys
 import time
@@ -33,6 +30,11 @@ try:
     _COMPRESSOR = "zstd"
 except ImportError:
     _COMPRESSOR = "zlib"
+
+try:
+    from experiments.plotting_hook import maybe_update_experiment_plots as _update_experiment_plots
+except Exception:
+    _update_experiment_plots = None
 
 import numpy as np
 import sentencepiece as spm
@@ -435,7 +437,7 @@ class Hyperparameters:
     # reshaped (extreme positives/negatives saturate). Default 0 = disabled
     # (strict-gen recovery: tanh(x)*softcap → x as softcap→∞; we treat 0 as
     # the "off" sentinel via early-return). Records use 30.0 since 2026-04+;
-    # smoke test in `experiments/components/logit_softcap.py` (6/6 PASS).
+    # archived smoke test in `experiments/components/archive/logit_softcap.py` (6/6 PASS).
     logit_softcap = 0.0
     # iter 117 v3 (2026-04-29): routing-variance penalty REMOVED. iter 111 H83
     # introduced `routing_variance_coef = -λ · sum_e Var_token(w(e|t))` to break
@@ -5157,29 +5159,6 @@ def main() -> None:
             f"({_T} * {world_size} * {_gam} = {_per_step_tokens})"
         )
 
-    def _best_effort_update_plots(reason: str) -> None:
-        if not master_process or not bool(getattr(args, "auto_plot_on_val", False)):
-            return
-        try:
-            exp_logdir = Path("experiments/training_logs")
-            exp_logdir.mkdir(parents=True, exist_ok=True)
-            if logfile is not None and Path(logfile).exists():
-                shutil.copyfile(logfile, exp_logdir / "current.log")
-            if (exp_logdir / "current.log").exists() and not (exp_logdir / "baseline.log").exists():
-                shutil.copyfile(exp_logdir / "current.log", exp_logdir / "baseline.log")
-            for script in ("experiments/plot_metrics.py", "experiments/plot_eval_metrics.py"):
-                subprocess.run([sys.executable, script], capture_output=True, text=True, check=False)
-        except Exception:
-            pass
-
-    if master_process:
-        atexit.register(lambda: _best_effort_update_plots("atexit"))
-        for _sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                signal.signal(_sig, lambda s, _: (_best_effort_update_plots(f"signal:{s}"), sys.exit(128 + s)))
-            except Exception:
-                pass
-
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
@@ -5666,7 +5645,7 @@ def main() -> None:
         if should_validate:
             # Timing-accounting boundary: stop the train clock BEFORE val so
             # validation time does NOT contribute to training_time_ms / step_avg.
-            # `t0` is reset post-val below (after `_best_effort_update_plots`),
+            # `t0` is reset post-val below (after optional plot refresh),
             # so the next training step's clock starts AFTER val is done.
             # Post-training artifact write + K-sweep happen after the main loop
             # break, so they cannot pollute step_avg either.
@@ -5696,7 +5675,8 @@ def main() -> None:
                 f"{hutch_str}"
                 f"{deq_info}{expert_info}"
             )
-            _best_effort_update_plots("val")
+            if _update_experiment_plots is not None:
+                _update_experiment_plots(logfile, enabled=master_process and getattr(args, "auto_plot_on_val", False))
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             _step_t_prev = t0
