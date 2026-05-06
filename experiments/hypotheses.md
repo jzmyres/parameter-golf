@@ -3817,31 +3817,81 @@ log per-step adjoint iter count; if average >7, deprioritize.
 
 ---
 
-### iter 142b — decomposed (cosine + CV + sparsity) vs bundled (frobenius alone)
+### iter 142b — decomposed-stack canonical: cosine + CV + sparsity
 
-**Claim.** Cosine + CV + sparsity (the iter-142-refactor canonical stack)
-is at least as good as Frobenius-alone (no CV, no entropy). Tests the
-"separation of concerns" principle for routing regularization: cosine
-handles direction, CV handles usage, optimizer handles norm — vs
-Frobenius's bundled alternative that imposes direction + norm + indirect
-usage all at once, competing with CV.
+**Claim.** The iter-142-refactor canonical stack — cosine diversity at
+its target coef, plus the explicit decomposed regularisers (router CV,
+router entropy / sparsity, MoS CV) — is the principled default for
+RevDEQ + dense MoE. Tests separation of concerns: cosine handles
+direction, CV handles usage, entropy handles per-token specialization,
+optimizer handles norm. Each regulariser does one job, none compete.
 
 **Setup.** 50 iterations × 2× L40S DDP. `regularizer_warmup_frac=0`
-(full strength s1).
-- **Config A** (decomposed): `--expert-diversity-kind=cosine
-  --expert-output-diversity-coef=1.0` + defaults (`router_load_cv_coef=0.5`,
-  `router_entropy_coef=0.00125`, `mos_load_cv_coef=0.25`).
-- **Config B** (bundled): `--expert-diversity-kind=frobenius
-  --expert-output-diversity-coef=1.0 --router-load-cv-coef=0
-  --router-entropy-coef=0 --mos-load-cv-coef=0`. CV + entropy + MoS-CV
-  all explicitly disabled. Frobenius's E²-normalised loss provides the
-  only routing-shape signal.
+(full strength from s1 — short-run fairness, since the 0.10 default
+would still leave 5 ramp steps inside a 50-step budget). All other
+regularisers at their CLAUDE.md §5 defaults:
+- `--expert-diversity-kind=cosine --expert-output-diversity-coef=1.0`
+- `router_load_cv_coef=0.5` (default)
+- `router_entropy_coef=0.00125` (default)
+- `mos_load_cv_coef=0.25` (default)
 
-**Test plan.** Compare val_bpb @ s50, NTP descent, routing health
-(attn_cv, mlp_cv, pertoken_entropy), and FP travel. Expected if "cosine
-+ CV is principled": Config A wins on val_bpb at similar throughput, and
-Config B's routing balance degrades (CV no longer enforcing it).
+**Pair.** Compare against iter 142c (Frobenius alone with CV / entropy
+/ MoS-CV disabled) at matched compute. Expected if the principled-stack
+hypothesis holds: 142b wins on val_bpb, 142c's routing balance degrades
+(no CV → high attn_cv / mlp_cv).
 
-**Status.** IN FLIGHT (bg task `b3sxuw0v4`). Logs:
-`experiments/training_logs/iter142b_cosine_with_cv_sparsity.log`,
-`experiments/training_logs/iter142b_frobenius_alone.log`.
+**Test plan.** Capture log to
+`experiments/training_logs/iter142b_cosine_with_cv_sparsity.log`. Read
+val_bpb @ s50, NTP descent, attn_cv / mlp_cv, pertoken_entropy,
+deq_fp_travel, step_avg, peak_vram. Build paired comparison vs 142c.
+
+**Status.** PROPOSED. Run command:
+```
+torchrun --standalone --nproc_per_node=gpu train_gpt.py \
+    --iterations=50 \
+    --expert-diversity-kind=cosine --expert-output-diversity-coef=1.0 \
+    --regularizer-warmup-frac=0 \
+    --val-loss-every=1000000
+```
+
+---
+
+### iter 142c — bundled-stack alternative: Frobenius alone
+
+**Claim.** Frobenius diversity (`‖YYᵀ/D − I/E‖²_F`, E²-normalised) by
+itself can substitute for the decomposed stack — it bundles direction,
+norm-targeting, and indirect usage onto a single penalty. Tests the
+counterfactual to iter 142b: if Frobenius alone matches or beats
+decomposed-cosine + CV + sparsity, the bundled approach wins on
+simplicity. If it loses (especially on routing balance), the
+"non-stationary gradient pressure + CV-competition" critique of
+Frobenius is empirically supported.
+
+**Setup.** 50 iterations × 2× L40S DDP. `regularizer_warmup_frac=0`.
+`--expert-diversity-kind=frobenius --expert-output-diversity-coef=1.0`.
+**All decomposed regularisers explicitly disabled**:
+`--router-load-cv-coef=0 --router-entropy-coef=0 --mos-load-cv-coef=0`.
+Frobenius's E²-normalised loss is the only routing-shape signal.
+
+**Pair.** Direct counterfactual to iter 142b. Same iter count, same
+hardware, same warmup-frac=0 fairness fix.
+
+**Test plan.** Log to
+`experiments/training_logs/iter142c_frobenius_alone.log`. Same metrics
+as 142b. Watch for: (a) attn_cv / mlp_cv blow-up (no CV regulariser);
+(b) per-token entropy collapse (Frobenius's norm-targeting often pushes
+heavy specialization, which without an entropy regulariser may go
+further); (c) NTP descent rate. The acceptable outcome is
+"Frobenius-alone wins on val_bpb at similar routing health"; the
+expected outcome (per the principled-stack argument) is
+"Frobenius-alone matches NTP but degrades routing balance".
+
+**Status.** PROPOSED. Run command:
+```
+torchrun --standalone --nproc_per_node=gpu train_gpt.py \
+    --iterations=50 \
+    --expert-diversity-kind=frobenius --expert-output-diversity-coef=1.0 \
+    --router-load-cv-coef=0 --router-entropy-coef=0 --mos-load-cv-coef=0 \
+    --regularizer-warmup-frac=0 \
+    --val-loss-every=1000000
+```
