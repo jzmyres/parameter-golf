@@ -3814,3 +3814,34 @@ log per-step adjoint iter count; if average >7, deprioritize.
 
 **Status.** PROPOSED. References: Bai et al. "Deep Equilibrium Models"
 (NeurIPS 2019) §3.2 "Backward Pass via Implicit Differentiation".
+
+---
+
+### iter 142b — decomposed (cosine + CV + sparsity) vs bundled (frobenius alone)
+
+**Claim.** Cosine + CV + sparsity (the iter-142-refactor canonical stack)
+is at least as good as Frobenius-alone (no CV, no entropy). Tests the
+"separation of concerns" principle for routing regularization: cosine
+handles direction, CV handles usage, optimizer handles norm — vs
+Frobenius's bundled alternative that imposes direction + norm + indirect
+usage all at once, competing with CV.
+
+**Setup.** 50 iterations × 2× L40S DDP. `regularizer_warmup_frac=0`
+(full strength s1).
+- **Config A** (decomposed): `--expert-diversity-kind=cosine
+  --expert-output-diversity-coef=1.0` + defaults (`router_load_cv_coef=0.5`,
+  `router_entropy_coef=0.00125`, `mos_load_cv_coef=0.25`).
+- **Config B** (bundled): `--expert-diversity-kind=frobenius
+  --expert-output-diversity-coef=1.0 --router-load-cv-coef=0
+  --router-entropy-coef=0 --mos-load-cv-coef=0`. CV + entropy + MoS-CV
+  all explicitly disabled. Frobenius's E²-normalised loss provides the
+  only routing-shape signal.
+
+**Test plan.** Compare val_bpb @ s50, NTP descent, routing health
+(attn_cv, mlp_cv, pertoken_entropy), and FP travel. Expected if "cosine
++ CV is principled": Config A wins on val_bpb at similar throughput, and
+Config B's routing balance degrades (CV no longer enforcing it).
+
+**Status.** IN FLIGHT (bg task `b3sxuw0v4`). Logs:
+`experiments/training_logs/iter142b_cosine_with_cv_sparsity.log`,
+`experiments/training_logs/iter142b_frobenius_alone.log`.

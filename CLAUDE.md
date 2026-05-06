@@ -239,12 +239,13 @@ Paper: Soft MoE (arxiv:2308.00951). Mixtape (NeurIPS 2019) for MoS softmax.
 - **Applied to**: attention output, MLP hidden, MoS output heads.
 - **Expert-health diagnostics** normalize usage shares for readability; total routed mass is logged separately. **Routing regularization** uses the combined routed mass `p = softmax/entmax(allocation) * sigmoid(gate)` directly. CV does not require a probability distribution and must not renormalize away gate effects.
 - **Two distinct routing entropies** — *global utilization* (`H_global` over batch-averaged shares; HIGH = no dead experts; sentinel) and *per-token concentration* (`H_pertoken` averaged over tokens; LOW = specialization). Target: HIGH global AND LOW per-token. Full definitions, axes, and failure modes in §7 metrics table.
-- **Regularization** — flat objective in `_collect_routing_losses`; each term has a direct coefficient and is logged separately:
-  - **Router load balance**: `router_load_cv_coef * Σ_r relu(cv_r - cv_target)^2`.
-  - **Per-token specialization**: `router_entropy_coef_eff * Σ_r H_pertoken(r)` (positive sign drives `H_pertoken -> 0`).
+- **Regularization — decomposed stack** (one objective per concern; flat objective in `_collect_routing_losses`; each term has a direct coefficient and is logged separately):
+  - **Router load balance**: `router_load_cv_coef * Σ_r relu(cv_r - cv_target)^2` (handles routing usage; no expert is rarely selected).
+  - **Per-token specialization**: `router_entropy_coef_eff * Σ_r H_pertoken(r)` (positive sign drives `H_pertoken -> 0`; sparsity).
   - **MoS load balance**: `mos_load_cv_coef * relu(cv_mos - mos_cv_target)^2`.
-  - **Expert diversity**: `expert_output_diversity_coef_eff * diversity(expert outputs)`.
+  - **Expert diversity (direction-only)**: `expert_output_diversity_coef_eff * diversity(expert outputs)` with `expert_diversity_kind=cosine` default — penalises only direction (off-diagonal cosine of expert outputs), leaving norm to the optimizer (Muon spectral preconditioning + AdamW decay) and usage to CV.
   - **MoS diversity**: `mos_output_diversity_coef_eff * diversity(MoS low-rank states)`, default off.
+- **Why cosine is the principled default for `expert_diversity_kind`** — separation of concerns. Cosine handles direction; CV handles usage; optimizer handles norm. The Frobenius alternative (`‖YYᵀ/D − I/E‖²_F`) bundles direction + norm-targeting + indirect-usage onto one penalty, which competes with explicit CV (two regularisers fighting for routing balance) and produces non-stationary gradient pressure (penalty grows as `‖y_e‖²/D` drifts from `1/E`). E²-normalised so both kinds are magnitude-comparable at the same coef. Use Frobenius only for explicit norm-targeting experiments; cosine + CV + sparsity is the canonical iter-142-refactor stack.
 - **Loss + Parcae tracking** — train logs emit raw components (`router_cv_loss`, `router_entropy_loss`, `mos_cv_loss`, `expert_diversity_loss`, `mos_diversity_loss`), `router_reg_loss`, effective coefficients (`*_coef_eff`), and Parcae state (`parcae_a_bar_min/mean/max`, `parcae_a_bar_core_max`, `parcae_beta_mean/max`, `parcae_b_bar_mean/max`, `parcae_delta_mean/max`, `parcae_recon_amp_log10`). `experiments/plot_metrics.py` derives weighted terms as `raw × effective_coef` and plots Parcae state for comparison.
 - Fully differentiable, no discrete decisions.
 
