@@ -9,3 +9,5 @@ Historical prototypes live under `experiments/components/archive/`. Restore
 individual files into this directory before reactivating; see
 `experiments/components/README.md` for the integration cookbook.
 """
+
+from . import chained_routing  # noqa: F401

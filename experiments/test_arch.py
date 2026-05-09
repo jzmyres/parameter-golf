@@ -456,22 +456,86 @@ def test_prescribe_min_share_routes_to_cv_loss():
     assert "weight_decay_mult" in p_ortho["config_change"]
 
 
-def test_direct_cv_coefficients_are_hyperparameters():
-    """Direct load-CV coefficients are the canonical routing balance knobs."""
+def test_routing_regularizer_coefficients_match_promoted_defaults():
+    """Promoted iter145r stack: EMA balance is the canonical routing-balance
+    knob, router CV is off by default, and MoS-CV / per-token entropy /
+    expert-output-diversity ride at the new lower coefficients. This test
+    locks the Hyperparameters defaults AND verifies they propagate to a
+    constructed model so signature-default drift is loud, not silent.
+    """
     from train_gpt import Hyperparameters
-    assert hasattr(Hyperparameters, "router_load_cv_coef")
-    assert hasattr(Hyperparameters, "mos_load_cv_coef")
-    assert float(Hyperparameters.router_load_cv_coef) == 1.0
-    assert float(Hyperparameters.mos_load_cv_coef) == 1.0
+    # Required fields exist.
+    for name in (
+        "router_load_cv_coef",
+        "router_ema_balance_coef",
+        "router_ema_specialization_coef",
+        "router_pertoken_entropy_coef",
+        "mos_load_cv_coef",
+        "expert_output_diversity_coef",
+        "regularizer_warmup_frac",
+        "use_router_sigmoid_gate",
+        "router_scoring",
+        "router_dirichlet_ucb_beta",
+        "weight_decay",
+    ):
+        assert hasattr(Hyperparameters, name), f"missing Hyperparameters field {name}"
+    # Promoted iter145r values (2026-05-08).
+    assert float(Hyperparameters.router_load_cv_coef) == 0.0
+    assert float(Hyperparameters.router_ema_balance_coef) == 0.15
+    assert float(Hyperparameters.router_ema_specialization_coef) == 0.1
+    assert float(Hyperparameters.router_pertoken_entropy_coef) == 0.1
+    assert float(Hyperparameters.mos_load_cv_coef) == 0.15
+    assert float(Hyperparameters.expert_output_diversity_coef) == 0.15
+    assert float(Hyperparameters.regularizer_warmup_frac) == 0.07
+    assert bool(Hyperparameters.use_router_sigmoid_gate) is False
+    assert str(Hyperparameters.router_scoring) == "dirichlet_ucb"
+    assert float(Hyperparameters.router_dirichlet_ucb_beta) == 0.5
+    assert float(Hyperparameters.weight_decay) == 0.015
     # Regression guard: iter 142b dropped the relu(cv − cv_target)² hinge in
     # favor of continuous cv²; the old target knobs must NOT come back.
     assert not hasattr(Hyperparameters, "cv_target")
     assert not hasattr(Hyperparameters, "mos_cv_target")
+    # Verify Hyperparameters values propagate to a constructed model.  Only
+    # fields that GPT.__init__ stores on `self` are public model attributes;
+    # `expert_output_diversity_coef` and `router_pertoken_entropy_coef` are
+    # held as `_*_target` private fields and read via the annealer/router.
     model = _make_model(num_experts=4)
-    assert hasattr(model, "router_load_cv_coef")
-    assert hasattr(model, "mos_load_cv_coef")
-    assert float(model.router_load_cv_coef) == 1.0
-    assert float(model.mos_load_cv_coef) == 1.0
+    assert float(model.router_load_cv_coef) == 0.0
+    assert float(model.router_ema_balance_coef) == 0.15
+    assert float(model.router_ema_specialization_coef) == 0.1
+    assert float(model.mos_load_cv_coef) == 0.15
+    assert float(model._expert_diversity_coef_target) == 0.15
+    assert float(model._router_pertoken_entropy_coef_target) == 0.1
+    assert float(model.regularizer_warmup_frac) == 0.07
+    # use_router_sigmoid_gate lives on each SoftDenseRouter instance.
+    for r in model.shared_block.active_routers():
+        assert bool(r.use_router_sigmoid_gate) is False
+
+
+def test_fp_probe_uses_eager_forward_when_instance_forward_is_wrapped():
+    """Fast-val Lipschitz probes must bypass the compiled training forward."""
+    import torch
+    from train_gpt import _prepare_saved_fp_probe
+
+    class DummyBlock(torch.nn.Module):
+        def forward(self, z, x0, b_bar):
+            return z + x0
+
+    class DummyModel:
+        def __init__(self):
+            self.shared_block = DummyBlock()
+            self.use_parcae = False
+            self._lyapunov_z_star = torch.ones(1, 2, 3)
+            self._lyapunov_x0 = torch.full((1, 2, 3), 2.0)
+
+    model = DummyModel()
+    model.shared_block.forward = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("wrapped forward should not be used by FP probes"))
+    prepared = _prepare_saved_fp_probe(model)
+    assert prepared is not None
+    z_star, x0_lyap, b_bar_d, sb_call, _, _ = prepared
+    out = sb_call(z_star, x0_lyap, b_bar_d)
+    assert torch.allclose(out, torch.full_like(out, 3.0))
 
 
 if __name__ == "__main__":

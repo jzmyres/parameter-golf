@@ -64,9 +64,13 @@ def parse_log(logpath: str) -> dict:
         "config_line": None,
         "train_batch_tokens": None,
         "train_steps": [], "train_loss": [], "ntp_loss": [], "ctp_loss": [],
-        "router_cv_loss": [], "router_pertoken_entropy_loss": [], "mos_cv_loss": [],
+        "router_cv_loss": [], "router_pertoken_entropy_loss": [],
+        "router_ema_alive_loss": [], "router_ema_balance_loss": [],
+        "router_ema_specialization_loss": [], "mos_cv_loss": [],
         "expert_diversity_loss": [], "mos_diversity_loss": [], "router_reg_loss": [],
         "router_cv_coef_eff": [], "router_pertoken_entropy_coef_eff": [],
+        "router_ema_alive_coef_eff": [], "router_ema_balance_coef_eff": [],
+        "router_ema_specialization_coef_eff": [],
         "mos_cv_coef_eff": [], "expert_diversity_coef_eff": [],
         "mos_diversity_coef_eff": [],
         "parcae_a_bar_min": [], "parcae_a_bar_mean": [], "parcae_a_bar_max": [],
@@ -75,7 +79,9 @@ def parse_log(logpath: str) -> dict:
         "parcae_b_bar_mean": [], "parcae_b_bar_max": [],
         "parcae_delta_mean": [], "parcae_delta_max": [],
         "parcae_recon_amp_log10": [],
-        "router_cv_term": [], "router_pertoken_entropy_term": [], "mos_cv_term": [],
+        "router_cv_term": [], "router_pertoken_entropy_term": [],
+        "router_ema_alive_term": [], "router_ema_balance_term": [],
+        "router_ema_specialization_term": [], "mos_cv_term": [],
         "expert_diversity_term": [], "mos_diversity_term": [],
         "grad_norm": [],
         "step_avg_ms": [], "train_time_ms": [],
@@ -163,9 +169,13 @@ def parse_log(logpath: str) -> dict:
             m_ctp = re.search(rf"ctp_loss:{_FLOAT}", line)
             data["ctp_loss"].append(float(m_ctp.group(1)) if m_ctp else math.nan)
             for key in [
-                "router_cv_loss", "router_pertoken_entropy_loss", "mos_cv_loss",
+                "router_cv_loss", "router_pertoken_entropy_loss",
+                "router_ema_alive_loss", "router_ema_balance_loss",
+                "router_ema_specialization_loss", "mos_cv_loss",
                 "expert_diversity_loss", "mos_diversity_loss", "router_reg_loss",
                 "router_cv_coef_eff", "router_pertoken_entropy_coef_eff",
+                "router_ema_alive_coef_eff", "router_ema_balance_coef_eff",
+                "router_ema_specialization_coef_eff",
                 "mos_cv_coef_eff", "expert_diversity_coef_eff",
                 "mos_diversity_coef_eff",
                 "parcae_a_bar_min", "parcae_a_bar_mean", "parcae_a_bar_max",
@@ -320,21 +330,31 @@ def _value_at(data: dict, key: str, idx: int) -> float:
 
 
 def _populate_aux_terms(data: dict) -> None:
-    """Derive weighted auxiliary contributions from raw losses and effective coefs."""
+    """Derive weighted auxiliary contributions from raw losses and effective coefs.
+
+    NOTE: The EMA-anchored term signs (router_ema_*_term, sign=+1/+1/-1) MUST
+    match `train_gpt.py::ROUTER_EMA_LOSS_TERMS`. That registry is the
+    authoritative source of truth — if the trainer flips a sign or adds a term,
+    update both. Cross-process import of train_gpt.py is intentionally avoided
+    here because plotting must work without GPU/torch in the analysis env.
+    """
     specs = [
-        ("router_cv_term", "router_cv_loss", "router_cv_coef_eff"),
-        ("router_pertoken_entropy_term", "router_pertoken_entropy_loss", "router_pertoken_entropy_coef_eff"),
-        ("mos_cv_term", "mos_cv_loss", "mos_cv_coef_eff"),
-        ("expert_diversity_term", "expert_diversity_loss", "expert_diversity_coef_eff"),
-        ("mos_diversity_term", "mos_diversity_loss", "mos_diversity_coef_eff"),
+        ("router_cv_term", "router_cv_loss", "router_cv_coef_eff", 1.0),
+        ("router_pertoken_entropy_term", "router_pertoken_entropy_loss", "router_pertoken_entropy_coef_eff", 1.0),
+        ("router_ema_alive_term", "router_ema_alive_loss", "router_ema_alive_coef_eff", 1.0),
+        ("router_ema_balance_term", "router_ema_balance_loss", "router_ema_balance_coef_eff", 1.0),
+        ("router_ema_specialization_term", "router_ema_specialization_loss", "router_ema_specialization_coef_eff", -1.0),
+        ("mos_cv_term", "mos_cv_loss", "mos_cv_coef_eff", 1.0),
+        ("expert_diversity_term", "expert_diversity_loss", "expert_diversity_coef_eff", 1.0),
+        ("mos_diversity_term", "mos_diversity_loss", "mos_diversity_coef_eff", 1.0),
     ]
     n = len(data.get("train_steps", []))
-    for out_key, loss_key, coef_key in specs:
+    for out_key, loss_key, coef_key, sign in specs:
         terms: list[float] = []
         for idx in range(n):
             loss = _value_at(data, loss_key, idx)
             coef = _value_at(data, coef_key, idx)
-            terms.append(loss * coef if _is_finite(loss) and _is_finite(coef) else math.nan)
+            terms.append(sign * loss * coef if _is_finite(loss) and _is_finite(coef) else math.nan)
         data[out_key] = terms
 
 

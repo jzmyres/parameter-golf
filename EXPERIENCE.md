@@ -35,6 +35,9 @@ This file has two roles, in this order:
 | 2026-05-05 | [#partial-preview-completeness](#partial-preview-completeness) | iter-142-refactor 100-step preview silently skipped the descent-rate component because the run was "partial"  |
 | 2026-05-06 | [#move-tracked-invariant](#move-tracked-invariant)           | Components-archive move staged 9 deletions but left destinations untracked; archive-not-gitignored copies would have vanished |
 | 2026-05-06 | [#loss-form-triple-touch](#loss-form-triple-touch)           | iter 142b cv² promotion shipped with stale `cv_hinge` docstring + stale `opg_doc.tex` parameter table & loss equation; magnitude-only audit didn't catch the structural change |
+| 2026-05-08 | [#untested-path-executability](#untested-path-executability) | iter145r resume `step=0` reset + iter103 chained `Block` alias landed structurally-correct but never end-to-end exercised |
+| 2026-05-08 | [#sibling-fanout-dry-gate](#sibling-fanout-dry-gate)         | iter145 EMA-loss triplet hand-rolled at 9 sites; future term would be a 9-place grep-and-paste |
+| 2026-05-08 | [#promotion-propagation](#promotion-propagation)             | iter145r promotion changed `Hyperparameters` defaults but signature defaults / regression test / `opg_doc.tex` lagged silently |
 
 ### Section template
 
@@ -600,6 +603,78 @@ Magnitude-only edits keep using the existing four-touch hyperparameter rule. Str
 
 **Cross-references.** Related: [#hyperparameter-fanout](#hyperparameter-fanout) (sibling rule for magnitude-only changes), [#doc-code-invariant](#doc-code-invariant) (parent principle: paper-facing pseudocode must track implementation), [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (companion: prescriptions must reflect current defaults, not historical ones), [#strict-generalization](#strict-generalization) (form changes are usually NOT strict generalizations — promotion gating must use the standard `val_bpb` rule, not the auto-promote shortcut, and the deviation must be recorded in `experiments/hypotheses.md`).
 
+### untested-path-executability
+
+**Date:** 2026-05-08 pre-commit review of iter145r promotion + iter103 chained scaffold
+**Rule in CLAUDE.md:** Audit Checklist row · "Untested-path executability"
+
+**What happened.** Two new branches landed on `autoresearch/phase2-optimization` that were structurally correct under static reading but had never been exercised end-to-end:
+
+1. The new resume path (`--resume-from`/`--resume-latest`) restored `step` from `ckpt.get("step", step)`, then a flat `step = 0` further down the function unconditionally erased the resumed value. Anyone calling resume would silently restart the loop counter from 0, double-count gradient updates, replay the LR/regularizer warmup, and contaminate `training_time_ms`. A second bug in the same block — `step` was used as a fallback name before any prior assignment — would have raised `NameError` if the checkpoint key was missing.
+2. The chained-routing `Block` constructor set stage-0 backward-compat aliases `self.attn = chained_stack.attns[0]`, `self.mlp = ...`, `self.router = ...`. Today's hot-path consumers all early-return on `chained_stack is not None`, but the alias pattern was a future-proof landmine: a new diagnostic that forgot the guard would silently see only stage-0 and report on it.
+
+**Root cause.** Static review of an "obvious" branch is a different signal than a runtime witness. A branch that compiles and reads correctly is not the same thing as a branch that runs. The resume reset survived precisely because nobody had run a `--resume-latest` smoke after the rest of the resume infrastructure landed.
+
+**The rule.** Every new top-level control-flow branch — resume path, preset, scoring mode, optimizer group, alias surface — needs at least one of (a) a focused unit test that visits the branch, (b) a smoke run whose log shows the branch fired, or (c) an explicit "manually verified at <commit-sha>" note in the PR description. A branch with no executable witness is dead code: either delete it or add the test that proves it works. If the branch can only be witnessed under DDP / multi-GPU / hardware-specific conditions, document the manual recipe in the PR.
+
+**Verification recipe.**
+1. Diff for new `if`/`elif`/`match` branches and new attribute aliases.
+2. For each, find the call site in tests or smoke logs. If there is no call site, write the smallest possible test that reaches it (CPU-only is fine for routing; DDP-only paths get a documented manual recipe).
+3. The resume path specifically: `--checkpoint-every=10 --iterations=25` then `--resume-latest=1 --iterations=25` and assert the second run reports the resumed step in the log.
+
+**Cross-references.** Related: [#dead-code-tracking](#dead-code-tracking) (companion principle: branches without consumers are dead), [#hypothesis-log-detail](#hypothesis-log-detail) (failed branches should be recorded as Caveats, not silent skips).
+
+### sibling-fanout-dry-gate
+
+**Date:** 2026-05-08 pre-commit review of iter145 EMA-anchored loss family
+**Rule in CLAUDE.md:** Audit Checklist row · "Sibling-fanout DRY gate"
+
+**What happened.** iter145 introduced three sibling EMA-anchored routing-loss terms (`alive`, `balance`, `specialization`) added to the existing CV/entropy/MoS-CV stack. The implementation hand-rolled the triplet at nine separate sites: `Hyperparameters` defaults; `SoftDenseRouter.__init__` zero-init; `SoftDenseRouter.forward` else-branch zero-fill; `GPT.__init__` coef field + target store + `_loss_t` cache + `_coef_eff_t` cache; `_collect_routing_losses` accumulators; the annealer; the per-step log f-string; and `experiments/plot_metrics.py` parser/spec list. Adding the (likely) iter146 strict-alive-hinge fourth term would require nine independent edits, each of which is a place to silently drift in sign or magnitude. The Research-Protocol "DRY and orthogonal functions" bullet had been advisory, not a hard audit gate, and an advisory rule does not survive a multi-site fanout.
+
+**Root cause.** Mechanical parallelism between siblings looks "explicit" line-by-line and is easy to write, but every site is a separate place to forget. The `_collect_routing_losses` site additionally separated the sign of the `specialization` term (`-` operator at the call line) from the formula (`KL(token || ema)` at the definition line), so a future reviewer could not tell from the call site whether the sign was a typo or intentional.
+
+**The rule.** When a feature introduces three or more parallel siblings AND each sibling repeats across three or more code sites, the implementation MUST replace the boilerplate with a single registry constant (tuple/dataclass list) plus iteration. The (N+1)th sibling addition has to be a one-line registry change, not a multi-site grep-and-paste. Plot/log/parser layers must read from the same registry as the trainer; if cross-process import is impractical (analysis env without GPU/torch), the secondary site declares a mirror list with a `NOTE: must match <registry>` comment so drift is loud. If the siblings genuinely have different shapes that defeat iteration, justify the exception in the commit message.
+
+**Verification recipe.**
+1. Identify the parallel triplet (or larger) in the diff.
+2. Count call sites per sibling. If ≥3 sites × ≥3 siblings, refactor to registry + loop.
+3. Move sign / direction / magnitude data into the registry tuple. The call site reads from the registry, never hard-codes a sign.
+4. After refactor, adding a fake fourth member should compile, run tests, and the trainer should emit a fourth log column without further edits to the trainer code.
+
+**Cross-references.** Companion: [#dry-function-orthogonality](#dry-function-orthogonality) (parent principle), [#hyperparameter-fanout](#hyperparameter-fanout) (similar rule for hyperparameter knobs), [#loss-form-triple-touch](#loss-form-triple-touch) (related: cross-surface drift after structural loss changes).
+
+### promotion-propagation
+
+**Date:** 2026-05-08 review of iter145r promotion (Dirichlet-UCB + EMA-anchored + warmup + sigmoid-gate-off)
+**Rule in CLAUDE.md:** Audit Checklist row · "Promotion propagation"
+
+**What happened.** When iter145r was promoted into `train_gpt.py::Hyperparameters` defaults (router_load_cv_coef 1.0→0.0, router_ema_balance_coef 0.0→0.15, router_ema_specialization_coef 0.0→0.1, mos_load_cv_coef 1.0→0.15, expert_output_diversity_coef 1.0→0.15, regularizer_warmup_frac 0.0→0.07, use_router_sigmoid_gate True→False, weight_decay 0.01→0.015, router_scoring linear→dirichlet_ucb, router_dirichlet_ucb_beta 0.0→0.5), the promotion was incomplete in three places:
+
+1. `experiments/test_arch.py` had a regression test that hard-coded the prior values; it would have failed on first run.
+2. `GPT.__init__`, `Block.__init__`, and `SoftDenseRouter.__init__` signature defaults still mirrored the prior iter142b values. In production this is hidden because `args.<field>` is always passed; in tests, `_make_model(**defaults)` constructs `GPT()` without overriding routing fields, so every architectural test was silently running on iter142b values, NOT iter145r values. The promotion was effectively untested.
+3. `opg_doc.tex` defaults table and §router/§loss subsections still described the linear-scorer + softmax-times-sigmoid + CV-as-balance world. The paper, as published from this branch, would misrepresent the model.
+
+**Root cause.** The promotion changed `Hyperparameters` and CLAUDE.md "Current Architecture" — the two surfaces the user thinks of as authoritative — but the promotion's effective surface is wider: every place that mirrors a default. CLAUDE.md's existing "Single source of truth" rule names `Hyperparameters` as authoritative, but a `__init__` signature default that drifts from `Hyperparameters` is silent because no test used to compare them.
+
+**The rule.** A promotion commit must touch every surface that mirrors a `Hyperparameters` value:
+1. `Hyperparameters` defaults — primary.
+2. Every `__init__` signature default in `train_gpt.py` (`GPT`, `Block`, `SharedBlock`, `SoftDenseRouter`, `MoSHead`, ...) for any field that the production CLI passes through. If a sub-module doesn't take a field, no change; if it does, the default must match `Hyperparameters`.
+3. Every test that hard-codes the prior value, especially regression-guard asserts. Renaming the test is appropriate when the rationale changes.
+4. CLAUDE.md "Current Architecture" + any §-Architecture-Principles bullet that names a default magnitude.
+5. `opg_doc.tex` defaults table; if the loss form or router form changes, also the relevant subsection — or an explicit "Implementation deviates from §X — paper update queued for iter<N+1>" deviation note in the same subsection.
+6. `experiments/hypotheses.md` queue header + the iter row's verdict (PROMOTED / PROMOTED_WITH_TECH_DEBT) + the "active config" recipe block.
+
+If any of (2)-(5) is intentionally deferred, the deferral must be explicit in the commit message AND the paper must carry a deviation note (not a silent stale section).
+
+**Verification recipe.**
+1. After updating `Hyperparameters`, grep each new value against signature defaults: `grep -nE "field_name: (float|bool|str|int) = " train_gpt.py` and confirm every match equals the new `Hyperparameters` value.
+2. Run the full test suite. Any test that fails on the new defaults either (a) is a regression-guard that needs renaming + new asserts, or (b) is a real signature-default-drift bug found by the test.
+3. Grep `opg_doc.tex` for the field name and old value; the value must match (or carry a deviation note).
+4. Grep `CLAUDE.md` for the field name; "Current Architecture" must reflect the new value.
+5. The promotion test in `experiments/test_arch.py::test_routing_regularizer_coefficients_match_promoted_defaults` asserts `Hyperparameters` AND a constructed-model attribute, so signature drift (item 2) cannot recur silently.
+
+**Cross-references.** Companion: [#hyperparameter-fanout](#hyperparameter-fanout) (single-source-of-truth principle), [#loss-form-triple-touch](#loss-form-triple-touch) (paper-side rule when loss form changes during promotion), [#untested-path-executability](#untested-path-executability) (a promoted but-untested path is the same failure mode at the architecture layer).
+
 ---
 
 ## §2. Lessons Learned
@@ -721,6 +796,11 @@ Every metric you read in a healthcheck or postmortem is a *function* of raw sign
 ### Distributed
 - Any rank-conditional control flow around collectives is a correctness bug; all ranks must execute collectives in the same order.
 
+### DRY Function Orthogonality
+- Shared tensor preparation, context selection, DDP reduction, metric formulas, and log formatting should each have one implementation. If fast validation and K-sweep need the same fixed-point probe, both call the same setup helper.
+- Keep functions orthogonal: a probe returns raw measurements, a metric helper transforms raw measurements into a gate value, and a logger formats fields. Do not hide policy decisions inside measurement routines.
+- When adding a metric, name the mathematical object precisely. If a value is a numerical estimate or conservative metric rather than a formal proof, the function name, log label, and docs must say so.
+
 ---
 
 ### Routing Health Metrics
@@ -734,11 +814,67 @@ Every metric you read in a healthcheck or postmortem is a *function* of raw sign
 - **`*_cv`** — coefficient of variation. Per-slice CV uses the renormalized within-slice distribution; pool CV uses the full 2R unrenormalized distribution. Diagnostic: large gap between attn_cv and mlp_cv = role-asymmetric routing (e.g. iter 100b s120 attn_cv≈1.07 / mlp_cv≈0.18: attn winner-take-all, MLP uniform). Large pool_cv with small per-slice CVs = cross-slice dominance.
 - **`*_ortho`** — `max|cos_sim|` between expert OUTPUT means. Reported per-slice because attn experts and MLP experts produce DIFFERENT outputs even with the shared (pooled) router.
 - **`router_mass`** — mean `sigmoid(gate)`. Drops when the model gates the mixture down.
-- **`hutch_F`** — Hutchinson-Frobenius estimator at the saved DEQ FP `z*`: `rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)` for `J = ∂T_θ/∂z`. Distinguishes contractive attractor (`rho_F < 1`, decreasing with training), marginal stability (`rho_F ≈ 1`), and trivial dynamics (`rho_F → 0`). Probe runs at `B_probe=1` slice of saved `z*/x0` to bound activation memory to ~1-2 GiB; silently skipped on OOM-pred guard / runtime OOM / SDPA-grad-incompatibility.
+- **`hutch_F`** — Hutchinson-Frobenius estimator at the saved DEQ FP `z*`: `rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)` for `J = ∂T_θ/∂z`. This tracks average local contraction but is **not** a sufficient Lipschitz certificate because one large singular direction can be hidden by the `/sqrt(dim)` normalization. Probe runs at `B_probe=1` slice of saved `z*/x0` to bound activation memory to ~1-2 GiB; skipped on OOM/backend failure.
+- **`spec_norm`** — power-iteration estimate of `||∂T_θ/∂z||_2` at `z*`. The true condition `||∂T_θ/∂z||_2 < 1` is sufficient for local contraction when the Jacobian is continuous, but the logged value is still a numerical estimate.
+- **`lip_ub`** — conservative numerical Lipschitz upper-bound metric derived from `spec_norm` by `spec_norm * fp_lip_ub_safety + fp_lip_ub_margin`. It is the fixed-point contraction gate in fast validation and K-sweep. This is stricter than raw `spec_norm`, but still not a formal interval/linear-relaxation certificate.
+- **`fp_residual_rel`** — direct relative fixed-point residual proxy from the saved solve, currently `deq_iter_conv_rel` / `iter_conv_rel` under the existing solver diagnostics.
+- **`fp_bound`** — a posteriori relative fixed-point distance proxy `fp_residual_rel / (1 - lip_ub)` when `lip_ub < 1`. This is the compact convergence certificate: small residual plus a contraction margin bounds distance to the local fixed point. `N/A` means `lip_ub` was missing or not below 1.
+- **`rd_step`** — finite-direction random-step gain `max_v ||T(z* + eps·v) - T(z*)|| / eps` over a few sampled unit directions. Use it as a trend/sanity metric; it is not a sufficient contraction certificate.
+
+**Parcae and contraction attribution.** In the active Parcae path, scalar
+`deq_beta` is not the solver blend; Parcae computes per-dim
+`beta = 1 - A_bar`. More importantly, `spec_norm`/`lip_ub` are probes of the
+transition map `T_theta(z, x0)`, not probes of the blended solver update
+`(1-beta)z + beta T_theta(z, x0)`. Therefore lowering scalar `deq_beta` cannot
+be a principled fix for a failed `lip_ub` under Parcae. A real fix must shrink
+or regularize the transition Jacobian itself, for example through weight decay,
+an output-scale constraint, or a dedicated transition-Jacobian penalty.
+
+**iter145r promotion tech debt and future fix.** iter145r promoted
+Dirichlet-UCB + EMA-balanced routing for BPB, but its post-int diagnostics did
+not certify strict health: attention min share stayed just under the hard floor,
+expert-output cosine gates failed, and `lip_ub` stayed far above 1 while
+`hutch_F` remained below 1. Treat this as a useful separation of concerns:
+`hutch_F` tracks average random-direction energy, while `lip_ub` catches a
+large singular direction of `T_theta`. The principled follow-up is not another
+scalar-beta sweep. Test a direct transition-control iteration instead:
+
+- Add a strict EMA alive hinge, `sum_e relu(tau - m_e)^2`, using the same
+  straight-through current-routing anchor as the EMA balance loss. Zero loss
+  directly implies every tracked expert EMA is above the chosen floor.
+- Add default-off transition-output scale control or a low-cadence
+  transition-Jacobian penalty that targets `||dT_theta/dz||_2` directly. The
+  clean certificate is still `lip_ub < 1`; a first rescue run can accept a
+  large reduction in `lip_ub` as evidence before investing in formal
+  interval/linear-relaxation bounds.
+- Keep routing token-local. Do not introduce Sinkhorn, capacity matching, or
+  batch-coupled assignment to force expert usage.
+
+**Evidential router / EMA-anchor principle.** A Dirichlet router can be tested
+without changing the RevDEQ contract: each token maps `h -> Softplus(W h + b) ->
+alpha=e+1 -> mu=alpha/sum(alpha)`, then an annealed local UCB bonus from the
+marginal Beta variance can be added before a smooth positive simplex projection.
+This is token-local and linear in expert count; it is not a batch-level
+assignment. Persistent EMA usage is also valid, but it is detached state.
+Therefore a plain detached `KL(EMA || uniform)` scalar is only a diagnostic. If
+it is used as a trainable balance objective, use an explicit straight-through
+EMA anchor whose forward value is `KL(EMA || uniform)` but whose gradient flows
+through the current token-local routing share. Pair that global balance term
+with bounded `-KL(P_token || stopgrad(EMA))` specialization if sharp assignments
+are desired. This preserves the RevDEQ map: routing decisions depend on the
+token and parameters only; historical usage influences only auxiliary gradients
+or slow state updates.
+
+**Orthogonality principle.** Router-row orthogonality is only a weak conditioning
+prior. It does not guarantee that experts are used or that they compute different
+functions. The more direct specialization signal is the normalized expert-output
+Gram/cosine penalty: zero off-diagonal output Gram on active tokens means active
+experts produce decorrelated transformations on the data manifold. Pair this with
+EMA usage/liveness; output Gram alone cannot rule out unused experts.
 
 **Prefix convention** (iter 100b). The SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components. Routing-distribution metrics decompose into THREE values: `attn_*` (per-slice renormalized), `mlp_*` (per-slice renormalized), and `pool_*` (full 2R distribution). Metrics derived from **expert outputs** (usage, ortho, min_share per slice) keep `attn_*`/`mlp_*` only — there is no pool variant.
 
-**K-sweep tabular emission** (PERMANENT iter 100b). The eval K-sweep emits a `k_sweep_table:` row per K with 15 fixed-width columns: `K val_bpb attn_cv mlp_cv pool_cv attn_min mlp_min attn_ortho mlp_ortho pertoken_ent pool_ent shared_gate hutch_F rd_step iter_conv_rel`. A header row precedes data rows. `N/A` indicates an unavailable field (most commonly Hutchinson when SDPA backend rejects under `enable_grad`). The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[…] router_gate_iter:[…] iter_conv_rel:… residual:…` line is preserved for `experiments/plot_metrics.py` back-compat. Use `k_sweep_table:` for cross-K and cross-iter routing-health comparisons; use `k_sweep:` for per-iter gate trajectories.
+**K-sweep tabular emission** (PERMANENT iter 100b; `lip_ub`/`fp_bound` added 2026-05-07). The eval K-sweep emits a `k_sweep_table:` row per K with fixed-width columns: `K val_bpb attn_cv mlp_cv pool_cv attn_min mlp_min attn_ortho mlp_ortho pertoken_ent pool_ent shared_gate hutch_F spec_norm lip_ub fp_bound rd_step iter_conv_rel`. A header row precedes data rows. `N/A` indicates an unavailable field. The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[…] router_gate_iter:[…] iter_conv_rel:… residual:…` line is preserved for `experiments/plot_metrics.py` back-compat. Use `k_sweep_table:` for cross-K and cross-iter routing-health comparisons; use `k_sweep:` for per-iter gate trajectories. Fast validation logs the same fixed-point certificate fields when `fp_lip_fast_val_every > 0`.
 
 ---
 
@@ -858,7 +994,7 @@ Current default families to check in code before launch:
 - Core dimensions: layers, heads/KV heads, expert count, ranks, sequence length, batch tokens, refinement count, CTP flag, NSA flag.
 - Solver: Parcae init/floor, `deq_bptt_k`, K-jitter set, beta fallback/jitter, Lyapunov/denoising disabled state.
 - Optimizer: Muon/AdamW grouping, LRs, PE-NS backend, momentum warmup, weight decay, gradient clipping, warmdown.
-- Routing/loss stack: router CV, MoS CV, per-token entropy, expert/MoS diversity, entmax blend, logit softcap, routing mass diagnostics.
+- Routing/loss stack: promoted iter145r Dirichlet-UCB router, EMA balance/specialization, no routed sigmoid gate, router CV off by default, MoS CV, per-token entropy, expert/MoS diversity, entmax blend, logit softcap, routing mass diagnostics.
 - Quantization/eval: int6 roundtrip, sliding-window eval, artifact byte accounting.
 
 ### revdeq-architecture-details
@@ -903,10 +1039,10 @@ eps_rev = parcae_reversibility_floor = 0.1
 Router regularizers must see the combined routed mass:
 
 ```text
-p = softmax_or_entmax(allocation_logits) * sigmoid(gate_logits)
+p = simplex(allocation_scores) * sigmoid(gate_logits)
 ```
 
-The principle is simple: if the sigmoid gate suppresses an expert path, load-balance and sparsity losses must see that suppression. Renormalizing shares before the loss hides gate effects and optimizes a different distribution. MoS is exempt because it is intentionally a pure softmax convex combination.
+The principle is simple: if the sigmoid gate suppresses an expert path, load-balance and sparsity losses must see that suppression. Renormalizing shares before the loss hides gate effects and optimizes a different distribution. MoS is exempt because it is intentionally a pure softmax convex combination. If a run explicitly disables the routed sigmoid gate, this reduces to `p = simplex(allocation_scores)` and forces routed expert output to participate; treat that as a controlled ablation, not a silent default change.
 
 Useful audit:
 
@@ -923,9 +1059,17 @@ Hard discrete routing decisions are not RevDEQ-safe in the learned fixed-point m
 Permitted categories:
 
 - dense soft routing;
-- smooth relaxations such as softmax/entmax, Sinkhorn, or Gumbel-softmax when used differentiably;
+- smooth per-token relaxations such as softmax/entmax or Gumbel-softmax when used differentiably;
 - epsilon skips only when the truncation is below bf16 numerical floor and proven not to change reconstruction decisions;
 - discrete logic outside the RevDEQ path or guarded off under RevDEQ.
+
+Sinkhorn/OT-style routers are not permitted for expert assignment in the learned
+map, even when differentiable. They make a token's expert weights depend on the
+other tokens in the batch and on global expert occupancy/capacity. Project
+routing semantics require local token routing: each token's expert weights are a
+function of that token representation and learned router parameters only. Global
+usage pressure belongs in auxiliary losses or slow router-bias feedback, not in
+the forward assignment solver.
 
 Useful audit:
 

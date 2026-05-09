@@ -2,8 +2,8 @@
 
 Item 2 of the Phase 9 cleanup plan: every Hyperparameters field tunable from
 the CLI must round-trip through `_parse_cli_overrides` with the documented
-default. Booleans accept "0"/"1"; tuples are not yet auto-parsed (left for the
-future generator-driven refactor); enums are not used in the current schema.
+default. Booleans accept "0"/"1"; tuple-valued knobs accept either Python tuple
+syntax or comma-separated values; enums are not used in the current schema.
 """
 import os
 import sys
@@ -27,6 +27,12 @@ class TestCliParser(unittest.TestCase):
     def test_int_parsing(self):
         ov = _parse_cli_overrides(["--bigram-vocab-size", "4096"])
         self.assertEqual(ov["bigram_vocab_size"], 4096)
+
+    def test_tuple_parsing(self):
+        ov = _parse_cli_overrides(["--deq-beta-jitter-set", "0.25,0.45,0.65"])
+        self.assertEqual(ov["deq_beta_jitter_set"], (0.25, 0.45, 0.65))
+        ov = _parse_cli_overrides(["--deq-beta-jitter-set", "(0.2, 0.4)"])
+        self.assertEqual(ov["deq_beta_jitter_set"], (0.2, 0.4))
 
     def test_unknown_flag_is_rejected(self):
         with self.assertRaises(SystemExit):

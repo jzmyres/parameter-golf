@@ -168,14 +168,17 @@ equilibrium is a locally exponentially stable attractor.
 \texttt{deq\_backward} & revdeq only & \texttt{deq\_bptt\_k} & 3 \\
 \texttt{deq\_bptt\_k\_jitter} & false & \texttt{deq\_bptt\_k\_jitter\_set} & $(3)$ \\
 \texttt{deq\_k\_jitter} & true & \texttt{deq\_k\_jitter\_set} & $(16,24)$ \\
-\texttt{deq\_k\_eval} & 16 & \texttt{router\_scoring} & linear \\
+\texttt{deq\_k\_eval} & 16 & \texttt{router\_scoring} & dirichlet\_ucb \\
+\texttt{router\_dirichlet\_ucb\_beta} & 0.5 & \texttt{use\_router\_sigmoid\_gate} & false \\
 \texttt{lyapunov\_coef} & 0.0 & \texttt{lyapunov\_gamma} & 0.97 \\
 \texttt{lyapunov\_warmup\_frac} & 0.05 & \texttt{denoising\_coef} & 0.0 \\
 \texttt{denoising\_noise\_std} & 0.01 & \texttt{grad\_clip\_norm} & 1.0 \\
-\texttt{weight\_decay} & 0.01 & \texttt{router\_load\_cv\_coef} & 1.0 \\
-\texttt{mos\_load\_cv\_coef} & 1.0 & \texttt{router\_pertoken\_entropy\_coef} & 1.0 \\
-\texttt{expert\_diversity\_kind} & cosine & \texttt{expert\_output\_diversity\_coef} & 1.0 \\
-\texttt{mos\_output\_diversity\_coef} & 0.0 & \texttt{regularizer\_warmup\_frac} & 0.0 \\
+\texttt{weight\_decay} & 0.015 & \texttt{router\_load\_cv\_coef} & 0.0 \\
+\texttt{router\_ema\_balance\_coef} & 0.15 & \texttt{router\_ema\_specialization\_coef} & 0.1 \\
+\texttt{router\_ema\_alive\_coef} & 0.0 & \texttt{router\_pertoken\_entropy\_coef} & 0.1 \\
+\texttt{mos\_load\_cv\_coef} & 0.15 & \texttt{regularizer\_warmup\_frac} & 0.07 \\
+\texttt{expert\_diversity\_kind} & cosine & \texttt{expert\_output\_diversity\_coef} & 0.15 \\
+\texttt{mos\_output\_diversity\_coef} & 0.0 & & \\
 \texttt{use\_entmax\_routing} & false & \texttt{entmax\_blend\_init\_logit} & 5.0 \\
 \texttt{use\_nsa\_attention} & false & \texttt{use\_smear\_gate} & false \\
 \texttt{muon\_backend\_steps} & 7 & \texttt{use\_polar\_express\_ns} & true \\
@@ -296,6 +299,24 @@ $\sum_e p_e(h)\le 1$.  This lets the model suppress the routed expert bank when
 a token is near equilibrium.  Health metrics renormalize shares within each
 routed component before checking balance; total routed mass is logged
 separately.
+
+\paragraph{Implementation deviates from \S\ref{sec:router}: iter145r promoted
+defaults.} As of the iter145r promotion (2026-05-08, see
+\texttt{experiments/hypotheses.md}), the implementation defaults run a
+Dirichlet-UCB scorer with the routed sigmoid gate disabled.  Per token,
+$\alpha = \softplus(\ell(h)) + 1$ defines a Dirichlet posterior with mean
+$\mu = \alpha / \sum \alpha$ and per-expert standard deviation
+$\sigma_e = \sqrt{\alpha_e(\sum\alpha - \alpha_e) / ((\sum\alpha)^2(\sum\alpha+1))}$;
+routing weights are $p(h) = \mathrm{acq} / \sum \mathrm{acq}$ where
+$\mathrm{acq} = \mu + \beta \sigma$ and $\beta=0.5$ anneals to zero over
+training.  With \texttt{use\_router\_sigmoid\_gate=False} the
+$\sum_e p_e(h)\le 1$ suppress-bank capability is also off — total routed mass
+is exactly $1$ at every token.  The CV regularizer
+(\texttt{router\_load\_cv\_coef}) is replaced by EMA-anchored balance and
+specialization terms with a straight-through current-routing anchor (see the
+loss section).  A full paper-side rewrite of this subsection is queued for
+the iter146 commit; until then, treat \texttt{train\_gpt.py::Hyperparameters}
+as authoritative.
 
 The block uses one pooled router over $2R$ routed outputs, where $S$ is the
 number of shared experts and $R=E-S$.  The first $R$ entries route attention
@@ -558,21 +579,49 @@ i.e. softmax or entmax routing probability multiplied by the learned sigmoid
 gate.  CV penalties use unbounded quadratic pressure (no target threshold), so
 the term keeps pushing $\operatorname{CV}\to0$ even when balance is already
 acceptable; this replaces the earlier hinge form $[\operatorname{CV}-\tau]_+^2$
-which went silent below a fixed target.  After the iter~142b promotion
-(2026-05-06 user override), all router-side coefficients run at full strength
-from step~0 (\texttt{regularizer\_warmup\_frac=0.0}); previous variants annealed
-entropy and diversity coefficients linearly over the first
-\texttt{regularizer\_warmup\_frac} of training.  Current defaults are
-\[
-\lambda_{\rm rcv}=1.0,\quad
-\lambda_{\rm ent}=1.0,\quad
-\lambda_{\rm mcv}=1.0,\quad
-\lambda_{\rm div}=1.0,\quad
-\lambda_{\rm mosdiv}=0.0.
-\]
-The default expert diversity is scale-invariant cosine diversity; the Frobenius
+which went silent below a fixed target.  The default expert diversity is scale-invariant cosine diversity; the Frobenius
 variant remains a controlled ablation that bundles direction and norm pressure
 into one term.
+
+\paragraph{Implementation deviates from \S\ref{sec:experts} loss stack:
+iter145r promoted defaults.} The iter145r promotion (2026-05-08) moves the
+balance pressure off CV and onto an EMA-anchored stack.  Let
+$\bar p_e$ be the per-router persistent EMA of expert usage (decay $0.99$,
+detached, registered as a buffer so it survives checkpoint resume).  Define
+the straight-through anchor $\tilde m = \mathrm{stopgrad}(\bar p) + (m - \mathrm{stopgrad}(m))$
+which carries the forward value of the EMA but routes gradients through the
+current step's routing mass $m$.  The promoted router term is
+\[
+\begin{aligned}
+\mathcal{L}_{\rm router}^{\rm iter145r}
+  &= \lambda_{\rm rcv}\sum_r \operatorname{CV}(m_r)^2
+     + \lambda_{\rm ent}\sum_r H_{\rm pertoken}(m_r) \\
+  &\quad + \lambda_{\rm bal}\sum_r \operatorname{KL}(\tilde m_r\,\|\,U)
+     + \lambda_{\rm alive}\sum_r (\bar d_r)\!\cdot\!(d_r)^2 \\
+  &\quad - \lambda_{\rm spec}\sum_r \operatorname{KL}(p^{\rm token}_r\,\|\,\bar p_r) \\
+  &\quad + \lambda_{\rm mcv}\operatorname{CV}(m_{\rm MoS})^2
+     + \lambda_{\rm div}\mathcal{D}_{\rm experts}
+     + \lambda_{\rm mosdiv}\mathcal{D}_{\rm MoS},
+\end{aligned}
+\]
+where $U$ is the within-component uniform target,
+$d_r = (\tau \cdot U - m_r)_+$ is the per-component deficit hinge with
+$\tau=$\texttt{min\_share\_frac}, and $p^{\rm token}_r$ is the per-token share.
+The minus sign on the specialization term reflects KL maximization: minimizing
+$-\lambda_{\rm spec}\,\mathrm{KL}$ pushes per-token routing AWAY from the
+historical mean, bounded by $\log(E)$ since $\bar p$ is normalized and clamped.
+Promoted coefficients: $\lambda_{\rm rcv}=0.0$ (CV off by default; remains
+available),
+$\lambda_{\rm bal}=0.15$, $\lambda_{\rm spec}=0.1$, $\lambda_{\rm alive}=0.0$,
+$\lambda_{\rm ent}=0.1$, $\lambda_{\rm mcv}=0.15$, $\lambda_{\rm div}=0.15$,
+$\lambda_{\rm mosdiv}=0.0$, with all coefficients ramped linearly over the
+first \texttt{regularizer\_warmup\_frac=0.07} of training.  The
+\texttt{use\_router\_sigmoid\_gate=False} default also means $m_r$ is the bare
+softmax/Dirichlet-UCB output (no $\sigma(g)$ multiplier).  A full paper rewrite
+of this subsection is queued for the iter146 commit; until then,
+\texttt{train\_gpt.py::Hyperparameters} and the
+\texttt{ROUTER\_EMA\_LOSS\_TERMS} registry are authoritative on the EMA-family
+sign convention.
 
 \section{Jacobian and Denoising Regularization}
 \label{sec:regularization}\label{sec:reg}

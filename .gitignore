@@ -23,6 +23,7 @@ records_baseline/
 final_model.*
 experiments/training_logs/
 experiments/weights/
+experiments/checkpoints/
 experiments/*.png
 experiments/__pycache__/
 # Local experiment artifacts (never commit)

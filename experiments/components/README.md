@@ -17,6 +17,7 @@ a focused single-purpose module that:
 | Component | Status | Integration step | Tests |
 |---|---|---|---|
 | `fused_routed_down.py` | active optional path | imported by `train_gpt.py` when `use_unified_routed_down=True` | component smoke test |
+| `chained_routing.py` | active optional path (design: [`../iter103_chained_routing_plan.md`](../iter103_chained_routing_plan.md)) | selected by `--chained-stages-preset=<preset>` | `experiments/test_chained_routing.py` |
 
 ## Archived Prototypes
 

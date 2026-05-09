@@ -27,9 +27,12 @@ designed to test it with a single controlled variable change.
 Use this section to orient quickly; detailed evidence remains in the sections below.
 
 - **Config source:** `train_gpt.py::Hyperparameters`; promoted baseline and active comparisons are documented in the recent-result entries below.
-- **Current focus:** iter-142-family routing/diversity regularization, TBPTT depth, and IFT-adjoint followups.
-- **Active proposed runs:** iter 143 (`deq_bptt_k=4`), iter 144 (IFT adjoint), iter 142b (cosine + CV + sparsity), and iter 142c (Frobenius-alone counterfactual).
-- **Deferred heavy items:** H91 phased TTT, H94 GPTQ+LQER, H95 tokenizer/CaseOps, H96 compression, iter 118b RevDEQ-safe sparsity, and iter 120 fused sparse attention.
+- **Promoted baseline 2026-05-06:** iter 142b (cosine + decomposed CV/entropy/MoS-CV stack at coef=1.0). Defaults updated in `train_gpt.py`. val_bpb 1.5009 full / 1.5063 K=24-best at 1000 steps. Note: this is +0.008 vs the earlier c94899a-era anchor (1.4930) which ran on the pre-iter-142-refactor codebase with the legacy nested gram penalty — not a comparable optimisation path.
+- **Loss-stack form change (user directive 2026-05-06):** all reg coefs unified at 1.0 (`router_load_cv_coef`, `mos_load_cv_coef`, `router_pertoken_entropy_coef`, `expert_output_diversity_coef`); `regularizer_warmup_frac=0`; CV loss switched from `relu(cv − cv_target)²` to plain `cv²` (continuous balance pressure, no threshold dead zone); `router_entropy_coef` renamed to `router_pertoken_entropy_coef` to make the per-token semantics explicit; `cv_target` / `mos_cv_target` knobs removed. 20-step smoke (`validated_clean`) confirms end-to-end functionality.
+- **Current focus:** TBPTT depth (iter 143), chained-routing component (iter 103 / H77, plan written, implementation gated on user go-ahead), and IFT-adjoint follow-ups.
+- **Active proposed runs (queue):** iter 143 (`deq_bptt_k=4`); iter 103 / H77 chained N-stage routing (plan only — see `experiments/iter103_chained_routing_plan.md`); iter 144 (IFT adjoint, gated on iter 143 outcome).
+- **Deferred heavy items:** H91 phased TTT, H94 GPTQ+LQER, H95 tokenizer/CaseOps, H96 compression, iter 118b RevDEQ-safe sparsity, iter 120 fused sparse attention. Conditional priority-4: iter 135/136 entmax tweaks, iter 142 deep K-jitter `(32,48)`.
+- **Closed in 2026-05-06 session:** iter 142b PROMOTED; iter 142c Frobenius-only NOT-PROMOTED (Frobenius-alone path closed); iter 142d (2× coefs) deleted (user's uniform-1.0 directive moved defaults past 142d's proposal); legacy `use_chained_routing` flag superseded by iter 103 plan's `chained_stages_preset`.
 - **Logging invariant:** every new iter entry must include the complete evidence packet or explicit Caveats for missing pieces; see `EXPERIENCE.md#hypothesis-log-detail`.
 
 ## Durable Conclusions Index
@@ -441,7 +444,7 @@ build on this verified refactor commit.
 
 ---
 
-### iter 143 — K_bwd 3 → 4 (TBPTT depth bump under iter-142-refactor baseline)
+### iter 143 — K_bwd 3 → 4 (TBPTT depth bump under iter-142b-promoted + uniform-1.0 baseline)
 
 **Claim.** Bumping TBPTT depth from K_bwd=3 to K_bwd=4 captures one more
 Neumann-series term in the implicit gradient `dz*/dx0` and the implicit
@@ -452,23 +455,28 @@ of `f_theta` forward + autograd.grad call).
 
 **Motivation.** Iter 95 promoted K_bwd 2→3 based on `grad_norm = 0.07`
 (well below `grad_clip=1.0`) — clear gradient-magnitude headroom. Under
-the iter-142-refactor regularization regime the same headroom analysis
-applies; if grad_norm has stayed comparably low, K_bwd=4 is the natural
-next step. bf16 budget for the gradient path: `(1/Ā)^4 × ε_bf16 ≈
+the new uniform-coef stack (iter 142b promoted + reg coefs uniform at
+1.0 + `cv²` form, 2026-05-06) the 20-step smoke confirmed grad_norm
+stays in the 0.3 – 1.0 range steady-state — same headroom argument
+applies. bf16 budget for the gradient path: `(1/Ā)^4 × ε_bf16 ≈
 1.43^4 × 7e-3 ≈ 0.03` worst-case relative drift, ~3 orders below the
-0.1 ceiling and only marginally tighter than K_bwd=3 (0.02). Smoke at
-default config (see `EXPERIENCE.md#revdeq-architecture-details`, post-iter 142-batch) reports
-`tbptt_recon_loss ≈ 6e-7` at K_bwd=3 — comfortable headroom for the
-bump.
+0.1 ceiling and only marginally tighter than K_bwd=3 (0.02).
+Smoke `tbptt_recon` 4.1e-2 → 7.7e-3 over 20 steps — comfortable
+headroom for the bump.
 
-**Test plan.** 100-step controlled comparison vs iter-142-refactor
-baseline (5026978). Single CLI override `--deq-bptt-k=4`. All other
-hyperparameters at default. Diagnostics: `tbptt_recon_loss` should
-remain at fp-precision floor; per-step `step_avg` should rise by ≤+33%
-(empirical measurement); val_bpb @ s100 expected to match or beat
-baseline (±0.05 noise band).
+**Test plan.** 1000-step controlled comparison (per user directive
+2026-05-06: every queue iter runs the full 1000-step budget) vs the
+iter-142b-promoted + uniform-1.0 + `cv²` baseline. Single CLI
+override `--deq-bptt-k=4`. All other hyperparameters at the new
+defaults. Diagnostics: `tbptt_recon_loss` should remain at
+fp-precision floor; per-step `step_avg` should rise by ≤+33%
+(empirical measurement); val_bpb expected to match or beat the
+new-baseline anchor at K=24 best.
 
-**Status.** PROPOSED.
+**Status.** READY-TO-LAUNCH (was launched and stopped 2026-05-06 to
+land the loss-stack changes; relaunched after the 20-step smoke
+validated `validated_clean`; awaiting user go-ahead for the full
+1000-step run).
 
 **Rollback.** If `tbptt_recon_loss > 1e-3` at any point, or step_avg
 penalty > +50%, revert to K_bwd=3.
@@ -523,84 +531,163 @@ log per-step adjoint iter count; if average >7, deprioritize.
 
 ---
 
-### iter 142b — decomposed-stack canonical: cosine + CV + sparsity
+### iter 142b — decomposed-stack canonical: cosine + CV + sparsity (PROMOTED, user override 2026-05-06)
 
-**Claim.** The iter-142-refactor canonical stack — cosine diversity at
-its target coef, plus the explicit decomposed regularisers (router CV,
-router entropy / sparsity, MoS CV) — is the principled default for
-RevDEQ + dense MoE. Tests separation of concerns: cosine handles
-direction, CV handles usage, entropy handles per-token specialization,
-optimizer handles norm. Each regulariser does one job, none compete.
+**Claim.** The iter-142-refactor canonical stack — cosine diversity,
+plus the explicit decomposed regularisers (router CV, router pertoken
+entropy, MoS CV) — is the principled default for RevDEQ + dense MoE.
+Tests separation of concerns: cosine handles direction, CV handles
+usage, entropy handles per-token specialization, optimizer handles
+norm. Each regulariser does one job, none compete.
 
-**Setup.** 50 iterations × 2× L40S DDP. `regularizer_warmup_frac=0`
-(full strength from s1 — short-run fairness, since the 0.10 default
-would still leave 5 ramp steps inside a 50-step budget). All other
-regularisers at their `train_gpt.py::Hyperparameters` defaults:
-- `--expert-diversity-kind=cosine --expert-output-diversity-coef=1.0`
-- `router_load_cv_coef=0.5` (default)
-- `router_entropy_coef=0.00125` (default)
-- `mos_load_cv_coef=0.25` (default)
+**Setup.** 1000 iterations × 2× L40S DDP, ~6.5 h, 23.46 s/step.
+`--expert-diversity-kind=cosine --expert-output-diversity-coef=1.0
+--regularizer-warmup-frac=0 --val-loss-every=1000000
+--final-full-validation=1`. Other regularisers at the
+pre-2026-05-06 defaults: `router_load_cv_coef=0.5`,
+`mos_load_cv_coef=0.25`, `router_entropy_coef=0.00125`,
+`cv_target=0.20`, `mos_cv_target=0.20`,
+loss form `relu(cv − cv_target)²`.
 
-**Pair.** Compare against iter 142c (Frobenius alone with CV / entropy
-/ MoS-CV disabled) at matched compute. Expected if the principled-stack
-hypothesis holds: 142b wins on val_bpb, 142c's routing balance degrades
-(no CV → high attn_cv / mlp_cv).
+**Result (full validation).** val_bpb 1.5009 (full), 1.5112 post-int6,
+artifact 7.65 MB. K=24 best at 1.5063 (well-converged from K≥16);
+acyclicity primes 17/37/113 within ±0.001 of neighbours. Routing
+trajectory: attn_cv 0.03 → 2.68 (peak at s100) → 0.72 (final);
+pertoken_entropy held near max (~3.05); shared_gate trained to 0.52;
+mlp side stayed balanced (mlp_cv 0.18). Diagnostic gate flagged
+`router_collapse` (attn_min_share 0.0135 < 0.04 fair-share threshold).
+Status: `validated_with_tech_debt`.
 
-**Test plan.** Capture log to
-`experiments/training_logs/iter142b_cosine_with_cv_sparsity.log`. Read
-val_bpb @ s50, NTP descent, attn_cv / mlp_cv, pertoken_entropy,
-deq_fp_travel, step_avg, peak_vram. Build paired comparison vs 142c.
+**Pair.** vs iter 142c (Frobenius-only): 142b wins by +0.013 BPB at
+K=24; vs c94899a-era anchor (1.4930): 142b is +0.008 worse but the
+anchor ran on the pre-iter-142-refactor codebase (legacy nested gram
+penalty active at attn_ortho 0.141, vs 142b's 0.026) — not a comparable
+optimisation path.
 
-**Status.** PROPOSED. Run command:
-```
-torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-    --iterations=50 \
-    --expert-diversity-kind=cosine --expert-output-diversity-coef=1.0 \
-    --regularizer-warmup-frac=0 \
-    --val-loss-every=1000000
-```
+**Status.** PROMOTED (user override 2026-05-06). Defaults updated in
+`train_gpt.py::Hyperparameters`:
+- `expert_output_diversity_coef`: `0.1 → 1.0` (class default + ctor default)
+- `regularizer_warmup_frac`: `0.10 → 0.0` (class default + ctor default)
+
+**Follow-up directives applied 2026-05-06 (further loss-stack changes
+on top of 142b's promotion):** all reg coefs unified at 1.0
+(`router_load_cv_coef 0.5 → 1.0`, `mos_load_cv_coef 0.25 → 1.0`,
+`router_entropy_coef 0.00125 → 1.0`); `router_entropy_coef` renamed to
+`router_pertoken_entropy_coef`; CV loss switched from
+`relu(cv − cv_target)²` to plain `cv²` (continuous balance pressure);
+`cv_target` / `mos_cv_target` knobs removed. 20-step smoke validated
+the new stack (`validated_clean`, val_bpb 2.97, no NaN, all five reg
+terms emit at coef=1.0). Next 1000-step run on this stack is iter 143.
 
 ---
 
-### iter 142c — bundled-stack alternative: Frobenius alone
+### iter 142c — bundled-stack alternative: Frobenius alone (NOT-PROMOTED 2026-05-06)
 
 **Claim.** Frobenius diversity (`‖YYᵀ/D − I/E‖²_F`, E²-normalised) by
 itself can substitute for the decomposed stack — it bundles direction,
-norm-targeting, and indirect usage onto a single penalty. Tests the
-counterfactual to iter 142b: if Frobenius alone matches or beats
-decomposed-cosine + CV + sparsity, the bundled approach wins on
-simplicity. If it loses (especially on routing balance), the
-"non-stationary gradient pressure + CV-competition" critique of
-Frobenius is empirically supported.
+norm-targeting, and indirect usage onto a single penalty.
 
-**Setup.** 50 iterations × 2× L40S DDP. `regularizer_warmup_frac=0`.
-`--expert-diversity-kind=frobenius --expert-output-diversity-coef=1.0`.
-**All decomposed regularisers explicitly disabled**:
-`--router-load-cv-coef=0 --router-entropy-coef=0 --mos-load-cv-coef=0`.
-Frobenius's E²-normalised loss is the only routing-shape signal.
+**Setup.** 1000 iterations × 2× L40S DDP, ~6.5 h, 23.45 s/step.
+`--expert-diversity-kind=frobenius --expert-output-diversity-coef=1.0
+--router-load-cv-coef=0 --router-entropy-coef=0 --mos-load-cv-coef=0
+--regularizer-warmup-frac=0 --val-loss-every=1000000
+--final-full-validation=1`. Frobenius is the only routing-shape signal.
 
-**Pair.** Direct counterfactual to iter 142b. Same iter count, same
-hardware, same warmup-frac=0 fairness fix.
+**Result (full validation).** val_bpb 1.5143 (full), 1.5245 post-int6,
+artifact 7.61 MB. K=24 best at 1.5233; acyclicity prime K=113 shows a
++0.004 bump from K=64 (small acyclicity artifact, not seen in 142b).
+Routing trajectory: attn_cv ≤ 1.70 throughout (peaked at s100, settled
+at 0.65); MLP side worse than 142b (mlp_cv 0.20 vs 0.18, floor 0.047 vs
+0.044); pertoken_entropy 2.288 at K=128 (lower utilization than 142b's
+2.706). Diagnostic gate flagged `router_collapse + expert_collapse ×2`.
 
-**Test plan.** Log to
-`experiments/training_logs/iter142c_frobenius_alone.log`. Same metrics
-as 142b. Watch for: (a) attn_cv / mlp_cv blow-up (no CV regulariser);
-(b) per-token entropy collapse (Frobenius's norm-targeting often pushes
-heavy specialization, which without an entropy regulariser may go
-further); (c) NTP descent rate. The acceptable outcome is
-"Frobenius-alone wins on val_bpb at similar routing health"; the
-expected outcome (per the principled-stack argument) is
-"Frobenius-alone matches NTP but degrades routing balance".
+**Pair vs iter 142b.** 142c is +0.013 BPB worse at K=24 best, +0.022
+worse at K=128. attn_cv comparable (0.65 vs 0.72) but pool entropy
+lower → utilization-degraded. The "non-stationary gradient pressure +
+CV-competition" critique of Frobenius is empirically supported.
 
-**Status.** PROPOSED. Run command:
-```
-torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-    --iterations=50 \
-    --expert-diversity-kind=frobenius --expert-output-diversity-coef=1.0 \
-    --router-load-cv-coef=0 --router-entropy-coef=0 --mos-load-cv-coef=0 \
-    --regularizer-warmup-frac=0 \
-    --val-loss-every=1000000
-```
+**Status.** NOT-PROMOTED. Frobenius-alone path **closed** for the
+canonical loss design; the decomposed-cosine stack (iter 142b) wins
+on both BPB and routing health. Frobenius remains an optional
+ablation path via `--expert-diversity-kind=frobenius`.
+
+---
+
+### iter 142d — 2× iter 142b coefs (deleted 2026-05-06)
+
+**Claim (proposed).** Doubling all reg coefs vs 142b would close the
++0.008 gap to the c94899a anchor while maintaining the decomposed
+canonical stack.
+
+**Status.** **Deleted before launch.** The user's 2026-05-06 "uniform
+1.0" directive moved the live defaults to coefs ≥ what 142d originally
+proposed (and bumped `router_pertoken_entropy_coef` ~800× higher than
+its prior value), so iter 142d's specific magnitudes no longer add new
+information. Subsumed by iter 143 on the new defaults.
+
+---
+
+### 20-step smoke (2026-05-06) — validate uniform reg-coef + cv² stack
+
+**Claim.** The user's directive package — uniform reg coefs at 1.0,
+`cv²` loss form, renamed `router_pertoken_entropy_*`,
+`regularizer_warmup_frac=0` — is end-to-end functional and produces
+healthy training behaviour.
+
+**Setup.** 20 iterations × 2× L40S, default `deq_bptt_k=3`. No CLI
+overrides — exercises the new defaults directly.
+
+**Result.** val_bpb 2.9714 (post-int6 same; quant gap 0.005). K=8 best
+at 2.9689; well-converged at K≥16. Artifact 7.40 MB; total 7.76 MB
+(48.5% of 16 MB budget). Step time 24.0 s/step. Status:
+`validated_clean` (no NaN, no `router_collapse` gate failure).
+ntp_loss 7.01 → 4.99 in 20 steps. pertoken_entropy 3.36 → 3.05
+(entropy coef visibly active). attn_cv finished at 0.244 (mild
+differentiation, no collapse). Per-stage diagnostic matrix and
+K-sweep table in `experiments/training_logs/smoke_20step_2xL40S.log`.
+
+**Status.** Confirms readiness for full 1000-step iter 143 on the new
+stack. Smoke is a process check, not a research claim — no promotion
+gate involved.
+
+---
+
+### iter 103 / H77 — chained N-stage routing (PLAN ONLY, 2026-05-06)
+
+**Status.** PROPOSED — implementation plan written but **not yet
+implemented**. Plan lives at
+`experiments/iter103_chained_routing_plan.md`. Prior in-session
+implementation attempt was rolled back per user's "plan only"
+directive; all 125 / 125 existing tests still pass.
+
+**Key plan decisions (per user spec 2026-05-06):**
+- Live as drop-in component at
+  `experiments/components/chained_routing.py` (default OFF).
+- Five preset variants: `unified` (strict-gen recovery target),
+  `attn_first_2stage`, `mlp_first_2stage`, `split_2stage`,
+  `split_4stage`.
+- N-stage residual chain: `stage_in_0 = z + x_0`,
+  `stage_in_{k+1} = stage_in_k + Δ_k`, `Δ_total = Σ_k Δ_k`. Parcae x_0
+  injection unchanged (preserves RevDEQ contract).
+- Per-stage param independence (no shared weights across stages).
+- Forward-peak activation halves with N=2 typed stages at iso-expert-
+  count (sequential buffer release); backward unchanged because
+  autograd retains all stages' tensors.
+- 8 surgical sites in `train_gpt.py` (Hyperparameters,
+  `_CLI_TUNABLE_KNOBS`, `Block.__init__` + forward dispatch,
+  `GPT.__init__`, main wiring, deprecation guard for
+  `use_chained_routing`).
+
+**Pre-registered hypothesis.** Chained typed-stage routing
+(attn_first_2stage) at iso-expert-count vs unified:
+- Improves val_bpb (composition-axis claim) **OR** matches val_bpb at
+  reduced forward-VRAM (memory-scaling claim). Either is a win.
+- Routing health per-stage is a new diagnostic axis; first version
+  aggregates across stages, per-stage breakdown deferred.
+
+**Gating.** Awaiting user go-ahead before implementation; iter 143
+runs first to land the new uniform-coef stack as the comparison
+baseline.
 
 ## Archive - Historical Claims and Legacy Queue
 
