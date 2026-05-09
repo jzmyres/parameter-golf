@@ -26,18 +26,23 @@ class TestRouterMatmulParity(unittest.TestCase):
     def test_l2_matmul_matches_broadcast_fp32(self) -> None:
         torch.manual_seed(0)
         D, E, B, T = 32, 4, 2, 5
+        # Test whatever the iter146 default is for `use_router_sigmoid_gate`
+        # (currently OFF — `gate = 1.0`, mass = simplex(allocation)). The
+        # reference branches on the actual flag so the parity holds whether
+        # the default flips back to ON in a future iter.
         r = SoftDenseRouter(dim=D, num_experts=E, scoring="l2")
         r.train(False)
         x = torch.randn(B, T, D)
-        # Match the router's internal pre-processing (no pre_norm, fp32 path).
         x_n = x  # we'll pass pre_normed=True so no internal RMS norm
         p = r(x_n, pre_normed=True)
-        # Re-derive the expected logits via broadcast on prototypes (unbounded under Lyapunov).
         with torch.no_grad():
             c = r.prototypes.float()
         ref_route = _broadcast_l2_logits(x_n.float(), c, r.l2_gamma)
         ref_route = ref_route + r.expert_bias.float()
-        gate_act = torch.sigmoid(r.router_gate(x_n).float())
+        if r.use_router_sigmoid_gate:
+            gate_act = torch.sigmoid(r.router_gate(x_n).float())
+        else:
+            gate_act = torch.ones_like(ref_route)
         ref_p = torch.softmax(ref_route, dim=-1) * gate_act
         self.assertTrue(
             torch.allclose(p, ref_p.to(p.dtype), atol=1e-3, rtol=1e-3),

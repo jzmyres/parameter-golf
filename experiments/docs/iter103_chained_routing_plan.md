@@ -323,7 +323,7 @@ change**, not a behavior change — all tensors already exist per-router.
 | 7 | CPU integration smoke (2-iter run with each preset). | Catch DDP-free correctness issues. |
 | 8 | GPU smoke (20-iter run with `attn_first_2stage`). | Verify GPU + RevDEQ + autocast end-to-end. |
 | 9 | `experiments/components/README.md` inventory + integration cookbook update. | Doc closing the loop. |
-| 10 | `experiments/hypotheses.md` queue: add iter 103 row with run plan. | Research ledger sync (per CLAUDE.md standing directive). |
+| 10 | `experiments/docs/hypotheses.md` queue: add iter 103 row with run plan. | Research ledger sync (per CLAUDE.md standing directive). |
 
 ---
 

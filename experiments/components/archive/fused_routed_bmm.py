@@ -5,7 +5,7 @@ dispatch path when `use_unified_routed_bmm=True`. Replaces the eager
 sequence (materialize routing weights, per-expert linear, weighted sum)
 with a single fused operation: `out[t] = Σ_e w[t,e] · expert_e(x[t])`.
 
-# Hypothesis (from experiments/hypotheses.md H88 v2 Phase A)
+# Hypothesis (from experiments/docs/hypotheses.md H88 v2 Phase A)
 
 A Triton kernel `fused_routed_bmm` fuses (a) the routing transform
 (softmax of allocation logits + sigmoid of gate logits) with (b) the

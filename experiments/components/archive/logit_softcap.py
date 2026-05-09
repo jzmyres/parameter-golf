@@ -4,7 +4,7 @@ Drop-in for the LM head's final logits in `train_gpt.py::MoSLowRankOutputHead.fo
 (or wherever final logits are produced). Bounds extreme logit values via tanh
 to limit gradient spikes and bf16 numerical issues.
 
-# Hypothesis (from experiments/hypotheses.md H93)
+# Hypothesis (from experiments/docs/hypotheses.md H93)
 
 Records use `logits = softcap * tanh(logits / softcap)` with softcap=30 on
 every submission since 2026-04+. While our grad_norm history is healthy (0.05-

@@ -12,7 +12,7 @@ Verified against records SOTA (2026-04-27, val_bpb=1.0611):
 - L2222-2300: `gptq_mixed_quantize` driver — algorithmic match (top-K by
   residual norm, pack via int4 sym or int4-asym groupwise)
 
-# Hypothesis (from experiments/hypotheses.md H94)
+# Hypothesis (from experiments/docs/hypotheses.md H94)
 
 Our current per-row int6 quantization uses naive scale-zero-point with no
 Hessian-aware optimization. Records use:

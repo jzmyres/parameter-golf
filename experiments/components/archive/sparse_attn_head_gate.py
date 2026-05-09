@@ -17,7 +17,7 @@ GatedAttention (arxiv:2505.06708 G1). The "sparsity" is in the INPUT WIDTH (12
 of D), NOT in any top-K selection over heads. Each head still gets a per-token
 sigmoid gate; no head is hard-zeroed. Calling it "sparse" is records' terminology.
 
-# Hypothesis (from experiments/hypotheses.md H98)
+# Hypothesis (from experiments/docs/hypotheses.md H98)
 
 Records use:
 

@@ -9,7 +9,7 @@ Verified against records SOTA (2026-04-27, val_bpb=1.0611):
 L1242–1338. The corrected implementation here is BIT-EQUIVALENT to that file's
 `_forward_hidden` SmearGate path.
 
-# Hypothesis (from experiments/hypotheses.md H99)
+# Hypothesis (from experiments/docs/hypotheses.md H99)
 
 Records' SmearGate adds an INPUT-DEPENDENT forward-1 position smear:
 

@@ -15,7 +15,15 @@ class TestRouterHealthLoss(unittest.TestCase):
 
     def setUp(self) -> None:
         torch.manual_seed(0)
-        self.router = SoftDenseRouter(dim=4, num_experts=self.E, min_share_frac=0.6)
+        # `use_router_sigmoid_gate=True` is required because
+        # `test_uniform_submass_is_healthy` mutates `router_gate.bias` to
+        # exercise the sigmoid(0)=0.5 sub-mass path. Iter146 default is
+        # gate-OFF; without this override the gate is forced to 1.0 and
+        # the test's mass assertions become wrong.
+        self.router = SoftDenseRouter(
+            dim=4, num_experts=self.E, min_share_frac=0.6,
+            use_router_sigmoid_gate=True,
+        )
         self.router.train()
 
     def test_cv_squared_penalizes_collapse(self) -> None:

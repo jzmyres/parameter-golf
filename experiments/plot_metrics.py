@@ -18,6 +18,19 @@ import sys
 import math
 from pathlib import Path
 
+# Mirror of `train_gpt.ROUTER_DIRICHLET_DIAG_TERMS`. Local-only to keep
+# the parser dependency-free (importing train_gpt would pull torch).
+# `tests/test_training_contracts.py::test_router_dirichlet_diag_registry_in_sync`
+# enforces that this stays equal to the canonical tuple.
+ROUTER_DIRICHLET_DIAG_FIELDS: tuple[str, ...] = (
+    "router_dir_strength_mean",
+    "router_dir_uncertainty_mass",
+    "router_dir_sigma_mean",
+    "router_dir_evidence_mean",
+    "router_dir_mu_entropy_norm",
+    "router_ucb_beta_current",  # last term sourced from `_dirichlet_ucb_beta`
+)
+
 # Consistent colors: blue for Baseline, orange for Current
 COLOR_BASELINE = "#1f77b4"  # matplotlib default blue
 COLOR_CURRENT = "#ff7f0e"   # matplotlib default orange
@@ -98,6 +111,7 @@ def parse_log(logpath: str) -> dict:
         # Component-level routing metrics (preferred for component-level MoE plotting).
         **{f"{p}_{s}": [] for p in ("attn", "mlp") for s in ("usage", "entropy", "cv", "sparsity")},
         **{f"{p}_ortho": [] for p in ("attn", "mlp")},
+        **{f"{p}": [] for p in ROUTER_DIRICHLET_DIAG_FIELDS},
         # Per-group: usage (list of lists), entropy, cv
         **{f"{p}_{s}": [] for p in ("mos_ctp", "mos_ntp") for s in ("usage", "entropy", "cv")},
         # Block-level routing metrics (preferred for block-level MoE plotting).
@@ -112,6 +126,7 @@ def parse_log(logpath: str) -> dict:
         "block_usage_train": [], "block_entropy_train": [], "block_cv_train": [],
         **{f"{p}_{s}_train": [] for p in ("attn", "mlp") for s in ("usage", "entropy", "cv", "sparsity")},
         **{f"{p}_ortho_train": [] for p in ("attn", "mlp")},
+        **{f"{p}_train": [] for p in ROUTER_DIRICHLET_DIAG_FIELDS},
         "expert_ortho_train": [],
         "block_ortho_train": [],
         "mos_ctp_ortho_train": [], "mos_ntp_ortho_train": [],
@@ -119,12 +134,30 @@ def parse_log(logpath: str) -> dict:
         # Final post-quant scoring metric (what the submission is scored on)
         "final_postquant_val_loss": None,
         "final_postquant_val_bpb": None,
+        "k_sweep": [],
+        "k_sweep_table": [],
         }
 
     # NOTE: logs may accidentally contain multiple runs concatenated together (e.g. reused run_id).
     # Plotting must be run-session aware; keep only the most recent run.
     data = _new_data()
     last_step_seen: int | None = None
+    k_sweep_table_header: list[str] = []
+
+    def _parse_kdiag_token(tok: str):
+        if tok == "N/A":
+            return math.nan
+        try:
+            if tok.lstrip("+-").isdigit():
+                return int(tok)
+            return float(tok)
+        except ValueError:
+            # Malformed cell (truncated log, partial flush, etc.) —
+            # surface as NaN with a stderr warning so downstream code
+            # never receives a string in a numeric column.
+            print(f"plot_metrics WARN: malformed k_sweep_table cell {tok!r}",
+                  file=sys.stderr)
+            return math.nan
 
     for line in lines:
         m = re.search(r"^run_id:([\w\-.]+)", line)
@@ -148,8 +181,37 @@ def parse_log(logpath: str) -> dict:
             if data["train_steps"] or data["val_steps"] or data.get("final_postquant_val_bpb") is not None:
                 data = _new_data()
                 last_step_seen = None
+                k_sweep_table_header = []
             if data["train_batch_tokens"] is None:
                 data["train_batch_tokens"] = int(m.group(1))
+
+        m = re.search(r"^k_sweep:k=(\d+)\s+(.*)$", line)
+        if m:
+            row: dict[str, float | int] = {"K": int(m.group(1))}
+            for key in (
+                "val_bpb",
+                "iter_conv_rel",
+                "residual",
+                *ROUTER_DIRICHLET_DIAG_FIELDS,
+                "lip_ub",
+                "fp_bound",
+            ):
+                m_key = re.search(rf"{key}:{_FLOAT}", m.group(2))
+                if m_key:
+                    row[key] = float(m_key.group(1))
+            data["k_sweep"].append(row)
+
+        m = re.search(r"^k_sweep_table:\s*(.*)$", line)
+        if m:
+            cells = m.group(1).split()
+            if cells and cells[0] == "K":
+                k_sweep_table_header = cells
+            elif k_sweep_table_header and len(cells) >= len(k_sweep_table_header):
+                row = {
+                    name: _parse_kdiag_token(tok)
+                    for name, tok in zip(k_sweep_table_header, cells)
+                }
+                data["k_sweep_table"].append(row)
 
         # Training steps
         m = re.search(rf"^step:(\d+)/\d+ train_loss:{_FLOAT}.*train_time:{_FLOAT}ms step_avg:{_FLOAT}ms", line)
@@ -219,6 +281,8 @@ def parse_log(logpath: str) -> dict:
                 ("mlp_sparsity_train", rf"mlp_sparsity:{_FLOAT}"),
                 ("mos_ctp_ortho_train", rf"mos_ctp_ortho:{_FLOAT}"),
                 ("mos_ntp_ortho_train", rf"mos_ntp_ortho:{_FLOAT}"),
+                *[(f"{name}_train", rf"{name}:{_FLOAT}")
+                  for name in ROUTER_DIRICHLET_DIAG_FIELDS],
             ]:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else math.nan)
@@ -274,6 +338,7 @@ def parse_log(logpath: str) -> dict:
                 ("expert_ortho", rf"expert_ortho:{_FLOAT}"),
                 ("attn_ortho", rf"attn_ortho:{_FLOAT}"),
                 ("mlp_ortho", rf"mlp_ortho:{_FLOAT}"),
+                *[(name, rf"{name}:{_FLOAT}") for name in ROUTER_DIRICHLET_DIAG_FIELDS],
             ]:
                 m2 = re.search(pat, line)
                 data[key].append(float(m2.group(1)) if m2 else math.nan)

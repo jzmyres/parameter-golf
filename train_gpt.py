@@ -65,7 +65,7 @@ _DEQ_SOLVE_ACTIVE = False
 # does not bypass the inner Function — both register, view-meta replay corrupts.
 # Sliding-window attention (iter 104 v2) also dropped — global reach loss
 # fundamentally hurts long-range modeling. NSA (iter 106, see H77-region in
-# hypotheses.md) is the principled forward path: torch.compile-native via
+# experiments/docs/hypotheses.md) is the principled forward path: torch.compile-native via
 # flex_attention, preserves global reach via 3-branch (compression + selection
 # + sliding), natively trainable from scratch.
 
@@ -215,6 +215,82 @@ def _safe_mean(values, floor: float = 1e-8) -> float:
     return max(sum(values) / max(n, 1), floor)
 
 
+def _diag_scalar(value) -> float | None:
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return float(value.detach().float().mean().item())
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+# Single source of truth for Dirichlet-UCB router confidence diagnostics.
+# Each entry: (log_field, router_attr, kdiag_short_name). Adding a new
+# diagnostic is a one-line registry change — train logger, val logger,
+# K-sweep table, plot parser, and SoftDenseRouter cache zeroing all
+# iterate this tuple instead of duplicating the field list. Audit gate:
+# CLAUDE.md "Sibling-fanout DRY gate".
+ROUTER_DIRICHLET_DIAG_TERMS: tuple[tuple[str, str, str], ...] = (
+    ("router_dir_strength_mean",    "_dirichlet_strength_last",         "dir_S"),
+    ("router_dir_uncertainty_mass", "_dirichlet_uncertainty_mass_last", "dir_U"),
+    ("router_dir_sigma_mean",       "_dirichlet_uncertainty_last",      "dir_sigma"),
+    ("router_dir_evidence_mean",    "_dirichlet_evidence_mean_last",    "dir_evid"),
+    ("router_dir_mu_entropy_norm",  "_dirichlet_mu_entropy_norm_last",  "dir_Hmu"),
+)
+# Beta is sourced from a different router attribute (`_dirichlet_ucb_beta`)
+# and is per-config rather than per-token; tracked separately so that the
+# main registry stays homogeneous.
+ROUTER_DIRICHLET_BETA_TERM: tuple[str, str, str] = (
+    "router_ucb_beta_current", "_dirichlet_ucb_beta", "ucb_beta",
+)
+
+
+def _router_confidence_stats(
+    routers,
+    *,
+    step: int | None = None,
+    require_step_match: bool = False,
+) -> dict[str, float]:
+    """Aggregate Dirichlet-router confidence diagnostics across unique routers."""
+    acc: dict[str, list[float]] = {name: [] for name, _, _ in ROUTER_DIRICHLET_DIAG_TERMS}
+    beta_name, beta_attr, _ = ROUTER_DIRICHLET_BETA_TERM
+    beta_vals: list[float] = []
+    for router in routers:
+        if router is None or getattr(router, "scoring", None) != "dirichlet_ucb":
+            continue
+        if require_step_match and getattr(router, "_dirichlet_diag_step", None) != step:
+            continue
+        for name, attr, _ in ROUTER_DIRICHLET_DIAG_TERMS:
+            v = _diag_scalar(getattr(router, attr, None))
+            if v is not None:
+                acc[name].append(v)
+        beta_v = _diag_scalar(getattr(router, beta_attr, None))
+        if beta_v is not None:
+            beta_vals.append(beta_v)
+    out = {name: sum(vals) / len(vals) for name, vals in acc.items() if vals}
+    if beta_vals:
+        out[beta_name] = sum(beta_vals) / len(beta_vals)
+    return out
+
+
+def _format_router_confidence_parts(
+    routers,
+    *,
+    step: int | None = None,
+    require_step_match: bool = False,
+) -> list[str]:
+    stats = _router_confidence_stats(routers, step=step, require_step_match=require_step_match)
+    order = tuple(name for name, _, _ in ROUTER_DIRICHLET_DIAG_TERMS) + (
+        ROUTER_DIRICHLET_BETA_TERM[0],
+    )
+    return [f"{name}:{stats[name]:.4f}" for name in order if name in stats]
+
+
 @contextlib.contextmanager
 def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
     global _ROUTER_DIAGNOSTICS_ACTIVE, _ROUTER_DIAGNOSTICS_STEP
@@ -241,7 +317,14 @@ class Hyperparameters:
     seed = 42
 
     val_batch_size = 524_288
-    val_micro_batch_seqs = 0  # T-opt 17: 0 = derive from training micro-batch (same B as training)
+    # Throughput-only eval cap on per-forward chunking (NOT eval coverage —
+    # `eval_batch_seqs` controls coverage). Calibrated for the dev
+    # `world_size=2, grad_accum=4` profile where the derived local train
+    # microbatch is 32, so 48 ≈ 1.5× train. The literal 48 may not be
+    # 1.5× on submission hardware (`world_size=8`); revisit if eval-time
+    # VRAM headroom changes. 0 ⇒ derive from the training microbatch
+    # (see `_resolve_val_micro_batch_seqs` ~ line 1147).
+    val_micro_batch_seqs = 48
     val_loss_every = 200
     train_log_every = 10  # log every 10 steps (~85s at 8.5s/step) for better progress visibility
     auto_plot_on_val = True
@@ -262,12 +345,20 @@ class Hyperparameters:
     warmdown_frac = 0.72  # fraction of total steps for warmdown
     train_batch_tokens = 524_288
     train_seq_len = 2048
-    # Training timer is training-only (excludes post-loop val / quantization /
-    # K-sweep). Process wallclock = max_training_seconds + eval_reservation_seconds.
+    # `max_training_seconds` is the total *process wallclock* budget (the
+    # value submitters pass on the command line). The training loop runs
+    # for at most max_training_seconds - eval_reservation_seconds so that
+    # post-loop val + int6 + K-sweep + sliding val fit under the same
+    # process wallclock. Project invariant: submission must fit 600 s
+    # 8×H100. See `_compute_training_budget_ms` and audit gate
+    # `EXPERIENCE.md#scalar-semantic-shift`.
     max_training_seconds = 0
     max_wallclock_seconds = 0  # deprecated one-cycle alias for max_training_seconds
     eval_reservation_seconds = 120
-    final_full_validation = False
+    # Promotion/submission metadata must use the full validation split. Fast
+    # validation remains useful for step logs and smoke loops, but a final
+    # `val_bpb` proxy is not promotable.
+    final_full_validation = True
     # Iter 98b (2026-04-28) NOT PROMOTED ✗ (closed 2026-04-29). The
     # micro-batch-halving rescue successfully fit D=1024 (peak VRAM 23 GiB
     # vs iter 98's 47 GiB OOM), but val_bpb int6 = 1.5018 vs iter 100b
@@ -298,7 +389,14 @@ class Hyperparameters:
     model_dim = 768
     num_heads = 8
     num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
-    num_shared_experts = 1  # Phase 9 iter 51: DeepSeek shared expert (always-on, bypass routing)
+    # Shared expert disabled by default. The DeepSeek-style always-on
+    # bypass-routing expert (Phase 9 iter 51) remains a code path but
+    # is opt-in: every routed expert is full-D LoRA-style under the
+    # iter146 rescue stack, and a separately-parameterized always-on
+    # expert is redundant when the routing-EMA balance + alive-hinge
+    # already prevent expert collapse. To re-enable for a specific
+    # ablation, pass --num-shared-experts=1.
+    num_shared_experts = 0
     # Iter 94 (2026-04-24): disable CTP head entirely. When False, MoS head only
     # emits NTP log-probs; CTP param banks (gate_ctp, A_ctp_shared, A_ctp,
     # B_denoise, ctp_*_norm_weight) are not allocated, CTP loss is skipped, and
@@ -344,7 +442,7 @@ class Hyperparameters:
     # Mixed via per-expert-per-head learnable softmax gate. Strict-generalization:
     # `nsa_compress_block_size=1, nsa_compress_block_sliding_stride=1,
     # nsa_sliding_window_size=T, nsa_branch_gate_init=0` recovers full causal
-    # SDPA exactly. See H86 in experiments/hypotheses.md for the design spec.
+    # SDPA exactly. See H86 in experiments/docs/hypotheses.md for the design spec.
     use_nsa_attention = False
     nsa_compress_block_size = 32
     nsa_compress_block_sliding_stride = 16
@@ -413,11 +511,16 @@ class Hyperparameters:
     # state; the KL-balance term uses a straight-through EMA anchor so it can
     # train current routing while the forward value tracks historical usage.
     # Exact detached KL(EMA||U) would only be a diagnostic. The hard min-share
-    # issue is not solved by KL alone; future strict-health tests should add an
-    # EMA alive hinge that directly matches the no-underuse gate.
-    router_ema_alive_coef = 0.0
-    router_ema_balance_coef = 0.15
-    router_ema_specialization_coef = 0.1
+    # issue is not solved by KL alone, so the alive hinge below directly
+    # matches the no-underuse gate.
+    # Small strict liveness hinge: EMA balance improves average usage, but the
+    # post-int min-share gate fails on worst under-use. This term directly
+    # targets the same deficit without changing token-local routing.
+    router_ema_alive_coef = 0.02
+    # Coefficient-first rescue: double the promoted EMA terms to push closer to
+    # ideal long-run balance and stronger token specialization.
+    router_ema_balance_coef = 0.30
+    router_ema_specialization_coef = 0.20
     # iter 100b (2026-04-27): per-token entropy penalty with ANNEALED schedule
     # + min_share_loss decoupled. iter 100 (entropy_coef=0.02 from step 0)
     # hit train_loss instability — penalty fights min_share_loss penalty
@@ -435,7 +538,7 @@ class Hyperparameters:
     # NOT PROMOTED — int6 +0.0007 vs iter 117 v5, hypothesis REFUTED:
     # in soft-dense MoE, the CV-redistribution dominates over the per-token
     # sparsity push at any reasonable entropy coef. Pertoken_entropy
-    # stabilizes around 2.6 regardless. See H87b RESULT in hypotheses.md.
+    # stabilizes around 2.6 regardless. See H87b RESULT in experiments/docs/hypotheses.md.
     # iter 145r promoted a lower, warm-started regularization stack around the
     # evidential router. This supersedes the 2026-05-06 uniform-1.0 stack for
     # new default runs, while keeping the post-int health failures documented.
@@ -456,12 +559,14 @@ class Hyperparameters:
     router_pertoken_entropy_coef = 0.1
     # Per-token expert-OUTPUT diversity (replaces block_ortho_aux + iter 141 expert_gram).
     # `expert_diversity_kind`:
-    #   cosine    (default): Y' = normalize(Y); loss = mean(off_diag(Y' Y'^T)²)
-    #             / (E·(E−1)). Scale-invariant; penalizes direction only —
-    #             preferred under iter-142-refactor since CV handles usage and
-    #             optimizer handles norm (separation of concerns; cosine is
-    #             also blind to expert-output collapse, which CV catches via
-    #             routing-mass imbalance).
+    #   cosine    (default): Y' = normalize(Y); loss =
+    #             mean_token max_pair(off_diag(Y' Y'^T)²). Scale-invariant
+    #             worst-pair pressure (per-token argmax over off-diagonal
+    #             pairs, then mean over tokens) — penalizes direction only
+    #             at the most antagonistic expert pair, which targets the
+    #             post-int orthogonality failure mode directly. CV handles
+    #             usage and the optimizer handles norm (separation of
+    #             concerns).
     #   frobenius: G = (Y Y^T)/D; loss = E_t[‖G − I/E‖²_F] / E². Couples
     #             direction AND per-expert norm; bundles a norm-target onto
     #             the diversity penalty. The /E² is for magnitude parity
@@ -472,7 +577,9 @@ class Hyperparameters:
     # Final post-int gates still flagged attn/mlp output collinearity, so a
     # future fix should strengthen direction pressure or add a better
     # transition-output scale/Jacobian control rather than hiding the issue.
-    expert_output_diversity_coef = 0.15
+    # Root-cause rescue: 0.15 -> 0.30 and cosine loss uses worst-pair pressure
+    # so training targets the post-int orthogonality failure mode directly.
+    expert_output_diversity_coef = 0.30
     expert_diversity_every = 8       # cadence: aux fires every N optimizer steps
     expert_diversity_max_tokens = 64
     mos_output_diversity_coef = 0.0  # per-token Gram on MoS low-rank states; default off
@@ -565,7 +672,7 @@ class Hyperparameters:
     # residual = T_2(T_1(z, x_0), x_0) + Parcae input injection.
     # Skip-connection across the chain: out = stage_1_out + stage_2_out
     # (preserves iter 100b strict-gen path when stage 2 zero-init).
-    # See experiments/hypotheses.md H77 for full spec + design questions.
+    # See experiments/docs/hypotheses.md H77 for full spec + design questions.
     # Step 1 (this commit): Hyperparameter + CLI only — Block refactor
     # lands in step 2.
     use_chained_routing = False
@@ -584,18 +691,21 @@ class Hyperparameters:
     # Mirrors the entropy/variance warmup_delay_frac=0.3 pattern.
     entmax_blend_warmup_delay_frac = 0.3
 
-    # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty.
-    # Encourages ρ(J_{z*}) < γ at the reached equilibrium via persistent
-    # power-iteration VJP. One boundary forward + one VJP per step.
-    # Phase 9 iter 88 (2026-04-25): Lyapunov hinge penalty disabled (0.01 → 0).
-    # Hypothesis: under iter-66b Parcae per-dim Ā, the solver's
-    # reversibility/stability is improved by the bounded decay path; contraction
-    # of the full nonlinear block remains empirical and is monitored by K-sweep
-    # / fixed-point diagnostics. The Hutchinson-Frobenius probe was redundant in
-    # practice. Set λ_jac = 0;
-    # if val_bpb regresses by > 0.03 OR K-sweep widens > 0.5, restore.
-    lyapunov_coef = 0.0        # λ_jac: weight of hinge penalty (iter 88: disabled)
-    lyapunov_gamma = 0.97      # iter 74b: raise from 0.9 — preserve faster warmup observed at γ=0.95 (H57)
+    # iter147 path: finite-perturbation expansion penalty on T_theta. Per-call
+    # form is `expansion = ‖T(z+ε·u) − T(z)‖_RMS / ε` with `u` a unit-RMS
+    # random direction; the Hutchinson expectation is ‖J‖_F/√D, NOT operator
+    # norm — see `lip_ub` gate for true operator-norm certification. Kept
+    # default-off until the contraction experiment; when enabled, runs
+    # low-cadence on a token window to avoid making every training step pay
+    # two extra shared-block forwards.
+    lyapunov_coef = 0.0        # λ_jac: weight of relu(expansion - gamma)^2
+    # γ is on the Frobenius/√D proxy (Hutchinson), not ‖J‖_2: ‖J‖_2 < 1
+    # implies Frobenius/√D < 1 but not the reverse, so γ=0.97 is a soft
+    # pressure, not a contraction certificate — `lip_ub` is the gate.
+    # Recalibration recipe lives in iter144_ift_adjoint_plan.md.
+    lyapunov_gamma = 0.97
+    lyapunov_every = 16
+    lyapunov_max_tokens = 64
     # Phase 9 iter 55: Denoising regularization (HyDRA 2026, Efficient DEQ 2025).
     # ||f(z*+ε, x0) - z*||² penalizes contraction failure at finite perturbation.
     # Complements Hutchinson (which penalizes ||J||²_F at infinitesimal scale).
@@ -647,9 +757,13 @@ class Hyperparameters:
     # added to the K-sweep matrix for cross-K diagnostics at this depth.
     deq_k_jitter = True
     deq_k_min = 4
-    deq_k_max = 24
+    # iter 146: keep most training at the promoted K16/K24 depths, but sample
+    # K32/K64 at low probability for finite-depth robustness. Weighted sampling
+    # is required: a plain 4-value tuple would sample K64 25% of the time.
+    deq_k_max = 64
     deq_k_step = 4
-    deq_k_jitter_set = (16, 24)
+    deq_k_jitter_set = (16, 24, 32, 64)
+    deq_k_jitter_weights = (0.50, 0.40, 0.07, 0.03)
     deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
 
     # Architecture knobs
@@ -700,7 +814,7 @@ class Hyperparameters:
 _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "data-path", "tokenizer-path", "run-id", "seed", "iterations",
     "train-batch-tokens", "train-seq-len",
-    "val-batch-size", "val-loss-every", "train-log-every",
+    "val-batch-size", "val-micro-batch-seqs", "val-loss-every", "train-log-every",
     "fp-lip-fast-val-every", "fp-lip-power-iters", "fp-lip-ub-safety", "fp-lip-ub-margin",
     "checkpoint-dir", "checkpoint-every", "checkpoint-keep", "resume-from",
     "max-training-seconds", "max-wallclock-seconds",  # max-wallclock-seconds is a deprecated alias
@@ -709,7 +823,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "bigram-vocab-size", "bigram-dim",
     "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
     "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
-    "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval", "deq-bptt-k",
+    "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval",
+    "deq-k-jitter-set", "deq-k-jitter-weights", "deq-bptt-k",
     "deq-beta", "deq-beta-jitter-set",
     "warmdown-frac", "num-refinements-ramp-frac",
     "weight-decay",
@@ -726,7 +841,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "sparse-dispatch-capacity-factor",
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     "denoising-coef", "denoising-noise-std",
-    "lyapunov-coef", "lyapunov-gamma",
+    "lyapunov-coef", "lyapunov-gamma", "lyapunov-every", "lyapunov-max-tokens",
     "eval-reservation-seconds",
     "ctp-weight",
     "router-load-cv-coef", "mos-load-cv-coef",
@@ -1540,20 +1655,82 @@ def max_pairwise_abs_cosine(groups: Tensor, eps: float = 1e-8) -> Tensor:
     return cos.max()
 
 
+def _normalize_k_jitter_weights(values, weights) -> tuple[list[int], list[float]]:
+    if values is None:
+        raise ValueError("K jitter weights require explicit values")
+    vals = [int(v) for v in values]
+    ws = [float(w) for w in weights]
+    if len(vals) != len(ws):
+        raise ValueError("K jitter values and weights must have equal length")
+    if len(set(vals)) != len(vals):
+        raise ValueError("Weighted K jitter values must be unique; encode probability in weights")
+    if any((not math.isfinite(w)) or w < 0.0 for w in ws):
+        raise ValueError("K jitter weights must be finite and non-negative")
+    weight_sum = sum(ws)
+    if weight_sum <= 0.0:
+        raise ValueError("K jitter weights must sum to a positive value")
+    return vals, [w / weight_sum for w in ws]
+
+
 class KShuffleBagSampler:
     def __init__(self, k_min: int, k_max: int, rng: random.Random, *, step: int = 1,
-                 values: list[int] | None = None):
+                 values: list[int] | None = None,
+                 weights: list[float] | None = None):
         # Explicit `values` overrides range(k_min, k_max+1, step) — lets us
         # express non-uniform K sets like {4, 8, 16} (skipping K=12 because
         # K=8 and K=16 bracket it well; ~7% throughput gain).
         self.k_min = int(k_min)
         self.k_max = int(k_max)
         self.step = int(step)
-        self.values = sorted(set(int(v) for v in values)) if values else None
+        if weights is not None and not values:
+            raise ValueError("KShuffleBagSampler weights require explicit values")
+        if values and weights is not None:
+            self.values, self.weights = _normalize_k_jitter_weights(values, weights)
+        else:
+            self.values = sorted(set(int(v) for v in values)) if values else None
+            self.weights = None
         self.rng = rng
         self._bag: list[int] = []
 
+    def _weighted_bag(self) -> list[int]:
+        """Build one exact weighted cycle from normalized weights.
+
+        Over each cycle the empirical K counts match the configured weights
+        up to integer rounding (no min-count floor — a configured weight
+        smaller than 1/cycle_len rounds down to zero in this cycle, which
+        the docstring contract permits and which avoids ≥10× silent
+        inflation of small weights).
+        """
+        assert self.values is not None and self.weights is not None
+        cycle_len = max(100, len(self.values))
+        raw = [float(w) * float(cycle_len) for w in self.weights]
+        counts = [int(math.floor(r)) for r in raw]
+        while sum(counts) < cycle_len:
+            idx = max(range(len(counts)), key=lambda i: raw[i] - counts[i])
+            counts[idx] += 1
+        while sum(counts) > cycle_len:
+            candidates = [i for i, c in enumerate(counts) if c > 0]
+            if not candidates:
+                # Unreachable: cycle_len ≥ len(values) ≥ 1 and counts sum
+                # ≥ floor(cycle_len * sum(weights)) = cycle_len, so every
+                # over-budget loop has a non-zero count to decrement.
+                raise AssertionError(
+                    "_weighted_bag: no positive count available to decrement "
+                    "(cycle_len smaller than the count sum should be impossible)"
+                )
+            idx = max(candidates, key=lambda i: counts[i] - raw[i])
+            counts[idx] -= 1
+        bag: list[int] = []
+        for value, count in zip(self.values, counts):
+            bag.extend([int(value)] * int(count))
+        self.rng.shuffle(bag)
+        return bag
+
     def sample(self) -> int:
+        if self.weights is not None:
+            if not self._bag:
+                self._bag = self._weighted_bag()
+            return self._bag.pop()
         if not self._bag:
             if self.values is not None:
                 self._bag = list(self.values)
@@ -1571,6 +1748,7 @@ class KShuffleBagSampler:
             "k_max": self.k_max,
             "step": self.step,
             "values": self.values,
+            "weights": self.weights,
             "bag": list(self._bag),
             "rng_state": self.rng.getstate(),
         }
@@ -1580,7 +1758,12 @@ class KShuffleBagSampler:
         self.k_max = int(state.get("k_max", self.k_max))
         self.step = int(state.get("step", self.step))
         values = state.get("values", self.values)
-        self.values = [int(v) for v in values] if values is not None else None
+        weights = state.get("weights")
+        if weights is not None:
+            self.values, self.weights = _normalize_k_jitter_weights(values, weights)
+        else:
+            self.values = [int(v) for v in values] if values is not None else None
+            self.weights = None
         self._bag = [int(v) for v in state.get("bag", [])]
         rng_state = state.get("rng_state")
         if rng_state is not None:
@@ -1946,7 +2129,7 @@ def sparse_moe_dispatch_capacity(
 # code sites — Hyperparameters defaults stay explicit (public knob surface),
 # but every internal init / accumulator / cache / annealer / log column that
 # fans out across the family iterates over this registry. Adding a future
-# member (e.g., iter146 strict alive-hinge) MUST be a one-line addition here,
+# member (e.g., a future strict alive-hinge) MUST be a one-line addition here,
 # not a multi-site grep-and-paste. See `EXPERIENCE.md#sibling-fanout-dry-gate`.
 #
 # Convention: for `name`, the trainer expects the matching:
@@ -1982,7 +2165,7 @@ class SoftDenseRouter(nn.Module):
     def __init__(self, dim: int, num_experts: int, *,
                  min_share_frac: float = 0.6,
                  # Scoring/gate defaults align with Hyperparameters
-                 # (iter145r promoted 2026-05-08).
+                 # (current rescue stack, 2026-05-08).
                  scoring: str = "dirichlet_ucb", health_slices: tuple[int, ...] | None = None,
                  entropy_coef: float = 0.1,
                  dirichlet_ucb_beta: float = 0.5,
@@ -2072,8 +2255,11 @@ class SoftDenseRouter(nn.Module):
         # specialization). Driven by ROUTER_EMA_LOSS_TERMS — see registry.
         for _name, _ in ROUTER_EMA_LOSS_TERMS:
             setattr(self, f"_ema_{_name}_raw_loss", None)
-        self._dirichlet_strength_last: Tensor | None = None
-        self._dirichlet_uncertainty_last: Tensor | None = None
+        # Dirichlet-UCB confidence cache; driven by
+        # ROUTER_DIRICHLET_DIAG_TERMS so adding a new diagnostic is a
+        # single registry edit.
+        self._dirichlet_diag_step: int | None = None
+        self._clear_dirichlet_diag()
         # GPU-resident views used by DDP reductions — populated by
         # _record_diagnostics on every rank during eval, avoiding per-forward
         # cpu() syncs on non-master ranks.
@@ -2151,6 +2337,11 @@ class SoftDenseRouter(nn.Module):
     def dirichlet_ucb_beta(self, value: float) -> None:
         with torch.no_grad():
             self._dirichlet_ucb_beta.fill_(float(value))
+
+    def _clear_dirichlet_diag(self) -> None:
+        for _, _attr, _ in ROUTER_DIRICHLET_DIAG_TERMS:
+            setattr(self, _attr, None)
+        self._dirichlet_diag_step = None
 
     @torch.no_grad()
     def bias_update(self, *, lr: float, clip: float, distributed: bool) -> None:
@@ -2232,8 +2423,7 @@ class SoftDenseRouter(nn.Module):
                 route_logits = self.l2_gamma * (x_norm @ c_norm.t())
             route_logits = route_logits.reshape(*leading, -1).to(dtype=x.dtype)
             route_logits = route_logits + self.expert_bias.to(dtype=x.dtype)
-            self._dirichlet_strength_last = None
-            self._dirichlet_uncertainty_last = None
+            self._clear_dirichlet_diag()
         elif self.scoring == "dirichlet_ucb":
             # Evidential routing: logits parameterize non-negative evidence,
             # alpha=e+1 gives a Dirichlet over the expert simplex, and the UCB
@@ -2250,16 +2440,29 @@ class SoftDenseRouter(nn.Module):
             acq = (mu + beta * sigma).clamp_min(1e-8)
             p_base = acq / acq.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             route_logits = torch.log(acq)
-            self._dirichlet_strength_last = strength.detach().mean()
-            self._dirichlet_uncertainty_last = sigma.detach().mean()
+            # Confidence reductions are log-only (consumed by
+            # `_router_confidence_stats` which gates on
+            # `_dirichlet_diag_step`). Skipping when diagnostics are off
+            # eliminates 5+ per-layer reductions on the DEQ unroll hot path.
+            if _ROUTER_DIAGNOSTICS_ACTIVE:
+                self._dirichlet_strength_last = strength.detach().mean()
+                self._dirichlet_uncertainty_last = sigma.detach().mean()
+                self._dirichlet_uncertainty_mass_last = (float(alpha.shape[-1]) / strength).detach().mean()
+                self._dirichlet_evidence_mean_last = evidence.detach().mean()
+                mu_entropy = -(mu * (mu + 1e-8).log()).sum(dim=-1)
+                self._dirichlet_mu_entropy_norm_last = (
+                    mu_entropy / math.log(max(int(alpha.shape[-1]), 2))
+                ).detach().mean()
+                self._dirichlet_diag_step = _ROUTER_DIAGNOSTICS_STEP
+            else:
+                self._clear_dirichlet_diag()
         else:
             # Linear scoring (iter 30-33b baseline).
             route_logits = self.router(x_score) + self.expert_bias.to(dtype=x.dtype)
-            self._dirichlet_strength_last = None
-            self._dirichlet_uncertainty_last = None
+            self._clear_dirichlet_diag()
         # Softmax allocation (iter 100b promoted baseline). Sparsemax/entmax15/
         # entmax_anneal variants tested in iters 99/101/102 NOT PROMOTED — see
-        # H74/H75/H77 in experiments/hypotheses.md. Sigmoid gate is applied
+        # H74/H75/H77 in experiments/docs/hypotheses.md. Sigmoid gate is applied
         # multiplicatively (NOT renormalized) so total mass can be < 1, letting
         # the model suppress the mixture near fixed point.
         # iter 117 (H87): when use_entmax_routing=True, p_alloc is a learnable
@@ -2345,6 +2548,11 @@ class SoftDenseRouter(nn.Module):
             target_min = (uniform * float(self.min_share_frac)).detach()
             ema_deficit = (target_min - ema_ref).clamp_min(0.0)
             current_deficit = (target_min - mean_share.float()).clamp_min(0.0)
+            # EMA-gated current-deficit²: per-expert ema_deficit weight on
+            # relu(τ−share)². Experts whose persistent EMA share has recovered
+            # contribute zero penalty even if the instant share dips, so the
+            # term chases truly persistent under-utilization rather than
+            # transient routing noise. NOT the simpler Σ relu(τ−share)² hinge.
             self._ema_alive_raw_loss = (ema_deficit * current_deficit.pow(2)).sum()
             # Loss assembles as `- coef * KL(token || ema_ref)`: minimizing the
             # negative KL ⇔ MAXIMIZING KL ⇔ pushing per-token routing AWAY from
@@ -3454,7 +3662,7 @@ class Block(nn.Module):
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 8, num_shared_experts: int = 0,
-                 # Defaults below mirror Hyperparameters (iter145r promoted
+                 # Defaults below mirror Hyperparameters (current rescue stack,
                  # 2026-05-08).
                  router_scoring: str = "dirichlet_ucb",
                  router_pertoken_entropy_coef: float = 0.1,
@@ -3736,12 +3944,14 @@ class Block(nn.Module):
                 y_attn_n = F.normalize(y_attn.float(), dim=-1, eps=1e-6)
                 g_attn = torch.einsum("bted,btfd->btef", y_attn_n, y_attn_n)
                 off_attn = g_attn - torch.eye(e_attn, device=g_attn.device, dtype=g_attn.dtype)
-                attn_gram_pt = off_attn.pow(2).sum(dim=(-2, -1)).mean() / float(max(e_attn * (e_attn - 1), 1))
+                # Strict health rescue: train against the worst off-diagonal
+                # pair per sampled token, not the mean over all pairs.
+                attn_gram_pt = off_attn.pow(2).amax(dim=(-2, -1)).mean()
 
                 y_mlp_n = F.normalize(y_mlp.float(), dim=-1, eps=1e-6)
                 g_mlp = torch.einsum("ned,nfd->nef", y_mlp_n, y_mlp_n)
                 off_mlp = g_mlp - torch.eye(e_mlp, device=g_mlp.device, dtype=g_mlp.dtype)
-                mlp_gram_pt = off_mlp.pow(2).sum(dim=(-2, -1)).mean() / float(max(e_mlp * (e_mlp - 1), 1))
+                mlp_gram_pt = off_mlp.pow(2).amax(dim=(-2, -1)).mean()
             else:
                 target_attn = torch.eye(e_attn, device=y_attn.device, dtype=torch.float32) / float(e_attn)
                 g_attn = torch.einsum("bted,btfd->btef", y_attn.float(), y_attn.float()) / float(dim)
@@ -3832,8 +4042,9 @@ class Block(nn.Module):
             #   frobenius (iter 141): G = (Y Y^T)/D; loss = ‖G − I/E‖²_F.
             #     Penalizes both orthogonality (off-diag → 0) AND norm balance
             #     (diag → 1/E ⇔ ‖y_e‖² → D/E). Subsumes block_ortho via Jensen.
-            #   cosine: Y' = normalize(Y); G = Y' Y'^T; loss = mean(off_diag²).
-            #     Scale-invariant (norm decoupled); penalizes only direction.
+            #   cosine: Y' = normalize(Y); G = Y' Y'^T; loss =
+            #     mean_token max_pair(off_diag²). Scale-invariant and aligned
+            #     with the worst-pair post-int health failure.
             E_attn = attn_expert_out.shape[2]
             Y_attn = attn_expert_out.float()  # (B, t, E, D)
             Y_mlp = torch.einsum("ner,erd->ned",
@@ -3843,12 +4054,12 @@ class Block(nn.Module):
                 Y_attn_n = F.normalize(Y_attn, dim=-1, eps=1e-6)
                 G_attn = torch.einsum("bted,btfd->btef", Y_attn_n, Y_attn_n)
                 off_attn = G_attn - torch.eye(E_attn, device=G_attn.device, dtype=G_attn.dtype)
-                attn_gram_pt = off_attn.pow(2).sum(dim=(-2, -1)).mean() / float(max(E_attn * (E_attn - 1), 1))
+                attn_gram_pt = off_attn.pow(2).amax(dim=(-2, -1)).mean()
 
                 Y_mlp_n = F.normalize(Y_mlp, dim=-1, eps=1e-6)
                 G_mlp = torch.einsum("ned,nfd->nef", Y_mlp_n, Y_mlp_n)
                 off_mlp = G_mlp - torch.eye(E2, device=G_mlp.device, dtype=G_mlp.dtype)
-                mlp_gram_pt = off_mlp.pow(2).sum(dim=(-2, -1)).mean() / float(max(E2 * (E2 - 1), 1))
+                mlp_gram_pt = off_mlp.pow(2).amax(dim=(-2, -1)).mean()
             else:  # frobenius
                 # Per-entry mean (divide by E²) so the loss magnitude is
                 # comparable to cosine's per-pair-mean rather than ~30× larger.
@@ -4393,7 +4604,7 @@ class GPT(nn.Module):
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  deq_beta: float = 0.35,
                  deq_bptt_k: int = 0,
-                 # Defaults below mirror Hyperparameters (iter145r promoted
+                 # Defaults below mirror Hyperparameters (current rescue stack,
                  # 2026-05-08). Keep these aligned: experiments/test_arch.py
                  # constructs GPT() without overrides and asserts the values.
                  router_scoring: str = "dirichlet_ucb",
@@ -4410,18 +4621,20 @@ class GPT(nn.Module):
                  num_experts: int = 8, num_shared_experts: int = 0,
                  lyapunov_coef: float = 0.0,
                  lyapunov_gamma: float = 0.97,
+                 lyapunov_every: int = 16,
+                 lyapunov_max_tokens: int = 64,
                  use_parcae: bool = True,
                  parcae_init_a_bar: float = 0.7,
                  parcae_init_b_bar: float | None = None,
                  use_ctp: bool = True,
                  ctp_weight: float = 0.0,
                  router_load_cv_coef: float = 0.0,
-                 router_ema_alive_coef: float = 0.0,
-                 router_ema_balance_coef: float = 0.15,
-                 router_ema_specialization_coef: float = 0.1,
+                 router_ema_alive_coef: float = 0.02,
+                 router_ema_balance_coef: float = 0.30,
+                 router_ema_specialization_coef: float = 0.20,
                  mos_load_cv_coef: float = 0.15,
                  expert_diversity_kind: str = "cosine",
-                 expert_output_diversity_coef: float = 0.15,
+                 expert_output_diversity_coef: float = 0.30,
                  expert_diversity_every: int = 8,
                  expert_diversity_max_tokens: int = 64,
                  mos_output_diversity_coef: float = 0.0,
@@ -4557,12 +4770,13 @@ class GPT(nn.Module):
             self.parcae_raw_delta = nn.Parameter(torch.full((model_dim,), raw_delta_init))
             self.parcae_raw_b = nn.Parameter(torch.full((model_dim,), raw_b_init))
         self.deq_bptt_k = int(deq_bptt_k)
-        # iter 45 (opg_doc.tex §4): Lyapunov spectral-radius penalty (default OFF).
-        # Two-forward approach: VJP for ρ̂ + surrogate loss for ∇_θ.
+        # iter147 path: finite-perturbation Hutchinson Frobenius/√D probe on
+        # T_theta (default OFF), run low-cadence from the training loop. NOT
+        # an operator-norm probe — see `lip_ub` gate for that.
         self.lyapunov_coef = float(lyapunov_coef)
         self.lyapunov_gamma = float(lyapunov_gamma)
-        self._lyapunov_v_buf: Tensor | None = None
-        self._lyapunov_rho_hat_buf: Tensor | None = None
+        self.lyapunov_every = int(lyapunov_every)
+        self.lyapunov_max_tokens = int(lyapunov_max_tokens)
         self.logit_softcap = float(logit_softcap)
         self.mos_head = MoSHead(
             model_dim, vocab_size, rank=256,
@@ -5328,20 +5542,25 @@ def _prescribe_failure_fix(failure: str) -> dict:
                 "config_change": {"mos_load_cv_coef_mult": 1.5},
             }
         cur = float(Hyperparameters.router_load_cv_coef)
+        alive_cur = float(Hyperparameters.router_ema_alive_coef)
+        balance_cur = float(Hyperparameters.router_ema_balance_coef)
         cv_fix = (
             f"Increase router_load_cv_coef by 1.5x (e.g. {cur:g}->{cur * 1.5:g})."
             if cur > 0.0
             else "Enable a small router_load_cv_coef floor (e.g. 0.05-0.10) if EMA alone is insufficient."
         )
+        alive_target = alive_cur * 1.5 if alive_cur > 0.0 else 0.02
         return {
             "failure": failure,
             "category": "router_collapse",
             "hypothesis": "Routing long-run balance under-regularized",
-            "fix": (f"CV path: {cv_fix} CV-free EMA path: increase router_ema_balance_coef "
-                    "or enable a small router_ema_alive_coef."),
+            "fix": (f"Strict-liveness path: increase router_ema_alive_coef "
+                    f"(e.g. {alive_cur:g}->{alive_target:g}). CV path: {cv_fix} "
+                    f"EMA balance is already {balance_cur:g}; do not prescribe stale lower floors."),
             "config_change": {"router_load_cv_coef_mult": 1.5,
                               "router_load_cv_coef_floor": 0.05,
-                              "router_ema_balance_coef_floor": 0.15},
+                              "router_ema_alive_coef_mult": 1.5,
+                              "router_ema_alive_coef_floor": alive_target},
         }
     if first_token.startswith("mos_") and "ortho" in first_token:
         return {
@@ -5372,17 +5591,20 @@ def _prescribe_failure_fix(failure: str) -> dict:
                    "is no longer gated; it's within finite-K noise.",
             "config_change": {"deq_k_max_delta": 4},
         }
-    if first_token.startswith("lip_ub") or first_token.startswith("spec_norm"):
+    if first_token.startswith("lip_ub"):
+        lyap_cur = float(Hyperparameters.lyapunov_coef)
+        lyap_target = lyap_cur * 1.5 if lyap_cur > 0.0 else 0.005
         return {
             "failure": failure,
             "category": "local_contraction_failed",
             "hypothesis": "The RevDEQ transition Jacobian failed the local Lipschitz contraction metric",
-            "fix": ("Shrink the transition map itself: increase weight_decay 1.5× and, if still high, "
-                    "add a dedicated transition-Jacobian penalty or output-scale constraint. "
+            "fix": ("Shrink the transition map itself: enable/increase the finite-perturbation "
+                    f"Lyapunov penalty (e.g. lyapunov_coef {lyap_cur:g}->{lyap_target:g}); "
+                    "increase weight_decay 1.5× only if the direct transition penalty is insufficient. "
                     "Do not treat scalar deq_beta as a fix in the active Parcae path; lip_ub probes "
                     "T_theta, not the solver blend, and Parcae uses per-dim beta=1-A_bar."),
-            "config_change": {"weight_decay_mult": 1.5,
-                              "needs_transition_jacobian_control": True},
+            "config_change": {"lyapunov_coef": lyap_target,
+                              "weight_decay_mult": 1.5},
         }
     if first_token.startswith("fp_bound"):
         return {
@@ -5415,7 +5637,7 @@ def _prescribe_failure_fix(failure: str) -> dict:
         "failure": failure,
         "category": "unknown",
         "hypothesis": "none",
-        "fix": "Manual analysis required — check hypotheses.md for related observations.",
+        "fix": "Manual analysis required — check experiments/docs/hypotheses.md for related observations.",
         "config_change": {},
     }
 
@@ -5441,55 +5663,6 @@ def _slice_for_fp_probe(z_star: Tensor, x0_lyap: Tensor, B_probe: int) -> tuple[
     return z_star[:B_probe].contiguous(), x0_lyap[:B_probe].contiguous()
 
 
-def _run_hutchinson_F(
-    z_star: Tensor,
-    x0_lyap: Tensor,
-    b_bar_d: Tensor | None,
-    sb,
-    target_dtype: torch.dtype,
-    n_samples: int,
-    ctx_factory,
-) -> float | None:
-    """Core Hutchinson-Frobenius probe loop (DRY helper, iter 117b-1).
-
-    Inputs must be pre-sliced (via ``_slice_for_fp_probe``) and pre-cast to
-    ``target_dtype``. Returns ``rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F /
-    sqrt(dim)`` or ``None`` on predictive OOM. Caller is responsible for the
-    outer try/except around runtime OOM and dtype/SDPA mismatches.
-
-    Shared by ``_hutchinson_F_at_saved_fp`` (val checkpoints) and
-    ``_compute_eval_fp_lipschitz`` (K-sweep). Eliminates the divergence
-    pattern that produced iter 97.5b-fix2 (val) + iter 97.5b-fix3 (K-sweep)
-    as separate patches for the same dtype-mismatch root cause.
-    """
-    torch.cuda.empty_cache()
-    free_b, _ = torch.cuda.mem_get_info(z_star.device)
-    need_b = int(z_star.numel() * z_star.element_size() * 16)
-    if free_b < int(need_b * 1.25):
-        print(
-            f"hutch_F skip: oom_pred need={need_b/1e9:.2f}GiB "
-            f"free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}",
-            flush=True,
-        )
-        return None
-    samples: list[float] = []
-    with ctx_factory():
-        for _ in range(max(1, n_samples)):
-            v = (torch.randint(0, 2, z_star.shape, device=z_star.device,
-                               dtype=z_star.dtype) * 2.0 - 1.0)
-            z_b = z_star.detach().clone().requires_grad_(True)
-            with torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
-                u_b = sb(z_b, x0_lyap, b_bar_d)
-                jvp = torch.autograd.grad(
-                    (u_b * v).sum(), z_b,
-                    create_graph=False, retain_graph=False,
-                )[0]
-            samples.append(float(jvp.detach().float().pow(2).mean().sqrt().item()))
-            del v, z_b, u_b, jvp
-            torch.cuda.empty_cache()
-    return sum(samples) / len(samples) if samples else None
-
-
 def _run_spectral_norm_power(
     z_star: Tensor,
     x0_lyap: Tensor,
@@ -5499,19 +5672,13 @@ def _run_spectral_norm_power(
     n_iters: int,
     ctx_factory,
 ) -> float | None:
-    """Power-iteration estimate of ``||dT/dz||_2`` at the saved FP.
-
-    Unlike ``hutch_F`` this targets the operator norm whose true value below
-    one is the local contraction condition. The reported number is still a
-    numerical estimate, so it is a stronger certificate candidate rather than a
-    formal proof over all perturbation directions.
-    """
+    """Internal power-iteration estimate used to compute ``lip_ub``."""
     torch.cuda.empty_cache()
     free_b, _ = torch.cuda.mem_get_info(z_star.device)
     need_b = int(z_star.numel() * z_star.element_size() * 24)
     if free_b < int(need_b * 1.25):
         print(
-            f"spec_norm skip: oom_pred need={need_b/1e9:.2f}GiB "
+            f"lip_ub skip: oom_pred need={need_b/1e9:.2f}GiB "
             f"free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}",
             flush=True,
         )
@@ -5589,7 +5756,7 @@ def _prepare_saved_fp_probe(base_m, B_probe: int = 1):
 
 
 def _lipschitz_upper_bound_metric(
-    spec_norm: float | None,
+    spectral_est: float | None,
     safety: float = 1.10,
     margin: float = 0.0,
 ) -> float | None:
@@ -5601,9 +5768,9 @@ def _lipschitz_upper_bound_metric(
     interval or linear-relaxation bound is practical for the full attention
     block.
     """
-    if spec_norm is None or not math.isfinite(float(spec_norm)):
+    if spectral_est is None or not math.isfinite(float(spectral_est)):
         return None
-    return max(0.0, float(spec_norm)) * max(1.0, float(safety)) + max(0.0, float(margin))
+    return max(0.0, float(spectral_est)) * max(1.0, float(safety)) + max(0.0, float(margin))
 
 
 def _fixed_point_error_bound_metric(
@@ -5641,68 +5808,37 @@ def _atomic_torch_save(obj, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
-def _spectral_norm_at_saved_fp(
+def _lip_ub_at_saved_fp(
     base_m,
     n_iters: int = 3,
     B_probe: int = 1,
+    safety: float = 1.10,
+    margin: float = 0.0,
+    log_label: str = "lip_ub",
 ) -> float | None:
-    """Fast-val local spectral-norm probe at the model's saved DEQ FP."""
-    prepared = _prepare_saved_fp_probe(base_m, B_probe)
-    if prepared is None:
-        return None
-    z_star, x0_lyap, b_bar_d, sb, target_dtype, ctx_factory = prepared
-    try:
-        return _run_spectral_norm_power(
-            z_star, x0_lyap, b_bar_d, sb, target_dtype,
-            max(1, int(n_iters)), ctx_factory,
-        )
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"spec_norm skip: oom_runtime {e}", flush=True)
-        torch.cuda.empty_cache()
-        return None
-    except Exception as e:
-        print(f"spec_norm skip: {type(e).__name__}: {e}", flush=True)
-        return None
+    """Local contraction metric at the model's saved DEQ FP.
 
-
-def _hutchinson_F_at_saved_fp(base_m, n_samples: int = 2, B_probe: int = 1) -> float | None:
-    """Hutchinson-Frobenius estimator at the model's saved DEQ fixed point.
-
-    Reads ``_lyapunov_z_star`` and ``_lyapunov_x0`` saved by the most recent
-    ``GPT.forward`` (populated on every forward including eval mode). For
-    Rademacher ``v`` with ``E[v v^T] = I``,
-    ``E[||J^T v||²] = ||J||²_F``. Reports
-    ``rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)``, a per-element
-    proxy for average squared singular value of ``J = ∂T_θ/∂z`` at ``z*``.
-
-    Returns ``None`` on missing saved FP or OOM. The predictive OOM skip
-    is calibrated against the SLICED probe size (post-``_slice_for_fp_probe``),
-    not the full saved z_star — without slicing the JVP through SharedBlock
-    needs ~32 GiB at val batch size, which is why iter 100b's K-sweep
-    reported `hutch_F: N/A` across all K (root cause: OOM, not SDPA backend
-    rejection as previously documented). With ``B_probe=1`` activation memory
-    is ~1 GiB.
-
-    iter 97.5b PERMANENT (2026-04-29): hoisted from the K-sweep harness so
-    val checkpoints can also report ``hutch_F``. Cost: ~2 backward passes
-    through the SharedBlock at z* sliced to a single sequence.
-
-    iter 97.5b-fix (2026-04-29): added ``B_probe`` slicing to resolve the
-    "hutch_F shows N/A across all K" issue documented in iter 100b.
+    `log_label` distinguishes call sites in skip-reason log lines (e.g.
+    K-sweep passes `"ksweep_skip_reason:lip_ub"` so the prescription
+    parser keys on it). Narrow exceptions: OOM + CUDA RuntimeError only;
+    every other exception propagates so refactor breakage stays loud.
     """
     prepared = _prepare_saved_fp_probe(base_m, B_probe)
     if prepared is None:
         return None
     z_star, x0_lyap, b_bar_d, sb, target_dtype, ctx_factory = prepared
-
     try:
-        return _run_hutchinson_F(z_star, x0_lyap, b_bar_d, sb, target_dtype, n_samples, ctx_factory)
+        spec_est = _run_spectral_norm_power(
+            z_star, x0_lyap, b_bar_d, sb, target_dtype,
+            max(1, int(n_iters)), ctx_factory,
+        )
+        return _lipschitz_upper_bound_metric(spec_est, safety=safety, margin=margin)
     except torch.cuda.OutOfMemoryError as e:
-        print(f"hutch_F skip: oom_runtime {e}", flush=True)
+        print(f"{log_label} skip: oom_runtime {e}", flush=True)
         torch.cuda.empty_cache()
         return None
-    except Exception as e:
-        print(f"hutch_F skip: {type(e).__name__}: {e}", flush=True)
+    except RuntimeError as e:
+        print(f"{log_label} skip: cuda_runtime {type(e).__name__}: {e}", flush=True)
         return None
 
 
@@ -5724,6 +5860,25 @@ def _resolve_training_seconds_alias(args, cli_overrides: dict[str, object]) -> N
         )
 
 
+def _compute_training_budget_ms(
+    max_training_seconds: float,
+    eval_reservation_seconds: float,
+) -> float | None:
+    """Process wallclock budget minus eval reservation, in ms; None if uncapped.
+
+    See `EXPERIENCE.md#scalar-semantic-shift` and CLAUDE.md
+    "Project Invariants" (600 s 8×H100). Both args are required to make
+    forgetting the reservation a type-checker error rather than a silent
+    wallclock overrun.
+    """
+    max_train_s = float(max_training_seconds)
+    if max_train_s <= 0.0:
+        return None
+    eval_res_s = max(float(eval_reservation_seconds), 0.0)
+    train_budget_s = max(max_train_s - eval_res_s, 1.0)
+    return 1000.0 * train_budget_s
+
+
 def _validate_hyperparameters(args) -> None:
     """Fail-fast architecture/config validation — catches malformed combos
     at startup rather than as opaque reshape errors deep in SDPA forward."""
@@ -5734,6 +5889,10 @@ def _validate_hyperparameters(args) -> None:
         raise SystemExit(f"num_heads ({nh}) must be divisible by num_kv_heads ({nkv}) for GQA")
     if int(args.num_layers) <= 0:
         raise SystemExit(f"num_layers ({args.num_layers}) must be positive")
+    if int(getattr(args, "lyapunov_every", 1)) <= 0:
+        raise SystemExit(f"lyapunov_every ({args.lyapunov_every}) must be positive")
+    if int(getattr(args, "lyapunov_max_tokens", 1)) <= 0:
+        raise SystemExit(f"lyapunov_max_tokens ({args.lyapunov_max_tokens}) must be positive")
     nE, nS = int(args.num_experts), int(args.num_shared_experts)
     if nE < 0:
         raise SystemExit(f"num_experts ({nE}) must be non-negative")
@@ -5743,6 +5902,13 @@ def _validate_hyperparameters(args) -> None:
         raise SystemExit("at least one of (num_experts, num_shared_experts) must be > 0")
     if str(args.router_scoring) not in ("linear", "l2", "sips", "dirichlet_ucb"):
         raise SystemExit(f"router_scoring={args.router_scoring!r} must be one of linear,l2,sips,dirichlet_ucb")
+    if str(args.router_scoring) == "dirichlet_ucb" and bool(getattr(args, "use_entmax_routing", False)):
+        # entmax_1.5 is not invariant under the softmax→entmax substitution
+        # `log(acq)`-as-logits assumes; the resulting blend would be ambiguous.
+        raise SystemExit(
+            "dirichlet_ucb scoring + use_entmax_routing is not a supported combination "
+            "(entmax projection has no defined meaning on Dirichlet UCB acquisition scores)"
+        )
     if int(args.train_seq_len) <= 0:
         raise SystemExit(f"train_seq_len ({args.train_seq_len}) must be positive")
     if int(args.train_batch_tokens) % int(args.train_seq_len) != 0:
@@ -5805,6 +5971,13 @@ def main() -> None:
         raise ValueError("deq_k_min must be positive")
     if int(args.deq_k_max) < int(args.deq_k_min):
         raise ValueError("deq_k_max must be >= deq_k_min")
+    _k_values_for_validation = getattr(args, "deq_k_jitter_set", None)
+    _k_weights_for_validation = getattr(args, "deq_k_jitter_weights", None)
+    if _k_weights_for_validation:
+        _k_vals_norm, _k_weights_norm = _normalize_k_jitter_weights(
+            _k_values_for_validation, _k_weights_for_validation)
+        args.deq_k_jitter_set = tuple(_k_vals_norm)
+        args.deq_k_jitter_weights = tuple(_k_weights_norm)
     # deq_k_max can exceed num_layers: the DEQ uses a shared block so the
     # solver can run any number of iterations.  num_layers is just the default K.
 
@@ -5902,7 +6075,7 @@ def main() -> None:
     if getattr(args, "_max_wallclock_seconds_deprecated", False):
         log0(
             f"deprecation_warning: --max-wallclock-seconds is now an alias for "
-            f"--max-training-seconds (timer measures training-only seconds, "
+            f"--max-training-seconds (process wallclock budget; training loop "
             f"reserves {int(args.eval_reservation_seconds)}s for post-loop work). "
             f"Update record commands to --max-training-seconds={int(args.max_training_seconds)}."
         )
@@ -5931,16 +6104,21 @@ def main() -> None:
     torch.cuda.manual_seed_all(args.seed)
     k_rng = random.Random(args.seed + 12345)
     _k_jitter_set = getattr(args, "deq_k_jitter_set", None)
+    _k_jitter_weights = getattr(args, "deq_k_jitter_weights", None)
     k_sampler = KShuffleBagSampler(args.deq_k_min, args.deq_k_max, k_rng,
                                     step=int(args.deq_k_step),
-                                    values=list(_k_jitter_set) if _k_jitter_set else None)
+                                    values=list(_k_jitter_set) if _k_jitter_set else None,
+                                    weights=list(_k_jitter_weights) if _k_jitter_weights else None)
+    k_sample_counts: Counter[int] = Counter()
 
     def deq_k_for_step(step_i: int) -> int:
         # Short-circuit when jitter is disabled — broadcasting a constant
         # value every step is wasteful and pulls a `.item()` sync into the
         # train hot path. The default (jitter=False) hits this fast path.
         if not args.deq_k_jitter:
-            return int(args.deq_k_max)
+            k_fixed = int(args.deq_k_max)
+            k_sample_counts[k_fixed] += 1
+            return k_fixed
         k = 0
         if rank == 0:
             k = int(k_sampler.sample())
@@ -5948,7 +6126,16 @@ def main() -> None:
             k_t = torch.tensor([k], device=device, dtype=torch.int64)
             dist.broadcast(k_t, src=0)
             k = int(k_t.item())
+        k_sample_counts[int(k)] += 1
         return int(k)
+
+    def format_k_jitter_info() -> str:
+        total = sum(k_sample_counts.values())
+        if total <= 0:
+            return ""
+        mean_k = sum(int(k) * int(n) for k, n in k_sample_counts.items()) / float(total)
+        counts = ",".join(f"{int(k)}:{int(k_sample_counts[k])}" for k in sorted(k_sample_counts))
+        return f" deq_k_sample_mean:{mean_k:.2f} deq_k_counts:[{counts}]"
 
     # Phase 9 iter 49: β jitter — sample β per step (like K-jitter, H30).
     # Forces model to be robust across solver dynamics. RevDEQ-safe because
@@ -6008,6 +6195,8 @@ def main() -> None:
         f" model_dim={args.model_dim} heads={args.num_heads} kv_heads={args.num_kv_heads}"
         f" mlp_mult={args.mlp_mult} beta={args.deq_beta:.3f}"
         f" deq_k_range={args.deq_k_min}-{args.deq_k_max} deq_k_eval={args.deq_k_eval}"
+        f" deq_k_jitter_set={tuple(getattr(args, 'deq_k_jitter_set', ()) or ())}"
+        f" deq_k_jitter_weights={tuple(getattr(args, 'deq_k_jitter_weights', ()) or ())}"
         f" batch_tokens={args.train_batch_tokens} seq_len={args.train_seq_len}"
         f" refinements={args.num_refinements} refine_ramp_frac={args.num_refinements_ramp_frac}"
         f" ema={int(args.ema_enabled)} ema_decay={args.ema_decay:.4f}"
@@ -6041,6 +6230,8 @@ def main() -> None:
         logit_softcap=float(args.logit_softcap),
         lyapunov_coef=args.lyapunov_coef,
         lyapunov_gamma=args.lyapunov_gamma,
+        lyapunov_every=args.lyapunov_every,
+        lyapunov_max_tokens=args.lyapunov_max_tokens,
         use_parcae=args.use_parcae,
         parcae_init_a_bar=args.parcae_init_a_bar,
         parcae_init_b_bar=args.parcae_init_b_bar,
@@ -6208,6 +6399,7 @@ def main() -> None:
             "optimizers": [_to_cpu_tree(opt.state_dict()) for opt in optimizers],
             "train_loader": train_loader.state_dict(),
             "k_sampler": k_sampler.state_dict(),
+            "k_sample_counts": {int(k): int(v) for k, v in k_sample_counts.items()},
             "beta_bag": list(_beta_bag),
             "beta_rng_state": _beta_rng.getstate(),
             "bptt_k_bag": list(_bptt_k_bag),
@@ -6239,15 +6431,14 @@ def main() -> None:
                 old_path.unlink(missing_ok=True)
         log0(f"checkpoint:saved step:{int(step_i)} path:{step_path}")
 
-    # Training-only cap. Subtract eval_reservation_seconds so post-loop
-    # int6 roundtrip + K-sweep + sliding val fit under the process wallclock.
-    _max_train_s = float(getattr(args, "max_training_seconds", 0.0))
-    _eval_res_s = float(getattr(args, "eval_reservation_seconds", 0.0))
-    if _max_train_s > 0.0:
-        _train_budget_s = max(_max_train_s - max(_eval_res_s, 0.0), 1.0)
-        max_training_ms: float | None = 1000.0 * _train_budget_s
-    else:
-        max_training_ms = None
+    # `max_training_seconds` is the *process wallclock* budget; the training
+    # loop runs for at most that minus `eval_reservation_seconds` so that
+    # post-loop val + int6 roundtrip + K-sweep + sliding val fit under the
+    # same process wallclock. Project invariant: submission must fit 600 s.
+    max_training_ms: float | None = _compute_training_budget_ms(
+        float(getattr(args, "max_training_seconds", 0.0)),
+        float(getattr(args, "eval_reservation_seconds", 0.0)),
+    )
     max_wallclock_ms = max_training_ms  # deprecated alias for downstream log-grep compat
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -6353,7 +6544,8 @@ def main() -> None:
                 masses: list[float] = []
                 mins: list[float] = []
                 ema_mins: list[float] = []
-                for router in _iter_unique_routers(sb_fmt):
+                routers_for_conf = list(_iter_unique_routers(sb_fmt))
+                for router in routers_for_conf:
                     if hasattr(router, "_materialize_diag_lists"):
                         router._materialize_diag_lists()
                     ok = getattr(router, "_expert_usage", None) is not None
@@ -6386,6 +6578,8 @@ def main() -> None:
                     parts.append(f"chain_pertoken_entropy:{_safe_mean(ents):.4f}")
                 if masses:
                     parts.append(f"chain_router_mass:{_safe_mean(masses):.4f}")
+                parts.extend(_format_router_confidence_parts(
+                    routers_for_conf, step=step, require_step_match=require_step_match))
                 attn_vals: list[float] = []
                 for _, comp in sb_fmt.active_attn_modules():
                     v_t = getattr(comp, "_out_ortho_cos_sim_t", None)
@@ -6416,8 +6610,9 @@ def main() -> None:
             # Dedup routers by id — pooled router is aliased as attn_router AND
             # mlp_router.  Log pooled 2E usage once, then per-type normalized halves.
             seen_routers: set[int] = set()
-            for prefix, router in (("attn", getattr(m.shared_block.attn, "attn_router", None)),
-                                   ("mlp", getattr(m.shared_block.mlp, "mlp_router", None))):
+            routers_for_conf = list(_iter_unique_routers(sb_fmt))
+            for prefix, router in (("attn", getattr(getattr(sb_fmt, "attn", None), "attn_router", None)),
+                                   ("mlp", getattr(getattr(sb_fmt, "mlp", None), "mlp_router", None))):
                 if router is None or id(router) in seen_routers:
                     continue
                 seen_routers.add(id(router))
@@ -6481,6 +6676,8 @@ def main() -> None:
                     total_mass = getattr(router, "_expert_total_mass", None)
                     if total_mass is not None:
                         parts.append(f"{prefix}_mass:{float(total_mass):.4f}")
+            parts.extend(_format_router_confidence_parts(
+                routers_for_conf, step=step, require_step_match=require_step_match))
             sg_mean = getattr(m.shared_block, "_shared_gate_mean", None)
             sg_step = getattr(m.shared_block, "_shared_gate_diag_step", None)
             if sg_mean is not None and (not require_step_match or sg_step == step):
@@ -6552,6 +6749,10 @@ def main() -> None:
         sampler_state = ckpt.get("k_sampler")
         if isinstance(sampler_state, dict):
             k_sampler.load_state_dict(sampler_state)
+        k_counts_state = ckpt.get("k_sample_counts")
+        if isinstance(k_counts_state, dict):
+            k_sample_counts.clear()
+            k_sample_counts.update({int(k): int(v) for k, v in k_counts_state.items()})
         _beta_bag = [float(v) for v in ckpt.get("beta_bag", [])]
         if ckpt.get("beta_rng_state") is not None:
             _beta_rng.setstate(ckpt["beta_rng_state"])
@@ -6610,13 +6811,6 @@ def main() -> None:
             deq_info = format_deq_info(base_model)
             expert_info = format_expert_info(base_model, step=step) if master_process else ""
             _window_avg = (sum(_step_dt_window) / len(_step_dt_window)) if _step_dt_window else 0.0
-            # iter 97.5b PERMANENT (2026-04-29): Hutchinson-Frobenius at val
-            # checkpoints. Tracks ||J(z*)||_F across training time, distinguishes
-            # contractive FP (rho_F decreasing) from trivial dynamics or marginal
-            # stability where deq_residual alone is uninformative. Silently
-            # skipped on SDPA backend rejection / OOM (returns None).
-            hutch_F = _hutchinson_F_at_saved_fp(base_model) if master_process else None
-            hutch_str = f" hutch_F:{hutch_F:.4f}" if hutch_F is not None else ""
             _fast_val_count += 1
             fp_probe_every = int(getattr(args, "fp_lip_fast_val_every", 0) or 0)
             run_fp_lip_probe = (
@@ -6624,14 +6818,14 @@ def main() -> None:
                 and fp_probe_every > 0
                 and (last_step or (_fast_val_count % fp_probe_every == 0))
             )
-            spec_norm = (
-                _spectral_norm_at_saved_fp(base_model, n_iters=int(getattr(args, "fp_lip_power_iters", 3)))
+            lip_ub = (
+                _lip_ub_at_saved_fp(
+                    base_model,
+                    n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
+                    safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
+                    margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
+                )
                 if run_fp_lip_probe else None
-            )
-            lip_ub = _lipschitz_upper_bound_metric(
-                spec_norm,
-                safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
-                margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
             )
             conv_rel_t = getattr(base_model, "_deq_iter_convergence_rel_t", None)
             fp_residual_rel = (
@@ -6639,7 +6833,6 @@ def main() -> None:
                 if isinstance(conv_rel_t, torch.Tensor) else None
             )
             fp_bound = _fixed_point_error_bound_metric(fp_residual_rel, lip_ub)
-            spec_str = f" spec_norm:{spec_norm:.4f}" if spec_norm is not None else " spec_norm:N/A"
             lip_str = f" lip_ub:{lip_ub:.4f}" if lip_ub is not None else " lip_ub:N/A"
             fp_resid_str = f" fp_residual_rel:{fp_residual_rel:.6f}" if fp_residual_rel is not None else ""
             fp_bound_str = f" fp_bound:{fp_bound:.6f}" if fp_bound is not None else ""
@@ -6648,9 +6841,9 @@ def main() -> None:
                 f"val_mode:fast "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
                 f"step_avg_w50:{_window_avg:.2f}ms"
-                f"{hutch_str}"
-                f"{spec_str}{lip_str}{fp_resid_str}{fp_bound_str}"
+                f"{lip_str}{fp_resid_str}{fp_bound_str}"
                 f"{deq_info}{expert_info}"
+                f"{format_k_jitter_info()}"
             )
             if _update_experiment_plots is not None:
                 _update_experiment_plots(logfile, enabled=master_process and getattr(args, "auto_plot_on_val", False))
@@ -6771,14 +6964,10 @@ def main() -> None:
                 with router_diagnostics(diag_enabled, step_tag=next_step if diag_enabled else None):
                     loss = model(x, y)
 
-                # Lyapunov + denoising auxiliaries: hard-gated on coefs > 0
-                # (both default 0.0 since iter 88/89 — Parcae-style damping
-                # improves solver reversibility/stability, while contraction of
-                # the full nonlinear block remains empirically monitored). Code
-                # retained behind a single
-                # flag so the eval-time Hutchinson harness in the K-sweep can
-                # still recompute ρ̂ on demand. The aggressive zero-skip means
-                # disabled-by-default = zero forward/backward cost.
+                # Lyapunov + denoising auxiliaries: hard-gated on coefs > 0.
+                # The Lyapunov path directly penalizes finite expansion of
+                # T_theta near the saved fixed point; it is low-cadence because
+                # it costs two extra shared-block forwards when enabled.
                 lyap_coef = float(base_model.lyapunov_coef)
                 dn_coef = float(args.denoising_coef)
                 if (lyap_coef > 0.0 or dn_coef > 0.0) and micro_step == grad_accum_steps - 1:
@@ -6786,34 +6975,66 @@ def main() -> None:
                     lyap_scale = float(reg_scale)
                     z_star = getattr(base_model, '_lyapunov_z_star', None)
                     x0_lyap = getattr(base_model, '_lyapunov_x0', None)
+                    # One-shot warning when the flag is on but the saved FP
+                    # is missing (e.g., a future refactor moves the
+                    # assignment site). CLAUDE.md "Diagnostic gates follow
+                    # flags": if the flag is on, absence of effect is a
+                    # silent failure.
+                    if (lyap_coef > 0.0 and lyap_scale > 0.0
+                            and (z_star is None or x0_lyap is None)
+                            and not getattr(base_model, '_lyapunov_missing_warned', False)):
+                        log0(
+                            "lyapunov_warning: lyapunov_coef>0 but _lyapunov_z_star/_lyapunov_x0 "
+                            "are unset; penalty becomes a no-op until populated"
+                        )
+                        base_model._lyapunov_missing_warned = True
                     if z_star is not None and x0_lyap is not None and lyap_scale > 0.0:
                         aux_b_bar = base_model._parcae_b_bar() if base_model.use_parcae else None
-                        aux_b_bar_detached = aux_b_bar.detach() if aux_b_bar is not None else None
-                        if lyap_coef > 0.0:
-                            v_hutch = torch.randint(0, 2, z_star.shape, device=z_star.device, dtype=z_star.dtype) * 2.0 - 1.0
-                            z_b = z_star.detach().requires_grad_(True)
-                            u_b = sb(z_b, x0_lyap, aux_b_bar_detached)
-                            jvp = torch.autograd.grad(
-                                (u_b * v_hutch).sum(), z_b,
-                                create_graph=False, retain_graph=False,
-                            )[0]
-                            rho_sample_t = jvp.detach().float().pow(2).mean().sqrt()
-                            rho_buf = base_model._lyapunov_rho_hat_buf
-                            if rho_buf is None:
-                                base_model._lyapunov_rho_hat_buf = rho_sample_t.detach().clone()
-                                rho_buf = base_model._lyapunov_rho_hat_buf
-                            else:
-                                rho_buf.mul_(0.9).add_(rho_sample_t.detach(), alpha=0.1)
-                            gamma = float(base_model.lyapunov_gamma)
-                            scale_t = (torch.relu(rho_buf - gamma) / rho_buf.clamp(min=1e-8)).detach()
-                            v_dir = (jvp.detach() / jvp.detach().float().reshape(-1).norm().clamp(min=1e-8)).detach()
-                            u_b2 = sb(z_star.detach(), x0_lyap, aux_b_bar)
-                            surrogate = (u_b2 * v_dir).sum().abs()
+                        lyap_every = max(1, int(getattr(base_model, "lyapunov_every", 16)))
+                        if lyap_coef > 0.0 and (next_step % lyap_every == 0):
+                            max_tokens = max(1, int(getattr(base_model, "lyapunov_max_tokens", 64)))
+                            t_lyap = min(max_tokens, int(z_star.shape[1]))
+                            start_lyap = _deterministic_token_window_start(
+                                int(args.seed) + 17,
+                                int(next_step),
+                                int(z_star.shape[1]),
+                                t_lyap,
+                            )
+                            z_base = z_star.detach()[:, start_lyap:start_lyap + t_lyap].contiguous()
+                            x0_base = x0_lyap[:, start_lyap:start_lyap + t_lyap].contiguous()
+                            # Hutchinson-style probe: with `eps_unit` of unit RMS in
+                            # high-D, `expansion` has expectation ‖J‖_F/√D, NOT the
+                            # operator norm ‖J‖_2 that the post-final `lip_ub` gate
+                            # measures. So this is a Frobenius/√D proxy — soft
+                            # contraction pressure, not a tight Lipschitz cert. RMS
+                            # form (vs unit-L2) keeps per-element magnitudes ~O(1)
+                            # under bf16 finite differencing.
+                            # Seeded per-step generator: deterministic across reruns
+                            # at fixed (args.seed, next_step). Matches the determinism
+                            # of `_deterministic_token_window_start` above.
+                            lyap_gen = torch.Generator(device=z_base.device).manual_seed(
+                                int(args.seed) * 7919 + int(next_step))
+                            eps_dir = torch.randn(z_base.shape, dtype=z_base.dtype,
+                                                  device=z_base.device, generator=lyap_gen)
+                            eps_unit = eps_dir / eps_dir.float().pow(2).mean().sqrt().clamp(min=1e-8).to(dtype=eps_dir.dtype)
+                            # 1e-2 sits in the bf16 forward-difference sweet spot:
+                            # large enough to clear the ~2e-3 bf16 noise floor,
+                            # small enough that O(eps²) curvature error stays below
+                            # the linear directional-derivative signal.
+                            eps_step = 1e-2
+                            # Detach B̄ on the FD probe: keeps second-order
+                            # curvature out of the Parcae B̄ training signal
+                            # (denoising below intentionally keeps live B̄).
+                            aux_b_bar_d = aux_b_bar.detach() if aux_b_bar is not None else None
+                            u_base = sb(z_base, x0_base, aux_b_bar_d)
+                            u_pert = sb(z_base + eps_step * eps_unit, x0_base, aux_b_bar_d)
+                            expansion = (u_pert - u_base).float().pow(2).mean().sqrt() / float(eps_step)
+                            lyap_loss = torch.relu(expansion - float(base_model.lyapunov_gamma)).pow(2)
                             # Multiply by grad_accum_steps so the per-optimizer-step
                             # gradient contribution matches the documented coef
                             # (last-only aux otherwise gets attenuated by 1/N
                             # via the global grad_scale division below).
-                            loss = loss + grad_accum_steps * lyap_scale * lyap_coef * scale_t.to(dtype=surrogate.dtype) * surrogate
+                            loss = loss + grad_accum_steps * lyap_scale * lyap_coef * lyap_loss.to(dtype=loss.dtype)
                         if dn_coef > 0.0:
                             dn_std = float(args.denoising_noise_std)
                             eps_noise = torch.randn_like(z_star) * dn_std
@@ -7058,9 +7279,9 @@ def main() -> None:
 
         meta_path = weights_dir / "meta.json"
         with open(meta_path, "w") as f:
-            # run_valid stays false until the post-int6 assertions pass AND
-            # val_bpb is finalized at the end of main().  If the run aborts
-            # between here and there, stale run_valid=false keeps
+            # run_valid stays false until full final val_bpb is finalized at
+            # the end of main(). If the run aborts between here and there,
+            # stale run_valid=false keeps
             # update_results.sh --promote from picking it up.
             # Write both step/steps and commit/git_commit for schema compat.
             _git_commit = subprocess.run(
@@ -7143,108 +7364,6 @@ def main() -> None:
     )
     log0(f"roundtrip_verification:done val_loss:{val_loss_q:.4f} val_bpb:{val_bpb_q:.6f}")
 
-    def _compute_eval_fp_lipschitz(
-        base_m,
-        n_hutch: int = 8,
-        n_finite_diff: int = 5,
-        n_spectral_power: int = 3,
-        eps_step: float = 1e-3,
-        B_probe: int = 1,
-    ) -> tuple[float | None, float | None, float | None]:
-        """Three local fixed-point probes at the saved DEQ FP z*.
-
-        - Hutchinson-Frobenius (resurrected from iter 88 dead code, commit
-          ceb7dfa): for random Rademacher v with ``E[v v^T] = I``,
-          ``E[||J^T v||²] = ||J||²_F``. Reports
-          ``rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)`` — proxy for
-          average-singular-value-squared, not a contraction certificate.
-        - Spectral norm power iteration: estimates ``||J||_2``. The true
-          condition ``||J||_2 < 1`` is sufficient for local contraction around
-          z* when J is continuous. The raw estimate feeds the stricter
-          ``lip_ub`` metric used by the gates.
-        - Finite-direction random step: for unit ``v̂``,
-          ``||T_θ(z* + eps·v̂) - T_θ(z*)|| / eps ≈ ||J·v̂||``. Sampled
-          along ``n_finite_diff`` random directions; report the max as a
-          single-shot operator-norm lower bound.
-
-        Returns ``(rho_F, rho_op, rho_spec)`` or all-None if z*/x0 unavailable.
-        Caller should run AFTER a forward pass that populates the model's
-        ``_lyapunov_z_star`` and ``_lyapunov_x0`` attributes (set by
-        ``GPT.forward`` at L2870-2871; populated on every forward including
-        eval).
-
-        iter 97.5b-fix (2026-04-29): ``B_probe=1`` slicing (default) bounds
-        the JVP/forward graph to a single sequence — without it the SharedBlock
-        forward through 12 layers × 16 attn + 16 mlp experts at full val
-        batch size needs ~32 GiB activation memory, which is the actual root
-        cause of `hutch_F: N/A` across all K-sweep entries in iter 100b
-        (NOT SDPA backend rejection as previously documented). Both probes
-        are unbiased at any batch size for an LM with translation-invariant
-        attention; B_probe=1 yields a representative spectral estimate.
-        """
-        prepared = _prepare_saved_fp_probe(base_m, B_probe)
-        if prepared is None:
-            return None, None, None
-        z_star, x0_lyap, b_bar_d, sb, target_dtype, ctx_factory = prepared
-
-        # OOM-safe + general-fallback probe wrapper. Both probes share the
-        # same `try / except OutOfMemoryError / except Exception` outer
-        # structure; the wrapper centralizes the ksweep_skip_reason logging
-        # and post-OOM cache cleanup so the inner closures only describe
-        # the probe math.
-        def _try_probe(name: str, fn):
-            try:
-                torch.cuda.empty_cache()
-                return fn()
-            except torch.cuda.OutOfMemoryError as e:
-                print(f"ksweep_skip_reason:{name} oom_runtime {e}", flush=True)
-                torch.cuda.empty_cache()
-                return None
-            except Exception as e:
-                print(f"[{name} probe failed] {type(e).__name__}: {e}", flush=True)
-                return None
-
-        # iter 117b-1 (2026-04-30): delegate to module-level _run_hutchinson_F
-        # helper (DRY refactor — same code path as the val-checkpoint probe
-        # at _hutchinson_F_at_saved_fp). Eliminates the iter 97.5b-fix2/3
-        # divergence pattern where the same dtype-mismatch bug had to be
-        # patched in two places. n_hutch is clamped to 2 here (K-sweep peak
-        # VRAM is tighter than val checkpoints; variance is acceptable for
-        # a per-K diagnostic).
-        def _hutch_F_probe() -> float | None:
-            return _run_hutchinson_F(
-                z_star, x0_lyap, b_bar_d, sb, target_dtype,
-                min(n_hutch, 2), ctx_factory,
-            )
-
-        def _spec_norm_probe() -> float | None:
-            return _run_spectral_norm_power(
-                z_star, x0_lyap, b_bar_d, sb, target_dtype,
-                n_spectral_power, ctx_factory,
-            )
-
-        # Finite-direction random-step Lipschitz sample. Avoid `.item()`
-        # GPU→CPU sync inside the loop by clamping in-place.
-        # iter 97.5b-fix3 (2026-04-30): autocast wrapper added (same reason
-        # as _hutch_F_probe above).
-        def _rd_step_probe() -> float | None:
-            samples: list[float] = []
-            with ctx_factory(), torch.no_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
-                u_base = sb(z_star, x0_lyap, b_bar_d)
-                for _ in range(n_finite_diff):
-                    eps_dir = torch.randn_like(z_star)
-                    eps_norm = eps_dir.float().norm().clamp(min=1e-8)
-                    eps_unit = eps_dir / eps_norm
-                    u_pert = sb(z_star + eps_step * eps_unit, x0_lyap, b_bar_d)
-                    samples.append(
-                        float((u_pert - u_base).float().norm().item()) / eps_step)
-                    del eps_dir, eps_unit, u_pert
-            return max(samples) if samples else None
-
-        rho_F = _try_probe("hutch_F", _hutch_F_probe)
-        rho_spec = _try_probe("spec_norm", _spec_norm_probe)
-        rho_op = _try_probe("rd_step", _rd_step_probe)
-        return rho_F, rho_op, rho_spec
 
     # DEQ fixed-point K-sweep: verify val_bpb improves (or plateaus) as K grows.
     # A valid DEQ should converge to a fixed point — more solver iterations = better
@@ -7252,13 +7371,11 @@ def main() -> None:
     # is exploiting a specific iteration count rather than a true fixed point.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
     #
-    # iter 97.6 (PERMANENT, 2026-04-26): K-sweep harness now includes
-    # (a) Hutchinson-Frobenius average-singular-value proxy at the converged FP,
-    # (b) spectral-norm power estimate plus conservative lip_ub metric for
-    #     the sufficient local contraction condition ||dT/dz||_2 < 1,
-    # (c) finite-direction random-step Lipschitz sample (operator-norm proxy),
-    # (d) acyclicity primes K=17, 37, 113 — coprime to {2,3,4,5,12,20} to
-    #     detect period-L cycles aliased by power-of-2 sampling.
+    # iter 146 diagnostic simplification (2026-05-08): K-sweep reports one
+    # local contraction metric, lip_ub. The residual-side diagnostics
+    # iter_conv_rel/fp_bound remain because they answer a separate question:
+    # whether the solved iterate is close to the local fixed point when
+    # lip_ub < 1.
     log0("k_sweep:start")
     # T-opt 15: Reset dynamo before K-sweep to prevent recompilation storm.
     # Different K values change iteration counts, triggering dynamo guards
@@ -7274,7 +7391,6 @@ def main() -> None:
     # cross-depth diagnostics).
     k_sweep_values = [4, 8, 16, 17, 24, 32, 37, 64, 113, 128]
     k_sweep_results: dict[int, float] = {}
-    k_sweep_spec_norms: dict[int, float] = {}
     k_sweep_lip_ubs: dict[int, float] = {}
 
     # iter 100b user directive (PERMANENT 2026-04-27): emit a structured
@@ -7294,10 +7410,12 @@ def main() -> None:
         sb = _unwrap_compiled_module(sb_raw)
         out: dict[str, float] = {}
         if getattr(sb, "chained_stack", None) is not None:
+            routers_for_conf: list[SoftDenseRouter] = []
             cvs: list[float] = []
             mins: list[float] = []
             ents: list[float] = []
             for router in _iter_unique_routers(sb):
+                routers_for_conf.append(router)
                 if hasattr(router, "_materialize_diag_lists"):
                     router._materialize_diag_lists()
                 usage = getattr(router, "_expert_usage", None)
@@ -7334,6 +7452,7 @@ def main() -> None:
             sg = getattr(sb, "_shared_gate_mean", None)
             if sg is not None:
                 out["shared_gate"] = float(sg) if not isinstance(sg, torch.Tensor) else float(sg.detach().float().item())
+            out.update(_router_confidence_stats(routers_for_conf))
             return out
         R_total = int(getattr(sb, "num_experts", 0))
         R = R_total - int(getattr(sb, "num_shared_experts", 0))
@@ -7341,6 +7460,7 @@ def main() -> None:
         router = getattr(sb, "router", None)
         if router is None:
             router = getattr(getattr(sb, "attn", None), "attn_router", None)
+        routers_for_conf = [router] if router is not None else []
         if router is not None and hasattr(router, "_materialize_diag_lists"):
             router._materialize_diag_lists()
         usage = getattr(router, "_expert_usage", None) if router else None
@@ -7366,24 +7486,30 @@ def main() -> None:
             comp = getattr(sb, prefix, None)
             if comp is None:
                 continue
-            v_t = getattr(comp, "_out_ortho_cos_sim_t", None)
-            if isinstance(v_t, torch.Tensor):
-                out[f"{prefix}_ortho"] = float(v_t.float().item())
-            else:
-                v = getattr(comp, "_out_ortho_cos_sim", None)
-                if v is not None:
-                    out[f"{prefix}_ortho"] = float(v)
-        sg = getattr(sb, "_shared_gate_mean", None)
+            v = _diag_scalar(getattr(comp, "_out_ortho_cos_sim_t", None))
+            if v is None:
+                v = _diag_scalar(getattr(comp, "_out_ortho_cos_sim", None))
+            if v is not None:
+                out[f"{prefix}_ortho"] = v
+        sg = _diag_scalar(getattr(sb, "_shared_gate_mean", None))
         if sg is not None:
-            out["shared_gate"] = float(sg) if not isinstance(sg, torch.Tensor) else float(sg.detach().float().item())
+            out["shared_gate"] = sg
+        out.update(_router_confidence_stats(routers_for_conf))
         return out
 
     # Tabular K-sweep header — fixed-width columns for grep + visual scanning.
+    # Dirichlet diag columns are derived from ROUTER_DIRICHLET_DIAG_TERMS
+    # (single source of truth — adding a 6th term means a one-line
+    # registry edit, not 8 grep-and-paste sites).
+    _dir_cols = [(short, 10 if short == "dir_sigma" else 9)
+                 for _, _, short in ROUTER_DIRICHLET_DIAG_TERMS]
+    _dir_cols.append((ROUTER_DIRICHLET_BETA_TERM[2], 9))
     _kdiag_cols = [
         ("K", 5), ("val_bpb", 9), ("attn_cv", 8), ("mlp_cv", 8), ("pool_cv", 8),
         ("attn_min", 9), ("mlp_min", 9), ("attn_ortho", 11), ("mlp_ortho", 10),
         ("pertoken_ent", 13), ("pool_ent", 9), ("shared_gate", 12),
-        ("hutch_F", 9), ("spec_norm", 10), ("lip_ub", 9), ("fp_bound", 10), ("rd_step", 9), ("iter_conv_rel", 14),
+        *_dir_cols,
+        ("lip_ub", 9), ("fp_bound", 10), ("iter_conv_rel", 14),
     ]
     def _fmt_kdiag(value: float | None, width: int, name: str = "") -> str:
         if value is None:
@@ -7430,32 +7556,27 @@ def main() -> None:
         resid_t = getattr(base_m_for_roundtrip, "_deq_residual_t", None)
         if isinstance(resid_t, torch.Tensor):
             diag_parts.append(f"residual:{float(resid_t.detach().float().item()):.2f}")
-        # Local FP probes at the saved DEQ FP (z*). `hutch_F` tracks average
-        # contraction; `spec_norm` targets the sufficient local contraction
-        # condition ||dT/dz||_2 < 1; `rd_step` is a finite-direction sanity
-        # sample. Report all per-K beside val_bpb and iter_conv_rel.
-        rho_F, rho_op, rho_spec = _compute_eval_fp_lipschitz(
-            base_m_for_roundtrip,
-            n_spectral_power=int(getattr(args, "fp_lip_power_iters", 3)),
+        kdiag = _collect_eval_kdiag(base_m_for_roundtrip)
+        _conf_names = tuple(name for name, _, _ in ROUTER_DIRICHLET_DIAG_TERMS) + (
+            ROUTER_DIRICHLET_BETA_TERM[0],
         )
-        if rho_F is not None:
-            diag_parts.append(f"hutch_F:{rho_F:.4f}")
-        if rho_spec is not None:
-            diag_parts.append(f"spec_norm:{rho_spec:.4f}")
-            k_sweep_spec_norms[k_eval] = float(rho_spec)
-        lip_ub = _lipschitz_upper_bound_metric(
-            rho_spec,
+        for conf_name in _conf_names:
+            conf_value = kdiag.get(conf_name)
+            if conf_value is not None:
+                diag_parts.append(f"{conf_name}:{float(conf_value):.4f}")
+        # Local FP contraction metric at the saved DEQ FP (z*).
+        lip_ub = _lip_ub_at_saved_fp(
+            base_m_for_roundtrip,
+            n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
             safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
             margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
+            log_label="ksweep_skip_reason:lip_ub",
         )
         if lip_ub is not None:
             diag_parts.append(f"lip_ub:{lip_ub:.4f}")
             k_sweep_lip_ubs[k_eval] = float(lip_ub)
-        if rho_op is not None:
-            diag_parts.append(f"rd_step:{rho_op:.4f}")
         log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
         # iter 100b user directive (PERMANENT): tabular per-K row.
-        kdiag = _collect_eval_kdiag(base_m_for_roundtrip)
         conv_rel_val = float(conv_rel_t.detach().float().item()) if isinstance(conv_rel_t, torch.Tensor) else None
         fp_bound = _fixed_point_error_bound_metric(conv_rel_val, lip_ub)
         kdiag_row = {
@@ -7471,23 +7592,21 @@ def main() -> None:
             "pertoken_ent": kdiag.get("pertoken_ent"),
             "pool_ent": kdiag.get("pool_ent"),
             "shared_gate": kdiag.get("shared_gate"),
-            "hutch_F": rho_F,
-            "spec_norm": rho_spec,
+            **{short: kdiag.get(name) for name, _, short in ROUTER_DIRICHLET_DIAG_TERMS},
+            ROUTER_DIRICHLET_BETA_TERM[2]: kdiag.get(ROUTER_DIRICHLET_BETA_TERM[0]),
             "lip_ub": lip_ub,
             "fp_bound": fp_bound,
-            "rd_step": rho_op,
             "iter_conv_rel": conv_rel_val,
         }
         log0("k_sweep_table:" + " ".join(_fmt_kdiag(kdiag_row[name], w, name) for name, w in _kdiag_cols))
     k_parts = " ".join(f"k{k}:{b:.6f}" for k, b in k_sweep_results.items())
-    log0(f"k_sweep:done {k_parts}")
+    log0(f"k_sweep:done {k_parts}{format_k_jitter_info()}")
 
-    # ── Final HARD assertions on post-int6 model health ──────────────────
+    # ── Final diagnostic gates on post-int6 model health ─────────────────
     # Run after the K-sweep so all diagnostics are populated from the highest
-    # K eval pass.  These are HARD failures — they raise RuntimeError if the
-    # trained model violates the architectural invariants (expert health,
-    # DEQ input-dependence, FP convergence).  The run cannot be promoted to
-    # baseline unless every assertion passes.
+    # K eval pass.  These gates are diagnostics under the val_bpb-primary
+    # promotion policy: failures emit retry prescriptions and tech-debt status,
+    # while promotion authority comes from full-set final val_bpb.
     #
     # Expert usage + CV are rank-local per-router state (from the fast K-sweep
     # eval which only batched a subset), so we DDP-all-reduce them here to get
@@ -7753,16 +7872,14 @@ def main() -> None:
     conv_rel = _ddp_mean_scalar(conv_rel_local)
 
     # 3. Local contraction certificate: the sufficient differentiable condition
-    # at the fixed point is ||dT/dz||_2 < 1. `lip_ub` is the conservative
-    # numerical upper-bound metric derived from the spectral probe; it is the
-    # gate. `spec_norm` remains the raw estimate. If lip_ub<1, Banach gives
+    # at the fixed point is ||dT/dz||_2 < 1. `lip_ub` is the single reported
+    # conservative numerical local-contraction metric; it is the gate.
+    # If lip_ub<1, Banach gives
     # the a posteriori relative FP-distance proxy
     #   ||z - z*|| / ||z|| <= iter_conv_rel / (1 - lip_ub).
-    # hutch_F stays a trend metric and is intentionally not used as a proof.
     deepest_k = max(k_sweep_values) if k_sweep_values else None
     if deepest_k is not None:
         deepest_lip_ub = _ddp_max_scalar(k_sweep_lip_ubs.get(deepest_k))
-        deepest_spec = _ddp_max_scalar(k_sweep_spec_norms.get(deepest_k))
         if deepest_lip_ub is None:
             _failures.append(
                 f"lip_ub=N/A at K={deepest_k} "
@@ -7776,13 +7893,9 @@ def main() -> None:
         elif conv_rel is not None:
             fp_bound = conv_rel / max(1.0 - deepest_lip_ub, 1e-8)
             if fp_bound > 0.1:
-                spec_context = (
-                    f", spec_norm={deepest_spec:.4f}"
-                    if deepest_spec is not None else ""
-                )
                 _failures.append(
                     f"fp_bound={fp_bound:.4f} > 0.1 at K={deepest_k} "
-                    f"(iter_conv_rel/(1-lip_ub), lip_ub={deepest_lip_ub:.4f}{spec_context})"
+                    f"(iter_conv_rel/(1-lip_ub), lip_ub={deepest_lip_ub:.4f})"
                 )
 
     # 5. Iter convergence: relative convergence must be small at highest K.
@@ -7814,11 +7927,9 @@ def main() -> None:
         )
 
     # Classify each failure and prescribe a fix from the verified-hypothesis
-    # troubleshooting table.  A failed run is INVALID (cannot be promoted to
-    # baseline) but its diagnostics + retry_hint guide the NEXT iteration's
-    # config change — the agent applies the prescribed fix and reruns.  We
-    # do NOT raise here: letting the process exit cleanly preserves all the
-    # artifacts and log output the fix decision needs.
+    # troubleshooting table.  Gate failures are not metadata-invalidating by
+    # themselves; they guide the NEXT iteration's config change. We do NOT
+    # raise here because a clean exit preserves artifacts and log output.
     # `_prescribe_failure_fix` lives at module level for direct unit testing
     # — see experiments/test_arch.py.
     if _failures:
@@ -7886,9 +7997,9 @@ def main() -> None:
         )
         log0(f"sliding_validation:done val_bpb:{sliding_bpb:.6f}")
 
-    # Opt-in full-set validation. Default roundtrip uses full_validation=False
-    # (capped at eval_batch_seqs) for dev wallclock; submission runs set
-    # --final-full-validation=1 so meta_json["val_bpb"] is the full-set score.
+    # Full-set validation is authoritative for promotable final metadata. Fast
+    # roundtrip validation remains logged as `fast_val_bpb`, but it must not be
+    # silently promoted as the final score.
     full_val_bpb: float | None = None
     if bool(getattr(args, "final_full_validation", False)):
         log0("final_full_validation:start")
@@ -7899,29 +8010,32 @@ def main() -> None:
         )
         log0(f"final_full_validation:done val_bpb:{full_val_bpb:.6f}")
 
-    # Master-only: update meta.json with the final val_bpb AND flip
-    # run_valid=true (if all hard assertions passed).  Writing both atomically
-    # at the very end — after sliding val + all eval passes — ensures a crash
-    # between the assertion success and here leaves run_valid=false with
-    # val_bpb=0.0, so update_results.sh --promote refuses a half-finished run.
+    # Master-only: update meta.json with the final authoritative val_bpb and
+    # run_valid flag. Writing both atomically at the very end — after sliding
+    # val + all eval passes — ensures a crash between eval success and here
+    # leaves run_valid=false, so update_results.sh --promote refuses it.
     if master_process and meta_path is not None:
         with open(meta_path, "r") as f:
             meta_json = json.load(f)
-        # Persist both: fast_val_bpb is always the int6 roundtrip score; val_bpb
-        # is the full-set score when --final-full-validation=1, else the fast score.
+        # Persist both: fast_val_bpb is always the int6 roundtrip proxy; val_bpb
+        # is authoritative only when full validation completed.
         meta_json["fast_val_bpb"] = float(val_bpb_q)
-        meta_json["val_bpb"] = float(full_val_bpb if full_val_bpb is not None else val_bpb_q)
-        # POLICY (val_bpb-primary): run_valid=true whenever val_bpb is
-        # written, regardless of gate failures.  Promotion criterion is val_bpb
-        # improvement + 16MB budget; diagnostic-gate failures are recorded as
-        # retry prescriptions for the next iter (meta_json["failure_categories"]
-        # + retry_hint.json) but do not block promotion.
-        meta_json["run_valid"] = True
-        # Status label must match the update_results.sh promotion allowlist
-        # {"validated", "validated_clean", "validated_with_tech_debt"}; gate
-        # failures land in `failure_categories` + retry_hint.json and are
-        # tech debt for the next iter per CLAUDE.md val_bpb-primary policy.
-        meta_json["status"] = "validated_clean" if _assertions_passed else "validated_with_tech_debt"
+        if full_val_bpb is not None:
+            meta_json["val_bpb"] = float(full_val_bpb)
+            # POLICY (val_bpb-primary): run_valid=true once authoritative
+            # full-set val_bpb is written. Gate failures are tech debt for the
+            # next iter, not promotion blockers.
+            meta_json["run_valid"] = True
+            meta_json["status"] = "validated_clean" if _assertions_passed else "validated_with_tech_debt"
+        else:
+            # Fast-only path: keep val_bpb as the fast int6 surrogate so the
+            # downstream JSON schema stays float-typed; promotion is gated on
+            # `run_valid=False` + `status="validated_fast_only"` instead.
+            # update_results.sh refuses to promote these.
+            meta_json["val_bpb"] = float(val_bpb_q)
+            meta_json["run_valid"] = False
+            meta_json["status"] = "validated_fast_only"
+            meta_json["non_promotable_reason"] = "final_full_validation_disabled"
         with open(meta_path, "w") as f:
             json.dump(meta_json, f)
 

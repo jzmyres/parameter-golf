@@ -89,8 +89,8 @@ fi
 
 # --- Step 3: Promote current → baseline (if --promote) ---
 if [ "$PROMOTE" = true ]; then
-    # Refuse to promote if the run was flagged INVALID by post-int6 assertions.
-    # Fail CLOSED: require both run_valid=True AND status=="validated" in meta.json.
+    # Refuse to promote unless final full validation wrote authoritative val_bpb.
+    # Fail CLOSED: require run_valid=True and a promotable status in meta.json.
     # Any of {missing meta.json, JSON parse error, missing keys, False, "other"}
     # refuses promotion.  The old fail-open default silently promoted half-finished
     # runs whose meta.json was truncated.
@@ -103,10 +103,9 @@ if [ "$PROMOTE" = true ]; then
 import json, sys
 try:
     d = json.load(open("$CURRENT_META"))
-    # NEW POLICY (val_bpb-primary): val_bpb_q is recorded → run_valid=true.
+    # POLICY (full-val-bpb-primary): full final val_bpb recorded → run_valid=true.
     # Gate failures are tracked as tech debt (status=validated_with_tech_debt)
-    # but still allow promotion.  Only refuse if val_bpb wasn't written or
-    # status is in_progress / artifact_written (run aborted before final eval).
+    # but still allow promotion. Fast-only scores stay non-promotable.
     valid_statuses = {"validated", "validated_clean", "validated_with_tech_debt"}
     if d.get("run_valid") is True and d.get("status") in valid_statuses:
         print("VALID")
@@ -117,7 +116,7 @@ except Exception:
 PY
 )
     if [ "$run_valid" != "VALID" ]; then
-        echo "✗ REFUSING TO PROMOTE — run is INVALID (post-int6 assertions failed or meta.json malformed)."
+        echo "✗ REFUSING TO PROMOTE — run is not promotable (missing full validation or malformed meta.json)."
         if [ -f "$WEIGHTS_DIR/current/retry_hint.json" ]; then
             echo "  See experiments/weights/current/retry_hint.json for prescribed fix."
             python3 -c "import json; d=json.load(open('$WEIGHTS_DIR/current/retry_hint.json')); print('  suggested_config:', d.get('suggested_config', {}))" 2>/dev/null || true
@@ -162,16 +161,16 @@ if ! python -c "import matplotlib" >/dev/null 2>&1; then
     fi
 fi
 
-if "${PLOT_PYTHON[@]}" experiments/plot_metrics.py 2>/dev/null; then
+if "${PLOT_PYTHON[@]}" experiments/plot_metrics.py; then
     echo "Updated metrics_comparison.png"
 else
-    echo "Warning: plot_metrics.py failed (matplotlib missing?)"
+    echo "Warning: plot_metrics.py failed (see stderr above; matplotlib missing or parser error)"
 fi
 
-if "${PLOT_PYTHON[@]}" experiments/plot_progress.py 2>/dev/null; then
+if "${PLOT_PYTHON[@]}" experiments/plot_progress.py; then
     echo "Updated progress.png"
 else
-    echo "Warning: plot_progress.py failed"
+    echo "Warning: plot_progress.py failed (see stderr above)"
 fi
 
 # --- Summary ---
@@ -278,15 +277,27 @@ echo "Weights:"
 for d in baseline previous current; do
     meta="$WEIGHTS_DIR/$d/meta.json"
     if [ -f "$meta" ]; then
-        # Extract key fields from meta.json.  Use .get() with fallbacks so the
-        # script never aborts under `set -e` if a key is missing or spelled
-        # differently across runs (commit/git_commit, step/steps).
-        bpb=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('val_bpb','?'))" 2>/dev/null || echo "?")
-        commit=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('git_commit', d.get('commit','?')))" 2>/dev/null || echo "?")
-        size=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('artifact_bytes','?'))" 2>/dev/null || echo "?")
-        steps=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('steps', d.get('step','?')))" 2>/dev/null || echo "?")
-        valid=$(python3 -c "import json; d=json.load(open('$meta')); print(d.get('run_valid', True))" 2>/dev/null || echo "?")
-        echo "  $d/  val_bpb=$bpb  commit=$commit  artifact=${size}B  steps=$steps  valid=$valid"
+        # Extract key fields from meta.json in one pass so a corrupt file
+        # surfaces as a single "malformed" message rather than five "?" cells
+        # that could mask the failure. Field-level fallbacks remain inside
+        # the heredoc.
+        summary=$(python3 - "$meta" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    print(f"MALFORMED: {type(e).__name__}: {e}")
+    sys.exit(0)
+bpb    = d.get("val_bpb", "?")
+commit = d.get("git_commit", d.get("commit", "?"))
+size   = d.get("artifact_bytes", "?")
+steps  = d.get("steps", d.get("step", "?"))
+valid  = d.get("run_valid", True)
+print(f"val_bpb={bpb}  commit={commit}  artifact={size}B  steps={steps}  valid={valid}")
+PY
+)
+        echo "  $d/  $summary"
     else
         echo "  $d/  (no meta.json)"
     fi

@@ -10,7 +10,7 @@ L1639-1731 (BatchedLinearLoRA + BatchedTTTLoRA), L1427+ (forward_ttt),
 L3021+ (eval_val_ttt_phased). The `BatchedLinearLoRA` here is BIT-EQUIVALENT
 to the records implementation.
 
-# Hypothesis (from experiments/hypotheses.md H91)
+# Hypothesis (from experiments/docs/hypotheses.md H91)
 
 Records' SOTA stack uses TTT (Test-Time Training): a small LoRA adapter is
 fine-tuned on each document's prefix at eval time, then frozen and used to

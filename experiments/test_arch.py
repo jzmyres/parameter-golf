@@ -444,6 +444,8 @@ def test_prescribe_min_share_routes_to_cv_loss():
     p_attn = _prescribe_failure_fix("attn_min_share=0.01 < 0.150 (...)")
     assert p_attn["category"] == "router_collapse"
     assert "router_load_cv_coef_mult" in p_attn["config_change"]
+    assert "router_ema_alive_coef_mult" in p_attn["config_change"]
+    assert "router_ema_balance_coef_floor" not in p_attn["config_change"]
 
     p_mlp = _prescribe_failure_fix("mlp_min_share=0.01 < 0.150 (...)")
     assert p_mlp["category"] == "router_collapse"
@@ -457,11 +459,10 @@ def test_prescribe_min_share_routes_to_cv_loss():
 
 
 def test_routing_regularizer_coefficients_match_promoted_defaults():
-    """Promoted iter145r stack: EMA balance is the canonical routing-balance
-    knob, router CV is off by default, and MoS-CV / per-token entropy /
-    expert-output-diversity ride at the new lower coefficients. This test
-    locks the Hyperparameters defaults AND verifies they propagate to a
-    constructed model so signature-default drift is loud, not silent.
+    """Current rescue stack: EMA balance handles averages, alive hinge handles
+    minimum share, router CV is off by default, and diversity uses the
+    coefficient-first values. This locks Hyperparameters defaults and verifies
+    they propagate to a constructed model so signature-default drift is loud.
     """
     from train_gpt import Hyperparameters
     # Required fields exist.
@@ -469,9 +470,12 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
         "router_load_cv_coef",
         "router_ema_balance_coef",
         "router_ema_specialization_coef",
+        "router_ema_alive_coef",
         "router_pertoken_entropy_coef",
         "mos_load_cv_coef",
         "expert_output_diversity_coef",
+        "lyapunov_every",
+        "lyapunov_max_tokens",
         "regularizer_warmup_frac",
         "use_router_sigmoid_gate",
         "router_scoring",
@@ -479,13 +483,16 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
         "weight_decay",
     ):
         assert hasattr(Hyperparameters, name), f"missing Hyperparameters field {name}"
-    # Promoted iter145r values (2026-05-08).
+    # Current root-cause rescue values (2026-05-08).
     assert float(Hyperparameters.router_load_cv_coef) == 0.0
-    assert float(Hyperparameters.router_ema_balance_coef) == 0.15
-    assert float(Hyperparameters.router_ema_specialization_coef) == 0.1
+    assert float(Hyperparameters.router_ema_balance_coef) == 0.30
+    assert float(Hyperparameters.router_ema_specialization_coef) == 0.20
+    assert float(Hyperparameters.router_ema_alive_coef) == 0.02
     assert float(Hyperparameters.router_pertoken_entropy_coef) == 0.1
     assert float(Hyperparameters.mos_load_cv_coef) == 0.15
-    assert float(Hyperparameters.expert_output_diversity_coef) == 0.15
+    assert float(Hyperparameters.expert_output_diversity_coef) == 0.30
+    assert int(Hyperparameters.lyapunov_every) == 16
+    assert int(Hyperparameters.lyapunov_max_tokens) == 64
     assert float(Hyperparameters.regularizer_warmup_frac) == 0.07
     assert bool(Hyperparameters.use_router_sigmoid_gate) is False
     assert str(Hyperparameters.router_scoring) == "dirichlet_ucb"
@@ -501,15 +508,80 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
     # held as `_*_target` private fields and read via the annealer/router.
     model = _make_model(num_experts=4)
     assert float(model.router_load_cv_coef) == 0.0
-    assert float(model.router_ema_balance_coef) == 0.15
-    assert float(model.router_ema_specialization_coef) == 0.1
+    assert float(model.router_ema_alive_coef) == 0.02
+    assert float(model.router_ema_balance_coef) == 0.30
+    assert float(model.router_ema_specialization_coef) == 0.20
     assert float(model.mos_load_cv_coef) == 0.15
-    assert float(model._expert_diversity_coef_target) == 0.15
+    assert float(model._expert_diversity_coef_target) == 0.30
     assert float(model._router_pertoken_entropy_coef_target) == 0.1
     assert float(model.regularizer_warmup_frac) == 0.07
     # use_router_sigmoid_gate lives on each SoftDenseRouter instance.
     for r in model.shared_block.active_routers():
         assert bool(r.use_router_sigmoid_gate) is False
+
+    from train_gpt import _prescribe_failure_fix
+    p_lip = _prescribe_failure_fix("lip_ub=45.0 >= 1.0")
+    assert p_lip["category"] == "local_contraction_failed"
+    assert "lyapunov_coef" in p_lip["config_change"]
+
+
+def test_eval_microbatch_and_mos_expert_settings_are_dry_but_independent():
+    """Validation chunking is configurable, and MoS follows shared expert
+    principles without silently copying main DEQ expert counts/ranks.
+    """
+    from train_gpt import Hyperparameters
+
+    assert int(Hyperparameters.val_micro_batch_seqs) == 48
+
+    model = _make_model(num_experts=4, expert_diversity_kind="cosine")
+    mos = model.mos_head
+    assert mos.mos_output_diversity_kind == model.expert_diversity_kind
+    assert mos.num_experts == mos.num_shared + mos.num_specialized
+    assert mos.num_experts != model.num_experts
+    assert mos.rank != model.shared_block.mlp.expert_rank
+
+
+def test_dirichlet_router_confidence_diagnostics_are_populated():
+    from train_gpt import (
+        SoftDenseRouter,
+        _format_router_confidence_parts,
+        _router_confidence_stats,
+        router_diagnostics,
+    )
+
+    router = SoftDenseRouter(
+        dim=8,
+        num_experts=4,
+        scoring="dirichlet_ucb",
+        dirichlet_ucb_beta=0.5,
+        use_router_sigmoid_gate=False,
+    )
+    x = torch.randn(2, 3, 8)
+    # Confidence reductions are diagnostics-gated (skip on hot path).
+    # Wrap in `router_diagnostics` so the cache populates.
+    with router_diagnostics(enabled=True, step_tag=42):
+        p = router(x)
+    assert p.shape == (2, 3, 4)
+    stats = _router_confidence_stats([router])
+    for name in (
+        "router_dir_strength_mean",
+        "router_dir_uncertainty_mass",
+        "router_dir_sigma_mean",
+        "router_dir_evidence_mean",
+        "router_dir_mu_entropy_norm",
+        "router_ucb_beta_current",
+    ):
+        assert name in stats, f"missing confidence diagnostic {name}"
+        assert stats[name] >= 0.0
+    assert stats["router_ucb_beta_current"] == 0.5
+
+    with router_diagnostics(enabled=True, step_tag=123):
+        _ = router(x)
+    router._expert_usage = None
+    parts = _format_router_confidence_parts([router], step=123, require_step_match=True)
+    assert any(p.startswith("router_dir_strength_mean:") for p in parts)
+    stale_parts = _format_router_confidence_parts([router], step=124, require_step_match=True)
+    assert stale_parts == []
 
 
 def test_fp_probe_uses_eager_forward_when_instance_forward_is_wrapped():

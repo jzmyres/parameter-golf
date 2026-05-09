@@ -147,6 +147,14 @@ equilibrium is a locally exponentially stable attractor.
 \texttt{train\_gpt.py} is the source of truth.  Archived runs under
 \texttt{records/} are historical references and are not described here.
 
+\paragraph{Active training entrypoint.}
+This document treats \texttt{train\_gpt.py} as the only active training
+implementation for the current CUDA/H100 experiments.  The
+\texttt{train\_gpt\_mlx.py} script is an Apple Silicon/MLX starter path for
+Mac-local experimentation and is not used for these training runs,
+architecture decisions, or promotion criteria.  Unless explicitly working on
+Mac/MLX support, ignore \texttt{train\_gpt\_mlx.py}.
+
 \begin{center}\small
 \begin{tabular}{ll|ll}
 \toprule
@@ -155,30 +163,31 @@ equilibrium is a locally exponentially stable attractor.
 \texttt{vocab\_size} & 1024 & \texttt{train\_seq\_len} & 2048 \\
 \texttt{train\_batch\_tokens} & 524,288 & \texttt{iterations} & 1000 \\
 \texttt{max\_training\_seconds} & 0 & \texttt{eval\_reservation\_seconds} & 120 \\
-\texttt{max\_wallclock\_seconds} & deprecated alias & \texttt{num\_layers} & 12 \\
-\texttt{model\_dim} & 768 & \texttt{num\_heads} & 8 \\
-\texttt{num\_kv\_heads} & 4 & \texttt{num\_experts} & 16 \\
-\texttt{num\_shared\_experts} & 1 & \texttt{mlp\_mult} & 3.0 \\
-\texttt{attn\_expert\_rank} & 64 & \texttt{mlp\_expert\_rank} & 96 \\
-\texttt{kv\_latent\_dim} & auto $D/2$ & \texttt{tie\_embeddings} & true \\
-\texttt{bigram\_vocab\_size} & 0 & \texttt{use\_ctp} & false \\
-\texttt{num\_refinements} & 0 & \texttt{num\_refinements\_ramp\_frac} & 0.85 \\
-\texttt{use\_parcae} & true & \texttt{parcae\_init\_a\_bar} & 0.7 \\
-\texttt{parcae\_init\_b\_bar} & 0.3 & \texttt{parcae\_lr} & 0.002 \\
-\texttt{deq\_backward} & revdeq only & \texttt{deq\_bptt\_k} & 3 \\
-\texttt{deq\_bptt\_k\_jitter} & false & \texttt{deq\_bptt\_k\_jitter\_set} & $(3)$ \\
-\texttt{deq\_k\_jitter} & true & \texttt{deq\_k\_jitter\_set} & $(16,24)$ \\
+\texttt{final\_full\_validation} & true & \texttt{max\_wallclock\_seconds} & deprecated alias \\
+\texttt{num\_layers} & 12 & \texttt{model\_dim} & 768 \\
+\texttt{num\_heads} & 8 & \texttt{num\_kv\_heads} & 4 \\
+\texttt{num\_experts} & 16 & \texttt{num\_shared\_experts} & 0 \\
+\texttt{mlp\_mult} & 3.0 & \texttt{attn\_expert\_rank} & 64 \\
+\texttt{mlp\_expert\_rank} & 96 & \texttt{kv\_latent\_dim} & auto $D/2$ \\
+\texttt{tie\_embeddings} & true & \texttt{bigram\_vocab\_size} & 0 \\
+\texttt{use\_ctp} & false & \texttt{num\_refinements} & 0 \\
+\texttt{num\_refinements\_ramp\_frac} & 0.85 & \texttt{use\_parcae} & true \\
+\texttt{parcae\_init\_a\_bar} & 0.7 & \texttt{parcae\_init\_b\_bar} & 0.3 \\
+\texttt{parcae\_lr} & 0.002 & \texttt{deq\_backward} & revdeq only \\
+\texttt{deq\_bptt\_k} & 3 & \texttt{deq\_bptt\_k\_jitter} & false \\
+\texttt{deq\_bptt\_k\_jitter\_set} & $(3)$ & \texttt{deq\_k\_jitter} & true \\
+\texttt{deq\_k\_jitter\_set} & $(16,24,32,64)$ & \texttt{deq\_k\_jitter\_weights} & $(0.50,0.40,0.07,0.03)$ \\
 \texttt{deq\_k\_eval} & 16 & \texttt{router\_scoring} & dirichlet\_ucb \\
 \texttt{router\_dirichlet\_ucb\_beta} & 0.5 & \texttt{use\_router\_sigmoid\_gate} & false \\
 \texttt{lyapunov\_coef} & 0.0 & \texttt{lyapunov\_gamma} & 0.97 \\
-\texttt{lyapunov\_warmup\_frac} & 0.05 & \texttt{denoising\_coef} & 0.0 \\
-\texttt{denoising\_noise\_std} & 0.01 & \texttt{grad\_clip\_norm} & 1.0 \\
-\texttt{weight\_decay} & 0.015 & \texttt{router\_load\_cv\_coef} & 0.0 \\
-\texttt{router\_ema\_balance\_coef} & 0.15 & \texttt{router\_ema\_specialization\_coef} & 0.1 \\
-\texttt{router\_ema\_alive\_coef} & 0.0 & \texttt{router\_pertoken\_entropy\_coef} & 0.1 \\
-\texttt{mos\_load\_cv\_coef} & 0.15 & \texttt{regularizer\_warmup\_frac} & 0.07 \\
-\texttt{expert\_diversity\_kind} & cosine & \texttt{expert\_output\_diversity\_coef} & 0.15 \\
-\texttt{mos\_output\_diversity\_coef} & 0.0 & & \\
+\texttt{lyapunov\_every} & 16 & \texttt{lyapunov\_max\_tokens} & 64 \\
+\texttt{denoising\_coef} & 0.0 & \texttt{denoising\_noise\_std} & 0.01 \\
+\texttt{grad\_clip\_norm} & 1.0 & \texttt{weight\_decay} & 0.015 \\
+\texttt{router\_load\_cv\_coef} & 0.0 & \texttt{router\_ema\_balance\_coef} & 0.30 \\
+\texttt{router\_ema\_specialization\_coef} & 0.20 & \texttt{router\_ema\_alive\_coef} & 0.02 \\
+\texttt{router\_pertoken\_entropy\_coef} & 0.1 & \texttt{mos\_load\_cv\_coef} & 0.15 \\
+\texttt{regularizer\_warmup\_frac} & 0.07 & \texttt{expert\_diversity\_kind} & cosine max-pair \\
+\texttt{expert\_output\_diversity\_coef} & 0.30 & \texttt{mos\_output\_diversity\_coef} & 0.0 \\
 \texttt{use\_entmax\_routing} & false & \texttt{entmax\_blend\_init\_logit} & 5.0 \\
 \texttt{use\_nsa\_attention} & false & \texttt{use\_smear\_gate} & false \\
 \texttt{muon\_backend\_steps} & 7 & \texttt{use\_polar\_express\_ns} & true \\
@@ -300,9 +309,9 @@ a token is near equilibrium.  Health metrics renormalize shares within each
 routed component before checking balance; total routed mass is logged
 separately.
 
-\paragraph{Implementation deviates from \S\ref{sec:router}: iter145r promoted
-defaults.} As of the iter145r promotion (2026-05-08, see
-\texttt{experiments/hypotheses.md}), the implementation defaults run a
+\paragraph{Current implementation.} As of the current CUDA/H100 training path
+(2026-05-08, see
+\texttt{experiments/docs/hypotheses.md}), the implementation defaults run a
 Dirichlet-UCB scorer with the routed sigmoid gate disabled.  Per token,
 $\alpha = \softplus(\ell(h)) + 1$ defines a Dirichlet posterior with mean
 $\mu = \alpha / \sum \alpha$ and per-expert standard deviation
@@ -313,15 +322,17 @@ training.  With \texttt{use\_router\_sigmoid\_gate=False} the
 $\sum_e p_e(h)\le 1$ suppress-bank capability is also off — total routed mass
 is exactly $1$ at every token.  The CV regularizer
 (\texttt{router\_load\_cv\_coef}) is replaced by EMA-anchored balance and
-specialization terms with a straight-through current-routing anchor (see the
-loss section).  A full paper-side rewrite of this subsection is queued for
-the iter146 commit; until then, treat \texttt{train\_gpt.py::Hyperparameters}
-as authoritative.
+specialization terms plus a small strict alive hinge with a straight-through
+current-routing anchor (see the loss section).  Treat
+\texttt{train\_gpt.py::Hyperparameters} as authoritative if this mirror drifts.
 
 The block uses one pooled router over $2R$ routed outputs, where $S$ is the
 number of shared experts and $R=E-S$.  The first $R$ entries route attention
-experts and the last $R$ route MLP experts.  The $S$ shared experts bypass the
-router and are modulated by learned sigmoid gates.
+experts and the last $R$ route MLP experts.  In the iter146 rescue stack
+default ($S=0$, no routed sigmoid gate), every expert is routed and routed
+mass is always applied; if a future ablation re-enables shared experts,
+the $S$ always-on experts bypass the router and are independently modulated
+(legacy sigmoid gates, default off).
 
 \subsection{Independent Expert Computation}
 \label{sec:experts}
@@ -455,7 +466,8 @@ to the fixed-point equation
 \]
 
 The default training step samples the forward iteration count from
-$K\in\{16,24\}$ using a shuffle-bag sampler.  Evaluation defaults to
+$K\in\{16,24,32,64\}$ using a deterministic weighted bag with weights
+$(0.50,0.40,0.07,0.03)$.  Evaluation defaults to
 $K=16$, and the final diagnostic sweep evaluates
 \[
   K\in\{4,8,16,17,24,32,37,64,113,128\}
@@ -610,16 +622,17 @@ $\tau=$\texttt{min\_share\_frac}, and $p^{\rm token}_r$ is the per-token share.
 The minus sign on the specialization term reflects KL maximization: minimizing
 $-\lambda_{\rm spec}\,\mathrm{KL}$ pushes per-token routing AWAY from the
 historical mean, bounded by $\log(E)$ since $\bar p$ is normalized and clamped.
-Promoted coefficients: $\lambda_{\rm rcv}=0.0$ (CV off by default; remains
+Current coefficients: $\lambda_{\rm rcv}=0.0$ (CV off by default; remains
 available),
-$\lambda_{\rm bal}=0.15$, $\lambda_{\rm spec}=0.1$, $\lambda_{\rm alive}=0.0$,
-$\lambda_{\rm ent}=0.1$, $\lambda_{\rm mcv}=0.15$, $\lambda_{\rm div}=0.15$,
+$\lambda_{\rm bal}=0.30$, $\lambda_{\rm spec}=0.20$, $\lambda_{\rm alive}=0.02$,
+$\lambda_{\rm ent}=0.1$, $\lambda_{\rm mcv}=0.15$, $\lambda_{\rm div}=0.30$,
 $\lambda_{\rm mosdiv}=0.0$, with all coefficients ramped linearly over the
 first \texttt{regularizer\_warmup\_frac=0.07} of training.  The
 \texttt{use\_router\_sigmoid\_gate=False} default also means $m_r$ is the bare
-softmax/Dirichlet-UCB output (no $\sigma(g)$ multiplier).  A full paper rewrite
-of this subsection is queued for the iter146 commit; until then,
-\texttt{train\_gpt.py::Hyperparameters} and the
+softmax/Dirichlet-UCB output (no $\sigma(g)$ multiplier).  For the cosine
+expert-output diversity path, $\mathcal{D}_{\rm experts}$ is the mean over
+sampled tokens of the worst off-diagonal squared cosine pair, not the average
+over all pairs.  \texttt{train\_gpt.py::Hyperparameters} and the
 \texttt{ROUTER\_EMA\_LOSS\_TERMS} registry are authoritative on the EMA-family
 sign convention.
 
@@ -634,45 +647,32 @@ $\lambda_D=\texttt{denoising\_coef}$) default to $0.0$, so neither penalty
 contributes to the training loss as configured; the rest of this section
 describes the code path that activates when the coefficients are set positive.
 
-\paragraph{Hutchinson-Frobenius surrogate.}
-Draw a Rademacher probe $v\in\{-1,+1\}^{B\times T\times D}$ and set
-$z_b=\stopgrad(z^\star)$ with \texttt{requires\_grad=True}.  Compute
+\paragraph{Finite-expansion transition penalty.}
+Draw a Gaussian perturbation direction $v$ on a small deterministic token
+window and normalize it to RMS one, $\mathrm{rms}(\hat v)=1$.  With
+$\epsilon=10^{-2}$, compute the local expansion sample
 \[
-  u_b = T_\theta(z_b,x_0;\stopgrad(\bar B)),
-  \qquad
-  q = \nabla_{z_b}\langle u_b,v\rangle
-      = J(z_b)^\top v,
-\]
-where $J(z_b)=\nabla_z T_\theta(z_b,x_0;\bar B)$.  The sample estimate is
-\[
-  \hat\rho_{\rm sample}
-    = \sqrt{\frac{1}{BTD}\|q\|_2^2}.
-\]
-The implementation keeps a GPU-resident EMA
-\[
-  \hat\rho \leftarrow 0.9\,\hat\rho + 0.1\,\hat\rho_{\rm sample}.
-\]
-The VJP path uses detached $\bar B$ so the probe is a diagnostic, not a
-second-order learning signal.
-
-The trainable first-order surrogate re-evaluates the block with live $\bar B$:
-\[
-  \hat v = \frac{q}{\|q\|_2+\epsilon},\qquad
-  c = \stopgrad\left(\frac{(\hat\rho-\gamma)_+}{\max(\hat\rho,\epsilon)}\right),
+  r =
+  \frac{
+    \operatorname{rms}\!\left(
+      T_\theta(\stopgrad(z^\star)+\epsilon\hat v,x_0;\bar B)
+      -
+      T_\theta(\stopgrad(z^\star),x_0;\bar B)
+    \right)
+  }{\epsilon}.
 \]
 \begin{equation}
   \mathcal{L}_{\rm jac}
-    = \lambda_{\rm jac}\,s(t)\,c\,
-      \left|\left\langle
-        T_\theta(\stopgrad(z^\star),x_0;\bar B),\hat v
-      \right\rangle\right|.
+    = \lambda_{\rm jac}\,s(t)\,(r-\gamma)_+^2.
   \label{eq:ljac}
 \end{equation}
-Here $\gamma=0.97$, and $s(t)$ ramps linearly over the first 5\% of training.
-This avoids \texttt{create\_graph=True} and
-\texttt{retain\_graph=True}; gradients reach $\theta$ and Parcae's live
-$\bar B$ through the second block evaluation.  The coefficient
-$\lambda_{\rm jac}$ is the runtime value of \texttt{lyapunov\_coef}; it is
+Here $\gamma=0.97$, and $s(t)$ is the same regularizer warmup scale used for
+the router/diversity stack.  The penalty runs every
+\texttt{lyapunov\_every=16} optimizer steps on at most
+\texttt{lyapunov\_max\_tokens=64} tokens.  It constrains the transition map
+itself rather than the scalar solver blend; gradients reach $\theta$ and
+Parcae's live $\bar B$ through the two block evaluations.  The coefficient
+$\lambda_{\rm jac}$ is the runtime value of \texttt{lyapunov\_coef}; it remains
 $0.0$ by default.
 
 \paragraph{Finite-perturbation denoising.}

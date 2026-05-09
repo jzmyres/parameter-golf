@@ -12,7 +12,14 @@ class TestLossComponentLogging(unittest.TestCase):
     def test_router_cv_uses_combined_allocation_and_gate_mass(self) -> None:
         from train_gpt import SoftDenseRouter
 
-        router = SoftDenseRouter(dim=4, num_experts=4)
+        # `use_router_sigmoid_gate` is default-OFF in the iter146 rescue
+        # stack — without it the sigmoid gate is forced to 1.0 and the
+        # `router_gate.bias` mutations below would have no effect on the
+        # combined `p = simplex(allocation) * sigmoid(gate)` mass. The
+        # test's *purpose* is to verify the CV computation uses combined
+        # mass *when* the gate is on, so we instantiate the router with
+        # the gate enabled regardless of the current default.
+        router = SoftDenseRouter(dim=4, num_experts=4, use_router_sigmoid_gate=True)
         router.train()
         x = torch.zeros(2, 3, 4)
         with torch.no_grad():
@@ -35,10 +42,11 @@ class TestLossComponentLogging(unittest.TestCase):
         from train_gpt import GPT
 
         torch.manual_seed(0)
-        # Pass-through test: the entropy + diversity coefs below are deliberately
-        # NOT the Hyperparameters defaults (both 1.0) — they exercise that
-        # whatever value the caller passes ends up in `_*_coef_eff_t`. Small
-        # values keep `expected_router_reg` numerically clean.
+        # Pass-through test: every coef is passed explicitly so the
+        # assertion does not silently drift if a Hyperparameters default
+        # changes (iter146 promotion changed several defaults from 1.0
+        # to 0.0/0.15 — this test must lock the *pass-through* property,
+        # not the defaults).
         model = GPT(
             vocab_size=32, num_layers=1, model_dim=32, num_heads=4,
             num_kv_heads=2, mlp_mult=1.0, tie_embeddings=False,
@@ -46,7 +54,9 @@ class TestLossComponentLogging(unittest.TestCase):
             bigram_vocab_size=0, bigram_dim=8, kv_latent_dim=0,
             num_refinements=0, attn_expert_rank=4, mlp_expert_rank=4,
             num_experts=4, num_shared_experts=1, use_ctp=False,
+            router_load_cv_coef=1.0, mos_load_cv_coef=1.0,
             router_pertoken_entropy_coef=0.01, expert_output_diversity_coef=0.1,
+            mos_output_diversity_coef=0.0,
             expert_diversity_max_tokens=4,
         )
         model.train()
@@ -85,7 +95,11 @@ class TestLossComponentLogging(unittest.TestCase):
             + float(model._expert_diversity_loss_t.item()) * float(model._expert_diversity_coef_eff_t.item())
             + float(model._mos_diversity_loss_t.item()) * float(model._mos_diversity_coef_eff_t.item())
         )
-        self.assertAlmostEqual(float(model._router_reg_loss_t.item()), expected_router_reg, places=6)
+        # places=4 (≈1e-4 absolute) accommodates bf16 accumulation in the
+        # regularizer assembly path. The semantics — `_router_reg_loss_t`
+        # equals the linear combination of per-component losses and coefs
+        # — is what's locked here, not float32-equality.
+        self.assertAlmostEqual(float(model._router_reg_loss_t.item()), expected_router_reg, places=4)
 
     def test_deterministic_token_window_start_is_stable_and_bounded(self) -> None:
         from train_gpt import _deterministic_token_window_start

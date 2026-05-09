@@ -2,7 +2,7 @@
 
 Drop-in component for `train_gpt.py::Block` when `use_chained_routing=True`.
 
-# Design (matches experiments/hypotheses.md H77)
+# Design (matches experiments/docs/hypotheses.md H77)
 
 Single-stage baseline (iter 117 v5 / iter 117b-1):
     T_θ(z, x_0) = Δ(z, x_0) + B̄ ⊙ RMSNorm(x_0)

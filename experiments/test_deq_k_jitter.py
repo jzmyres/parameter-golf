@@ -1,7 +1,7 @@
 """K-jitter / sampler tests aligned to current defaults.
 
-Current baseline enables forward-K jitter over {16, 24}; TBPTT-k jitter remains
-disabled with fixed k=3. Tests cover the sampler mechanics and the
+Current baseline enables weighted forward-K jitter over {16, 24, 32, 64};
+TBPTT-k jitter remains disabled with fixed k=3. Tests cover the sampler mechanics and the
 Hyperparameters defaults that gate it.
 """
 import os
@@ -18,13 +18,15 @@ from train_gpt import Hyperparameters, KShuffleBagSampler, _parse_cli_overrides
 class TestDeqKJitterDefaults(unittest.TestCase):
     def test_hparams_have_k_jitter_defaults(self):
         # Required fields.
-        for f in ("deq_k_jitter", "deq_k_min", "deq_k_max", "deq_k_eval", "deq_k_jitter_set"):
+        for f in ("deq_k_jitter", "deq_k_min", "deq_k_max", "deq_k_eval",
+                  "deq_k_jitter_set", "deq_k_jitter_weights"):
             self.assertTrue(hasattr(Hyperparameters, f), f"missing field: {f}")
-        # Current baseline: forward-K jitter over {16, 24}; eval remains K=16.
+        # Current baseline: weighted forward-K jitter; eval remains K=16.
         self.assertEqual(Hyperparameters.deq_k_jitter, True)
-        self.assertEqual(Hyperparameters.deq_k_max, 24)
+        self.assertEqual(Hyperparameters.deq_k_max, 64)
         self.assertEqual(Hyperparameters.deq_k_eval, 16)
-        self.assertEqual(Hyperparameters.deq_k_jitter_set, (16, 24))
+        self.assertEqual(Hyperparameters.deq_k_jitter_set, (16, 24, 32, 64))
+        self.assertEqual(Hyperparameters.deq_k_jitter_weights, (0.50, 0.40, 0.07, 0.03))
         self.assertGreaterEqual(Hyperparameters.deq_k_min, 2)
 
     def test_bptt_k_jitter_defaults(self):

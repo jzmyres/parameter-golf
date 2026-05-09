@@ -38,6 +38,8 @@ This file has two roles, in this order:
 | 2026-05-08 | [#untested-path-executability](#untested-path-executability) | iter145r resume `step=0` reset + iter103 chained `Block` alias landed structurally-correct but never end-to-end exercised |
 | 2026-05-08 | [#sibling-fanout-dry-gate](#sibling-fanout-dry-gate)         | iter145 EMA-loss triplet hand-rolled at 9 sites; future term would be a 9-place grep-and-paste |
 | 2026-05-08 | [#promotion-propagation](#promotion-propagation)             | iter145r promotion changed `Hyperparameters` defaults but signature defaults / regression test / `opg_doc.tex` lagged silently |
+| 2026-05-09 | [#loss-gate-quantity-alignment](#loss-gate-quantity-alignment) | iter146 Lyapunov penalty trains on a Frobenius/√D Hutchinson proxy while the post-final `lip_ub` gate measures operator norm; both share the colloquial name "Lyapunov / contraction" |
+| 2026-05-09 | [#scalar-semantic-shift](#scalar-semantic-shift)              | `max_training_seconds` semantic flipped from process-total to training-only without updating callers; canonical `--max-training-seconds=600` would silently overrun the 600 s 8×H100 invariant by 120 s |
 
 ### Section template
 
@@ -235,7 +237,7 @@ Optional tensor inputs (e.g. `b_bar` when `use_parcae=False`) MUST be stored on 
 **What to do if val_bpb regresses after a strict-generalization promote.**
 - Do NOT revert. The new iter cannot be worse in capacity than the baseline — any regression is an optimization-landscape artifact.
 - Tune in decreasing order of suspicion: (i) LR of the new params, (ii) initialization (try matching baseline at step 0 exactly), (iii) gradient flow paths if the new params sit behind a chain of reparametrizations.
-- Record the diagnostic in `experiments/hypotheses.md` but continue running the next queued iter on top of the new baseline.
+- Record the diagnostic in `experiments/docs/hypotheses.md` but continue running the next queued iter on top of the new baseline.
 
 **Verification recipe.** No grep — this is a promotion-policy invariant. The commit message for any strict-generalization iter must include the three items above, and `CLAUDE.md` Promotion Rules enforce "do not revert".
 
@@ -450,18 +452,18 @@ When effective magnitude differs from documented magnitude (as with the entropy 
 **Date:** 2026-04-30 review
 **Rule in CLAUDE.md:** §9 audit checklist row "CLAUDE.md size budget"
 
-**What happened.** CLAUDE.md grew to 51 887 chars and triggered Claude Code's "Large CLAUDE.md will impact performance (>40 000 chars)" warning. Almost every knob in §5 had accreted a multi-line iter-history annotation ("iter 96 baseline; iter 97 attempt NOT PROMOTED on per-wallclock grounds, see H72…"); §6.3 carried a paragraph-long postmortem of the bottleneck-experts approach; §7 metrics-table prose duplicated definitions already living in `experiments/hypotheses.md`.
+**What happened.** CLAUDE.md grew to 51 887 chars and triggered Claude Code's "Large CLAUDE.md will impact performance (>40 000 chars)" warning. Almost every knob in §5 had accreted a multi-line iter-history annotation ("iter 96 baseline; iter 97 attempt NOT PROMOTED on per-wallclock grounds, see H72…"); §6.3 carried a paragraph-long postmortem of the bottleneck-experts approach; §7 metrics-table prose duplicated definitions already living in `experiments/docs/hypotheses.md`.
 
 **Root cause.** Promotion etiquette put a "why this knob has its current value" annotation on the knob itself. Each annotation was reasonable in isolation; together they coupled a stable rule file (CLAUDE.md) to an unstable narrative file (`hypotheses.md`). Stories about *past* iterations don't compose with rules about the *current* state — they only accumulate.
 
 **The rule.**
 
-> `wc -c CLAUDE.md` < 40 000. Iter-history prose ("iter X NOT PROMOTED because Y") is **content rot in CLAUDE.md** — it belongs in `experiments/hypotheses.md` (per-iter narrative) or `EXPERIENCE.md` §2 (durable lessons). Before adding to CLAUDE.md, ask: "is this an *invariant* (current state) or a *story* (history)?". Invariants stay; stories go elsewhere with a one-line pointer left behind.
+> `wc -c CLAUDE.md` < 40 000. Iter-history prose ("iter X NOT PROMOTED because Y") is **content rot in CLAUDE.md** — it belongs in `experiments/docs/hypotheses.md` (per-iter narrative) or `EXPERIENCE.md` §2 (durable lessons). Before adding to CLAUDE.md, ask: "is this an *invariant* (current state) or a *story* (history)?". Invariants stay; stories go elsewhere with a one-line pointer left behind.
 
 **Verification recipe.**
 - Pre-commit: `wc -c CLAUDE.md` returns < 40 000.
 - Anchor resolution: `grep -oE 'EXPERIENCE.md#[a-z-]+' CLAUDE.md | sort -u`; each anchor has a matching `### <slug>` heading in this file.
-- Knob-row size cap (informal): any config-mirror annotation should fit in one line of prose; longer annotations route to `hypotheses.md` H## with a short pointer left in the mirror.
+- Knob-row size cap (informal): any config-mirror annotation should fit in one line of prose; longer annotations route to `experiments/docs/hypotheses.md` H## with a short pointer left in the mirror.
 
 **Cross-references.** [#config-drift](#config-drift), [#hyperparameter-fanout](#hyperparameter-fanout) — both share the "single source of truth" theme; this rule applies it to *narrative* drift, not numeric drift.
 
@@ -543,13 +545,13 @@ The first command gives instantaneous per-step latency. The second gives cumulat
 **Date:** 2026-05-05 review of iter 142-refactor
 **Rule in CLAUDE.md:** §9 audit checklist row · §7 step 12 (Hypothesis Log)
 
-**What happened.** The iter-142-refactor entry in `experiments/hypotheses.md` (commit `3e62655`) reported a 100-step preview verdict with components (a) roundtrip int6, (b) k_sweep_table, (c) trajectory, (d) acyclicity-prime check — but silently omitted (e) `ntp_loss` descent rate, the permanent-metric component mandated by user directive 2026-05-02. The author implicitly granted themselves an exemption because "100 steps is a partial signal" (per the entry's Caveats) and a longer run was pending. Caught during pre-commit review (this file).
+**What happened.** The iter-142-refactor entry in `experiments/docs/hypotheses.md` (commit `3e62655`) reported a 100-step preview verdict with components (a) roundtrip int6, (b) k_sweep_table, (c) trajectory, (d) acyclicity-prime check — but silently omitted (e) `ntp_loss` descent rate, the permanent-metric component mandated by user directive 2026-05-02. The author implicitly granted themselves an exemption because "100 steps is a partial signal" (per the entry's Caveats) and a longer run was pending. Caught during pre-commit review (this file).
 
 **Root cause.** The five-component requirement was framed assuming a 1000-step run with the canonical descent windows (s30-s100, s100-s200, …). When an iter publishes a verdict from fewer steps, no rule said how to behave — the author silently skipped rather than emitting partial windows. Same shape will recur on every short-budget preview, K-sweep skipped on OOM, log-rotation race, etc.
 
 **The rule.** Partial-step previews are NOT exempt from the 5-component report. Emit the partial windows that are computable (e.g. one s30–s60 row instead of the full s30→s1000 table). If a component is genuinely uncomputable from the run.log (logs rotated, OOM during K-sweep, etc.), state it explicitly under **Caveats** with a recovery plan ("iter-Xa will re-emit"). Silently omitting shifts a tracked debt into an untracked one. **Generalizes**: graceful-degradation > silent-skip for any mandated artifact (k_sweep_table on partial K-coverage, log_summary on missing fields, etc.).
 
-**Verification recipe.** `grep -E "^### iter " experiments/hypotheses.md | tail -5` then inspect the most recent entries. Each must show all 5 §7-step-12 components or an explicit Caveats note for the missing one. Pre-commit reviewers should specifically check that "longer run pending" is paired with whatever partial data IS available, not used as a wholesale exemption.
+**Verification recipe.** `grep -E "^### iter " experiments/docs/hypotheses.md | tail -5` then inspect the most recent entries. Each must show all 5 §7-step-12 components or an explicit Caveats note for the missing one. Pre-commit reviewers should specifically check that "longer run pending" is paired with whatever partial data IS available, not used as a wholesale exemption.
 
 **Cross-references.** Related: [#cumulative-metric-misread](#cumulative-metric-misread) (also a "convenient simplification eats a required signal" pattern), [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (also a "stale exemption survived a regime change" pattern). The unifying theme: **mandated artifacts degrade gracefully; they do not silently skip.**
 
@@ -597,11 +599,11 @@ Magnitude-only edits keep using the existing four-touch hyperparameter rule. Str
    ```bash
    grep -nE "cv_target|cv_hinge|relu\(cv" train_gpt.py opg_doc.tex CLAUDE.md
    ```
-2. Zero matches outside an explicit deviation note (e.g., a row in `experiments/hypotheses.md` documenting why the equation surface intentionally lags) is the post-condition.
+2. Zero matches outside an explicit deviation note (e.g., a row in `experiments/docs/hypotheses.md` documenting why the equation surface intentionally lags) is the post-condition.
 3. If `_prescribe_failure_fix` cites default magnitudes inline, refactor to read defaults dynamically from `Hyperparameters` (drift-proof: `f"{Hyperparameters.foo:g}→{Hyperparameters.foo * mult:g}"`).
 4. Add or rename a focused test that exercises the new form's distinguishing property (e.g., `test_cv_squared_has_gradient_below_old_target` — the old hinge was silent in this regime; the new form is not).
 
-**Cross-references.** Related: [#hyperparameter-fanout](#hyperparameter-fanout) (sibling rule for magnitude-only changes), [#doc-code-invariant](#doc-code-invariant) (parent principle: paper-facing pseudocode must track implementation), [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (companion: prescriptions must reflect current defaults, not historical ones), [#strict-generalization](#strict-generalization) (form changes are usually NOT strict generalizations — promotion gating must use the standard `val_bpb` rule, not the auto-promote shortcut, and the deviation must be recorded in `experiments/hypotheses.md`).
+**Cross-references.** Related: [#hyperparameter-fanout](#hyperparameter-fanout) (sibling rule for magnitude-only changes), [#doc-code-invariant](#doc-code-invariant) (parent principle: paper-facing pseudocode must track implementation), [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (companion: prescriptions must reflect current defaults, not historical ones), [#strict-generalization](#strict-generalization) (form changes are usually NOT strict generalizations — promotion gating must use the standard `val_bpb` rule, not the auto-promote shortcut, and the deviation must be recorded in `experiments/docs/hypotheses.md`).
 
 ### untested-path-executability
 
@@ -629,7 +631,7 @@ Magnitude-only edits keep using the existing four-touch hyperparameter rule. Str
 **Date:** 2026-05-08 pre-commit review of iter145 EMA-anchored loss family
 **Rule in CLAUDE.md:** Audit Checklist row · "Sibling-fanout DRY gate"
 
-**What happened.** iter145 introduced three sibling EMA-anchored routing-loss terms (`alive`, `balance`, `specialization`) added to the existing CV/entropy/MoS-CV stack. The implementation hand-rolled the triplet at nine separate sites: `Hyperparameters` defaults; `SoftDenseRouter.__init__` zero-init; `SoftDenseRouter.forward` else-branch zero-fill; `GPT.__init__` coef field + target store + `_loss_t` cache + `_coef_eff_t` cache; `_collect_routing_losses` accumulators; the annealer; the per-step log f-string; and `experiments/plot_metrics.py` parser/spec list. Adding the (likely) iter146 strict-alive-hinge fourth term would require nine independent edits, each of which is a place to silently drift in sign or magnitude. The Research-Protocol "DRY and orthogonal functions" bullet had been advisory, not a hard audit gate, and an advisory rule does not survive a multi-site fanout.
+**What happened.** iter145 introduced three sibling EMA-anchored routing-loss terms (`alive`, `balance`, `specialization`) added to the existing CV/entropy/MoS-CV stack. The implementation hand-rolled the triplet at nine separate sites: `Hyperparameters` defaults; `SoftDenseRouter.__init__` zero-init; `SoftDenseRouter.forward` else-branch zero-fill; `GPT.__init__` coef field + target store + `_loss_t` cache + `_coef_eff_t` cache; `_collect_routing_losses` accumulators; the annealer; the per-step log f-string; and `experiments/plot_metrics.py` parser/spec list. Adding a future strict-alive-hinge fourth term would require nine independent edits without the registry, each of which is a place to silently drift in sign or magnitude. The Research-Protocol "DRY and orthogonal functions" bullet had been advisory, not a hard audit gate, and an advisory rule does not survive a multi-site fanout.
 
 **Root cause.** Mechanical parallelism between siblings looks "explicit" line-by-line and is easy to write, but every site is a separate place to forget. The `_collect_routing_losses` site additionally separated the sign of the `specialization` term (`-` operator at the call line) from the formula (`KL(token || ema)` at the definition line), so a future reviewer could not tell from the call site whether the sign was a typo or intentional.
 
@@ -662,7 +664,7 @@ Magnitude-only edits keep using the existing four-touch hyperparameter rule. Str
 3. Every test that hard-codes the prior value, especially regression-guard asserts. Renaming the test is appropriate when the rationale changes.
 4. CLAUDE.md "Current Architecture" + any §-Architecture-Principles bullet that names a default magnitude.
 5. `opg_doc.tex` defaults table; if the loss form or router form changes, also the relevant subsection — or an explicit "Implementation deviates from §X — paper update queued for iter<N+1>" deviation note in the same subsection.
-6. `experiments/hypotheses.md` queue header + the iter row's verdict (PROMOTED / PROMOTED_WITH_TECH_DEBT) + the "active config" recipe block.
+6. `experiments/docs/hypotheses.md` queue header + the iter row's verdict (PROMOTED / PROMOTED_WITH_TECH_DEBT) + the "active config" recipe block.
 
 If any of (2)-(5) is intentionally deferred, the deferral must be explicit in the commit message AND the paper must carry a deviation note (not a silent stale section).
 
@@ -674,6 +676,56 @@ If any of (2)-(5) is intentionally deferred, the deferral must be explicit in th
 5. The promotion test in `experiments/test_arch.py::test_routing_regularizer_coefficients_match_promoted_defaults` asserts `Hyperparameters` AND a constructed-model attribute, so signature drift (item 2) cannot recur silently.
 
 **Cross-references.** Companion: [#hyperparameter-fanout](#hyperparameter-fanout) (single-source-of-truth principle), [#loss-form-triple-touch](#loss-form-triple-touch) (paper-side rule when loss form changes during promotion), [#untested-path-executability](#untested-path-executability) (a promoted but-untested path is the same failure mode at the architecture layer).
+
+---
+
+### loss-gate-quantity-alignment
+
+**Date:** 2026-05-09 pre-commit review of iter146 rescue stack (Lyapunov penalty + `lip_ub` gate)
+**Rule in CLAUDE.md:** Audit Checklist row · "Loss-quantity / gate-quantity alignment"
+
+**What happened.** iter146 introduced a "finite-perturbation Lyapunov penalty" using a unit-RMS random direction `u` and `expansion = ‖T(z + ε·u) − T(z)‖_RMS / ε`. In high-D this is a Hutchinson-style estimator with expectation `‖J‖_F / √D`, NOT the operator norm `‖J‖_2` that the post-final `lip_ub` gate measures via power iteration. With `lyapunov_gamma=0.97` the penalty fires only when `‖J‖_F > 0.97 · √D ≈ 26.9`, which permits operator norms vastly above 1 — i.e. the penalty does not directly enforce contraction even though both surfaces shared the colloquial name "Lyapunov / finite-expansion / contraction". The first-pass code reviewer accepted the iter146 diff as "READY TO COMMIT" because penalty-name and gate-name matched. A second-pass deep review caught the mismatch by deriving the Hutchinson expectation from the normalization choice. (Cosmetic L2-vs-RMS swap does NOT fix this — both have the same `‖J‖_F/√D` expectation; only power iteration or many-direction max would estimate the operator norm.)
+
+**Root cause.** Penalty and gate were named after the same physical quantity ("contraction of T_theta") but implemented different mathematical estimators. The "Loss-form triple-touch" rule guards a *single-side* form change; this incident is the cross-side analogue: when *two separately implemented* surfaces both claim to constrain quantity X, the implementations themselves must agree on what X is, formula by formula. Naming alone is insufficient; reviewer intuition trained on penalty-form changes did not transfer to penalty/gate-form mismatches.
+
+**The rule.** When a training-time penalty and a promotion-gate diagnostic both claim to constrain the same physical quantity (spectral radius, operator norm, expert orthogonality, expert min-share, output-cosine pair statistic, etc.), the penalty implementation, the gate implementation, the `Hyperparameters` formula comment, and `opg_doc.tex` must name the *same mathematical object* by formula (norm choice, reduction choice, normalization choice, gating choice). Each side carries a forward cross-reference to the other side's anchor in code comments. A change to one side proposes a corresponding change to the other; an intentional asymmetry (e.g. soft Frobenius proxy as cheap penalty vs strict operator-norm gate) must be called out explicitly in both comments AND in `opg_doc.tex`.
+
+**Verification recipe.**
+1. For each promotion-gate diagnostic, grep its name in `train_gpt.py` to find the matching training penalty (or confirm none exists).
+2. For each found pair, confirm the penalty docstring and the gate docstring use the same formula notation (e.g. both `‖J‖_2` or both `‖J‖_F/√D`, NOT one of each).
+3. If the formulas intentionally differ, both docstrings must say "soft proxy for X (see `<other_anchor>` for tight cert)" or symmetric language — never just X on both sides.
+4. Add a contract test that grep-asserts the cross-references survive future edits: penalty's docstring must mention the gate's identifier, and vice versa.
+
+**Companion meta-lesson.** A first-pass code review that says "READY TO COMMIT" on a 793-line cross-cutting diff without finding any IMPORTANT issues is suspect; default to a second-pass deep review when the diff (a) exceeds ~500 lines, (b) changes loss form and diagnostic surface together, or (c) touches both a penalty and the gate it claims to satisfy.
+
+**Cross-references.** Companion: [#loss-form-triple-touch](#loss-form-triple-touch) (single-side form-change rule), [#diagnostics](#diagnostics) (diagnostic-metric contract), [#diagnostic-gate-component-awareness](#diagnostic-gate-component-awareness) (gate emission rules).
+
+### scalar-semantic-shift
+
+**Date:** 2026-05-09 pre-commit review of iter146 rescue stack
+**Rule in CLAUDE.md:** Audit Checklist row · "Scalar-semantic shift triple-touch"
+
+**What happened.** The iter146 rescue stack refactored the budget timer: a new helper `_compute_training_budget_ms(max_training_seconds)` took only one argument and dropped the `eval_reservation_seconds` subtraction that the previous inline computation performed. The Hyperparameters comment was simultaneously rewritten to declare *"Process wallclock = max_training_seconds + eval_reservation_seconds"* — flipping the meaning of `max_training_seconds` from a process-total budget to a training-only budget. **Every existing caller, including the canonical submission command in CLAUDE.md "Run Commands" (`--max-training-seconds=600`), continued to pass the same numeric value.** Under the new semantic that command would run for `600 s training + 120 s post-loop = 720 s` total wallclock — a silent 20% violation of the project invariant *"submission training must fit the 600 s 8×H100 budget"*. Compounded by `final_full_validation=True` becoming default-on, the post-loop work expanded beyond the historical 120 s carve-out, so even reverting the bare meaning would not have been enough — the eval reservation needed re-profiling.
+
+The mistake passed every existing audit gate: the new helper had a (trivial) test (`assertEqual(_compute_training_budget_ms(600), 600_000.0)`); promotion propagation was satisfied because no *default value* changed; type signatures, units in their colloquial names ("seconds"), and CLI plumbing were all consistent. What changed silently was the *meaning* of the scalar — a class of drift the existing rules did not name.
+
+**Root cause.** The promotion-propagation rule covers default-value drift, the loss-form triple-touch rule covers single-side form changes, and the loss/gate-quantity alignment rule covers cross-side mathematical mismatches. None of them covers the case where the implementation, the Hyperparameters comment, and the test all agree on a *new* meaning while every external caller silently keeps the *old* meaning. The cost is invisible until a 600-second hardware constraint is breached on the actual submission run.
+
+**The rule.** When the *meaning* of an existing scalar contract changes — units (seconds vs ms vs steps), ownership (training-only vs process-total), inclusion or exclusion of a previously-bundled term, nullability of a metadata field, or any unit-level invariant — the same commit must:
+
+1. **Implementation site.** Update the function body and signature; if the new meaning is sufficiently different, prefer renaming the symbol (`max_training_seconds → max_process_seconds`) over silently re-meaning it.
+2. **Every caller of the scalar.** Sweep `CLAUDE.md` "Run Commands" snippets, `records/` submission scripts, `update_results.sh` consumers, `tests/test_training_contracts.py` schema asserts, and any historical command captured in iteration entries. If a caller's intent shifts, change the caller's value.
+3. **Every doc surface that names the unit.** `Hyperparameters` field comment, `opg_doc.tex` parameter table, EXPERIENCE.md runbook references, and CLAUDE.md "Project Invariants" if the constraint is project-level.
+4. **A focused numeric test pinning the new semantic against the project invariant.** For the budget case: assert `_compute_training_budget_ms(600, eval_reservation=120) ≤ (600 − 120) · 1000`. Renaming the field to `max_process_seconds` would make the test self-evidently correct without the need for the assert.
+5. **If a rename is too disruptive,** the field comment must declare the superseded semantic *adversarially*, e.g. *"NOTE: prior semantic was X; current semantic is Y; existing scripts that passed `--name=N` now produce Z and must be updated to N′."* — phrased as a warning to the reader, not a quiet rationale.
+
+**Verification recipe.**
+1. `grep -rn '<scalar-name>' .` — verify every match either was edited in this commit or its surrounding intent matches the new semantic.
+2. Confirm the Hyperparameters comment, `opg_doc.tex` table, and CLAUDE.md "Project Invariants" all describe the same meaning.
+3. Run the focused numeric test that pins the new semantic against the project invariant.
+4. If a default-on safety knob (`final_full_validation`) compounds the shift, run a smoke that *measures* total process wallclock against the project invariant on the dev profile — not just total training-loop seconds.
+
+**Cross-references.** Companion: [#promotion-propagation](#promotion-propagation) (default-value drift), [#loss-form-triple-touch](#loss-form-triple-touch) (single-side form change), [#loss-gate-quantity-alignment](#loss-gate-quantity-alignment) (cross-side mathematical mismatch), [#config-drift](#config-drift) (single-source-of-truth for tunables), [#cumulative-metric-misread](#cumulative-metric-misread) (semantic vs. instantaneous interpretation of the same scalar).
 
 ---
 
@@ -788,6 +840,7 @@ Every metric you read in a healthcheck or postmortem is a *function* of raw sign
 ### Diagnostics
 - Match plotting scale and summaries to the metric's dynamic range and sampling scheme so you don't mistake artifacts for behavior.
 - When experiments have hard constraints, bias toward changes that can be bounded and verified early (avoid hour-long runs that only fail at the end).
+- Metric contract rule: every required diagnostic needs a compute site, a freshness tag when it is tied to a forward pass, human log emission, parser support, and a focused test. Independent metrics must not be gated by unrelated diagnostic availability.
 
 ### Efficiency
 - In DEQ-style models, cost scales with batch × iterations × refinements; tune these jointly to avoid runaway wall time.
@@ -814,16 +867,13 @@ Every metric you read in a healthcheck or postmortem is a *function* of raw sign
 - **`*_cv`** — coefficient of variation. Per-slice CV uses the renormalized within-slice distribution; pool CV uses the full 2R unrenormalized distribution. Diagnostic: large gap between attn_cv and mlp_cv = role-asymmetric routing (e.g. iter 100b s120 attn_cv≈1.07 / mlp_cv≈0.18: attn winner-take-all, MLP uniform). Large pool_cv with small per-slice CVs = cross-slice dominance.
 - **`*_ortho`** — `max|cos_sim|` between expert OUTPUT means. Reported per-slice because attn experts and MLP experts produce DIFFERENT outputs even with the shared (pooled) router.
 - **`router_mass`** — mean `sigmoid(gate)`. Drops when the model gates the mixture down.
-- **`hutch_F`** — Hutchinson-Frobenius estimator at the saved DEQ FP `z*`: `rho_F = sqrt(E[mean(jvp²)]) ≈ ||J||_F / sqrt(dim)` for `J = ∂T_θ/∂z`. This tracks average local contraction but is **not** a sufficient Lipschitz certificate because one large singular direction can be hidden by the `/sqrt(dim)` normalization. Probe runs at `B_probe=1` slice of saved `z*/x0` to bound activation memory to ~1-2 GiB; skipped on OOM/backend failure.
-- **`spec_norm`** — power-iteration estimate of `||∂T_θ/∂z||_2` at `z*`. The true condition `||∂T_θ/∂z||_2 < 1` is sufficient for local contraction when the Jacobian is continuous, but the logged value is still a numerical estimate.
-- **`lip_ub`** — conservative numerical Lipschitz upper-bound metric derived from `spec_norm` by `spec_norm * fp_lip_ub_safety + fp_lip_ub_margin`. It is the fixed-point contraction gate in fast validation and K-sweep. This is stricter than raw `spec_norm`, but still not a formal interval/linear-relaxation certificate.
+- **`lip_ub`** — the single logged numerical local-contraction metric at the saved DEQ FP `z*`. Internally it is a power-iteration estimate of `||∂T_θ/∂z||_2` with `fp_lip_ub_safety` / `fp_lip_ub_margin` applied. `lip_ub < 1` is the operational sufficient local contraction check, but it is still a numerical metric, not a formal interval/linear-relaxation certificate.
 - **`fp_residual_rel`** — direct relative fixed-point residual proxy from the saved solve, currently `deq_iter_conv_rel` / `iter_conv_rel` under the existing solver diagnostics.
 - **`fp_bound`** — a posteriori relative fixed-point distance proxy `fp_residual_rel / (1 - lip_ub)` when `lip_ub < 1`. This is the compact convergence certificate: small residual plus a contraction margin bounds distance to the local fixed point. `N/A` means `lip_ub` was missing or not below 1.
-- **`rd_step`** — finite-direction random-step gain `max_v ||T(z* + eps·v) - T(z*)|| / eps` over a few sampled unit directions. Use it as a trend/sanity metric; it is not a sufficient contraction certificate.
 
 **Parcae and contraction attribution.** In the active Parcae path, scalar
 `deq_beta` is not the solver blend; Parcae computes per-dim
-`beta = 1 - A_bar`. More importantly, `spec_norm`/`lip_ub` are probes of the
+`beta = 1 - A_bar`. More importantly, `lip_ub` is a probe of the
 transition map `T_theta(z, x0)`, not probes of the blended solver update
 `(1-beta)z + beta T_theta(z, x0)`. Therefore lowering scalar `deq_beta` cannot
 be a principled fix for a failed `lip_ub` under Parcae. A real fix must shrink
@@ -834,19 +884,23 @@ an output-scale constraint, or a dedicated transition-Jacobian penalty.
 Dirichlet-UCB + EMA-balanced routing for BPB, but its post-int diagnostics did
 not certify strict health: attention min share stayed just under the hard floor,
 expert-output cosine gates failed, and `lip_ub` stayed far above 1 while
-`hutch_F` remained below 1. Treat this as a useful separation of concerns:
-`hutch_F` tracks average random-direction energy, while `lip_ub` catches a
-large singular direction of `T_theta`. The principled follow-up is not another
-scalar-beta sweep. Test a direct transition-control iteration instead:
+older auxiliary probes gave conflicting trend signals. Treat this as a reason
+to report one contraction metric: `lip_ub`. The next run is intentionally split
+for attribution: iter146 tests doubled ideal-target regularizers and weighted
+high-K jitter, while iter147 separately tests direct Lyapunov contraction.
 
-- Add a strict EMA alive hinge, `sum_e relu(tau - m_e)^2`, using the same
-  straight-through current-routing anchor as the EMA balance loss. Zero loss
-  directly implies every tracked expert EMA is above the chosen floor.
-- Add default-off transition-output scale control or a low-cadence
-  transition-Jacobian penalty that targets `||dT_theta/dz||_2` directly. The
-  clean certificate is still `lip_ub < 1`; a first rescue run can accept a
-  large reduction in `lip_ub` as evidence before investing in formal
-  interval/linear-relaxation bounds.
+- Iter146 doubles `router_ema_balance_coef`, `router_ema_specialization_coef`,
+  and `expert_output_diversity_coef` without enabling an EMA alive hinge. This
+  tests whether stronger pressure toward balance, specialization, and output
+  orthogonality fixes the health gates without changing the loss form.
+- Iter146 also emits Dirichlet confidence diagnostics: strength `S`, uncertainty
+  mass `E/S`, marginal sigma, evidence, normalized `H(mu)`, and current UCB beta.
+  Expected learning signal is rising strength/evidence, falling `E/S`/sigma,
+  and lower `H(mu)` if routing specializes.
+- Iter147, if needed, adds a low-cadence Lyapunov expansion penalty on
+  `T_theta`: `relu(||T(z*+eps v,x)-T(z*,x)||/eps - gamma)^2`. The clean
+  certificate is still `lip_ub < 1`; do not re-enable the old stochastic
+  Lyapunov surrogate unchanged.
 - Keep routing token-local. Do not introduce Sinkhorn, capacity matching, or
   batch-coupled assignment to force expert usage.
 
@@ -874,7 +928,7 @@ EMA usage/liveness; output Gram alone cannot rule out unused experts.
 
 **Prefix convention** (iter 100b). The SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components. Routing-distribution metrics decompose into THREE values: `attn_*` (per-slice renormalized), `mlp_*` (per-slice renormalized), and `pool_*` (full 2R distribution). Metrics derived from **expert outputs** (usage, ortho, min_share per slice) keep `attn_*`/`mlp_*` only — there is no pool variant.
 
-**K-sweep tabular emission** (PERMANENT iter 100b; `lip_ub`/`fp_bound` added 2026-05-07). The eval K-sweep emits a `k_sweep_table:` row per K with fixed-width columns: `K val_bpb attn_cv mlp_cv pool_cv attn_min mlp_min attn_ortho mlp_ortho pertoken_ent pool_ent shared_gate hutch_F spec_norm lip_ub fp_bound rd_step iter_conv_rel`. A header row precedes data rows. `N/A` indicates an unavailable field. The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[…] router_gate_iter:[…] iter_conv_rel:… residual:…` line is preserved for `experiments/plot_metrics.py` back-compat. Use `k_sweep_table:` for cross-K and cross-iter routing-health comparisons; use `k_sweep:` for per-iter gate trajectories. Fast validation logs the same fixed-point certificate fields when `fp_lip_fast_val_every > 0`.
+**K-sweep tabular emission** (PERMANENT iter 100b; simplified 2026-05-08). The eval K-sweep emits a `k_sweep_table:` row per K with fixed-width columns: `K val_bpb attn_cv mlp_cv pool_cv attn_min mlp_min attn_ortho mlp_ortho pertoken_ent pool_ent shared_gate dir_S dir_U dir_sigma dir_evid dir_Hmu ucb_beta lip_ub fp_bound iter_conv_rel`. A header row precedes data rows. `N/A` indicates an unavailable field. The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[…] router_gate_iter:[…] iter_conv_rel:… residual:…` line is preserved for `experiments/plot_metrics.py` back-compat and now also emits full `router_dir_*` confidence fields plus `lip_ub` for parser-friendly grep. Use `k_sweep_table:` for cross-K and cross-iter routing-health comparisons; use `k_sweep:` for per-iter gate trajectories. Fast validation logs the same fixed-point certificate fields when `fp_lip_fast_val_every > 0`.
 
 ---
 
@@ -903,7 +957,7 @@ Hard constraints:
 - Artifact: code plus compressed model must be no more than 16,000,000 bytes.
 - Submission training: no more than 600 seconds on 8xH100 SXM. `--max-training-seconds=600` is the explicit submission opt-in; evaluation reservation time is part of the loop budget.
 - Data/tokenizer: FineWeb validation with SentencePiece BPE vocab 1024.
-- Baseline pointer: the active promoted baseline is recorded in `experiments/hypotheses.md`; update that entry when promoting.
+- Baseline pointer: the active promoted baseline is recorded in `experiments/docs/hypotheses.md`; update that entry when promoting.
 
 ### environment-and-files
 
@@ -911,7 +965,7 @@ Hard constraints:
 - Dependencies: `requirements.txt`; do not add packages unless explicitly authorized. Authorized installs use `uv pip install <pkg>` and update requirements in the same commit.
 - Data: `./data/datasets/fineweb10B_sp1024/` is read-only. Tokenizer: `./data/tokenizers/fineweb_1024_bpe.model`.
 - Main implementation: `train_gpt.py`.
-- Research log: `experiments/hypotheses.md`.
+- Research log: `experiments/docs/hypotheses.md`.
 - Incident/rationale archive: `EXPERIENCE.md`.
 - Plot/log rotation: `experiments/update_results.sh`.
 - Untracked runtime files: `results.tsv`, `run.log`, `experiments/training_logs/*`, and `experiments/weights/*`.
@@ -948,16 +1002,17 @@ Fair comparison default: compare equal step count. Use wall-clock comparisons on
 
 Canonical iteration loop:
 
-1. Read git state, recent logs, `results.tsv`, and relevant hypotheses.
-2. State the hypothesis and make one focused change unless explicitly testing a bundle.
-3. Add or update focused tests before implementation when behavior changes.
-4. Run smoke before long training.
-5. Run training with output captured to `run.log`.
-6. Inspect scored metrics, K-sweep, artifact bytes, peak VRAM, and failure diagnostics.
-7. Run `bash experiments/update_results.sh` after every iteration to rotate logs/weights and regenerate plots.
-8. Apply promotion rules.
-9. Update `experiments/hypotheses.md` immediately with evidence, status, and confounds.
-10. Stop after 100 consecutive non-improvements and ask for direction.
+1. Review `experiments/docs/` comprehensively: read `README.md` and `hypotheses.md`, list the directory, and inspect any relevant archive or `iterNNN_*.md` design notes.
+2. Read git state, recent logs, `results.tsv`, and relevant hypotheses.
+3. State the hypothesis and make one focused change unless explicitly testing a bundle.
+4. Add or update focused tests before implementation when behavior changes.
+5. Run smoke before long training.
+6. Run training with output captured to `run.log`.
+7. Inspect scored metrics, K-sweep, artifact bytes, peak VRAM, and failure diagnostics.
+8. Run `bash experiments/update_results.sh` after every iteration to rotate logs/weights and regenerate plots.
+9. Apply promotion rules.
+10. Update `experiments/docs/hypotheses.md` immediately with evidence, status, and confounds.
+11. Stop after 100 consecutive non-improvements and ask for direction.
 
 Logging/plot artifacts:
 
@@ -992,9 +1047,9 @@ Current high-level shape:
 Current default families to check in code before launch:
 
 - Core dimensions: layers, heads/KV heads, expert count, ranks, sequence length, batch tokens, refinement count, CTP flag, NSA flag.
-- Solver: Parcae init/floor, `deq_bptt_k`, K-jitter set, beta fallback/jitter, Lyapunov/denoising disabled state.
+- Solver: Parcae init/floor, `deq_bptt_k`, weighted K-jitter set, beta fallback/jitter, Lyapunov/denoising disabled state.
 - Optimizer: Muon/AdamW grouping, LRs, PE-NS backend, momentum warmup, weight decay, gradient clipping, warmdown.
-- Routing/loss stack: promoted iter145r Dirichlet-UCB router, EMA balance/specialization, no routed sigmoid gate, router CV off by default, MoS CV, per-token entropy, expert/MoS diversity, entmax blend, logit softcap, routing mass diagnostics.
+- Routing/loss stack: iter146 Dirichlet-UCB router, doubled EMA balance/specialization, no routed sigmoid gate, router CV off by default, MoS CV, per-token entropy, doubled expert diversity, MoS diversity default-off, entmax blend, logit softcap, routing mass and Dirichlet confidence diagnostics.
 - Quantization/eval: int6 roundtrip, sliding-window eval, artifact byte accounting.
 
 ### revdeq-architecture-details

@@ -6,7 +6,7 @@ This file is the enforcement surface: it states the principle, the short rationa
 
 - **Mandatory memory pass.** Before any code change, doc edit, training launch, or commit, read the memory files listed in the project memory index. Individual memory files are not assumed loaded. Details and categories: [`EXPERIENCE.md#pre-action-memory`](EXPERIENCE.md#pre-action-memory).
 - **Incident rules first.** Before code or experiment work, read `EXPERIENCE.md` Section 1 index and any incident linked from the relevant audit row.
-- **Research ledger first.** Before choosing, launching, closing, or documenting an iteration, read `experiments/hypotheses.md`.
+- **Experiment docs first.** Before choosing, launching, closing, or documenting an iteration, review `experiments/docs/` comprehensively: read its README and active ledger, list the folder, and inspect any relevant archive or `iterNNN_*.md` design notes.
 - **Config source of truth.** `train_gpt.py::Hyperparameters` is authoritative. This file may summarize defaults, but it must never become the config source.
 - **New memory files.** Add new memory files to the memory index and to the appropriate documentation pointer in the same commit that creates them, or future sessions will miss the directive.
 
@@ -23,7 +23,7 @@ This file is the enforcement surface: it states the principle, the short rationa
 
 ## Standing Directives
 
-- Keep `experiments/hypotheses.md` synchronized in real time: read before every iter, update after every iter, and include required metrics.
+- Keep `experiments/docs/hypotheses.md` synchronized in real time: read before every iter, update after every iter, and include required metrics.
 - Prefer architecture exploration over blind hyperparameter tuning; throughput iterations take priority when the active queue marks them throughput-bearing.
 - Disable `torch.compile` for dev unless the iteration explicitly tests compile behavior; still keep code compile/DDP-safe.
 - Always use all visible GPUs via DDP for normal runs; use single-GPU only for debug.
@@ -46,7 +46,7 @@ This file is the enforcement surface: it states the principle, the short rationa
 - Dependencies: `requirements.txt`; authorized installs use `uv`, not `pip`.
 - Data is read-only: `./data/datasets/fineweb10B_sp1024/`; tokenizer: `./data/tokenizers/fineweb_1024_bpe.model`.
 - Model source: `train_gpt.py`; focused tests live under `experiments/test_*.py` or `tests/` as appropriate.
-- Research docs: `EXPERIENCE.md` for details/rationale, `experiments/hypotheses.md` for claims/results, `opg_doc.tex` for paper-facing algorithm text.
+- Research docs: `EXPERIENCE.md` for details/rationale, `experiments/docs/hypotheses.md` for claims/results, `opg_doc.tex` for paper-facing algorithm text.
 - Runtime outputs are untracked unless explicitly promoted: `run.log`, `results.tsv`, `experiments/training_logs/*`, `experiments/weights/*`, `experiments/checkpoints/*`.
 - Optional debug plotting: `auto_plot_on_val=True` (default) refreshes `experiments/*.png` on each validation via `experiments/plotting_hook.py` (rank-0 only; silent no-op if matplotlib or `experiments/plot_*.py` modules are absent).
 - Historical submissions in `records/` are read-only.
@@ -57,12 +57,12 @@ This file is the enforcement surface: it states the principle, the short rationa
 This is an orientation mirror only. Check `train_gpt.py::Hyperparameters` before launch.
 
 - **Core:** 12-layer RevDEQ-style shared block, `model_dim=768`, 8 query heads, 4 KV heads, sequence length 2048, vocab 1024, tied embeddings, train batch tokens 524,288.
-- **Experts:** 16 total experts with 1 always-on shared expert; routed experts are full-D LoRA-style with attention rank 64 and MLP rank 96.
-- **Solver:** Parcae-style per-dim damping/injection enabled; `parcae_reversibility_floor=0.1`; `deq_bptt_k=3`; K-jitter default `(16, 24)`; scalar beta path is fallback only.
+- **Experts:** 16 total routed experts (no shared/always-on expert by default); routed experts are full-D LoRA-style with attention rank 64 and MLP rank 96. Iter146 rescue stack made the shared expert opt-in (`--num-shared-experts=1`) because routing-EMA balance + alive-hinge already prevent collapse without an unrouted bypass.
+- **Solver:** Parcae-style per-dim damping/injection enabled; `parcae_reversibility_floor=0.1`; `deq_bptt_k=3`; weighted K-jitter default `{16:0.50, 24:0.40, 32:0.07, 64:0.03}`; scalar beta path is fallback only.
 - **Default-off paths:** `num_refinements=0`, `use_ctp=False`, `use_nsa_attention=False`, `lyapunov_coef=0`, `denoising_coef=0`, `mos_output_diversity_coef=0`, `logit_softcap=0`, `bigram_vocab_size=0`.
 - **Optimizer:** Muon/AdamW groups with PE-NS enabled by default; weight decay 0.015; grad clip 1.0; warmdown fraction 0.72. See code for exact LR groups.
-- **Routing/loss stack:** promoted iter145r uses Dirichlet-UCB routing, router CV off, EMA balance/specialization, no routed sigmoid gate, lower MoS-CV/per-token-entropy/expert-diversity coefficients, and 0.07 regularizer warmup. CV still uses combined routed mass when enabled.
-- **Quantization/eval:** int6 per-row quantization plus zstd-22 compression is the scored artifact path; sliding-window eval remains enabled.
+- **Routing/loss stack:** current rescue stack uses Dirichlet-UCB routing, router CV off, EMA balance/specialization, a small EMA-gated alive hinge (per-expert `ema_deficit · relu(τ−share)²`, so recovered experts contribute zero penalty), no routed sigmoid gate, worst-pair cosine expert-output diversity, unchanged MoS-CV/per-token entropy, and 0.07 regularizer warmup. CV still uses combined routed mass when enabled.
+- **Quantization/eval:** int6 per-row quantization plus zstd-22 compression is the scored artifact path; sliding-window eval remains enabled; fast eval uses `eval_batch_seqs=256` with `val_micro_batch_seqs=48`; promotable final metadata requires full validation.
 
 ## Run Commands
 
@@ -96,12 +96,12 @@ Full environment, file, logging, and plotting details live in [`EXPERIENCE.md#en
 - **DEQ input conditioning.** The DEQ block may add output-side `x0` only through the learnable per-dim Parcae ZOH coefficient `B_bar = Delta * B`; unconditional shortcuts like `T = x0 + Delta` are prohibited. Current form: `T_theta(z, x0) = B_bar * RMSNorm_learn(x0) + Delta(z, x0)`. Any equation change updates `train_gpt.py`, targeted tests, and `opg_doc.tex` together.
 - **Parcae floor is not a tuning knob.** Coefficients that divide reverse reconstruction need a lower bound; changing the floor requires code, tests, smoke tolerance, and paper-doc updates together. Details: [`EXPERIENCE.md#revdeq-reversibility-floor`](EXPERIENCE.md#revdeq-reversibility-floor).
 - **Backward-only floors are forbidden.** Coefficients that do not divide reverse reconstruction, especially `B_bar`, must not gain artificial floors; doing so biases the ZOH form.
-- **Interpret DEQ diagnostics by definition.** Under TBPTT, `deq_recon_err` measures forward distance travelled, not true reconstruction error. `hutch_F` is an average-Jacobian trend metric, not a Lipschitz proof; use `lip_ub < 1` and the derived `fp_bound = fp_residual_rel/(1-lip_ub)` at the saved fixed point as the numerical local-contraction certificate, plus K-sweep plateau and full-BPTT smoke when true reconstruction is needed. Details: [`EXPERIENCE.md#deq-recon-err-interpretation`](EXPERIENCE.md#deq-recon-err-interpretation).
+- **Interpret DEQ diagnostics by definition.** Under TBPTT, `deq_recon_err` measures forward distance travelled, not true reconstruction error. Use the single `lip_ub < 1` metric and derived `fp_bound = fp_residual_rel/(1-lip_ub)` at the saved fixed point as the numerical local-contraction certificate, plus K-sweep plateau and full-BPTT smoke when true reconstruction is needed. Details: [`EXPERIENCE.md#deq-recon-err-interpretation`](EXPERIENCE.md#deq-recon-err-interpretation).
 - **Do not misattribute Parcae contraction fixes.** In the active Parcae path, scalar `deq_beta` is fallback-only; the solver uses per-dim `beta = 1 - A_bar`. The `lip_ub` probe measures the transition map `T_theta`, not the solver blend, so a failed `lip_ub` needs transition-Jacobian control rather than a scalar-beta tweak.
-- **Promoted routing has explicit tech debt.** The promoted iter145r defaults use Dirichlet-UCB routing, EMA balance/specialization, no routed sigmoid gate, and warm-started lower regularization coefficients. This is a BPB promotion, not proof that strict expert floors, output orthogonality, or local contraction are solved. Future fixes should test a strict EMA alive hinge and direct transition-Jacobian/output-scale control.
+- **Promoted routing has explicit tech debt.** The promoted iter145r defaults improved BPB but left min-share, output-orthogonality, and `lip_ub` debt. The current rescue stack addresses those root causes directly: EMA-gated alive hinge for min-share, worst-pair output diversity for orthogonality, and a default-off finite-perturbation Hutchinson Frobenius/√D probe (not an operator-norm cert — see `lip_ub` gate) as soft contraction pressure on `T_theta`.
 - **Soft dense routing only.** All experts process all tokens. Top-K gather, capacity drop, argmax dispatch, and threshold skips break RevDEQ reversibility unless explicitly outside the RevDEQ path or mathematically smooth. Details: [`EXPERIENCE.md#no-top-k-dispatch`](EXPERIENCE.md#no-top-k-dispatch).
 - **Expert independence is hard.** Every trainable parameter inside an expert computation path belongs to exactly one expert. Shared learned scales silently couple experts and projections; non-learned ops and routers may be shared. Details: [`EXPERIENCE.md#prenorm-scale-independence`](EXPERIENCE.md#prenorm-scale-independence).
-- **Router placement is semantic.** Routers route on component input before expert computation. Attn/MLP routing is `simplex(allocation) * sigmoid(gate)` when the routed sigmoid gate is enabled; the promoted iter145r default disables that gate so routed mass is always used. MoS routing is pure softmax.
+- **Router placement is semantic.** Routers route on component input before expert computation. Attn/MLP routing is `simplex(allocation) * sigmoid(gate)` when the routed sigmoid gate is enabled; the iter146 default disables that gate so routed mass is always used. MoS routing is pure softmax.
 - **No batch-coupled expert assignment.** Expert weights must be computed locally from each token representation and learned router parameters, not from batch-level matching, occupancy, capacity, or Sinkhorn/OT normalization. Use losses or slow bias feedback for global usage pressure.
 - **EMA anchors are detached.** Persistent router EMA is valid for diagnostics, alive-loss weighting, slow bias feedback, and straight-through EMA-anchored balance losses. A plain detached `KL(EMA || uniform)` scalar does not backpropagate into the current token router; any trainable EMA-anchored loss must still depend on current routing weights.
 - **Full-D LoRA-style experts are the standard.** Expert rank constrains parameter count, not activation width: attention and MLP computation stay in full `model_dim`. Bottleneck expert bodies are closed as a scaling direction. Details: [`EXPERIENCE.md#bottleneck-experts-closed`](EXPERIENCE.md#bottleneck-experts-closed).
@@ -123,12 +123,13 @@ Full environment, file, logging, and plotting details live in [`EXPERIENCE.md#en
 - **Architecture beats knob churn.** Prefer changes that alter model capacity, routing, solver behavior, or evaluation capability over blind hyperparameter sweeps.
 - **Simplicity criterion.** All else equal, simpler wins. Small score gains do not justify brittle code; code removal with equal results is a keep.
 - **DRY and orthogonal functions.** Shared setup, tensor preparation, logging formats, and metric formulas must live in one helper each. Functions should have one reason to change; do not duplicate probe setup or couple unrelated diagnostics behind one bundled routine. Details: [`EXPERIENCE.md#dry-function-orthogonality`](EXPERIENCE.md#dry-function-orthogonality).
+- **Diagnostic metric contract.** Required metrics need compute, freshness tagging when forward-dependent, human log emission, parser support, and focused tests; do not gate independent diagnostics on unrelated metric availability. Details: [`EXPERIENCE.md#diagnostics`](EXPERIENCE.md#diagnostics).
 - **Pre-commit review chain.** Before every commit: `/simplify`, `coderabbit:review`, `pr-review-toolkit:review-pr`, `superpowers:requesting-code-review`, run this audit checklist, then apply simple first-principled fixes.
 - **New audit rules.** Add incident-driven rules to `EXPERIENCE.md` Section 1 with an index row and cite them here concisely; do not grow long rule bodies in `CLAUDE.md`.
 
 ## Audit Checklist
 
-Run before commits that touch `train_gpt.py`, model tests, `CLAUDE.md`, `EXPERIENCE.md`, or `experiments/hypotheses.md`.
+Run before commits that touch `train_gpt.py`, model tests, `CLAUDE.md`, `EXPERIENCE.md`, or `experiments/docs/hypotheses.md`.
 
 > **Meta-principle:** read metric definitions before values; compute from raw when in doubt; user pushback is a signal to re-derive, not defend. Details: [`EXPERIENCE.md#reading-derived-metrics`](EXPERIENCE.md#reading-derived-metrics).
 
@@ -146,7 +147,7 @@ Run before commits that touch `train_gpt.py`, model tests, `CLAUDE.md`, `EXPERIE
 - **Learned norm-scale independence.** Each learned scale conditions exactly one linear weight; shape follows ownership. Details: [`EXPERIENCE.md#prenorm-scale-independence`](EXPERIENCE.md#prenorm-scale-independence).
 - **Doc-code invariant.** If `opg_doc.tex` describes an algorithm and implementation intentionally differs, document the practical deviation. Details: [`EXPERIENCE.md#doc-code-invariant`](EXPERIENCE.md#doc-code-invariant).
 - **Diagnostic gates follow flags.** Disabled components do not emit live diagnostics or stale prescriptions; prescriptions target the component-specific lever. Details: [`EXPERIENCE.md#diagnostic-gate-component-awareness`](EXPERIENCE.md#diagnostic-gate-component-awareness).
-- **Keep CLAUDE concise.** This file keeps principles and brief rationale only; long examples and iter history go to `EXPERIENCE.md` or `experiments/hypotheses.md`. Details: [`EXPERIENCE.md#claude-md-size-budget`](EXPERIENCE.md#claude-md-size-budget).
+- **Keep CLAUDE concise.** This file keeps principles and brief rationale only; long examples and iter history go to `EXPERIENCE.md` or `experiments/docs/hypotheses.md`. Details: [`EXPERIENCE.md#claude-md-size-budget`](EXPERIENCE.md#claude-md-size-budget).
 - **Cumulative metrics are not instantaneous.** Before s50, compute per-step deltas from raw `train_time`; do not make throughput decisions from cold-start-contaminated cumulative `step_avg`. Details: [`EXPERIENCE.md#cumulative-metric-misread`](EXPERIENCE.md#cumulative-metric-misread).
 - **Routing-reg input invariant.** Router regularizers operate on combined routed mass, not renormalized shares that hide gate effects. Details: [`EXPERIENCE.md#routing-reg-input-invariant`](EXPERIENCE.md#routing-reg-input-invariant).
 - **No discrete dispatch in RevDEQ.** Top-K, capacity, argmax, and hard threshold dispatch require explicit proof or must remain off under RevDEQ. Details: [`EXPERIENCE.md#no-top-k-dispatch`](EXPERIENCE.md#no-top-k-dispatch).
@@ -156,11 +157,13 @@ Run before commits that touch `train_gpt.py`, model tests, `CLAUDE.md`, `EXPERIE
 - **Loss-form changes are triple-touch.** When the *functional form* of a loss term changes (not just its magnitude), the same commit must touch implementation, the assembly docstring + `Hyperparameters` formula comment, and `opg_doc.tex` equation + parameter table. Details: [`EXPERIENCE.md#loss-form-triple-touch`](EXPERIENCE.md#loss-form-triple-touch).
 - **Untested-path executability.** Any new control-flow branch (resume path, preset, scoring mode, optimizer group, alias) must be exercised by at least one focused test OR a smoke that visits the branch before commit. A branch with no executable witness is treated as dead code. Details: [`EXPERIENCE.md#untested-path-executability`](EXPERIENCE.md#untested-path-executability).
 - **Sibling-fanout DRY gate.** If a feature introduces ≥3 parallel siblings (loss terms, optimizer groups, scoring modes, presets, EMA buffers, log fields) and each sibling repeats across ≥3 code sites, the implementation MUST be driven by a single registry/tuple/dict — adding the next sibling has to be a one-line registry change, not a multi-site grep-and-paste. Plot/log/parser layers read from the same registry as the trainer. Companion to the Research-Protocol "DRY and orthogonal functions" bullet — that's the principle, this is the audit gate. Details: [`EXPERIENCE.md#sibling-fanout-dry-gate`](EXPERIENCE.md#sibling-fanout-dry-gate).
-- **Promotion propagation.** When promoting an iteration, the same commit must update: `Hyperparameters` defaults, every `__init__` signature default that mirrors a Hyperparameter, tests that hard-code prior values, CLAUDE.md "Current Architecture", `opg_doc.tex` (or an explicit deviation note), and `experiments/hypotheses.md`. Each surface that does not propagate becomes silent drift the next reviewer must catch. Details: [`EXPERIENCE.md#promotion-propagation`](EXPERIENCE.md#promotion-propagation).
+- **Promotion propagation.** When promoting an iteration, the same commit must update: `Hyperparameters` defaults, every `__init__` signature default that mirrors a Hyperparameter, tests that hard-code prior values, CLAUDE.md "Current Architecture", `opg_doc.tex` (or an explicit deviation note), and `experiments/docs/hypotheses.md`. Each surface that does not propagate becomes silent drift the next reviewer must catch. Details: [`EXPERIENCE.md#promotion-propagation`](EXPERIENCE.md#promotion-propagation).
+- **Loss-quantity / gate-quantity alignment.** When a training-time penalty and a promotion-gate diagnostic both claim to constrain the same physical quantity (spectral radius, operator norm, expert orthogonality, min-share, etc.), the penalty implementation, the gate implementation, the `Hyperparameters` formula comment, and `opg_doc.tex` must name the *same mathematical object* by formula — Frobenius vs operator norm; mean vs max; per-element vs per-vector; gated vs ungated. Name-matching is insufficient; if they intentionally differ, both surfaces must say "soft proxy for X (see <gate>)" symmetrically. Details: [`EXPERIENCE.md#loss-gate-quantity-alignment`](EXPERIENCE.md#loss-gate-quantity-alignment).
+- **Scalar-semantic shift triple-touch.** Changing the *meaning* of an existing scalar contract — units, ownership (training-only vs process-total), inclusion/exclusion of a previously-bundled term, or nullability — requires same-commit updates to (a) the implementation, (b) every caller that passes the scalar (CLAUDE.md "Run Commands" snippets, `records/` submission scripts, `update_results.sh` consumers, `tests/test_training_contracts.py` schema asserts), and (c) every doc surface that names the unit (`Hyperparameters` field comment, `opg_doc.tex` parameter table). A focused numeric test must pin the new semantic against the project invariant. Renaming the scalar is preferred over silently re-meaning it; if that's too disruptive, the comment must declare the superseded semantic *adversarially*. Details: [`EXPERIENCE.md#scalar-semantic-shift`](EXPERIENCE.md#scalar-semantic-shift).
 
 ## Promotion Rules
 
-- **Primary gate:** promote if post-quant `val_bpb` improves and artifact is under 16 MB. Diagnostic failures become next-iteration prescriptions, not promotion blockers.
+- **Primary gate:** promote if full-validation post-quant `val_bpb` improves and artifact is under 16 MB. Fast-only final scores are non-promotable; diagnostic failures become next-iteration prescriptions, not promotion blockers.
 - **Procedure on improvement:** run the review chain and audit, promote with `bash experiments/update_results.sh --promote`, then review/simplify before committing the improvement.
 - **Strict generalization:** if a change's functional class exactly contains the previous baseline, promote unconditionally and tune the optimization path instead of reverting. Include the recovery setting, representability argument, and optimizer-access argument in the commit message. Details: [`EXPERIENCE.md#strict-generalization`](EXPERIENCE.md#strict-generalization).
 - **Non-improvements:** if the change is not a strict generalization and scored quality is equal/worse, revert to the previous good state while preserving logs and hypothesis evidence.
@@ -176,6 +179,6 @@ Run before commits that touch `train_gpt.py`, model tests, `CLAUDE.md`, `EXPERIE
 ## Where Details Go
 
 - `EXPERIENCE.md`: incidents, lessons, detailed runbook, metric definitions, architecture rationale, verification recipes.
-- `experiments/hypotheses.md`: active queue, per-iteration evidence, verdicts, confounds, and research archive.
+- `experiments/docs/hypotheses.md`: active queue, per-iteration evidence, verdicts, confounds, and research archive.
 - `train_gpt.py::Hyperparameters`: current config defaults.
 - `opg_doc.tex`: paper-facing algorithm description; update when implementation intentionally diverges.

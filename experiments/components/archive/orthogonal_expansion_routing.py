@@ -3,7 +3,7 @@
 Drop-in component for `train_gpt.py::SoftDenseRouter` when
 `use_orthogonal_expansion_routing=True`.
 
-# Hypothesis (from experiments/hypotheses.md H84)
+# Hypothesis (from experiments/docs/hypotheses.md H84)
 
 Replace the current per-token soft routing with one that produces literal
 **orthogonal per-token weight vectors across tokens**: enforce
