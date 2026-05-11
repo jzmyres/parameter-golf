@@ -40,6 +40,9 @@ class TestRouterDiagnostics(unittest.TestCase):
         Ensure we still get:
         - dense (train-step) mlp/attn router diagnostics when enabled
         - CV load regularizers that carry gradients (not detached)
+
+        Constructs GPT against the post-iter146 NTP-only default (`use_ctp=False`);
+        CTP coverage is exercised by `experiments/test_arch.py::_make_model`.
         """
         from train_gpt import GPT, router_diagnostics
 

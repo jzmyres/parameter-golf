@@ -211,6 +211,11 @@ $\bar A$, which provides the useful local damping signal.  The penalty terms
 remain in the code path so the coefficients can be re-enabled without an
 architectural change.
 
+\texttt{use\_sparse\_dispatch} is not an active training knob.  The old
+capacity-padded helper uses hard per-expert top-$k$ token selection, which is
+discrete inside $T_\theta$ and therefore rejected by startup validation for
+RevDEQ training.
+
 \subsection{Optimizer}
 \label{sec:optimizer}
 
@@ -585,10 +590,12 @@ task term contributes.  The router/diversity term is
 \]
 Here $m_r$ is the combined routed mass
 \[
-  m_r = \operatorname{route\_prob}_r(z,x_0)\odot \sigma(g_r(z,x_0)),
+  m_r = \operatorname{route\_prob}_r(z,x_0)
 \]
-i.e. softmax or entmax routing probability multiplied by the learned sigmoid
-gate.  CV penalties use unbounded quadratic pressure (no target threshold), so
+i.e. the dense token-local routing probability.  The optional learned sigmoid
+router gate is default-off; when explicitly enabled, it multiplicatively
+scales this mass and is included in the same diagnostics/losses.  CV penalties
+use unbounded quadratic pressure (no target threshold), so
 the term keeps pushing $\operatorname{CV}\to0$ even when balance is already
 acceptable; this replaces the earlier hinge form $[\operatorname{CV}-\tau]_+^2$
 which went silent below a fixed target.  The default expert diversity is scale-invariant cosine diversity; the Frobenius
@@ -700,9 +707,12 @@ The total loss used for backpropagation is
 \section{Quantization and Validation}
 \label{sec:validation}
 
-After training, the script serializes the current code and model state.  Matrix,
-embedding, and optional BigramHash tensors are quantized by per-row int6
-helpers and compressed with zstd level 22.  The required budget is
+After training, the script serializes the current code and model state.  Matrix
+tensors and optional BigramHash tensors are quantized by per-row int6 helpers;
+token embeddings are intentionally kept in fp16 by
+\texttt{FP16\_KEEP\_PATTERNS=(\textquotedblleft tok\_emb\textquotedblright,)}
+until an embedding-quantization ablation proves the BPB tradeoff.  The payload
+is compressed with zstd level 22.  The required budget is
 \[
   \texttt{len(code bytes)}+\texttt{len(compressed model bytes)}
   \le 16{,}000{,}000.

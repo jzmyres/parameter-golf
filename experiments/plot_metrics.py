@@ -110,6 +110,9 @@ def parse_log(logpath: str) -> dict:
         "block_ortho": [],
         # Component-level routing metrics (preferred for component-level MoE plotting).
         **{f"{p}_{s}": [] for p in ("attn", "mlp") for s in ("usage", "entropy", "cv", "sparsity")},
+        # Persistent expert-usage EMA shares (min + CV per role + pool). Materialized
+        # on val only; trainer emits train-side mirrors below.
+        **{f"{p}_ema_{s}": [] for p in ("attn", "mlp", "pool") for s in ("min", "cv")},
         **{f"{p}_ortho": [] for p in ("attn", "mlp")},
         **{f"{p}": [] for p in ROUTER_DIRICHLET_DIAG_FIELDS},
         # Per-group: usage (list of lists), entropy, cv
@@ -125,6 +128,7 @@ def parse_log(logpath: str) -> dict:
         **{f"{p}_{s}_train": [] for p in ("mos_ctp", "mos_ntp") for s in ("usage", "entropy", "cv")},
         "block_usage_train": [], "block_entropy_train": [], "block_cv_train": [],
         **{f"{p}_{s}_train": [] for p in ("attn", "mlp") for s in ("usage", "entropy", "cv", "sparsity")},
+        **{f"{p}_ema_{s}_train": [] for p in ("attn", "mlp", "pool") for s in ("min", "cv")},
         **{f"{p}_ortho_train": [] for p in ("attn", "mlp")},
         **{f"{p}_train": [] for p in ROUTER_DIRICHLET_DIAG_FIELDS},
         "expert_ortho_train": [],
@@ -277,6 +281,8 @@ def parse_log(logpath: str) -> dict:
                 ("block_cv_train", rf"block_cv:{_FLOAT}"),
                 ("attn_cv_train", rf"attn_cv:{_FLOAT}"),
                 ("mlp_cv_train", rf"mlp_cv:{_FLOAT}"),
+                *[(f"{p}_ema_{s}_train", rf"{p}_ema_{s}:{_FLOAT}")
+                  for p in ("attn", "mlp", "pool") for s in ("min", "cv")],
                 ("attn_sparsity_train", rf"attn_sparsity:{_FLOAT}"),
                 ("mlp_sparsity_train", rf"mlp_sparsity:{_FLOAT}"),
                 ("mos_ctp_ortho_train", rf"mos_ctp_ortho:{_FLOAT}"),
@@ -338,6 +344,8 @@ def parse_log(logpath: str) -> dict:
                 ("expert_ortho", rf"expert_ortho:{_FLOAT}"),
                 ("attn_ortho", rf"attn_ortho:{_FLOAT}"),
                 ("mlp_ortho", rf"mlp_ortho:{_FLOAT}"),
+                *[(f"{p}_ema_{s}", rf"{p}_ema_{s}:{_FLOAT}")
+                  for p in ("attn", "mlp", "pool") for s in ("min", "cv")],
                 *[(name, rf"{name}:{_FLOAT}") for name in ROUTER_DIRICHLET_DIAG_FIELDS],
             ]:
                 m2 = re.search(pat, line)

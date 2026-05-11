@@ -14,7 +14,8 @@ class TestMoSProjectionLayout(unittest.TestCase):
 
         torch.manual_seed(0)
         head = MoSHead(d_model=5, vocab_size=7, rank=3,
-                       num_shared=2, num_specialized=1, fsq_levels=0)
+                       num_shared=2, num_specialized=1, fsq_levels=0,
+                       use_ctp=True)
         x = torch.randn(4, 5)
         A_all = torch.cat([head.A_ctp_shared, head.A_ctp], dim=0)
 
@@ -48,6 +49,8 @@ class TestOptimizerCoverage(unittest.TestCase):
             num_experts=3,
             num_shared_experts=1,
             use_parcae=True,
+            use_ctp=True,
+            use_router_sigmoid_gate=True,
         )
         args = types.SimpleNamespace(tie_embeddings=True, tied_embed_lr=0.03, embed_lr=0.6)
 

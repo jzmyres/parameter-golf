@@ -234,7 +234,7 @@ def test_forward_correctness():
         if err >= 1e-4:
             failures += 1
         print(f"{B:>6} {E:>4} {err:>14.2e} {sum_err:>14.2e} {status:>8}")
-    return failures
+    assert failures == 0
 
 
 def test_backward_correctness():
@@ -260,7 +260,7 @@ def test_backward_correctness():
         if rel >= 1e-3:
             failures += 1
         print(f"{B:>6} {E:>4} {err:>14.2e} {rel:>14.2e} {status:>8}")
-    return failures
+    assert failures == 0
 
 
 def test_throughput():

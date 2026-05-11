@@ -10,6 +10,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class TestTiedAttnMlpRouter(unittest.TestCase):
     def test_tied_router_shares_module_and_diagnostics(self):
+        """Constructs GPT against the post-iter146 NTP-only default (`use_ctp=False`).
+        The test inspects router fields only — CTP coverage is exercised by
+        `experiments/test_arch.py::_make_model` which pins `use_ctp=True`."""
         from train_gpt import GPT, router_diagnostics
 
         if not torch.cuda.is_available():

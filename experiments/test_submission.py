@@ -161,7 +161,6 @@ def test_artifact_size():
         f"FAIL: artifact {total_bytes:,} bytes exceeds {MAX_ARTIFACT_BYTES:,} byte limit"
     )
     print("  PASS: artifact within size limit\n")
-    return total_bytes
 
 
 def test_quantization_roundtrip():
@@ -196,7 +195,6 @@ def test_quantization_roundtrip():
         f"FAIL: suspicious improvement after quantization ({degradation:+.4f})"
     )
     print("  PASS: quantization roundtrip within tolerance\n")
-    return pre_loss, post_loss
 
 
 def test_roundtrip_deterministic():

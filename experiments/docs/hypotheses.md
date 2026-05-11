@@ -35,8 +35,8 @@ baseline.
 | Code source of truth | `train_gpt.py::Hyperparameters`; docs must track active defaults, not old records. |
 | Backbone | RevDEQ + Parcae, `use_parcae=True`, weighted `deq_k_jitter_set=(16,24,32,64)` with weights `(0.50,0.40,0.07,0.03)`, `deq_bptt_k=3`. |
 | Routing loss stack | Root-cause rescue stack: Dirichlet-UCB routing, router CV off, EMA-anchored balance/specialization (`router_ema_balance_coef=0.30`, `router_ema_specialization_coef=0.20`), small alive hinge (`router_ema_alive_coef=0.02`), worst-pair cosine expert-output diversity (`expert_output_diversity_coef=0.30`), MoS-CV/per-token entropy unchanged, and 0.07 warmup. Legacy nested routing-gram stack is superseded. |
-| Main active question | Test whether direct root-cause pressure closes the promoted tech debt: alive hinge for min-share, worst-pair diversity for post-int orthogonality, deterministic weighted K bags for finite-depth coverage, and default-off finite-expansion Lyapunov control for `T_theta`. |
-| Near queue | Current code is the next smoke candidate. `lyapunov_coef` remains default-off and should be enabled only for the contraction ablation if `lip_ub` stays high. `iter144` remains the next nominal gradient-quality item but should not be launched automatically. `iter143` remains deferred. Chained routing rerun/fix path is deferred; when resumed, include 4-stage alternating typed chains `attn -> mlp -> attn -> mlp` and `mlp -> attn -> mlp -> attn`. |
+| Main active question | Health-first rescue after user directive: promotion hard-gates on validation BPB only. Do not explicitly penalize `lip_ub` with Lyapunov because it hurt BPB. Treat sparse routing, orthogonality, EMA load balance, liveness, and `lip_ub < 1` as soft diagnostic goals that select the next principled rescue loss/coef rather than blocking promotion by themselves. |
+| Near queue | Rescue coefficient escalation is stopped after iter150: it improved some expert diagnostics but regressed validation BPB, so further diagnostic-first tuning is lower priority than clearing the queue. Iter149 remains the BPB-winning base (`router_ema_balance_coef=0.60`, `router_ema_specialization_coef=0.40`, `router_pertoken_entropy_coef=0.20`, `expert_output_diversity_coef=0.60`, `router_ema_alive_coef=0.04`, `deq_k_jitter_weights=(0.50,0.40,0.07,0.03)`, `lyapunov_coef=0`). Iter151 x3 was aborted at step 10 after the pivot and is not a comparable 1000-step iteration. Next real iteration: conditional prefix-K multi-anchor on the iter149 base. Do not retry pure IFT; if gradient-quality is revisited, redesign it as a hybrid finite-K/IFT estimator with a fresh hypothesis. `iter143` and chained routing remain deferred. |
 | Heavy queue | H91 TTT (scaffold archived: `experiments/components/archive/phased_ttt.py`), H94 GPTQ+LQER (`archive/gptq_lqer.py`), H96 compression, H95 tokenizer/CaseOps, iter 118b smooth sparsity (`archive/sparse_attn_head_gate.py`, `archive/sparse_attention_dispatch.py`), iter 120 RRAttention (`archive/rr_attention.py`). Restore archived scaffolds into `experiments/components/` per `experiments/components/README.md` before reactivating. |
 
 ## Tested Iterations
@@ -78,14 +78,20 @@ baseline.
 | Deferred | iter 103e | Four-stage alternating typed chain: `attn -> mlp -> attn -> mlp`, with each stage owning 7 routed + 1 shared expert of that stage's type. | Yes: tests whether repeated transformer-order composition gives useful intermediate states while preserving the 32 expert-module budget and reducing per-stage peak VRAM. | Requires preset implementation; run after higher-ROI architecture tests. | Defer. Must keep at least one shared expert in every stage and persistent per-stage EMA liveness. Compare against 103a mixed split and non-chained iter142b, not only against 103b/103c. |
 | Deferred | iter 103f | Four-stage alternating typed chain: `mlp -> attn -> mlp -> attn`, with each stage owning 7 routed + 1 shared expert of that stage's type. | Yes: reverse-order counterfactual to 103e; tests whether MLP-first transformations make later attention stages more effective in a deeper chain. | Requires preset implementation; run after higher-ROI architecture tests. | Defer. Same health gates as 103e; only worth continuing if it improves over 103a or materially improves VRAM/step-time without BPB damage. |
 | Deferred | iter 103d | Chained-router health fix: per-stage/per-health-slice alive hinge `sum relu(tau - normalized_usage)^2`, delayed router sparsity/entropy ramp, and per-stage minima diagnostics. | Yes: zero alive loss directly implies no dead expert in every staged router/slice; sparsity remains token-local and input-dependent. | Not efficient now. | Defer behind stronger architecture work: no chained preset beat the non-chained baseline, so health-fixing chained routing is lower ROI than `iter145`. |
-| Done | iter 145 | Evidential Dirichlet-UCB router + EMA-anchored GJSD-style routing objective: `router_scoring=dirichlet_ucb`, `router_dirichlet_ucb_beta=0.5`, `router_load_cv_coef=0`, `router_ema_balance_coef=0.1`, `router_ema_specialization_coef=0.1`, other active reg targets `0.1`, `regularizer_warmup_frac=0.07`, and `use_router_sigmoid_gate=0`. | Yes with caveat: routing remains token-local; persistent EMA is detached, so the balance loss uses a straight-through EMA anchor to give current routing a gradient while tracking historical usage. Normalized expert-output Gram/cosine remains the principled orthogonality pressure. | 1000 steps, 6.50 h train, 23.40 s/step, peak VRAM 34.86 GB. | `VALIDATED_WITH_TECH_DEBT`, not promoted as-is. BPB improved over iter142b: fast `1.4642` vs `1.4715`, final full `1.4840` vs `1.5009`, K-sweep best `K=24 1.4918` vs `1.5063`. Router/MoS health improved versus 142b and no dead expert was observed during training, but post-int gate failed `attn_min_share=0.0319 < 0.0400`, `mlp_ortho=0.5312 > 0.5`, and `lip_ub=65.3672 >= 1`. Root cause: router/liveness fix works for BPB but does not control the RevDEQ transition Jacobian; rescue before `iter144`. |
+| Done | iter 145 | Evidential Dirichlet-UCB router + EMA-anchored GJSD-style routing objective: `router_scoring=dirichlet_ucb`, `router_dirichlet_ucb_beta=0.5`, `router_load_cv_coef=0`, `router_ema_balance_coef=0.1`, `router_ema_specialization_coef=0.1`, other active reg targets `0.1`, `regularizer_warmup_frac=0.07`, and `use_router_sigmoid_gate=0`. | Yes with caveat: routing remains token-local; persistent EMA is detached, so the balance loss uses a straight-through EMA anchor to give current routing a gradient while tracking historical usage. Normalized expert-output Gram/cosine remains the principled orthogonality pressure. | 1000 steps, 6.50 h train, 23.40 s/step, peak VRAM 34.86 GB. | `VALIDATED_WITH_TECH_DEBT`, not promoted as-is. BPB improved over iter142b: fast `1.4642` vs `1.4715`, final full `1.4840` vs `1.5009`, K-sweep best `K=24 1.4918` vs `1.5063`. Router/MoS health improved versus 142b and no dead expert was observed during training, but post-int gate failed `attn_min_share=0.0319 < 0.0400`, `mlp_ortho=0.5312 > 0.5`, and `lip_ub=65.3672 >= 1`. Root cause: router/liveness fix works for BPB but does not control the RevDEQ transition Jacobian; later contraction work must target `T_theta` directly. |
 | Done | iter 145r | Promoted Dirichlet-UCB + EMA-balance routing defaults: `router_scoring=dirichlet_ucb`, `router_dirichlet_ucb_beta=0.5`, `router_load_cv_coef=0`, `router_ema_balance_coef=0.15`, `router_ema_specialization_coef=0.1`, `router_pertoken_entropy_coef=0.1`, `mos_load_cv_coef=0.15`, `expert_output_diversity_coef=0.15`, `regularizer_warmup_frac=0.07`, `use_router_sigmoid_gate=0`, `weight_decay=0.015`. | Yes with documented tech debt: routing remains token-local; EMA balance directly improves historical usage and BPB, but KL-to-uniform alone does not guarantee a hard minimum share. Scalar `deq_beta` is not a Parcae contraction fix because `lip_ub` probes `T_theta`, not the solver blend. | 1000 steps, 6.50 h train, 23.41 s/step, peak VRAM 34.86 GB. | **PROMOTED_WITH_TECH_DEBT** by user directive 2026-05-08. BPB improved: final full `1.4818` vs iter145 `1.4840` and iter142b `1.5009`; fast step1000 `1.4567`; roundtrip/K16 `1.4909`; K-sweep best `K=24 1.4899`. Open issues: strict post-int `attn_min_share=0.0371 < 0.0400`; output collinearity `attn_ortho=0.5098`, `mlp_ortho=0.5703`; contraction failure `lip_ub=45.7943` at K128. Promotion reason: task BPB win and no true dead expert during training. Tech-debt fix is queued separately. |
-| 1 | root-cause rescue | Direct fixes on top of promoted `iter145r`: deterministic weighted K bag over `{16,24,32,64}`, EMA alive hinge, worst-pair cosine expert-output diversity, full-final-validation metadata, and router-confidence diagnostics. | Yes: each change targets an observed failure mode without batch-coupled routing or hard sparse dispatch. | Implemented; requires smoke before full run. | Success criteria: preserve iter145r BPB within `+0.003`, raise post-int `attn_min_share >= 0.040`, keep `mlp_min_share` healthy, bring `attn_ortho/mlp_ortho <= 0.5`, and keep final metadata full-validation promotable. |
-| 2 | contraction ablation | Enable the implemented low-cadence Lyapunov loss on measured RMS expansion of `T_theta`, `relu(rms(T(z*+eps v,x)-T(z*,x))/eps - gamma)^2`, with RMS-normalized `v`, `eps=1e-2`, and `gamma=0.97`. | Yes: Lyapunov stability is principled when it directly constrains the transition map whose `lip_ub` gate is failing. | Code path exists behind `lyapunov_coef`; requires controlled run. | Run only if the root-cause rescue leaves `lip_ub` too high. Success: materially reduce `lip_ub`; clean contraction requires `lip_ub < 1`; BPB regression no worse than `+0.003` unless followed by a rescue. |
+| Done | iter146 rescue | Behavior-changing rescue on top of promoted `iter145r`: deterministic weighted K bag `{16,24,32,64}` with weights `(0.50,0.40,0.07,0.03)`, EMA alive hinge, stronger EMA balance/specialization, worst-pair cosine expert-output diversity, full-final-validation metadata, and router-confidence diagnostics. | Yes, with attribution caveat: this is a targeted failure-mode bundle, not an attribution-clean mechanism test. | 1000 steps, 6.78 h train, 24.41 s/step. | `NOT PROMOTED` for strict health, though BPB is competitive. Fast step1000 `val_bpb=1.4575`; final full `1.479157`; K-sweep best `K=24 1.484500`, `K=128 1.485336`; sampled K counts `[16:500,24:400,32:70,64:30]`. Post-int gate failed `router_collapse` (`attn_min_share=0.0341 < 0.0375`) and `local_contraction_failed` (`lip_ub=21.5896 >= 1`). Takeaway: K/liveness/orthogonality rescue preserved BPB and improved contraction vs iter145r, but not enough for the strict contraction gate. Run the one-variable Lyapunov contraction ablation next; do not combine the router liveness floor with iter147 unless contraction is first isolated. |
+| Done | iter147 contraction ablation | Same iter146 baseline plus only the low-cadence Lyapunov transition expansion loss: `lyapunov_coef=0.005`, `lyapunov_gamma=0.97`, `lyapunov_every=16`, `lyapunov_max_tokens=64`. | Yes: one-variable test of direct transition-map contraction pressure. | 1000 steps, 6.79 h train, 24.45 s/step. | `NOT PROMOTED` for strict health, but the hypothesis is partially supported. Fast step1000 `val_bpb=1.4582`; final full `1.480286`; K-sweep best `K=24 1.486178`, `K=128 1.487220`; post-int gate failed `router_collapse` (`attn_min_share=0.0320 < 0.0375`) and `local_contraction_failed` (`lip_ub=12.5324 >= 1`). Compared with iter146, K128 `lip_ub` improved `21.5896 -> 12.5324` while final full BPB regressed only `+0.001129`, so iter148's coefficient-only escalation condition is met. |
+| Done | iter148 contraction rescue | Same as iter147, but only `lyapunov_coef` increased `0.005 -> 0.0075`; routing, K-jitter, weight decay, and all other knobs fixed. | Yes: one-axis coefficient response after the first direct transition penalty moved `lip_ub` in the right direction. | 1000 steps, 6.78 h train, 24.42 s/step. | `NOT PROMOTED`; escalation refuted. Fast step1000 `val_bpb=1.4590`; final full `1.481556`; K-sweep best `K=24 1.488734`, `K=128 1.490097`; K counts `[16:500,24:400,32:70,64:30]`. Post-int gate failed `router_collapse` (`attn_min_share=0.0366 < 0.0375`) and `local_contraction_failed` (`lip_ub=23.9952 >= 1`). Compared with iter147, BPB regressed and K128 `lip_ub` worsened `12.5324 -> 23.9952`; Lyapunov escalation is closed. |
 | Deferred | iter 143 | `deq_bptt_k=4` counterfactual. Original queue target was iter142b uniform-1.0 defaults; if revived, explicitly choose whether to run on the promoted iter145r stack or the historical iter142b stack. | Yes: one extra Neumann/VJP term after K=3 promoted. | Full 1000 steps. | Deferred by user directive. |
-| 3 | iter 144 | IFT adjoint gradient for the truncated input/embedding signal. Design: [`iter144_ift_adjoint_plan.md`](./iter144_ift_adjoint_plan.md). | Yes: standard DEQ implicit-gradient correction and complementary to routing changes. | No: code change and likely about 2x backward cost. | Implement/test after user chooses whether to prioritize contraction follow-up (`iter147`) or this gradient-quality item. Land default-off only and compare equal-step plus wallclock. |
-| 4 | iter 135/136 | Entmax blend init/LR tweaks. | Conditional: useful only if sparsity remains the active bottleneck. | Yes: CLI-only. | Hold until 142b/142c show whether smooth diversity is insufficient. |
-| 4 | iter 142 deep K | `deq_k_jitter_set=(32,48)`. | Conditional: deeper solve only pays off after routing sparsifies. | Yes: CLI-only, but costly. | Run only if effective experts are roughly `<= 7` and step cost has sparse-kernel headroom. |
+| Done | iter 144 | Pure IFT adjoint gradient for the truncated input/embedding signal. | Refuted for the current stack: the pure equilibrium estimator is mismatched to the noncontractive finite-K transition map, and the implementation removes `z_init` and Parcae-beta task-gradient paths that TBPTT preserves. | 1000 steps, 5.59 h train, 20.12 s/step, peak VRAM 30.28 GB. | `NOT PROMOTED`; pure IFT-2 refuted. Fast step1000 `val_bpb=2.0268`; final full `2.033712`; K-sweep best `K=8 2.028207`, `K=128 2.088864`; K counts `[16:500,24:400,32:70,64:30]`. Post-int failed K64/K128 degradation vs best and `local_contraction_failed` (`lip_ub=32.7620 >= 1`). Throughput improved about 18% vs TBPTT, but BPB regressed by over 0.55. Pure IFT code and CLI support were removed; any revisit needs a new hybrid design. |
+| Done | iter149 combined health double | Cumulative health-first rescue from iter146: double all direct observed-problem coefficients together: `router_ema_balance_coef 0.30 -> 0.60`, `router_ema_specialization_coef 0.20 -> 0.40`, `router_pertoken_entropy_coef 0.10 -> 0.20`, `expert_output_diversity_coef 0.30 -> 0.60`; keep `lyapunov_coef=0`. `router_ema_alive_coef 0.02 -> 0.04` is a guard for the strict min-share failure, not evidence of true dead experts. | Yes: each active coefficient maps to an observed failure axis without adding a direct `lip_ub` penalty; alive is tracked separately as a persistent-underuse guard because iter146's alive raw loss was zero. | 1000 steps, 6.78 h train, 24.41 s/step, peak VRAM 34.86 GB. | `CURRENT_BEST_BY_BPB`; continue rescue. Final full `val_bpb=1.478698`, a small win over iter146 `1.479157`; fast step1000 `1.4569`; K-sweep best `K=24 1.484021`, `K=128 1.485084`; K counts `[16:500,24:400,32:70,64:30]`. Soft diagnostic debt remains: post-int reported `attn_min_share=0.0307 < 0.0375` and `lip_ub=35.3658`; step1000 soft metrics `attn_cv=0.3438`, `mlp_cv=0.0848`, `pool_cv=0.2504`, `pertoken_entropy=3.2304`, `attn_ortho=0.0283`, `mlp_ortho=0.2051`. Do not reject the BPB win on these; use them to run iter150 with the active problem-loss coefficients doubled again. |
+| Done | iter150 combined problem-loss double x2 + K32-200 | Cumulative on iter149: doubled the observed-problem coefficients again: balance `1.20`, specialization `0.80`, per-token entropy `0.40`, expert diversity `1.20`; kept `router_ema_alive_coef=0.04`, `router_load_cv_coef=0`, and `lyapunov_coef=0`. Changed the K-jitter mix to weights `(0.43,0.34,0.20,0.03)`, targeting counts `[16:430,24:340,32:200,64:30]`, so K=32 received 200/1000 training steps with lower average K than the aborted K32-300 plan. | Yes, but confounded: it jointly tested coefficient escalation and a targeted finite-depth distribution change. | 1000 steps, 7.11 h train, 25.59 s/step, peak VRAM 34.87 GB. | `NOT PROMOTED` by the validation-BPB hard gate. Final full `val_bpb=1.501195`, worse than iter149 `1.478698`; fast step1000 `1.4765`; roundtrip/K16 `1.510464`; K-sweep best remained `K=24 1.504070`, with `K=32 1.504192`, `K=64 1.504609`, `K=128 1.504683`; K counts `[16:430,24:340,32:200,64:30]`. K32-200 is not the better training distribution. Soft diagnostics were mixed: entropy and orthogonality improved (`pertoken_entropy=3.1821`, `attn_ortho=0.0219`, `mlp_ortho=0.2002`) and K128 `lip_ub=18.6603` improved vs iter149, but EMA/current load worsened (`attn_ema_min=0.0534`, `attn_ema_cv=0.2309`, `pool_ema_min=0.0276`, `pool_ema_cv=0.1749`, `attn_cv=0.3779`, `pool_cv=0.2758`). Revert the K mix for iter151 and continue the coefficient-dose stress test once more before selecting the BPB winner. |
+| Aborted | iter151 combined problem-loss double x3 + K rollback | Planned coefficient stress test: revert K weights to `(0.50,0.40,0.07,0.03)` and double active observed-problem coefficients to balance `2.40`, specialization `1.60`, per-token entropy `0.80`, expert diversity `2.40`. | Principled as a stress test, but lower priority after iter150 showed diagnostic-first over-regularization and user pivoted to queue clearing. | Aborted at step 10; not comparable and not counted. | Do not use as evidence. If rescue is revisited later, require a new BPB-first reason rather than continuing automatic coefficient doubling. |
+| 2 | iter152 conditional prefix-K multi-anchor | Use the iter149 BPB-winning coefficients and replace single-endpoint jitter supervision with conditional prefix anchors: sample the usual `K` from `{16,24,32,64}` with weights `(0.50,0.40,0.07,0.03)`, store endpoints only for jitter depths `<= sampled K`, and apply normalized losses/TBPTT tails to those endpoints. Expected anchors per step are `0.50*1 + 0.40*2 + 0.07*3 + 0.03*4 = 1.63`, while expected forward K remains `21.76`. | Yes: same finite-K objective family, but lower-variance multi-depth supervision for all prefix endpoints actually traversed by the sampled solve. It is not a forced `K=64` pass and does not change the K sampling distribution. | Full 1000 steps after implementation. | Compare against iter149. Success: similar or better BPB with improved K-sweep robustness and no worsening of EMA load balance, `pertoken_ent`, or orthogonality. Keep current-batch CV secondary and do not mix with another coefficient change. |
+| Removed | IFT hybrid redesign | Do not keep an IFT implementation in the active codebase. Any future IFT-like work must start from a new design that preserves the Parcae beta task signal and either the finite-K TBPTT tail or an explicitly bounded implicit correction. | Plausible only as a new mechanism: pure IFT assumes a useful equilibrium, uses an ill-conditioned adjoint when `lip_ub >> 1`, and discards solver-relaxation task gradient, which failed here. | Not runnable. | Write a design doc before code; no more pure-IFT points. Only allow a smoke test after a concrete design explains why it avoids iter144's failure mode. |
+| Held | iter 135/136 | Entmax blend init/LR tweaks. | Conditional: useful only if sparsity remains the active bottleneck. | Yes: CLI-only. | Hold until smooth diversity/rescue work shows sparsity is still the bottleneck. |
+| Held | iter 142 deep K | `deq_k_jitter_set=(32,48)`. | Conditional: deeper solve only pays off after routing sparsifies. | Yes: CLI-only, but costly. | Run only if effective experts are roughly `<= 7` and step cost has sparse-kernel headroom. |
 | 5 | H99 SmearGate | Default-off position-mixing memory channel. | Plausible: BOS-masked local memory channel. | Medium: code exists; needs controlled run. | Keep default-off; run only after the current routing/TBPTT queue. |
 | 6 | iter 118b | RevDEQ-safe smooth sparsity primitive. | Yes if smooth/differentiable; hard Top-K is disallowed. | No: 6-10h feature. | Defer until 142b/142c and cheap entmax knobs fail to produce useful sparsity. |
 | 7 | iter 120 | RRAttention / dynamic block sparse attention. | Plausible but kernel-sensitive at T=2048. | No: flex/Triton rewrite. | Defer until attention scaling is the measured bottleneck. |
@@ -96,22 +102,23 @@ baseline.
 | Closed | iter 138/140/141 legacy gram queue | Old routing-gram ablations. | Partly, but stale under current flat objective. | Would waste runs. | Mark superseded; do not run. |
 | Closed | H97/H98/H105 | Attn-gate quantization / hard sparse head gate / weak stale proposals. | Weak or mismatched to active architecture. | Not worth current queue slots. | Close or keep archived only. |
 
-## Fast Test Macros
+## Run Macros
 
-These are experiment shapes, not mandatory commands. Keep all logs under
+These are experiment shapes, not mandatory commands. Iteration comparisons use
+the full 1000-step budget by default. Keep all logs under
 `experiments/training_logs/` and archive the result row back into this file.
 
 ```bash
 # iter 142b: decomposed canonical stack
 torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-  --iterations=50 \
+  --iterations=1000 \
   --expert-diversity-kind=cosine --expert-output-diversity-coef=1.0 \
   --regularizer-warmup-frac=0 \
   --val-loss-every=1000000
 
 # iter 142c: Frobenius-only counterfactual
 torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-  --iterations=50 \
+  --iterations=1000 \
   --expert-diversity-kind=frobenius --expert-output-diversity-coef=1.0 \
   --router-load-cv-coef=0 --router-entropy-coef=0 --mos-load-cv-coef=0 \
   --regularizer-warmup-frac=0 \
@@ -119,27 +126,27 @@ torchrun --standalone --nproc_per_node=gpu train_gpt.py \
 
 # iter 103a: chained mixed split
 torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-  --iterations=100 \
+  --iterations=1000 \
   --chained-stages-preset=split_2stage
-# iter 103a health probe: keep balance alive, reduce entropy sparsity pressure
+# iter 103a health comparison: keep balance alive, reduce entropy sparsity pressure
 torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-  --iterations=100 \
+  --iterations=1000 \
   --chained-stages-preset=split_2stage \
   --router-pertoken-entropy-coef=0.5
 
 # iter 103b/103c: typed-chain order counterfactuals
 torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-  --iterations=100 \
+  --iterations=1000 \
   --chained-stages-preset=attn_first_2stage \
   --router-pertoken-entropy-coef=0.5
 torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-  --iterations=100 \
+  --iterations=1000 \
   --chained-stages-preset=mlp_first_2stage \
   --router-pertoken-entropy-coef=0.5
 
 # iter 145: evidential router + EMA-GJSD CV replacement
 torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-  --iterations=100 \
+  --iterations=1000 \
   --router-scoring=dirichlet_ucb \
   --router-dirichlet-ucb-beta=0.5 \
   --router-load-cv-coef=0 \
@@ -152,11 +159,11 @@ torchrun --standalone --nproc_per_node=gpu train_gpt.py \
   --use-router-sigmoid-gate=0 \
   --checkpoint-every=100
 
-# iter 146: coefficient-first rescue + weighted K jitter + confidence diagnostics
+# iter146 rescue: bundled liveness/orthogonality/K-coverage rescue
 # These flags are now the Hyperparameters defaults; keep explicit flags only
 # for reproduction or A/B runs against older checkpoints.
 torchrun --standalone --nproc_per_node=gpu train_gpt.py \
-  --iterations=100 \
+  --iterations=1000 \
   --deq-k-jitter-set=16,24,32,64 \
   --deq-k-jitter-weights=0.50,0.40,0.07,0.03 \
   --router-scoring=dirichlet_ucb \
@@ -172,12 +179,70 @@ torchrun --standalone --nproc_per_node=gpu train_gpt.py \
   --use-router-sigmoid-gate=0 \
   --weight-decay=0.015 \
   --checkpoint-every=100
+
+# iter147 contraction ablation: run only if iter146 leaves lip_ub >= 1
+torchrun --standalone --nproc_per_node=gpu train_gpt.py \
+  --iterations=1000 \
+  --lyapunov-coef=0.005 \
+  --lyapunov-gamma=0.97 \
+  --lyapunov-every=16 \
+  --lyapunov-max-tokens=64 \
+  --checkpoint-every=100
+
+# iter148 contraction rescue: run only if iter147 improves lip_ub but does not solve it
+torchrun --standalone --nproc_per_node=gpu train_gpt.py \
+  --iterations=1000 \
+  --lyapunov-coef=0.0075 \
+  --lyapunov-gamma=0.97 \
+  --lyapunov-every=16 \
+  --lyapunov-max-tokens=64 \
+  --checkpoint-every=100
+
+# iter149 health-first rescue: double all direct health losses, no Lyapunov penalty
+torchrun --standalone --nproc_per_node=gpu train_gpt.py \
+  --iterations=1000 \
+  --router-ema-alive-coef=0.04 \
+  --router-ema-balance-coef=0.60 \
+  --router-ema-specialization-coef=0.40 \
+  --router-pertoken-entropy-coef=0.20 \
+  --expert-output-diversity-coef=0.60 \
+  --lyapunov-coef=0 \
+  --checkpoint-every=100
+
+# iter150 health-first rescue: repeat combined observed-problem doubling + K32-200
+torchrun --standalone --nproc_per_node=gpu train_gpt.py \
+  --iterations=1000 \
+  --deq-k-jitter-set=16,24,32,64 \
+  --deq-k-jitter-weights=0.43,0.34,0.20,0.03 \
+  --router-ema-alive-coef=0.04 \
+  --router-ema-balance-coef=1.20 \
+  --router-ema-specialization-coef=0.80 \
+  --router-pertoken-entropy-coef=0.40 \
+  --expert-output-diversity-coef=1.20 \
+  --lyapunov-coef=0 \
+  --checkpoint-every=100
+
+# iter151 health-first rescue: third combined observed-problem doubling + K rollback
+torchrun --standalone --nproc_per_node=gpu train_gpt.py \
+  --iterations=1000 \
+  --deq-k-jitter-set=16,24,32,64 \
+  --deq-k-jitter-weights=0.50,0.40,0.07,0.03 \
+  --router-ema-alive-coef=0.04 \
+  --router-ema-balance-coef=2.40 \
+  --router-ema-specialization-coef=1.60 \
+  --router-pertoken-entropy-coef=0.80 \
+  --expert-output-diversity-coef=2.40 \
+  --lyapunov-coef=0 \
+  --checkpoint-every=100
 ```
 
 ## Durable Rules
 
-- Routing penalties operate on combined routed mass
-  (`simplex(allocation_scores) * sigmoid(gate)`), not on renormalized slices.
+- Routing penalties operate on active routed mass. With the default
+  `use_router_sigmoid_gate=False` (iter146), mass is `simplex(allocation_scores)`;
+  when the optional sigmoid gate is enabled, mass is the combined
+  `simplex(allocation_scores) * sigmoid(gate)`. Either way, never on
+  renormalized slices.
 - Hard Top-K / magnitude-skip dispatch is not RevDEQ-safe. Any sparsity path
   must be smooth, default-off, and exact/no-op at the strict-generalization
   point.
@@ -191,14 +256,50 @@ torchrun --standalone --nproc_per_node=gpu train_gpt.py \
   weights, slow bias feedback, and straight-through EMA-balance losses. Detached
   `KL(EMA||uniform)` alone has no gradient to the current router.
 - Promoted iter145r defaults improve BPB but do not close strict expert-health
-  or contraction gates. Iter146 deliberately tests doubled ideal-target
-  regularizers first; keep EMA alive hinges and Lyapunov/Jacobian contraction
-  losses out of that run so attribution stays clean.
+  or contraction gates. Iter146 is a bundled 1000-step rescue run, not an
+  attribution-clean mechanism test: keep the EMA alive hinge in because it
+  directly targets the observed min-share failure, but keep Lyapunov/Jacobian
+  contraction losses out so contraction remains isolated in iter147.
+- The iter149-151 health-first rescue sequence intentionally keeps
+  `lyapunov_coef=0`: `lip_ub` remains a reported diagnostic with desired goal
+  `< 1`, but the sequence prioritizes sparse, live, orthogonal experts before
+  adding any direct transition-map penalty.
+- For iter149-151, every observed problematic health metric maps to a direct
+  training loss and all active problem losses are doubled together per
+  iteration: long-run load balance uses `router_ema_balance_loss` and should be
+  judged primarily by EMA usage/min-share diagnostics, sparse specialization
+  uses `router_pertoken_entropy_loss` plus EMA specialization, and output
+  orthogonality uses `expert_diversity_loss`. Current-batch `attn_cv`,
+  `mlp_cv`, and `pool_cv` are secondary smoke diagnostics only; they can rise
+  on specialist batches and should not be the promotion criterion while
+  `router_load_cv_coef=0`. `router_ema_alive_loss` is a conditional guard for
+  persistent under-floor usage; iter146 had `router_ema_alive_loss=0`, so do
+  not treat alive escalation as an active rescue lever unless the hinge becomes
+  nonzero or a true dead/under-floor EMA failure appears.
+- Promotion hard-gates on validation BPB only. EMA balance/min-share, sparsity,
+  orthogonality, current-batch CV, and `lip_ub` are soft diagnostics: report
+  them, then map each undesirable metric to its corresponding principled rescue
+  regularizer for the next iteration rather than rejecting an otherwise better
+  validation-BPB point.
+- iter149 is BPB-winner-but-not-promoted-to-defaults. Final full
+  `val_bpb=1.478698` is a small win over iter146 `1.479157` and iter149 is the
+  comparison base for iter152+. However, `Hyperparameters` defaults remain at
+  the iter146 values (`router_ema_balance_coef=0.30`,
+  `router_ema_specialization_coef=0.20`, `router_pertoken_entropy_coef=0.10`,
+  `expert_output_diversity_coef=0.30`, `router_ema_alive_coef=0.02`) because
+  iter150 regressed the doubled coefficients and iter151 was aborted before
+  any promotion-propagation commit. Iter149's coefficients must be passed
+  explicitly via CLI (`--router-ema-balance-coef=0.60 ...`) until a follow-up
+  cleanly wins on BPB and triggers a full defaults-propagation commit.
 - Weighted K jitter over `{16,24,32,64}` is a finite-depth robustness add-on,
   not the contraction fix. Low-probability high-K sampling is represented by
   the explicit `deq_k_jitter_weights` field; the sampler normalizes weights,
   samples exact weighted bags, restores checkpoint state, and logs sampled-K
   counts for audit.
+- Pure IFT adjoint with no TBPTT/Parcae-beta task signal is not viable under
+  the current noncontractive transition map: iter144 was faster but
+  catastrophically worse. The code and CLI knob were removed; any revisit must
+  be a hybrid redesign, not another pure IFT coefficient point.
 - Router confidence tracking is diagnostic-only in iter146. Expected trajectory:
   Dirichlet strength/evidence rise, `E/S` and sigma fall, normalized `H(mu)`
   falls if routing specializes, and UCB beta anneals toward zero.

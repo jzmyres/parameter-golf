@@ -215,6 +215,27 @@ def _safe_mean(values, floor: float = 1e-8) -> float:
     return max(sum(values) / max(n, 1), floor)
 
 
+def _share_cv(p: list[float]) -> float:
+    """Coefficient-of-variation of a normalized share list.
+
+    Companion to ``_safe_sum`` / ``_safe_mean``. The router-health log
+    formatter computes this for `attn/mlp/pool` raw shares and again for
+    EMA shares; keep the definition in one place.
+    """
+    mu = _safe_mean(p)
+    var = sum((x - mu) ** 2 for x in p) / max(len(p), 1)
+    return (var ** 0.5) / mu
+
+
+def _share_entropy(p: list[float]) -> float:
+    """Shannon entropy (nats) of a normalized share list.
+
+    The +1e-8 floor inside ``log`` keeps the term finite for x=0 (the 0·log
+    contribution is then 0, so no explicit guard is needed).
+    """
+    return -sum(x * math.log(x + 1e-8) for x in p)
+
+
 def _diag_scalar(value) -> float | None:
     if isinstance(value, torch.Tensor):
         if value.numel() == 0:
@@ -644,16 +665,10 @@ class Hyperparameters:
     # full training launch (custom_op + DDP + compile + RevDEQ is fragile;
     # see CLAUDE.md Fix #2 NOT VIABLE for the AdaSplash precedent).
     use_entmax_triton = False
-    # iter 117b-3 (2026-04-30): capacity-padded sparse MoE dispatch.
-    # Default OFF (dense evaluation: every expert sees every token).
-    # When True, MLP and/or attention expert paths gather top-K tokens per
-    # expert (K = ceil(C * T / E)), evaluate, and scatter_add. Throughput-
-    # only change when C is sufficient (≥ (1-s)·E + headroom for sparsity s).
-    # See experiments/test_sparse_dispatch.py Phase A.0-A.5 for correctness
-    # proofs (bit-identical to dense at sufficient C, monotone approximation
-    # error otherwise). Wiring is currently inert: helper function exists but
-    # CausalSelfAttention/MLP still use dense compute. Step 3 will add the
-    # MLP-path wiring.
+    # iter 117b-3 (2026-04-30): capacity-padded sparse MoE dispatch scaffold.
+    # Default OFF and rejected by startup validation for training: hard top-k
+    # capacity dispatch is discrete and not RevDEQ-safe inside T_theta. Keep
+    # helper tests as archived kernel evidence, not an active train-time flag.
     use_sparse_dispatch = False
     sparse_dispatch_capacity_factor = 4.0
     # iter 118a Phase A3 (2026-05-03): fused Triton routed-down kernel for
@@ -702,7 +717,8 @@ class Hyperparameters:
     # γ is on the Frobenius/√D proxy (Hutchinson), not ‖J‖_2: ‖J‖_2 < 1
     # implies Frobenius/√D < 1 but not the reverse, so γ=0.97 is a soft
     # pressure, not a contraction certificate — `lip_ub` is the gate.
-    # Recalibration recipe lives in iter144_ift_adjoint_plan.md.
+    # Pure IFT was removed after iter144; future contraction work should change
+    # the transition parameterization or use a new hybrid finite-K design.
     lyapunov_gamma = 0.97
     lyapunov_every = 16
     lyapunov_max_tokens = 64
@@ -2050,12 +2066,12 @@ def entmax_1p5_dispatch(z: Tensor, dim: int = -1) -> Tensor:
 # ---------------------------------------------------------------------------
 # Iter 117b-3: capacity-padded sparse MoE dispatch (pure-PyTorch).
 # ---------------------------------------------------------------------------
-# Default OFF (`use_sparse_dispatch: bool = False`). Replaces dense
-# (E, T, D) expert evaluation with a capacity-padded gather/scatter path:
-# each expert processes only its top-K tokens by routing weight,
-# K = ceil(C * T / E) static. Tokens with zero routing weight fall outside
-# top-K and contribute nothing to that expert's compute (operator-level
-# equivalence proven in experiments/test_sparse_dispatch.py Phase A.0-A.5).
+# Default OFF and rejected by `_validate_hyperparameters` for training.
+# Replaces dense (E, T, D) expert evaluation with a capacity-padded
+# gather/scatter path: each expert processes only its top-K tokens by routing
+# weight, K = ceil(C * T / E) static. That hard top-k is not smooth enough for
+# the RevDEQ transition, so this remains kernel evidence rather than an active
+# train-time optimization.
 #
 # Equivalence:
 #   - C ≥ (1-s)·E + headroom (for sparsity s): bit-identical to dense
@@ -2149,18 +2165,13 @@ ROUTER_EMA_LOSS_TERMS: tuple[tuple[str, float], ...] = (
 
 
 class SoftDenseRouter(nn.Module):
-    """Dense softmax routing over experts (no top-k, no dropping).
+    """Dense token-local routing over experts (no top-k, no dropping).
 
-    Two scoring modes (iter 34 A/B, opg_doc.tex §4.3):
-      - scoring='linear' (default, iter 30-33b baseline): logits =
-        `W_r x_n + b_expert + log σ(W_g x_n + b_g)` — unbounded Linear
-        over RMSNorm-ed input, gated by a sigmoid.  NOT 1-Lipschitz in
-        input.
-      - scoring='l2' (iter 34A): logits = `tanh(-γ‖x_n − c_j‖²)` using
-        learnable prototypes c_j ∈ R^dim.  1-Lipschitz in input under
-        bounded-state assumption (doc §4.3 Option B, §6.4) — tanh
-        saturation caps the composition's Lipschitz constant.  γ is
-        fixed at 1.0 initially (not learnable), can be promoted later.
+    Active default scoring is `dirichlet_ucb`: router logits parameterize
+    Softplus evidence for a Dirichlet mean plus an annealed uncertainty bonus.
+    Legacy `linear`, `l2`, and `sips` scoring remain available for ablations;
+    prototype parameters are allocated only for the prototype-based modes.
+    The extra sigmoid gate is also optional and default-off.
     """
     def __init__(self, dim: int, num_experts: int, *,
                  min_share_frac: float = 0.6,
@@ -2221,23 +2232,31 @@ class SoftDenseRouter(nn.Module):
         if self.router.bias is not None:
             nn.init.zeros_(self.router.bias)
         self.score_norm_weight = nn.Parameter(torch.ones(dim))
-        self.gate_norm_weight = nn.Parameter(torch.ones(dim))
-        # L2-distance scoring: learnable prototypes c_j and fixed γ.  When
-        # scoring='linear', prototypes are unused (kept as a zero-init module
-        # attribute for state-dict compatibility).
-        self.prototypes = nn.Parameter(torch.empty(num_experts, dim))
-        with torch.no_grad():
-            nn.init.normal_(self.prototypes, std=0.02)
-        self.l2_gamma = 1.0
+        if self.use_router_sigmoid_gate:
+            self.gate_norm_weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.gate_norm_weight = None
+        # Prototype scoring is an ablation path; the promoted default should
+        # not carry unused trainable state or optimizer slots.
+        if self.scoring in ("l2", "sips"):
+            self.prototypes = nn.Parameter(torch.empty(num_experts, dim))
+            with torch.no_grad():
+                nn.init.normal_(self.prototypes, std=0.02)
+            self.l2_gamma = 1.0
+        else:
+            self.prototypes = None
         # Lyapunov: no prototype bounding needed (was BallProjection for 1-Lip).
         self.register_buffer("expert_bias", torch.zeros(num_experts, dtype=torch.float32), persistent=True)
         # Input-dependent sigmoid gate on routing weights (iter 17, H14).
         # Init fully open: weight=0, bias=5.0 → sigmoid(5)≈0.993.
         # The model can learn to suppress specific experts per-token.
-        self.router_gate = CastedLinear(dim, num_experts, bias=True)
-        with torch.no_grad():
-            self.router_gate.weight.zero_()
-            self.router_gate.bias.fill_(5.0)
+        if self.use_router_sigmoid_gate:
+            self.router_gate = CastedLinear(dim, num_experts, bias=True)
+            with torch.no_grad():
+                self.router_gate.weight.zero_()
+                self.router_gate.bias.fill_(5.0)
+        else:
+            self.router_gate = None
         # 0-d GPU tensor (or None) — see comment at the assignment site in `forward`.
         # Stored on GPU to avoid the dynamo Python-float value-guard that triggered
         # a per-step recompile of the compiled block.forward (profile, 2026-04-28).
@@ -2272,6 +2291,27 @@ class SoftDenseRouter(nn.Module):
         self._expert_total_mass_gpu: Tensor | None = None
         self._diag_step: int | None = None
         self._expert_usage_ema_decay = 0.99
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict,
+        missing_keys, unexpected_keys, error_msgs,
+    ) -> None:
+        # Silently drop legacy optional-param keys when the current router did
+        # not allocate them (Dirichlet-UCB + gate-off default). PyTorch's
+        # public `load_state_dict` shallow-copies the input dict before
+        # recursing here, so popping from `state_dict` does not mutate the
+        # caller's original; no restore needed.
+        if self.prototypes is None:
+            state_dict.pop(prefix + "prototypes", None)
+        if self.gate_norm_weight is None:
+            state_dict.pop(prefix + "gate_norm_weight", None)
+        if self.router_gate is None:
+            state_dict.pop(prefix + "router_gate.weight", None)
+            state_dict.pop(prefix + "router_gate.bias", None)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
 
     def _component_ranges(self) -> list[tuple[int, int]]:
         out = []
@@ -2396,12 +2436,16 @@ class SoftDenseRouter(nn.Module):
     def forward(self, x: Tensor, *, pre_normed: bool = True) -> Tensor:
         x_n = x  # Caller supplies parameter-free RMS-normalized activations.
         score_weight = self.score_norm_weight.to(dtype=x_n.dtype)
-        gate_weight = self.gate_norm_weight.to(dtype=x_n.dtype)
         x_score = x_n * score_weight
-        x_gate = x_n * gate_weight
-        D = self.prototypes.shape[-1]
+        x_gate: Tensor | None = None
+        if self.use_router_sigmoid_gate:
+            assert self.gate_norm_weight is not None
+            gate_weight = self.gate_norm_weight.to(dtype=x_n.dtype)
+            x_gate = x_n * gate_weight
+        D = x_score.shape[-1]
         p_base: Tensor | None = None
         if self.scoring in ("l2", "sips"):
+            assert self.prototypes is not None
             # Phase 6a.3 (reviews 1, 10): replace the O(B·T·E·D) broadcast
             # (x_n.unsqueeze(-2) - c) with a matmul-based distance / cosine,
             # and apply the bounded-prototype projection.  Compute the
@@ -2491,22 +2535,18 @@ class SoftDenseRouter(nn.Module):
         else:
             p_alloc = p_softmax
         if self.use_router_sigmoid_gate:
+            assert self.router_gate is not None and x_gate is not None
             gate_act = torch.sigmoid(self.router_gate(x_gate).float())
+            self._router_gate_last_mean = gate_act.detach().mean()
         else:
             gate_act = torch.ones_like(p_alloc, dtype=torch.float32)
+            # `_router_gate_last_mean` was set to None in __init__ and stays
+            # None on the gate-off path — skip the redundant per-forward write.
         p = (p_alloc * gate_act).to(dtype=x.dtype)
-        # Diagnostic capture — store as 0-d GPU tensor (no `.item()`).
-        # `.item()` here triggered a dynamo graph break AND the resulting Python
-        # float was guard-captured by the outer compiled block.forward, causing a
-        # per-step recompile when the running batch stat changed (profile run
-        # 2026-04-28: dynamo log `[6/8] last reason: ... _router_gate_last_mean ==
-        # 0.9846050143241882`). Mirrors the iter 84 `_shared_gate_mean` pattern at
-        # L2388-2390. Materialization to Python float happens at log time
-        # (`format_expert_info`), which already calls `float(t)` for formatting.
-        # Always-on (no flag gate): mean reduction is negligible vs the recompile
-        # cost it eliminates, and removes the `_ROUTER_DIAGNOSTICS_ACTIVE` guard
-        # recompile axis at this site.
-        self._router_gate_last_mean = gate_act.detach().mean()
+        # When the optional sigmoid gate is enabled, its mean is kept as a 0-d
+        # GPU tensor. Materialization to Python happens only at log time.
+        # Background on the 0-d-GPU diagnostic pattern (avoids dynamo
+        # value-guard recompiles): EXPERIENCE.md#hot-path-sync (iter 84 profile).
         if self.training:
             reduce_dims = tuple(range(p.ndim - 1))
             mean_mass = p.mean(dim=reduce_dims)
@@ -2840,7 +2880,7 @@ class CausalSelfAttention(nn.Module):
     H/H_kv (same as before).
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
-                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 8,
+                 qk_gain_init: float, kv_latent_dim: int = 0, num_experts: int = 16,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None,
                  use_nsa_attention: bool = False,
                  nsa_compress_block_size: int = 32,
@@ -3152,7 +3192,7 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     """SwiGLU-gated MLP expert bank (doc §3.4)."""
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 8,
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 16,
                  expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
         hidden = int(mlp_mult * dim)
@@ -3411,7 +3451,7 @@ class MoSHead(nn.Module):
     """
     def __init__(self, d_model: int, vocab_size: int, rank: int = 256,
                  num_shared: int = 2, num_specialized: int = 1, fsq_levels: int = 8,
-                 use_ctp: bool = True, logit_softcap: float = 0.0,
+                 use_ctp: bool = False, logit_softcap: float = 0.0,
                  mos_output_diversity_kind: str = "cosine"):
         super().__init__()
         self.d_model = d_model
@@ -3661,7 +3701,7 @@ class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 num_experts: int = 8, num_shared_experts: int = 0,
+                 num_experts: int = 16, num_shared_experts: int = 0,
                  # Defaults below mirror Hyperparameters (current rescue stack,
                  # 2026-05-08).
                  router_scoring: str = "dirichlet_ucb",
@@ -4600,10 +4640,10 @@ class GPT(nn.Module):
                  num_kv_heads: int, mlp_mult: float, tie_embeddings: bool,
                  tied_embed_init_std: float, rope_base: float,
                  qk_gain_init: float, bigram_vocab_size: int = 0, bigram_dim: int = 128,
-                 kv_latent_dim: int = 0, num_refinements: int = 1,
+                 kv_latent_dim: int = 0, num_refinements: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
-                 deq_beta: float = 0.35,
-                 deq_bptt_k: int = 0,
+                 deq_beta: float = 0.50,
+                 deq_bptt_k: int = 3,
                  # Defaults below mirror Hyperparameters (current rescue stack,
                  # 2026-05-08). Keep these aligned: experiments/test_arch.py
                  # constructs GPT() without overrides and asserts the values.
@@ -4618,7 +4658,7 @@ class GPT(nn.Module):
                  smear_gate_init: float = 0.1,
                  smear_gate_bos_id: int = 1,
                  logit_softcap: float = 0.0,
-                 num_experts: int = 8, num_shared_experts: int = 0,
+                 num_experts: int = 16, num_shared_experts: int = 0,
                  lyapunov_coef: float = 0.0,
                  lyapunov_gamma: float = 0.97,
                  lyapunov_every: int = 16,
@@ -4626,7 +4666,7 @@ class GPT(nn.Module):
                  use_parcae: bool = True,
                  parcae_init_a_bar: float = 0.7,
                  parcae_init_b_bar: float | None = None,
-                 use_ctp: bool = True,
+                 use_ctp: bool = False,
                  ctp_weight: float = 0.0,
                  router_load_cv_coef: float = 0.0,
                  router_ema_alive_coef: float = 0.02,
@@ -4963,7 +5003,9 @@ class GPT(nn.Module):
             if self.training:
                 params = tuple(p for p in sb.parameters() if p.requires_grad)
                 bptt_k = int(getattr(self, "deq_bptt_k", 0) or 0)
-                z, z_prev = RevDEQFunction.apply(f_theta, x0, z_init, beta, b_bar, K, bptt_k, *params)
+                z, z_prev = RevDEQFunction.apply(
+                    f_theta, x0, z_init, beta, b_bar, K, bptt_k, *params
+                )
                 return z, z_prev, None, None
 
             # FP32 accumulators for the unrolled solver (eval path only — train uses revdeq).
@@ -5448,7 +5490,7 @@ class OptimizerParamLists:
 def _build_optimizer_param_lists(base_model: nn.Module, args) -> OptimizerParamLists:
     sb = _unwrap_compiled_module(base_model.shared_block)
     block_named_params = list(sb.named_parameters())
-    # All ndim >= 2 block params (incl. router prototypes/weights) -> Muon;
+    # All ndim >= 2 block params (including active router weights/prototypes) -> Muon;
     # all ndim < 2 / control params -> AdamW scalar.
     matrix_params = [p for name, p in block_named_params
                      if p.ndim >= 2 and not any(pat in name for pat in CONTROL_TENSOR_PATTERNS)]
@@ -5894,12 +5936,15 @@ def _validate_hyperparameters(args) -> None:
     if int(getattr(args, "lyapunov_max_tokens", 1)) <= 0:
         raise SystemExit(f"lyapunov_max_tokens ({args.lyapunov_max_tokens}) must be positive")
     nE, nS = int(args.num_experts), int(args.num_shared_experts)
-    if nE < 0:
-        raise SystemExit(f"num_experts ({nE}) must be non-negative")
+    if nE <= 0:
+        raise SystemExit(f"num_experts ({nE}) must be positive")
     if nS < 0:
         raise SystemExit(f"num_shared_experts ({nS}) must be non-negative")
-    if nE + nS == 0:
-        raise SystemExit("at least one of (num_experts, num_shared_experts) must be > 0")
+    if nS >= nE:
+        raise SystemExit(
+            f"num_shared_experts ({nS}) must be < num_experts ({nE}) so at least "
+            f"one routed expert remains"
+        )
     if str(args.router_scoring) not in ("linear", "l2", "sips", "dirichlet_ucb"):
         raise SystemExit(f"router_scoring={args.router_scoring!r} must be one of linear,l2,sips,dirichlet_ucb")
     if str(args.router_scoring) == "dirichlet_ucb" and bool(getattr(args, "use_entmax_routing", False)):
@@ -5908,6 +5953,11 @@ def _validate_hyperparameters(args) -> None:
         raise SystemExit(
             "dirichlet_ucb scoring + use_entmax_routing is not a supported combination "
             "(entmax projection has no defined meaning on Dirichlet UCB acquisition scores)"
+        )
+    if bool(getattr(args, "use_sparse_dispatch", False)):
+        raise SystemExit(
+            "use_sparse_dispatch is not supported in train_gpt.py: the capacity/top-k "
+            "dispatch path is discrete and is not RevDEQ-safe during training"
         )
     if int(args.train_seq_len) <= 0:
         raise SystemExit(f"train_seq_len ({args.train_seq_len}) must be positive")
@@ -6197,6 +6247,7 @@ def main() -> None:
         f" deq_k_range={args.deq_k_min}-{args.deq_k_max} deq_k_eval={args.deq_k_eval}"
         f" deq_k_jitter_set={tuple(getattr(args, 'deq_k_jitter_set', ()) or ())}"
         f" deq_k_jitter_weights={tuple(getattr(args, 'deq_k_jitter_weights', ()) or ())}"
+        f" deq_bptt_k={args.deq_bptt_k}"
         f" batch_tokens={args.train_batch_tokens} seq_len={args.train_seq_len}"
         f" refinements={args.num_refinements} refine_ramp_frac={args.num_refinements_ramp_frac}"
         f" ema={int(args.ema_enabled)} ema_decay={args.ema_decay:.4f}"
@@ -6647,18 +6698,27 @@ def main() -> None:
                     # mass toward attn or mlp. Per-slice CVs use the already-
                     # renormalized halves above so they are independent of the
                     # cross-slice tilt.
-                    def _cv(p: list[float]) -> float:
-                        mu = _safe_mean(p)
-                        var = sum((x - mu) ** 2 for x in p) / max(len(p), 1)
-                        return (var ** 0.5) / mu
-                    def _entropy(p: list[float]) -> float:
-                        return -sum(x * math.log(x + 1e-8) for x in p if x > 0.0)
-                    parts.append(f"attn_cv:{_cv(attn_norm):.4f}")
-                    parts.append(f"mlp_cv:{_cv(mlp_norm):.4f}")
-                    parts.append(f"pool_cv:{_cv(pool_norm):.4f}")
-                    parts.append(f"attn_entropy:{_entropy(attn_norm):.4f}")
-                    parts.append(f"mlp_entropy:{_entropy(mlp_norm):.4f}")
-                    parts.append(f"pool_entropy:{_entropy(pool_norm):.4f}")
+                    ema_usage = getattr(router, "_expert_usage_ema", None)
+                    if ema_usage is not None and len(ema_usage) == 2 * R:
+                        ema_attn_half = list(ema_usage[:R])
+                        ema_mlp_half = list(ema_usage[R:])
+                        ema_attn_sum = _safe_sum(ema_attn_half)
+                        ema_mlp_sum = _safe_sum(ema_mlp_half)
+                        ema_pool_sum = max(ema_attn_sum + ema_mlp_sum, 1e-8)
+                        ema_norms = (
+                            ("attn", [u / ema_attn_sum for u in ema_attn_half]),
+                            ("mlp", [u / ema_mlp_sum for u in ema_mlp_half]),
+                            ("pool", [u / ema_pool_sum for u in ema_usage]),
+                        )
+                        for _prefix, _norm in ema_norms:
+                            parts.append(f"{_prefix}_ema_min:{min(_norm):.4f}")
+                            parts.append(f"{_prefix}_ema_cv:{_share_cv(_norm):.4f}")
+                    parts.append(f"attn_cv:{_share_cv(attn_norm):.4f}")
+                    parts.append(f"mlp_cv:{_share_cv(mlp_norm):.4f}")
+                    parts.append(f"pool_cv:{_share_cv(pool_norm):.4f}")
+                    parts.append(f"attn_entropy:{_share_entropy(attn_norm):.4f}")
+                    parts.append(f"mlp_entropy:{_share_entropy(mlp_norm):.4f}")
+                    parts.append(f"pool_entropy:{_share_entropy(pool_norm):.4f}")
                     pertoken_ent = getattr(router, "_expert_entropy", None)
                     if pertoken_ent is not None:
                         parts.append(f"pertoken_entropy:{pertoken_ent:.4f}")

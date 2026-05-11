@@ -40,6 +40,8 @@ This file has two roles, in this order:
 | 2026-05-08 | [#promotion-propagation](#promotion-propagation)             | iter145r promotion changed `Hyperparameters` defaults but signature defaults / regression test / `opg_doc.tex` lagged silently |
 | 2026-05-09 | [#loss-gate-quantity-alignment](#loss-gate-quantity-alignment) | iter146 Lyapunov penalty trains on a Frobenius/√D Hutchinson proxy while the post-final `lip_ub` gate measures operator norm; both share the colloquial name "Lyapunov / contraction" |
 | 2026-05-09 | [#scalar-semantic-shift](#scalar-semantic-shift)              | `max_training_seconds` semantic flipped from process-total to training-only without updating callers; canonical `--max-training-seconds=600` would silently overrun the 600 s 8×H100 invariant by 120 s |
+| 2026-05-11 | [#enforcement-config-staging](#enforcement-config-staging)   | iter146-151 commit window introduced `pytest.ini` to convert legacy `return failures` test patterns into hard CI failures via `PytestReturnNotNoneWarning`; the file was untracked while the test rewrites were staged — would have silently disarmed the gate on the next contributor's machine |
+| 2026-05-11 | [#audit-row-executability](#audit-row-executability)         | three-reviewer audit found that the Sibling-fanout DRY gate row added in `5ecf324` was first violated one commit later (EMA log fields with no parser entries); same review found the Enforcement-config staging row shipped only a manual recipe — both symptoms of audit rules without executable witnesses |
 
 ### Section template
 
@@ -574,7 +576,59 @@ The first command gives instantaneous per-step latency. The second gives cumulat
 3. Prefer `git mv` for renames so both sides are staged atomically. For bulk moves, `git mv` each file then verify with `git status --short`.
 4. If a directory is intended to be ignored (true scratch), add it to `.gitignore` in the same commit and document the intent.
 
-**Cross-references.** Related: [#dead-code-tracking](#dead-code-tracking) (companion rule: removals must purge all references in the same commit), [#config-drift](#config-drift) (sibling rule: source-of-truth integrity). The unifying theme: **partial automation is worse than none — `git add -u` is convenient until silent omissions accrue cost.**
+**Cross-references.** Related: [#dead-code-tracking](#dead-code-tracking) (companion rule: removals must purge all references in the same commit), [#config-drift](#config-drift) (sibling rule: source-of-truth integrity), [#enforcement-config-staging](#enforcement-config-staging) (generalizes the same staging-omission failure mode to enforcement-side configs). The unifying theme: **partial automation is worse than none — `git add -u` is convenient until silent omissions accrue cost.**
+
+---
+
+### enforcement-config-staging
+
+**Date:** 2026-05-11 review of iter146-151 rescue commit window
+**Rule in CLAUDE.md:** Audit Checklist row · "Enforcement-config staging"
+
+**What happened.** Pre-commit review of the iter146-151 rescue commit found `pytest.ini` as `??` in `git status` while a 7-test rewrite (`return failures` → `assert failures == 0`) was already staged. The new `pytest.ini` was the *reason* for the rewrite: `filterwarnings = error::pytest.PytestReturnNotNoneWarning` flips pytest's previously-warning return-non-None behavior into a hard test failure. With the test rewrite staged but `pytest.ini` unstaged, the gate would have been silently inactive on the next contributor's machine and on CI restart — and any future contributor writing `return failures` in a new test function would not see the failure. The rewrite would have looked successful but the enforcement would not be active.
+
+**Root cause.** The existing *Move means tracked* rule covers source-file *relocations* — `mv outside git`, `cp + rm`, archive-style moves — where the destination needs an explicit `git add`. It does NOT cover *new* enforcement-config files (`pytest.ini`, `pyproject.toml [tool.X]` sections, `.pre-commit-config.yaml`, ruff/mypy rule files, `tool.coverage` thresholds) that are created alongside the code they gate. The failure mode is identical (staged code change relies on an unstaged sibling file to behave correctly) but the trigger is *creation* rather than *relocation*, so the move-tracked verification recipe (`git status --short | grep "^??"` inside the moved tree) didn't surface it because there was no "moved tree" to scope the grep to.
+
+**The rule.** Any new project-level config that *enforces* an invariant — `pytest.ini`, `pyproject.toml` lint/format/test sections, `.pre-commit-config.yaml`, ruff/mypy/pyright rule files, `tool.coverage` thresholds, `.editorconfig`, dependency-pinning manifests — MUST be staged in the same commit as the code change it enforces. If the config file appears in `git status` as `??` while the code it gates is staged, the invariant is silently inactive on the next contributor's machine and on CI restart.
+
+**Verification recipe.**
+1. Before staging, run `git status --short | grep "^??"`. Inspect every untracked path.
+2. For any untracked path that is a config file (filename matches `*.ini`, `*.toml`, `*.cfg`, `*.yaml` at project root or inside `.config/` / `.github/`, or matches `pyproject.toml`, `setup.cfg`, `.pre-commit-config.yaml`, `pytest.ini`, `tox.ini`, `ruff.toml`, `mypy.ini`, `pyrightconfig.json`, `.editorconfig`, `requirements*.txt`, `uv.lock`), ask: *does the staged code change depend on this config to behave correctly?* If yes → `git add` it in the same commit.
+3. For an enforcement-config that is intentionally machine-local (developer-only, e.g. a private `.editorconfig` extension), add it to `.gitignore` *in the same commit* and document why.
+4. The verification step is one shell command; no rule should be allowed to add review burden without an automated check.
+
+**Cross-references.** Generalizes [#move-tracked-invariant](#move-tracked-invariant) (same failure class: staged change depends on unstaged sibling) and [#dead-code-tracking](#dead-code-tracking) (companion: removals must purge references). Companion to [#untested-path-executability](#untested-path-executability): a gate with no executable enforcement is dead code; an enforcement-config that isn't staged is the same failure expressed at the config-staging layer. Generalized further by [#audit-row-executability](#audit-row-executability), which requires every new audit row to ship with an executable witness rather than a manual recipe.
+
+---
+
+### audit-row-executability
+
+**Date:** 2026-05-11 three-reviewer audit of iter146-151 cleanup commit
+**Rule in CLAUDE.md:** Audit Checklist row · "Audit-row executability"
+
+**What happened.** A three-agent pre-commit review (coderabbit + pr-review-toolkit + superpowers) of the iter146-151 cleanup commit found two related failures, both downstream of the same meta-pattern:
+
+1. The **Sibling-fanout DRY gate** audit row added in `5ecf324` (one commit earlier) was first violated by the *next* commit: six new EMA share-log fields (`attn_ema_min`, `mlp_ema_min`, `pool_ema_min`, `attn_ema_cv`, `mlp_ema_cv`, `pool_ema_cv`) were emitted from `train_gpt.py` but had no parser entries in `experiments/plot_metrics.py`. The row's own definition (3 siblings × 3 sites) was satisfied — trainer + log + plot — and yet the new siblings shipped without the plot-parser leg. The row had no executable witness: just CLAUDE.md prose plus an `EXPERIENCE.md` recipe asking the reviewer to grep.
+
+2. The **Enforcement-config staging** audit row added in the *same* iter146-151 cleanup commit codified itself as a manual recipe (`git status --short | grep "^??"`). Its own closing clause said "no rule should be allowed to add review burden without an automated check," yet the rule shipped exactly that review burden. The same review window flagged both — making the pattern unmistakable.
+
+**Root cause.** Audit rules in `CLAUDE.md` are durable; verification recipes expressed as shell snippets or prose checklists are reviewer-time procedures. Recipes degrade in two predictable ways: (a) the next contributor doesn't run them, (b) the next reviewer doesn't know to look for them. A test, hook, or CI gate is the only enforcement that survives staffing turnover. The pattern is general: every new manually-verified rule is one commit away from its first silent violation, often by the diff that creates it.
+
+**The rule.** Every new audit-checklist row added to `CLAUDE.md` MUST ship with at least one executable witness in the same commit:
+
+1. **A unit test** (`tests/test_*.py` or `experiments/test_*.py`) that asserts the invariant the rule names. Example: `tests/test_enforcement_config_staged.py` asserts `pytest.ini` is git-tracked when it exists on disk.
+2. **A pre-commit hook entry** in `.pre-commit-config.yaml` if the rule is about staging hygiene rather than code semantics.
+3. **A CI gate** if the invariant can only be observed at build time (build size, artifact size, smoke `val_bpb`).
+
+A manual "verification recipe" is acceptable *only as supporting documentation* of how the executable witness works, not as a substitute for one.
+
+**Verification recipe (for adding the next rule).**
+1. Identify the invariant the new rule asserts.
+2. Search `tests/`, `experiments/test_*.py`, and hook configs: does any existing test assert it? If yes, link from the rule body ("Enforced by …").
+3. If no, write one and stage it in the same commit. A 15-line test that runs in <1 s is cheap and stays paid back forever.
+4. Cross-check: is the new rule itself enforced by something? If the answer is "the reviewer reads CLAUDE.md" — that is by definition manual; promote it to executable form.
+
+**Cross-references.** Companion to [#untested-path-executability](#untested-path-executability) (same principle at the code-branch layer), [#enforcement-config-staging](#enforcement-config-staging) (same principle at the config-staging layer), and [#move-tracked-invariant](#move-tracked-invariant) (same principle at the file-relocation layer). The four rules together express one underlying invariant: **every claim of correctness must have a runnable artifact that asserts it; prose-only rules accrue silent violations.**
 
 ---
 

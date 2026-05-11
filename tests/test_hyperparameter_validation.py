@@ -52,7 +52,25 @@ class TestValidateHyperparameters(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             _validate_hyperparameters(_mut(num_experts=0, num_shared_experts=0))
         self.assertIn("num_experts", str(ctx.exception))
+
+    def test_num_shared_experts_cannot_exceed_total_experts(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            _validate_hyperparameters(_mut(num_experts=1, num_shared_experts=2))
         self.assertIn("num_shared_experts", str(ctx.exception))
+        self.assertIn("num_experts", str(ctx.exception))
+        self.assertIn("routed expert", str(ctx.exception))
+
+    def test_at_least_one_routed_expert_required(self) -> None:
+        # nS == nE is the boundary case: zero routed experts after shared.
+        with self.assertRaises(SystemExit) as ctx:
+            _validate_hyperparameters(_mut(num_experts=2, num_shared_experts=2))
+        self.assertIn("routed expert", str(ctx.exception))
+
+    def test_sparse_dispatch_rejected_for_training(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            _validate_hyperparameters(_mut(use_sparse_dispatch=True))
+        self.assertIn("use_sparse_dispatch", str(ctx.exception))
+        self.assertIn("RevDEQ-safe", str(ctx.exception))
 
     def test_train_batch_tokens_not_divisible_by_seq_len(self) -> None:
         with self.assertRaises(SystemExit) as ctx:

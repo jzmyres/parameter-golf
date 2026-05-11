@@ -60,6 +60,17 @@ class TestTrainingContracts(unittest.TestCase):
         self.assertIn('meta_json["status"] = "validated_fast_only"', text)
         self.assertIn('meta_json["non_promotable_reason"] = "final_full_validation_disabled"', text)
 
+    def test_refuted_pure_ift_path_is_removed(self) -> None:
+        # Word-boundary regex so the assertion fires on actual symbol
+        # re-introduction, not on incidental substrings inside identifiers,
+        # comments, or unrelated tokens (e.g. `deq_ifteration`, `gift_iters`).
+        text = TRAIN_GPT.read_text()
+        for pattern in (r"\bdeq_ift\b", r"\b_backward_ift\b", r"\bift_iters\b"):
+            self.assertIsNone(
+                re.search(pattern, text),
+                f"refuted IFT identifier matching {pattern!r} re-introduced",
+            )
+
     def test_opg_doc_tracks_active_entrypoint_and_rescue_defaults(self) -> None:
         # Whitespace-tolerant: any number of spaces/tabs between `\texttt{...}`,
         # the `&` separator, and the value. Matches the actual table column
@@ -81,7 +92,6 @@ class TestTrainingContracts(unittest.TestCase):
             "hypotheses.md",
             "hypotheses_archive.md",
             "iter103_chained_routing_plan.md",
-            "iter144_ift_adjoint_plan.md",
         ]
         for name in expected_docs:
             doc_path = EXPERIMENT_DOCS / name
@@ -101,10 +111,12 @@ class TestTrainingContracts(unittest.TestCase):
             self.assertFalse(old_path.exists(), f"stale root-level doc remains: {old_path}")
 
         hyp = (EXPERIMENT_DOCS / "hypotheses.md").read_text()
-        ift = (EXPERIMENT_DOCS / "iter144_ift_adjoint_plan.md").read_text()
-        self.assertIn("iter144_ift_adjoint_plan.md", hyp)
-        self.assertIn("deq_ift_iters = 0", ift)
-        self.assertIn("grad_beta = None", ift)
+        # Require "removed" to appear within a same-line "pure IFT" window
+        # so an unrelated future use of the word "removed" elsewhere in the
+        # doc cannot satisfy the IFT-refutation assertion. Single-line +
+        # 200-char span is tight enough to survive minor reformatting but
+        # not loose enough to span paragraphs.
+        self.assertRegex(hyp, r"(?i)pure IFT[^\n]{0,200}remov")
 
     def test_iteration_workflow_requires_comprehensive_docs_review(self) -> None:
         expected = "review `experiments/docs/` comprehensively"
@@ -149,7 +161,6 @@ class TestTrainingContracts(unittest.TestCase):
             EXPERIMENT_DOCS / "hypotheses.md",
             EXPERIMENT_DOCS / "hypotheses_archive.md",
             EXPERIMENT_DOCS / "iter103_chained_routing_plan.md",
-            EXPERIMENT_DOCS / "iter144_ift_adjoint_plan.md",
         ]
         for path in checked_files:
             text = path.read_text()

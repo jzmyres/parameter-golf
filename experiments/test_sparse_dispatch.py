@@ -117,7 +117,7 @@ def test_phase_A0_entmax_matches_reference():
             print(f"  {name:<18} B={B:>4} E={E:>3}  "
                   f"max_diff={err_max:.2e}  Σw_ours-1={sum_err:.2e}  "
                   f"Σw_ref-1={sum_err_ref:.2e}  {status}")
-    return failures
+    assert failures == 0
 
 
 # ===========================================================================
@@ -281,7 +281,7 @@ def test_phase_A1_sparse_dispatch_equivalence():
         print(f"    C={C:>3.1f} K={K:>3}  rel={rel:.2e}  sparsity={sparsity_sharp:.2f} "
               f"util_max={util_max_sharp}{suffix}  {status}")
 
-    return failures
+    assert failures == 0
 
 
 # ===========================================================================
@@ -408,7 +408,7 @@ def test_phase_A2_gradient_correctness():
         print(f"    gradcheck: FAIL ({type(e).__name__}: {str(e)[:80]})")
         failures += 1
 
-    return failures
+    assert failures == 0
 
 
 # ===========================================================================
@@ -516,7 +516,7 @@ def test_phase_A3_edge_cases():
     if not bound_holds:
         failures += 1
 
-    return failures
+    assert failures == 0
 
 
 # ===========================================================================
@@ -634,7 +634,7 @@ def test_phase_A4_compile_traceability():
         print(f"    recompile pressure: FAIL ({type(e).__name__}: {str(e)[:120]})")
         failures += 1
 
-    return failures
+    assert failures == 0
 
 
 # ===========================================================================
@@ -765,7 +765,7 @@ def test_phase_A5_overflow_gradients():
         failures += 1
     print(f"  monotone gradient error in 1/C: {status}")
 
-    return failures
+    assert failures == 0
 
 
 # ===========================================================================

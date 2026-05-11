@@ -9,6 +9,11 @@ def _get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def _make_model(**overrides):
+    # Legacy-path harness: keeps the iter145r-era CTP+refinement surface alive
+    # so reversibility/convergence/Parcae tests still exercise that ablation
+    # code. Production defaults (use_ctp=False, num_refinements=0) flipped in
+    # iter146 and are pinned by `test_gpt_constructor_defaults_track_hyperparameters`
+    # which constructs `GPT()` without going through this helper.
     from train_gpt import GPT
     defaults = dict(
         vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
@@ -16,6 +21,7 @@ def _make_model(**overrides):
         tied_embed_init_std=0.005, rope_base=10000.0,
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
         kv_latent_dim=0, num_refinements=1,
+        use_ctp=True,
     )
     defaults.update(overrides)
     dev = _get_device()
@@ -24,6 +30,72 @@ def _make_model(**overrides):
     if dev.type == "cuda":
         m = m.bfloat16()
     return m
+
+
+def test_gpt_constructor_defaults_track_hyperparameters():
+    """Production defaults must not drift between Hyperparameters and GPT()."""
+    from train_gpt import GPT, Hyperparameters
+
+    model = GPT(
+        vocab_size=64, num_layers=2, model_dim=32, num_heads=4,
+        num_kv_heads=2, mlp_mult=2.0, tie_embeddings=True,
+        tied_embed_init_std=0.005, rope_base=10000.0,
+        qk_gain_init=1.0, bigram_vocab_size=0, bigram_dim=8,
+        kv_latent_dim=16, attn_expert_rank=4, mlp_expert_rank=4,
+    )
+    assert model.num_refinements == Hyperparameters.num_refinements
+    assert model.deq_beta == Hyperparameters.deq_beta
+    assert model.deq_bptt_k == Hyperparameters.deq_bptt_k
+    assert model.num_experts == Hyperparameters.num_experts
+    assert model.use_ctp == Hyperparameters.use_ctp
+    assert model.mos_head.use_ctp == Hyperparameters.use_ctp
+    assert not hasattr(model.mos_head, "gate_ctp")
+
+
+def test_default_router_does_not_allocate_inactive_parameters():
+    """Dirichlet-UCB + gate-off should not carry dead trainable state."""
+    model = _make_model(num_experts=4, use_ctp=False)
+    router = model.shared_block.router
+    assert router.scoring == "dirichlet_ucb"
+    assert router.use_router_sigmoid_gate is False
+    assert router.prototypes is None
+    assert router.router_gate is None
+    assert router.gate_norm_weight is None
+    names = dict(router.named_parameters())
+    assert "prototypes" not in names
+    assert "gate_norm_weight" not in names
+    assert not any(name.startswith("router_gate.") for name in names)
+
+
+def test_router_state_dict_optional_param_load():
+    """Loading a legacy (l2 + sigmoid-gate) checkpoint into a default
+    (Dirichlet-UCB + gate-off) router must silently drop the optional keys
+    and must not mutate the caller's state_dict."""
+    from train_gpt import SoftDenseRouter
+
+    dim, E = 32, 4
+    legacy = SoftDenseRouter(dim=dim, num_experts=E,
+                             scoring="l2", use_router_sigmoid_gate=True)
+    legacy_sd = legacy.state_dict()
+    legacy_keys_before = set(legacy_sd.keys())
+    assert "prototypes" in legacy_keys_before
+    assert "gate_norm_weight" in legacy_keys_before
+    assert "router_gate.weight" in legacy_keys_before
+
+    fresh = SoftDenseRouter(dim=dim, num_experts=E,
+                            scoring="dirichlet_ucb", use_router_sigmoid_gate=False)
+    result = fresh.load_state_dict(legacy_sd, strict=False)
+    # Caller's dict must be intact post-load (no in-place mutation).
+    assert set(legacy_sd.keys()) == legacy_keys_before
+    # Optional legacy keys should not surface as unexpected — they are
+    # silently dropped by _load_from_state_dict.
+    unexpected = set(result.unexpected_keys)
+    for k in ("prototypes", "gate_norm_weight", "router_gate.weight", "router_gate.bias"):
+        assert k not in unexpected, f"{k!r} leaked to unexpected_keys"
+    # Shared parameters that exist on both routers must have loaded.
+    fresh_sd = fresh.state_dict()
+    for shared in ("router.weight", "score_norm_weight", "expert_bias"):
+        assert torch.equal(fresh_sd[shared], legacy_sd[shared]), f"{shared} did not load"
 
 
 def test_all_constraints():
@@ -306,7 +378,7 @@ def test_revdeq_convergence():
 
 def test_revdeq_reversibility():
     """Test RevDEQ backward reconstruction quality."""
-    model = _make_model(bigram_vocab_size=0)
+    model = _make_model(bigram_vocab_size=0, deq_bptt_k=0)
 
     dev = _get_device()
     x = torch.randint(0, 1024, (1, 16), device=dev)
@@ -343,7 +415,7 @@ def test_revdeq_reconstruction_at_a_bar_floor():
     Note: reconstruction error compounds as (1/Ā)^K across K backward steps,
     so ε_rev is sized to keep the worst-case amplification tractable in fp64.
     """
-    model = _make_model(bigram_vocab_size=0)
+    model = _make_model(bigram_vocab_size=0, deq_bptt_k=0)
     eps_rev = float(model.parcae_reversibility_floor)
     with torch.no_grad():
         model.parcae_raw_a.fill_(100.0)  # → Ā saturates to ε_rev
