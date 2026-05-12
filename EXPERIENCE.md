@@ -43,6 +43,7 @@ This file has two roles, in this order:
 | 2026-05-11 | [#enforcement-config-staging](#enforcement-config-staging)   | iter146-151 commit window introduced `pytest.ini` to convert legacy `return failures` test patterns into hard CI failures via `PytestReturnNotNoneWarning`; the file was untracked while the test rewrites were staged — would have silently disarmed the gate on the next contributor's machine |
 | 2026-05-11 | [#audit-row-executability](#audit-row-executability)         | three-reviewer audit found that the Sibling-fanout DRY gate row added in `5ecf324` was first violated one commit later (EMA log fields with no parser entries); same review found the Enforcement-config staging row shipped only a manual recipe — both symptoms of audit rules without executable witnesses |
 | 2026-05-12 | [#flag-to-effect-contract](#flag-to-effect-contract)         | iter152-batch un-archived 7 components and wired 8 new `use_*` flags; pre-commit review found `use_rr_attention=1` was a no-op at the project default `train_seq_len=2048` (silent fallback to dense SDPA above 512 tokens) and `use_gptq`/`use_lqer`/`use_ttt_eval`/`use_caseops` ran only synthetic-tensor or hardcoded-string smokes while the startup banner advertised them as "1" — a research-log-integrity hazard |
+| 2026-05-12 | [#audit-row-self-enforcement](#audit-row-self-enforcement)   | iter152 profile-system + capability-registry diff added the "Root-cause fix preference" audit row, yet the same diff's `_prescribe_failure_fix.mos_ortho` branch returned a per-symptom loss bump with no exit-ablation framing — exactly the failure mode the new policy forbids. A 5-agent parallel review found that the witness for the new rule covered only 2 of 8 sibling branches |
 
 ### Section template
 
@@ -630,6 +631,40 @@ A manual "verification recipe" is acceptable *only as supporting documentation* 
 4. Cross-check: is the new rule itself enforced by something? If the answer is "the reviewer reads CLAUDE.md" — that is by definition manual; promote it to executable form.
 
 **Cross-references.** Companion to [#untested-path-executability](#untested-path-executability) (same principle at the code-branch layer), [#enforcement-config-staging](#enforcement-config-staging) (same principle at the config-staging layer), and [#move-tracked-invariant](#move-tracked-invariant) (same principle at the file-relocation layer). The four rules together express one underlying invariant: **every claim of correctness must have a runnable artifact that asserts it; prose-only rules accrue silent violations.**
+
+---
+
+### audit-row-self-enforcement
+
+**Date:** 2026-05-12 five-reviewer pre-commit audit of the iter152 profile-system + capability-registry diff
+**Rule in CLAUDE.md:** Audit Checklist row · "Audit-row self-enforcement"
+
+**What happened.** The diff that added the new "Root-cause fix preference" audit row also added a new `mos_ortho` branch to `_prescribe_failure_fix` (`train_gpt.py:6383-6392`). The new row's policy is explicit: "Prefer architecture/parameterization, then shared controllers, then invariant regularizers; use metric-specific losses only as temporary ablations with an exit plan." The non-MoS `ortho` branch in the same function correctly emitted `{"needs_expert_bank_geometry_constraint": True, ...}` and framed `expert_output_diversity_coef_mult` as "only as a temporary ablation." The MoS branch — sibling code, same function, same diff — returned `{"mos_output_diversity_coef": 0.05}` and the `fix` text contained no exit-ablation framing. The motivating example for the new rule was honored; the sibling instance the rule also applied to was not.
+
+A five-agent parallel review (coderabbit + pr-review-toolkit + feature-dev high-bar + silent-failure-hunter + pr-test-analyzer) converged on this finding independently. The Audit-row-executability witness for "Root-cause fix preference" covered only two of the eight `_prescribe_failure_fix` branches (`min_share` and `lip_ub`), so neither CI nor a pre-commit hook would have caught the omission.
+
+**Root cause.** [`#audit-row-executability`](#audit-row-executability) requires a new rule to ship with a witness, but does not require the witness to *iterate over the rule's full scope*. A single-instance witness is satisfied by the motivating case alone. Sibling instances — whose existence is what makes the rule worth writing — silently slip through. Three previous incidents share this signature:
+
+- iter146 EMA log fields landed without parser entries (witness covered only the motivating field).
+- The `5ecf324` Sibling-fanout DRY gate row landed without iterating over every plot/log/parser triple.
+- The current diff: a per-symptom loss bump landed inside the very commit that codified the policy against per-symptom losses.
+
+The general pattern: rules name *classes* of sites (every loss branch, every `use_X` flag, every `setattr` loop), and the witness must enumerate the class, not pick a representative.
+
+**The rule.** Every new audit-checklist row, contract paragraph, or policy section MUST be accompanied in the same commit by:
+
+1. **A scope-enumerating witness.** The executable test iterates over the *full set* of sites the rule applies to and asserts the invariant on each. Examples: `experiments/test_arch.py::test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses` iterates every `_prescribe_failure_fix` failure-class; `tests/test_optional_component_flag_contract.py::test_each_flag_has_effect_or_explicit_reject` iterates every `_OPTIONAL_COMPONENT_FLAGS` entry; `tests/test_hyperparameter_validation.py::test_hyperparameter_fields_covers_score_iter152_profile` iterates every `_CONFIG_PROFILES` profile.
+2. **A same-commit compliance sweep.** Before the commit lands, every existing sibling that the rule applies to must already be compliant. The witness catches future violations; the manual sweep catches the violations the rule itself introduces.
+
+A "representative case" witness is acceptable only if the rule's scope is provably singleton (e.g. a rule about a unique class).
+
+**Verification recipe (for adding the next rule).**
+1. State the rule's scope explicitly in the row body: "applies to every `_prescribe_failure_fix` branch", "applies to every `use_X` Hyperparameter", "applies to every `setattr` on `args`", etc.
+2. Grep the codebase for the scope predicate (e.g. `grep -n "return {" train_gpt.py | grep "_prescribe_"`).
+3. Confirm every grep hit is compliant; bring any non-compliant site into compliance in the same commit.
+4. Add or extend a test that iterates over the same scope predicate and asserts the invariant. The test must fail before the compliance sweep and pass after it.
+
+**Cross-references.** Companion to [#audit-row-executability](#audit-row-executability) (that rule says "ship a witness"; this one says "the witness must cover every sibling"). Same underlying invariant as [#sibling-fanout-dry-gate](#sibling-fanout-dry-gate) and [#untested-path-executability](#untested-path-executability): **every claim of policy compliance must enumerate the policy's scope; representative-case enforcement decays to motivating-case enforcement the moment a sibling is added.**
 
 ---
 

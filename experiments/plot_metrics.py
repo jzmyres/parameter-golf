@@ -138,6 +138,7 @@ def parse_log(logpath: str) -> dict:
         # Final post-quant scoring metric (what the submission is scored on)
         "final_postquant_val_loss": None,
         "final_postquant_val_bpb": None,
+        "final_status": {},
         "k_sweep": [],
         "k_sweep_table": [],
         }
@@ -311,6 +312,19 @@ def parse_log(logpath: str) -> dict:
         if m:
             data["final_postquant_val_loss"] = float(m.group(1))
             data["final_postquant_val_bpb"] = float(m.group(2))
+
+        # Final-status banner emitted near the meta.json write. Carries the
+        # promotion-gate state (health/score validity, codec) for the summary
+        # block; satisfies the Sibling-fanout DRY gate by routing through
+        # the same parser as other run-level metadata.
+        m = re.search(r"^final_status:\s*(.*)$", line)
+        if m:
+            kvs: dict[str, str] = {}
+            for tok in m.group(1).split():
+                if ":" in tok:
+                    k, v = tok.split(":", 1)
+                    kvs[k.strip()] = v.strip()
+            data["final_status"] = kvs
 
         # Validation steps
         m = re.search(rf"^step:(\d+)/\d+ val_loss:{_FLOAT} val_bpb:{_FLOAT}", line)
@@ -1153,6 +1167,16 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
         d2 = c["final_postquant_val_bpb"] - b["final_postquant_val_bpb"]
         summary_lines.append(
             f"Post-Quant: {b['final_postquant_val_bpb']:.4f} -> {c['final_postquant_val_bpb']:.4f} (d={d2:+.4f})"
+        )
+    b_fs = b.get("final_status") or {}
+    c_fs = c.get("final_status") or {}
+    if b_fs or c_fs:
+        def _fs(d: dict, key: str) -> str:
+            return d.get(key, "??")
+        summary_lines.append(
+            f"Gate:       health={_fs(b_fs, 'health_valid')}/{_fs(c_fs, 'health_valid')} "
+            f"status={_fs(b_fs, 'gate_status')}/{_fs(c_fs, 'gate_status')} "
+            f"codec={_fs(b_fs, 'codec')}/{_fs(c_fs, 'codec')}"
         )
     if b["train_steps"] and c["train_steps"]:
         summary_lines.append(f"Steps:      {b['train_steps'][-1]} vs {c['train_steps'][-1]}")

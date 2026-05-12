@@ -19,8 +19,12 @@ from train_gpt import (
     Hyperparameters,
     KShuffleBagSampler,
     _CLI_TUNABLE_KNOBS,
+    _EVAL_PROFILES,
+    _apply_config_profile,
     _compute_training_budget_ms,
     _parse_cli_overrides,
+    _resolve_k_sweep_values,
+    _should_probe_lip_for_k,
 )
 
 
@@ -47,6 +51,37 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(ov["deq_beta_jitter_set"], (0.2, 0.4))
         ov = _parse_cli_overrides(["--deq-k-jitter-weights", "0.5,0.4,0.07,0.03"])
         self.assertEqual(ov["deq_k_jitter_weights"], (0.5, 0.4, 0.07, 0.03))
+
+    def test_config_profile_applies_before_cli_overrides(self):
+        ov = _parse_cli_overrides([
+            "--config-profile", "score_iter152",
+            "--router-ema-balance-coef", "0.7",
+        ])
+        args = Hyperparameters()
+        profile = str(ov.pop("config_profile"))
+        _apply_config_profile(args, profile)
+        for key, value in ov.items():
+            setattr(args, key, value)
+        self.assertEqual(args.config_profile, "score_iter152")
+        self.assertTrue(args.deq_prefix_anchors)
+        self.assertEqual(args.eval_profile, "submission")
+        self.assertAlmostEqual(args.router_ema_specialization_coef, 0.40)
+        self.assertAlmostEqual(args.router_ema_balance_coef, 0.70)
+
+    def test_eval_profiles_own_k_sweep_and_lip_scope(self):
+        args = Hyperparameters()
+        args.eval_profile = "diagnostic"
+        self.assertEqual(tuple(_resolve_k_sweep_values(args)), _EVAL_PROFILES["diagnostic"].k_sweep_values)
+        self.assertTrue(_should_probe_lip_for_k(args, 17))
+
+        args.eval_profile = "submission"
+        self.assertEqual(tuple(_resolve_k_sweep_values(args)), (16, 24, 64, 128))
+        self.assertFalse(_should_probe_lip_for_k(args, 16))
+        self.assertTrue(_should_probe_lip_for_k(args, 128))
+
+        args.eval_profile = "debug"
+        self.assertEqual(tuple(_resolve_k_sweep_values(args)), (16,))
+        self.assertTrue(_should_probe_lip_for_k(args, 16))
 
     def test_weighted_k_sampler(self):
         sampler = KShuffleBagSampler(

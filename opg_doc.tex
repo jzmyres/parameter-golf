@@ -163,7 +163,9 @@ Mac/MLX support, ignore \texttt{train\_gpt\_mlx.py}.
 \texttt{vocab\_size} & 1024 & \texttt{train\_seq\_len} & 2048 \\
 \texttt{train\_batch\_tokens} & 524,288 & \texttt{iterations} & 1000 \\
 \texttt{max\_training\_seconds} & 0 & \texttt{eval\_reservation\_seconds} & 120 \\
-\texttt{final\_full\_validation} & true & \texttt{max\_wallclock\_seconds} & deprecated alias \\
+\texttt{final\_full\_validation} & true & \texttt{diagnostic\_gate\_policy} & advisory \\
+\texttt{config\_profile} & fast\_default & \texttt{eval\_profile} & diagnostic \\
+\texttt{max\_wallclock\_seconds} & deprecated alias & \texttt{router\_bias\_update} & false \\
 \texttt{num\_layers} & 12 & \texttt{model\_dim} & 768 \\
 \texttt{num\_heads} & 8 & \texttt{num\_kv\_heads} & 4 \\
 \texttt{num\_experts} & 16 & \texttt{num\_shared\_experts} & 0 \\
@@ -192,6 +194,60 @@ Mac/MLX support, ignore \texttt{train\_gpt\_mlx.py}.
 \texttt{use\_nsa\_attention} & false & \texttt{use\_smear\_gate} & false \\
 \texttt{muon\_backend\_steps} & 7 & \texttt{use\_polar\_express\_ns} & true \\
 \texttt{muon\_momentum} & 0.99 & \texttt{matrix\_lr} & 0.022 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Profiles.}
+\texttt{config\_profile=fast\_default} applies the literal defaults in
+\texttt{Hyperparameters}.  \texttt{score\_iter152} is the BPB-winning reference
+profile: it enables \texttt{deq\_prefix\_anchors}, uses the iter149 routing and
+diversity coefficient base
+(\texttt{router\_ema\_balance\_coef=0.60},
+\texttt{router\_ema\_specialization\_coef=0.40},
+\texttt{router\_pertoken\_entropy\_coef=0.20},
+\texttt{expert\_output\_diversity\_coef=0.60},
+\texttt{router\_ema\_alive\_coef=0.04}), and selects
+\texttt{eval\_profile=submission}.  \texttt{debug} selects
+\texttt{eval\_profile=debug}, disables final full validation, and disables the
+fast-validation Lipschitz probe.  CLI overrides are applied after the selected
+profile, so explicit launch flags win over profile values.  Each profile field
+is independently CLI-overridable; partial overrides break the profile bundle
+by design.  Note: \texttt{score\_iter152} pins
+\texttt{eval\_profile=submission}, so the local Lipschitz probe runs only at
+$K=128$.  Switch to \texttt{--eval-profile=diagnostic} to recover the full
+audit trail used in the original iter152 promotion run.
+
+\paragraph{Feature and capability defaults.}
+The table below mirrors \texttt{Hyperparameters} and the optional capability
+registry in \texttt{train\_gpt.py}.  ``Rejected'' means startup validation
+refuses the flag until the path has a real training, eval, or artifact effect.
+
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+\textbf{feature} & \textbf{default} & \textbf{status} \\
+\midrule
+\texttt{use\_parcae} & true & active solver damping/injection path \\
+\texttt{use\_ctp}, \texttt{ctp\_weight} & false, 0.0 & CTP banks/loss disabled \\
+\texttt{num\_refinements} & 0 & outer refinement loop disabled \\
+\texttt{bigram\_vocab\_size} & 0 & BigramHash disabled \\
+\texttt{logit\_softcap} & 0.0 & no-op unless positive \\
+\texttt{deq\_prefix\_anchors} & false & optional training-effect path; enabled by \texttt{score\_iter152} \\
+\texttt{use\_smear\_gate} & false & optional training-effect path \\
+\texttt{use\_sparse\_attn\_head\_gate} & false & optional training-effect path \\
+\texttt{use\_rr\_attention} & false & optional training-effect path; rejects silent dense fallback configs \\
+\texttt{use\_nsa\_attention} & false & optional attention ablation \\
+\texttt{use\_entmax\_routing} & false & optional routing ablation \\
+\texttt{use\_entmax\_triton} & false & optional routing-kernel acceleration \\
+\texttt{use\_unified\_routed\_down} & false & optional no-grad routed-down kernel \\
+\texttt{use\_chained\_routing}, \texttt{chained\_stages\_preset} & false, none & chained routing inactive \\
+\texttt{use\_sparse\_dispatch} & false & rejected: hard top-$k$ dispatch is not RevDEQ-safe \\
+\texttt{use\_ttt\_eval} & false & rejected scaffold: no eval consumer \\
+\texttt{use\_gptq}, \texttt{use\_lqer} & false, false & rejected scaffold: not wired into scored codec \\
+\texttt{use\_grouped\_artifact\_compression} & false & optional artifact-effect path \\
+\texttt{use\_caseops} & false & rejected scaffold: tokenized data bypasses codec \\
+\texttt{lyapunov\_coef}, \texttt{denoising\_coef} & 0.0, 0.0 & default-off regularizer ablations \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -735,12 +791,18 @@ The total loss used for backpropagation is
 \section{Quantization and Validation}
 \label{sec:validation}
 
-After training, the script serializes the current code and model state.  Matrix
-tensors and optional BigramHash tensors are quantized by per-row int6 helpers;
-token embeddings are intentionally kept in fp16 by
+After training, the script serializes the current code and model state through
+\texttt{encode\_scored\_artifact}.  Matrix tensors and optional BigramHash
+tensors are quantized by per-row int6 helpers; token embeddings are
+intentionally kept in fp16 by
 \texttt{FP16\_KEEP\_PATTERNS=(\textquotedblleft tok\_emb\textquotedblright,)}
 until an embedding-quantization ablation proves the BPB tradeoff.  The payload
-is compressed with zstd level 22.  The required budget is
+is compressed with zstd level 22.  If
+\texttt{use\_grouped\_artifact\_compression=True}, the grouped codec competes
+behind the same byte-accounted interface and is accepted only when it is
+strictly smaller than the baseline bytes; otherwise the baseline int6 artifact
+is kept.  GPTQ/LQER remain rejected scaffolds until they are wired into this
+scored codec interface.  The required budget is
 \[
   \texttt{len(code bytes)}+\texttt{len(compressed model bytes)}
   \le 16{,}000{,}000.
@@ -748,10 +810,12 @@ is compressed with zstd level 22.  The required budget is
 The model is then dequantized, loaded back into the same architecture, and
 validated after round-trip.
 
-The fixed-point diagnostic sweep evaluates the quantized model at
-\[
-  K\in\{4,8,16,17,24,32,37,64,113,128\}.
-\]
+The fixed-point diagnostic sweep is controlled by \texttt{eval\_profile}.
+The default \texttt{diagnostic} profile evaluates
+$K\in\{4,8,16,17,24,32,37,64,113,128\}$ and runs the local Lipschitz probe on
+every row.  The \texttt{submission} profile evaluates
+$K\in\{16,24,64,128\}$ and runs the Lipschitz probe only at $K=128$.
+The \texttt{debug} profile evaluates only $K=16$ and probes only that row.
 The hard checks are intentionally coarse enough to avoid treating finite-$K$
 noise as failure:
 \begin{itemize}[leftmargin=2em,itemsep=0.2em]
@@ -765,6 +829,33 @@ noise as failure:
   \item routed expert usage and expert orthogonality must pass the post-int6
         health gates.
 \end{itemize}
+Final metadata records both \texttt{score\_valid} and \texttt{health\_valid}.
+With \texttt{diagnostic\_gate\_policy=advisory}, a full-validation BPB run can
+remain \texttt{run\_valid=true} while health failures are recorded as
+\texttt{validated\_with\_tech\_debt}.  With
+\texttt{diagnostic\_gate\_policy=hard}, the same health failures produce
+\texttt{run\_valid=false} and \texttt{status=health\_gate\_failed}.  Fast-only
+final validation remains non-promotable regardless of health status.
+
+\paragraph{Root-cause fix policy.}
+Diagnostics identify failure modes; they do not automatically justify a new
+metric-specific training loss.  Once the root cause is identified, the
+preferred fix order is:
+\begin{enumerate}[leftmargin=2em,itemsep=0.2em]
+  \item architecture or parameterization that makes the bad state hard or
+        impossible, such as bounded transition gains for contraction failures;
+  \item a reusable controller or interface shared across components, such as
+        the slow router-bias usage controller for routed min-share failures;
+  \item a general regularizer tied to a model invariant, shared by every
+        component that exposes that invariant;
+  \item a metric-specific loss only as a temporary ablation, with an explicit
+        exit plan.
+\end{enumerate}
+Every fix should state the invariant it enforces and which diagnostics merely
+verify it.  For example, an attention min-share failure should first route to
+the generic router usage controller, not to an attention-only min-share loss;
+a \texttt{lip\_ub} failure should first route to transition-map
+parameterization, not another coefficient sweep on a proxy Lyapunov loss.
 
 \section{Local Stability Guarantee}
 \label{sec:lyapunov}

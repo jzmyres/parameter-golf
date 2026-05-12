@@ -501,33 +501,81 @@ def test_post_int6_gate_skips_mos_ctp_when_disabled():
         "so any 'mos_ctp_min_share' failure would be fake.")
 
 
-def test_prescribe_min_share_routes_to_cv_loss():
-    """min_share failures map to direct CV-load coefficients, not legacy knobs."""
+def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
+    """Witness for the CLAUDE.md "Root-cause fix preference" audit row.
+
+    Every `_prescribe_failure_fix` branch must EITHER include an invariant-level
+    mechanism (shared controller, parameterization, or load-balance regularizer)
+    in `config_change`, OR include "temporary ablation" framing in the `fix`
+    text. Per-case `required` and `forbidden` lists pin the specific routing
+    decisions and act as regression guards against keys that were intentionally
+    removed in the rework (e.g. `router_ema_alive_coef_mult`, `weight_decay_mult`
+    for routing collapse).
+    """
     from train_gpt import _prescribe_failure_fix
 
-    p_mos = _prescribe_failure_fix(
-        "mos_ntp_min_share=0.005 < 0.150 (expert below 60% of fair share 1/4)")
-    assert p_mos["category"] == "mos_router_collapse"
-    assert "mos_load_cv_coef_mult" in p_mos["config_change"], (
-        f"mos_*_min_share must prescribe mos_load_cv_coef bump, got {p_mos['config_change']}")
-    assert "weight_decay_mult" not in p_mos["config_change"], (
-        "WD must NOT be prescribed for MoS routing collapse.")
+    invariant_keys = {
+        "router_bias_update",
+        "router_load_cv_coef_floor",
+        "mos_load_cv_coef_mult",
+        "weight_decay_mult",
+        "deq_k_max_delta",
+        "needs_expert_bank_geometry_constraint",
+        "needs_mos_output_geometry_constraint",
+        "needs_transition_parameterization",
+        "needs_transition_jacobian_control",
+    }
+    metric_specific_keys = {
+        "expert_output_diversity_coef_mult",
+        "mos_output_diversity_coef",
+    }
 
-    p_attn = _prescribe_failure_fix("attn_min_share=0.01 < 0.150 (...)")
-    assert p_attn["category"] == "router_collapse"
-    assert "router_load_cv_coef_mult" in p_attn["config_change"]
-    assert "router_ema_alive_coef_mult" in p_attn["config_change"]
-    assert "router_ema_balance_coef_floor" not in p_attn["config_change"]
-
-    p_mlp = _prescribe_failure_fix("mlp_min_share=0.01 < 0.150 (...)")
-    assert p_mlp["category"] == "router_collapse"
-    assert "router_load_cv_coef_mult" in p_mlp["config_change"]
-
-    # Ortho failures use output-diversity first and keep WD as fallback.
-    p_ortho = _prescribe_failure_fix("attn_ortho=0.71 > 0.5 (max pairwise |cos| ...)")
-    assert p_ortho["category"] == "expert_collapse"
-    assert "expert_output_diversity_coef_mult" in p_ortho["config_change"]
-    assert "weight_decay_mult" in p_ortho["config_change"]
+    cases = [
+        # (failure, expected_category, required_keys, forbidden_keys)
+        ("attn_min_share=0.01 < 0.150", "router_collapse",
+         {"router_bias_update", "router_load_cv_coef_floor"},
+         {"router_ema_alive_coef_mult", "router_ema_balance_coef_floor"}),
+        ("mlp_min_share=0.01 < 0.150", "router_collapse",
+         {"router_bias_update"}, set()),
+        ("mos_ntp_min_share=0.005 < 0.150", "mos_router_collapse",
+         {"mos_load_cv_coef_mult"}, {"weight_decay_mult"}),
+        ("attn_ortho=0.71 > 0.5", "expert_collapse",
+         {"needs_expert_bank_geometry_constraint", "expert_output_diversity_coef_mult"},
+         {"weight_decay_mult"}),
+        ("mos_ntp_ortho=0.61 > 0.5", "mos_head_collapse",
+         {"needs_mos_output_geometry_constraint"}, set()),
+        ("k-sweep delta > 0.1 at K=64", "fp_quality_loss", set(), set()),
+        ("lip_ub=45.0 >= 1.0", "local_contraction_failed",
+         {"needs_transition_parameterization"}, {"lyapunov_coef"}),
+        ("fp_bound=2.5 >= 1.0", "fp_certificate_loose", set(), set()),
+        ("iter_conv_rel=0.6 > 0.3", "solver_divergence", set(), set()),
+        ("deq_recon_err=1.5e-2 > 1e-3", "reversibility_broken", set(), set()),
+    ]
+    for failure, expected_category, required, forbidden in cases:
+        p = _prescribe_failure_fix(failure)
+        assert p["category"] == expected_category, (
+            f"{failure!r}: category {p['category']} != expected {expected_category}"
+        )
+        change_keys = set(p["config_change"].keys())
+        for key in required:
+            assert key in change_keys, f"{failure!r}: missing required key {key!r} in {change_keys}"
+        for key in forbidden:
+            assert key not in change_keys, f"{failure!r}: forbidden key {key!r} appears in {change_keys}"
+        # Root-cause fix preference: invariant mechanism OR explicit ablation framing.
+        has_invariant = bool(change_keys & invariant_keys)
+        has_metric_only = bool(change_keys & metric_specific_keys)
+        fix_text = p["fix"].lower()
+        framed_as_ablation = "temporary ablation" in fix_text or "fallback only" in fix_text
+        assert has_invariant or framed_as_ablation, (
+            f"{failure!r}: config_change={change_keys} has no invariant mechanism "
+            f"and the fix string lacks 'temporary ablation' framing — "
+            f"violates Root-cause fix preference."
+        )
+        if has_metric_only and not has_invariant:
+            assert framed_as_ablation, (
+                f"{failure!r}: prescribed only metric-specific knobs "
+                f"({change_keys & metric_specific_keys}) without temporary-ablation framing"
+            )
 
 
 def test_routing_regularizer_coefficients_match_promoted_defaults():
@@ -594,7 +642,8 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
     from train_gpt import _prescribe_failure_fix
     p_lip = _prescribe_failure_fix("lip_ub=45.0 >= 1.0")
     assert p_lip["category"] == "local_contraction_failed"
-    assert "lyapunov_coef" in p_lip["config_change"]
+    assert "needs_transition_parameterization" in p_lip["config_change"]
+    assert "lyapunov_coef" not in p_lip["config_change"]
 
 
 def test_eval_microbatch_and_mos_expert_settings_are_dry_but_independent():
@@ -697,6 +746,6 @@ if __name__ == "__main__":
     test_revdeq_reconstruction_at_a_bar_floor()
     test_ntp_only_baseline_skips_ctp_param_banks()
     test_post_int6_gate_skips_mos_ctp_when_disabled()
-    test_prescribe_min_share_routes_to_cv_loss()
-    test_direct_cv_coefficients_are_hyperparameters()
+    test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses()
+    test_routing_regularizer_coefficients_match_promoted_defaults()
     print("\nAll tests passed!")

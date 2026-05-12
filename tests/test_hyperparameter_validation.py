@@ -10,13 +10,84 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from tests._helpers import mutate_hyperparameters as _mut  # noqa: E402
-from train_gpt import Hyperparameters, _validate_hyperparameters  # noqa: E402
+from train_gpt import (  # noqa: E402
+    Hyperparameters,
+    _CONFIG_PROFILES,
+    _HYPERPARAMETER_FIELDS,
+    _apply_config_profile,
+    _assert_known_hyperparameter,
+    _compute_run_status,
+    _validate_hyperparameters,
+)
 
 
 class TestValidateHyperparameters(unittest.TestCase):
     def test_default_config_passes(self) -> None:
         # Sanity: the live default config must not be rejected by its own validator.
         _validate_hyperparameters(Hyperparameters())
+
+    def test_profile_and_policy_names_are_validated(self) -> None:
+        for field, value in (
+            ("config_profile", "unknown"),
+            ("eval_profile", "unknown"),
+            ("diagnostic_gate_policy", "strict"),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                _validate_hyperparameters(_mut(**{field: value}))
+            self.assertIn(field, str(ctx.exception))
+
+    def test_unknown_profile_key_is_rejected(self) -> None:
+        # Defends `_CONFIG_PROFILES` against silent typos: a stray attribute on
+        # `args` would let the run proceed with the real Hyperparameter at its
+        # default while the banner falsely advertised the chosen profile.
+        _CONFIG_PROFILES["test_profile_with_typo"] = {"router_ema_balanced_coef": 0.5}
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                _apply_config_profile(Hyperparameters(), "test_profile_with_typo")
+            self.assertIn("router_ema_balanced_coef", str(ctx.exception))
+            self.assertIn("unknown Hyperparameter", str(ctx.exception))
+        finally:
+            _CONFIG_PROFILES.pop("test_profile_with_typo", None)
+
+    def test_unknown_cli_override_key_is_rejected(self) -> None:
+        with self.assertRaises(SystemExit) as ctx:
+            _assert_known_hyperparameter("router_ema_balanced_coef", source="cli_override")
+        self.assertIn("router_ema_balanced_coef", str(ctx.exception))
+        self.assertIn("cli_override", str(ctx.exception))
+
+    def test_diagnostic_gate_policy_hard_flips_run_valid(self) -> None:
+        # Truth table over (policy × health_valid × full_val_completed). Pins the
+        # scalar-semantic shift introduced when `diagnostic_gate_policy=hard` was
+        # added: previously `run_valid` followed full_validation completion only.
+        cases = [
+            # (policy, health, full_val) -> (run_valid, status, reason)
+            ("advisory", True,  True,  (True,  "validated_clean",          None)),
+            ("advisory", False, True,  (True,  "validated_with_tech_debt", None)),
+            ("hard",     True,  True,  (True,  "validated_clean",          None)),
+            ("hard",     False, True,  (False, "health_gate_failed",       "diagnostic_gate_policy_hard")),
+            ("advisory", True,  False, (False, "validated_fast_only",      "final_full_validation_disabled")),
+            ("hard",     False, False, (False, "validated_fast_only",      "final_full_validation_disabled")),
+        ]
+        for policy, health, full_val, expected in cases:
+            got = _compute_run_status(
+                diagnostic_policy=policy,
+                health_valid=health,
+                full_val_completed=full_val,
+            )
+            self.assertEqual(
+                got, expected,
+                f"policy={policy} health={health} full_val={full_val}: got {got}, want {expected}",
+            )
+
+    def test_hyperparameter_fields_covers_score_iter152_profile(self) -> None:
+        # The whitelist must include every key referenced by any builtin profile,
+        # otherwise the new schema check rejects the live default launch path.
+        for profile_name, profile_dict in _CONFIG_PROFILES.items():
+            for key in profile_dict:
+                self.assertIn(
+                    key, _HYPERPARAMETER_FIELDS,
+                    f"profile {profile_name!r} references unknown Hyperparameter {key!r}",
+                )
 
     def test_model_dim_not_divisible_by_num_heads(self) -> None:
         with self.assertRaises(SystemExit) as ctx:

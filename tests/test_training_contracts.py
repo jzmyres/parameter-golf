@@ -57,8 +57,13 @@ class TestTrainingContracts(unittest.TestCase):
     def test_final_metadata_requires_full_validation_for_promotion(self) -> None:
         text = TRAIN_GPT.read_text()
         self.assertRegex(text, r"\n\s*final_full_validation\s*=\s*True\b")
-        self.assertIn('meta_json["status"] = "validated_fast_only"', text)
-        self.assertIn('meta_json["non_promotable_reason"] = "final_full_validation_disabled"', text)
+        # After P0-3 the inline `meta_json["status"] = ...` literal moved into
+        # `_compute_run_status`; the contract is now pinned by the helper's
+        # return values plus the focused truth-table test in
+        # `tests/test_hyperparameter_validation.py`.
+        self.assertIn('"validated_fast_only"', text)
+        self.assertIn('"final_full_validation_disabled"', text)
+        self.assertIn('_compute_run_status(', text)
 
     def test_refuted_pure_ift_path_is_removed(self) -> None:
         # Word-boundary regex so the assertion fires on actual symbol
@@ -81,10 +86,34 @@ class TestTrainingContracts(unittest.TestCase):
         self.assertIn(r"\texttt{train\_gpt\_mlx.py} script is an Apple Silicon/MLX starter path", text)
         for pattern in (
             r"\\texttt\{deq\\_k\\_jitter\\_set\}\s*&\s*\$\(16,24,32,64\)\$",
+            r"\\texttt\{config\\_profile\}\s*&\s*fast\\_default",
+            r"\\texttt\{eval\\_profile\}\s*&\s*diagnostic",
+            r"\\texttt\{diagnostic\\_gate\\_policy\}\s*&\s*advisory",
             r"\\texttt\{router\\_ema\\_alive\\_coef\}\s*&\s*0\.02",
             r"\\texttt\{expert\\_diversity\\_kind\}\s*&\s*cosine\s+max-pair",
         ):
             self.assertRegex(text, pattern)
+        self.assertIn("Root-cause fix policy", text)
+        self.assertIn("generic router usage controller", text)
+        self.assertIn("transition-map", text)
+        for snippet in (
+            r"\paragraph{Profiles.}",
+            r"\texttt{score\_iter152}",
+            r"\texttt{eval\_profile=submission}",
+            r"\paragraph{Feature and capability defaults.}",
+            r"\texttt{use\_grouped\_artifact\_compression} & false & optional artifact-effect path",
+            r"\texttt{use\_gptq}, \texttt{use\_lqer} & false, false & rejected scaffold",
+            r"\texttt{use\_caseops} & false & rejected scaffold",
+            r"\texttt{use\_sparse\_dispatch} & false & rejected:",
+            r"\texttt{encode\_scored\_artifact}",
+            r"\texttt{diagnostic} profile evaluates",
+            r"\texttt{submission} profile evaluates",
+            r"\texttt{debug} profile evaluates only",
+            r"\texttt{score\_valid}",
+            r"\texttt{health\_valid}",
+            r"\texttt{diagnostic\_gate\_policy=hard}",
+        ):
+            self.assertIn(snippet, text)
 
     def test_experiment_docs_are_canonical(self) -> None:
         expected_docs = [

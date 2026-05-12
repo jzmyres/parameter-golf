@@ -330,6 +330,14 @@ def router_diagnostics(enabled: bool = True, *, step_tag: int | None = None):
 # ---------------------------------------------------------------------------
 
 class Hyperparameters:
+    config_profile = "fast_default"
+    eval_profile = "diagnostic"
+    # `advisory` keeps the iter142 BPB-primary policy: any successful full
+    # validation produces `run_valid=True` regardless of health gates. `hard`
+    # makes `run_valid` follow `health_valid`, so health failures block
+    # promotion even when val_bpb improved.
+    diagnostic_gate_policy = "advisory"
+
     data_path = "./data/datasets/fineweb10B_sp1024"
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
@@ -510,9 +518,9 @@ class Hyperparameters:
     tied_embed_init_std = 0.005
 
     # Routing
-    # CV hinge is the canonical anti-collapse mechanism. Keep the no-grad
-    # router-bias controller disabled by default; re-enable only if CV alone
-    # proves insufficient to prevent dead experts.
+    # Slow generic router-bias controller.  Default stays off for historical
+    # parity, but when diagnostics identify a routed min-share root cause this
+    # controller is the preferred first fix over adding per-component losses.
     router_bias_update = False
     router_bias_lr = 0.10
     router_bias_clip = 10.0
@@ -631,11 +639,8 @@ class Hyperparameters:
     use_ttt_eval = False
     use_gptq = False
     use_lqer = False
-    lqer_rank = 4
-    lqer_top_k = 3
     use_grouped_artifact_compression = False
     use_caseops = False
-    caseops_smoke_text = "Parameter Golf Smoke"
     # iter 122 / H93 (2026-05-01): logit softcap (Gemma2-style).
     # `logits = softcap * tanh(logits / softcap)` bounds extreme logit values,
     # smoothing gradient spikes and reducing bf16 numerical issues. Applied
@@ -852,12 +857,126 @@ class Hyperparameters:
     eval_batch_seqs = 256  # fast eval: 256 seqs × 2048 = 512K tokens (~8x more representative than 32)
 
 
+_CONFIG_PROFILES: dict[str, dict[str, object]] = {
+    # Current source-of-truth defaults.  Kept explicit so launch logs and
+    # tests can distinguish "default recipe" from hand-assembled CLI flags.
+    "fast_default": {},
+    # BPB-winning reference from iter152: conditional prefix-K anchors on the
+    # iter149 coefficient base.  This is a profile, not the unconditional
+    # default, because it costs more wallclock and still carries health debt.
+    # Note: `eval_profile=submission` runs the local Lipschitz probe ONLY at
+    # K=128, so reproducing this profile produces a shorter audit trail than
+    # the iter152 promotion run (which used the full diagnostic K-sweep).
+    # Switch to `--eval-profile=diagnostic` to recover the original coverage.
+    "score_iter152": {
+        "deq_prefix_anchors": True,
+        "router_ema_balance_coef": 0.60,
+        "router_ema_specialization_coef": 0.40,
+        "router_pertoken_entropy_coef": 0.20,
+        "expert_output_diversity_coef": 0.60,
+        "router_ema_alive_coef": 0.04,
+        "eval_profile": "submission",
+    },
+    # Local smoke/debug profile.  It changes validation scope only; callers
+    # still choose their own training length explicitly.
+    "debug": {
+        "eval_profile": "debug",
+        "final_full_validation": False,
+        "fp_lip_fast_val_every": 0,
+    },
+}
+
+
+@dataclass(frozen=True)
+class EvalProfile:
+    k_sweep_values: tuple[int, ...]
+    # `None` means "probe every K"; otherwise the set of K-rows that trigger
+    # the local Lipschitz probe.  Precomputed at module init so the per-row
+    # `should_probe` predicate is a frozenset lookup.
+    lip_probe_set: frozenset[int] | None
+
+
+_EVAL_PROFILES: dict[str, EvalProfile] = {
+    "debug": EvalProfile(k_sweep_values=(16,), lip_probe_set=frozenset({16})),
+    "submission": EvalProfile(k_sweep_values=(16, 24, 64, 128), lip_probe_set=frozenset({128})),
+    "diagnostic": EvalProfile(
+        k_sweep_values=(4, 8, 16, 17, 24, 32, 37, 64, 113, 128),
+        lip_probe_set=None,
+    ),
+}
+
+
+_HYPERPARAMETER_FIELDS: frozenset[str] = frozenset(
+    name for name, value in vars(Hyperparameters).items()
+    if not name.startswith("_") and not callable(value)
+)
+
+
+def _assert_known_hyperparameter(key: str, *, source: str) -> None:
+    # Without this guard a typo in `_CONFIG_PROFILES` (e.g. `router_ema_balanced_coef`)
+    # silently creates a stray attribute on `args`; the real Hyperparameter stays
+    # at its default and the promotion log misreports the active config.
+    if key not in _HYPERPARAMETER_FIELDS:
+        raise SystemExit(
+            f"unknown Hyperparameter {key!r} (source: {source}); "
+            f"add the field to Hyperparameters or fix the typo"
+        )
+
+
+def _apply_config_profile(args, profile_name: str) -> None:
+    profile = str(profile_name or "fast_default").strip().lower()
+    if profile not in _CONFIG_PROFILES:
+        valid = ", ".join(sorted(_CONFIG_PROFILES))
+        raise SystemExit(f"config_profile={profile_name!r} must be one of: {valid}")
+    args.config_profile = profile
+    for key, value in _CONFIG_PROFILES[profile].items():
+        _assert_known_hyperparameter(key, source=f"_CONFIG_PROFILES[{profile!r}]")
+        setattr(args, key, value)
+
+
+def _resolve_k_sweep_values(args) -> list[int]:
+    profile = str(args.eval_profile).strip().lower()
+    # `_validate_hyperparameters` owns the value-set check; if we got here with
+    # an unknown profile something bypassed validation.
+    assert profile in _EVAL_PROFILES, f"unknown eval_profile {profile!r}"
+    return list(_EVAL_PROFILES[profile].k_sweep_values)
+
+
+def _should_probe_lip_for_k(args, k_eval: int) -> bool:
+    profile = str(args.eval_profile).strip().lower()
+    assert profile in _EVAL_PROFILES, f"unknown eval_profile {profile!r}"
+    probe_set = _EVAL_PROFILES[profile].lip_probe_set
+    return probe_set is None or int(k_eval) in probe_set
+
+
+@dataclass(frozen=True)
+class OptionalComponentCapability:
+    py_name: str
+    label: str
+    state: str  # rejected | training_effect | eval_effect | artifact_effect
+
+
+_OPTIONAL_COMPONENT_CAPABILITIES: tuple[OptionalComponentCapability, ...] = (
+    OptionalComponentCapability("use_smear_gate", "smear_gate", "training_effect"),
+    OptionalComponentCapability("use_sparse_attn_head_gate", "sparse_attn_head_gate", "training_effect"),
+    OptionalComponentCapability("use_rr_attention", "rr_attention", "training_effect"),
+    OptionalComponentCapability("use_ttt_eval", "ttt_eval", "rejected"),
+    OptionalComponentCapability("use_gptq", "gptq", "rejected"),
+    OptionalComponentCapability("use_lqer", "lqer", "rejected"),
+    OptionalComponentCapability("use_grouped_artifact_compression", "grouped_artifact", "artifact_effect"),
+    OptionalComponentCapability("use_caseops", "caseops", "rejected"),
+    OptionalComponentCapability("use_sparse_dispatch", "sparse_dispatch", "rejected"),
+    OptionalComponentCapability("deq_prefix_anchors", "deq_prefix_anchors", "training_effect"),
+)
+
+
 # Numeric / string knobs that are tunable from the command line. Single source
 # of truth — `experiments/test_cli_parser.py::test_default_parity` iterates
 # this tuple to verify every entry resolves to a `Hyperparameters` field with
 # the documented default. Adding a new tunable knob? Append here AND add the
 # CLAUDE.md §5 row in the same commit (EXPERIENCE.md#hyperparameter-fanout).
 _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
+    "config-profile", "eval-profile", "diagnostic-gate-policy",
     "data-path", "tokenizer-path", "run-id", "seed", "iterations",
     "train-batch-tokens", "train-seq-len",
     "val-batch-size", "val-micro-batch-seqs", "val-loss-every", "train-log-every",
@@ -884,8 +1003,6 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "sparse-attn-gate-window", "sparse-attn-gate-scale",
     "sparse-attn-gate-factor", "sparse-attn-gate-init-std",
     "rr-stride", "rr-block-size", "rr-tau",
-    "lqer-rank", "lqer-top-k",
-    "caseops-smoke-text",
     # iter 122 H93 — logit softcap (Gemma2-style)
     "logit-softcap",
     # iter 117b-3 — sparse MoE dispatch capacity factor
@@ -913,20 +1030,11 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
 # - the CLI bool-flag list in `_parse_cli_overrides` (dashed names),
 # - the `bool_keys` set in `_parse_cli_overrides` (underscored names),
 # - the banner emission in `main()` (label seen in run.log).
-# Adding a new optional component is now a one-line registry change instead
-# of a 3-site grep-and-paste. The companion `flag-to-effect-contract` audit
-# row in CLAUDE.md asserts each entry either has an effect-asserting test or
-# a validator reject.
-_OPTIONAL_COMPONENT_FLAGS: tuple[tuple[str, str], ...] = (
-    ("use_smear_gate", "smear_gate"),                          # iter 129 / H99
-    ("use_sparse_attn_head_gate", "sparse_attn_head_gate"),    # iter 118b
-    ("use_rr_attention", "rr_attention"),                      # iter 120
-    ("use_ttt_eval", "ttt_eval"),                              # H91 scaffold
-    ("use_gptq", "gptq"),                                      # H94 scaffold
-    ("use_lqer", "lqer"),                                      # H94 scaffold
-    ("use_grouped_artifact_compression", "grouped_artifact"),  # H96
-    ("use_caseops", "caseops"),                                # H95 scaffold
-    ("deq_prefix_anchors", "deq_prefix_anchors"),              # iter 152
+# Adding a new optional component is a registry change with an explicit
+# capability state.  `_OPTIONAL_COMPONENT_FLAGS` remains as the backwards-
+# compatible `(py_name, label)` projection used by older call sites.
+_OPTIONAL_COMPONENT_FLAGS: tuple[tuple[str, str], ...] = tuple(
+    (cap.py_name, cap.label) for cap in _OPTIONAL_COMPONENT_CAPABILITIES
 )
 
 
@@ -947,7 +1055,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
         "use-router-sigmoid-gate",
-        "use-polar-express-ns", "use-entmax-triton", "use-sparse-dispatch",
+        "use-polar-express-ns", "use-entmax-triton",
         "use-chained-routing",
         "use-unified-routed-down",  # iter 118a Phase A3
         "use-parcae", "deq-beta-jitter",
@@ -976,7 +1084,7 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
         "use_entmax_routing", "use_router_sigmoid_gate",
         "use_polar_express_ns",
-        "use_entmax_triton", "use_sparse_dispatch", "use_unified_routed_down",
+        "use_entmax_triton", "use_unified_routed_down",
         "use_chained_routing",
         "use_parcae", "deq_beta_jitter",
         "final_full_validation", "resume_latest",
@@ -1462,6 +1570,72 @@ def save_int6_artifact(state_dict: dict[str, Tensor]) -> tuple[bytes, dict, dict
     else:
         compressed = zlib.compress(raw_bytes, 9)
     return compressed, qsd, meta
+
+
+@dataclass(frozen=True)
+class ArtifactCodecResult:
+    compressed: bytes
+    qsd: dict
+    meta: dict
+    codec: str
+    baseline_bytes: int
+    compressed_bytes: int
+    stats: dict[str, object]
+
+
+def encode_scored_artifact(
+    state_dict: dict[str, Tensor],
+    *,
+    use_grouped_artifact_compression: bool = False,
+    log_fn=None,
+) -> ArtifactCodecResult:
+    """Encode the scored artifact behind one byte-accounted codec interface.
+
+    New codecs must compete here via measured bytes and roundtrip-compatible
+    payloads, rather than growing one-off save branches in `main()`.
+    """
+    compressed, qsd, meta = save_int6_artifact(state_dict)
+    baseline_bytes = len(compressed)
+    codec = f"int6_{_COMPRESSOR}"
+    stats: dict[str, object] = {
+        "baseline_bytes": baseline_bytes,
+        "compressed_bytes": baseline_bytes,
+        "codec": codec,
+    }
+    if use_grouped_artifact_compression:
+        from experiments.components.artifact_compression import grouped_compress_int6_payload
+        grouped_compressed, grouped_stats = grouped_compress_int6_payload(
+            qsd, meta, compressor=_COMPRESSOR,
+        )
+        grouped_bytes = int(grouped_stats["compressed_bytes"])
+        stats["grouped_bytes"] = grouped_bytes
+        # Strict `<`: on exact tie, keep the baseline so logs truthfully report
+        # that the grouped path did not win.
+        if grouped_bytes < baseline_bytes:
+            compressed = grouped_compressed
+            codec = f"int6_grouped_{_COMPRESSOR}"
+            stats.update(grouped_stats)
+            stats["codec"] = codec
+            stats["compressed_bytes"] = grouped_bytes
+            if log_fn is not None:
+                log_fn(
+                    f"grouped_artifact_compression:accepted bytes:{grouped_bytes} "
+                    f"baseline_bytes:{baseline_bytes}"
+                )
+        elif log_fn is not None:
+            log_fn(
+                f"grouped_artifact_compression:kept_baseline bytes:{baseline_bytes} "
+                f"grouped_bytes:{grouped_bytes}"
+            )
+    return ArtifactCodecResult(
+        compressed=compressed,
+        qsd=qsd,
+        meta=meta,
+        codec=codec,
+        baseline_bytes=baseline_bytes,
+        compressed_bytes=len(compressed),
+        stats=stats,
+    )
 
 
 def load_int6_artifact(blob: bytes, template_state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -6171,13 +6345,13 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> OptimizerParamL
 def _prescribe_failure_fix(failure: str) -> dict:
     """Map a post-int6 diagnostic failure string to a fix prescription.
 
-    After the iter-142-refactor flatten, the routing/MoS balance levers are:
-      - router_load_cv_coef        — covers attn/mlp slice CV
-      - router_ema_balance_coef    — covers EMA-anchored no-dead-expert balance when CV is off
-      - mos_load_cv_coef           — covers MoS gate CV
-      - expert_output_diversity_coef — covers attn/mlp expert orthogonality
-      - mos_output_diversity_coef    — covers MoS expert orthogonality
-      - weight_decay                — last resort for weight-space collinearity
+    Diagnostics identify root causes; prescriptions prefer reusable mechanisms
+    over symptom-specific losses:
+      - router_bias_update          — slow generic usage-prior controller
+      - router_load_cv_coef         — fallback routed-usage regularizer
+      - mos_load_cv_coef            — MoS gate usage regularizer
+      - expert-bank geometry        — preferred expert-collapse fix
+      - transition parameterization — preferred contraction fix
     """
     low = failure.lower()
     first_token = low.split("=", 1)[0].split()[0] if low else ""
@@ -6193,44 +6367,47 @@ def _prescribe_failure_fix(failure: str) -> dict:
                 "config_change": {"mos_load_cv_coef_mult": 1.5},
             }
         cur = float(Hyperparameters.router_load_cv_coef)
-        alive_cur = float(Hyperparameters.router_ema_alive_coef)
-        balance_cur = float(Hyperparameters.router_ema_balance_coef)
         cv_fix = (
             f"Increase router_load_cv_coef by 1.5x (e.g. {cur:g}->{cur * 1.5:g})."
             if cur > 0.0
             else "Enable a small router_load_cv_coef floor (e.g. 0.05-0.10) if EMA alone is insufficient."
         )
-        alive_target = alive_cur * 1.5 if alive_cur > 0.0 else 0.02
         return {
             "failure": failure,
             "category": "router_collapse",
-            "hypothesis": "Routing long-run balance under-regularized",
-            "fix": (f"Strict-liveness path: increase router_ema_alive_coef "
-                    f"(e.g. {alive_cur:g}->{alive_target:g}). CV path: {cv_fix} "
-                    f"EMA balance is already {balance_cur:g}; do not prescribe stale lower floors."),
-            "config_change": {"router_load_cv_coef_mult": 1.5,
-                              "router_load_cv_coef_floor": 0.05,
-                              "router_ema_alive_coef_mult": 1.5,
-                              "router_ema_alive_coef_floor": alive_target},
+            "hypothesis": "Router usage prior is not being enforced strongly enough over long-run usage",
+            "fix": ("Prefer the generic slow router-bias controller: set "
+                    "router_bias_update=1 with the clipped default controller. "
+                    f"Fallback only if needed: {cv_fix} Do not add a one-off "
+                    "attention/min-share loss."),
+            "config_change": {"router_bias_update": True,
+                              "router_bias_lr": float(Hyperparameters.router_bias_lr),
+                              "router_bias_clip": float(Hyperparameters.router_bias_clip),
+                              "router_load_cv_coef_floor": 0.05},
         }
     if first_token.startswith("mos_") and "ortho" in first_token:
         return {
             "failure": failure,
             "category": "mos_head_collapse",
-            "hypothesis": "MoS expert orthogonality under-regularized",
-            "fix": "Enable mos_output_diversity_coef (default 0.0); start at 0.05.",
-            "config_change": {"mos_output_diversity_coef": 0.05},
+            "hypothesis": "MoS expert-bank geometry permits parallel MoS directions",
+            "fix": ("Prefer a shared MoS expert-bank geometry constraint "
+                    "(normalized/orthogonalized low-rank state vectors or retraction). "
+                    "mos_output_diversity_coef=0.05 is a temporary ablation only."),
+            "config_change": {"needs_mos_output_geometry_constraint": True,
+                              "mos_output_diversity_coef": 0.05},
         }
     if "ortho" in first_token:
         cur = float(Hyperparameters.expert_output_diversity_coef)
         return {
             "failure": failure,
             "category": "expert_collapse",
-            "hypothesis": "Expert outputs collapsing toward parallel directions",
-            "fix": (f"Increase expert_output_diversity_coef by 1.5× (e.g. {cur:g}→{cur * 1.5:g}) "
-                    "or fall back to weight_decay × 1.5 if direction-only pressure fails."),
-            "config_change": {"expert_output_diversity_coef_mult": 1.5,
-                              "weight_decay_mult": 1.5},
+            "hypothesis": "Expert-bank geometry permits parallel expert directions",
+            "fix": ("Prefer a shared expert-bank geometry constraint "
+                    "(normalized/orthogonalized low-rank deltas or retraction). "
+                    f"Use expert_output_diversity_coef ×1.5 (e.g. {cur:g}→{cur * 1.5:g}) "
+                    "only as a temporary ablation."),
+            "config_change": {"needs_expert_bank_geometry_constraint": True,
+                              "expert_output_diversity_coef_mult": 1.5},
         }
     if low.startswith("k-sweep"):
         return {
@@ -6243,19 +6420,15 @@ def _prescribe_failure_fix(failure: str) -> dict:
             "config_change": {"deq_k_max_delta": 4},
         }
     if first_token.startswith("lip_ub"):
-        lyap_cur = float(Hyperparameters.lyapunov_coef)
-        lyap_target = lyap_cur * 1.5 if lyap_cur > 0.0 else 0.005
         return {
             "failure": failure,
             "category": "local_contraction_failed",
             "hypothesis": "The RevDEQ transition Jacobian failed the local Lipschitz contraction metric",
-            "fix": ("Shrink the transition map itself: enable/increase the finite-perturbation "
-                    f"Lyapunov penalty (e.g. lyapunov_coef {lyap_cur:g}->{lyap_target:g}); "
-                    "increase weight_decay 1.5× only if the direct transition penalty is insufficient. "
-                    "Do not treat scalar deq_beta as a fix in the active Parcae path; lip_ub probes "
-                    "T_theta, not the solver blend, and Parcae uses per-dim beta=1-A_bar."),
-            "config_change": {"lyapunov_coef": lyap_target,
-                              "weight_decay_mult": 1.5},
+            "fix": ("Shrink the transition map by parameterization: bounded residual gains, "
+                    "spectral/weight normalization, or another shared transition constraint. "
+                    "Do not add another Lyapunov coefficient sweep by default; lip_ub is the "
+                    "gate-aligned diagnostic, not a request for a new symptom loss."),
+            "config_change": {"needs_transition_parameterization": True},
         }
     if first_token.startswith("fp_bound"):
         return {
@@ -6530,9 +6703,43 @@ def _compute_training_budget_ms(
     return 1000.0 * train_budget_s
 
 
+def _compute_run_status(
+    *,
+    diagnostic_policy: str,
+    health_valid: bool,
+    full_val_completed: bool,
+) -> tuple[bool, str, str | None]:
+    # Pure decision table for `meta.json` `run_valid` / `status` / `non_promotable_reason`.
+    # Extracted so the scalar-semantic shift in `diagnostic_gate_policy=hard` is
+    # pinned by a focused test (truth table over policy × health_valid × full_val).
+    if not full_val_completed:
+        return False, "validated_fast_only", "final_full_validation_disabled"
+    if health_valid:
+        return True, "validated_clean", None
+    if diagnostic_policy == "advisory":
+        return True, "validated_with_tech_debt", None
+    return False, "health_gate_failed", "diagnostic_gate_policy_hard"
+
+
 def _validate_hyperparameters(args) -> None:
     """Fail-fast architecture/config validation — catches malformed combos
-    at startup rather than as opaque reshape errors deep in SDPA forward."""
+    at startup rather than as opaque reshape errors deep in SDPA forward.
+
+    Tolerates `SimpleNamespace` test fixtures via `getattr`-with-default so
+    focused tests can omit unrelated profile fields.
+    """
+    profile = str(getattr(args, "config_profile", "fast_default")).strip().lower()
+    if profile not in _CONFIG_PROFILES:
+        valid = ", ".join(sorted(_CONFIG_PROFILES))
+        raise SystemExit(f"config_profile={profile!r} must be one of: {valid}")
+    eval_profile = str(getattr(args, "eval_profile", "diagnostic")).strip().lower()
+    if eval_profile not in _EVAL_PROFILES:
+        valid = ", ".join(sorted(_EVAL_PROFILES))
+        raise SystemExit(f"eval_profile={eval_profile!r} must be one of: {valid}")
+    policy = str(getattr(args, "diagnostic_gate_policy", "advisory")).strip().lower()
+    if policy not in ("advisory", "hard"):
+        raise SystemExit("diagnostic_gate_policy must be one of: advisory, hard")
+
     md, nh, nkv = int(args.model_dim), int(args.num_heads), int(args.num_kv_heads)
     if md % nh != 0:
         raise SystemExit(f"model_dim ({md}) must be divisible by num_heads ({nh})")
@@ -6610,10 +6817,6 @@ def _validate_hyperparameters(args) -> None:
                 f"use_rr_attention requires train_seq_len <= {rr_T_cap} "
                 f"(rr_attention silently falls back to dense SDPA above that cap)"
             )
-    if int(getattr(args, "lqer_rank", 1)) <= 0:
-        raise SystemExit("lqer_rank must be positive")
-    if int(getattr(args, "lqer_top_k", 0)) < 0:
-        raise SystemExit("lqer_top_k must be non-negative")
     # Flag-to-effect contract: --use-gptq / --use-lqer currently only run a
     # synthetic-tensor smoke; the scored int6 artifact path is unchanged, so a
     # banner advertising gptq=1 / lqer=1 would misrepresent the run.
@@ -6634,9 +6837,9 @@ def _validate_hyperparameters(args) -> None:
     # print; the FineWeb shards are already tokenized and bypass the codec.
     if bool(getattr(args, "use_caseops", False)):
         raise SystemExit(
-            "use_caseops only runs a fixture print over caseops_smoke_text; the "
-            "tokenized dataset bypasses it. Disable the flag until the codec is "
-            "wired into the data pipeline."
+            "use_caseops only runs a fixture print over a hardcoded smoke string; "
+            "the tokenized dataset bypasses it. Disable the flag until the codec "
+            "is wired into the data pipeline."
         )
     if bool(getattr(args, "deq_prefix_anchors", False)) and int(getattr(args, "num_refinements", 0)) != 0:
         raise SystemExit("deq_prefix_anchors currently requires num_refinements=0")
@@ -6657,7 +6860,10 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     cli_overrides = _parse_cli_overrides(sys.argv[1:])
     args = Hyperparameters()
+    profile_name = str(cli_overrides.pop("config_profile", args.config_profile))
+    _apply_config_profile(args, profile_name)
     for k, v in cli_overrides.items():
+        _assert_known_hyperparameter(k, source="cli_override")
         setattr(args, k, v)
     _resolve_training_seconds_alias(args, cli_overrides)
     _validate_hyperparameters(args)
@@ -6719,8 +6925,6 @@ def main() -> None:
     set_gptq_lqer_enabled(
         use_gptq=getattr(args, "use_gptq", False),
         use_lqer=getattr(args, "use_lqer", False),
-        lqer_rank=getattr(args, "lqer_rank", 4),
-        lqer_top_k=getattr(args, "lqer_top_k", 3),
     )
     set_grouped_artifact_compression_enabled(getattr(args, "use_grouped_artifact_compression", False))
     set_caseops_enabled(getattr(args, "use_caseops", False))
@@ -6969,6 +7173,9 @@ def main() -> None:
         f" batch_tokens={args.train_batch_tokens} seq_len={args.train_seq_len}"
         f" refinements={args.num_refinements} refine_ramp_frac={args.num_refinements_ramp_frac}"
         f" ema={int(args.ema_enabled)} ema_decay={args.ema_decay:.4f}"
+        f" config_profile={args.config_profile}"
+        f" eval_profile={args.eval_profile}"
+        f" diagnostic_gate_policy={args.diagnostic_gate_policy}"
         f" pooled_router=True router_scoring={args.router_scoring}"
         f" router_ucb_beta={float(args.router_dirichlet_ucb_beta):.4g}"
         f" router_sigmoid_gate={int(bool(args.use_router_sigmoid_gate))}"
@@ -8032,31 +8239,14 @@ def main() -> None:
         # `experiments/test_submission.py` calls the same helper so its
         # quant_categories / serialization keys / compressor settings cannot
         # drift away from what is actually scored.
-        compressed, qsd, meta = save_int6_artifact(sd)
-        if getattr(args, "use_grouped_artifact_compression", False):
-            from experiments.components.artifact_compression import grouped_compress_int6_payload
-            grouped_compressed, grouped_stats = grouped_compress_int6_payload(
-                qsd, meta, compressor=_COMPRESSOR,
-            )
-            grouped_bytes = int(grouped_stats["compressed_bytes"])
-            base_bytes = len(compressed)
-            # Strict `<`: on exact tie, keep the baseline so the log truthfully
-            # reports the grouped path did not win. The earlier `<=` flipped to
-            # grouped on ties yet logged as "accepted", misreporting for the
-            # promotion-review reader.
-            if grouped_bytes < base_bytes:
-                compressed = grouped_compressed
-                log0(
-                    f"grouped_artifact_compression:accepted bytes:{grouped_bytes} "
-                    f"baseline_bytes:{base_bytes}"
-                )
-            else:
-                log0(
-                    f"grouped_artifact_compression:kept_baseline bytes:{base_bytes} "
-                    f"grouped_bytes:{grouped_bytes}"
-                )
-        artifact_bytes = len(compressed)
-        log0(f"artifact_bytes:{artifact_bytes} compressor:{_COMPRESSOR}")
+        artifact = encode_scored_artifact(
+            sd,
+            use_grouped_artifact_compression=bool(getattr(args, "use_grouped_artifact_compression", False)),
+            log_fn=log0,
+        )
+        compressed, qsd, meta = artifact.compressed, artifact.qsd, artifact.meta
+        artifact_bytes = int(artifact.compressed_bytes)
+        log0(f"artifact_bytes:{artifact_bytes} codec:{artifact.codec} compressor:{_COMPRESSOR}")
 
         # Parameter Golf HARD budget: total = code + compressed model ≤ 16,000,000 bytes.
         # Failing this means the artifact violates the competition constraint; we
@@ -8113,6 +8303,10 @@ def main() -> None:
                 "git_commit": _git_commit,
                 "run_valid": False,
                 "status": "artifact_written",
+                "config_profile": str(args.config_profile),
+                "eval_profile": str(args.eval_profile),
+                "diagnostic_gate_policy": str(args.diagnostic_gate_policy),
+                "artifact_codec": artifact.codec,
             }, f)
 
         log0("roundtrip_verification:start")
@@ -8197,15 +8391,10 @@ def main() -> None:
     # Different K values change iteration counts, triggering dynamo guards
     # that cause recompile_limit hits → stall one rank → NCCL timeout.
     torch._dynamo.reset()
-    # iter 97.6: insert primes {17, 37, 113} between the powers of 2.
-    # Primes coprime to {2,3,4,5,12,20} (training K-jitter set GCD = 4)
-    # break the period-L cycle alias inherent in power-of-2 sampling.
-    # 2026-04-29 user directive: K=24 added per the {16, 24} K-jitter set —
-    # captures the FP behaviour at the deeper jitter point so the K-sweep
-    # matrix has direct training-K coverage (K=16 + K=24 are both in the
-    # training jitter set; K=4/8/32/64/128 + primes 17/37/113 give the
-    # cross-depth diagnostics).
-    k_sweep_values = [4, 8, 16, 17, 24, 32, 37, 64, 113, 128]
+    # Eval profile owns K-sweep scope.  The diagnostic profile preserves the
+    # historical prime-rich matrix; submission/debug profiles reduce redundant
+    # probes without changing training behavior.
+    k_sweep_values = _resolve_k_sweep_values(args)
     k_sweep_results: dict[int, float] = {}
     k_sweep_lip_ubs: dict[int, float] = {}
 
@@ -8380,14 +8569,17 @@ def main() -> None:
             conf_value = kdiag.get(conf_name)
             if conf_value is not None:
                 diag_parts.append(f"{conf_name}:{float(conf_value):.4f}")
-        # Local FP contraction metric at the saved DEQ FP (z*).
-        lip_ub = _lip_ub_at_saved_fp(
-            base_m_for_roundtrip,
-            n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
-            safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
-            margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
-            log_label="ksweep_skip_reason:lip_ub",
-        )
+        # Local FP contraction metric at the saved DEQ FP (z*).  Eval profile
+        # controls which K rows pay for this probe.
+        lip_ub = None
+        if _should_probe_lip_for_k(args, k_eval):
+            lip_ub = _lip_ub_at_saved_fp(
+                base_m_for_roundtrip,
+                n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
+                safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
+                margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
+                log_label="ksweep_skip_reason:lip_ub",
+            )
         if lip_ub is not None:
             diag_parts.append(f"lip_ub:{lip_ub:.4f}")
             k_sweep_lip_ubs[k_eval] = float(lip_ub)
@@ -8775,7 +8967,7 @@ def main() -> None:
         # Write machine-readable retry hint next to the artifacts.
         if master_process:
             retry_hint = {
-                "run_valid": False,
+                "health_valid": False,
                 "failure_count": len(_failures),
                 "prescriptions": prescriptions,
                 "suggested_config": suggested_config,
@@ -8835,25 +9027,36 @@ def main() -> None:
             meta_json = json.load(f)
         # Persist both: fast_val_bpb is always the int6 roundtrip proxy; val_bpb
         # is authoritative only when full validation completed.
+        diagnostic_policy = str(args.diagnostic_gate_policy).strip().lower()
+        health_valid = bool(_assertions_passed)
+        score_valid = full_val_bpb is not None
+        meta_json["config_profile"] = str(args.config_profile)
+        meta_json["eval_profile"] = str(args.eval_profile)
+        meta_json["diagnostic_gate_policy"] = diagnostic_policy
+        meta_json["score_valid"] = bool(score_valid)
+        meta_json["health_valid"] = bool(health_valid)
+        meta_json["gate_status"] = "passed" if health_valid else "diagnostic_fail"
         meta_json["fast_val_bpb"] = float(val_bpb_q)
-        if full_val_bpb is not None:
-            meta_json["val_bpb"] = float(full_val_bpb)
-            # POLICY (val_bpb-primary): run_valid=true once authoritative
-            # full-set val_bpb is written. Gate failures are tech debt for the
-            # next iter, not promotion blockers.
-            meta_json["run_valid"] = True
-            meta_json["status"] = "validated_clean" if _assertions_passed else "validated_with_tech_debt"
-        else:
-            # Fast-only path: keep val_bpb as the fast int6 surrogate so the
-            # downstream JSON schema stays float-typed; promotion is gated on
-            # `run_valid=False` + `status="validated_fast_only"` instead.
-            # update_results.sh refuses to promote these.
-            meta_json["val_bpb"] = float(val_bpb_q)
-            meta_json["run_valid"] = False
-            meta_json["status"] = "validated_fast_only"
-            meta_json["non_promotable_reason"] = "final_full_validation_disabled"
+        # Keep val_bpb float-typed even in the fast-only path; promotion gating
+        # lives in `_compute_run_status` (returns validated_fast_only there).
+        meta_json["val_bpb"] = float(full_val_bpb) if full_val_bpb is not None else float(val_bpb_q)
+        run_valid, status, reason = _compute_run_status(
+            diagnostic_policy=diagnostic_policy,
+            health_valid=health_valid,
+            full_val_completed=full_val_bpb is not None,
+        )
+        meta_json["run_valid"] = bool(run_valid)
+        meta_json["status"] = status
+        if reason is not None:
+            meta_json["non_promotable_reason"] = reason
         with open(meta_path, "w") as f:
             json.dump(meta_json, f)
+        log0(
+            f"final_status: health_valid:{int(health_valid)} "
+            f"gate_status:{meta_json['gate_status']} "
+            f"score_valid:{int(score_valid)} run_valid:{int(run_valid)} "
+            f"status:{status} codec:{meta_json.get('artifact_codec', 'int6')}"
+        )
 
     # Tear down DDP after all eval completes.
     if distributed:

@@ -5,9 +5,10 @@ used for scoring, still meets the 16MB size limit and that the quantized
 model's loss closely matches the unquantized model's loss.
 
 This is the test for what actually gets submitted and scored — the
-quantization, serialization, and compression all go through the SAME helpers
-that `train_gpt.main()` uses (`save_int6_artifact` / `load_int6_artifact`),
-so the test cannot drift away from the real save path.
+quantization, serialization, and compression all go through the SAME helper
+that `train_gpt.main()` uses (`encode_scored_artifact`, which wraps
+`save_int6_artifact` and the optional grouped codec under one byte-accounted
+interface), so the test cannot drift away from the real save path.
 """
 import os
 import sys
@@ -120,10 +121,37 @@ def _quantize_and_compress(model):
     Returns `(blob, sd_cpu)` — `sd_cpu` is the un-quantized template needed
     by the symmetric loader for shape/dtype reconstruction.
     """
-    from train_gpt import save_int6_artifact
+    from train_gpt import encode_scored_artifact
     sd_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    blob, _qsd, _meta = save_int6_artifact(sd_cpu)
-    return blob, sd_cpu
+    result = encode_scored_artifact(sd_cpu)
+    return result.compressed, sd_cpu
+
+
+def test_encode_scored_artifact_default_path_is_byte_identical_to_save_int6():
+    """Pin the refactor: `encode_scored_artifact` with grouped disabled must
+    return the same bytes as the previous inline `save_int6_artifact` call.
+
+    Without this assertion a future codec change could silently desync the
+    contract-mirror path from production.
+    """
+    from train_gpt import _COMPRESSOR, encode_scored_artifact, save_int6_artifact
+    torch.manual_seed(0)
+    sd = {
+        f"layer{i}.weight": torch.randn(8, 16, dtype=torch.float32)
+        for i in range(4)
+    }
+    sd["tok_emb.weight"] = torch.randn(16, 8, dtype=torch.float32)
+    baseline_compressed, _baseline_qsd, _baseline_meta = save_int6_artifact(sd)
+    result = encode_scored_artifact(sd)
+    assert result.compressed == baseline_compressed, (
+        "encode_scored_artifact default path drifted from save_int6_artifact bytes"
+    )
+    assert result.codec == f"int6_{_COMPRESSOR}", (
+        f"unexpected codec label: {result.codec!r}"
+    )
+    assert result.compressed_bytes == len(baseline_compressed)
+    assert result.baseline_bytes == len(baseline_compressed)
+    print("  PASS: encode_scored_artifact default path is byte-identical")
 
 
 def _decompress_and_load(model, quant_blob, sd_cpu):

@@ -20,7 +20,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from tests._helpers import mutate_hyperparameters as _mut  # noqa: E402
-from train_gpt import Hyperparameters, _OPTIONAL_COMPONENT_FLAGS, _validate_hyperparameters  # noqa: E402
+from train_gpt import (  # noqa: E402
+    Hyperparameters,
+    _OPTIONAL_COMPONENT_CAPABILITIES,
+    _OPTIONAL_COMPONENT_FLAGS,
+    _validate_hyperparameters,
+)
 
 
 def _validator_rejects(field: str) -> bool:
@@ -138,6 +143,25 @@ class TestOptionalComponentFlagContract(unittest.TestCase):
     def test_registry_is_non_empty(self) -> None:
         # Guard against an accidental rename or truncation of the registry.
         self.assertGreater(len(_OPTIONAL_COMPONENT_FLAGS), 0)
+        self.assertEqual(
+            _OPTIONAL_COMPONENT_FLAGS,
+            tuple((cap.py_name, cap.label) for cap in _OPTIONAL_COMPONENT_CAPABILITIES),
+        )
+
+    def test_capability_states_are_explicit(self) -> None:
+        allowed = {"rejected", "training_effect", "eval_effect", "artifact_effect"}
+        bad = [
+            (cap.py_name, cap.state)
+            for cap in _OPTIONAL_COMPONENT_CAPABILITIES
+            if cap.state not in allowed
+        ]
+        self.assertFalse(bad, f"unknown capability state(s): {bad}")
+        rejected = [cap.py_name for cap in _OPTIONAL_COMPONENT_CAPABILITIES if cap.state == "rejected"]
+        for field in rejected:
+            self.assertTrue(
+                _validator_rejects(field),
+                f"{field} is declared rejected but _validate_hyperparameters accepts it",
+            )
 
     def test_each_flag_has_effect_or_explicit_reject(self) -> None:
         """For every (py_name, label) in the registry, the flag must EITHER
