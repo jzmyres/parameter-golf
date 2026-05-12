@@ -12,7 +12,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-from train_gpt import Hyperparameters, KShuffleBagSampler, _parse_cli_overrides
+from train_gpt import Hyperparameters, KShuffleBagSampler, _parse_cli_overrides, _prefix_anchor_depths
 
 
 class TestDeqKJitterDefaults(unittest.TestCase):
@@ -40,6 +40,17 @@ class TestDeqKJitterDefaults(unittest.TestCase):
         self.assertFalse(ov["deq_k_jitter"])
         ov = _parse_cli_overrides(["--deq-k-jitter", "1"])
         self.assertTrue(ov["deq_k_jitter"])
+        ov = _parse_cli_overrides(["--deq-prefix-anchors", "1"])
+        self.assertTrue(ov["deq_prefix_anchors"])
+
+    def test_prefix_anchor_depths_are_conditional_prefixes(self):
+        values = (16, 24, 32, 64)
+        self.assertEqual(_prefix_anchor_depths(16, values), (16,))
+        self.assertEqual(_prefix_anchor_depths(24, values), (16, 24))
+        self.assertEqual(_prefix_anchor_depths(32, values), (16, 24, 32))
+        self.assertEqual(_prefix_anchor_depths(64, values), (16, 24, 32, 64))
+        # Non-jitter K still includes the actual sampled endpoint.
+        self.assertEqual(_prefix_anchor_depths(20, values), (16, 20))
 
 
 class TestKShuffleBagSampler(unittest.TestCase):

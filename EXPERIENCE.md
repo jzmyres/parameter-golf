@@ -42,6 +42,7 @@ This file has two roles, in this order:
 | 2026-05-09 | [#scalar-semantic-shift](#scalar-semantic-shift)              | `max_training_seconds` semantic flipped from process-total to training-only without updating callers; canonical `--max-training-seconds=600` would silently overrun the 600 s 8×H100 invariant by 120 s |
 | 2026-05-11 | [#enforcement-config-staging](#enforcement-config-staging)   | iter146-151 commit window introduced `pytest.ini` to convert legacy `return failures` test patterns into hard CI failures via `PytestReturnNotNoneWarning`; the file was untracked while the test rewrites were staged — would have silently disarmed the gate on the next contributor's machine |
 | 2026-05-11 | [#audit-row-executability](#audit-row-executability)         | three-reviewer audit found that the Sibling-fanout DRY gate row added in `5ecf324` was first violated one commit later (EMA log fields with no parser entries); same review found the Enforcement-config staging row shipped only a manual recipe — both symptoms of audit rules without executable witnesses |
+| 2026-05-12 | [#flag-to-effect-contract](#flag-to-effect-contract)         | iter152-batch un-archived 7 components and wired 8 new `use_*` flags; pre-commit review found `use_rr_attention=1` was a no-op at the project default `train_seq_len=2048` (silent fallback to dense SDPA above 512 tokens) and `use_gptq`/`use_lqer`/`use_ttt_eval`/`use_caseops` ran only synthetic-tensor or hardcoded-string smokes while the startup banner advertised them as "1" — a research-log-integrity hazard |
 
 ### Section template
 
@@ -780,6 +781,33 @@ The mistake passed every existing audit gate: the new helper had a (trivial) tes
 4. If a default-on safety knob (`final_full_validation`) compounds the shift, run a smoke that *measures* total process wallclock against the project invariant on the dev profile — not just total training-loop seconds.
 
 **Cross-references.** Companion: [#promotion-propagation](#promotion-propagation) (default-value drift), [#loss-form-triple-touch](#loss-form-triple-touch) (single-side form change), [#loss-gate-quantity-alignment](#loss-gate-quantity-alignment) (cross-side mathematical mismatch), [#config-drift](#config-drift) (single-source-of-truth for tunables), [#cumulative-metric-misread](#cumulative-metric-misread) (semantic vs. instantaneous interpretation of the same scalar).
+
+---
+
+### flag-to-effect-contract
+
+**Date:** 2026-05-12 pre-commit review of iter152 promotion + remaining-queue activation
+**Rule in CLAUDE.md:** Audit Checklist row · "Flag-to-effect contract"
+
+**What happened.** The iter152 commit un-archived 7 default-off components and wired 8 new `use_*` flags (`use_smear_gate`, `use_sparse_attn_head_gate`, `use_rr_attention`, `use_ttt_eval`, `use_gptq`, `use_lqer`, `use_grouped_artifact_compression`, `use_caseops`) plus `deq_prefix_anchors`. Pre-commit review using two parallel reviewer subagents found that four of these flags were silent no-ops at the project default `train_seq_len=2048`:
+
+- `use_rr_attention=True` silently fell through to `F.scaled_dot_product_attention` because `rr_attention.py` gates the masked path on `T <= _RR_MAX_TOKEN_MASK_TOKENS=512` and the project default `train_seq_len=2048` exceeds it. No warning, no metric, but the startup banner printed `rr_attention=1`.
+- `use_gptq=True` / `use_lqer=True` only invoked `run_gptq_lqer_component_smoke` on a synthetic 16×24 matrix. The scored int6 artifact path (`save_int6_artifact → mixed_quantize_int6`) was unchanged, but the banner advertised `gptq=1 lqer=1`.
+- `use_ttt_eval=True` had zero consumers in `train_gpt.py` (`grep is_ttt_eval_enabled` returned no hits outside imports).
+- `use_caseops=True` ran a hardcoded `caseops_smoke_text` fixture print and never touched the pre-tokenized FineWeb shards.
+
+Existing tests partially covered each component module (helper-level smokes), but no test asserted that flipping `use_X=True` produced an *observable* difference in the training-path forward output relative to the default-off baseline. The earlier audit-row-executability rule had been satisfied at the per-module level while silently failing at the integration level.
+
+**Root cause.** Optional-component flags occupy a special place in the research workflow: their value is precisely the ability to compare `use_X=True` vs `use_X=False` runs in the hypothesis log. A flag that prints `X=1` in the startup banner but produces baseline behaviour corrupts the *evidence base*, not just runtime behaviour. The prior audit gates (`promotion-propagation`, `loss-form-triple-touch`, `scalar-semantic-shift`) covered scalars whose *values* shifted silently; they did not cover bool flags whose *effect* was silently absent. This is the bool-flag analogue of the `scalar-semantic-shift` rule.
+
+**The rule.** Every new `use_X` Hyperparameter MUST have at least one **observable, asserted effect on the training-path tensor flow OR on the scored artifact** at the project's default `train_seq_len`, exercised by a test that flips the flag True and asserts the output **differs** from the disabled baseline (within a fixed tolerance). Smoke-only fixtures, hardcoded-string codec prints, synthetic-tensor quantization rehearsals, and silent dense fallbacks at the default T do **not** satisfy this contract. If the implementation is scaffolding pending a future iter, the validator MUST `SystemExit` with a message that names the scaffold scope explicitly — research-log entries must never claim to test a technique that was silently disabled.
+
+**Verification recipe.**
+1. Maintain a single registry `_OPTIONAL_COMPONENT_FLAGS` in `train_gpt.py` that names every default-off `use_X` field. The CLI bool list, the `bool_keys` set, and the startup-banner emission read from it.
+2. Provide a parameterised contract test `tests/test_optional_component_flag_contract.py::test_each_flag_has_effect_or_explicit_reject` that, for each entry in `_OPTIONAL_COMPONENT_FLAGS`, asserts **either** (a) `_validate_hyperparameters(_mut(use_X=True))` raises `SystemExit` with a message naming the field, **or** (b) a test exists in `tests/` or `experiments/` whose name contains the field and which exercises a `use_X=True` forward path that asserts an output-differs invariant. Discover (b) by lexical AST scan, not runtime — keep the contract test cheap.
+3. On a new optional component, add the registry entry plus *either* a `SystemExit` branch in `_validate_hyperparameters` (with a matching `test_use_X_rejected_*` case) *or* an effect-asserting test in `experiments/test_remaining_components.py`. The contract test fails-loudly otherwise.
+
+**Cross-references.** Companion: [#scalar-semantic-shift](#scalar-semantic-shift) (the scalar analogue), [#untested-path-executability](#untested-path-executability) (the structural prior), [#sibling-fanout-dry-gate](#sibling-fanout-dry-gate) (paired DRY enforcement for the registry), [#audit-row-executability](#audit-row-executability) (the contract test is the executable witness for this rule).
 
 ---
 

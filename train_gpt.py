@@ -612,8 +612,30 @@ class Hyperparameters:
     # (mask suppresses leak across packed-doc boundaries; SP BOS_ID=1).
     # Default OFF; strict-gen at coef=0 → exact recovery (no x-mixing).
     use_smear_gate = False
-    smear_gate_init = 0.1
+    smear_gate_init = 0.0
+    smear_gate_window = 12
     smear_gate_bos_id = 1  # SentencePiece BOS
+    # Remaining-queue component toggles (2026-05-12): every promoted component
+    # below is default-off and removable. Training smokes turn on one flag at a
+    # time so failed iterations can be dropped by deleting the component file
+    # plus its narrow hook.
+    use_sparse_attn_head_gate = False
+    sparse_attn_gate_window = 12
+    sparse_attn_gate_scale = 1.0
+    sparse_attn_gate_factor = 2.0
+    sparse_attn_gate_init_std = 0.0
+    use_rr_attention = False
+    rr_stride = 8
+    rr_block_size = 64
+    rr_tau = 0.95
+    use_ttt_eval = False
+    use_gptq = False
+    use_lqer = False
+    lqer_rank = 4
+    lqer_top_k = 3
+    use_grouped_artifact_compression = False
+    use_caseops = False
+    caseops_smoke_text = "Parameter Golf Smoke"
     # iter 122 / H93 (2026-05-01): logit softcap (Gemma2-style).
     # `logits = softcap * tanh(logits / softcap)` bounds extreme logit values,
     # smoothing gradient spikes and reducing bf16 numerical issues. Applied
@@ -781,6 +803,14 @@ class Hyperparameters:
     deq_k_jitter_set = (16, 24, 32, 64)
     deq_k_jitter_weights = (0.50, 0.40, 0.07, 0.03)
     deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
+    # iter152: conditional prefix-K multi-anchor supervision. Default OFF.
+    # When enabled, a sampled K still performs one K-step solve, but the train
+    # task loss is averaged over traversed prefix endpoints from the current
+    # jitter set (e.g. K=32 supervises {16,24,32}). Router/MoS/diversity
+    # regularizers remain attached to the final endpoint only, so the iter is a
+    # pure finite-depth task-supervision change rather than another coefficient
+    # bundle.
+    deq_prefix_anchors = False
 
     # Architecture knobs
     # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
@@ -850,7 +880,12 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "router-ema-alive-coef", "router-ema-balance-coef", "router-ema-specialization-coef",
     "entmax-blend-init-logit", "entmax-blend-warmup-delay-frac", "entmax-blend-lr",
     # iter 129 / H99 — SmearGate (default off; --use-smear-gate=1 to enable)
-    "smear-gate-init", "smear-gate-bos-id",
+    "smear-gate-init", "smear-gate-window", "smear-gate-bos-id",
+    "sparse-attn-gate-window", "sparse-attn-gate-scale",
+    "sparse-attn-gate-factor", "sparse-attn-gate-init-std",
+    "rr-stride", "rr-block-size", "rr-tau",
+    "lqer-rank", "lqer-top-k",
+    "caseops-smoke-text",
     # iter 122 H93 — logit softcap (Gemma2-style)
     "logit-softcap",
     # iter 117b-3 — sparse MoE dispatch capacity factor
@@ -874,6 +909,27 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
 )
 
 
+# Optional default-off component flags. Single source of truth that drives:
+# - the CLI bool-flag list in `_parse_cli_overrides` (dashed names),
+# - the `bool_keys` set in `_parse_cli_overrides` (underscored names),
+# - the banner emission in `main()` (label seen in run.log).
+# Adding a new optional component is now a one-line registry change instead
+# of a 3-site grep-and-paste. The companion `flag-to-effect-contract` audit
+# row in CLAUDE.md asserts each entry either has an effect-asserting test or
+# a validator reject.
+_OPTIONAL_COMPONENT_FLAGS: tuple[tuple[str, str], ...] = (
+    ("use_smear_gate", "smear_gate"),                          # iter 129 / H99
+    ("use_sparse_attn_head_gate", "sparse_attn_head_gate"),    # iter 118b
+    ("use_rr_attention", "rr_attention"),                      # iter 120
+    ("use_ttt_eval", "ttt_eval"),                              # H91 scaffold
+    ("use_gptq", "gptq"),                                      # H94 scaffold
+    ("use_lqer", "lqer"),                                      # H94 scaffold
+    ("use_grouped_artifact_compression", "grouped_artifact"),  # H96
+    ("use_caseops", "caseops"),                                # H95 scaffold
+    ("deq_prefix_anchors", "deq_prefix_anchors"),              # iter 152
+)
+
+
 def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     p = argparse.ArgumentParser(add_help=True)
     for name in _CLI_TUNABLE_KNOBS:
@@ -887,17 +943,20 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
             p.add_argument(f"--{name}", type=str, default=None)
         else:
             p.add_argument(f"--{name}", type=str, default=None)
-    for name in [
+    _core_bool_flag_names = [
         "auto-plot-on-val", "router-bias-update", "deq-k-jitter",
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
         "use-router-sigmoid-gate",
         "use-polar-express-ns", "use-entmax-triton", "use-sparse-dispatch",
         "use-chained-routing",
         "use-unified-routed-down",  # iter 118a Phase A3
-        "use-smear-gate",  # iter 129 / H99
         "use-parcae", "deq-beta-jitter",
         "final-full-validation", "resume-latest",
-    ]:
+    ]
+    _optional_component_flag_names = [
+        py_name.replace("_", "-") for py_name, _ in _OPTIONAL_COMPONENT_FLAGS
+    ]
+    for name in _core_bool_flag_names + _optional_component_flag_names:
         p.add_argument(f"--{name}", type=int, default=None, help="1/0")
     # iter 106: `use_nsa_attention` defaults to False (bool subclass of int)
     # which the loop above already routes through `add_argument(type=int)`. Add
@@ -912,15 +971,17 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
     if bad:
         raise SystemExit(f"Unknown args: {bad}")
     out: dict[str, object] = {}
-    bool_keys = {"auto_plot_on_val", "router_bias_update", "deq_k_jitter",
-                 "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
-                 "use_entmax_routing", "use_router_sigmoid_gate",
-                 "use_polar_express_ns",
+    bool_keys = {
+        "auto_plot_on_val", "router_bias_update", "deq_k_jitter",
+        "swa_enabled", "ema_enabled", "use_ctp", "use_nsa_attention",
+        "use_entmax_routing", "use_router_sigmoid_gate",
+        "use_polar_express_ns",
         "use_entmax_triton", "use_sparse_dispatch", "use_unified_routed_down",
         "use_chained_routing",
-        "use_smear_gate",
         "use_parcae", "deq_beta_jitter",
-        "final_full_validation", "resume_latest"}
+        "final_full_validation", "resume_latest",
+    }
+    bool_keys.update(py_name for py_name, _ in _OPTIONAL_COMPONENT_FLAGS)
     for k, v in vars(ns).items():
         if v is not None:
             key = k.replace("-", "_")
@@ -1274,7 +1335,10 @@ eval_val = run_validation
 # QUANTIZATION (uniform INT6 + SDClip)
 # ---------------------------------------------------------------------------
 
-CONTROL_TENSOR_PATTERNS = ("q_gain", "gate_bias", "bigram.scale", "norm_weight", "nsa_branch_gate", "_entmax_blend_logit")
+CONTROL_TENSOR_PATTERNS = (
+    "q_gain", "gate_bias", "bigram.scale", "norm_weight", "nsa_branch_gate",
+    "_entmax_blend_logit", "attn_gate_w", "smear_gate",
+)
 FP16_KEEP_PATTERNS = ("tok_emb",)
 SDCLIP_K_MATRIX = 12.85
 SDCLIP_K_EMBED = 20.0
@@ -1686,6 +1750,24 @@ def _normalize_k_jitter_weights(values, weights) -> tuple[list[int], list[float]
     if weight_sum <= 0.0:
         raise ValueError("K jitter weights must sum to a positive value")
     return vals, [w / weight_sum for w in ws]
+
+
+def _prefix_anchor_depths(sampled_k: int, values) -> tuple[int, ...]:
+    """Return traversed prefix anchors for iter152 multi-anchor supervision.
+
+    Anchors are the sorted positive jitter depths no larger than the sampled
+    solve depth, with the sampled endpoint always included. This preserves the
+    one-solve forward budget: K=32 supervises {16,24,32}; it does not force a
+    separate K=64 pass.
+    """
+    k = int(sampled_k)
+    if k <= 0:
+        raise ValueError(f"sampled_k must be positive, got {sampled_k}")
+    candidates = (int(v) for v in (values or ()))
+    anchors = sorted({v for v in candidates if 0 < v <= k})
+    if k not in anchors:
+        anchors.append(k)
+    return tuple(anchors)
 
 
 class KShuffleBagSampler:
@@ -2887,6 +2969,15 @@ class CausalSelfAttention(nn.Module):
                  nsa_compress_block_sliding_stride: int = 16,
                  nsa_sliding_window_size: int = 256,
                  nsa_branch_gate_init: float = 0.0,
+                 use_sparse_attn_head_gate: bool = False,
+                 sparse_attn_gate_window: int = 12,
+                 sparse_attn_gate_scale: float = 1.0,
+                 sparse_attn_gate_factor: float = 2.0,
+                 sparse_attn_gate_init_std: float = 0.0,
+                 use_rr_attention: bool = False,
+                 rr_stride: int = 8,
+                 rr_block_size: int = 64,
+                 rr_tau: float = 0.95,
                  **kwargs):
         super().__init__()
         self.num_heads = num_heads
@@ -2900,6 +2991,11 @@ class CausalSelfAttention(nn.Module):
         self.nsa_compress_block_size = int(nsa_compress_block_size)
         self.nsa_compress_block_sliding_stride = int(nsa_compress_block_sliding_stride)
         self.nsa_sliding_window_size = int(nsa_sliding_window_size)
+        self.use_rr_attention = bool(use_rr_attention)
+        self.rr_stride = int(rr_stride)
+        self.rr_block_size = int(rr_block_size)
+        self.rr_tau = float(rr_tau)
+        self.use_sparse_attn_head_gate = bool(use_sparse_attn_head_gate)
         self.rope_dim = self.head_dim // 2
         self.nope_dim = self.head_dim - self.rope_dim
         self.kv_rank = max(self.kv_latent_dim // 8, 32)
@@ -2971,6 +3067,15 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_experts * num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dim, base=rope_base)
         self.gate_bias = nn.Parameter(torch.zeros(num_experts * num_heads, dtype=torch.float32))
+        if self.use_sparse_attn_head_gate:
+            from experiments.components.sparse_attn_head_gate import SparseAttnHeadGate
+            self.sparse_attn_head_gate = SparseAttnHeadGate(
+                num_heads=num_experts * num_heads,
+                gate_window=int(sparse_attn_gate_window),
+                scale=float(sparse_attn_gate_scale),
+                gate_factor=float(sparse_attn_gate_factor),
+                init_std=float(sparse_attn_gate_init_std),
+            )
         # iter 106 NSA: per-expert-per-head two-branch (compression, sliding)
         # softmax mixer logits. Allocated only when NSA is on; zero-param when
         # off so disabled-default has no opt-coverage / quantization fallout.
@@ -3103,6 +3208,20 @@ class CausalSelfAttention(nn.Module):
                 compress_stride=self.nsa_compress_block_sliding_stride,
                 sliding_window_size=self.nsa_sliding_window_size,
             )
+        elif self.use_rr_attention:
+            from experiments.components.rr_attention import rr_attention
+            k_use, v_use = k_full, v_full
+            if H_kv != H:
+                rep = H // H_kv
+                k_use = k_full.repeat_interleave(rep, dim=1)
+                v_use = v_full.repeat_interleave(rep, dim=1)
+            y = rr_attention(
+                q_full, k_use, v_use,
+                stride=self.rr_stride,
+                block_size=self.rr_block_size,
+                tau=self.rr_tau,
+                causal=True,
+            )
         else:
             try:
                 y = F.scaled_dot_product_attention(
@@ -3116,6 +3235,9 @@ class CausalSelfAttention(nn.Module):
                     k_use = k_full.repeat_interleave(rep, dim=1)
                     v_use = v_full.repeat_interleave(rep, dim=1)
                     y = F.scaled_dot_product_attention(q_full, k_use, v_use, attn_mask=None, is_causal=True)
+
+        if self.use_sparse_attn_head_gate:
+            y = self.sparse_attn_head_gate(x_n, y.permute(0, 2, 1, 3)).permute(0, 2, 1, 3)
 
         # --- Gated attention ---
         gate_logits_p = gate_logits.permute(1, 0, 3, 2, 4).reshape(B, E * H, T, 1)
@@ -3715,6 +3837,15 @@ class Block(nn.Module):
                  nsa_compress_block_sliding_stride: int = 16,
                  nsa_sliding_window_size: int = 256,
                  nsa_branch_gate_init: float = 0.0,
+                 use_sparse_attn_head_gate: bool = False,
+                 sparse_attn_gate_window: int = 12,
+                 sparse_attn_gate_scale: float = 1.0,
+                 sparse_attn_gate_factor: float = 2.0,
+                 sparse_attn_gate_init_std: float = 0.0,
+                 use_rr_attention: bool = False,
+                 rr_stride: int = 8,
+                 rr_block_size: int = 64,
+                 rr_tau: float = 0.95,
                  chained_stages_preset: str | None = None,
                  **kwargs):
         super().__init__()
@@ -3788,6 +3919,15 @@ class Block(nn.Module):
                 nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
                 nsa_sliding_window_size=nsa_sliding_window_size,
                 nsa_branch_gate_init=nsa_branch_gate_init,
+                use_sparse_attn_head_gate=use_sparse_attn_head_gate,
+                sparse_attn_gate_window=sparse_attn_gate_window,
+                sparse_attn_gate_scale=sparse_attn_gate_scale,
+                sparse_attn_gate_factor=sparse_attn_gate_factor,
+                sparse_attn_gate_init_std=sparse_attn_gate_init_std,
+                use_rr_attention=use_rr_attention,
+                rr_stride=rr_stride,
+                rr_block_size=rr_block_size,
+                rr_tau=rr_tau,
                 soft_dense_router_cls=SoftDenseRouter,
                 causal_self_attention_cls=CausalSelfAttention,
                 mlp_cls=MLP,
@@ -3834,7 +3974,16 @@ class Block(nn.Module):
                                          nsa_compress_block_size=nsa_compress_block_size,
                                          nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
                                          nsa_sliding_window_size=nsa_sliding_window_size,
-                                         nsa_branch_gate_init=nsa_branch_gate_init)
+                                         nsa_branch_gate_init=nsa_branch_gate_init,
+                                         use_sparse_attn_head_gate=use_sparse_attn_head_gate,
+                                         sparse_attn_gate_window=sparse_attn_gate_window,
+                                         sparse_attn_gate_scale=sparse_attn_gate_scale,
+                                         sparse_attn_gate_factor=sparse_attn_gate_factor,
+                                         sparse_attn_gate_init_std=sparse_attn_gate_init_std,
+                                         use_rr_attention=use_rr_attention,
+                                         rr_stride=rr_stride,
+                                         rr_block_size=rr_block_size,
+                                         rr_tau=rr_tau)
         self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
 
     def _init_chained_stage0_aliases(self) -> None:
@@ -4631,6 +4780,286 @@ class RevDEQFunction(torch.autograd.Function):
                 grad_b_bar_out, None, None, *param_grads_out)
 
 
+class RevDEQPrefixAnchorFunction(torch.autograd.Function):
+    """RevDEQ solve that returns several already-traversed prefix endpoints.
+
+    Forward runs the solver once to the sampled K and stores only the requested
+    prefix terminal states. Backward replays a TBPTT tail from each endpoint and
+    sums the gradients; the loss-side averaging controls each anchor's weight.
+    """
+
+    @staticmethod
+    def forward(ctx, f_theta, x0, z_init, beta, b_bar, K, bptt_k, anchor_depths, *params):
+        acc_dtype = torch.float64
+        state_dtype = torch.float32
+        compute_dtype = z_init.dtype
+        device_type = x0.device.type
+        anchors = tuple(int(k) for k in anchor_depths)
+        if not anchors:
+            anchors = (int(K),)
+        if anchors[-1] != int(K):
+            raise ValueError(f"last prefix anchor {anchors[-1]} must equal sampled K={int(K)}")
+        ctx.beta_requires_grad = isinstance(beta, torch.Tensor) and beta.requires_grad
+        ctx.beta_input_dtype = beta.dtype if isinstance(beta, torch.Tensor) else None
+        ctx.b_bar_requires_grad = isinstance(b_bar, torch.Tensor) and b_bar.requires_grad
+        ctx.b_bar_input_dtype = b_bar.dtype if isinstance(b_bar, torch.Tensor) else None
+        ctx.has_b_bar = isinstance(b_bar, torch.Tensor)
+        ctx.b_bar_saved = b_bar.detach() if isinstance(b_bar, torch.Tensor) else None
+        if isinstance(beta, torch.Tensor):
+            beta = beta.detach().to(torch.float64)
+            beta_inv = 1.0 - beta
+        else:
+            beta_inv = 1.0 - beta
+        ctx.do_recon_diag = bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+
+        y_state = z_init.to(state_dtype)
+        z_state = z_init.to(state_dtype)
+        z_prev_state = z_state
+        z_init_state = z_state.detach()
+        anchor_set = set(anchors)
+        y_anchors: list[Tensor] = []
+        z_anchors: list[Tensor] = []
+        # Only the final anchor's z_prev is consumed (caller reads [-1]) and
+        # backward ignores it. Capturing the full list would be O(A·B·T·D)
+        # dead state; keep just the last.
+        last_z_prev: Tensor | None = None
+
+        K_bwd_final = int(bptt_k) if bptt_k else 0
+        if K_bwd_final <= 0 or K_bwd_final >= int(K):
+            K_bwd_final = int(K)
+        snap_iter = int(K) - K_bwd_final
+        y_snap_state: Tensor | None = None
+        z_snap_state: Tensor | None = None
+
+        with torch.no_grad():
+            if bool(ctx.do_recon_diag) and snap_iter == 0:
+                y_snap_state = z_init_state
+                z_snap_state = z_init_state
+            out_y = None
+            for i in range(int(K)):
+                z_prev_state = z_state
+                y_acc = y_state.to(acc_dtype) * beta_inv
+                with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                    out_z = f_theta(z_state.to(compute_dtype), x0, b_bar)
+                y_acc = y_acc + out_z.to(acc_dtype) * beta
+                y_state = y_acc.to(state_dtype)
+
+                z_acc = z_state.to(acc_dtype) * beta_inv
+                with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                    out_y = f_theta(y_state.to(compute_dtype), x0, b_bar)
+                z_acc = z_acc + out_y.to(acc_dtype) * beta
+                z_state = z_acc.to(state_dtype)
+
+                step_i = i + 1
+                if bool(ctx.do_recon_diag) and step_i == snap_iter:
+                    y_snap_state = y_state.detach().clone()
+                    z_snap_state = z_state.detach().clone()
+                if step_i in anchor_set:
+                    y_anchors.append(y_state.detach().clone())
+                    z_anchors.append(z_state.detach().clone())
+                    last_z_prev = z_prev_state.detach().clone()
+
+            if out_y is not None and bool(ctx.do_recon_diag):
+                # Best-effort recon-diag capture: writes are diagnostic-only,
+                # so a failure must never crash training. `AttributeError` is
+                # the paranoid swallow for future compile-wrapper-structure
+                # changes (today `_unwrap_compiled_module` does not raise, but
+                # private torch APIs shift); any other exception is a real bug
+                # surfaced via `warnings.warn` so it lands in run.log instead
+                # of being silently dropped.
+                try:
+                    _target = _unwrap_compiled_module(f_theta)
+                    setattr(
+                        _target,
+                        "_deq_residual_proxy_t",
+                        (z_state - out_y.to(state_dtype)).norm().detach(),
+                    )
+                    denom0 = z_init_state.to(state_dtype).norm().clamp(min=1.0)
+                    setattr(
+                        _target,
+                        "_deq_fp_travel_last_fwd",
+                        ((z_state - z_init_state.to(state_dtype)).norm() / denom0).detach(),
+                    )
+                except AttributeError:
+                    pass
+                except Exception as e:
+                    warnings.warn(f"deq_recon_diag_capture_failed[prefix]: {type(e).__name__}: {e}")
+
+        if len(z_anchors) != len(anchors):
+            raise RuntimeError(f"captured {len(z_anchors)} anchors for requested {anchors}")
+        if last_z_prev is None:
+            raise RuntimeError(f"no anchor captured for K={K} anchors={anchors}")
+        y_stack = torch.stack(y_anchors, dim=0)
+        z_stack = torch.stack(z_anchors, dim=0)
+        z_prev_stack = last_z_prev.unsqueeze(0)
+        ctx.save_for_backward(x0.detach(), y_stack.detach(), z_stack.detach())
+        ctx.z_init_state = z_init_state
+        ctx.y_snap_state = y_snap_state
+        ctx.z_snap_state = z_snap_state
+        ctx.f_theta = f_theta
+        ctx.beta = beta if isinstance(beta, torch.Tensor) else torch.tensor(beta, dtype=torch.float64)
+        ctx.beta_inv = beta_inv if isinstance(beta_inv, torch.Tensor) else torch.tensor(beta_inv, dtype=torch.float64)
+        ctx.K = int(K)
+        ctx.anchor_depths = anchors
+        ctx.bptt_k = int(bptt_k) if bptt_k else 0
+        ctx.compute_dtype = compute_dtype
+        ctx.device_type = device_type
+        ctx.params = params
+        return z_stack.to(compute_dtype), z_prev_stack.to(compute_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_z_stack, _grad_z_prev_stack_ignored):
+        x0, y_stack, z_stack = (t.detach() for t in ctx.saved_tensors)
+        f_theta = ctx.f_theta
+        beta, beta_inv = ctx.beta, ctx.beta_inv
+        compute_dtype = ctx.compute_dtype
+        device_type = ctx.device_type
+        acc_dtype = torch.float64
+        state_dtype = torch.float32
+        anchors = tuple(int(k) for k in getattr(ctx, "anchor_depths", (ctx.K,)))
+
+        params_all = tuple(ctx.params)
+        req_indices = [i for i, p in enumerate(params_all) if getattr(p, "requires_grad", False)]
+        params_req = tuple(params_all[i] for i in req_indices)
+        param_grads_req: list[torch.Tensor | None] = [None] * len(params_req)
+        cur_x_grad = torch.zeros_like(x0, dtype=torch.float32)
+        z_init_grad = torch.zeros_like(x0)
+
+        b_bar_saved = ctx.b_bar_saved
+        b_bar_requires_grad = bool(getattr(ctx, "b_bar_requires_grad", False))
+        b_bar_local_base: Tensor | None = None
+        grad_b_bar: torch.Tensor | None = None
+        if bool(getattr(ctx, "has_b_bar", False)):
+            b_dtype = getattr(ctx, "b_bar_input_dtype", None) or compute_dtype
+            b_bar_local_base = b_bar_saved.detach().to(dtype=b_dtype)
+            if b_bar_requires_grad:
+                grad_b_bar = torch.zeros_like(b_bar_local_base, dtype=torch.float32)
+
+        beta_requires_grad = ctx.beta_requires_grad
+        grad_beta: torch.Tensor | None = torch.zeros_like(beta) if beta_requires_grad else None
+        diag_vjp_per_iter: list[tuple[float, float]] = []
+        do_vjp_diag = bool(getattr(ctx, "do_recon_diag", False))
+
+        if grad_z_stack is None:
+            grad_z_stack = torch.zeros_like(z_stack)
+
+        for anchor_idx, K_anchor in enumerate(anchors):
+            bar_z = grad_z_stack[anchor_idx].to(state_dtype)
+            bar_y = torch.zeros_like(bar_z)
+            y_next64 = y_stack[anchor_idx].to(acc_dtype)
+            z_next64 = z_stack[anchor_idx].to(acc_dtype)
+            bptt_k = int(getattr(ctx, "bptt_k", 0) or 0)
+            K_bwd = K_anchor if (bptt_k <= 0 or bptt_k >= K_anchor) else bptt_k
+            truncated = K_bwd < K_anchor
+            collect_diag = do_vjp_diag and anchor_idx == len(anchors) - 1
+
+            for _ in range(K_bwd):
+                y_local = y_next64.detach().to(compute_dtype).requires_grad_()
+                x_local = x0.detach().to(x0.dtype).requires_grad_()
+                b_bar_y = None
+                if b_bar_local_base is not None:
+                    b_bar_y = b_bar_local_base.clone().requires_grad_(b_bar_requires_grad)
+                with torch.enable_grad():
+                    with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                        out_y = f_theta(y_local, x_local, b_bar_y)
+                z_n64 = (z_next64 - out_y.detach().to(acc_dtype) * beta) / beta_inv
+                if grad_beta is not None:
+                    grad_beta += (bar_z.to(acc_dtype) * (out_y.detach().to(acc_dtype) - z_n64)).sum(dim=(0, 1))
+
+                grad_seed_y = (beta * bar_z).to(out_y.dtype)
+                if b_bar_requires_grad:
+                    grads_y = torch.autograd.grad(out_y, (y_local, x_local, b_bar_y, *params_req),
+                                                  grad_outputs=grad_seed_y, allow_unused=True)
+                    gy_b = grads_y[2]
+                    y_param_offset = 3
+                else:
+                    grads_y = torch.autograd.grad(out_y, (y_local, x_local, *params_req),
+                                                  grad_outputs=grad_seed_y, allow_unused=True)
+                    gy_b = None
+                    y_param_offset = 2
+                vjp_y = grads_y[0].to(state_dtype)
+                bar_y_acc = bar_y + vjp_y
+
+                z_local = z_n64.detach().to(compute_dtype).requires_grad_()
+                x_local2 = x0.detach().to(x0.dtype).requires_grad_()
+                b_bar_z = None
+                if b_bar_local_base is not None:
+                    b_bar_z = b_bar_local_base.clone().requires_grad_(b_bar_requires_grad)
+                with torch.enable_grad():
+                    with RevDEQFunction._autocast_like_ctx(device_type, compute_dtype):
+                        out_z = f_theta(z_local, x_local2, b_bar_z)
+                y_n64 = (y_next64 - out_z.detach().to(acc_dtype) * beta) / beta_inv
+                if grad_beta is not None:
+                    grad_beta += (bar_y_acc.to(acc_dtype) * (out_z.detach().to(acc_dtype) - y_n64)).sum(dim=(0, 1))
+
+                grad_seed_z = (beta * bar_y_acc).to(out_z.dtype)
+                if b_bar_requires_grad:
+                    grads_z = torch.autograd.grad(out_z, (z_local, x_local2, b_bar_z, *params_req),
+                                                  grad_outputs=grad_seed_z, allow_unused=True)
+                    gz_b = grads_z[2]
+                    z_param_offset = 3
+                else:
+                    grads_z = torch.autograd.grad(out_z, (z_local, x_local2, *params_req),
+                                                  grad_outputs=grad_seed_z, allow_unused=True)
+                    gz_b = None
+                    z_param_offset = 2
+                vjp_z = grads_z[0].to(state_dtype)
+
+                if collect_diag:
+                    diag_vjp_per_iter.append((vjp_y.detach().norm(), vjp_z.detach().norm()))
+
+                bar_z = beta_inv * bar_z + vjp_z
+                bar_y = beta_inv * bar_y_acc
+                if grad_b_bar is not None and (gy_b is not None or gz_b is not None):
+                    grad_b_bar = grad_b_bar + ((gy_b if gy_b is not None else 0.0)
+                                               + (gz_b if gz_b is not None else 0.0)).detach().float()
+                for j in range(len(params_req)):
+                    gy = grads_y[y_param_offset + j]
+                    gz = grads_z[z_param_offset + j]
+                    if gy is None and gz is None:
+                        continue
+                    g = (gy if gy is not None else 0.0) + (gz if gz is not None else 0.0)
+                    param_grads_req[j] = g.detach() if param_grads_req[j] is None else param_grads_req[j] + g.detach()
+                if grads_y[1] is not None:
+                    cur_x_grad += grads_y[1].detach().float()
+                if grads_z[1] is not None:
+                    cur_x_grad += grads_z[1].detach().float()
+                y_next64, z_next64 = y_n64, z_n64
+
+            if truncated:
+                z_init_grad = z_init_grad + torch.zeros_like(x0)
+            else:
+                z_init_grad = z_init_grad + (bar_y + bar_z).to(x0.dtype)
+
+            if collect_diag:
+                try:
+                    _target = _unwrap_compiled_module(f_theta)
+                    setattr(_target, "_tbptt_vjp_iter_last_bwd", diag_vjp_per_iter)
+                    setattr(_target, "_tbptt_bwd_k_last", int(K_bwd))
+                    setattr(_target, "_tbptt_fwd_k_last", int(K_anchor))
+                    y_snap_state = getattr(ctx, "y_snap_state", None)
+                    z_snap_state = getattr(ctx, "z_snap_state", None)
+                    if isinstance(y_snap_state, torch.Tensor) and isinstance(z_snap_state, torch.Tensor):
+                        denom_s = z_snap_state.to(dtype=state_dtype).norm().clamp(min=1.0)
+                        recon_err_t = (
+                            (z_next64.to(dtype=state_dtype) - z_snap_state.to(dtype=state_dtype)).norm()
+                            + (y_next64.to(dtype=state_dtype) - y_snap_state.to(dtype=state_dtype)).norm()
+                        ) / denom_s
+                        setattr(_target, "_deq_recon_error_last_bwd", recon_err_t.detach())
+                except Exception:
+                    pass
+
+        param_grads_out: list[torch.Tensor | None] = [None] * len(params_all)
+        for j, all_idx in enumerate(req_indices):
+            g = param_grads_req[j]
+            if g is not None:
+                param_grads_out[all_idx] = g.to(dtype=params_all[all_idx].dtype)
+        grad_beta_out = grad_beta.to(ctx.beta_input_dtype) if grad_beta is not None else None
+        grad_b_bar_out = grad_b_bar.to(ctx.b_bar_input_dtype) if grad_b_bar is not None else None
+        return (None, cur_x_grad.to(x0.dtype), z_init_grad, grad_beta_out,
+                grad_b_bar_out, None, None, None, *param_grads_out)
+
+
 # ---------------------------------------------------------------------------
 # GPT MODEL
 # ---------------------------------------------------------------------------
@@ -4655,7 +5084,8 @@ class GPT(nn.Module):
                  entmax_blend_init_logit: float = 5.0,
                  entmax_blend_warmup_delay_frac: float = 0.3,
                  use_smear_gate: bool = False,
-                 smear_gate_init: float = 0.1,
+                 smear_gate_init: float = 0.0,
+                 smear_gate_window: int = 12,
                  smear_gate_bos_id: int = 1,
                  logit_softcap: float = 0.0,
                  num_experts: int = 16, num_shared_experts: int = 0,
@@ -4663,6 +5093,8 @@ class GPT(nn.Module):
                  lyapunov_gamma: float = 0.97,
                  lyapunov_every: int = 16,
                  lyapunov_max_tokens: int = 64,
+                 deq_prefix_anchors: bool = False,
+                 deq_prefix_anchor_set: tuple[int, ...] | None = None,
                  use_parcae: bool = True,
                  parcae_init_a_bar: float = 0.7,
                  parcae_init_b_bar: float | None = None,
@@ -4684,6 +5116,15 @@ class GPT(nn.Module):
                  nsa_compress_block_sliding_stride: int = 16,
                  nsa_sliding_window_size: int = 256,
                  nsa_branch_gate_init: float = 0.0,
+                 use_sparse_attn_head_gate: bool = False,
+                 sparse_attn_gate_window: int = 12,
+                 sparse_attn_gate_scale: float = 1.0,
+                 sparse_attn_gate_factor: float = 2.0,
+                 sparse_attn_gate_init_std: float = 0.0,
+                 use_rr_attention: bool = False,
+                 rr_stride: int = 8,
+                 rr_block_size: int = 64,
+                 rr_tau: float = 0.95,
                  chained_stages_preset: str | None = None):
         super().__init__()
         self.use_ctp = bool(use_ctp)
@@ -4746,12 +5187,20 @@ class GPT(nn.Module):
         self._router_reg_loss_t: Tensor | None = None
         # iter 129 / H99: SmearGate — single learnable scalar shared across the
         # entire backbone (we have one shared Block; per-layer doesn't apply).
-        # `x[1:] += g · x[:-1] · not_bos_mask` after token embedding lookup.
-        # Strict-gen at use_smear_gate=False → no parameter, no compute.
+        # The active component implements the records-style input-dependent
+        # narrow gate, applied after token embedding lookup with BOS masking.
+        # Strict-gen at use_smear_gate=False -> no parameter, no compute.
         self.use_smear_gate = bool(use_smear_gate)
         self.smear_gate_bos_id = int(smear_gate_bos_id)
         if self.use_smear_gate:
-            self.smear_gate = nn.Parameter(torch.tensor(float(smear_gate_init)))
+            from experiments.components.smear_gate import SmearGate
+            self.smear_gate = SmearGate(
+                dim=model_dim,
+                window=int(smear_gate_window),
+                bos_id=int(smear_gate_bos_id),
+            )
+            with torch.no_grad():
+                self.smear_gate.lam.fill_(float(smear_gate_init))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
@@ -4774,6 +5223,15 @@ class GPT(nn.Module):
                                    nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
                                    nsa_sliding_window_size=nsa_sliding_window_size,
                                    nsa_branch_gate_init=nsa_branch_gate_init,
+                                   use_sparse_attn_head_gate=use_sparse_attn_head_gate,
+                                   sparse_attn_gate_window=sparse_attn_gate_window,
+                                   sparse_attn_gate_scale=sparse_attn_gate_scale,
+                                   sparse_attn_gate_factor=sparse_attn_gate_factor,
+                                   sparse_attn_gate_init_std=sparse_attn_gate_init_std,
+                                   use_rr_attention=use_rr_attention,
+                                   rr_stride=rr_stride,
+                                   rr_block_size=rr_block_size,
+                                   rr_tau=rr_tau,
                                    chained_stages_preset=chained_stages_preset,
                                    )
         self.deq_beta = float(deq_beta)
@@ -4810,6 +5268,9 @@ class GPT(nn.Module):
             self.parcae_raw_delta = nn.Parameter(torch.full((model_dim,), raw_delta_init))
             self.parcae_raw_b = nn.Parameter(torch.full((model_dim,), raw_b_init))
         self.deq_bptt_k = int(deq_bptt_k)
+        self.deq_prefix_anchors = bool(deq_prefix_anchors)
+        self.deq_prefix_anchor_set = tuple(int(k) for k in (deq_prefix_anchor_set or ()))
+        self._deq_prefix_anchor_depths_last: tuple[int, ...] = ()
         # iter147 path: finite-perturbation Hutchinson Frobenius/√D probe on
         # T_theta (default OFF), run low-cadence from the training loop. NOT
         # an operator-norm probe — see `lip_ub` gate for that.
@@ -5085,6 +5546,93 @@ class GPT(nn.Module):
 
             # Backward compat: after a DEQ solve with router_diagnostics enabled,
             # materialize list-form router diagnostics exactly once (not per-iter).
+            # The `hasattr` guard below already filters routers that lack the
+            # optional helper, so `AttributeError` here is a paranoid swallow
+            # for race-window changes; any other exception is a real bug —
+            # surface via warnings.warn.
+            if track_diag and bool(_ROUTER_DIAGNOSTICS_ACTIVE):
+                try:
+                    for r in _iter_unique_routers(sb):
+                        if hasattr(r, "_materialize_diag_lists"):
+                            r._materialize_diag_lists()
+                except AttributeError:
+                    pass
+                except Exception as e:
+                    warnings.warn(f"router_diag_materialize_failed: {type(e).__name__}: {e}")
+
+    def _deq_solve_prefix_anchors(self, x0: Tensor, z_init: Tensor, anchor_depths: tuple[int, ...]):
+        global _DEQ_SOLVE_ACTIVE
+        if self.use_parcae:
+            a_bar = self._parcae_a_bar()
+            beta = 1.0 - a_bar
+            b_bar = self._parcae_b_bar()
+        else:
+            beta = self.deq_beta
+            b_bar = None
+        K = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
+        track_diag = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
+        sb = _unwrap_compiled_module(self.shared_block)
+        sb._diag_track_enabled = bool(track_diag)
+        stack = getattr(sb, "chained_stack", None)
+        if stack is not None:
+            stack._diag_track_enabled = bool(track_diag)
+            stack._attn_gate_call_track = []
+            stack._router_gate_call_track = []
+            stack._attn_router_gate_call_track = []
+            stack._attn_expert_weights_per_iter = []
+            stack._mlp_expert_weights_per_iter = []
+        sb._attn_gate_call_track = []
+        sb._router_gate_call_track = []
+        sb._attn_router_gate_call_track = []
+        prev_deq_flag = bool(_DEQ_SOLVE_ACTIVE)
+        _DEQ_SOLVE_ACTIVE = True
+        try:
+            params = tuple(p for p in sb.parameters() if p.requires_grad)
+            bptt_k = int(getattr(self, "deq_bptt_k", 0) or 0)
+            return RevDEQPrefixAnchorFunction.apply(
+                self.shared_block, x0, z_init, beta, b_bar, K, bptt_k, anchor_depths, *params
+            )
+        finally:
+            _DEQ_SOLVE_ACTIVE = prev_deq_flag
+            sb._diag_track_enabled = False
+            if stack is not None:
+                stack._diag_track_enabled = False
+
+            def _materialize_pairs(track: list) -> list[float]:
+                if len(track) == 2 * K:
+                    pairs = [0.5 * (track[2*i] + track[2*i+1]) for i in range(K)]
+                    return [float(p.item()) if torch.is_tensor(p) else float(p) for p in pairs]
+                if len(track) > 0 and len(track) % (2 * K) == 0:
+                    per_solve_call = len(track) // (2 * K)
+                    vals = []
+                    for i in range(K):
+                        chunk = track[(2 * i * per_solve_call):(2 * (i + 1) * per_solve_call)]
+                        avg = sum(chunk) / float(len(chunk))
+                        vals.append(float(avg.item()) if torch.is_tensor(avg) else float(avg))
+                    return vals
+                return []
+
+            track_owner = stack if stack is not None else sb
+            self._attn_gate_iter_last_solve = _materialize_pairs(
+                list(getattr(track_owner, "_attn_gate_call_track", []) or []))
+            self._router_gate_iter_last_solve = _materialize_pairs(
+                list(getattr(track_owner, "_router_gate_call_track", []) or []))
+            self._attn_router_gate_iter_last_solve = _materialize_pairs(
+                list(getattr(track_owner, "_attn_router_gate_call_track", []) or []))
+            self._mlp_router_gate_iter_last_solve = self._attn_router_gate_iter_last_solve
+
+            attn_ew = list(getattr(track_owner, "_attn_expert_weights_per_iter", []) or [])
+            if stack is not None:
+                self._attn_expert_weights_iter_t = None
+            elif len(attn_ew) == 2 * K:
+                self._attn_expert_weights_iter_t = (
+                    torch.stack(attn_ew, dim=0).reshape(K, 2, -1).mean(dim=1)
+                )
+            else:
+                self._attn_expert_weights_iter_t = None
+            self._attn_expert_weights_iter = None
+            track_owner._attn_expert_weights_per_iter = []
+            track_owner._mlp_expert_weights_per_iter = []
             if track_diag and bool(_ROUTER_DIAGNOSTICS_ACTIVE):
                 try:
                     for r in _iter_unique_routers(sb):
@@ -5108,6 +5656,7 @@ class GPT(nn.Module):
         prev_soft_embed = x0
         x0_refined = x0
         self._expert_diversity_loss = None
+        prefix_mode = bool(self.training and self.deq_prefix_anchors)
 
         for r in range(1 + self.num_refinements):
             if r > 0:
@@ -5122,7 +5671,15 @@ class GPT(nn.Module):
 
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
             self._deq_z_init_last = z.detach()
-            z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
+            if prefix_mode:
+                anchors = _prefix_anchor_depths(self._deq_k_last, self.deq_prefix_anchor_set)
+                self._deq_prefix_anchor_depths_last = anchors
+                z_stack, z_prev_stack = self._deq_solve_prefix_anchors(x0_refined, z, anchors)
+                z = z_stack[-1]
+                z_prev = z_prev_stack[-1]
+            else:
+                self._deq_prefix_anchor_depths_last = ()
+                z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
         # DEQ diagnostics: keep tensor fields for low-overhead logging, but
         # also maintain legacy float/list fields for existing experiments.
@@ -5202,18 +5759,14 @@ class GPT(nn.Module):
                 if attn_gram_pt is not None and mlp_gram_pt is not None:
                     self._expert_diversity_loss = 0.5 * (attn_gram_pt + mlp_gram_pt)
 
-        return z
+        return z_stack if prefix_mode else z
 
     def _encode(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
-        # iter 129 / H99: SmearGate. `x[1:] += g · x[:-1] · not_bos`.
-        # not_bos_mask suppresses leak across packed-doc boundaries.
         if self.use_smear_gate:
-            not_bos = (input_ids[:, 1:] != self.smear_gate_bos_id).to(dtype=x.dtype).unsqueeze(-1)
-            smeared_tail = x[:, 1:] + self.smear_gate.to(dtype=x.dtype) * x[:, :-1] * not_bos
-            x = torch.cat([x[:, :1], smeared_tail], dim=1)
+            x = self.smear_gate(x, input_ids, bos_id=self.smear_gate_bos_id)
         # Phase 9 iter 71g: learnable embed norm.
         x = self.embed_norm(x)
         x = self._run_backbone(x)
@@ -5304,6 +5857,61 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
+        if self.training and self.deq_prefix_anchors:
+            # x is (A,B,T,D): task loss over all prefix anchors; auxiliary
+            # regularizers remain final-endpoint-only for attribution.
+            A = int(x.shape[0])
+            self.mos_head._diversity_aux_enabled = False
+            log_p_ctp, log_p_ntp = self.mos_head(x)
+            V = self.tok_emb.num_embeddings
+            target_stack = target_ids.unsqueeze(0).expand(A, *target_ids.shape)
+            ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_stack.reshape(-1))
+            if self.use_ctp:
+                input_stack = input_ids.unsqueeze(0).expand(A, *input_ids.shape)
+                ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_stack.reshape(-1))
+            else:
+                ctp_loss = torch.tensor(0.0, device=ntp_loss.device)
+
+            final_x = x[-1]
+            self.mos_head._diversity_aux_enabled = bool(
+                self.training
+                and self.mos_output_diversity_coef > 0.0
+                and float(self._expert_diversity_coef_scale) > 0.0
+            )
+            # Populate final-endpoint MoS CV/diversity diagnostics/losses.
+            self.mos_head(final_x)
+
+            aux_gas = float(getattr(self, "_aux_grad_accum_scale", 1.0))
+            diversity_loss = torch.tensor(0.0, device=ntp_loss.device)
+            eff_diversity_coef = 0.0
+            if getattr(self, "_expert_diversity_aux_enabled", False) and isinstance(self._expert_diversity_loss, torch.Tensor):
+                diversity_loss = self._expert_diversity_loss.to(device=ntp_loss.device)
+                eff_diversity_coef = (
+                    float(self._expert_diversity_coef_target)
+                    * float(self._expert_diversity_coef_scale)
+                    * aux_gas
+                )
+            mos_diversity_loss = torch.tensor(0.0, device=ntp_loss.device)
+            eff_mos_diversity_coef = 0.0
+            mos_div_t = getattr(self.mos_head, "_diversity_loss", None)
+            if self.mos_output_diversity_coef > 0.0 and isinstance(mos_div_t, torch.Tensor):
+                mos_diversity_loss = mos_div_t.to(device=ntp_loss.device)
+                eff_mos_diversity_coef = (
+                    float(self.mos_output_diversity_coef)
+                    * float(self._expert_diversity_coef_scale)
+                )
+            router_reg_loss = self._collect_routing_losses(
+                ntp_loss.device,
+                diversity_loss, eff_diversity_coef,
+                mos_diversity_loss, eff_mos_diversity_coef,
+            )
+            self._ntp_loss_t = ntp_loss.detach()
+            self._ctp_loss_t = ctp_loss.detach()
+            self._ntp_loss = 0.0
+            self._ctp_loss = 0.0
+            ctp_weight = float(getattr(self, "ctp_weight", 0.0)) if self.use_ctp else 0.0
+            return ntp_loss + ctp_weight * ctp_loss + router_reg_loss
+
         self.mos_head._diversity_aux_enabled = bool(
             self.training
             and self.mos_output_diversity_coef > 0.0
@@ -5530,10 +6138,11 @@ def _build_optimizer_param_lists(base_model: nn.Module, args) -> OptimizerParamL
     scalar_params.extend(mos_params)
     scalar_params.append(base_model.final_norm.weight)
     scalar_params.append(base_model.embed_norm.weight)
-    # iter 129 / H99: SmearGate scalar lives at GPT level (single scalar shared
-    # across the entire backbone). Routed to scalar group when active.
+    # iter 129 / H99: SmearGate lives at GPT level (single module shared across
+    # the entire backbone). Route its narrow gate + lambda through AdamW scalar
+    # handling rather than Muon.
     if getattr(base_model, "use_smear_gate", False):
-        scalar_params.append(base_model.smear_gate)
+        scalar_params.extend(p for p in base_model.smear_gate.parameters() if p.requires_grad)
 
     parcae_params: list[nn.Parameter] = []
     if getattr(base_model, "use_parcae", False):
@@ -5959,6 +6568,78 @@ def _validate_hyperparameters(args) -> None:
             "use_sparse_dispatch is not supported in train_gpt.py: the capacity/top-k "
             "dispatch path is discrete and is not RevDEQ-safe during training"
         )
+    if int(getattr(args, "smear_gate_window", 1)) <= 0:
+        raise SystemExit("smear_gate_window must be positive")
+    if int(getattr(args, "smear_gate_window", 1)) > md:
+        raise SystemExit(f"smear_gate_window ({args.smear_gate_window}) must be <= model_dim ({md})")
+    if int(getattr(args, "sparse_attn_gate_window", 1)) <= 0:
+        raise SystemExit("sparse_attn_gate_window must be positive")
+    if int(getattr(args, "sparse_attn_gate_window", 1)) > md:
+        raise SystemExit(
+            f"sparse_attn_gate_window ({args.sparse_attn_gate_window}) must be <= model_dim ({md})"
+        )
+    if float(getattr(args, "sparse_attn_gate_factor", 1.0)) <= 0.0:
+        raise SystemExit("sparse_attn_gate_factor must be positive")
+    if float(getattr(args, "sparse_attn_gate_init_std", 0.0)) < 0.0:
+        raise SystemExit("sparse_attn_gate_init_std must be non-negative")
+    if bool(getattr(args, "use_rr_attention", False)) and bool(getattr(args, "use_nsa_attention", False)):
+        raise SystemExit("use_rr_attention and use_nsa_attention are mutually exclusive attention dispatches")
+    if int(getattr(args, "rr_stride", 1)) <= 0:
+        raise SystemExit("rr_stride must be positive")
+    if int(getattr(args, "rr_block_size", 1)) <= 0:
+        raise SystemExit("rr_block_size must be positive")
+    if int(getattr(args, "rr_block_size", 1)) % int(getattr(args, "rr_stride", 1)) != 0:
+        raise SystemExit("rr_block_size must be a multiple of rr_stride")
+    if int(getattr(args, "train_seq_len", 1)) % int(getattr(args, "rr_stride", 1)) != 0:
+        raise SystemExit("train_seq_len must be divisible by rr_stride")
+    if int(getattr(args, "train_seq_len", 1)) % int(getattr(args, "rr_block_size", 1)) != 0:
+        raise SystemExit("train_seq_len must be divisible by rr_block_size")
+    rr_tau = float(getattr(args, "rr_tau", 0.0))
+    if not math.isfinite(rr_tau) or not (0.0 < rr_tau <= 1.0):
+        raise SystemExit("rr_tau must be finite and in (0, 1]")
+    # Flag-to-effect contract: rr_attention silently falls back to dense SDPA
+    # above _RR_MAX_TOKEN_MASK_TOKENS, so enabling it at the project default
+    # train_seq_len=2048 would be a no-op with a misleading banner. Checked
+    # last in the rr block so the more specific divisibility errors fire first
+    # when both conditions are violated.
+    if bool(getattr(args, "use_rr_attention", False)):
+        from experiments.components.rr_attention import _RR_MAX_TOKEN_MASK_TOKENS
+        rr_T_cap = int(_RR_MAX_TOKEN_MASK_TOKENS)
+        if int(getattr(args, "train_seq_len", 1)) > rr_T_cap:
+            raise SystemExit(
+                f"use_rr_attention requires train_seq_len <= {rr_T_cap} "
+                f"(rr_attention silently falls back to dense SDPA above that cap)"
+            )
+    if int(getattr(args, "lqer_rank", 1)) <= 0:
+        raise SystemExit("lqer_rank must be positive")
+    if int(getattr(args, "lqer_top_k", 0)) < 0:
+        raise SystemExit("lqer_top_k must be non-negative")
+    # Flag-to-effect contract: --use-gptq / --use-lqer currently only run a
+    # synthetic-tensor smoke; the scored int6 artifact path is unchanged, so a
+    # banner advertising gptq=1 / lqer=1 would misrepresent the run.
+    if bool(getattr(args, "use_gptq", False)) or bool(getattr(args, "use_lqer", False)):
+        raise SystemExit(
+            "use_gptq / use_lqer are scaffolds: only run_gptq_lqer_component_smoke "
+            "exercises them, and the scored int6 artifact path is unchanged. Disable "
+            "the flag or wire the codec into save_int6_artifact first."
+        )
+    # Flag-to-effect contract: --use-ttt-eval has no consumer in train_gpt.py
+    # (no forward_ttt; _evaluate_val_loss does not branch on the flag).
+    if bool(getattr(args, "use_ttt_eval", False)):
+        raise SystemExit(
+            "use_ttt_eval has no training- or eval-path consumer in train_gpt.py. "
+            "Disable the flag until the phased TTT eval driver is wired."
+        )
+    # Flag-to-effect contract: --use-caseops only runs a hardcoded-string fixture
+    # print; the FineWeb shards are already tokenized and bypass the codec.
+    if bool(getattr(args, "use_caseops", False)):
+        raise SystemExit(
+            "use_caseops only runs a fixture print over caseops_smoke_text; the "
+            "tokenized dataset bypasses it. Disable the flag until the codec is "
+            "wired into the data pipeline."
+        )
+    if bool(getattr(args, "deq_prefix_anchors", False)) and int(getattr(args, "num_refinements", 0)) != 0:
+        raise SystemExit("deq_prefix_anchors currently requires num_refinements=0")
     if int(args.train_seq_len) <= 0:
         raise SystemExit(f"train_seq_len ({args.train_seq_len}) must be positive")
     if int(args.train_batch_tokens) % int(args.train_seq_len) != 0:
@@ -6010,6 +6691,39 @@ def main() -> None:
     from experiments.components.chained_routing import set_chained_routing_enabled
     _chained_preset = getattr(args, "chained_stages_preset", None)
     set_chained_routing_enabled(_chained_preset is not None and str(_chained_preset).strip().lower() not in ("", "none"))
+    from experiments.components.artifact_compression import set_grouped_artifact_compression_enabled
+    from experiments.components.caseops_tokenizer import set_caseops_enabled
+    from experiments.components.gptq_lqer import set_gptq_lqer_enabled
+    from experiments.components.phased_ttt import set_ttt_eval_enabled
+    from experiments.components.rr_attention import set_rr_attention
+    from experiments.components.smear_gate import set_smear_gate_enabled
+    from experiments.components.sparse_attn_head_gate import set_sparse_attn_head_gate_enabled
+    set_smear_gate_enabled(
+        getattr(args, "use_smear_gate", False),
+        window=getattr(args, "smear_gate_window", 12),
+        bos_id=getattr(args, "smear_gate_bos_id", 1),
+    )
+    set_sparse_attn_head_gate_enabled(
+        getattr(args, "use_sparse_attn_head_gate", False),
+        gate_window=getattr(args, "sparse_attn_gate_window", 12),
+        scale=getattr(args, "sparse_attn_gate_scale", 1.0),
+        gate_factor=getattr(args, "sparse_attn_gate_factor", 2.0),
+    )
+    set_rr_attention(
+        getattr(args, "use_rr_attention", False),
+        stride=getattr(args, "rr_stride", 8),
+        block_size=getattr(args, "rr_block_size", 64),
+        tau=getattr(args, "rr_tau", 0.95),
+    )
+    set_ttt_eval_enabled(getattr(args, "use_ttt_eval", False))
+    set_gptq_lqer_enabled(
+        use_gptq=getattr(args, "use_gptq", False),
+        use_lqer=getattr(args, "use_lqer", False),
+        lqer_rank=getattr(args, "lqer_rank", 4),
+        lqer_top_k=getattr(args, "lqer_top_k", 3),
+    )
+    set_grouped_artifact_compression_enabled(getattr(args, "use_grouped_artifact_compression", False))
+    set_caseops_enabled(getattr(args, "use_caseops", False))
     args.train_files = os.path.join(args.data_path, "fineweb_train_*.bin")
     args.val_files = os.path.join(args.data_path, "fineweb_val_*.bin")
     if not getattr(args, "run_id", ""):
@@ -6240,6 +6954,10 @@ def main() -> None:
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"run_id:{args.run_id}")
+    optional_flags_banner = " ".join(
+        f"{label}={int(bool(getattr(args, py_name, False)))}"
+        for py_name, label in _OPTIONAL_COMPONENT_FLAGS
+    )
     log0(
         f"config:"
         f" model_dim={args.model_dim} heads={args.num_heads} kv_heads={args.num_kv_heads}"
@@ -6254,6 +6972,7 @@ def main() -> None:
         f" pooled_router=True router_scoring={args.router_scoring}"
         f" router_ucb_beta={float(args.router_dirichlet_ucb_beta):.4g}"
         f" router_sigmoid_gate={int(bool(args.use_router_sigmoid_gate))}"
+        f" {optional_flags_banner}"
     )
 
     # MODEL
@@ -6267,6 +6986,8 @@ def main() -> None:
         attn_expert_rank=args.attn_expert_rank, mlp_expert_rank=args.mlp_expert_rank,
         deq_beta=args.deq_beta,
         deq_bptt_k=args.deq_bptt_k,
+        deq_prefix_anchors=bool(getattr(args, "deq_prefix_anchors", False)),
+        deq_prefix_anchor_set=tuple(int(k) for k in (getattr(args, "deq_k_jitter_set", ()) or ())),
         num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
         router_pertoken_entropy_coef=float(args.router_pertoken_entropy_coef),
@@ -6277,6 +6998,7 @@ def main() -> None:
         entmax_blend_warmup_delay_frac=float(args.entmax_blend_warmup_delay_frac),
         use_smear_gate=bool(args.use_smear_gate),
         smear_gate_init=float(args.smear_gate_init),
+        smear_gate_window=int(args.smear_gate_window),
         smear_gate_bos_id=int(args.smear_gate_bos_id),
         logit_softcap=float(args.logit_softcap),
         lyapunov_coef=args.lyapunov_coef,
@@ -6304,6 +7026,15 @@ def main() -> None:
         nsa_compress_block_sliding_stride=args.nsa_compress_block_sliding_stride,
         nsa_sliding_window_size=args.nsa_sliding_window_size,
         nsa_branch_gate_init=args.nsa_branch_gate_init,
+        use_sparse_attn_head_gate=bool(args.use_sparse_attn_head_gate),
+        sparse_attn_gate_window=int(args.sparse_attn_gate_window),
+        sparse_attn_gate_scale=float(args.sparse_attn_gate_scale),
+        sparse_attn_gate_factor=float(args.sparse_attn_gate_factor),
+        sparse_attn_gate_init_std=float(args.sparse_attn_gate_init_std),
+        use_rr_attention=bool(args.use_rr_attention),
+        rr_stride=int(args.rr_stride),
+        rr_block_size=int(args.rr_block_size),
+        rr_tau=float(args.rr_tau),
         chained_stages_preset=args.chained_stages_preset,
     ).to(device).bfloat16()
 
@@ -6507,6 +7238,9 @@ def main() -> None:
         parts: list[str] = []
         if hasattr(m, "_deq_k_last"):
             parts.append(f"deq_k:{int(m._deq_k_last)}")
+        prefix_anchors = getattr(m, "_deq_prefix_anchor_depths_last", None)
+        if prefix_anchors:
+            parts.append(f"deq_prefix_anchors:[{','.join(str(int(k)) for k in prefix_anchors)}]")
         resid_t = getattr(m, "_deq_residual_t", None)
         if isinstance(resid_t, torch.Tensor):
             parts.append(f"deq_residual:{float(resid_t.detach().float().item()):.6f}")
@@ -7299,6 +8033,28 @@ def main() -> None:
         # quant_categories / serialization keys / compressor settings cannot
         # drift away from what is actually scored.
         compressed, qsd, meta = save_int6_artifact(sd)
+        if getattr(args, "use_grouped_artifact_compression", False):
+            from experiments.components.artifact_compression import grouped_compress_int6_payload
+            grouped_compressed, grouped_stats = grouped_compress_int6_payload(
+                qsd, meta, compressor=_COMPRESSOR,
+            )
+            grouped_bytes = int(grouped_stats["compressed_bytes"])
+            base_bytes = len(compressed)
+            # Strict `<`: on exact tie, keep the baseline so the log truthfully
+            # reports the grouped path did not win. The earlier `<=` flipped to
+            # grouped on ties yet logged as "accepted", misreporting for the
+            # promotion-review reader.
+            if grouped_bytes < base_bytes:
+                compressed = grouped_compressed
+                log0(
+                    f"grouped_artifact_compression:accepted bytes:{grouped_bytes} "
+                    f"baseline_bytes:{base_bytes}"
+                )
+            else:
+                log0(
+                    f"grouped_artifact_compression:kept_baseline bytes:{base_bytes} "
+                    f"grouped_bytes:{grouped_bytes}"
+                )
         artifact_bytes = len(compressed)
         log0(f"artifact_bytes:{artifact_bytes} compressor:{_COMPRESSOR}")
 

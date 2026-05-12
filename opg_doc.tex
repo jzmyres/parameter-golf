@@ -554,6 +554,34 @@ which bounds extreme logit magnitudes (Gemma2-style) and damps gradient
 spikes without altering the convex log-softmax mixture identity.  Strict
 generalization holds at $c=0$ (no-op short-circuit); records use $c=30$.
 
+\paragraph{Practical implementation: conditional prefix-$K$ multi-anchor
+supervision (iter 152 / \texttt{deq\_prefix\_anchors}).}
+When \texttt{deq\_prefix\_anchors=True}, the forward DEQ solve still draws a
+single sampled depth $K\sim\operatorname{Cat}(\texttt{deq\_k\_jitter\_set},
+\texttt{deq\_k\_jitter\_weights})$, but the task-side cross-entropy is
+averaged over every traversed prefix anchor $K_a$ that lies on the same
+solve trajectory,
+\[
+  \mathcal{L}_{\rm NTP}^{\rm prefix}
+    = \frac{1}{|\mathcal{A}(K)|}
+      \sum_{K_a\in\mathcal{A}(K)}
+        \mathbb{E}_n\bigl[-\log p_{\rm NTP}(y_n\mid h_n(K_a))\bigr],
+  \quad
+  \mathcal{A}(K)=\{K_a\in\texttt{deq\_k\_jitter\_set}: 0<K_a\le K\}\cup\{K\}.
+\]
+The forward budget is unchanged because $K_a<K$ anchors are captured as
+intermediate states inside the same $K$-step solve, not as separate forward
+passes.  MoS-side regularizers (MoS-CV, MoS diversity, and expert-output
+diversity) attach to the \emph{final-endpoint} re-call of the output head, so
+they target the fixed-point representation rather than its early-iteration
+prefix.  Router-side regularizers (load CV, EMA balance, per-token entropy,
+alive hinge) are populated during the solve itself and therefore aggregate
+over the full trajectory in either mode; the prefix variant does not alter
+their attachment.  Default is \texttt{deq\_prefix\_anchors=False}; iter 152
+promoted the path on validation BPB (1.4718 vs 1.4787; see
+\texttt{experiments/docs/hypotheses.md} for current numbers) but left
+soft-diagnostic debt on \texttt{lip\_ub} and \texttt{attn\_min\_share}.
+
 Refinement is an optional outer loop around the DEQ solve.  It is disabled by
 default because \texttt{num\_refinements=0}; the 85\% ramp only matters when a
 future run explicitly re-enables refinements.  Once enabled, the model predicts

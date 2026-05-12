@@ -10,4 +10,11 @@ individual files into this directory before reactivating; see
 `experiments/components/README.md` for the integration cookbook.
 """
 
+from . import artifact_compression  # noqa: F401
+from . import caseops_tokenizer  # noqa: F401
 from . import chained_routing  # noqa: F401
+from . import gptq_lqer  # noqa: F401
+from . import phased_ttt  # noqa: F401
+from . import rr_attention  # noqa: F401
+from . import smear_gate  # noqa: F401
+from . import sparse_attn_head_gate  # noqa: F401

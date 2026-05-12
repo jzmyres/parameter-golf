@@ -18,6 +18,13 @@ a focused single-purpose module that:
 |---|---|---|---|
 | `fused_routed_down.py` | active optional path | imported by `train_gpt.py` when `use_unified_routed_down=True` | component smoke test |
 | `chained_routing.py` | active optional path (design: [`../docs/iter103_chained_routing_plan.md`](../docs/iter103_chained_routing_plan.md)) | selected by `--chained-stages-preset=<preset>` | `experiments/test_chained_routing.py` |
+| `smear_gate.py` | active optional path | selected by `--use-smear-gate=1` after token embedding | `experiments/test_remaining_components.py` |
+| `sparse_attn_head_gate.py` | active optional path | selected by `--use-sparse-attn-head-gate=1` after attention SDPA | `experiments/test_remaining_components.py` |
+| `rr_attention.py` | active optional path | selected by `--use-rr-attention=1` instead of dense causal SDPA | `experiments/test_remaining_components.py` |
+| `phased_ttt.py` | active smoke/eval scaffold | selected by `--use-ttt-eval=1` for LoRA primitive exec witness | `experiments/test_remaining_components.py` |
+| `gptq_lqer.py` | active artifact scaffold | selected by `--use-gptq=1` / `--use-lqer=1` for quant math exec witness | `experiments/test_remaining_components.py` |
+| `artifact_compression.py` | active optional path | selected by `--use-grouped-artifact-compression=1` for grouped int6 payload repack | `experiments/test_remaining_components.py` |
+| `caseops_tokenizer.py` | active fixture scaffold | selected by `--use-caseops=1` for CaseOps codec fixture smoke | `experiments/test_remaining_components.py` |
 
 ## Archived Prototypes
 
