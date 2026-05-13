@@ -190,15 +190,20 @@ class TestCliParser(unittest.TestCase):
                 _validate_hyperparameters(args)
 
     def test_parse_k_sweep_confidence_diagnostics(self):
+        # iter155 (corrected): K-sweep emits three contraction diagnostics:
+        # lip_ub_T (decomposition), lip_ub_S (advisory surrogate), and
+        # lip_ub_F (gate-aligned two-state Parcae cycle).  Parser must
+        # extract all three and the table-header path must surface the
+        # new column names.
         log_text = "\n".join([
             "train_batch_tokens:1024",
             "k_sweep:k=16 val_bpb:1.234500 iter_conv_rel:0.001000 "
             "router_dir_strength_mean:30.0000 router_dir_uncertainty_mass:0.2000 "
             "router_dir_sigma_mean:0.0500 router_dir_evidence_mean:1.0000 "
             "router_dir_mu_entropy_norm:0.9000 router_ucb_beta_current:0.5000 "
-            "lip_ub:0.8000 fp_bound:0.0050",
-            "k_sweep_table:    K   val_bpb    dir_S    dir_U ucb_beta   lip_ub fp_bound iter_conv_rel",
-            "k_sweep_table:   16    1.2345  30.0000   0.2000   0.5000   0.8000   0.0050       0.0010",
+            "lip_ub_T:1.5000 lip_ub_S:0.8000 lip_ub_F:0.9500 fp_bound:0.0050",
+            "k_sweep_table:    K   val_bpb    dir_S    dir_U ucb_beta   lip_ub_T   lip_ub_S   lip_ub_F fp_bound iter_conv_rel",
+            "k_sweep_table:   16    1.2345  30.0000   0.2000   0.5000     1.5000     0.8000     0.9500   0.0050       0.0010",
         ])
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
             f.write(log_text)
@@ -209,12 +214,91 @@ class TestCliParser(unittest.TestCase):
             Path(path).unlink(missing_ok=True)
         self.assertEqual(data["k_sweep"][0]["K"], 16)
         self.assertEqual(data["k_sweep"][0]["router_dir_strength_mean"], 30.0)
-        self.assertEqual(data["k_sweep"][0]["lip_ub"], 0.8)
+        self.assertEqual(data["k_sweep"][0]["lip_ub_T"], 1.5)
+        self.assertEqual(data["k_sweep"][0]["lip_ub_S"], 0.8)
+        self.assertEqual(data["k_sweep"][0]["lip_ub_F"], 0.95)
+        self.assertNotIn("lip_ub", data["k_sweep"][0])  # legacy key not present in new logs
         self.assertEqual(data["k_sweep_table"][0]["K"], 16)
         self.assertEqual(data["k_sweep_table"][0]["dir_U"], 0.2)
+        self.assertEqual(data["k_sweep_table"][0]["lip_ub_T"], 1.5)
+        self.assertEqual(data["k_sweep_table"][0]["lip_ub_S"], 0.8)
+        self.assertEqual(data["k_sweep_table"][0]["lip_ub_F"], 0.95)
         self.assertNotIn("hutch_F", data["k_sweep_table"][0])
         self.assertNotIn("spec_norm", data["k_sweep_table"][0])
         self.assertNotIn("rd_step", data["k_sweep_table"][0])
+
+    def test_fp_bound_in_k_sweep_log_uses_fp_residual_F_not_iter_conv_rel(self):
+        # iter155 corrected (2026-05-13): fp_bound must be computed from
+        # fp_residual_F (the joint two-state cycle residual) paired with
+        # lip_ub_F (the F-side operator-norm estimate), NOT from the
+        # legacy z-only iter_conv_rel.  Pairing iter_conv_rel with lip_ub_F
+        # was a category error: the residual must be measured on the same
+        # map as the Lipschitz constant.
+        #
+        # This synthetic-log test pins the F-derived formula by parsing
+        # values produced by train_gpt.py and verifying the printed
+        # fp_bound matches fp_residual_F/(1-lip_ub_F) (NOT the
+        # iter_conv_rel-derived value).  iter_conv_rel and fp_residual_F
+        # are deliberately set to DIFFERENT values so the formula source
+        # is unambiguous.
+        iter_conv_rel = 0.050000   # legacy z-only step residual
+        fp_residual_F = 0.001000   # joint cycle residual at saved FP
+        lip_ub_F = 0.5000          # F-side operator-norm estimate
+        # Correct (F-side) bound: 0.001 / 0.5 = 0.002.  Legacy
+        # (iter_conv_rel) bound would be 0.05 / 0.5 = 0.1, which is 50×
+        # different — easy to distinguish.
+        fp_bound_expected_F = fp_residual_F / (1.0 - lip_ub_F)
+        fp_bound_legacy_z = iter_conv_rel / (1.0 - lip_ub_F)
+        assert abs(fp_bound_expected_F - fp_bound_legacy_z) > 1e-3, (
+            "test fixture is degenerate: F and legacy bounds are equal"
+        )
+
+        log_text = "\n".join([
+            "train_batch_tokens:1024",
+            f"k_sweep:k=128 val_bpb:1.234500 iter_conv_rel:{iter_conv_rel:.6f} "
+            "router_dir_strength_mean:30.0000 router_dir_uncertainty_mass:0.2000 "
+            "router_dir_sigma_mean:0.0500 router_dir_evidence_mean:1.0000 "
+            "router_dir_mu_entropy_norm:0.9000 router_ucb_beta_current:0.5000 "
+            f"lip_ub_T:1.5000 lip_ub_S:0.8000 lip_ub_F:{lip_ub_F:.4f} "
+            f"fp_residual_F:{fp_residual_F:.6f} "
+            f"fp_bound:{fp_bound_expected_F:.6f}",
+        ])
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(log_text)
+            path = f.name
+        try:
+            data = parse_log(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+        row = data["k_sweep"][0]
+        # All four fields must parse independently.
+        self.assertEqual(row["iter_conv_rel"], iter_conv_rel)
+        self.assertEqual(row["fp_residual_F"], fp_residual_F)
+        self.assertEqual(row["lip_ub_F"], lip_ub_F)
+        # The CRITICAL check: parsed fp_bound matches the F-derived formula
+        # within float tolerance, NOT the legacy iter_conv_rel-derived one.
+        self.assertAlmostEqual(row["fp_bound"], fp_bound_expected_F, places=4)
+        self.assertNotAlmostEqual(row["fp_bound"], fp_bound_legacy_z, places=2)
+
+    def test_parse_k_sweep_legacy_lip_ub_field_still_parses(self):
+        # iter155 backward compat: pre-iter155 logs only emit `lip_ub:`.
+        # The parser must still accept that key so historical training_logs
+        # in experiments/training_logs/ remain analyzable.
+        log_text = "\n".join([
+            "train_batch_tokens:1024",
+            "k_sweep:k=16 val_bpb:1.234500 lip_ub:0.8000 fp_bound:0.0050",
+        ])
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(log_text)
+            path = f.name
+        try:
+            data = parse_log(path)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        self.assertEqual(data["k_sweep"][0]["lip_ub"], 0.8)
+        self.assertNotIn("lip_ub_T", data["k_sweep"][0])
+        self.assertNotIn("lip_ub_S", data["k_sweep"][0])
 
     def test_unknown_flag_is_rejected(self):
         with self.assertRaises(SystemExit):

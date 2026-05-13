@@ -524,6 +524,12 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
         "needs_mos_output_geometry_constraint",
         "needs_transition_parameterization",
         "needs_transition_jacobian_control",
+        # iter155: gate-aligned contraction object (Parcae-blended iteration
+        # map S).  Invariant-mechanism: route to `lyapunov_target=iteration_S`
+        # (parameterization of which Jacobian we control) AND tighter Parcae
+        # damping AND eventually iter156 hard governor — all reusable across
+        # any contraction failure mode, not a per-symptom loss.
+        "needs_iteration_map_contraction",
     }
     metric_specific_keys = {
         "expert_output_diversity_coef_mult",
@@ -545,8 +551,8 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
         ("mos_ntp_ortho=0.61 > 0.5", "mos_head_collapse",
          {"needs_mos_output_geometry_constraint"}, set()),
         ("k-sweep delta > 0.1 at K=64", "fp_quality_loss", set(), set()),
-        ("lip_ub=45.0 >= 1.0", "local_contraction_failed",
-         {"needs_transition_parameterization"}, {"lyapunov_coef"}),
+        ("lip_ub_F=45.0 >= 1.0", "local_contraction_failed",
+         {"needs_iteration_map_contraction"}, {"lyapunov_coef"}),
         ("fp_bound=2.5 >= 1.0", "fp_certificate_loose", set(), set()),
         ("iter_conv_rel=0.6 > 0.3", "solver_divergence", set(), set()),
         ("deq_recon_err=1.5e-2 > 1e-3", "reversibility_broken", set(), set()),
@@ -640,10 +646,14 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
         assert bool(r.use_router_sigmoid_gate) is False
 
     from train_gpt import _prescribe_failure_fix
-    p_lip = _prescribe_failure_fix("lip_ub=45.0 >= 1.0")
+    p_lip = _prescribe_failure_fix("lip_ub_F=45.0 >= 1.0")
     assert p_lip["category"] == "local_contraction_failed"
-    assert "needs_transition_parameterization" in p_lip["config_change"]
+    assert "needs_iteration_map_contraction" in p_lip["config_change"]
     assert "lyapunov_coef" not in p_lip["config_change"]
+    # iter155 corrected: lip_ub_S is now an advisory surrogate, not a gate.
+    p_lip_s = _prescribe_failure_fix("lip_ub_S=45.0 >= 1.0")
+    assert p_lip_s["category"] == "single_state_blend_loose"
+    assert p_lip_s["config_change"] == {}
 
 
 def test_eval_microbatch_and_mos_expert_settings_are_dry_but_independent():
@@ -726,7 +736,12 @@ def test_fp_probe_uses_eager_forward_when_instance_forward_is_wrapped():
         RuntimeError("wrapped forward should not be used by FP probes"))
     prepared = _prepare_saved_fp_probe(model)
     assert prepared is not None
-    z_star, x0_lyap, b_bar_d, sb_call, _, _ = prepared
+    # iter155: `_prepare_saved_fp_probe` now returns `a_bar_d` as well so
+    # callers can compute the iteration-map S = Ā·z + (1−Ā)·T probe in
+    # parallel with the transition-map T probe.  When `use_parcae=False`
+    # (this fixture), `a_bar_d` is None and S degenerates to T.
+    z_star, x0_lyap, b_bar_d, a_bar_d, sb_call, _, _ = prepared
+    assert a_bar_d is None, "use_parcae=False should yield a_bar_d=None"
     out = sb_call(z_star, x0_lyap, b_bar_d)
     assert torch.allclose(out, torch.full_like(out, 3.0))
 

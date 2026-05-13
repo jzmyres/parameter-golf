@@ -198,7 +198,20 @@ def parse_log(logpath: str) -> dict:
                 "iter_conv_rel",
                 "residual",
                 *ROUTER_DIRICHLET_DIAG_FIELDS,
+                # iter155 (corrected): three-way contraction diagnostics.
+                #   lip_ub_F — gate-aligned (two-state Parcae cycle map)
+                #   lip_ub_S — single-state convex-blend advisory surrogate
+                #   lip_ub_T — transition-map decomposition diagnostic
+                # Pre-iter155 logs only emit `lip_ub:`; parsing the legacy
+                # key plus all three new keys keeps backward compatibility
+                # for historical training_logs/.
                 "lip_ub",
+                "lip_ub_T",
+                "lip_ub_S",
+                "lip_ub_F",
+                # iter155 corrected: joint cycle residual paired with
+                # lip_ub_F in fp_bound = fp_residual_F / (1 - lip_ub_F).
+                "fp_residual_F",
                 "fp_bound",
             ):
                 m_key = re.search(rf"{key}:{_FLOAT}", m.group(2))

@@ -742,22 +742,63 @@ class Hyperparameters:
     # Mirrors the entropy/variance warmup_delay_frac=0.3 pattern.
     entmax_blend_warmup_delay_frac = 0.3
 
-    # iter147 path: finite-perturbation expansion penalty on T_theta. Per-call
-    # form is `expansion = ‖T(z+ε·u) − T(z)‖_RMS / ε` with `u` a unit-RMS
-    # random direction; the Hutchinson expectation is ‖J‖_F/√D, NOT operator
-    # norm — see `lip_ub` gate for true operator-norm certification. Kept
-    # default-off until the contraction experiment; when enabled, runs
+    # iter147/iter155 path: finite-perturbation expansion penalty. Per-call
+    # form is `expansion = ‖M(z+ε·u) − M(z)‖_RMS / ε` with `u` a unit-RMS
+    # random direction; the Hutchinson expectation is ‖J_M‖_F/√D, NOT operator
+    # norm — see `lip_ub_F` (gate-aligned empirical metric), `lip_ub_S`
+    # (advisory surrogate), and `lip_ub_T` (decomposition) for the
+    # operator-norm power-iteration estimates.  None of these are formal
+    # certificates: power iteration is a lower-bound estimator and the
+    # safety multiplier is a heuristic margin, not a proof.
+    # `M` is selected by `lyapunov_target`:
+    #   - "transition_T" (iter147 default): M = T_θ(z, x₀); penalizes ‖J_T·u‖.
+    #     Decomposition-only — T is one component of the iterated map.
+    #   - "iteration_S"  (iter155 first attempt): M = S(z, x₀) = Ā·z+(1−Ā)·T_θ;
+    #      penalizes ‖J_S·u‖.  Single-state convex blend — NOT what the solver
+    #      iterates (the solver is two-state).  Advisory surrogate only.
+    #   - "iteration_F"  (iter155 corrected, gate-aligned): M = F(y, z) =
+    #      (Ā·y + β·T(z), Ā·z + β·T(Ā·y + β·T(z))) with β = 1−Ā.  This is
+    #      the actual Parcae cycle the solver iterates; σ_max(J_F) < 1 is
+    #      a sufficient (not necessary) empirical local-contraction
+    #      condition.  Penalizes ‖J_F·(u_y, u_z)‖ — empirical pressure
+    #      toward contraction, not a formal certificate.
+    # Kept default-off until the contraction experiment; when enabled, runs
     # low-cadence on a token window to avoid making every training step pay
-    # two extra shared-block forwards.
+    # the extra shared-block forwards (T: +2 sb calls; S: +2; F: +4).
     lyapunov_coef = 0.0        # λ_jac: weight of relu(expansion - gamma)^2
     # γ is on the Frobenius/√D proxy (Hutchinson), not ‖J‖_2: ‖J‖_2 < 1
     # implies Frobenius/√D < 1 but not the reverse, so γ=0.97 is a soft
-    # pressure, not a contraction certificate — `lip_ub` is the gate.
+    # directional proxy for the spectral norm of the chosen J_M; the gate is
+    # `lip_ub_F` (iter155 corrected gate-aligned empirical local-contraction
+    # metric on the actual two-state Parcae cycle), with `lip_ub_S`
+    # (single-state blend) and `lip_ub_T` (transition map) retained as
+    # advisory decomposition diagnostics.  All three are power-iteration
+    # estimates of σ_max, not formal upper bounds.
     # Pure IFT was removed after iter144; future contraction work should change
     # the transition parameterization or use a new hybrid finite-K design.
     lyapunov_gamma = 0.97
     lyapunov_every = 16
     lyapunov_max_tokens = 64
+    # iter155 (corrected): which Jacobian the Lyapunov FD probe penalizes.
+    # Default "transition_T" preserves iter147 behavior.  "iteration_S" routes
+    # the FD probe to the single-state convex blend (advisory only — not the
+    # iterated map); "iteration_F" routes to the actual two-state Parcae
+    # cycle map and is gate-aligned with `lip_ub_F`.  The S/F branches do
+    # NOT detach Ā so gradients flow to Parcae damping; B̄ remains detached
+    # because it appears inside the FD subtraction and would carry
+    # second-order curvature otherwise.
+    lyapunov_target = "transition_T"
+    # iter155 (corrected): which direction the FD probe perturbs.
+    #   "random_fd" (default): single random RMS-1 direction — Hutchinson
+    #     Frobenius/√D estimate, low cost.
+    #   "power_jvp_F": run a few power-iteration steps on J_F (no-grad) to
+    #     estimate the dominant right singular vector, then perturb in
+    #     THAT direction.  Penalty bears on the worst expansion mode of
+    #     J_F rather than averaging random directions; cost ~3× the
+    #     random_fd path (a few extra sb forwards/backwards).  Only
+    #     meaningful when `lyapunov_target=iteration_F`; falls back to
+    #     random_fd otherwise.
+    lyapunov_estimator = "random_fd"
     # Phase 9 iter 55: Denoising regularization (HyDRA 2026, Efficient DEQ 2025).
     # ||f(z*+ε, x0) - z*||² penalizes contraction failure at finite perturbation.
     # Complements Hutchinson (which penalizes ||J||²_F at infinitesimal scale).
@@ -1020,6 +1061,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "parcae-init-a-bar", "parcae-init-b-bar", "parcae-lr",
     "denoising-coef", "denoising-noise-std",
     "lyapunov-coef", "lyapunov-gamma", "lyapunov-every", "lyapunov-max-tokens",
+    "lyapunov-target",
+    "lyapunov-estimator",
     "eval-reservation-seconds",
     "ctp-weight",
     "router-load-cv-coef", "mos-load-cv-coef",
@@ -5288,6 +5331,8 @@ class GPT(nn.Module):
                  lyapunov_gamma: float = 0.97,
                  lyapunov_every: int = 16,
                  lyapunov_max_tokens: int = 64,
+                 lyapunov_target: str = "transition_T",
+                 lyapunov_estimator: str = "random_fd",
                  deq_prefix_anchors: bool = False,
                  deq_prefix_anchor_set: tuple[int, ...] | None = None,
                  use_parcae: bool = True,
@@ -5468,13 +5513,25 @@ class GPT(nn.Module):
         self.deq_prefix_anchors = bool(deq_prefix_anchors)
         self.deq_prefix_anchor_set = tuple(int(k) for k in (deq_prefix_anchor_set or ()))
         self._deq_prefix_anchor_depths_last: tuple[int, ...] = ()
-        # iter147 path: finite-perturbation Hutchinson Frobenius/√D probe on
-        # T_theta (default OFF), run low-cadence from the training loop. NOT
-        # an operator-norm probe — see `lip_ub` gate for that.
+        # iter147/iter155 path: finite-perturbation Hutchinson Frobenius/√D
+        # probe on T_θ (default), the single-state convex blend
+        # S = Ā·z+(1−Ā)·T_θ (when `lyapunov_target=iteration_S`; advisory
+        # only — NOT the iterated map), or the actual two-state Parcae cycle
+        # F (when `lyapunov_target=iteration_F`; gate-aligned).  Default OFF,
+        # run low-cadence from the training loop.  NOT an operator-norm
+        # probe — see the `lip_ub_F` gate (with `lip_ub_S` advisory and
+        # `lip_ub_T` decomposition diagnostic) for that.
         self.lyapunov_coef = float(lyapunov_coef)
         self.lyapunov_gamma = float(lyapunov_gamma)
         self.lyapunov_every = int(lyapunov_every)
         self.lyapunov_max_tokens = int(lyapunov_max_tokens)
+        # iter155 (corrected): enum {"transition_T","iteration_S","iteration_F"}; selects which Jacobian
+        # the FD probe penalizes. Validated in `_validate_hyperparameters`.
+        self.lyapunov_target = str(lyapunov_target)
+        # iter155 (corrected): enum {"random_fd","power_jvp_F"}; selects which
+        # direction the FD probe perturbs. power_jvp_F bears on the dominant
+        # singular vector of J_F; only meaningful with iteration_F target.
+        self.lyapunov_estimator = str(lyapunov_estimator)
         self.logit_softcap = float(logit_softcap)
         self.mos_head = MoSHead(
             model_dim, vocab_size, rank=256,
@@ -6446,25 +6503,77 @@ def _prescribe_failure_fix(failure: str) -> dict:
                    "is no longer gated; it's within finite-K noise.",
             "config_change": {"deq_k_max_delta": 4},
         }
-    if first_token.startswith("lip_ub"):
+    # `first_token` is lowercased from `failure.lower()` above, so comparisons
+    # below are all lowercase.  iter155 (corrected) split the contraction
+    # metric into three:
+    #   - `lip_ub_F` — gate-aligned empirical local-contraction metric
+    #     (operator-norm power-iteration estimate, lower-bounded by the
+    #     true σ_max) on the actual two-state Parcae cycle map F.
+    #   - `lip_ub_S` — single-state convex-blend advisory surrogate (NOT the
+    #     iterated map; kept for diagnostic compatibility).
+    #   - `lip_ub_T` — transition-map decomposition diagnostic.
+    # The legacy `lip_ub=` prefix from pre-iter155 logs is treated as a
+    # gate-equivalent failure (operator norm of the contraction object).
+    if first_token == "lip_ub_f" or first_token == "lip_ub":
+        # iter155 corrected: gate-aligned object is `lip_ub_F` on the actual
+        # two-state Parcae cycle.  J_F has Ā on the diagonal blocks plus
+        # β·J_T cross terms; controlling it requires either tighter damping
+        # (Ā↑) AND/OR shrunk transition magnitude (J_T↓), since for
+        # σ_max(J_T) > 1 damping alone cannot drive σ_max(J_F) below 1
+        # (the cross-block terms scale with β·σ_max(J_T)).
         return {
             "failure": failure,
             "category": "local_contraction_failed",
-            "hypothesis": "The RevDEQ transition Jacobian failed the local Lipschitz contraction metric",
-            "fix": ("Shrink the transition map by parameterization: bounded residual gains, "
-                    "spectral/weight normalization, or another shared transition constraint. "
-                    "Do not add another Lyapunov coefficient sweep by default; lip_ub is the "
-                    "gate-aligned diagnostic, not a request for a new symptom loss."),
-            "config_change": {"needs_transition_parameterization": True},
+            "hypothesis": "The two-state Parcae cycle map F failed the local Lipschitz contraction metric",
+            "fix": ("Set `lyapunov_target=iteration_F` and enable a small "
+                    "`lyapunov_coef` (start 0.005 per iter147 BPB-cheap precedent) — "
+                    "this trains both Parcae damping Ā and the transition map θ "
+                    "to jointly shrink σ_max(J_F).  Decompose with `lip_ub_T` and "
+                    "`lip_ub_S`: if lip_ub_T is small, the failure is in the "
+                    "cross-block coupling and the iter156 hard Ā governor (156a) "
+                    "is the next step; if lip_ub_T is also large, transition-map "
+                    "parameterization (bounded gains, spectral normalization, or "
+                    "iter156b new c·Δ gain) is required because damping cannot fix "
+                    "a positive expanding mode of T."),
+            "config_change": {"needs_iteration_map_contraction": True},
+        }
+    if first_token == "lip_ub_s":
+        # iter155 corrected: S is the single-state convex blend, NOT the
+        # iterated map.  Failure here is informational — the gate object
+        # is `lip_ub_F`.  Treated as advisory.
+        return {
+            "failure": failure,
+            "category": "single_state_blend_loose",
+            "hypothesis": "Single-state convex blend operator norm is large; the gate-relevant object is `lip_ub_F` on the actual two-state cycle.",
+            "fix": ("`lip_ub_S` is an advisory surrogate (single-state convex blend "
+                    "Ā·I + (1-Ā)·J_T), not the iterated map.  Check `lip_ub_F` for "
+                    "the gate-relevant contraction object; if lip_ub_F<1, the actual "
+                    "two-state Parcae cycle is contractive and no rescue is needed."),
+            "config_change": {},
+        }
+    if first_token == "lip_ub_t":
+        # iter155 corrected: T is one component of the iteration, not the
+        # iterated map.  Decomposition diagnostic only — check lip_ub_F.
+        return {
+            "failure": failure,
+            "category": "transition_jacobian_loose",
+            "hypothesis": "The transition map J_T spectral norm is large; the gate-relevant object is `lip_ub_F` on the two-state Parcae cycle, which couples J_T through cross blocks β·J_T.",
+            "fix": ("`lip_ub_T` is a decomposition diagnostic; check `lip_ub_F` for "
+                    "the gate-relevant contraction object. If lip_ub_F<1, the actual "
+                    "two-state Parcae cycle is contractive and no rescue is needed; "
+                    "if lip_ub_F>=1, follow the lip_ub_F prescription (transition-map "
+                    "parameterization is required because damping alone cannot fix "
+                    "a positive expanding mode of T via the β·J_T cross terms)."),
+            "config_change": {},
         }
     if first_token.startswith("fp_bound"):
         return {
             "failure": failure,
             "category": "fp_certificate_loose",
-            "hypothesis": "The map may be contractive, but the residual divided by the contraction margin is too large",
-            "fix": "Increase deq_k_max by 4 for a smaller residual; if lip_ub is close to 1, shrink the transition Jacobian.",
+            "hypothesis": "The iteration map may be contractive, but the residual divided by the contraction margin is too large",
+            "fix": "Increase deq_k_max by 4 for a smaller residual; if lip_ub_F is close to 1, follow the lip_ub_F prescription (lyapunov_target=iteration_F to jointly train Ā and θ for the actual two-state cycle, with iter156 hard governor as the escalation if soft pressure is insufficient).",
             "config_change": {"deq_k_max_delta": 4,
-                              "needs_transition_jacobian_control": True},
+                              "needs_iteration_map_contraction": True},
         }
     if first_token.startswith("iter_conv_rel"):
         return {
@@ -6514,6 +6623,36 @@ def _slice_for_fp_probe(z_star: Tensor, x0_lyap: Tensor, B_probe: int) -> tuple[
     return z_star[:B_probe].contiguous(), x0_lyap[:B_probe].contiguous()
 
 
+def _parcae_cycle_F(
+    y: Tensor,
+    z: Tensor,
+    x0: Tensor,
+    b_bar: Tensor | None,
+    a_bar_d: Tensor,
+    sb,
+) -> tuple[Tensor, Tensor]:
+    """Single application of the actual two-state Parcae cycle map F.
+
+    ``F(y, z) = (Ā·y + β·T_θ(z),  Ā·z + β·T_θ(Ā·y + β·T_θ(z)))``
+    with ``β = 1 − Ā`` and per-dim Ā stored in ``a_bar_d`` (broadcast-
+    compatible with ``y`` / ``z``, e.g. shape ``(1, 1, D)``).
+
+    This is the gate-aligned iteration map probed by ``lip_ub_F``,
+    measured by ``fp_residual_F``, and penalized by the
+    ``lyapunov_target=iteration_F`` FD branch — the single source of
+    truth for the F-cycle algebra so the probe / residual / training
+    paths cannot silently diverge.
+
+    Returns ``(y_new, z_new)`` with the same shape and dtype as ``y, z``.
+    Two ``sb`` calls per invocation (one for ``T(z)``, one for ``T(y_new)``).
+    """
+    t_z = sb(z, x0, b_bar)
+    y_new = a_bar_d * y + (1.0 - a_bar_d) * t_z
+    t_y_new = sb(y_new, x0, b_bar)
+    z_new = a_bar_d * z + (1.0 - a_bar_d) * t_y_new
+    return y_new, z_new
+
+
 def _run_spectral_norm_power(
     z_star: Tensor,
     x0_lyap: Tensor,
@@ -6522,33 +6661,88 @@ def _run_spectral_norm_power(
     target_dtype: torch.dtype,
     n_iters: int,
     ctx_factory,
-) -> float | None:
-    """Internal power-iteration estimate used to compute ``lip_ub``."""
+    map_kind: str = "T",
+    a_bar_d: Tensor | None = None,
+    return_v: bool = False,
+):
+    """Internal power-iteration estimate used to compute ``lip_ub_T`` /
+    ``lip_ub_S`` / ``lip_ub_F``.
+
+    ``map_kind`` selects the Jacobian probed:
+      - ``"T"`` (iter147 legacy): J of the transition map
+        ``T_θ(z, x₀) = sb(z, x₀, B̄)``.  **Decomposition diagnostic only** —
+        T is one component of the iteration, not the iterated map itself.
+      - ``"S"`` (iter155 first attempt): J of the single-state convex blend
+        ``S(z, x₀) = Ā·z + (1−Ā)·sb(z, x₀, B̄)``.  **Advisory surrogate
+        only** — S is NOT what the solver iterates (the solver is two-state),
+        and σ_max(J_S) ≤ Ā + (1−Ā)·σ_max(J_T) > 1 whenever σ_max(J_T) > 1
+        for any Ā < 1, so damping cannot rescue an expansive T via S either.
+      - ``"F"`` (iter155 corrected, gate-aligned): J of the actual two-state
+        Parcae cycle map ``F(y, z) = (Ā·y + β·T(z), Ā·z + β·T(Ā·y + β·T(z)))``
+        with β = 1−Ā.  Probe state lives in (B, T, 2D) — concatenated (y, z).
+        At the fixed point, y* = z* = z_star, so we initialize the joint
+        state at (z_star, z_star).  σ_max(J_F) < 1 is sufficient (not
+        equivalent) for ρ(J_F) < 1 (the local FP convergence condition);
+        the power-iteration estimate produced here is itself a LOWER bound
+        on σ_max, so this is an empirical metric, not a formal certificate.
+
+    Pass ``a_bar_d`` (per-dim Ā tensor, broadcast-compatible with ``z``)
+    when ``map_kind ∈ {"S", "F"}``.
+    """
+    if map_kind in ("S", "F") and a_bar_d is None:
+        raise ValueError(f"map_kind={map_kind!r} requires a_bar_d (per-dim Ā) for the Parcae blend")
+
     torch.cuda.empty_cache()
+    # F-probe doubles the joint-state size (y, z) → (2*z numel) and the cycle
+    # map computes T twice per F-application; both effects double peak VRAM
+    # and FLOPs vs T/S probes.  Use a 2× factor in the OOM predictor for F.
+    state_factor = 2 if map_kind == "F" else 1
     free_b, _ = torch.cuda.mem_get_info(z_star.device)
-    need_b = int(z_star.numel() * z_star.element_size() * 24)
+    need_b = int(z_star.numel() * z_star.element_size() * 24 * state_factor)
     if free_b < int(need_b * 1.25):
         print(
-            f"lip_ub skip: oom_pred need={need_b/1e9:.2f}GiB "
+            f"lip_ub_{map_kind} skip: oom_pred need={need_b/1e9:.2f}GiB "
             f"free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}",
             flush=True,
         )
         return None
 
-    v = torch.randn_like(z_star, dtype=torch.float32)
+    a_bar_t = a_bar_d.to(device=z_star.device, dtype=target_dtype) if a_bar_d is not None else None
+
+    if map_kind == "F":
+        # F state is concat[y, z] along the last (D) axis ⇒ (B, T, 2D).
+        # At the saved FP, y* = z* = z_star; init both halves to z_star.
+        # Cycle algebra delegates to the shared `_parcae_cycle_F` helper
+        # so the probe / residual / training paths share one definition.
+        D = z_star.shape[-1]
+
+        def _apply_map(state: Tensor) -> Tensor:
+            y, z = torch.split(state, D, dim=-1)
+            y_new, z_new = _parcae_cycle_F(y, z, x0_lyap, b_bar_d, a_bar_t, sb)
+            return torch.cat([y_new, z_new], dim=-1)
+
+        # Stack (z_star, z_star) into the joint state for power iteration.
+        seed_state = torch.cat([z_star, z_star], dim=-1).contiguous()
+    else:
+        def _apply_map(z_arg: Tensor) -> Tensor:
+            out_T = sb(z_arg, x0_lyap, b_bar_d)
+            if map_kind == "S":
+                return a_bar_t * z_arg + (1.0 - a_bar_t) * out_T
+            return out_T
+
+        seed_state = z_star
+
+    v = torch.randn_like(seed_state, dtype=torch.float32)
     v = v / v.norm().clamp(min=1e-8)
     sigma: float | None = None
 
     def _jvp(v_float: Tensor) -> Tensor:
-        z_b = z_star.detach().clone().requires_grad_(True)
+        z_b = seed_state.detach().clone().requires_grad_(True)
         v_b = v_float.to(device=z_b.device, dtype=z_b.dtype)
-
-        def _f(z_arg: Tensor) -> Tensor:
-            return sb(z_arg, x0_lyap, b_bar_d)
 
         with ctx_factory(), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
             _, jv = torch.autograd.functional.jvp(
-                _f, (z_b,), (v_b,), create_graph=False, strict=False
+                _apply_map, (z_b,), (v_b,), create_graph=False, strict=False
             )
         del z_b, v_b
         return jv.detach()
@@ -6557,9 +6751,9 @@ def _run_spectral_norm_power(
         jv = _jvp(v)
         sigma = float(jv.float().norm().item())
 
-        z_b = z_star.detach().clone().requires_grad_(True)
+        z_b = seed_state.detach().clone().requires_grad_(True)
         with ctx_factory(), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
-            u_b = sb(z_b, x0_lyap, b_bar_d)
+            u_b = _apply_map(z_b)
             grad_target = jv.to(device=u_b.device, dtype=u_b.dtype)
             jt_jv = torch.autograd.grad(
                 (u_b * grad_target).sum(), z_b,
@@ -6570,6 +6764,8 @@ def _run_spectral_norm_power(
         del jv, z_b, u_b, grad_target, jt_jv
         torch.cuda.empty_cache()
 
+    if return_v:
+        return sigma, v
     return sigma
 
 
@@ -6588,6 +6784,13 @@ def _fp_probe_context_factory():
 
 
 def _prepare_saved_fp_probe(base_m, B_probe: int = 1):
+    """Slice + dtype-prep the saved FP tensors and the Parcae per-dim
+    coefficients so probes can run map-agnostically.
+
+    Returns ``(z_star, x0_lyap, b_bar_d, a_bar_d, sb_call, target_dtype, ctx_factory)``.
+    ``a_bar_d`` is the per-dim Ā tensor (broadcast as ``(1, 1, D)``) or ``None``
+    when Parcae is disabled — callers selecting ``map_kind="S"`` must check.
+    """
     z_star = getattr(base_m, "_lyapunov_z_star", None)
     x0_lyap = getattr(base_m, "_lyapunov_x0", None)
     if z_star is None or x0_lyap is None:
@@ -6603,7 +6806,13 @@ def _prepare_saved_fp_probe(base_m, B_probe: int = 1):
     x0_lyap = x0_lyap.to(target_dtype)
     b_bar = base_m._parcae_b_bar() if base_m.use_parcae else None
     b_bar_d = b_bar.detach().to(target_dtype) if b_bar is not None else None
-    return z_star, x0_lyap, b_bar_d, sb_call, target_dtype, _fp_probe_context_factory()
+    if base_m.use_parcae:
+        a_bar = base_m._parcae_a_bar().detach().to(target_dtype)
+        # Broadcast (D,) -> (1, 1, D) so a_bar_d * z works on (B, T, D).
+        a_bar_d = a_bar.view(*([1] * (z_star.ndim - 1)), -1)
+    else:
+        a_bar_d = None
+    return z_star, x0_lyap, b_bar_d, a_bar_d, sb_call, target_dtype, _fp_probe_context_factory()
 
 
 def _lipschitz_upper_bound_metric(
@@ -6659,6 +6868,59 @@ def _atomic_torch_save(obj, path: Path) -> None:
     os.replace(tmp_path, path)
 
 
+def _joint_F_residual_at_saved_fp(
+    base_m,
+    B_probe: int = 1,
+    log_label: str = "fp_residual_F",
+) -> float | None:
+    """Joint two-state Parcae cycle residual at the saved FP.
+
+    Computes ``r_F = ‖F(z*, z*) − (z*, z*)‖_RMS / ‖(z*, z*)‖_RMS`` for the
+    actual cycle ``F(y, z) = (Ā·y + β·T(z), Ā·z + β·T(Ā·y + β·T(z)))``.
+    At a true joint FP, ``r_F = 0``; in practice ``z*`` is from a finite-K
+    solver, so ``r_F`` measures the distance to the joint FP and pairs
+    correctly with ``lip_ub_F`` in Banach's bound
+    ``‖x − x*‖ ≤ r_F / (1 − lip_ub_F)``.
+
+    Cost: 2 ``sb`` calls (one for ``T(z*)``, one for ``T(u')``); no autograd.
+    Reuses the saved-FP probe preparation so dtype/slice choices match the
+    spectral-norm probes.  Returns ``None`` when Parcae is disabled (the
+    cycle reduces to a single-step iteration and the conv_rel z-only
+    residual is the right object).
+    """
+    prepared = _prepare_saved_fp_probe(base_m, B_probe)
+    if prepared is None:
+        return None
+    z_star, x0_lyap, b_bar_d, a_bar_d, sb, target_dtype, ctx_factory = prepared
+    if a_bar_d is None:
+        # Parcae disabled: F ≡ T (single step).  Caller should fall back
+        # to the z-only conv_rel.
+        return None
+    a_bar_t = a_bar_d.to(device=z_star.device, dtype=target_dtype)
+    try:
+        with torch.no_grad():
+            with ctx_factory(), torch.autocast(device_type="cuda", dtype=target_dtype):
+                # Joint state at saved FP: (y*, z*) = (z_star, z_star).
+                # Delegates to the shared cycle helper so the residual
+                # measurement uses identical algebra to the lip_ub_F probe.
+                y_new, z_new = _parcae_cycle_F(
+                    z_star, z_star, x0_lyap, b_bar_d, a_bar_t, sb,
+                )
+            diff_y = (y_new - z_star).float()
+            diff_z = (z_new - z_star).float()
+            num_sq = diff_y.pow(2).sum() + diff_z.pow(2).sum()
+            # ‖(z*, z*)‖² = 2·‖z*‖²
+            denom_sq = 2.0 * z_star.float().pow(2).sum().clamp_min(1e-12)
+            return float((num_sq / denom_sq).sqrt().item())
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"{log_label} skip: oom_runtime {e}", flush=True)
+        torch.cuda.empty_cache()
+        return None
+    except RuntimeError as e:
+        print(f"{log_label} skip: cuda_runtime {type(e).__name__}: {e}", flush=True)
+        return None
+
+
 def _lip_ub_at_saved_fp(
     base_m,
     n_iters: int = 3,
@@ -6666,22 +6928,38 @@ def _lip_ub_at_saved_fp(
     safety: float = 1.10,
     margin: float = 0.0,
     log_label: str = "lip_ub",
+    map_kind: str = "T",
 ) -> float | None:
     """Local contraction metric at the model's saved DEQ FP.
 
     `log_label` distinguishes call sites in skip-reason log lines (e.g.
-    K-sweep passes `"ksweep_skip_reason:lip_ub"` so the prescription
+    K-sweep passes `"ksweep_skip_reason:lip_ub_F"` so the prescription
     parser keys on it). Narrow exceptions: OOM + CUDA RuntimeError only;
     every other exception propagates so refactor breakage stays loud.
+
+    `map_kind` ∈ {"T", "S", "F"} (see `_run_spectral_norm_power` docstring):
+      - "T": transition-map J — decomposition diagnostic only.
+      - "S": single-state convex blend J — advisory surrogate, not the
+        iterated map.
+      - "F": full two-state Parcae cycle J — gate-aligned empirical
+        local-contraction metric (iter155 corrected; not a formal
+        certificate — see `_run_spectral_norm_power` docstring caveats).
+
+    When the model has Parcae disabled, "S" and "F" both reduce to "T"
+    and the call returns the T value.
     """
     prepared = _prepare_saved_fp_probe(base_m, B_probe)
     if prepared is None:
         return None
-    z_star, x0_lyap, b_bar_d, sb, target_dtype, ctx_factory = prepared
+    z_star, x0_lyap, b_bar_d, a_bar_d, sb, target_dtype, ctx_factory = prepared
+    if map_kind in ("S", "F") and a_bar_d is None:
+        # Parcae disabled — S/F ≡ T. Fall back to T so callers always get a value.
+        map_kind = "T"
     try:
         spec_est = _run_spectral_norm_power(
             z_star, x0_lyap, b_bar_d, sb, target_dtype,
             max(1, int(n_iters)), ctx_factory,
+            map_kind=map_kind, a_bar_d=a_bar_d,
         )
         return _lipschitz_upper_bound_metric(spec_est, safety=safety, margin=margin)
     except torch.cuda.OutOfMemoryError as e:
@@ -6778,6 +7056,18 @@ def _validate_hyperparameters(args) -> None:
         raise SystemExit(f"lyapunov_every ({args.lyapunov_every}) must be positive")
     if int(getattr(args, "lyapunov_max_tokens", 1)) <= 0:
         raise SystemExit(f"lyapunov_max_tokens ({args.lyapunov_max_tokens}) must be positive")
+    lyap_target = str(getattr(args, "lyapunov_target", "transition_T"))
+    if lyap_target not in ("transition_T", "iteration_S", "iteration_F"):
+        raise SystemExit(
+            f"lyapunov_target={lyap_target!r} must be one of: "
+            "transition_T, iteration_S, iteration_F"
+        )
+    lyap_estimator = str(getattr(args, "lyapunov_estimator", "random_fd"))
+    if lyap_estimator not in ("random_fd", "power_jvp_F"):
+        raise SystemExit(
+            f"lyapunov_estimator={lyap_estimator!r} must be one of: "
+            "random_fd, power_jvp_F"
+        )
     nE, nS = int(args.num_experts), int(args.num_shared_experts)
     if nE <= 0:
         raise SystemExit(f"num_experts ({nE}) must be positive")
@@ -7239,6 +7529,8 @@ def main() -> None:
         lyapunov_gamma=args.lyapunov_gamma,
         lyapunov_every=args.lyapunov_every,
         lyapunov_max_tokens=args.lyapunov_max_tokens,
+        lyapunov_target=getattr(args, "lyapunov_target", "transition_T"),
+        lyapunov_estimator=getattr(args, "lyapunov_estimator", "random_fd"),
         use_parcae=args.use_parcae,
         parcae_init_a_bar=args.parcae_init_a_bar,
         parcae_init_b_bar=args.parcae_init_b_bar,
@@ -7842,28 +8134,73 @@ def main() -> None:
             _window_avg = (sum(_step_dt_window) / len(_step_dt_window)) if _step_dt_window else 0.0
             _fast_val_count += 1
             fp_probe_every = int(getattr(args, "fp_lip_fast_val_every", 0) or 0)
-            run_fp_lip_probe = (
+            # iter155 (corrected) directive 2026-05-13: lip_ub_F is the
+            # gate-aligned contraction object on the actual two-state Parcae
+            # cycle and MUST be reported on every FP eval, never gated by
+            # cadence.  Otherwise the gate's own evidence becomes optional
+            # — exactly the "decision based on metric we haven't measured"
+            # failure mode the audit checklist forbids.  fp_residual_F is
+            # paired with lip_ub_F in `fp_bound = fp_residual_F /
+            # (1 − lip_ub_F)` so it shares the same always-on policy.
+            # T (decomposition diagnostic) and S (single-state advisory
+            # surrogate) remain on the fp_lip_fast_val_every cadence
+            # because they cost extra JVPs without changing the gate
+            # decision — they're only useful when lip_ub_F has crossed
+            # the prescription threshold and the next iter needs to know
+            # which component (J_T magnitude vs Ā damping) is the lever.
+            run_fp_lip_probe_F = master_process
+            run_fp_lip_probe_TS = (
                 master_process
                 and fp_probe_every > 0
                 and (last_step or (_fast_val_count % fp_probe_every == 0))
             )
-            lip_ub = (
-                _lip_ub_at_saved_fp(
+            if run_fp_lip_probe_F:
+                lip_ub_F = _lip_ub_at_saved_fp(
                     base_model,
                     n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
                     safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
                     margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
+                    map_kind="F",
                 )
-                if run_fp_lip_probe else None
-            )
+                fp_residual_F = _joint_F_residual_at_saved_fp(base_model)
+            else:
+                lip_ub_F = None
+                fp_residual_F = None
+            if run_fp_lip_probe_TS:
+                lip_ub_T = _lip_ub_at_saved_fp(
+                    base_model,
+                    n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
+                    safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
+                    margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
+                    map_kind="T",
+                )
+                lip_ub_S = _lip_ub_at_saved_fp(
+                    base_model,
+                    n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
+                    safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
+                    margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
+                    map_kind="S",
+                )
+            else:
+                lip_ub_T = None
+                lip_ub_S = None
             conv_rel_t = getattr(base_model, "_deq_iter_convergence_rel_t", None)
             fp_residual_rel = (
                 float(conv_rel_t.detach().float().item())
                 if isinstance(conv_rel_t, torch.Tensor) else None
             )
-            fp_bound = _fixed_point_error_bound_metric(fp_residual_rel, lip_ub)
-            lip_str = f" lip_ub:{lip_ub:.4f}" if lip_ub is not None else " lip_ub:N/A"
-            fp_resid_str = f" fp_residual_rel:{fp_residual_rel:.6f}" if fp_residual_rel is not None else ""
+            # fp_bound uses the gate-aligned F-side pair (Banach's bound on
+            # the actual two-state cycle, joint residual + joint Lipschitz).
+            fp_bound = _fixed_point_error_bound_metric(fp_residual_F, lip_ub_F)
+            lip_str = (
+                (f" lip_ub_T:{lip_ub_T:.4f}" if lip_ub_T is not None else " lip_ub_T:N/A")
+                + (f" lip_ub_S:{lip_ub_S:.4f}" if lip_ub_S is not None else " lip_ub_S:N/A")
+                + (f" lip_ub_F:{lip_ub_F:.4f}" if lip_ub_F is not None else " lip_ub_F:N/A")
+            )
+            fp_resid_str = (
+                (f" fp_residual_rel:{fp_residual_rel:.6f}" if fp_residual_rel is not None else "")
+                + (f" fp_residual_F:{fp_residual_F:.6f}" if fp_residual_F is not None else "")
+            )
             fp_bound_str = f" fp_bound:{fp_bound:.6f}" if fp_bound is not None else ""
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -8032,12 +8369,14 @@ def main() -> None:
                             z_base = z_star.detach()[:, start_lyap:start_lyap + t_lyap].contiguous()
                             x0_base = x0_lyap[:, start_lyap:start_lyap + t_lyap].contiguous()
                             # Hutchinson-style probe: with `eps_unit` of unit RMS in
-                            # high-D, `expansion` has expectation ‖J‖_F/√D, NOT the
-                            # operator norm ‖J‖_2 that the post-final `lip_ub` gate
-                            # measures. So this is a Frobenius/√D proxy — soft
-                            # contraction pressure, not a tight Lipschitz cert. RMS
-                            # form (vs unit-L2) keeps per-element magnitudes ~O(1)
-                            # under bf16 finite differencing.
+                            # high-D, `expansion` has expectation ‖J_M‖_F/√D, NOT the
+                            # operator norm ‖J_M‖_2 that the post-final `lip_ub_F`
+                            # (gate-aligned), `lip_ub_S` (advisory), and `lip_ub_T`
+                            # (decomposition) probes measure. So this is a Frobenius/√D
+                            # proxy on whichever Jacobian `lyapunov_target` selects
+                            # (T_θ, S, or F) — soft contraction pressure, not a tight
+                            # Lipschitz cert. RMS form (vs unit-L2) keeps per-element
+                            # magnitudes ~O(1) under bf16 finite differencing.
                             # Seeded per-step generator: deterministic across reruns
                             # at fixed (args.seed, next_step). Matches the determinism
                             # of `_deterministic_token_window_start` above.
@@ -8054,10 +8393,116 @@ def main() -> None:
                             # Detach B̄ on the FD probe: keeps second-order
                             # curvature out of the Parcae B̄ training signal
                             # (denoising below intentionally keeps live B̄).
+                            # Ā is NOT detached in S/F branches: it appears
+                            # only in outside-linear-blend coefficients
+                            # (no second-order FD curvature concern), so
+                            # gradients to Ā are first-order and exactly
+                            # what should pressure damping when expansion>γ.
                             aux_b_bar_d = aux_b_bar.detach() if aux_b_bar is not None else None
-                            u_base = sb(z_base, x0_base, aux_b_bar_d)
-                            u_pert = sb(z_base + eps_step * eps_unit, x0_base, aux_b_bar_d)
-                            expansion = (u_pert - u_base).float().pow(2).mean().sqrt() / float(eps_step)
+                            # iter155 (corrected): select which Jacobian's
+                            # directional derivative we penalize.
+                            #   transition_T: diff = sb(z+εu) − sb(z)  (≈ J_T·u)
+                            #   iteration_S:  diff = Ā·(εu) + (1−Ā)·(sb(z+εu) − sb(z))
+                            #     ⇒ J_S·u where J_S = Ā·I + (1−Ā)·J_T (single
+                            #     -state convex blend; advisory surrogate)
+                            #   iteration_F:  joint perturbation on (y, z) with
+                            #     y* = z* = z_base; diff is the directional
+                            #     derivative of the two-state cycle map F.
+                            #     ⇒ ‖J_F · (u_y, u_z)‖ — the gate-aligned object.
+                            # Soft directional proxy for the spectral norm of
+                            # the chosen J_M; gate is `lip_ub_F`.
+                            lyap_target = str(getattr(base_model, "lyapunov_target", "transition_T"))
+                            if lyap_target == "iteration_F" and base_model.use_parcae:
+                                # Two-state cycle: y' = Ā·y + β·T(z),
+                                #                  z' = Ā·z + β·T(y').
+                                # At the saved FP, y* = z* = z_base (so the
+                                # initial joint state is duplicated).  Cycle
+                                # algebra delegates to `_parcae_cycle_F`.
+                                a_bar_full = base_model._parcae_a_bar()  # NOT detached
+                                a_bar_d = a_bar_full.view(*([1] * (z_base.ndim - 1)), -1).to(dtype=z_base.dtype)
+                                lyap_estimator = str(getattr(base_model, "lyapunov_estimator", "random_fd"))
+                                if lyap_estimator == "power_jvp_F":
+                                    # Worst-direction probe: estimate the
+                                    # dominant right singular vector of J_F
+                                    # via no-grad power iteration, then split
+                                    # into (v_y, v_z) and use those as the
+                                    # FD perturbation directions.  Penalty
+                                    # bears on σ_max(J_F) directly rather
+                                    # than averaging random directions.
+                                    a_bar_for_probe = a_bar_d.detach()
+                                    with torch.no_grad():
+                                        ret = _run_spectral_norm_power(
+                                            z_base.detach(), x0_base, aux_b_bar_d,
+                                            sb, z_base.dtype, n_iters=2,
+                                            ctx_factory=_fp_probe_context_factory(),
+                                            map_kind="F", a_bar_d=a_bar_for_probe,
+                                            return_v=True,
+                                        )
+                                    if ret is None:
+                                        # Probe OOM/error — silently fall
+                                        # back to random_fd directions.
+                                        eps_dir_y = torch.randn(
+                                            z_base.shape, dtype=z_base.dtype,
+                                            device=z_base.device, generator=lyap_gen,
+                                        )
+                                        eps_unit_y = eps_dir_y / eps_dir_y.float().pow(2).mean().sqrt().clamp(min=1e-8).to(dtype=eps_dir_y.dtype)
+                                    else:
+                                        _sigma_unused, v_top = ret
+                                        D = z_base.shape[-1]
+                                        # Joint normalization (NOT per-half):
+                                        # power iteration converges to a v
+                                        # whose two halves carry the relative
+                                        # magnitudes that make it the dominant
+                                        # singular direction.  Normalizing
+                                        # each half to RMS=1 independently
+                                        # would change the direction.  Instead,
+                                        # normalize the concatenated joint
+                                        # vector once so it has joint RMS=1,
+                                        # then split — preserves ‖v_y‖/‖v_z‖.
+                                        v_joint_rms = v_top.float().pow(2).mean().sqrt().clamp(min=1e-8)
+                                        v_top_unit = (v_top / v_joint_rms.to(dtype=v_top.dtype)).to(dtype=z_base.dtype)
+                                        eps_unit_y, eps_unit = torch.split(v_top_unit, D, dim=-1)
+                                else:
+                                    # random_fd (default): independent
+                                    # random directions for u_y, u_z.
+                                    eps_dir_y = torch.randn(
+                                        z_base.shape, dtype=z_base.dtype,
+                                        device=z_base.device, generator=lyap_gen,
+                                    )
+                                    eps_unit_y = eps_dir_y / eps_dir_y.float().pow(2).mean().sqrt().clamp(min=1e-8).to(dtype=eps_dir_y.dtype)
+                                # F at base = F(z_base, z_base); F at perturbed
+                                # = F(z_base + ε·u_y, z_base + ε·u_z).  Cycle
+                                # algebra is the same `_parcae_cycle_F` helper
+                                # used by lip_ub_F probe and fp_residual_F —
+                                # single source of truth, no future drift.
+                                y_new_base, z_new_base = _parcae_cycle_F(
+                                    z_base, z_base, x0_base, aux_b_bar_d, a_bar_d, sb,
+                                )
+                                y_pert_init = z_base + eps_step * eps_unit_y
+                                z_pert = z_base + eps_step * eps_unit
+                                y_new_pert, z_new_pert = _parcae_cycle_F(
+                                    y_pert_init, z_pert, x0_base, aux_b_bar_d, a_bar_d, sb,
+                                )
+                                # Directional derivative of F = concat(y', z').
+                                diff_y = y_new_pert - y_new_base
+                                diff_z = z_new_pert - z_new_base
+                                # Joint RMS over both halves (equivalent to
+                                # concatenating along last dim and RMS-reducing).
+                                diff_sq_sum = diff_y.float().pow(2).sum() + diff_z.float().pow(2).sum()
+                                diff_count = diff_y.numel() + diff_z.numel()
+                                expansion = (diff_sq_sum / diff_count).sqrt() / float(eps_step)
+                            elif lyap_target == "iteration_S" and base_model.use_parcae:
+                                a_bar_full = base_model._parcae_a_bar()  # NOT detached
+                                a_bar_d = a_bar_full.view(*([1] * (z_base.ndim - 1)), -1).to(dtype=z_base.dtype)
+                                u_base = sb(z_base, x0_base, aux_b_bar_d)
+                                u_pert = sb(z_base + eps_step * eps_unit, x0_base, aux_b_bar_d)
+                                diff = a_bar_d * (eps_step * eps_unit) + (1.0 - a_bar_d) * (u_pert - u_base)
+                                expansion = diff.float().pow(2).mean().sqrt() / float(eps_step)
+                            else:
+                                u_base = sb(z_base, x0_base, aux_b_bar_d)
+                                u_pert = sb(z_base + eps_step * eps_unit, x0_base, aux_b_bar_d)
+                                diff = u_pert - u_base
+                                expansion = diff.float().pow(2).mean().sqrt() / float(eps_step)
                             lyap_loss = torch.relu(expansion - float(base_model.lyapunov_gamma)).pow(2)
                             # Multiply by grad_accum_steps so the per-optimizer-step
                             # gradient contribution matches the documented coef
@@ -8424,7 +8869,23 @@ def main() -> None:
     # probes without changing training behavior.
     k_sweep_values = _resolve_k_sweep_values(args)
     k_sweep_results: dict[int, float] = {}
-    k_sweep_lip_ubs: dict[int, float] = {}
+    # iter155 (corrected): three-way contraction diagnostics.
+    #   lip_ub_T — transition-map J (decomposition diagnostic, was `lip_ub`)
+    #   lip_ub_S — single-state convex-blend J (advisory surrogate; NOT the
+    #              iterated map of the actual two-state Parcae solver)
+    #   lip_ub_F — full two-state Parcae cycle J (gate-aligned empirical
+    #              local-contraction metric; safety-adjusted power-iteration
+    #              estimate, NOT a formal certificate — see post-int gate)
+    # The post-int contraction failure gate triggers on lip_ub_F; T and S
+    # are reported alongside for failure attribution.
+    k_sweep_lip_ubs_T: dict[int, float] = {}
+    k_sweep_lip_ubs_S: dict[int, float] = {}
+    k_sweep_lip_ubs_F: dict[int, float] = {}
+    # iter155 corrected (2026-05-13): joint-cycle residual paired with
+    # lip_ub_F for a principled Banach-style FP error bound.  The legacy
+    # iter_conv_rel is the z-only step residual, which doesn't pair
+    # correctly with the F-side Lipschitz constant.
+    k_sweep_fp_residual_F: dict[int, float] = {}
 
     # iter 100b user directive (PERMANENT 2026-04-27): emit a structured
     # per-K table of expert health + Lipschitz + sparsity + shared_gate so
@@ -8542,7 +9003,14 @@ def main() -> None:
         ("attn_min", 9), ("mlp_min", 9), ("attn_ortho", 11), ("mlp_ortho", 10),
         ("pertoken_ent", 13), ("pool_ent", 9), ("shared_gate", 12),
         *_dir_cols,
-        ("lip_ub", 9), ("fp_bound", 10), ("iter_conv_rel", 14),
+        # iter155 (corrected): lip_ub_F is the gate-aligned contraction
+        # object on the actual two-state Parcae cycle; lip_ub_S is the
+        # single-state convex-blend advisory surrogate (NOT the iterated
+        # map); lip_ub_T is the transition-map decomposition diagnostic.
+        # fp_residual_F = ‖F(z*,z*)−(z*,z*)‖_RMS / ‖(z*,z*)‖_RMS pairs with
+        # lip_ub_F in fp_bound = fp_residual_F / (1 − lip_ub_F).
+        ("lip_ub_T", 10), ("lip_ub_S", 10), ("lip_ub_F", 10),
+        ("fp_residual_F", 14), ("fp_bound", 10), ("iter_conv_rel", 14),
     ]
     def _fmt_kdiag(value: float | None, width: int, name: str = "") -> str:
         if value is None:
@@ -8599,22 +9067,76 @@ def main() -> None:
                 diag_parts.append(f"{conf_name}:{float(conf_value):.4f}")
         # Local FP contraction metric at the saved DEQ FP (z*).  Eval profile
         # controls which K rows pay for this probe.
-        lip_ub = None
+        # iter155 (corrected): three probes share the saved FP and Hutchinson
+        # power-iteration machinery.  lip_ub_F (gate object) is on the actual
+        # two-state Parcae cycle; lip_ub_S (advisory) is the single-state
+        # convex-blend surrogate; lip_ub_T (decomposition) is on the
+        # transition map alone.  Combined cost ~12 extra JVPs per K-value
+        # (F probe is ~2× the others due to the two-state cycle), still
+        # dominated by the K-sweep validation forward.
+        lip_ub_T_val = None
+        lip_ub_S_val = None
+        lip_ub_F_val = None
+        # iter155 (corrected) directive 2026-05-13: lip_ub_F always probed
+        # on every K-sweep row — every K is its own FP eval, and the
+        # gate-aligned object cannot be silently absent for any K we
+        # actually report.  T/S remain on the eval-profile cadence
+        # (`submission` probes K=128 only) because they're decomposition
+        # diagnostics and only useful when lip_ub_F has crossed the
+        # prescription threshold.
+        lip_ub_F_val = _lip_ub_at_saved_fp(
+            base_m_for_roundtrip,
+            n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
+            safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
+            margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
+            log_label="ksweep_skip_reason:lip_ub_F",
+            map_kind="F",
+        )
         if _should_probe_lip_for_k(args, k_eval):
-            lip_ub = _lip_ub_at_saved_fp(
+            lip_ub_T_val = _lip_ub_at_saved_fp(
                 base_m_for_roundtrip,
                 n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
                 safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
                 margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
-                log_label="ksweep_skip_reason:lip_ub",
+                log_label="ksweep_skip_reason:lip_ub_T",
+                map_kind="T",
             )
-        if lip_ub is not None:
-            diag_parts.append(f"lip_ub:{lip_ub:.4f}")
-            k_sweep_lip_ubs[k_eval] = float(lip_ub)
+            lip_ub_S_val = _lip_ub_at_saved_fp(
+                base_m_for_roundtrip,
+                n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
+                safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
+                margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
+                log_label="ksweep_skip_reason:lip_ub_S",
+                map_kind="S",
+            )
+        if lip_ub_T_val is not None:
+            diag_parts.append(f"lip_ub_T:{lip_ub_T_val:.4f}")
+            k_sweep_lip_ubs_T[k_eval] = float(lip_ub_T_val)
+        if lip_ub_S_val is not None:
+            diag_parts.append(f"lip_ub_S:{lip_ub_S_val:.4f}")
+            k_sweep_lip_ubs_S[k_eval] = float(lip_ub_S_val)
+        if lip_ub_F_val is not None:
+            diag_parts.append(f"lip_ub_F:{lip_ub_F_val:.4f}")
+            k_sweep_lip_ubs_F[k_eval] = float(lip_ub_F_val)
+        # iter155 corrected: joint cycle residual paired with lip_ub_F —
+        # always probed for the same always-on policy as lip_ub_F.
+        # Probed at the saved FP, no autograd, ~2 sb calls.
+        fp_residual_F_val = _joint_F_residual_at_saved_fp(
+            base_m_for_roundtrip,
+            log_label="ksweep_skip_reason:fp_residual_F",
+        )
+        if fp_residual_F_val is not None:
+            diag_parts.append(f"fp_residual_F:{fp_residual_F_val:.6f}")
+            k_sweep_fp_residual_F[k_eval] = float(fp_residual_F_val)
         log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
         # iter 100b user directive (PERMANENT): tabular per-K row.
+        # fp_bound uses the gate-aligned F-side metric AND the joint cycle
+        # residual: fp_bound = fp_residual_F / (1 − lip_ub_F) is the
+        # principled Banach bound on ‖(y, z) − (z*, z*)‖ for the actual
+        # two-state Parcae cycle.  iter_conv_rel (z-only step residual)
+        # is retained as a separate diagnostic.
         conv_rel_val = float(conv_rel_t.detach().float().item()) if isinstance(conv_rel_t, torch.Tensor) else None
-        fp_bound = _fixed_point_error_bound_metric(conv_rel_val, lip_ub)
+        fp_bound = _fixed_point_error_bound_metric(fp_residual_F_val, lip_ub_F_val)
         kdiag_row = {
             "K": float(k_eval),
             "val_bpb": float(bpb_k),
@@ -8630,7 +9152,10 @@ def main() -> None:
             "shared_gate": kdiag.get("shared_gate"),
             **{short: kdiag.get(name) for name, _, short in ROUTER_DIRICHLET_DIAG_TERMS},
             ROUTER_DIRICHLET_BETA_TERM[2]: kdiag.get(ROUTER_DIRICHLET_BETA_TERM[0]),
-            "lip_ub": lip_ub,
+            "lip_ub_T": lip_ub_T_val,
+            "lip_ub_S": lip_ub_S_val,
+            "lip_ub_F": lip_ub_F_val,
+            "fp_residual_F": fp_residual_F_val,
             "fp_bound": fp_bound,
             "iter_conv_rel": conv_rel_val,
         }
@@ -8907,31 +9432,50 @@ def main() -> None:
     )
     conv_rel = _ddp_mean_scalar(conv_rel_local)
 
-    # 3. Local contraction certificate: the sufficient differentiable condition
-    # at the fixed point is ||dT/dz||_2 < 1. `lip_ub` is the single reported
-    # conservative numerical local-contraction metric; it is the gate.
-    # If lip_ub<1, Banach gives
-    # the a posteriori relative FP-distance proxy
-    #   ||z - z*|| / ||z|| <= iter_conv_rel / (1 - lip_ub).
+    # 3. Local contraction empirical metric: iter155 (corrected) probes the
+    # actual two-state Parcae cycle map F.  ``lip_ub_F`` is the gate-aligned
+    # safety-adjusted power-iteration estimate of σ_max(J_F) on F (the map
+    # the solver actually iterates: y' = Ā·y + β·T(z), z' = Ā·z + β·T(y')).
+    # NOT a formal certificate — power iteration is a lower-bound estimator
+    # and the safety multiplier is heuristic.
+    # ``lip_ub_S`` (single-state convex blend) and ``lip_ub_T`` (transition
+    # map alone) are logged as advisory decomposition diagnostics — neither
+    # is the iterated map.  If lip_ub_F<1, Banach gives the a posteriori
+    # joint FP-distance bound
+    #   ||(y, z) - (z*, z*)|| / ||(z*, z*)|| <= fp_residual_F / (1 - lip_ub_F),
+    # where fp_residual_F = ||F(z*, z*) − (z*, z*)|| / ||(z*, z*)|| is the
+    # joint cycle residual at the saved FP.  iter_conv_rel (z-only step
+    # residual) does NOT pair correctly with lip_ub_F and is retained as a
+    # separate diagnostic only.
     deepest_k = max(k_sweep_values) if k_sweep_values else None
     if deepest_k is not None:
-        deepest_lip_ub = _ddp_max_scalar(k_sweep_lip_ubs.get(deepest_k))
-        if deepest_lip_ub is None:
+        deepest_lip_ub_F = _ddp_max_scalar(k_sweep_lip_ubs_F.get(deepest_k))
+        deepest_lip_ub_S = _ddp_max_scalar(k_sweep_lip_ubs_S.get(deepest_k))
+        deepest_lip_ub_T = _ddp_max_scalar(k_sweep_lip_ubs_T.get(deepest_k))
+        deepest_fp_resid_F = _ddp_max_scalar(k_sweep_fp_residual_F.get(deepest_k))
+        if deepest_lip_ub_F is None:
             _failures.append(
-                f"lip_ub=N/A at K={deepest_k} "
+                f"lip_ub_F=N/A at K={deepest_k} "
                 "(local contraction metric missing; cannot certify fixed-point contraction)"
             )
-        elif deepest_lip_ub >= 1.0:
+        elif deepest_lip_ub_F >= 1.0:
+            attribution = []
+            if deepest_lip_ub_S is not None:
+                attribution.append(f"lip_ub_S={deepest_lip_ub_S:.4f}")
+            if deepest_lip_ub_T is not None:
+                attribution.append(f"lip_ub_T={deepest_lip_ub_T:.4f}")
+            attr_str = (", " + ", ".join(attribution)) if attribution else ""
             _failures.append(
-                f"lip_ub={deepest_lip_ub:.4f} >= 1.0 at K={deepest_k} "
-                "(conservative local contraction metric failed)"
+                f"lip_ub_F={deepest_lip_ub_F:.4f} >= 1.0 at K={deepest_k}{attr_str} "
+                "(conservative local contraction metric on two-state Parcae cycle F failed)"
             )
-        elif conv_rel is not None:
-            fp_bound = conv_rel / max(1.0 - deepest_lip_ub, 1e-8)
+        elif deepest_fp_resid_F is not None:
+            fp_bound = deepest_fp_resid_F / max(1.0 - deepest_lip_ub_F, 1e-8)
             if fp_bound > 0.1:
                 _failures.append(
                     f"fp_bound={fp_bound:.4f} > 0.1 at K={deepest_k} "
-                    f"(iter_conv_rel/(1-lip_ub), lip_ub={deepest_lip_ub:.4f})"
+                    f"(fp_residual_F/(1-lip_ub_F), fp_residual_F={deepest_fp_resid_F:.6f}, "
+                    f"lip_ub_F={deepest_lip_ub_F:.4f})"
                 )
 
     # 5. Iter convergence: relative convergence must be small at highest K.

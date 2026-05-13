@@ -36,6 +36,30 @@ class TestValidateHyperparameters(unittest.TestCase):
                 _validate_hyperparameters(_mut(**{field: value}))
             self.assertIn(field, str(ctx.exception))
 
+    def test_lyapunov_target_enum_is_validated(self) -> None:
+        # iter155 (corrected): `lyapunov_target` must be one of
+        # {"transition_T", "iteration_S", "iteration_F"}.  An invalid value
+        # would silently fall through to the T-side branch in the FD probe,
+        # defeating the iter155 hypothesis, so the validator must hard-reject
+        # at startup.  iteration_F is the gate-aligned target on the actual
+        # two-state Parcae cycle.
+        with self.assertRaises(SystemExit) as ctx:
+            _validate_hyperparameters(_mut(lyapunov_target="iteration_X"))
+        self.assertIn("lyapunov_target", str(ctx.exception))
+        # All three valid values must pass.
+        for valid in ("transition_T", "iteration_S", "iteration_F"):
+            _validate_hyperparameters(_mut(lyapunov_target=valid))
+
+    def test_lyapunov_estimator_enum_is_validated(self) -> None:
+        # iter155 (corrected): `lyapunov_estimator` ∈ {"random_fd",
+        # "power_jvp_F"}.  Default random_fd preserves iter155 cost
+        # envelope; power_jvp_F is opt-in worst-direction probe.
+        with self.assertRaises(SystemExit) as ctx:
+            _validate_hyperparameters(_mut(lyapunov_estimator="hutch_xyz"))
+        self.assertIn("lyapunov_estimator", str(ctx.exception))
+        for valid in ("random_fd", "power_jvp_F"):
+            _validate_hyperparameters(_mut(lyapunov_estimator=valid))
+
     def test_unknown_profile_key_is_rejected(self) -> None:
         # Defends `_CONFIG_PROFILES` against silent typos: a stray attribute on
         # `args` would let the run proceed with the real Hyperparameter at its

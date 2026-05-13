@@ -136,10 +136,16 @@ denoising terms are present as ablation paths gated by both a feature flag
 (\texttt{use\_ctp}, etc.) and a coefficient (\texttt{ctp\_weight},
 \texttt{lyapunov\_coef}, \texttt{denoising\_coef}); all flags default off and
 all coefficients default zero.  After training, validation checks the int6 round-trip
-artifact and a fixed-point iteration-count sweep.  The stability guarantee is
-local: if the spectral radius of
-$J^\star=\nabla_zT_\theta(z^\star,x_0;\bar B)$ is below one, the reached
-equilibrium is a locally exponentially stable attractor.
+artifact and a fixed-point iteration-count sweep.  The stability guarantee
+applies to whichever map drives the iteration: under Parcae the active
+solver iterates the joint two-state cycle
+$F(y,z)=(\bar A y+\beta T_\theta(z),\bar A z+\beta T_\theta(\bar A y+\beta T_\theta(z)))$
+with $\beta=1-\bar A$, so the relevant local condition is
+$\rho(\nabla F(z^\star,z^\star))<1$ — a sufficient (not necessary)
+spectral-radius condition for local exponential stability of the joint
+iteration.  $T_\theta$ alone is retained as a decomposition diagnostic;
+$\rho(\nabla T_\theta)<1$ is sufficient but not necessary for the joint
+condition (Section~\ref{sec:lyapunov}, Remark~\ref{rem:contraction-objects}).
 
 \section{Current Defaults}
 \label{sec:config}
@@ -183,6 +189,7 @@ Mac/MLX support, ignore \texttt{train\_gpt\_mlx.py}.
 \texttt{router\_dirichlet\_ucb\_beta} & 0.5 & \texttt{use\_router\_sigmoid\_gate} & false \\
 \texttt{lyapunov\_coef} & 0.0 & \texttt{lyapunov\_gamma} & 0.97 \\
 \texttt{lyapunov\_every} & 16 & \texttt{lyapunov\_max\_tokens} & 64 \\
+\texttt{lyapunov\_target} & transition\_T & \multicolumn{2}{l}{\small enum: \texttt{transition\_T} (J of $T_\theta$; iter147), \texttt{iteration\_S} (J of $S=\bar A z+(1-\bar A)T_\theta$; advisory), \texttt{iteration\_F} (J of two-state Parcae cycle $F$; gate-aligned, iter155 corrected)} \\
 \texttt{denoising\_coef} & 0.0 & \texttt{denoising\_noise\_std} & 0.01 \\
 \texttt{grad\_clip\_norm} & 1.0 & \texttt{weight\_decay} & 0.015 \\
 \texttt{router\_load\_cv\_coef} & 0.0 & \texttt{router\_ema\_balance\_coef} & 0.30 \\
@@ -747,20 +754,34 @@ $\lambda_D=\texttt{denoising\_coef}$) default to $0.0$, so neither penalty
 contributes to the training loss as configured; the rest of this section
 describes the code path that activates when the coefficients are set positive.
 
-\paragraph{Finite-expansion transition penalty.}
+\paragraph{Finite-expansion penalty.}
 Draw a Gaussian perturbation direction $v$ on a small deterministic token
 window and normalize it to RMS one, $\mathrm{rms}(\hat v)=1$.  With
-$\epsilon=10^{-2}$, compute the local expansion sample
+$\epsilon=10^{-2}$, the configuration knob \texttt{lyapunov\_target} selects
+which Jacobian the local expansion sample probes:
+\begin{align*}
+  M_T(z,x_0) &= T_\theta(z,x_0;\bar B) & \text{(\texttt{transition\_T}; iter147)} \\
+  M_S(z,x_0) &= \bar A\cdot z + (1-\bar A)\cdot T_\theta(z,x_0;\bar B) & \text{(\texttt{iteration\_S}; advisory only)} \\
+  M_F(y,z,x_0) &= \big(\bar A\cdot y + \beta\cdot T_\theta(z), \;\bar A\cdot z + \beta\cdot T_\theta(\bar A\cdot y + \beta\cdot T_\theta(z))\big) & \text{(\texttt{iteration\_F}; iter155 corrected)}
+\end{align*}
+where $\beta = 1-\bar A$.  The expansion sample is the directional derivative
+of the chosen $M$ at the saved fixed point, RMS-normalized over the joint
+output:
 \[
   r =
   \frac{
     \operatorname{rms}\!\left(
-      T_\theta(\stopgrad(z^\star)+\epsilon\hat v,x_0;\bar B)
+      M(\stopgrad(z^\star)+\epsilon\hat v,x_0)
       -
-      T_\theta(\stopgrad(z^\star),x_0;\bar B)
+      M(\stopgrad(z^\star),x_0)
     \right)
   }{\epsilon}.
 \]
+For \texttt{iteration\_F}, the joint state is $(y, z)$ initialized at
+$(z^\star, z^\star)$ (since at the fixed point $y^\star = z^\star$ and
+$T(z^\star) = z^\star$); independent random directions $\hat v_y, \hat v_z$
+perturb each half, and $r$ is the joint RMS over both output halves.  The
+penalty itself is unchanged:
 \begin{equation}
   \mathcal{L}_{\rm jac}
     = \lambda_{\rm jac}\,s(t)\,(r-\gamma)_+^2.
@@ -769,11 +790,103 @@ $\epsilon=10^{-2}$, compute the local expansion sample
 Here $\gamma=0.97$, and $s(t)$ is the same regularizer warmup scale used for
 the router/diversity stack.  The penalty runs every
 \texttt{lyapunov\_every=16} optimizer steps on at most
-\texttt{lyapunov\_max\_tokens=64} tokens.  It constrains the transition map
-itself rather than the scalar solver blend; gradients reach $\theta$ and
-Parcae's live $\bar B$ through the two block evaluations.  The coefficient
-$\lambda_{\rm jac}$ is the runtime value of \texttt{lyapunov\_coef}; it remains
-$0.0$ by default.
+\texttt{lyapunov\_max\_tokens=64} tokens.  Cost: T and S branches share
+two block evaluations; F branch needs four (the two-state cycle evaluates
+$T$ twice).  Each branch is a soft directional proxy for the operator
+norm of the chosen Jacobian (Hutchinson Frobenius$/\sqrt D$ on a single
+random direction — an under-estimate of $\sigma_{\max}(J)$, not a
+spectral-radius proxy).  The gate-aligned \emph{empirical local-contraction
+metric} is \texttt{lip\_ub\_F} (estimate on the actual two-state Parcae
+cycle), with \texttt{lip\_ub\_S} (single-state convex blend; advisory
+surrogate) and \texttt{lip\_ub\_T} (transition map alone; decomposition
+diagnostic) reported alongside for failure attribution.
+
+\textbf{Honesty caveat.}  Power iteration with $n_\text{iters}=3$ in noisy
+bf16 is a lower-bound estimator of $\sigma_{\max}$ — the reported
+\texttt{lip\_ub\_F} systematically under-estimates the true operator
+norm.  The safety multiplier (\texttt{fp\_lip\_ub\_safety}=1.10 by
+default) is a heuristic conservative margin, not a proof.  Even
+$\sigma_{\max}(J_F)<1$ exactly is only a sufficient condition for
+$\rho(J_F)<1$ (a non-normal Jacobian can have $\rho \to 0$ while
+$\sigma_{\max}$ stays large via "transient amplification"), so
+\texttt{lip\_ub\_F} is best read as an \emph{empirical local-contraction
+metric}, not a formal certificate.
+
+\paragraph{Two tiers of contraction control.}
+The codebase explicitly distinguishes two tiers of mechanism for the
+contraction problem; conflating them is the source of overclaiming bugs
+flagged in iter155 review:
+
+\begin{enumerate}[leftmargin=2em,itemsep=0.2em]
+  \item \emph{Architecture-agnostic empirical pressure} (current iter155
+    + iter156a paths).  Mechanism: K-sweep \texttt{lip\_ub\_F} probe +
+    Lyapunov-on-F soft FD penalty (with optional
+    \texttt{lyapunov\_estimator=power\_jvp\_F} worst-direction probe) +
+    iter156a heuristic Ā-projection governor.  Property: preserves model
+    capacity (no Lipschitz constraint on the architecture itself), runs
+    with default-off coefficient and BPB-gated aug-Lagrangian
+    escalation.  Guarantee: \emph{none} — power iteration is a
+    lower-bound estimator, the safety multiplier is heuristic, and the
+    Ā governor is non-monotone in $\sigma_{\max}(J_F)$.  This tier
+    measures and pressures the right object empirically.
+  \item \emph{Formal-guarantee tier} (iter156b and siblings; not present
+    in iter155).  Mechanisms with true upper-bound semantics:
+    interval/explicit-Jacobian bound estimation over a local ball,
+    spectral normalization of $\Delta$, bounded-Lipschitz block
+    parameterization, or a learned $c\in(0,1]$ gain on $\Delta$ that is
+    hard-projected at design time.  Property: introduces an explicit
+    architectural Lipschitz constraint that may reduce model capacity in
+    exchange for a real upper bound on $\sigma_{\max}(J_F)$.  Guarantee:
+    a true Lipschitz cert is achievable only by combining a
+    formal-tier mechanism with the F-side measurement.
+\end{enumerate}
+
+iter155 is firmly tier (1).  Promotion rules (BPB-gated, soft escalation)
+reflect that.  No part of tier (1) should be described as a "certificate"
+or as "guaranteeing" contraction or capacity preservation.  Moving to
+tier (2) is an explicit model-class decision documented in iter156b.
+
+The Banach-style FP error \emph{a posteriori bound metric} at the saved
+fixed point uses the joint cycle residual paired with the same operator
+norm: \texttt{fp\_bound = fp\_residual\_F / (1 - lip\_ub\_F)}, where
+$\texttt{fp\_residual\_F} = \|F(z^\star,z^\star)-(z^\star,z^\star)\|_{\rm RMS}/\|(z^\star,z^\star)\|_{\rm RMS}$.
+This is principled \emph{only if} \texttt{lip\_ub\_F} upper-bounds the
+local Lipschitz constant on a neighborhood of $(z^\star, z^\star)$ — a
+pointwise power-iteration estimate at the single sampled FP is an
+\emph{empirical a posteriori bound metric}, not a formal Banach bound.
+Producing a true Banach bound would require either an interval/explicit-
+Jacobian estimate over a small local ball (e.g.\ Lipschitz-bound
+estimation across a finite cover of perturbed $z$ samples) or a
+hard Lipschitz-bound parameterization of $F$ (spectral-normalized layers,
+bounded-Lipschitz blocks, or a learned $c\in(0,1]$ gain on $\Delta$
+constrained at design time).  iter155 deliberately introduces neither;
+\texttt{fp\_bound} is therefore reported as a comparable cross-iteration
+metric, not a guarantee.
+
+Gradients reach $\theta$ through the block evaluations under any target.
+Under \texttt{iteration\_S} and \texttt{iteration\_F}, gradients
+additionally reach Parcae's live $\bar A$ through the outside-linear-blend
+coefficients (these are first-order, no second-order FD curvature concern,
+so $\bar A$ is \emph{not} detached).  Parcae's $\bar B$, by contrast, is
+\emph{detached} on the FD probe (\texttt{aux\_b\_bar.detach()}): $\bar B$
+appears \emph{inside} the FD subtraction $\texttt{sb}(z+\epsilon u, x_0; \bar B)
+- \texttt{sb}(z, x_0; \bar B)$, where its gradient would carry $O(\epsilon)$
+second-order curvature noise.  $\bar B$ continues to receive task-side
+gradients through the main forward and through the denoising path (when
+enabled).  The coefficient $\lambda_{\rm jac}$ is the runtime value of
+\texttt{lyapunov\_coef}; it remains $0.0$ by default.
+
+The \texttt{iteration\_F} target is the right object for fixed-point
+convergence: $F$ is the actual cycle the Parcae solver iterates (see
+Section~\ref{sec:summary} and \texttt{RevDEQFunction.forward}'s alternating
+$y$/$z$ update), so $\sigma_{\max}(\nabla F(z^\star, z^\star))<1$ is what
+suffices for local exponential stability of the joint iteration in
+Banach-norm sense (Theorem~\ref{thm:lyap_main} states the equivalent
+spectral-radius condition for non-norm linearizations; the norm condition
+is strictly stronger).  The earlier \texttt{transition\_T} and
+\texttt{iteration\_S} targets are preserved as backward-compatible code
+paths and as advisory diagnostics; their relations are documented in
+Remark~\ref{rem:contraction-objects} below.
 
 \paragraph{Finite-perturbation denoising.}
 With $\xi\sim\mathcal{N}(0,\sigma^2I)$ and $\sigma=0.01$,
@@ -863,14 +976,25 @@ preferred fix order is:
 Every fix should state the invariant it enforces and which diagnostics merely
 verify it.  For example, an attention min-share failure should first route to
 the generic router usage controller, not to an attention-only min-share loss;
-a \texttt{lip\_ub} failure should first route to transition-map
-parameterization, not another coefficient sweep on a proxy Lyapunov loss.
+a \texttt{lip\_ub\_F} failure (the gate-aligned contraction object on the
+actual two-state Parcae cycle map $F$) should first route to setting
+\texttt{lyapunov\_target=iteration\_F} and tightening Parcae damping
+\emph{together with} transition-map parameterization (since $J_F$ couples
+$J_T$ through cross blocks $\beta\cdot J_T$ that damping alone cannot
+suppress when $\sigma_{\max}(J_T)>1$), with \texttt{lip\_ub\_T} and
+\texttt{lip\_ub\_S} consulted as decomposition diagnostics that attribute
+the failure to damping-vs-transition causes; another coefficient sweep on
+the same proxy Lyapunov loss without first switching the target is
+forbidden.
 
 \section{Local Stability Guarantee}
 \label{sec:lyapunov}
 
 This section states the mathematical guarantee used to justify the local
-stability target.  It is a property of the fixed-point map $T$, not a claim that
+stability target.  It is stated generically for any iteration map $M$ —
+under Parcae the active solver's iterated map is the joint two-state
+$M = F$ (Remark~\ref{rem:contraction-objects}), not the transition map
+$T_\theta$ in isolation.  The guarantee is local: it does not claim that
 the current finite-step solver globally converges from every state.
 
 \begin{definition}[Spectral radius]
@@ -881,26 +1005,37 @@ For a square linear operator $A$,
 \end{definition}
 
 \begin{definition}[Local exponential stability]
-Let $z^\star=T(z^\star)$ and define the iteration $z_{k+1}=T(z_k)$.  The fixed
-point is locally exponentially stable if there exist $\delta>0$, $C>0$, and
-$\eta\in(0,1)$ such that
+Let $x^\star=M(x^\star)$ and define the iteration $x_{k+1}=M(x_k)$.  The
+fixed point is locally exponentially stable if there exist $\delta>0$,
+$C>0$, and $\eta\in(0,1)$ such that
 \[
-  \|z_0-z^\star\|<\delta
+  \|x_0-x^\star\|<\delta
   \quad\Longrightarrow\quad
-  \|z_k-z^\star\|\le C\eta^k\|z_0-z^\star\|
+  \|x_k-x^\star\|\le C\eta^k\|x_0-x^\star\|
   \quad\text{for all }k\ge0.
 \]
 \end{definition}
 
 \begin{theorem}[Jacobian spectral radius below one implies local convergence]
 \label{thm:lyap_main}
-Let $T$ be continuously differentiable in a neighborhood of $z^\star$, and let
-$z^\star=T(z^\star)$.  If
+Let $M$ be continuously differentiable in a neighborhood of $x^\star$,
+and let $x^\star=M(x^\star)$.  If
 \[
-  \rho\!\left(\nabla T(z^\star)\right)<1,
+  \rho\!\left(\nabla M(x^\star)\right)<1,
 \]
-then $z^\star$ is locally exponentially stable for $z_{k+1}=T(z_k)$.
+then $x^\star$ is locally exponentially stable for $x_{k+1}=M(x_k)$.
 \end{theorem}
+
+\paragraph{Application to the active solver.}
+Under Parcae, the iterated map is $M=F$ on the joint state $(y, z)$;
+the relevant local condition is therefore
+$\rho(\nabla F(z^\star,z^\star))<1$.  The K-sweep estimator
+\texttt{lip\_ub\_F} reports $\sigma_{\max}(\nabla F)$ as a power-iteration
+estimate (sufficient for $\rho<1$ when accurate), with the honesty caveat
+that power iteration is a lower-bound estimator — see Section~\ref{sec:reg}
+for the empirical-vs-formal distinction.  The transition map $T_\theta$
+is retained as a decomposition diagnostic only; $\rho(\nabla T_\theta)<1$
+is sufficient but not necessary for the joint condition.
 
 \begin{proof}
 Let $J=\nabla T(z^\star)$.  Since $\rho(J)<1$, the discrete Lyapunov theorem
@@ -947,6 +1082,107 @@ initializations land in the same basin.  It justifies training pressure that
 shrinks the local Jacobian around solver-reached states.  The code's K-sweep,
 iterate-convergence, and reconstruction checks are the empirical validation
 that the finite RevDEQ/Parcae solver behaves like a useful fixed-point model.
+\end{remark}
+
+\begin{remark}[Choosing the contraction object: $T_\theta$ vs $S$ vs $F$ — iter155 corrected]
+\label{rem:contraction-objects}
+The theorem applies to whatever map drives the iteration.  The actual Parcae
+solver iterates the two-state cycle
+\[
+  F(y, z) = \big(D_A\, y + D_\beta\, T_\theta(z),\;
+                D_A\, z + D_\beta\, T_\theta(D_A\, y + D_\beta\, T_\theta(z))\big),
+\]
+with $D_A = \mathrm{diag}(\bar A)$ and $D_\beta = \mathrm{diag}(1-\bar A)$
+the per-dimension Parcae gates (so $\bar A$ and $\beta$ are model-dim
+vectors, not scalars; matrix-multiplication order matters when they meet
+the dense $J_T$).  This is \emph{not} the single-state convex blend
+$S(z) = D_A z + D_\beta T_\theta(z)$ that one might naïvely write down.
+The Jacobian of $F$ at the fixed point $(y^\star, z^\star) = (z^\star, z^\star)$
+has block structure (with $J_T = \nabla T_\theta(z^\star)$):
+\[
+  \nabla F =
+  \begin{bmatrix}
+    D_A & D_\beta\, J_T \\
+    D_\beta\, J_T\, D_A & D_A + D_\beta\, J_T\, D_\beta\, J_T
+  \end{bmatrix}.
+\]
+The diagonal $D_A, D_\beta$ matrices do \emph{not} commute with $J_T$ in
+general, so order is preserved as written; the K-sweep \texttt{lip\_ub\_F}
+probe builds the JVP through the literal closure
+$\texttt{a\_bar\_t}*y + (1-\texttt{a\_bar\_t})*\texttt{sb}(z, x_0; \bar B)$
+(elementwise multiply), which gives \texttt{torch.autograd} the correct
+order automatically.  $J_F$ couples $J_T$ through the off-diagonal
+$D_\beta\, J_T$ blocks and through $D_\beta\, J_T\, D_\beta\, J_T$ in the
+lower-right.  The gate-aligned \emph{empirical local-contraction
+condition} is $\sigma_{\max}(J_F)<1$ (estimated by \texttt{lip\_ub\_F};
+sufficient but not equivalent to $\rho(J_F)<1$, and the estimator itself
+is a lower bound on $\sigma_{\max}$ rather than a hard upper bound — see
+the honesty caveat in Section~\ref{sec:reg}).
+
+The single-state surrogate $S$ and the transition map $T_\theta$ are kept
+as advisory decomposition diagnostics, with the following
+operator-norm relations clarifying what damping can and cannot do:
+
+\begin{enumerate}[leftmargin=2em,itemsep=0.2em]
+  \item \emph{For the convex-blend surrogate $S$}: by sub-additivity,
+    $\sigma_{\max}(J_S) \le \bar A + (1-\bar A)\,\sigma_{\max}(J_T)$.  When
+    $\sigma_{\max}(J_T) < 1$, this is sufficient for $\sigma_{\max}(J_S) < 1$
+    (the bound is below $1$).  When $\sigma_{\max}(J_T) > 1$, however,
+    $\bar A + (1-\bar A)\,\sigma_{\max}(J_T) > 1$ for every $\bar A < 1$:
+    convex blending with the identity \emph{cannot} contract a positive
+    expanding singular mode of $T$.  The same conclusion holds for
+    eigenvalues of $J_S$: any positive real eigenvalue $\lambda_T > 1$ of
+    $J_T$ produces $\bar A + (1-\bar A)\,\lambda_T > 1$.
+  \item \emph{For the actual cycle $F$}: damping alone is even more limited.
+    The cross-block $\beta\cdot J_T$ entries scale linearly with the
+    transition magnitude, so a large $\sigma_{\max}(J_T)$ produces
+    a large $\sigma_{\max}(J_F)$ via the off-diagonal blocks regardless
+    of $\bar A$.  Bringing $\sigma_{\max}(J_F) < 1$ requires \emph{joint}
+    pressure on $\bar A$ (toward the reversibility ceiling) \emph{and} on
+    the transition parameters $\theta$ (to shrink $\sigma_{\max}(J_T)$).
+\end{enumerate}
+
+In particular: with $D_A, D_\beta$ per-dim and order preserved as written
+in $\nabla F$ above, the same bound holds elementwise — damping alone
+cannot rescue an expansive transition mode in either $S$ or $F$.
+
+So $\rho(\nabla T_\theta) < 1$ \emph{is} sufficient for $\rho(\nabla S) < 1$
+(scalar convex blend with $I$).  For the joint $J_F$ with per-dim,
+non-commuting $D_A, D_\beta$ gates, the analogous implication is
+\emph{not} a textbook spectral-radius bound — the upper-right block is
+$D_\beta J_T$ rather than a convex combination, and the lower-left and
+lower-right blocks introduce $D_\beta J_T D_A$ and $D_\beta J_T D_\beta J_T$
+terms that depend on the eigenstructure of $J_T$ in a non-monotone way.
+We do not state $\rho(\nabla T_\theta)<1 \Rightarrow \rho(\nabla F)<1$ as
+a general guarantee; the safe stance is that the contraction guarantee
+must be evaluated directly on $F$ (via $\sigma_{\max}(J_F)$ or a true
+local-ball Lipschitz bound).  $T_\theta$ is retained as a decomposition
+diagnostic only: a large $\sigma_{\max}(J_T)$ at iter145r/149/152
+($\texttt{lip\_ub\_T}\in[22,65]$) attributes the F-side expansion to the
+transition rather than to insufficient damping, but does not by itself
+imply F is expansive (or contractive).
+The gate-aligned remediation under \texttt{iteration\_F} therefore trains
+$\bar A$ \emph{and} $\theta$ jointly through the F-side FD penalty.
+iter156 escalates: (156a) is a \emph{heuristic} Ā-projection governor
+that probes $\texttt{lip\_ub\_F}$ and adjusts $\bar A$ greedily but
+without a monotonicity guarantee on $\sigma_{\max}(J_F)$; (156b)
+introduces a learned $c\in(0,1]$ gain on $\Delta$ as a true bounded-
+Lipschitz parameterization (the formal-guarantee tier) — combined with
+F-side measurement, 156b can actually enforce a Lipschitz upper bound.
+Sibling formal-tier paths: spectral normalization of $\Delta$,
+bounded-Lipschitz block parameterization, or interval/explicit-Jacobian
+estimation over a local ball.
+
+A subtlety: the K-sweep \texttt{lip\_ub} probes use power iteration
+($n\_\text{iters}=3$ by default), which converges to the dominant singular
+value from below.  In short runs or when the dominant direction is not
+quickly captured, the reported \texttt{lip\_ub} can underestimate
+$\sigma_{\max}$.  A reading $\texttt{lip\_ub\_F}<1$ is therefore an
+empirical local-contraction estimate, not a hard certificate; iter156's
+hard governor design will provide projection-based enforcement, and a
+true formal certificate requires either an interval/explicit-Jacobian
+bound or a model-class change (spectral normalization, bounded-Lipschitz
+layers, or a learned $c\in(0,1]$ gain on $\Delta$).
 \end{remark}
 
 \appendix
