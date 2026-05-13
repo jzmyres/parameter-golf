@@ -85,7 +85,7 @@ class TestTrainingContracts(unittest.TestCase):
         text = OPG_DOC.read_text()
         self.assertIn(r"\texttt{train\_gpt\_mlx.py} script is an Apple Silicon/MLX starter path", text)
         for pattern in (
-            r"\\texttt\{deq\\_k\\_jitter\\_set\}\s*&\s*\$\(16,24,32,64\)\$",
+            r"\\texttt\{deq\\_k\\_jitter\\_set\}\s*&\s*\$\(16,24,32,64,96,128\)\$",
             r"\\texttt\{config\\_profile\}\s*&\s*fast\\_default",
             r"\\texttt\{eval\\_profile\}\s*&\s*diagnostic",
             r"\\texttt\{diagnostic\\_gate\\_policy\}\s*&\s*advisory",

@@ -209,6 +209,14 @@ def parse_log(logpath: str) -> dict:
                 "lip_ub_T",
                 "lip_ub_S",
                 "lip_ub_F",
+                # Tier 2 (2026-05-13): rho_F = |lambda_max(J_F)|, the
+                # spectral-radius estimate that is necessary AND
+                # sufficient for asymptotic local FP convergence
+                # (Hartman--Grobman; architecture-agnostic).  Replaces
+                # lip_ub_F as the gate-relevant convergence signal;
+                # lip_ub_F is now an over-restrictive operator-norm
+                # diagnostic only.
+                "rho_F",
                 # iter155 corrected: joint cycle residual paired with
                 # lip_ub_F in fp_bound = fp_residual_F / (1 - lip_ub_F).
                 "fp_residual_F",

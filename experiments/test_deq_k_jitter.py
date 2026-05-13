@@ -23,10 +23,10 @@ class TestDeqKJitterDefaults(unittest.TestCase):
             self.assertTrue(hasattr(Hyperparameters, f), f"missing field: {f}")
         # Current baseline: weighted forward-K jitter; eval remains K=16.
         self.assertEqual(Hyperparameters.deq_k_jitter, True)
-        self.assertEqual(Hyperparameters.deq_k_max, 64)
+        self.assertEqual(Hyperparameters.deq_k_max, 128)
         self.assertEqual(Hyperparameters.deq_k_eval, 16)
-        self.assertEqual(Hyperparameters.deq_k_jitter_set, (16, 24, 32, 64))
-        self.assertEqual(Hyperparameters.deq_k_jitter_weights, (0.50, 0.40, 0.07, 0.03))
+        self.assertEqual(Hyperparameters.deq_k_jitter_set, (16, 24, 32, 64, 96, 128))
+        self.assertEqual(Hyperparameters.deq_k_jitter_weights, (0.50, 0.40, 0.07, 0.03, 0.015, 0.0075))
         self.assertGreaterEqual(Hyperparameters.deq_k_min, 2)
 
     def test_bptt_k_jitter_defaults(self):

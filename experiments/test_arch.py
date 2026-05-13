@@ -14,6 +14,10 @@ def _make_model(**overrides):
     # code. Production defaults (use_ctp=False, num_refinements=0) flipped in
     # iter146 and are pinned by `test_gpt_constructor_defaults_track_hyperparameters`
     # which constructs `GPT()` without going through this helper.
+    # `deq_prefix_anchors=False` pinned explicitly in 2026-05-13 because the
+    # production default flipped to True (iter152 promotion-propagation fix)
+    # but prefix anchors are incompatible with num_refinements=1 (validator
+    # rejects the combo).  Tests that need prefix anchors must override.
     from train_gpt import GPT
     defaults = dict(
         vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
@@ -22,6 +26,7 @@ def _make_model(**overrides):
         qk_gain_init=1.5, bigram_vocab_size=16384, bigram_dim=256,
         kv_latent_dim=0, num_refinements=1,
         use_ctp=True,
+        deq_prefix_anchors=False,
     )
     defaults.update(overrides)
     dev = _get_device()
@@ -524,12 +529,16 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
         "needs_mos_output_geometry_constraint",
         "needs_transition_parameterization",
         "needs_transition_jacobian_control",
-        # iter155: gate-aligned contraction object (Parcae-blended iteration
-        # map S).  Invariant-mechanism: route to `lyapunov_target=iteration_S`
-        # (parameterization of which Jacobian we control) AND tighter Parcae
-        # damping AND eventually iter156 hard governor — all reusable across
-        # any contraction failure mode, not a per-symptom loss.
+        # iter155 corrected: contraction-object key was needs_iteration_map_contraction
+        # (Lyapunov-on-F target). Tier 1+2 redesign 2026-05-13 reframed the gate
+        # from operator norm (lip_ub_F, over-restrictive) to spectral radius
+        # (rho_F, necessary AND sufficient for asymptotic local convergence).
+        # The lip_ub_F branch became advisory; rho_F branch routes to
+        # needs_formal_tier_contraction (formal-tier mechanism: spectral
+        # normalization, bounded-Lipschitz block, learned c·Δ gain — all
+        # reusable, NOT a per-symptom loss).
         "needs_iteration_map_contraction",
+        "needs_formal_tier_contraction",
     }
     metric_specific_keys = {
         "expert_output_diversity_coef_mult",
@@ -551,10 +560,17 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
         ("mos_ntp_ortho=0.61 > 0.5", "mos_head_collapse",
          {"needs_mos_output_geometry_constraint"}, set()),
         ("k-sweep delta > 0.1 at K=64", "fp_quality_loss", set(), set()),
-        ("lip_ub_F=45.0 >= 1.0", "local_contraction_failed",
-         {"needs_iteration_map_contraction"}, {"lyapunov_coef"}),
+        # Tier 1+2 redesign 2026-05-13: lip_ub_F demoted to advisory; the
+        # gate-relevant signal is now rho_F (spectral radius, necessary AND
+        # sufficient for asymptotic convergence) and iter_conv_rel (empirical).
+        ("lip_ub_F=45.0 >= 1.0", "operator_norm_advisory",
+         set(), {"lyapunov_coef", "needs_iteration_map_contraction"}),
+        ("rho_F=1.2 >= 1.0", "fp_convergence_failed",
+         {"needs_formal_tier_contraction"}, {"lyapunov_coef"}),
         ("fp_bound=2.5 >= 1.0", "fp_certificate_loose", set(), set()),
-        ("iter_conv_rel=0.6 > 0.3", "solver_divergence", set(), set()),
+        # iter_conv_rel category renamed Tier 1: gate-relevant empirical signal.
+        ("iter_conv_rel=0.6 > 0.3", "fp_convergence_empirical_failed",
+         {"weight_decay_mult", "deq_k_max_delta"}, {"lyapunov_coef"}),
         ("deq_recon_err=1.5e-2 > 1e-3", "reversibility_broken", set(), set()),
     ]
     for failure, expected_category, required, forbidden in cases:
@@ -567,15 +583,20 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
             assert key in change_keys, f"{failure!r}: missing required key {key!r} in {change_keys}"
         for key in forbidden:
             assert key not in change_keys, f"{failure!r}: forbidden key {key!r} appears in {change_keys}"
-        # Root-cause fix preference: invariant mechanism OR explicit ablation framing.
+        # Root-cause fix preference: invariant mechanism OR explicit ablation
+        # framing OR advisory-only category (Tier 1 redesign 2026-05-13:
+        # operator-norm proxies like lip_ub_F are now diagnostic-only and
+        # legitimately have no config_change; the gate-relevant prescriptions
+        # are rho_F and iter_conv_rel which DO have invariant_keys.)
         has_invariant = bool(change_keys & invariant_keys)
         has_metric_only = bool(change_keys & metric_specific_keys)
         fix_text = p["fix"].lower()
         framed_as_ablation = "temporary ablation" in fix_text or "fallback only" in fix_text
-        assert has_invariant or framed_as_ablation, (
-            f"{failure!r}: config_change={change_keys} has no invariant mechanism "
-            f"and the fix string lacks 'temporary ablation' framing — "
-            f"violates Root-cause fix preference."
+        is_advisory_category = p["category"].endswith("_advisory") or p["category"] == "single_state_blend_loose" or p["category"] == "transition_jacobian_loose"
+        assert has_invariant or framed_as_ablation or is_advisory_category, (
+            f"{failure!r}: config_change={change_keys} has no invariant mechanism, "
+            f"the fix string lacks 'temporary ablation' framing, AND the category "
+            f"({p['category']!r}) is not advisory — violates Root-cause fix preference."
         )
         if has_metric_only and not has_invariant:
             assert framed_as_ablation, (
@@ -646,10 +667,18 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
         assert bool(r.use_router_sigmoid_gate) is False
 
     from train_gpt import _prescribe_failure_fix
+    # Tier 1 redesign 2026-05-13: lip_ub_F demoted to advisory diagnostic
+    # (operator norm is sufficient but over-restrictive for asymptotic
+    # convergence; the gate-relevant signal is rho_F).
     p_lip = _prescribe_failure_fix("lip_ub_F=45.0 >= 1.0")
-    assert p_lip["category"] == "local_contraction_failed"
-    assert "needs_iteration_map_contraction" in p_lip["config_change"]
+    assert p_lip["category"] == "operator_norm_advisory"
     assert "lyapunov_coef" not in p_lip["config_change"]
+    # New gate-relevant prescription: rho_F (spectral radius) routes to
+    # the formal-tier mechanism, NOT a soft penalty.
+    p_rho = _prescribe_failure_fix("rho_F=1.2 >= 1.0")
+    assert p_rho["category"] == "fp_convergence_failed"
+    assert "needs_formal_tier_contraction" in p_rho["config_change"]
+    assert "lyapunov_coef" not in p_rho["config_change"]
     # iter155 corrected: lip_ub_S is now an advisory surrogate, not a gate.
     p_lip_s = _prescribe_failure_fix("lip_ub_S=45.0 >= 1.0")
     assert p_lip_s["category"] == "single_state_blend_loose"

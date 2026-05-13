@@ -184,7 +184,7 @@ Mac/MLX support, ignore \texttt{train\_gpt\_mlx.py}.
 \texttt{parcae\_lr} & 0.002 & \texttt{deq\_backward} & revdeq only \\
 \texttt{deq\_bptt\_k} & 3 & \texttt{deq\_bptt\_k\_jitter} & false \\
 \texttt{deq\_bptt\_k\_jitter\_set} & $(3)$ & \texttt{deq\_k\_jitter} & true \\
-\texttt{deq\_k\_jitter\_set} & $(16,24,32,64)$ & \texttt{deq\_k\_jitter\_weights} & $(0.50,0.40,0.07,0.03)$ \\
+\texttt{deq\_k\_jitter\_set} & $(16,24,32,64,96,128)$ & \texttt{deq\_k\_jitter\_weights} & $(0.50,0.40,0.07,0.03,0.015,0.0075)$ \\
 \texttt{deq\_k\_eval} & 16 & \texttt{router\_scoring} & dirichlet\_ucb \\
 \texttt{router\_dirichlet\_ucb\_beta} & 0.5 & \texttt{use\_router\_sigmoid\_gate} & false \\
 \texttt{lyapunov\_coef} & 0.0 & \texttt{lyapunov\_gamma} & 0.97 \\
@@ -535,8 +535,10 @@ to the fixed-point equation
 \]
 
 The default training step samples the forward iteration count from
-$K\in\{16,24,32,64\}$ using a deterministic weighted bag with weights
-$(0.50,0.40,0.07,0.03)$.  Evaluation defaults to
+$K\in\{16,24,32,64,96,128\}$ using a deterministic weighted bag with weights
+$(0.50,0.40,0.07,0.03,0.015,0.0075)$ (low-frequency tail at K=96 and
+K=128 added 2026-05-13 to expose training to the gate-relevant K=128
+evaluation depth).  Evaluation defaults to
 $K=16$, and the final diagnostic sweep evaluates
 \[
   K\in\{4,8,16,17,24,32,37,64,113,128\}
@@ -1030,12 +1032,40 @@ then $x^\star$ is locally exponentially stable for $x_{k+1}=M(x_k)$.
 Under Parcae, the iterated map is $M=F$ on the joint state $(y, z)$;
 the relevant local condition is therefore
 $\rho(\nabla F(z^\star,z^\star))<1$.  The K-sweep estimator
-\texttt{lip\_ub\_F} reports $\sigma_{\max}(\nabla F)$ as a power-iteration
-estimate (sufficient for $\rho<1$ when accurate), with the honesty caveat
-that power iteration is a lower-bound estimator — see Section~\ref{sec:reg}
-for the empirical-vs-formal distinction.  The transition map $T_\theta$
-is retained as a decomposition diagnostic only; $\rho(\nabla T_\theta)<1$
-is sufficient but not necessary for the joint condition.
+\texttt{rho\_F} reports $\rho(\nabla F)$ via straight power iteration on
+$J_F$ (\(v_{k+1}=J_F v_k/\|J_F v_k\|\); the per-step ratio
+\(\|J_F v\|/\|v\|\) at convergence equals $|\lambda_{\max}|$).  This
+is the gate-relevant signal because $\rho<1$ is necessary AND sufficient
+for the local condition above.  An auxiliary K-sweep estimator
+\texttt{lip\_ub\_F} reports $\sigma_{\max}(\nabla F)$ via power iteration
+on $J_F^\top J_F$; this is logged as an over-restrictive diagnostic only,
+since $\sigma_{\max}<1$ is sufficient (Banach contraction principle) but
+not necessary for $\rho<1$ --- the gap can be huge for non-symmetric
+$J_F$, as iter152 empirically confirms ($\sigma_{\max}\approx 17$ with
+\texttt{iter\_conv\_rel}$\approx 0.02$ at K=128, demonstrating the
+iteration converges fine even with large operator norm).  The
+transition map $T_\theta$ is retained as a decomposition diagnostic
+only; $\rho(\nabla T_\theta)<1$ is sufficient but not necessary for the
+joint condition.
+
+\paragraph{Architecture-agnostic constraint.}
+The framework above is independent of any particular model architecture.
+For any iteration mechanism --- alternative DEQ solvers, refinement
+loops, recurrent layers, or future iterative components --- the same
+condition $\rho(J_M)<1$ on the iteration map's Jacobian governs
+asymptotic local convergence (Hartman--Grobman theorem applied to the
+linearization at the fixed point).  Promotion of any such mechanism is
+gated on \texttt{rho\_F < 1} (theoretical, when measurable on $F$ or its
+analog $J_M$) or \texttt{iter\_conv\_rel < 0.05} at deepest K
+(empirical operational signal).  Soft penalties on operator-norm
+proxies were empirically refuted (iter155, 2026-05-13) as not
+principled: they target the wrong condition AND cannot reliably
+constrain spectral properties via soft pressure.  When formal
+enforcement is needed, the principled mechanism is hard
+parameterization (spectral normalization on $T_\theta$ component
+layers, bounded-Lipschitz block parameterization, or learned
+$c\cdot\Delta$ gain with hard projection), not coefficient-tuned soft
+penalties.
 
 \begin{proof}
 Let $J=\nabla T(z^\star)$.  Since $\rho(J)<1$, the discrete Lyapunov theorem

@@ -523,6 +523,55 @@ def math_isfinite(x: float) -> bool:
     return math.isfinite(x)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_rho_F_at_saved_fp_returns_finite_float():
+    """Tier 2 (2026-05-13): ``rho_F`` is the spectral-radius estimate
+    |λ_max(J_F)| via straight power iteration on J_F.
+
+    Necessary AND sufficient condition for asymptotic local FP convergence
+    (Hartman--Grobman): rho(J_F) < 1 iff the fixed point is locally
+    attractive.  Architecture-agnostic: the same condition governs any
+    iteration map M, not specifically the Parcae cycle.
+
+    Companion to ``lip_ub_F`` which returns sigma_max(J_F) (operator
+    norm, sufficient but over-restrictive).  rho <= sigma_max always,
+    with equality only for normal/symmetric matrices; for non-symmetric
+    J_F the gap can be huge.
+    """
+    from train_gpt import _rho_F_at_saved_fp
+    model = _make_small_model()
+    _populate_saved_fp(model)
+    rho_F = _rho_F_at_saved_fp(model, n_iters=8, B_probe=1)
+    assert rho_F is not None, "rho_F returned None — should yield a finite float"
+    assert isinstance(rho_F, float), f"expected float, got {type(rho_F).__name__}"
+    assert 0.0 < rho_F < 1e6, f"rho_F out of plausible range: {rho_F}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_rho_F_is_at_most_lip_ub_F_at_saved_fp():
+    """Mathematical invariant: |λ_max(J)| ≤ σ_max(J) for any matrix J.
+
+    The spectral radius is bounded above by the operator norm
+    (proof: σ_max = ||J||_2 = sup_{||v||=1} ||Jv||, and for any
+    eigenvector v with eigenvalue λ, ||Jv|| = |λ|·||v||, so
+    |λ| ≤ σ_max).  Power-iteration estimates can have noise so we
+    use a 25% slack tolerance — but rho_F should never exceed
+    1.25 * lip_ub_F by more than estimator noise.
+    """
+    from train_gpt import _lip_ub_at_saved_fp, _rho_F_at_saved_fp
+    model = _make_small_model()
+    _populate_saved_fp(model)
+    lip_ub_F = _lip_ub_at_saved_fp(model, n_iters=4, B_probe=1, map_kind="F")
+    rho_F = _rho_F_at_saved_fp(model, n_iters=8, B_probe=1)
+    assert lip_ub_F is not None and rho_F is not None
+    # rho ≤ sigma_max strictly; allow 25% slack for finite-iteration
+    # power-iteration noise on both estimates.
+    assert rho_F <= lip_ub_F * 1.25, (
+        f"rho_F={rho_F:.4f} > 1.25 * lip_ub_F={lip_ub_F:.4f} — violates "
+        f"mathematical invariant rho(J) ≤ σ_max(J)"
+    )
+
+
 def test_lip_ub_F_is_always_probed_on_FP_eval_unconditional_of_cadence_knob():
     """User directive 2026-05-13: ``lip_ub_F`` is the gate-aligned
     contraction object on the actual two-state Parcae cycle.  It MUST
