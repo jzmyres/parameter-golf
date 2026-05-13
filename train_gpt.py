@@ -550,6 +550,15 @@ class Hyperparameters:
     # ideal long-run balance and stronger token specialization.
     router_ema_balance_coef = 0.30
     router_ema_specialization_coef = 0.20
+    # iter153 (provisional default-on, pending iter result): use reverse KL
+    # `KL(U || EMA)` instead of forward `KL(EMA || U)` for the balance term.
+    # Forward KL weights each per-expert term by EMA_i, so a dead expert at
+    # tiny EMA_i contributes a tiny loss term even when log(EMA_i / U_i) is
+    # large; the gradient on the tail vanishes. Reverse KL weights by U_i,
+    # giving each expert an equal weight regardless of mass, and the gradient
+    # on EMA_i diverges as EMA_i → 0 — exactly the asymmetry the min-share
+    # gate needs. Revert to False if iter153 fails.
+    use_reverse_kl_balance = True
     # iter 100b (2026-04-27): per-token entropy penalty with ANNEALED schedule
     # + min_share_loss decoupled. iter 100 (entropy_coef=0.02 from step 0)
     # hit train_loss instability — penalty fights min_share_loss penalty
@@ -967,6 +976,7 @@ _OPTIONAL_COMPONENT_CAPABILITIES: tuple[OptionalComponentCapability, ...] = (
     OptionalComponentCapability("use_caseops", "caseops", "rejected"),
     OptionalComponentCapability("use_sparse_dispatch", "sparse_dispatch", "rejected"),
     OptionalComponentCapability("deq_prefix_anchors", "deq_prefix_anchors", "training_effect"),
+    OptionalComponentCapability("use_reverse_kl_balance", "reverse_kl_balance", "training_effect"),
 )
 
 
@@ -2438,11 +2448,13 @@ class SoftDenseRouter(nn.Module):
                  dirichlet_ucb_beta: float = 0.5,
                  use_router_sigmoid_gate: bool = False,
                  use_entmax_routing: bool = False,
-                 entmax_blend_init_logit: float = 5.0):
+                 entmax_blend_init_logit: float = 5.0,
+                 use_reverse_kl_balance: bool = True):
         super().__init__()
         self.num_experts = num_experts
         self.min_share_frac = float(min_share_frac)
         self.scoring = str(scoring)
+        self._use_reverse_kl_balance = bool(use_reverse_kl_balance)
         assert self.scoring in ("linear", "l2", "sips", "dirichlet_ucb"), f"unknown scoring: {scoring}"
         self.use_router_sigmoid_gate = bool(use_router_sigmoid_gate)
         self.health_slices = tuple(int(v) for v in (health_slices or (num_experts,)))
@@ -2833,14 +2845,21 @@ class SoftDenseRouter(nn.Module):
             ema_default = uniform.detach()
             ema_ref = torch.where(ema_ready, self._expert_usage_ema_gpu.to(device=x.device), ema_default)
             ema_ref = self._normalized_component_shares(ema_ref.float()).detach()
-            # EMA-GJSD balance term for iter145. `ema_ref` is persistent and
-            # detached; the straight-through correction preserves the forward
-            # value KL(EMA||U) while giving the current token-local router the
-            # gradient needed to recover historically under-used experts.
+            # EMA-anchored balance. `ema_ref` is persistent and detached; the
+            # straight-through correction preserves the forward divergence value
+            # while routing the gradient through the current token-local router.
+            # iter153 default (use_reverse_kl_balance=True): use reverse KL
+            # `KL(U || anchor)` so each expert contributes ~U_i regardless of
+            # its mass — the gradient on a dead expert (tiny EMA_i) diverges as
+            # `-U_i/EMA_i`, matching the min-share gate's asymmetric need.
+            # Legacy path (forward KL(anchor || U)) is recoverable via the flag.
             ema_balance_anchor = ema_ref + (mean_share.float() - mean_share.float().detach())
             ema_balance_anchor = self._normalized_component_shares(
                 ema_balance_anchor.clamp_min(1e-8))
-            self._ema_balance_raw_loss = self._component_kl(ema_balance_anchor, uniform)
+            if self._use_reverse_kl_balance:
+                self._ema_balance_raw_loss = self._component_kl(uniform, ema_balance_anchor)
+            else:
+                self._ema_balance_raw_loss = self._component_kl(ema_balance_anchor, uniform)
             target_min = (uniform * float(self.min_share_frac)).detach()
             ema_deficit = (target_min - ema_ref).clamp_min(0.0)
             current_deficit = (target_min - mean_share.float()).clamp_min(0.0)
@@ -4006,6 +4025,7 @@ class Block(nn.Module):
                  use_router_sigmoid_gate: bool = False,
                  use_entmax_routing: bool = False,
                  entmax_blend_init_logit: float = 5.0,
+                 use_reverse_kl_balance: bool = True,
                  use_nsa_attention: bool = False,
                  nsa_compress_block_size: int = 32,
                  nsa_compress_block_sliding_stride: int = 16,
@@ -4138,7 +4158,8 @@ class Block(nn.Module):
                                       dirichlet_ucb_beta=router_dirichlet_ucb_beta,
                                       use_router_sigmoid_gate=use_router_sigmoid_gate,
                                       use_entmax_routing=use_entmax_routing,
-                                      entmax_blend_init_logit=entmax_blend_init_logit)
+                                      entmax_blend_init_logit=entmax_blend_init_logit,
+                                      use_reverse_kl_balance=use_reverse_kl_balance)
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -5278,6 +5299,7 @@ class GPT(nn.Module):
                  router_ema_alive_coef: float = 0.02,
                  router_ema_balance_coef: float = 0.30,
                  router_ema_specialization_coef: float = 0.20,
+                 use_reverse_kl_balance: bool = True,
                  mos_load_cv_coef: float = 0.15,
                  expert_diversity_kind: str = "cosine",
                  expert_output_diversity_coef: float = 0.30,
@@ -5392,6 +5414,7 @@ class GPT(nn.Module):
                                    use_router_sigmoid_gate=use_router_sigmoid_gate,
                                    use_entmax_routing=use_entmax_routing,
                                    entmax_blend_init_logit=entmax_blend_init_logit,
+                                   use_reverse_kl_balance=use_reverse_kl_balance,
                                    use_nsa_attention=use_nsa_attention,
                                    nsa_compress_block_size=nsa_compress_block_size,
                                    nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
@@ -5960,7 +5983,11 @@ class GPT(nn.Module):
               = router_load_cv_coef        × Σ_r cv²(r)
               + router_pertoken_entropy_coef_eff    × Σ_r H_pertoken(r)
               + router_ema_alive_coef      × Σ_r EMA_alive(r)
-              + router_ema_balance_coef    × Σ_r KL(ST(EMA_r) || U)
+              + router_ema_balance_coef    × Σ_r KL_bal(r)
+                where KL_bal = KL(U || ST(EMA_r)) when use_reverse_kl_balance
+                (iter153 default), else KL(ST(EMA_r) || U). Reverse KL
+                gives unbounded gradient on dead experts; forward KL
+                under-weights the tail.
               - router_ema_specialization_coef × Σ_r KL(P_token(r) || stopgrad(EMA_r))
               + mos_load_cv_coef           × mos_cv²
               + eff_diversity_coef         × per_token_expert_diversity
@@ -7221,6 +7248,7 @@ def main() -> None:
         router_ema_alive_coef=float(args.router_ema_alive_coef),
         router_ema_balance_coef=float(args.router_ema_balance_coef),
         router_ema_specialization_coef=float(args.router_ema_specialization_coef),
+        use_reverse_kl_balance=bool(args.use_reverse_kl_balance),
         mos_load_cv_coef=float(args.mos_load_cv_coef),
         expert_diversity_kind=str(args.expert_diversity_kind),
         expert_output_diversity_coef=float(args.expert_output_diversity_coef),

@@ -234,6 +234,7 @@ refuses the flag until the path has a real training, eval, or artifact effect.
 \texttt{bigram\_vocab\_size} & 0 & BigramHash disabled \\
 \texttt{logit\_softcap} & 0.0 & no-op unless positive \\
 \texttt{deq\_prefix\_anchors} & false & optional training-effect path; enabled by \texttt{score\_iter152} \\
+\texttt{use\_reverse\_kl\_balance} & true & iter153 default-on: reverse KL($U\,\|\,$EMA) balance term \\
 \texttt{use\_smear\_gate} & false & optional training-effect path \\
 \texttt{use\_sparse\_attn\_head\_gate} & false & optional training-effect path \\
 \texttt{use\_rr\_attention} & false & optional training-effect path; rejects silent dense fallback configs \\
@@ -699,7 +700,7 @@ current step's routing mass $m$.  The promoted router term is
 \mathcal{L}_{\rm router}^{\rm iter145r}
   &= \lambda_{\rm rcv}\sum_r \operatorname{CV}(m_r)^2
      + \lambda_{\rm ent}\sum_r H_{\rm pertoken}(m_r) \\
-  &\quad + \lambda_{\rm bal}\sum_r \operatorname{KL}(\tilde m_r\,\|\,U)
+  &\quad + \lambda_{\rm bal}\sum_r \operatorname{KL}_{\rm bal}(r)
      + \lambda_{\rm alive}\sum_r (\bar d_r)\!\cdot\!(d_r)^2 \\
   &\quad - \lambda_{\rm spec}\sum_r \operatorname{KL}(p^{\rm token}_r\,\|\,\bar p_r) \\
   &\quad + \lambda_{\rm mcv}\operatorname{CV}(m_{\rm MoS})^2
@@ -710,6 +711,14 @@ current step's routing mass $m$.  The promoted router term is
 where $U$ is the within-component uniform target,
 $d_r = (\tau \cdot U - m_r)_+$ is the per-component deficit hinge with
 $\tau=$\texttt{min\_share\_frac}, and $p^{\rm token}_r$ is the per-token share.
+The balance divergence
+$\operatorname{KL}_{\rm bal}(r) = \operatorname{KL}(U\,\|\,\tilde m_r)$
+when \texttt{use\_reverse\_kl\_balance=True} (iter153 default; reverse KL
+weights each expert by $U_i$, giving the dead-expert gradient $-U_i/\bar m_{r,i}$
+that diverges as $\bar m_{r,i}\!\to\!0$).  Setting the flag to False recovers
+the pre-iter153 form $\operatorname{KL}(\tilde m_r\,\|\,U)$, which weights each
+term by $\tilde m_{r,i}$ so a dead expert's contribution vanishes despite a
+large log-ratio.
 The minus sign on the specialization term reflects KL maximization: minimizing
 $-\lambda_{\rm spec}\,\mathrm{KL}$ pushes per-token routing AWAY from the
 historical mean, bounded by $\log(E)$ since $\bar p$ is normalized and clamped.

@@ -125,6 +125,45 @@ def test_gpt_deq_prefix_anchors_forward_backward():
     assert any_grad, "no finite gradient produced on any parameter"
 
 
+def test_use_reverse_kl_balance_output_differs():
+    """iter153 / flag-to-effect contract: forward KL(EMA||U) and reverse
+    KL(U||EMA) must produce different `_ema_balance_raw_loss` values for any
+    non-uniform EMA state. The reverse-KL path is the iter153 default; the
+    forward path remains recoverable via `--use-reverse-kl-balance=0`.
+    """
+    from train_gpt import SoftDenseRouter
+
+    torch.manual_seed(0)
+    fwd = SoftDenseRouter(dim=8, num_experts=4, use_reverse_kl_balance=False)
+    torch.manual_seed(0)
+    rev = SoftDenseRouter(dim=8, num_experts=4, use_reverse_kl_balance=True)
+
+    # Force a non-uniform persistent EMA: one dead expert, rest balanced.
+    non_uniform = torch.tensor([0.01, 0.33, 0.33, 0.33])
+    for r in (fwd, rev):
+        r._expert_usage_ema_gpu.copy_(non_uniform)
+        r._expert_usage_ema_initialized.fill_(True)
+
+    torch.manual_seed(1)
+    x = torch.randn(2, 6, 8)
+    fwd.train(); rev.train()
+    fwd(x); rev(x)
+
+    fwd_loss = float(fwd._ema_balance_raw_loss.detach())
+    rev_loss = float(rev._ema_balance_raw_loss.detach())
+    assert fwd_loss != rev_loss, (
+        f"reverse-KL flag had no effect on _ema_balance_raw_loss "
+        f"(fwd={fwd_loss}, rev={rev_loss})"
+    )
+    # Reverse KL must strictly exceed forward KL for this tail-heavy EMA
+    # (the whole point: reverse weights by uniform, so the dead expert's
+    # -log(EMA_i) term blows up while forward's EMA_i · log(EMA_i/U_i) damps).
+    assert rev_loss > fwd_loss, (
+        f"reverse-KL was meant to amplify the dead-expert signal "
+        f"but rev={rev_loss} <= fwd={fwd_loss}"
+    )
+
+
 def test_ttt_component_smoke():
     from experiments.components.phased_ttt import run_ttt_component_smoke
 
