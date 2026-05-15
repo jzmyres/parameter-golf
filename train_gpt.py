@@ -875,6 +875,29 @@ class Hyperparameters:
     # bundle.
     deq_prefix_anchors = True  # iter152 promoted on BPB (1.4718 vs 1.4787); promotion-propagation completed 2026-05-13 after iter153/iter155 confound was diagnosed.
 
+    # iter163 (2026-05-15): Multi-K consistency loss for natural FP-convergence
+    # learning. Two principled terms, hybrid CM-paradigm (consistency-distillation
+    # + boundary-anchoring), both architecture-agnostic per CLAUDE.md
+    # most-principled-simplest-general directive:
+    #   L_anchor = anchor_coef · Σ_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²
+    #     Recursive consistency on iter152 prefix anchors (Δ=8-32 between
+    #     adjacent depths). Reuses existing z_stack from
+    #     RevDEQPrefixAnchorFunction. Cost: ~free. Signal density: 50% of
+    #     steps (K=16 only) have no anchor pair → no signal.
+    #   L_ext    = extension_coef · ‖z_K − z_{K+Δ}.detach()‖²
+    #     Extension consistency at the boundary: extending K by Δ should not
+    #     change z (the operational FP-stability test). Wasteful v1 runs the
+    #     full DEQ at K_total=K+Δ no-grad. Cost: ~+50%-150% step time
+    #     depending on Δ. Fires every step regardless of K_jitter, covering
+    #     L_anchor's signal-density gap on K=16-only steps.
+    # Both default to 0 (off); enable iter163 with
+    #   --multi-k-consistency-anchor-coef=0.1
+    #   --multi-k-consistency-extension-coef=0.1
+    #   --multi-k-consistency-extension-delta=0   (0 means use K_train as Δ)
+    multi_k_consistency_anchor_coef = 0.0
+    multi_k_consistency_extension_coef = 0.0
+    multi_k_consistency_extension_delta = 0  # 0 means use K_train
+
     # Architecture knobs
     # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
     # to 4096×128 (~590K params) to match records (2026-03-25 uses 2048×128,
@@ -1074,6 +1097,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "eval-reservation-seconds",
     "ctp-weight",
     "router-load-cv-coef", "mos-load-cv-coef",
+    "multi-k-consistency-anchor-coef", "multi-k-consistency-extension-coef",
+    "multi-k-consistency-extension-delta",
     "expert-diversity-kind",
     "expert-output-diversity-coef", "expert-diversity-every", "expert-diversity-max-tokens",
     "mos-output-diversity-coef",
@@ -5354,6 +5379,9 @@ class GPT(nn.Module):
                  router_ema_specialization_coef: float = 0.20,
                  use_reverse_kl_balance: bool = True,
                  mos_load_cv_coef: float = 0.15,
+                 multi_k_consistency_anchor_coef: float = 0.0,
+                 multi_k_consistency_extension_coef: float = 0.0,
+                 multi_k_consistency_extension_delta: int = 0,
                  expert_diversity_kind: str = "cosine",
                  expert_output_diversity_coef: float = 0.30,
                  expert_diversity_every: int = 8,
@@ -5383,6 +5411,12 @@ class GPT(nn.Module):
         self.router_ema_balance_coef = float(router_ema_balance_coef)
         self.router_ema_specialization_coef = float(router_ema_specialization_coef)
         self.mos_load_cv_coef = float(mos_load_cv_coef)
+        self.multi_k_consistency_anchor_coef = float(multi_k_consistency_anchor_coef)
+        self.multi_k_consistency_extension_coef = float(multi_k_consistency_extension_coef)
+        self.multi_k_consistency_extension_delta = int(multi_k_consistency_extension_delta)
+        # Stash for diagnostics + readback in compute_loss; populated in _run_backbone.
+        self._consistency_anchor_loss_t: Tensor | None = None
+        self._consistency_ext_loss_t: Tensor | None = None
         self.expert_diversity_kind = str(expert_diversity_kind)
         if self.expert_diversity_kind not in ("frobenius", "cosine"):
             raise ValueError(
@@ -5903,6 +5937,28 @@ class GPT(nn.Module):
                 except Exception:
                     pass
 
+    def _consistency_extend_no_grad(self, z: Tensor, x0: Tensor, delta: int) -> Tensor:
+        """Extend the Parcae two-state cycle by ``delta`` no-grad iterations
+        starting from ``(z, z)``. Used by the iter163 extension consistency
+        loss as the deeper-K target ``z_GT = z_{K+Δ}``.
+
+        Initializing ``y = z`` is exact at the FP (where ``y = z`` by
+        definition) and approximate elsewhere. For the consistency-loss
+        purpose this is fine because the loss only fires meaningfully when
+        z is near the FP, where the approximation is tight.
+        """
+        sb = _unwrap_compiled_module(self.shared_block)
+        a_bar = self._parcae_a_bar()  # per-dim damping
+        one_minus_a = 1.0 - a_bar
+        b_bar = self._parcae_b_bar()
+        y_e = z.detach()
+        z_e = z.detach()
+        with torch.no_grad():
+            for _ in range(int(delta)):
+                y_e = a_bar * y_e + one_minus_a * sb(z_e, x0, b_bar)
+                z_e = a_bar * z_e + one_minus_a * sb(y_e, x0, b_bar)
+        return z_e
+
     def _run_backbone(self, x: Tensor) -> Tensor:
         x0 = x
         z = x
@@ -5942,6 +5998,30 @@ class GPT(nn.Module):
             else:
                 self._deq_prefix_anchor_depths_last = ()
                 z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
+
+        # iter163 (2026-05-15): Multi-K consistency losses for natural FP
+        # convergence learning (CLAUDE.md most-principled-simplest-general
+        # directive: principled = enforces FP equation T(z*)=z* directly;
+        # general = arch-agnostic, no T_θ-specific assumption).
+        self._consistency_anchor_loss_t = None
+        self._consistency_ext_loss_t = None
+        if self.training and prefix_mode and self.multi_k_consistency_anchor_coef > 0.0 and z_stack.shape[0] >= 2:
+            # Recursive consistency: ‖z_{anchor_i} − z_{anchor_{i+1}}.detach()‖²
+            # over consecutive prefix anchors. Gradient flows ONLY through the
+            # shallower anchor (deeper one detached); transitivity gives
+            # asymptotic FP convergence.
+            shallow = z_stack[:-1]
+            deep_target = z_stack[1:].detach()
+            self._consistency_anchor_loss_t = (shallow - deep_target).pow(2).mean()
+        if self.training and self.multi_k_consistency_extension_coef > 0.0 and self.use_parcae:
+            # Extension consistency: extending K by Δ should not change z (the
+            # operational asymptotic-stability test). Cheap implementation:
+            # extend from z (final state of with-grad forward) by Δ no-grad
+            # Parcae two-state iterations, initializing y = z (true at FP).
+            delta = int(self.multi_k_consistency_extension_delta) or int(self._deq_k_last)
+            if delta > 0:
+                z_extended = self._consistency_extend_no_grad(z, x0_refined, delta)
+                self._consistency_ext_loss_t = (z - z_extended.detach()).pow(2).mean()
 
         # DEQ diagnostics: keep tensor fields for low-overhead logging, but
         # also maintain legacy float/list fields for existing experiments.
@@ -6176,7 +6256,12 @@ class GPT(nn.Module):
             self._ntp_loss = 0.0
             self._ctp_loss = 0.0
             ctp_weight = float(getattr(self, "ctp_weight", 0.0)) if self.use_ctp else 0.0
-            return ntp_loss + ctp_weight * ctp_loss + router_reg_loss
+            total = ntp_loss + ctp_weight * ctp_loss + router_reg_loss
+            if isinstance(self._consistency_anchor_loss_t, torch.Tensor) and self.multi_k_consistency_anchor_coef > 0.0:
+                total = total + self.multi_k_consistency_anchor_coef * self._consistency_anchor_loss_t
+            if isinstance(self._consistency_ext_loss_t, torch.Tensor) and self.multi_k_consistency_extension_coef > 0.0:
+                total = total + self.multi_k_consistency_extension_coef * self._consistency_ext_loss_t
+            return total
 
         self.mos_head._diversity_aux_enabled = bool(
             self.training
@@ -6238,8 +6323,13 @@ class GPT(nn.Module):
             self._ntp_loss = 0.0
             self._ctp_loss = 0.0
         ctp_weight = float(getattr(self, "ctp_weight", 0.0)) if self.use_ctp else 0.0
+        # iter163 consistency losses (only extension term applies in
+        # final-endpoint mode; anchor term requires prefix_mode).
+        total = ntp_loss + ctp_weight * ctp_loss + router_reg_loss
+        if isinstance(self._consistency_ext_loss_t, torch.Tensor) and self.multi_k_consistency_extension_coef > 0.0:
+            total = total + self.multi_k_consistency_extension_coef * self._consistency_ext_loss_t
         # Lyapunov + denoising auxiliaries are added in the training loop.
-        return ntp_loss + ctp_weight * ctp_loss + router_reg_loss
+        return total
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
@@ -7761,6 +7851,9 @@ def main() -> None:
         router_ema_specialization_coef=float(args.router_ema_specialization_coef),
         use_reverse_kl_balance=bool(args.use_reverse_kl_balance),
         mos_load_cv_coef=float(args.mos_load_cv_coef),
+        multi_k_consistency_anchor_coef=float(getattr(args, "multi_k_consistency_anchor_coef", 0.0)),
+        multi_k_consistency_extension_coef=float(getattr(args, "multi_k_consistency_extension_coef", 0.0)),
+        multi_k_consistency_extension_delta=int(getattr(args, "multi_k_consistency_extension_delta", 0)),
         expert_diversity_kind=str(args.expert_diversity_kind),
         expert_output_diversity_coef=float(args.expert_output_diversity_coef),
         expert_diversity_every=int(args.expert_diversity_every),
@@ -8853,6 +8946,8 @@ def main() -> None:
                 f"mos_cv_coef_eff:{_log_tensor_attr('_mos_cv_coef_eff_t'):.6g} "
                 f"expert_diversity_coef_eff:{_log_tensor_attr('_expert_diversity_coef_eff_t'):.6g} "
                 f"mos_diversity_coef_eff:{_log_tensor_attr('_mos_diversity_coef_eff_t'):.6g} "
+                f"consistency_anchor_loss:{_log_tensor_attr('_consistency_anchor_loss_t'):.6f} "
+                f"consistency_ext_loss:{_log_tensor_attr('_consistency_ext_loss_t'):.6f} "
             )
             base_model._deq_x0_recon_error = getattr(base_model.shared_block, "_deq_x0_recon_error_last_bwd", None)
             base_model._deq_recon_error = getattr(base_model.shared_block, "_deq_recon_error_last_bwd", None)
