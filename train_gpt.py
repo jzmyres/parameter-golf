@@ -6463,7 +6463,11 @@ def _prescribe_failure_fix(failure: str) -> dict:
             "category": "router_collapse_advisory",
             "hypothesis": "EMPIRICALLY REFUTED 2026-05-15 by 3-iter closure (iter158/162/165): "
                           "pushing on attn_min_share via router_bias_update or doubled "
-                          "regularizers does NOT move BPB at iter152's operating point.",
+                          "regularizers does NOT move BPB at iter152's operating point. "
+                          "FAILED Principled test (per CLAUDE.md most-principled-simplest-general "
+                          "directive): attn_min_share is a symptom correlated with collapse, "
+                          "not a root-cause invariant for BPB. The fair-share threshold pressures "
+                          "the wrong objective.",
             "fix": ("Treat as informational only. iter158 (reverse-KL alone, Δ +0.003), "
                     "iter162 (entropy-only push, killed mid-run), iter165 (bundled "
                     "router_bias_update + doubled coefs, Δ +0.013) all confirmed "
