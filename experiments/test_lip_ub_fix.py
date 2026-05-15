@@ -649,6 +649,47 @@ def test_lip_ub_F_is_always_probed_on_FP_eval_unconditional_of_cadence_knob():
             break
 
 
+def test_rho_F_is_emitted_in_fast_val_alongside_lip_ub_F():
+    """Spring cleaning 2026-05-15: ``rho_F`` (necessary AND sufficient
+    spectral-radius gate metric, Hartman-Grobman) MUST be probed and
+    emitted in the train-time fast-val site, not only in the K-sweep.
+    Companion to ``test_lip_ub_F_is_always_probed_...`` — the principled
+    gate metric inherits the same always-on policy as the operator-norm
+    proxy it supersedes.  Without this, iter163's promotion gate (which
+    will drop the lip_ub_F advisory entirely) has no fast-val signal.
+
+    Static text-search test: assert (a) the `_rho_F_at_saved_fp` call
+    appears inside the `if run_fp_lip_probe_F:` block (so rho_F shares
+    the same always-on cadence), and (b) the fast-val log string
+    includes ``rho_F:`` formatting.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+
+    # rho_F probe must live inside the always-on F branch; assert it
+    # appears between the lip_ub_F call and the matching `else:` that
+    # zeroes both lip_ub_F and rho_F.
+    lip_idx = src.find("lip_ub_F = _lip_ub_at_saved_fp(\n                    base_model,")
+    rho_idx = src.find("rho_F = _rho_F_at_saved_fp(\n                    base_model,")
+    assert lip_idx > 0 and rho_idx > 0, (
+        f"fast-val: lip_ub_F call ({lip_idx=}) AND rho_F call ({rho_idx=}) "
+        "must both exist with the same indentation; the rho_F probe "
+        "inherits lip_ub_F's always-on policy per spring cleaning 2026-05-15."
+    )
+    assert rho_idx > lip_idx, (
+        "fast-val: rho_F call must appear AFTER lip_ub_F (sibling probes "
+        "in the same `if run_fp_lip_probe_F:` branch)."
+    )
+
+    # The fast-val log string MUST include rho_F formatting alongside
+    # lip_ub_F so a future reviewer can verify both gate-relevant
+    # metrics are observable per fast-val emission.
+    assert "f\" rho_F:{rho_F:.4f}\" if rho_F is not None else \" rho_F:N/A\"" in src, (
+        "fast-val log string missing rho_F formatting; user-facing "
+        "evidence for the gate metric must appear on every fast-val line."
+    )
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("SKIP: CUDA not available", flush=True)
@@ -665,6 +706,7 @@ if __name__ == "__main__":
         test_lyapunov_estimator_power_jvp_F_returns_dominant_v()
         test_lyapunov_F_target_grad_flows_to_parcae_a_bar()
         test_lip_ub_F_is_always_probed_on_FP_eval_unconditional_of_cadence_knob()
+        test_rho_F_is_emitted_in_fast_val_alongside_lip_ub_F()
     except AssertionError as e:
         print(f"FAIL: {e}", flush=True)
         sys.exit(1)

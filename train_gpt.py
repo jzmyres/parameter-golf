@@ -6458,24 +6458,21 @@ def _prescribe_failure_fix(failure: str) -> dict:
                 "fix": f"Increase mos_load_cv_coef by 1.5× (e.g. {cur:g}→{cur * 1.5:g}).",
                 "config_change": {"mos_load_cv_coef_mult": 1.5},
             }
-        cur = float(Hyperparameters.router_load_cv_coef)
-        cv_fix = (
-            f"Increase router_load_cv_coef by 1.5x (e.g. {cur:g}->{cur * 1.5:g})."
-            if cur > 0.0
-            else "Enable a small router_load_cv_coef floor (e.g. 0.05-0.10) if EMA alone is insufficient."
-        )
         return {
             "failure": failure,
-            "category": "router_collapse",
-            "hypothesis": "Router usage prior is not being enforced strongly enough over long-run usage",
-            "fix": ("Prefer the generic slow router-bias controller: set "
-                    "router_bias_update=1 with the clipped default controller. "
-                    f"Fallback only if needed: {cv_fix} Do not add a one-off "
-                    "attention/min-share loss."),
-            "config_change": {"router_bias_update": True,
-                              "router_bias_lr": float(Hyperparameters.router_bias_lr),
-                              "router_bias_clip": float(Hyperparameters.router_bias_clip),
-                              "router_load_cv_coef_floor": 0.05},
+            "category": "router_collapse_advisory",
+            "hypothesis": "EMPIRICALLY REFUTED 2026-05-15 by 3-iter closure (iter158/162/165): "
+                          "pushing on attn_min_share via router_bias_update or doubled "
+                          "regularizers does NOT move BPB at iter152's operating point.",
+            "fix": ("Treat as informational only. iter158 (reverse-KL alone, Δ +0.003), "
+                    "iter162 (entropy-only push, killed mid-run), iter165 (bundled "
+                    "router_bias_update + doubled coefs, Δ +0.013) all confirmed "
+                    "regression. The 0.0375 fair-share threshold is an arbitrary "
+                    "diagnostic, not a correctable BPB defect. A fundamentally new "
+                    "routing-balance mechanism (e.g. hard dispatch outside RevDEQ, "
+                    "dynamic expert pruning + respawn) is required to re-open this "
+                    "prescription class."),
+            "config_change": {},
         }
     if first_token.startswith("mos_") and "ortho" in first_token:
         return {
@@ -8381,9 +8378,14 @@ def main() -> None:
                     map_kind="F",
                 )
                 fp_residual_F = _joint_F_residual_at_saved_fp(base_model)
+                rho_F = _rho_F_at_saved_fp(
+                    base_model,
+                    n_iters=int(getattr(args, "fp_rho_power_iters", 8)),
+                )
             else:
                 lip_ub_F = None
                 fp_residual_F = None
+                rho_F = None
             if run_fp_lip_probe_TS:
                 lip_ub_T = _lip_ub_at_saved_fp(
                     base_model,
@@ -8414,6 +8416,7 @@ def main() -> None:
                 (f" lip_ub_T:{lip_ub_T:.4f}" if lip_ub_T is not None else " lip_ub_T:N/A")
                 + (f" lip_ub_S:{lip_ub_S:.4f}" if lip_ub_S is not None else " lip_ub_S:N/A")
                 + (f" lip_ub_F:{lip_ub_F:.4f}" if lip_ub_F is not None else " lip_ub_F:N/A")
+                + (f" rho_F:{rho_F:.4f}" if rho_F is not None else " rho_F:N/A")
             )
             fp_resid_str = (
                 (f" fp_residual_rel:{fp_residual_rel:.6f}" if fp_residual_rel is not None else "")

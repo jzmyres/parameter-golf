@@ -547,11 +547,17 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
 
     cases = [
         # (failure, expected_category, required_keys, forbidden_keys)
-        ("attn_min_share=0.01 < 0.150", "router_collapse",
-         {"router_bias_update", "router_load_cv_coef_floor"},
-         {"router_ema_alive_coef_mult", "router_ema_balance_coef_floor"}),
-        ("mlp_min_share=0.01 < 0.150", "router_collapse",
-         {"router_bias_update"}, set()),
+        # Router-side min_share prescription EMPIRICALLY REFUTED 2026-05-15
+        # by 3-iter closure (iter158/162/165 all confirmed pushing on
+        # routing-balance ACTIVELY HURTS BPB at iter152's operating point).
+        # Prescription now returns empty config_change; router_bias_update,
+        # router_load_cv_coef_floor, and any usage-prior fix are forbidden.
+        ("attn_min_share=0.01 < 0.150", "router_collapse_advisory",
+         set(),
+         {"router_bias_update", "router_load_cv_coef_floor",
+          "router_ema_alive_coef_mult", "router_ema_balance_coef_floor"}),
+        ("mlp_min_share=0.01 < 0.150", "router_collapse_advisory",
+         set(), {"router_bias_update", "router_load_cv_coef_floor"}),
         ("mos_ntp_min_share=0.005 < 0.150", "mos_router_collapse",
          {"mos_load_cv_coef_mult"}, {"weight_decay_mult"}),
         ("attn_ortho=0.71 > 0.5", "expert_collapse",
