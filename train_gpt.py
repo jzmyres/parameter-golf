@@ -355,6 +355,17 @@ class Hyperparameters:
     # (see `_resolve_val_micro_batch_seqs` ~ line 1147).
     val_micro_batch_seqs = 48
     val_loss_every = 200
+    # iter171 (2026-05-16): mini K-sweep at every fast-val event. When set,
+    # after the default-K val_bpb is computed, the trainer re-runs validation
+    # on the same fast-val subset at each additional K in this tuple and emits
+    # `fast_k_sweep:k4=X,k16=Y,k128=Z` to the log. Diagnostic ONLY — lets us
+    # detect degenerate K-sweep patterns (e.g. K=4 < K=16 < K=128, a signature
+    # of consistency-loss over-pressure causing F to become flat in z) at every
+    # 200-step val instead of waiting for end-of-training K-sweep. Default
+    # empty = feature disabled. Recommended for iter171: (4, 128) — adds ~65s
+    # per val event (~+1 % wallclock per 1000-step run). The default K (=16)
+    # is automatically excluded if listed.
+    fast_val_k_sweep_set: tuple[int, ...] = ()
     train_log_every = 10  # log every 10 steps (~85s at 8.5s/step) for better progress visibility
     auto_plot_on_val = True
     # Fixed-point spectral probe: rho_F = |lambda_max(J_F)| at the saved DEQ
@@ -864,6 +875,13 @@ class Hyperparameters:
     # pure finite-depth task-supervision change rather than another coefficient
     # bundle.
     deq_prefix_anchors = True  # iter152 promoted on BPB (1.4718 vs 1.4787); promotion-propagation completed 2026-05-13 after iter153/iter155 confound was diagnosed.
+    # iter170 (2026-05-16): explicit prefix-anchor depths, decoupled from
+    # the K-jitter set. Default empty tuple means "fall back to jitter set"
+    # (preserves pre-iter170 behavior). Set explicitly via CLI to test
+    # designs like `--deq-prefix-anchor-set "4,16,32,64,96,128"` which adds
+    # K=4 as a shallow anchor to give iter170's anchor-on-deepest loss a
+    # non-trivial pair (z_4, z_K_sampled.detach()) even at K_sampled=16.
+    deq_prefix_anchor_set: tuple[int, ...] = ()
 
     # iter170 (2026-05-16, supersedes iter163c v2 and iter167):
     # Anchor-on-deepest consistency loss where the TARGET is z_K_sampled
@@ -1084,6 +1102,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
     "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval",
     "deq-k-jitter-set", "deq-k-jitter-weights", "deq-bptt-k",
+    "deq-prefix-anchor-set",
+    "fast-val-k-sweep-set",
     "deq-beta", "deq-beta-jitter-set",
     "warmdown-frac", "num-refinements-ramp-frac",
     "weight-decay",
@@ -7871,7 +7891,15 @@ def main() -> None:
         deq_beta=args.deq_beta,
         deq_bptt_k=args.deq_bptt_k,
         deq_prefix_anchors=bool(getattr(args, "deq_prefix_anchors", False)),
-        deq_prefix_anchor_set=tuple(int(k) for k in (getattr(args, "deq_k_jitter_set", ()) or ())),
+        # iter170 (2026-05-16): prefer explicit --deq-prefix-anchor-set CLI
+        # override; fall back to the jitter set when not provided. This lets
+        # the anchor set differ from the jitter set (e.g. iter170 adds K=4
+        # to anchors while dropping K=24 from jitter).
+        deq_prefix_anchor_set=tuple(int(k) for k in (
+            getattr(args, "deq_prefix_anchor_set", None)
+            or getattr(args, "deq_k_jitter_set", ())
+            or ()
+        )),
         num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
         router_pertoken_entropy_coef=float(args.router_pertoken_entropy_coef),
@@ -8528,12 +8556,43 @@ def main() -> None:
                 (f" fp_residual_rel:{fp_residual_rel:.6f}" if fp_residual_rel is not None else "")
                 + (f" fp_residual_F:{fp_residual_F:.6f}" if fp_residual_F is not None else "")
             )
+            # iter171 (2026-05-16): mini K-sweep on the same fast-val subset.
+            # When `--fast-val-k-sweep-set "4,128"` is set, re-runs validation
+            # at each extra K and logs the per-K val_bpb. Diagnostic ONLY —
+            # lets us catch degenerate K-sweep patterns mid-training (e.g.
+            # iter170's K=4 < K=16 < K=128 signature) without waiting for
+            # end-of-training K-sweep. Cost: ~+65s per val event for
+            # {4, 128} (rare K=128 is the dominant cost).
+            default_k = int(getattr(args, "deq_k_eval", 16))
+            extra_ks = tuple(int(k) for k in (getattr(args, "fast_val_k_sweep_set", ()) or ()))
+            fast_k_sweep_pairs: list[tuple[int, float]] = [(default_k, float(val_bpb))]
+            for k_extra in extra_ks:
+                if k_extra == default_k or k_extra <= 0:
+                    continue
+                base_model._deq_k_override = k_extra
+                try:
+                    _, val_bpb_extra = run_validation(
+                        args, model, rank, world_size, device, grad_accum_steps,
+                        val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                        full_validation=False,
+                    )
+                    fast_k_sweep_pairs.append((k_extra, float(val_bpb_extra)))
+                finally:
+                    base_model._deq_k_override = default_k
+            if len(fast_k_sweep_pairs) > 1:
+                fast_k_sweep_pairs.sort(key=lambda kv: kv[0])
+                sweep_str = " fast_k_sweep:" + ",".join(
+                    f"k{k}={v:.4f}" for k, v in fast_k_sweep_pairs
+                )
+            else:
+                sweep_str = ""
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"val_mode:fast "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
                 f"step_avg_w50:{_window_avg:.2f}ms"
                 f"{rho_str}{sigma_str}{fp_resid_str}"
+                f"{sweep_str}"
                 f"{deq_info}{expert_info}"
                 f"{format_k_jitter_info()}"
             )
