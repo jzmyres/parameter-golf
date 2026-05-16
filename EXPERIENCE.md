@@ -44,6 +44,7 @@ This file has two roles, in this order:
 | 2026-05-11 | [#audit-row-executability](#audit-row-executability)         | three-reviewer audit found that the Sibling-fanout DRY gate row added in `5ecf324` was first violated one commit later (EMA log fields with no parser entries); same review found the Enforcement-config staging row shipped only a manual recipe — both symptoms of audit rules without executable witnesses |
 | 2026-05-12 | [#flag-to-effect-contract](#flag-to-effect-contract)         | iter152-batch un-archived 7 components and wired 8 new `use_*` flags; pre-commit review found `use_rr_attention=1` was a no-op at the project default `train_seq_len=2048` (silent fallback to dense SDPA above 512 tokens) and `use_gptq`/`use_lqer`/`use_ttt_eval`/`use_caseops` ran only synthetic-tensor or hardcoded-string smokes while the startup banner advertised them as "1" — a research-log-integrity hazard |
 | 2026-05-12 | [#audit-row-self-enforcement](#audit-row-self-enforcement)   | iter152 profile-system + capability-registry diff added the "Root-cause fix preference" audit row, yet the same diff's `_prescribe_failure_fix.mos_ortho` branch returned a per-symptom loss bump with no exit-ablation framing — exactly the failure mode the new policy forbids. A 5-agent parallel review found that the witness for the new rule covered only 2 of 8 sibling branches |
+| 2026-05-15 | [#removal-symmetry-sweep](#removal-symmetry-sweep)           | cleanup #47 + cleanup #50 (commits 7410cb9 + 56b2f29) removed `lip_ub_T/S/F` + `fp_bound` + `power_jvp_F` + `router_load_cv_coef` + `mos_load_cv_coef` from `Hyperparameters` and loss assembly, but left ~14 stale references across `opg_doc.tex` (parameter table rows + equation blocks still showing the removed CV terms, feature table still claiming `deq_prefix_anchors=false`, Local Stability section still describing `lip_ub_F` as an "auxiliary K-sweep estimator") and ~10 fossil docstrings/comments in `train_gpt.py`. iter163 promotion commit (884b132) simultaneously violated the Sibling-fanout DRY gate by emitting `consistency_anchor_loss`/`consistency_ext_loss` log fields with no `plot_metrics.py` parser entries, no `test_training_contracts.py` required_fields update, and no `test_plot_metrics_parse.py` fixture. Cleanup #51 added the "Removal-symmetry sweep" audit row, the companion `tests/test_removal_symmetry.py` enforcement test, and swept all sibling sites in the same commit |
 
 ### Section template
 
@@ -843,6 +844,39 @@ Existing tests partially covered each component module (helper-level smokes), bu
 3. On a new optional component, add the registry entry plus *either* a `SystemExit` branch in `_validate_hyperparameters` (with a matching `test_use_X_rejected_*` case) *or* an effect-asserting test in `experiments/test_remaining_components.py`. The contract test fails-loudly otherwise.
 
 **Cross-references.** Companion: [#scalar-semantic-shift](#scalar-semantic-shift) (the scalar analogue), [#untested-path-executability](#untested-path-executability) (the structural prior), [#sibling-fanout-dry-gate](#sibling-fanout-dry-gate) (paired DRY enforcement for the registry), [#audit-row-executability](#audit-row-executability) (the contract test is the executable witness for this rule).
+
+---
+
+### removal-symmetry-sweep
+
+**Date:** 2026-05-15 pre-production review of iter163 promotion + cleanup #47 + cleanup #50 (commit window 884b132 → 7410cb9)
+**Rule in CLAUDE.md:** Audit Checklist row · "Removal-symmetry sweep"
+
+**What happened.** Three commits landed in tight succession:
+
+1. **iter163 promotion (884b132)** — added multi-K consistency loss (`multi_k_consistency_anchor_coef=0.1`, `multi_k_consistency_extension_coef=0.1`); emitted `consistency_anchor_loss:` and `consistency_ext_loss:` to `run.log`.
+2. **cleanup #50 (56b2f29)** — removed `router_load_cv_coef` and `mos_load_cv_coef` loss multiplications. CV remains as diagnostic-only.
+3. **cleanup #47 (7410cb9)** — removed `lip_ub_T/S/F` operator-norm probes, `fp_bound` Banach error bound, and the `power_jvp_F` estimator branch.
+
+Pre-production review with two parallel reviewer subagents (coderabbit + pr-review-toolkit) plus four exploration agents and 720 lines of `train_gpt.py` cleanup found that the removals + addition left ~14 stale references the same-commit cleanup missed:
+
+- `opg_doc.tex` parameter table (lines 195, 197) still listed `router_load_cv_coef=0.0` and `mos_load_cv_coef=0.15` *with the pre-removal value*, i.e. arithmetically wrong.
+- `opg_doc.tex` loss equation block (line 676-680) still contained `λ_rcv·Σ CV²(m_r)` and `λ_mcv·CV(m_MoS)²` terms, with prose two paragraphs later (line 735-737) saying these are "gone" — internally inconsistent.
+- `opg_doc.tex` feature table (line 243) still claimed `deq_prefix_anchors=false`, conflicting with the CLAUDE.md default-on directive (2026-05-13).
+- `opg_doc.tex` Local Stability Guarantee section (lines 1068-1077, 1170-1180, 1218-1228) still described `lip_ub_F` as an "auxiliary K-sweep estimator" and named it as the gate-relevant signal.
+- `train_gpt.py` had ~10 stale docstrings/comments naming `lip_ub_F`/`fp_bound`/`power_jvp_F` (`_collect_routing_losses`, `_prescribe_failure_fix`, `_parcae_cycle_F`, `_joint_F_residual_at_saved_fp`, the Hyperparameters Lyapunov section, the Lyapunov FD branch comments).
+- `train_gpt.py:8581-8582` emitted `consistency_anchor_loss:`/`consistency_ext_loss:` to `run.log`, but `experiments/plot_metrics.py::parse_log` had no parser entry, `tests/test_training_contracts.py::test_training_log_emits_auxiliary_loss_components` had no `required_fields` entry, and `experiments/test_plot_metrics_parse.py` had no fixture — a Sibling-fanout DRY violation in the *addition* direction.
+- `_consistency_extend_no_grad` (the iter163 extension term implementation) silently ran the iteration in fp32 because `_parcae_a_bar()` returns fp32 — a CLAUDE.md "bf16 training default" invariant violation that biased the consistency target relative to the actual training-time DEQ trajectory.
+
+**Root cause.** Two converging pressures: (i) the existing `loss-form-triple-touch` rule names the surfaces for *additions* and "mirror" updates but says nothing about *removals*; (ii) the `promotion-propagation` rule covers default-value drift but not equation-block / probe-name removals. Cleanups #47 and #50 were correctly applied to `Hyperparameters` and the loss assembly, but the same diff did not sweep `opg_doc.tex` paragraph text, docstring bullets, or comment-block narratives that named the removed objects. A removal that leaves the equation in the doc but says "removed" in the prose is the worst failure mode because a future reader cannot tell which version is authoritative.
+
+**The rule.** When removing a Hyperparameter, loss term, or diagnostic, the same commit MUST: (a) delete the field from `Hyperparameters` and CLI parser; (b) delete the corresponding equation/symbol from `opg_doc.tex` (both equation blocks AND parameter-table rows — not just one); (c) remove or annotate every `train_gpt.py` docstring, inline comment, and `_prescribe_failure_fix` bullet that names the field or its formula; (d) leave intact any intentional backward-compat parsing (failure-string handlers, plot-metrics parsers for legacy logs) and co-locate a comment explaining the back-compat scope; (e) sweep `experiments/test_*.py` and `tests/test_*.py` to drop tests that asserted the removed mechanism is active.
+
+**Companion to** `loss-form-triple-touch` (functional-form *changes*, this rule covers *removals*), `promotion-propagation` (this rule covers the removal mirror image of the same surfaces), `sibling-fanout-dry-gate` (the parser-coverage violation in this incident is the addition-direction analogue).
+
+**Verification recipe.** Enforced by `tests/test_removal_symmetry.py`, which maintains an explicit `REMOVED_NAMES` ledger and asserts each appearance in `opg_doc.tex`, `train_gpt.py`, and `CLAUDE.md` is either: (1) inside a backward-compat parser whitelist; (2) on a line that contains an explicit removal annotation (`removed 2026-05-15`, `legacy`, `backward-compat`, `historical`, etc.); or (3) inside a `_prescribe_failure_fix` advisory branch designed to re-parse legacy log strings.
+
+**Cross-references.** Companion: [#loss-form-triple-touch](#loss-form-triple-touch) (functional-form change, this rule's positive-direction counterpart), [#promotion-propagation](#promotion-propagation) (default-value drift, this rule's mirror image for removals), [#sibling-fanout-dry-gate](#sibling-fanout-dry-gate) (paired DRY enforcement for new-field addition — the iter163 log-field parser gap is the addition-direction analogue caught in this same review), [#dead-code-tracking](#dead-code-tracking) (the precursor incident — always-1.0 tracking that survived feature removal at the code level; this rule extends that principle to docstrings and paper-facing equations).
 
 ---
 

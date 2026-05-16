@@ -31,6 +31,15 @@ ROUTER_DIRICHLET_DIAG_FIELDS: tuple[str, ...] = (
     "router_ucb_beta_current",  # last term sourced from `_dirichlet_ucb_beta`
 )
 
+# iter163: multi-K consistency loss step-log fields. Single source for the
+# parser's out-dict initializer AND the per-line parsing loop, so adding a
+# future consistency term is a one-line registry change. Enforced by
+# `tests/test_removal_symmetry.py::test_iter163_consistency_log_fields_in_parser_and_contract`.
+CONSISTENCY_LOSS_FIELDS: tuple[str, ...] = (
+    "consistency_anchor_loss",
+    "consistency_ext_loss",
+)
+
 # Consistent colors: blue for Baseline, orange for Current
 COLOR_BASELINE = "#1f77b4"  # matplotlib default blue
 COLOR_CURRENT = "#ff7f0e"   # matplotlib default orange
@@ -81,6 +90,7 @@ def parse_log(logpath: str) -> dict:
         "router_ema_alive_loss": [], "router_ema_balance_loss": [],
         "router_ema_specialization_loss": [], "mos_cv_loss": [],
         "expert_diversity_loss": [], "mos_diversity_loss": [], "router_reg_loss": [],
+        **{f: [] for f in CONSISTENCY_LOSS_FIELDS},
         "router_pertoken_entropy_coef_eff": [],
         "router_ema_alive_coef_eff": [], "router_ema_balance_coef_eff": [],
         "router_ema_specialization_coef_eff": [],
@@ -253,6 +263,7 @@ def parse_log(logpath: str) -> dict:
                 "router_ema_alive_loss", "router_ema_balance_loss",
                 "router_ema_specialization_loss", "mos_cv_loss",
                 "expert_diversity_loss", "mos_diversity_loss", "router_reg_loss",
+                *CONSISTENCY_LOSS_FIELDS,
                 "router_pertoken_entropy_coef_eff",
                 "router_ema_alive_coef_eff", "router_ema_balance_coef_eff",
                 "router_ema_specialization_coef_eff",

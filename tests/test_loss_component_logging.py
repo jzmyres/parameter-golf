@@ -69,18 +69,26 @@ class TestLossComponentLogging(unittest.TestCase):
         loss = model(input_ids, target_ids)
 
         self.assertTrue(loss.requires_grad)
-        # Note: _router_cv_loss_t and _mos_cv_loss_t are still emitted as
-        # diagnostic tensors (CV is computed for logging) but neither
-        # contributes to the loss after router_load_cv_coef and mos_load_cv_coef
-        # were removed 2026-05-15.
-        for name in [
+        # _router_cv_loss_t and _mos_cv_loss_t are still emitted as diagnostic
+        # tensors (CV is computed for logging) but neither contributes to the
+        # loss after router_load_cv_coef and mos_load_cv_coef were removed
+        # 2026-05-15. The iter163 consistency-loss tensors (`*_loss_t`) are
+        # detached log copies of the with-grad `*_loss_raw`; they may be None
+        # when the gating conditions don't fire (prefix_anchors=False here so
+        # the anchor term stays None; use_parcae=True so the extension fires).
+        required = [
             "_router_cv_loss_t", "_router_pertoken_entropy_loss_t", "_mos_cv_loss_t",
             "_expert_diversity_loss_t", "_mos_diversity_loss_t", "_router_reg_loss_t",
             "_router_pertoken_entropy_coef_eff_t",
             "_expert_diversity_coef_eff_t",
             "_mos_diversity_coef_eff_t",
-        ]:
+        ]
+        optional = ["_consistency_anchor_loss_t", "_consistency_ext_loss_t"]
+        for name in required + optional:
+            self.assertTrue(hasattr(model, name), name)
             t = getattr(model, name)
+            if name in optional and t is None:
+                continue
             self.assertIsInstance(t, torch.Tensor, name)
             self.assertEqual(tuple(t.shape), (), name)
             self.assertFalse(t.requires_grad, name)

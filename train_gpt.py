@@ -747,35 +747,31 @@ class Hyperparameters:
     # iter147/iter155 path: finite-perturbation expansion penalty. Per-call
     # form is `expansion = ‖M(z+ε·u) − M(z)‖_RMS / ε` with `u` a unit-RMS
     # random direction; the Hutchinson expectation is ‖J_M‖_F/√D, NOT operator
-    # norm — see `lip_ub_F` (gate-aligned empirical metric), `lip_ub_S`
-    # (advisory surrogate), and `lip_ub_T` (decomposition) for the
-    # operator-norm power-iteration estimates.  None of these are formal
-    # certificates: power iteration is a lower-bound estimator and the
-    # safety multiplier is a heuristic margin, not a proof.
+    # norm. The principled spectral signal is `rho_F` (Hartman-Grobman:
+    # rho(J_F) < 1 is necessary AND sufficient for asymptotic local
+    # convergence); the soft-Lyapunov FD penalty is a refuted lower-bound
+    # proxy retained only as a default-off ablation path.
     # `M` is selected by `lyapunov_target`:
     #   - "transition_T" (iter147 default): M = T_θ(z, x₀); penalizes ‖J_T·u‖.
     #     Decomposition-only — T is one component of the iterated map.
     #   - "iteration_S"  (iter155 first attempt): M = S(z, x₀) = Ā·z+(1−Ā)·T_θ;
     #      penalizes ‖J_S·u‖.  Single-state convex blend — NOT what the solver
     #      iterates (the solver is two-state).  Advisory surrogate only.
-    #   - "iteration_F"  (iter155 corrected, gate-aligned): M = F(y, z) =
+    #   - "iteration_F"  (iter155 corrected): M = F(y, z) =
     #      (Ā·y + β·T(z), Ā·z + β·T(Ā·y + β·T(z))) with β = 1−Ā.  This is
-    #      the actual Parcae cycle the solver iterates; σ_max(J_F) < 1 is
-    #      a sufficient (not necessary) empirical local-contraction
-    #      condition.  Penalizes ‖J_F·(u_y, u_z)‖ — empirical pressure
-    #      toward contraction, not a formal certificate.
-    # Kept default-off until the contraction experiment; when enabled, runs
-    # low-cadence on a token window to avoid making every training step pay
-    # the extra shared-block forwards (T: +2 sb calls; S: +2; F: +4).
+    #      the actual Parcae cycle the solver iterates; penalizes
+    #      ‖J_F·(u_y, u_z)‖ — empirical pressure toward contraction, not a
+    #      formal certificate. iter155 refuted this path empirically.
+    # Kept default-off; the principled FP-convergence mechanism is now the
+    # iter163 multi-K consistency loss (which *learns* rho(J_F) < 1 naturally
+    # by anchoring each TBPTT-K to the converged-FP target).
     lyapunov_coef = 0.0        # λ_jac: weight of relu(expansion - gamma)^2
     # γ is on the Frobenius/√D proxy (Hutchinson), not ‖J‖_2: ‖J‖_2 < 1
     # implies Frobenius/√D < 1 but not the reverse, so γ=0.97 is a soft
-    # directional proxy for the spectral norm of the chosen J_M; the gate is
-    # `lip_ub_F` (iter155 corrected gate-aligned empirical local-contraction
-    # metric on the actual two-state Parcae cycle), with `lip_ub_S`
-    # (single-state blend) and `lip_ub_T` (transition map) retained as
-    # advisory decomposition diagnostics.  All three are power-iteration
-    # estimates of σ_max, not formal upper bounds.
+    # directional proxy. The lip_ub_T/S/F operator-norm probes that
+    # historically accompanied this penalty were removed 2026-05-15 as
+    # over-restrictive — for non-symmetric J_F the σ_max can be orders of
+    # magnitude above ρ (iter152: σ_max ≈ 17, ρ ≈ 0.85, iter_conv_rel ≈ 0.02).
     # Pure IFT was removed after iter144; future contraction work should change
     # the transition parameterization or use a new hybrid finite-K design.
     lyapunov_gamma = 0.97
@@ -785,21 +781,13 @@ class Hyperparameters:
     # Default "transition_T" preserves iter147 behavior.  "iteration_S" routes
     # the FD probe to the single-state convex blend (advisory only — not the
     # iterated map); "iteration_F" routes to the actual two-state Parcae
-    # cycle map and is gate-aligned with `lip_ub_F`.  The S/F branches do
-    # NOT detach Ā so gradients flow to Parcae damping; B̄ remains detached
-    # because it appears inside the FD subtraction and would carry
-    # second-order curvature otherwise.
+    # cycle map.  The S/F branches do NOT detach Ā so gradients flow to Parcae
+    # damping; B̄ remains detached because it appears inside the FD subtraction
+    # and would carry second-order curvature otherwise.
     lyapunov_target = "transition_T"
-    # iter155 (corrected): which direction the FD probe perturbs.
-    #   "random_fd" (default): single random RMS-1 direction — Hutchinson
-    #     Frobenius/√D estimate, low cost.
-    #   "power_jvp_F": run a few power-iteration steps on J_F (no-grad) to
-    #     estimate the dominant right singular vector, then perturb in
-    #     THAT direction.  Penalty bears on the worst expansion mode of
-    #     J_F rather than averaging random directions; cost ~3× the
-    #     random_fd path (a few extra sb forwards/backwards).  Only
-    #     meaningful when `lyapunov_target=iteration_F`; falls back to
-    #     random_fd otherwise.
+    # iter155 (corrected): which direction the FD probe perturbs.  Currently
+    # validator accepts only "random_fd" — the `power_jvp_F` worst-direction
+    # branch was removed 2026-05-15 with the underlying lip_ub_* probes.
     lyapunov_estimator = "random_fd"
     # Phase 9 iter 55: Denoising regularization (HyDRA 2026, Efficient DEQ 2025).
     # ||f(z*+ε, x0) - z*||² penalizes contraction failure at finite perturbation.
@@ -5538,10 +5526,10 @@ class GPT(nn.Module):
         # probe on T_θ (default), the single-state convex blend
         # S = Ā·z+(1−Ā)·T_θ (when `lyapunov_target=iteration_S`; advisory
         # only — NOT the iterated map), or the actual two-state Parcae cycle
-        # F (when `lyapunov_target=iteration_F`; gate-aligned).  Default OFF,
-        # run low-cadence from the training loop.  NOT an operator-norm
-        # probe — see the `lip_ub_F` gate (with `lip_ub_S` advisory and
-        # `lip_ub_T` decomposition diagnostic) for that.
+        # F (when `lyapunov_target=iteration_F`).  Default OFF, run
+        # low-cadence from the training loop. NOT an operator-norm probe —
+        # the principled gate is `rho_F` (spectral radius via power
+        # iteration on J_F; Hartman-Grobman necessary AND sufficient).
         self.lyapunov_coef = float(lyapunov_coef)
         self.lyapunov_gamma = float(lyapunov_gamma)
         self.lyapunov_every = int(lyapunov_every)
@@ -5549,9 +5537,11 @@ class GPT(nn.Module):
         # iter155 (corrected): enum {"transition_T","iteration_S","iteration_F"}; selects which Jacobian
         # the FD probe penalizes. Validated in `_validate_hyperparameters`.
         self.lyapunov_target = str(lyapunov_target)
-        # iter155 (corrected): enum {"random_fd","power_jvp_F"}; selects which
-        # direction the FD probe perturbs. power_jvp_F bears on the dominant
-        # singular vector of J_F; only meaningful with iteration_F target.
+        # iter155 (corrected): enum currently only accepts {"random_fd"} — the
+        # `power_jvp_F` worst-direction branch was removed 2026-05-15 alongside
+        # the lip_ub_* operator-norm probes (refuted by iter155/iter152). The
+        # field is retained because the validator still names it, but should be
+        # collapsed to a constant in a follow-up cleanup.
         self.lyapunov_estimator = str(lyapunov_estimator)
         self.logit_softcap = float(logit_softcap)
         self.mos_head = MoSHead(
@@ -5925,11 +5915,19 @@ class GPT(nn.Module):
         definition) and approximate elsewhere. For the consistency-loss
         purpose this is fine because the loss only fires meaningfully when
         z is near the FP, where the approximation is tight.
+
+        Numerical dtype: ``_parcae_a_bar()`` / ``_parcae_b_bar()`` return
+        fp32, but the deeper-K target must follow the same trajectory as
+        the actual training-time DEQ solve (bf16 under CLAUDE.md
+        "bf16 training default"). Cast the Parcae coefficients into
+        ``z.dtype`` before the loop so the no-grad extension matches the
+        with-grad forward pass — otherwise the consistency target is
+        biased relative to what the model actually produces at K+Δ.
         """
         sb = _unwrap_compiled_module(self.shared_block)
-        a_bar = self._parcae_a_bar()  # per-dim damping
+        a_bar = self._parcae_a_bar().to(z.dtype)  # per-dim damping
         one_minus_a = 1.0 - a_bar
-        b_bar = self._parcae_b_bar()
+        b_bar = self._parcae_b_bar().to(z.dtype)
         y_e = z.detach()
         z_e = z.detach()
         with torch.no_grad():
@@ -5980,27 +5978,30 @@ class GPT(nn.Module):
 
         # iter163 (2026-05-15): Multi-K consistency losses for natural FP
         # convergence learning (CLAUDE.md most-principled-simplest-general
-        # directive: principled = enforces FP equation T(z*)=z* directly;
-        # general = arch-agnostic, no T_θ-specific assumption).
+        # directive). The `_*_loss_raw` fields hold the with-grad tensors
+        # that cross the `_run_backbone` → `forward` boundary and are
+        # multiplied into the total loss; the `_*_loss_t` fields are the
+        # detached log copies read by `_log_tensor_attr`. Same separation
+        # as `_ntp_loss_t` / `ntp_loss` (raw is a local in the assembly
+        # method) — instance attrs are needed here because the raw is
+        # computed in `_run_backbone` and consumed in `forward`. The
+        # consecutive-recursion form (vs "all-to-final-K") is documented
+        # in `opg_doc.tex` Section 7 and CLAUDE.md "Current Architecture".
+        self._consistency_anchor_loss_raw = None
+        self._consistency_ext_loss_raw = None
         self._consistency_anchor_loss_t = None
         self._consistency_ext_loss_t = None
         if self.training and prefix_mode and self.multi_k_consistency_anchor_coef > 0.0 and z_stack.shape[0] >= 2:
-            # Recursive consistency: ‖z_{anchor_i} − z_{anchor_{i+1}}.detach()‖²
-            # over consecutive prefix anchors. Gradient flows ONLY through the
-            # shallower anchor (deeper one detached); transitivity gives
-            # asymptotic FP convergence.
-            shallow = z_stack[:-1]
-            deep_target = z_stack[1:].detach()
-            self._consistency_anchor_loss_t = (shallow - deep_target).pow(2).mean()
+            anchor_raw = (z_stack[:-1] - z_stack[1:].detach()).pow(2).mean()
+            self._consistency_anchor_loss_raw = anchor_raw
+            self._consistency_anchor_loss_t = anchor_raw.detach()
         if self.training and self.multi_k_consistency_extension_coef > 0.0 and self.use_parcae:
-            # Extension consistency: extending K by Δ should not change z (the
-            # operational asymptotic-stability test). Cheap implementation:
-            # extend from z (final state of with-grad forward) by Δ no-grad
-            # Parcae two-state iterations, initializing y = z (true at FP).
             delta = int(self.multi_k_consistency_extension_delta) or int(self._deq_k_last)
             if delta > 0:
                 z_extended = self._consistency_extend_no_grad(z, x0_refined, delta)
-                self._consistency_ext_loss_t = (z - z_extended.detach()).pow(2).mean()
+                ext_raw = (z - z_extended.detach()).pow(2).mean()
+                self._consistency_ext_loss_raw = ext_raw
+                self._consistency_ext_loss_t = ext_raw.detach()
 
         # DEQ diagnostics: keep tensor fields for low-overhead logging, but
         # also maintain legacy float/list fields for existing experiments.
@@ -6104,8 +6105,7 @@ class GPT(nn.Module):
         """Flat router-side regularization assembly:
 
             router_reg_loss
-              = router_load_cv_coef        × Σ_r cv²(r)
-              + router_pertoken_entropy_coef_eff    × Σ_r H_pertoken(r)
+              = router_pertoken_entropy_coef_eff   × Σ_r H_pertoken(r)
               + router_ema_alive_coef      × Σ_r EMA_alive(r)
               + router_ema_balance_coef    × Σ_r KL_bal(r)
                 where KL_bal = KL(U || ST(EMA_r)) when use_reverse_kl_balance
@@ -6115,6 +6115,14 @@ class GPT(nn.Module):
               - router_ema_specialization_coef × Σ_r KL(P_token(r) || stopgrad(EMA_r))
               + eff_diversity_coef         × per_token_expert_diversity
               + eff_mos_diversity_coef     × mos_per_token_expert_diversity
+
+        CV-as-loss (router_load_cv_coef / mos_load_cv_coef) was removed
+        2026-05-15 — router CV is subsumed by the EMA-anchored balance
+        term, and MoS CV is subsumed by the routing softmax + small head
+        count (contribution was 0.08% noise at iter163 step 1000). CV is
+        still computed for the `_router_cv_loss_t` / `_mos_cv_loss_t`
+        diagnostic tensors (and `attn_cv` / `mlp_cv` / `pool_cv` step-log
+        fields); the multiplication into total loss is gone.
 
         `eff_*_coef` already includes the grad_accum_steps compensation for
         last-micro-step gating (multiplied by `_aux_grad_accum_scale`).
@@ -6129,6 +6137,11 @@ class GPT(nn.Module):
         ent_coef_sum = zero
         ent_count = 0
         for r in routers:
+            # cv_sum / mos_cv are diagnostic-only (CV-as-loss removed
+            # 2026-05-15) — aggregate as-is; the autograd graph is broken at
+            # the `_router_cv_loss_t = cv_sum.detach()` / `_mos_cv_loss_t =
+            # mos_cv.detach()` assignments below, which is the single source
+            # of truth for the diagnostic boundary.
             cv_sum = cv_sum + getattr(r, "_cv_loss_raw", zero)
             ent_sum = ent_sum + getattr(r, "_pertoken_entropy_loss", zero)
             ent_raw_sum = ent_raw_sum + getattr(r, "_pertoken_entropy_raw_loss", zero)
@@ -6237,10 +6250,10 @@ class GPT(nn.Module):
             self._ctp_loss = 0.0
             ctp_weight = float(getattr(self, "ctp_weight", 0.0)) if self.use_ctp else 0.0
             total = ntp_loss + ctp_weight * ctp_loss + router_reg_loss
-            if isinstance(self._consistency_anchor_loss_t, torch.Tensor) and self.multi_k_consistency_anchor_coef > 0.0:
-                total = total + self.multi_k_consistency_anchor_coef * self._consistency_anchor_loss_t
-            if isinstance(self._consistency_ext_loss_t, torch.Tensor) and self.multi_k_consistency_extension_coef > 0.0:
-                total = total + self.multi_k_consistency_extension_coef * self._consistency_ext_loss_t
+            if isinstance(self._consistency_anchor_loss_raw, torch.Tensor) and self.multi_k_consistency_anchor_coef > 0.0:
+                total = total + self.multi_k_consistency_anchor_coef * self._consistency_anchor_loss_raw
+            if isinstance(self._consistency_ext_loss_raw, torch.Tensor) and self.multi_k_consistency_extension_coef > 0.0:
+                total = total + self.multi_k_consistency_extension_coef * self._consistency_ext_loss_raw
             return total
 
         self.mos_head._diversity_aux_enabled = bool(
@@ -6304,10 +6317,12 @@ class GPT(nn.Module):
             self._ctp_loss = 0.0
         ctp_weight = float(getattr(self, "ctp_weight", 0.0)) if self.use_ctp else 0.0
         # iter163 consistency losses (only extension term applies in
-        # final-endpoint mode; anchor term requires prefix_mode).
+        # final-endpoint mode; anchor term requires prefix_mode). Use the
+        # raw with-grad tensor for the loss assembly; the `_*_loss_t` field
+        # is a detached log copy.
         total = ntp_loss + ctp_weight * ctp_loss + router_reg_loss
-        if isinstance(self._consistency_ext_loss_t, torch.Tensor) and self.multi_k_consistency_extension_coef > 0.0:
-            total = total + self.multi_k_consistency_extension_coef * self._consistency_ext_loss_t
+        if isinstance(self._consistency_ext_loss_raw, torch.Tensor) and self.multi_k_consistency_extension_coef > 0.0:
+            total = total + self.multi_k_consistency_extension_coef * self._consistency_ext_loss_raw
         # Lyapunov + denoising auxiliaries are added in the training loop.
         return total
 
@@ -6510,12 +6525,13 @@ def _prescribe_failure_fix(failure: str) -> dict:
     Diagnostics identify root causes; prescriptions prefer reusable mechanisms
     over symptom-specific losses:
       - router_bias_update          — slow generic usage-prior controller
-      - mos_load_cv_coef            — MoS gate usage regularizer
       - expert-bank geometry        — preferred expert-collapse fix
       - transition parameterization — preferred contraction fix
-    Router CV-as-loss was removed 2026-05-15 (EMA-anchored balance fully
-    covers routed-usage balance, so the CV-floor fallback is no longer a
-    valid prescription lever).
+      - multi-K consistency loss    — principled FP-convergence mechanism
+    Router/MoS CV-as-loss was removed 2026-05-15 (EMA-anchored balance fully
+    covers routed-usage balance, and MoS head balance is maintained for free
+    by the routing softmax + small head count); the CV-floor fallback is no
+    longer a valid prescription lever.
     """
     low = failure.lower()
     first_token = low.split("=", 1)[0].split()[0] if low else ""
@@ -6704,11 +6720,13 @@ def _parcae_cycle_F(
     with ``β = 1 − Ā`` and per-dim Ā stored in ``a_bar_d`` (broadcast-
     compatible with ``y`` / ``z``, e.g. shape ``(1, 1, D)``).
 
-    This is the gate-aligned iteration map probed by ``lip_ub_F``,
-    measured by ``fp_residual_F``, and penalized by the
-    ``lyapunov_target=iteration_F`` FD branch — the single source of
-    truth for the F-cycle algebra so the probe / residual / training
-    paths cannot silently diverge.
+    This is the iteration map probed by ``rho_F`` (the principled spectral
+    gate per Hartman--Grobman), measured by ``fp_residual_F``, and used by
+    the iter163 multi-K consistency loss extension term — the single source
+    of truth for the F-cycle algebra so the probe / residual / training
+    paths cannot silently diverge. The operator-norm probes (``lip_ub_F``,
+    ``lip_ub_S``, ``lip_ub_T``) and Banach error bound (``fp_bound``) were
+    removed 2026-05-15 as over-restrictive.
 
     Returns ``(y_new, z_new)`` with the same shape and dtype as ``y, z``.
     Two ``sb`` calls per invocation (one for ``T(z)``, one for ``T(y_new)``).
@@ -6964,9 +6982,11 @@ def _joint_F_residual_at_saved_fp(
     Computes ``r_F = ‖F(z*, z*) − (z*, z*)‖_RMS / ‖(z*, z*)‖_RMS`` for the
     actual cycle ``F(y, z) = (Ā·y + β·T(z), Ā·z + β·T(Ā·y + β·T(z)))``.
     At a true joint FP, ``r_F = 0``; in practice ``z*`` is from a finite-K
-    solver, so ``r_F`` measures the distance to the joint FP and pairs
-    correctly with ``lip_ub_F`` in Banach's bound
-    ``‖x − x*‖ ≤ r_F / (1 − lip_ub_F)``.
+    solver, so ``r_F`` measures the distance to the joint FP and is reported
+    as a standalone empirical convergence signal alongside ``rho_F`` and
+    ``iter_conv_rel``. The earlier Banach pair ``fp_bound = r_F / (1 - lip_ub_F)``
+    was removed 2026-05-15 — operator-norm bounds are over-restrictive for
+    non-symmetric ``J_F``.
 
     Cost: 2 ``sb`` calls (one for ``T(z*)``, one for ``T(u')``); no autograd.
     Reuses the saved-FP probe preparation so dtype/slice choices match the
@@ -6988,7 +7008,7 @@ def _joint_F_residual_at_saved_fp(
             with ctx_factory(), torch.autocast(device_type="cuda", dtype=target_dtype):
                 # Joint state at saved FP: (y*, z*) = (z_star, z_star).
                 # Delegates to the shared cycle helper so the residual
-                # measurement uses identical algebra to the lip_ub_F probe.
+                # measurement reuses `_parcae_cycle_F` (single source of truth).
                 y_new, z_new = _parcae_cycle_F(
                     z_star, z_star, x0_lyap, b_bar_d, a_bar_t, sb,
                 )
@@ -8363,12 +8383,14 @@ def main() -> None:
                             x0_base = x0_lyap[:, start_lyap:start_lyap + t_lyap].contiguous()
                             # Hutchinson-style probe: with `eps_unit` of unit RMS in
                             # high-D, `expansion` has expectation ‖J_M‖_F/√D, NOT the
-                            # operator norm ‖J_M‖_2 that the post-final `lip_ub_F`
-                            # (gate-aligned), `lip_ub_S` (advisory), and `lip_ub_T`
-                            # (decomposition) probes measure. So this is a Frobenius/√D
+                            # operator norm ‖J_M‖_2. So this is a Frobenius/√D
                             # proxy on whichever Jacobian `lyapunov_target` selects
                             # (T_θ, S, or F) — soft contraction pressure, not a tight
-                            # Lipschitz cert. RMS form (vs unit-L2) keeps per-element
+                            # Lipschitz cert. The principled FP-convergence gate is
+                            # `rho_F` (spectral radius via power iteration on J_F);
+                            # operator-norm probes `lip_ub_T/S/F` were removed
+                            # 2026-05-15 as over-restrictive proxies.
+                            # RMS form (vs unit-L2) keeps per-element
                             # magnitudes ~O(1) under bf16 finite differencing.
                             # Seeded per-step generator: deterministic across reruns
                             # at fixed (args.seed, next_step). Matches the determinism
@@ -8403,7 +8425,9 @@ def main() -> None:
                             #     derivative of the two-state cycle map F.
                             #     ⇒ ‖J_F · (u_y, u_z)‖ — the gate-aligned object.
                             # Soft directional proxy for the spectral norm of
-                            # the chosen J_M; gate is `lip_ub_F`.
+                            # the chosen J_M; the principled gate is `rho_F`
+                            # (spectral radius). This FD penalty is a refuted
+                            # lower-bound proxy retained only as an ablation.
                             lyap_target = str(getattr(base_model, "lyapunov_target", "transition_T"))
                             if lyap_target == "iteration_F" and base_model.use_parcae:
                                 # Two-state cycle: y' = Ā·y + β·T(z),
@@ -8424,9 +8448,9 @@ def main() -> None:
                                 eps_unit_y = eps_dir_y / eps_dir_y.float().pow(2).mean().sqrt().clamp(min=1e-8).to(dtype=eps_dir_y.dtype)
                                 # F at base = F(z_base, z_base); F at perturbed
                                 # = F(z_base + ε·u_y, z_base + ε·u_z).  Cycle
-                                # algebra is the same `_parcae_cycle_F` helper
-                                # used by lip_ub_F probe and fp_residual_F —
-                                # single source of truth, no future drift.
+                                # algebra delegates to `_parcae_cycle_F` (the
+                                # single source of truth used by `rho_F` and
+                                # `fp_residual_F` — no future drift).
                                 y_new_base, z_new_base = _parcae_cycle_F(
                                     z_base, z_base, x0_base, aux_b_bar_d, a_bar_d, sb,
                                 )
@@ -9342,8 +9366,8 @@ def main() -> None:
 
     # 4. Iter convergence (empirical FP convergence signal).  Promoted to
     # gate-relevant per Tier 1 redesign: this is the operational signal
-    # of asymptotic convergence and is decoupled from operator-norm
-    # estimates (lip_ub_F).  Threshold 0.05 chosen because iter152
+    # of asymptotic convergence (decoupled from theoretical spectral-radius
+    # estimates via `rho_F`).  Threshold 0.05 chosen because iter152
     # (BPB-winning baseline) shows 0.019 at K=128; 0.05 leaves headroom
     # for legitimate optimization noise while still flagging real divergence.
     # DDP-reduce the rank-local conv_rel so the assertion sees the global

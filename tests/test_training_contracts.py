@@ -214,6 +214,8 @@ class TestTrainingContracts(unittest.TestCase):
             "router_pertoken_entropy_coef_eff:",
             "expert_diversity_coef_eff:",
             "mos_diversity_coef_eff:",
+            "consistency_anchor_loss:",
+            "consistency_ext_loss:",
         ]
         for field in required_fields:
             self.assertIn(field, text)

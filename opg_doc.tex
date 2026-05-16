@@ -38,7 +38,7 @@
 \title{OPG (parameter-golf): Code-Aligned RevDEQ/Parcae Note\\
 \large Dense expert routing, independent MLA/MLP experts, and local stability notation}
 \author{Project document for \texttt{train\_gpt.py}}
-\date{2026-05-06}
+\date{2026-05-15}
 
 \begin{document}
 \maketitle
@@ -192,9 +192,10 @@ Mac/MLX support, ignore \texttt{train\_gpt\_mlx.py}.
 \texttt{lyapunov\_target} & transition\_T & \multicolumn{2}{l}{\small enum: \texttt{transition\_T} (J of $T_\theta$; iter147), \texttt{iteration\_S} (J of $S=\bar A z+(1-\bar A)T_\theta$; advisory), \texttt{iteration\_F} (J of two-state Parcae cycle $F$; gate-aligned, iter155 corrected)} \\
 \texttt{denoising\_coef} & 0.0 & \texttt{denoising\_noise\_std} & 0.01 \\
 \texttt{grad\_clip\_norm} & 1.0 & \texttt{weight\_decay} & 0.015 \\
-\texttt{router\_load\_cv\_coef} & 0.0 & \texttt{router\_ema\_balance\_coef} & 0.30 \\
+\texttt{multi\_k\_consistency\_anchor\_coef} & 0.1 & \texttt{router\_ema\_balance\_coef} & 0.30 \\
 \texttt{router\_ema\_specialization\_coef} & 0.20 & \texttt{router\_ema\_alive\_coef} & 0.02 \\
-\texttt{router\_pertoken\_entropy\_coef} & 0.1 & \texttt{mos\_load\_cv\_coef} & 0.15 \\
+\texttt{router\_pertoken\_entropy\_coef} & 0.1 & \texttt{multi\_k\_consistency\_extension\_coef} & 0.1 \\
+\texttt{multi\_k\_consistency\_extension\_delta} & 0 (uses $K_{\rm train}$) & \texttt{deq\_prefix\_anchors} & true \\
 \texttt{regularizer\_warmup\_frac} & 0.07 & \texttt{expert\_diversity\_kind} & cosine max-pair \\
 \texttt{expert\_output\_diversity\_coef} & 0.30 & \texttt{mos\_output\_diversity\_coef} & 0.0 \\
 \texttt{use\_entmax\_routing} & false & \texttt{entmax\_blend\_init\_logit} & 5.0 \\
@@ -240,7 +241,7 @@ refuses the flag until the path has a real training, eval, or artifact effect.
 \texttt{num\_refinements} & 0 & outer refinement loop disabled \\
 \texttt{bigram\_vocab\_size} & 0 & BigramHash disabled \\
 \texttt{logit\_softcap} & 0.0 & no-op unless positive \\
-\texttt{deq\_prefix\_anchors} & false & optional training-effect path; enabled by \texttt{score\_iter152} \\
+\texttt{deq\_prefix\_anchors} & true & default-on since iter152 promotion (2026-05-13) \\
 \texttt{use\_reverse\_kl\_balance} & true & iter153 default-on: reverse KL($U\,\|\,$EMA) balance term \\
 \texttt{use\_smear\_gate} & false & optional training-effect path \\
 \texttt{use\_sparse\_attn\_head\_gate} & false & optional training-effect path \\
@@ -644,10 +645,16 @@ they target the fixed-point representation rather than its early-iteration
 prefix.  Router-side regularizers (load CV, EMA balance, per-token entropy,
 alive hinge) are populated during the solve itself and therefore aggregate
 over the full trajectory in either mode; the prefix variant does not alter
-their attachment.  Default is \texttt{deq\_prefix\_anchors=False}; iter 152
-promoted the path on validation BPB (1.4718 vs 1.4787; see
-\texttt{experiments/docs/hypotheses.md} for current numbers) but left
-soft-diagnostic debt on \texttt{lip\_ub} and \texttt{attn\_min\_share}.
+their attachment.  Default is \texttt{deq\_prefix\_anchors=True} (default-on
+since iter152 promotion, 2026-05-13); iter 152 promoted the path on validation
+BPB (1.4718 vs 1.4787; see \texttt{experiments/docs/hypotheses.md} for current
+numbers).  The earlier soft-diagnostic debt on operator-norm proxies has been
+closed: \texttt{lip\_ub\_T/S/F} and \texttt{fp\_bound} were removed 2026-05-15
+as over-restrictive proxies (per Hartman--Grobman, $\rho(J_F)<1$ is necessary
+AND sufficient for local convergence; $\sigma_{\max}<1$ is sufficient but
+over-restrictive — iter152 had $\sigma_{\max}\approx 17$ with
+\texttt{iter\_conv\_rel}$\approx 0.02$, clearly converging).  \texttt{rho\_F}
+is now the sole spectral gate.
 
 Refinement is an optional outer loop around the DEQ solve.  It is disabled by
 default because \texttt{num\_refinements=0}; the 85\% ramp only matters when a
@@ -673,11 +680,8 @@ task term contributes.  The router/diversity term is
 \[
 \begin{aligned}
   \mathcal{L}_{\rm router}
-    &= \lambda_{\rm rcv}\sum_{r\in\{\mathrm{attn},\mathrm{mlp}\}}
-       \operatorname{CV}(m_r)^2 \\
-    &\quad
-     + \lambda_{\rm ent}(t)\sum_r H_{\rm pertoken}(m_r)
-     + \lambda_{\rm mcv}\operatorname{CV}(m_{\rm MoS})^2 \\
+    &= \lambda_{\rm ent}(t)\sum_{r\in\{\mathrm{attn},\mathrm{mlp}\}}
+       H_{\rm pertoken}(m_r) \\
     &\quad
      + \lambda_{\rm div}(t)\mathcal{D}_{\rm experts}
      + \lambda_{\rm mosdiv}(t)\mathcal{D}_{\rm MoS}.
@@ -708,13 +712,11 @@ current step's routing mass $m$.  The promoted router term is
 \[
 \begin{aligned}
 \mathcal{L}_{\rm router}^{\rm iter145r}
-  &= \lambda_{\rm rcv}\sum_r \operatorname{CV}(m_r)^2
-     + \lambda_{\rm ent}\sum_r H_{\rm pertoken}(m_r) \\
-  &\quad + \lambda_{\rm bal}\sum_r \operatorname{KL}_{\rm bal}(r)
-     + \lambda_{\rm alive}\sum_r (\bar d_r)\!\cdot\!(d_r)^2 \\
-  &\quad - \lambda_{\rm spec}\sum_r \operatorname{KL}(p^{\rm token}_r\,\|\,\bar p_r) \\
-  &\quad + \lambda_{\rm mcv}\operatorname{CV}(m_{\rm MoS})^2
-     + \lambda_{\rm div}\mathcal{D}_{\rm experts}
+  &= \lambda_{\rm ent}\sum_r H_{\rm pertoken}(m_r)
+     + \lambda_{\rm bal}\sum_r \operatorname{KL}_{\rm bal}(r) \\
+  &\quad + \lambda_{\rm alive}\sum_r (\bar d_r)\!\cdot\!(d_r)^2
+     - \lambda_{\rm spec}\sum_r \operatorname{KL}(p^{\rm token}_r\,\|\,\bar p_r) \\
+  &\quad + \lambda_{\rm div}\mathcal{D}_{\rm experts}
      + \lambda_{\rm mosdiv}\mathcal{D}_{\rm MoS},
 \end{aligned}
 \]
@@ -733,9 +735,10 @@ The minus sign on the specialization term reflects KL maximization: minimizing
 $-\lambda_{\rm spec}\,\mathrm{KL}$ pushes per-token routing AWAY from the
 historical mean, bounded by $\log(E)$ since $\bar p$ is normalized and clamped.
 Current coefficients (CV-as-loss removed 2026-05-15: $\lambda_{\rm rcv}$ and
-$\lambda_{\rm mcv}$ are gone — router CV subsumed by EMA-anchored balance,
-MoS CV subsumed by routing softmax + small head count; both remain as
-diagnostic tensors):
+$\lambda_{\rm mcv}$ were dropped — router CV subsumed by EMA-anchored balance,
+MoS CV subsumed by routing softmax + small head count; CV remains as
+diagnostic tensors \texttt{\_router\_cv\_loss\_t} / \texttt{\_mos\_cv\_loss\_t}
+only):
 $\lambda_{\rm bal}=0.30$, $\lambda_{\rm spec}=0.20$, $\lambda_{\rm alive}=0.02$,
 $\lambda_{\rm ent}=0.1$, $\lambda_{\rm div}=0.30$,
 $\lambda_{\rm mosdiv}=0.0$, with all coefficients ramped linearly over the
@@ -800,22 +803,25 @@ two block evaluations; F branch needs four (the two-state cycle evaluates
 $T$ twice).  Each branch is a soft directional proxy for the operator
 norm of the chosen Jacobian (Hutchinson Frobenius$/\sqrt D$ on a single
 random direction — an under-estimate of $\sigma_{\max}(J)$, not a
-spectral-radius proxy).  The gate-aligned \emph{empirical local-contraction
-metric} is \texttt{lip\_ub\_F} (estimate on the actual two-state Parcae
-cycle), with \texttt{lip\_ub\_S} (single-state convex blend; advisory
-surrogate) and \texttt{lip\_ub\_T} (transition map alone; decomposition
-diagnostic) reported alongside for failure attribution.
+spectral-radius proxy).  Live spectral monitoring of $\rho(\nabla F)$ is
+provided by the \texttt{rho\_F} probe (straight power iteration on $J_F$;
+see Section~\ref{sec:lyapunov}); $\rho<1$ is necessary AND sufficient for
+asymptotic local convergence by Hartman--Grobman.  The earlier
+operator-norm probes \texttt{lip\_ub\_T/S/F} were removed 2026-05-15 as
+over-restrictive proxies: iter152 demonstrated $\sigma_{\max}\approx 17$
+with \texttt{iter\_conv\_rel}$\approx 0.02$ (clearly converging despite
+large operator norm), so the operator-norm gate was pressuring the wrong
+condition.
 
-\textbf{Honesty caveat.}  Power iteration with $n_\text{iters}=3$ in noisy
-bf16 is a lower-bound estimator of $\sigma_{\max}$ — the reported
-\texttt{lip\_ub\_F} systematically under-estimates the true operator
-norm.  The safety multiplier (\texttt{fp\_lip\_ub\_safety}=1.10 by
-default) is a heuristic conservative margin, not a proof.  Even
-$\sigma_{\max}(J_F)<1$ exactly is only a sufficient condition for
-$\rho(J_F)<1$ (a non-normal Jacobian can have $\rho \to 0$ while
-$\sigma_{\max}$ stays large via "transient amplification"), so
-\texttt{lip\_ub\_F} is best read as an \emph{empirical local-contraction
-metric}, not a formal certificate.
+\textbf{Honesty caveat (the soft penalty itself).}  Even when
+\texttt{lyapunov\_coef} is set positive, the FD-based directional
+estimator $r$ is a lower-bound proxy for $\sigma_{\max}(J_M)$, and
+$\sigma_{\max}<1$ is only a sufficient (not necessary) condition for
+$\rho<1$.  A non-normal Jacobian can have $\rho\to 0$ while
+$\sigma_{\max}$ stays large via "transient amplification."  The penalty
+therefore cannot reliably constrain $\rho$, which is why iter155 refuted
+the soft-Lyapunov path empirically and the default coefficient was kept
+at $0.0$.
 
 \paragraph{Two tiers of contraction control.}
 The codebase explicitly distinguishes two tiers of mechanism for the
@@ -823,50 +829,44 @@ contraction problem; conflating them is the source of overclaiming bugs
 flagged in iter155 review:
 
 \begin{enumerate}[leftmargin=2em,itemsep=0.2em]
-  \item \emph{Architecture-agnostic empirical pressure} (current iter155
-    + iter156a paths).  Mechanism: K-sweep \texttt{lip\_ub\_F} probe +
-    Lyapunov-on-F soft FD penalty (with optional
-    \texttt{lyapunov\_estimator=power\_jvp\_F} worst-direction probe) +
-    iter156a heuristic Ā-projection governor.  Property: preserves model
-    capacity (no Lipschitz constraint on the architecture itself), runs
-    with default-off coefficient and BPB-gated aug-Lagrangian
-    escalation.  Guarantee: \emph{none} — power iteration is a
-    lower-bound estimator, the safety multiplier is heuristic, and the
-    Ā governor is non-monotone in $\sigma_{\max}(J_F)$.  This tier
-    measures and pressures the right object empirically.
-  \item \emph{Formal-guarantee tier} (iter156b and siblings; not present
-    in iter155).  Mechanisms with true upper-bound semantics:
-    interval/explicit-Jacobian bound estimation over a local ball,
-    spectral normalization of $\Delta$, bounded-Lipschitz block
-    parameterization, or a learned $c\in(0,1]$ gain on $\Delta$ that is
-    hard-projected at design time.  Property: introduces an explicit
-    architectural Lipschitz constraint that may reduce model capacity in
-    exchange for a real upper bound on $\sigma_{\max}(J_F)$.  Guarantee:
-    a true Lipschitz cert is achievable only by combining a
-    formal-tier mechanism with the F-side measurement.
+  \item \emph{Architecture-agnostic empirical pressure} (current default).
+    Mechanism: \texttt{rho\_F} spectral-radius probe (necessary AND
+    sufficient for local convergence by Hartman--Grobman) on every
+    fast-val emission and K-sweep row, plus the iter163 multi-K
+    consistency loss (Section~\ref{sec:consistency} below) which
+    \emph{learns} $\rho(J_F)<1$ naturally by anchoring each K to the
+    converged FP target.  Property: preserves model capacity (no
+    Lipschitz constraint on the architecture itself); the consistency
+    loss is the principled mechanism for FP-convergence learning.
+    Guarantee: \texttt{rho\_F}$<1$ at the sampled FP gives a true
+    spectral statement, not a soft proxy.  Earlier soft-Lyapunov +
+    operator-norm-probe variants (iter155 etc.) are refuted and removed.
+  \item \emph{Formal-guarantee tier} (not currently active).  Mechanisms
+    with true upper-bound semantics: interval/explicit-Jacobian bound
+    estimation over a local ball, spectral normalization of $\Delta$,
+    bounded-Lipschitz block parameterization, or a learned $c\in(0,1]$
+    gain on $\Delta$ that is hard-projected at design time.  Property:
+    introduces an explicit architectural Lipschitz constraint that may
+    reduce model capacity in exchange for a real upper bound on
+    $\sigma_{\max}(J_F)$.  Reserved for future iters if \texttt{rho\_F}
+    + consistency-loss tier proves insufficient.
 \end{enumerate}
 
-iter155 is firmly tier (1).  Promotion rules (BPB-gated, soft escalation)
-reflect that.  No part of tier (1) should be described as a "certificate"
-or as "guaranteeing" contraction or capacity preservation.  Moving to
-tier (2) is an explicit model-class decision documented in iter156b.
+Current promotion gates are tier (1): \texttt{rho\_F}$<1$ (theoretical)
+or \texttt{iter\_conv\_rel}$<0.05$ at deepest $K$ (empirical operational
+signal).  No tier-(1) mechanism should be described as a "certificate"
+or as "guaranteeing" Lipschitz contraction.  Moving to tier (2) is an
+explicit model-class decision.
 
-The Banach-style FP error \emph{a posteriori bound metric} at the saved
-fixed point uses the joint cycle residual paired with the same operator
-norm: \texttt{fp\_bound = fp\_residual\_F / (1 - lip\_ub\_F)}, where
-$\texttt{fp\_residual\_F} = \|F(z^\star,z^\star)-(z^\star,z^\star)\|_{\rm RMS}/\|(z^\star,z^\star)\|_{\rm RMS}$.
-This is principled \emph{only if} \texttt{lip\_ub\_F} upper-bounds the
-local Lipschitz constant on a neighborhood of $(z^\star, z^\star)$ — a
-pointwise power-iteration estimate at the single sampled FP is an
-\emph{empirical a posteriori bound metric}, not a formal Banach bound.
-Producing a true Banach bound would require either an interval/explicit-
-Jacobian estimate over a small local ball (e.g.\ Lipschitz-bound
-estimation across a finite cover of perturbed $z$ samples) or a
-hard Lipschitz-bound parameterization of $F$ (spectral-normalized layers,
-bounded-Lipschitz blocks, or a learned $c\in(0,1]$ gain on $\Delta$
-constrained at design time).  iter155 deliberately introduces neither;
-\texttt{fp\_bound} is therefore reported as a comparable cross-iteration
-metric, not a guarantee.
+The earlier Banach-style FP error metric \texttt{fp\_bound = fp\_residual\_F / (1 - lip\_ub\_F)}
+was removed 2026-05-15 along with the operator-norm probes.  The
+underlying observation stands: a pointwise power-iteration estimate at
+the single sampled FP is an empirical a posteriori metric, not a formal
+bound, because it does not cover a neighborhood of $(z^\star,z^\star)$.
+A true Banach bound would require interval/explicit-Jacobian estimation
+over a small local ball or a hard Lipschitz-bound parameterization of
+$F$.  The simpler \texttt{rho\_F} probe and \texttt{fp\_residual\_F}
+diagnostic are retained; the multiplicative bound formula is gone.
 
 Gradients reach $\theta$ through the block evaluations under any target.
 Under \texttt{iteration\_S} and \texttt{iteration\_F}, gradients
@@ -1009,16 +1009,17 @@ preferred fix order is:
 Every fix should state the invariant it enforces and which diagnostics merely
 verify it.  For example, an attention min-share failure should first route to
 the generic router usage controller, not to an attention-only min-share loss;
-a \texttt{lip\_ub\_F} failure (the gate-aligned contraction object on the
-actual two-state Parcae cycle map $F$) should first route to setting
-\texttt{lyapunov\_target=iteration\_F} and tightening Parcae damping
+a \texttt{rho\_F}$\ge 1$ failure (the principled FP-convergence gate on
+the actual two-state Parcae cycle map $F$, per Hartman--Grobman) should
+first route to the iter163 multi-K consistency loss (Section~\ref{sec:consistency}
+below — which \emph{learns} $\rho(J_F)<1$ naturally by anchoring each
+TBPTT-K to the converged-FP target) and to tightening Parcae damping
 \emph{together with} transition-map parameterization (since $J_F$ couples
 $J_T$ through cross blocks $\beta\cdot J_T$ that damping alone cannot
-suppress when $\sigma_{\max}(J_T)>1$), with \texttt{lip\_ub\_T} and
-\texttt{lip\_ub\_S} consulted as decomposition diagnostics that attribute
-the failure to damping-vs-transition causes; another coefficient sweep on
-the same proxy Lyapunov loss without first switching the target is
-forbidden.
+suppress when $J_T$ is itself expansive); another coefficient sweep on
+the (refuted) soft Lyapunov loss is forbidden.  The earlier operator-norm
+probes (\texttt{lip\_ub\_T/S/F}) were removed 2026-05-15 as
+over-restrictive.
 
 \section{Local Stability Guarantee}
 \label{sec:lyapunov}
@@ -1067,17 +1068,16 @@ $\rho(\nabla F(z^\star,z^\star))<1$.  The K-sweep estimator
 $J_F$ (\(v_{k+1}=J_F v_k/\|J_F v_k\|\); the per-step ratio
 \(\|J_F v\|/\|v\|\) at convergence equals $|\lambda_{\max}|$).  This
 is the gate-relevant signal because $\rho<1$ is necessary AND sufficient
-for the local condition above.  An auxiliary K-sweep estimator
-\texttt{lip\_ub\_F} reports $\sigma_{\max}(\nabla F)$ via power iteration
-on $J_F^\top J_F$; this is logged as an over-restrictive diagnostic only,
-since $\sigma_{\max}<1$ is sufficient (Banach contraction principle) but
-not necessary for $\rho<1$ --- the gap can be huge for non-symmetric
-$J_F$, as iter152 empirically confirms ($\sigma_{\max}\approx 17$ with
-\texttt{iter\_conv\_rel}$\approx 0.02$ at K=128, demonstrating the
-iteration converges fine even with large operator norm).  The
-transition map $T_\theta$ is retained as a decomposition diagnostic
-only; $\rho(\nabla T_\theta)<1$ is sufficient but not necessary for the
-joint condition.
+for the local condition above.  The earlier operator-norm proxies
+(\texttt{lip\_ub\_T/S/F}) and the Banach error bound \texttt{fp\_bound}
+were removed 2026-05-15 as over-restrictive: $\sigma_{\max}<1$ is
+sufficient (Banach contraction principle) but not necessary for $\rho<1$,
+and the gap can be huge for non-symmetric $J_F$ — iter152 empirically
+confirmed this with $\sigma_{\max}\approx 17$ and
+\texttt{iter\_conv\_rel}$\approx 0.02$ at $K=128$ (clearly converging
+despite large operator norm).  \texttt{rho\_F} is therefore the sole
+spectral gate; no operator-norm probe is emitted on training-time fast
+val or K-sweep paths.
 
 \paragraph{Architecture-agnostic constraint.}
 The framework above is independent of any particular model architecture.
@@ -1168,20 +1168,24 @@ has block structure (with $J_T = \nabla T_\theta(z^\star)$):
   \end{bmatrix}.
 \]
 The diagonal $D_A, D_\beta$ matrices do \emph{not} commute with $J_T$ in
-general, so order is preserved as written; the K-sweep \texttt{lip\_ub\_F}
+general, so order is preserved as written; the K-sweep \texttt{rho\_F}
 probe builds the JVP through the literal closure
 $\texttt{a\_bar\_t}*y + (1-\texttt{a\_bar\_t})*\texttt{sb}(z, x_0; \bar B)$
 (elementwise multiply), which gives \texttt{torch.autograd} the correct
 order automatically.  $J_F$ couples $J_T$ through the off-diagonal
 $D_\beta\, J_T$ blocks and through $D_\beta\, J_T\, D_\beta\, J_T$ in the
-lower-right.  The gate-aligned \emph{empirical local-contraction
-condition} is $\sigma_{\max}(J_F)<1$ (estimated by \texttt{lip\_ub\_F};
-sufficient but not equivalent to $\rho(J_F)<1$, and the estimator itself
-is a lower bound on $\sigma_{\max}$ rather than a hard upper bound — see
-the honesty caveat in Section~\ref{sec:reg}).
+lower-right.  The principled gate is $\rho(J_F)<1$ (Hartman--Grobman:
+necessary AND sufficient for asymptotic local convergence), estimated by
+the \texttt{rho\_F} probe via straight power iteration on $J_F$.  The
+earlier operator-norm condition $\sigma_{\max}(J_F)<1$ (estimated by
+the removed \texttt{lip\_ub\_F}) was \emph{sufficient but
+over-restrictive} for non-symmetric $J_F$ — see the iter152 evidence
+($\sigma_{\max}\approx 17$ with $\rho \ll 1$) cited above.
 
-The single-state surrogate $S$ and the transition map $T_\theta$ are kept
-as advisory decomposition diagnostics, with the following
+The single-state surrogate $S$ and the transition map $T_\theta$ remain
+as conceptual decomposition objects (their dedicated probes
+\texttt{lip\_ub\_S}/\texttt{lip\_ub\_T} were removed 2026-05-15 as
+over-restrictive operator-norm proxies), with the following
 operator-norm relations clarifying what damping can and cannot do:
 
 \begin{enumerate}[leftmargin=2em,itemsep=0.2em]
@@ -1215,35 +1219,24 @@ $D_\beta J_T$ rather than a convex combination, and the lower-left and
 lower-right blocks introduce $D_\beta J_T D_A$ and $D_\beta J_T D_\beta J_T$
 terms that depend on the eigenstructure of $J_T$ in a non-monotone way.
 We do not state $\rho(\nabla T_\theta)<1 \Rightarrow \rho(\nabla F)<1$ as
-a general guarantee; the safe stance is that the contraction guarantee
-must be evaluated directly on $F$ (via $\sigma_{\max}(J_F)$ or a true
-local-ball Lipschitz bound).  $T_\theta$ is retained as a decomposition
-diagnostic only: a large $\sigma_{\max}(J_T)$ at iter145r/149/152
-($\texttt{lip\_ub\_T}\in[22,65]$) attributes the F-side expansion to the
-transition rather than to insufficient damping, but does not by itself
-imply F is expansive (or contractive).
-The gate-aligned remediation under \texttt{iteration\_F} therefore trains
-$\bar A$ \emph{and} $\theta$ jointly through the F-side FD penalty.
-iter156 escalates: (156a) is a \emph{heuristic} Ā-projection governor
-that probes $\texttt{lip\_ub\_F}$ and adjusts $\bar A$ greedily but
-without a monotonicity guarantee on $\sigma_{\max}(J_F)$; (156b)
-introduces a learned $c\in(0,1]$ gain on $\Delta$ as a true bounded-
-Lipschitz parameterization (the formal-guarantee tier) — combined with
-F-side measurement, 156b can actually enforce a Lipschitz upper bound.
-Sibling formal-tier paths: spectral normalization of $\Delta$,
-bounded-Lipschitz block parameterization, or interval/explicit-Jacobian
-estimation over a local ball.
-
-A subtlety: the K-sweep \texttt{lip\_ub} probes use power iteration
-($n\_\text{iters}=3$ by default), which converges to the dominant singular
-value from below.  In short runs or when the dominant direction is not
-quickly captured, the reported \texttt{lip\_ub} can underestimate
-$\sigma_{\max}$.  A reading $\texttt{lip\_ub\_F}<1$ is therefore an
-empirical local-contraction estimate, not a hard certificate; iter156's
-hard governor design will provide projection-based enforcement, and a
-true formal certificate requires either an interval/explicit-Jacobian
-bound or a model-class change (spectral normalization, bounded-Lipschitz
-layers, or a learned $c\in(0,1]$ gain on $\Delta$).
+a general guarantee; the safe stance is that the contraction condition
+must be evaluated directly on $F$ via \texttt{rho\_F} (necessary AND
+sufficient by Hartman--Grobman).  $T_\theta$ remains a conceptual
+decomposition object: historically the removed \texttt{lip\_ub\_T} probe
+showed values in $[22,65]$ at iter145r/149/152, which would have
+attributed F-side operator-norm expansion to the transition rather than
+to insufficient damping — but operator-norm bounds were over-restrictive,
+and the same iters had $\rho(J_F)$ well below 1 with empirical
+\texttt{iter\_conv\_rel}$\approx 0.02$, confirming asymptotic local
+convergence regardless of $\sigma_{\max}$.
+The principled FP-convergence remediation is therefore (i) the iter163
+multi-K consistency loss (the architecture-agnostic mechanism that
+\emph{learns} $\rho(J_F)<1$ naturally) and (ii) direct
+\texttt{rho\_F}-gated promotion.  Formal-tier mechanisms — spectral
+normalization of $\Delta$, bounded-Lipschitz block parameterization,
+interval/explicit-Jacobian estimation over a local ball, or a hard
+learned $c\in(0,1]$ gain on $\Delta$ — remain reserved for a future
+iter if rho\_F or consistency loss prove insufficient.
 \end{remark}
 
 \appendix
