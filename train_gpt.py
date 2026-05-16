@@ -865,44 +865,51 @@ class Hyperparameters:
     # bundle.
     deq_prefix_anchors = True  # iter152 promoted on BPB (1.4718 vs 1.4787); promotion-propagation completed 2026-05-13 after iter153/iter155 confound was diagnosed.
 
-    # iter163c (2026-05-16, supersedes iter163 extension term):
-    # Anchor-on-deepest consistency anchor. The loss pulls every gradient-
-    # carrying z in the iter152 coarse prefix-anchor z_stack toward the most-
-    # converged available FP proxy z_{K+Δ_ext} (computed by Δ_ext no-grad
-    # Parcae iters after K_sampled):
-    #   L_anchor = anchor_coef · mean_i ‖z_{i} − z_{K+Δ_ext}.detach()‖²
-    # where i ranges over the iter152 prefix-anchor depths and Δ_ext defaults
-    # to 1 (the iter163c v2 design). iter167 promotes Δ_ext=8 to concentrate
-    # the anchor-target quality benefit at the common K_sampled=16 case
-    # (~50 % of training steps) — at Δ_ext=8 with ρ≈0.85, the target reaches
-    # ≈73 % of the FP gap vs ≈15 % at Δ_ext=1.
-    # Pairing every z_i with z_{K+Δ_ext}.detach() (most-converged proxy) is
-    # strictly stronger than pairing with z_{i+1}.detach() (next iteration):
-    # signal magnitude is "distance from FP", not just one-step residual,
-    # and there is no trivial-zero collapse risk because the target is
-    # input-driven (z_{K+Δ_ext} = F^{Δ_ext}(z_K, x0), not constant).
-    # Total cost: ~1.01-1.02× iter152 baseline step time at Δ_ext=1; ~1.07-
-    # 1.10× at Δ_ext=8. Was 1.6× under iter163's extension at Δ=K_train
-    # ≈ 22 no-grad iters per step.
+    # iter170 (2026-05-16, supersedes iter163c v2 and iter167):
+    # Anchor-on-deepest consistency loss where the TARGET is z_K_sampled
+    # itself — the deepest gradient-carrying z in z_stack from the prefix-
+    # anchor forward. ZERO extra forward compute (the target is already
+    # produced by the main TBPTT'd forward):
+    #   L_anchor = anchor_coef · mean_{i in z_stack[:-1]} ‖z_i − z_K_sampled.detach()‖²
+    # where i ranges over all gradient-carrying prefix-anchor depths EXCEPT
+    # the deepest (which serves as the target).  Pair (z_K, z_K.detach()) is
+    # structurally degenerate so it is excluded; only non-trivial pairs
+    # contribute to the mean.
+    #
+    # Trade-offs vs prior designs:
+    #   iter163  (Δ=K_train extension):   target varies wildly (z_32 to z_256);
+    #     ~1.6× iter152 step time due to deep no-grad extension forward.
+    #   iter163c v2 (Δ=1 no-grad iter):   target = z_{K+1}, marginally deeper
+    #     than z_K; ~1.02× step time. REFUTED — Δ=1 too weak, val_bpb
+    #     regressed +22 mBPB at full validation.
+    #   iter167 (Δ=8 no-grad iters):      target = z_{K+8}; ~1.07-1.10× step
+    #     time. Subsumed — z_K_sampled is FREE while providing comparable
+    #     (often better) target depth.
+    #   iter170 (this design):            target = z_K_sampled; target depth
+    #     scales fully with K_sampled (z_16 at K=16, z_128 at K=128);
+    #     ~1.00× step time. Most-principled-simplest-general: the deepest
+    #     available gradient-carrying point IS the model's best FP estimate;
+    #     no proxy and no extra compute needed.
+    #
+    # K_sampled=16 case: with only one prefix anchor (z_16), z_stack has one
+    # entry and z_stack[:-1] is empty — no consistency loss this step. The
+    # principled fix is to add a SHALLOW anchor (K=4) to deq_prefix_anchor_set
+    # so that even K_sampled=16 produces a pair (z_4, z_16.det). iter170 run
+    # uses CLI overrides to enable this:
+    #   --deq-prefix-anchor-set "4,16,32,64,96,128"
+    #   --deq-k-jitter-set      "16,32,64,96,128"     # drop K=24
+    #   --deq-k-jitter-weights  "0.9,0.07,0.03,0.015,0.0075"
+    # The K=24 removal keeps the backward-chain count at K_sampled=128 at
+    # 6 anchors (iter163-baseline-safe) even with K=4 added, avoiding the
+    # iter163c v1 OOM regime (which had 6 anchors → 18 reverse iters at
+    # K_sampled=64 → OOM on 44 GB dev L40S).
+    #
     # Architecture-agnostic per CLAUDE.md most-principled-simplest-general:
     # the FP equation z = F(z) is the universal condition for asymptotic
-    # local convergence; the deepest-K target is the model's best current
-    # estimate of z* at every step. iter163 measured rho_F 1.30 → 0.92 over
-    # training; iter163c should match or exceed this because the anchor-on-
-    # deepest target gives stronger directional signal toward the actual
-    # basin's FP, not just any FP. Disable for ablation with
+    # local convergence; the deepest gradient-carrying z is the model's
+    # best current FP estimate at every step. Disable for ablation with
     # `--multi-k-consistency-anchor-coef=0`.
     multi_k_consistency_anchor_coef = 0.1
-    # iter167 (2026-05-16): number of no-grad Parcae iters used to build the
-    # anchor target z_{K+Δ}. Default 1 = iter163c v2 behavior (target is z_{K+1}).
-    # Recommended iter167 value: 8 (~73 % of FP gap reached vs ~15 % at Δ=1,
-    # for ρ≈0.85). Cost scales linearly with Δ: at Δ=8 adds ~7 no-grad Parcae
-    # iters per step (~+7-10 % step time).
-    # Named distinctly from the REMOVED iter163 `multi_k_consistency_extension_*`
-    # knobs (which controlled a separate boundary extension loss with a paired
-    # z_K + z_{K+Δ} term, deleted 2026-05-15 alongside the helper). This knob
-    # controls the SHARED anchor target depth for ALL z_stack entries.
-    multi_k_consistency_target_delta = 1
 
     # iter161-QAT-late (2026-05-16): deterministic STE int6-SDCLIP fake-quant
     # on CastedLinear weights (matrix tensors with numel > 8192) for the last
@@ -1102,7 +1109,6 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "eval-reservation-seconds",
     "ctp-weight",
     "multi-k-consistency-anchor-coef",
-    "multi-k-consistency-target-delta",
     "qat-late-start-step",
     "expert-diversity-kind",
     "expert-output-diversity-coef", "expert-diversity-every", "expert-diversity-max-tokens",
@@ -5468,7 +5474,6 @@ class GPT(nn.Module):
                  router_ema_specialization_coef: float = 0.20,
                  use_reverse_kl_balance: bool = True,
                  multi_k_consistency_anchor_coef: float = 0.1,
-                 multi_k_consistency_target_delta: int = 1,
                  expert_diversity_kind: str = "cosine",
                  expert_output_diversity_coef: float = 0.30,
                  expert_diversity_every: int = 8,
@@ -5497,7 +5502,6 @@ class GPT(nn.Module):
         self.router_ema_balance_coef = float(router_ema_balance_coef)
         self.router_ema_specialization_coef = float(router_ema_specialization_coef)
         self.multi_k_consistency_anchor_coef = float(multi_k_consistency_anchor_coef)
-        self.multi_k_consistency_target_delta = max(1, int(multi_k_consistency_target_delta))
         # Stash for diagnostics + readback in compute_loss; populated in _run_backbone.
         self._consistency_anchor_loss_t: Tensor | None = None
         self.expert_diversity_kind = str(expert_diversity_kind)
@@ -6058,61 +6062,51 @@ class GPT(nn.Module):
                 self._deq_prefix_anchor_depths_last = ()
                 z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        # iter163c (2026-05-16): anchor-on-deepest consistency anchor.
-        # Every gradient-carrying z in z_stack (the iter152 coarse prefix
-        # anchors at depths {16, 24, 32, 64, ...} that <= K_sampled) is
-        # paired with the most-converged available FP proxy z_{K+1}
-        # (computed by ONE no-grad Parcae iter after K_sampled):
+        # iter170 (2026-05-16): anchor-on-deepest with z_K_sampled as target.
+        # The deepest gradient-carrying z in z_stack IS the model's best FP
+        # estimate at the current step — pairing all shallower z_i with it
+        # gives the strongest principled signal at ZERO extra forward cost.
         #
-        #   L_anchor = mean_i ‖z_i − z_{K+1}.detach()‖²
+        #   L_anchor = mean_{i in z_stack[:-1]} ‖z_i − z_stack[-1].detach()‖²
         #
-        # Pulling every iteration toward the model's best FP estimate is
-        # strictly stronger than pair-with-next (`z_i, z_{i+1}.detach()`):
-        # the target is most-converged (highest-quality FP proxy), signal
-        # magnitude is "distance from FP" (not just one-step residual), and
-        # there is no trivial-zero collapse risk (target z_{K+1} is input-
-        # driven via F(z_K, x0), not constant).
+        # Compared with prior anchor-on-deepest designs:
+        #   iter163c v2 (target = z_{K+1} via 1 no-grad iter): REFUTED at full
+        #     val (val_bpb +22 mBPB regression) — target only 1 iter deeper
+        #     than z_K provides too weak a signal.
+        #   iter167 (target = z_{K+8}): no-grad iters cost ~+7-10 % step time
+        #     and target is still not deeper than z_K_sampled at deep K.
+        #   iter170 (this design): target IS z_K_sampled; target depth scales
+        #     fully with K_sampled (z_16 at K=16, z_128 at K=128); ~1.00× step
+        #     time. At K_sampled=128 the target is z_128 — the model's truest
+        #     FP proxy possible at this scale.
         #
-        # Per the most-principled-simplest-general directive, this version
-        # uses ONLY the existing coarse prefix anchors — no TBPTT-window
-        # augmentation. A first iter163c attempt augmented anchors with
-        # {K-bptt_k+1, ..., K-1} for fine per-iter pairs, but that OOM'd
-        # on the dev L40S at step ~13 (~6 anchors × 3 bptt × T=2048 SDPA
-        # backward activations exceeds 44 GB VRAM). The coarse-only design
-        # is the simplest correct expression of "anchor every gradient-
-        # carrying z to the most-converged proxy" and stays within VRAM.
-        #
-        # Compared with iter163's extension (Δ=K_train ≈ 22 no-grad iters per
-        # step, ~+60 % step time), iter163c does ~1 no-grad iter per step
-        # (~+1 % step time) while giving anchor-on-deepest pairs at every
-        # coarse anchor (vs one boundary pair at Δ=K_train under iter163).
+        # K_sampled=16 case: with only one prefix anchor, z_stack.shape[0]=1
+        # and z_stack[:-1] is empty → no pairs → loss skipped. The principled
+        # fix is to broaden deq_prefix_anchor_set to include shallow K (e.g.
+        # K=4) so even K_sampled=16 produces a strong-signal pair (z_4 is far
+        # from FP, anchoring it to z_16 is meaningful). iter170 run uses CLI:
+        #   --deq-prefix-anchor-set "4,16,32,64,96,128"
+        #   --deq-k-jitter-set      "16,32,64,96,128"
+        #   --deq-k-jitter-weights  "0.9,0.07,0.03,0.015,0.0075"
+        # Dropping K=24 from jitter trades K=24's anchor budget for K=4's,
+        # keeping the K_sampled=128 backward chain count at 6 anchors —
+        # identical to iter163's known-safe memory profile.
         # The `_*_loss_raw` field holds the with-grad tensor that crosses the
         # `_run_backbone` → `forward` boundary; the `_*_loss_t` field is the
         # detached log copy. Same separation as `_ntp_loss_t` / `ntp_loss`.
         self._consistency_anchor_loss_raw = None
         self._consistency_anchor_loss_t = None
-        if self.training and prefix_mode and self.multi_k_consistency_anchor_coef > 0.0 and z_stack.shape[0] >= 1:
-            # Compute z_{K+Δ} via Δ no-grad Parcae two-state iters. Cast Parcae
-            # coefs to z.dtype so the no-grad extension matches the with-grad
-            # forward dtype trajectory (bf16 under CLAUDE.md). Δ defaults to 1
-            # (iter163c v2); iter167 promotes Δ=8 for stronger directional
-            # signal at common K_sampled=16 (signal magnitude reaches ~73 %
-            # of FP gap at Δ=8 vs ~15 % at Δ=1, for ρ≈0.85).
-            sb_inner = _unwrap_compiled_module(self.shared_block)
-            z_K = z_stack[-1]
-            a_bar_one = self._parcae_a_bar().to(z_K.dtype)
-            one_minus_a_one = 1.0 - a_bar_one
-            b_bar_one = self._parcae_b_bar().to(z_K.dtype)
-            delta = max(1, int(self.multi_k_consistency_target_delta))
-            with torch.no_grad():
-                y_e = z_K
-                z_e = z_K
-                for _ in range(delta):
-                    y_e = a_bar_one * y_e + one_minus_a_one * sb_inner(z_e, x0_refined, b_bar_one)
-                    z_e = a_bar_one * z_e + one_minus_a_one * sb_inner(y_e, x0_refined, b_bar_one)
-            target = z_e.detach()
-            # Anchor every gradient-carrying z to the most-converged target.
-            anchor_raw = (z_stack - target.unsqueeze(0)).pow(2).mean()
+        if self.training and prefix_mode and self.multi_k_consistency_anchor_coef > 0.0 and z_stack.shape[0] >= 2:
+            # iter170: anchor-on-deepest with z_K_sampled as target. The deepest
+            # gradient-carrying z in z_stack IS the model's best FP estimate at
+            # the current step — no extra forward needed. The pair (z_K, z_K.det)
+            # is structurally degenerate and excluded via z_stack[:-1]. With
+            # only one prefix anchor (z_stack.shape[0] == 1), no pairs exist
+            # and the loss is skipped this step; the principled fix is to
+            # broaden deq_prefix_anchor_set to include a shallow K (e.g. K=4)
+            # so even K_sampled=16 produces a non-trivial pair.
+            target = z_stack[-1].detach()
+            anchor_raw = (z_stack[:-1] - target.unsqueeze(0)).pow(2).mean()
             self._consistency_anchor_loss_raw = anchor_raw
             self._consistency_anchor_loss_t = anchor_raw.detach()
 
@@ -7907,7 +7901,6 @@ def main() -> None:
         router_ema_specialization_coef=float(args.router_ema_specialization_coef),
         use_reverse_kl_balance=bool(args.use_reverse_kl_balance),
         multi_k_consistency_anchor_coef=float(getattr(args, "multi_k_consistency_anchor_coef", 0.0)),
-        multi_k_consistency_target_delta=int(getattr(args, "multi_k_consistency_target_delta", 1)),
         expert_diversity_kind=str(args.expert_diversity_kind),
         expert_output_diversity_coef=float(args.expert_output_diversity_coef),
         expert_diversity_every=int(args.expert_diversity_every),
