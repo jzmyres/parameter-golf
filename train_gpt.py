@@ -357,13 +357,13 @@ class Hyperparameters:
     val_loss_every = 200
     train_log_every = 10  # log every 10 steps (~85s at 8.5s/step) for better progress visibility
     auto_plot_on_val = True
-    # Fixed-point local-contraction probes. Fast validation logs a numerical
-    # Lipschitz upper-bound metric at the saved DEQ FP; 0 disables the fast-val
-    # spectral probe while leaving post-training K-sweep diagnostics intact.
-    fp_lip_fast_val_every = 1
-    fp_lip_power_iters = 3
-    fp_lip_ub_safety = 1.10
-    fp_lip_ub_margin = 0.0
+    # Fixed-point spectral probe: rho_F = |lambda_max(J_F)| at the saved DEQ
+    # FP, via power iteration on J_F directly (NOT J_F^T J_F). rho_F < 1 is
+    # necessary AND sufficient for asymptotic local convergence per
+    # Hartman-Grobman; this is the principled gate metric. lip_ub_T/S/F
+    # (operator-norm proxies) were removed 2026-05-15 — over-restrictive
+    # for non-symmetric J_F (iter152 has rho ≈ 0.85 yet sigma_max ≈ 17).
+    fp_rho_power_iters = 8
     checkpoint_dir = "experiments/checkpoints"
     checkpoint_every = 200
     checkpoint_keep = 2
@@ -964,7 +964,6 @@ _CONFIG_PROFILES: dict[str, dict[str, object]] = {
     "debug": {
         "eval_profile": "debug",
         "final_full_validation": False,
-        "fp_lip_fast_val_every": 0,
     },
 }
 
@@ -972,18 +971,13 @@ _CONFIG_PROFILES: dict[str, dict[str, object]] = {
 @dataclass(frozen=True)
 class EvalProfile:
     k_sweep_values: tuple[int, ...]
-    # `None` means "probe every K"; otherwise the set of K-rows that trigger
-    # the local Lipschitz probe.  Precomputed at module init so the per-row
-    # `should_probe` predicate is a frozenset lookup.
-    lip_probe_set: frozenset[int] | None
 
 
 _EVAL_PROFILES: dict[str, EvalProfile] = {
-    "debug": EvalProfile(k_sweep_values=(16,), lip_probe_set=frozenset({16})),
-    "submission": EvalProfile(k_sweep_values=(16, 24, 64, 128), lip_probe_set=frozenset({128})),
+    "debug": EvalProfile(k_sweep_values=(16,)),
+    "submission": EvalProfile(k_sweep_values=(16, 24, 64, 128)),
     "diagnostic": EvalProfile(
         k_sweep_values=(4, 8, 16, 17, 24, 32, 37, 64, 113, 128),
-        lip_probe_set=None,
     ),
 }
 
@@ -1024,13 +1018,6 @@ def _resolve_k_sweep_values(args) -> list[int]:
     return list(_EVAL_PROFILES[profile].k_sweep_values)
 
 
-def _should_probe_lip_for_k(args, k_eval: int) -> bool:
-    profile = str(args.eval_profile).strip().lower()
-    assert profile in _EVAL_PROFILES, f"unknown eval_profile {profile!r}"
-    probe_set = _EVAL_PROFILES[profile].lip_probe_set
-    return probe_set is None or int(k_eval) in probe_set
-
-
 @dataclass(frozen=True)
 class OptionalComponentCapability:
     py_name: str
@@ -1063,7 +1050,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "data-path", "tokenizer-path", "run-id", "seed", "iterations",
     "train-batch-tokens", "train-seq-len",
     "val-batch-size", "val-micro-batch-seqs", "val-loss-every", "train-log-every",
-    "fp-lip-fast-val-every", "fp-lip-power-iters", "fp-lip-ub-safety", "fp-lip-ub-margin",
+    "fp-rho-power-iters",
     "checkpoint-dir", "checkpoint-every", "checkpoint-keep", "resume-from",
     "max-training-seconds", "max-wallclock-seconds",  # max-wallclock-seconds is a deprecated alias
     "grad-accum-multiplier",
@@ -6599,51 +6586,30 @@ def _prescribe_failure_fix(failure: str) -> dict:
     # `first_token` is lowercased from `failure.lower()` above, so comparisons
     # below are all lowercase.  iter155 (corrected) split the contraction
     # metric into three:
-    #   - `lip_ub_F` — gate-aligned empirical local-contraction metric
-    #     (operator-norm power-iteration estimate, lower-bounded by the
-    #     true σ_max) on the actual two-state Parcae cycle map F.
-    #   - `lip_ub_S` — single-state convex-blend advisory surrogate (NOT the
-    #     iterated map; kept for diagnostic compatibility).
-    #   - `lip_ub_T` — transition-map decomposition diagnostic.
-    # The legacy `lip_ub=` prefix from pre-iter155 logs is treated as a
-    # gate-equivalent failure (operator norm of the contraction object).
-    if first_token == "lip_ub_f" or first_token == "lip_ub":
-        # Tier 1 redesign 2026-05-13: lip_ub_F is the OPERATOR NORM
-        # (sigma_max), which is sufficient but over-restrictive for
-        # asymptotic local FP convergence.  The iter155 NOT-PROMOTED
-        # result + iter152 baseline measurement (sigma_max = 17 yet
-        # iter_conv_rel = 0.019, clearly converging) empirically refuted
-        # the claim that sigma_max < 1 is needed.  The principled
-        # gate-relevant signal is rho(J_F) < 1 (spectral radius;
-        # necessary AND sufficient by Hartman--Grobman) or
-        # iter_conv_rel < 0.05 (empirical convergence).  This branch is
-        # retained for backward compatibility with old logs but emits
-        # an advisory prescription, NOT a training intervention.
+    # rho_F (spectral radius on the actual two-state Parcae cycle F) is
+    # the principled FP-convergence gate per Hartman-Grobman. lip_ub_T/S/F
+    # operator-norm proxies and fp_bound (Banach error bound) were removed
+    # 2026-05-15 as over-restrictive. Legacy lip_ub_* / fp_bound failure
+    # strings from pre-2026-05-15 logs are routed to advisory.
+    if first_token in ("lip_ub_f", "lip_ub", "lip_ub_t", "lip_ub_s") or first_token.startswith("fp_bound"):
         return {
             "failure": failure,
             "category": "operator_norm_advisory",
-            "hypothesis": "Operator norm sigma_max(J_F) is large; this is over-restrictive for asymptotic convergence -- check rho_F (spectral radius) and iter_conv_rel for the actually-required condition.",
-            "fix": ("`lip_ub_F` (sigma_max) is an over-restrictive proxy: the "
+            "hypothesis": "Operator-norm proxy (lip_ub_*) and fp_bound were removed 2026-05-15 — over-restrictive for non-symmetric J_F. Check rho_F (spectral radius) and iter_conv_rel for the principled FP-convergence signals.",
+            "fix": ("Legacy operator-norm / Banach-bound prescription. The "
                     "necessary-and-sufficient condition for asymptotic local "
                     "contraction is rho(J_F) < 1 (spectral radius), NOT "
-                    "sigma_max(J_F) < 1.  For non-symmetric J_F the gap can be "
+                    "sigma_max(J_F) < 1. For non-symmetric J_F the gap can be "
                     "huge (iter152 has sigma_max ~ 17 with iter_conv_rel ~ 0.02 "
-                    "-- clearly converging).  Check `rho_F` and `iter_conv_rel` "
-                    "diagnostics; do NOT enable lyapunov_coef (refuted by iter155 "
-                    "as not principled for asymptotic convergence).  If `rho_F` "
-                    ">= 1 or `iter_conv_rel` >= 0.05, follow those prescriptions."),
+                    "-- clearly converging). Check rho_F and iter_conv_rel "
+                    "diagnostics; do NOT enable lyapunov_coef (refuted by iter155). "
+                    "If rho_F >= 1 or iter_conv_rel >= 0.05, follow those prescriptions."),
             "config_change": {},
         }
     if first_token == "rho_f":
-        # Tier 1 + Tier 2 (2026-05-13): rho_F = |lambda_max(J_F)| via
-        # straight power iteration on J_F.  Necessary AND sufficient
-        # for asymptotic local FP convergence (Hartman--Grobman).
-        # This is the gate-relevant signal; failure here means the
-        # iteration is genuinely non-convergent and a formal-tier
-        # mechanism is needed (NOT a soft penalty -- iter155 confirmed
-        # soft pressure cannot reliably constrain spectral properties).
-        # Architecture-agnostic: same condition applies to any
-        # iteration map M, not specific to Parcae or RevDEQ.
+        # rho_F = |lambda_max(J_F)| via straight power iteration on J_F.
+        # Necessary AND sufficient for asymptotic local FP convergence
+        # (Hartman-Grobman). Architecture-agnostic.
         return {
             "failure": failure,
             "category": "fp_convergence_failed",
@@ -6659,44 +6625,6 @@ def _prescribe_failure_fix(failure: str) -> dict:
                     "constraint: any new iteration mechanism must satisfy "
                     "rho(J) < 1 for asymptotic local contraction."),
             "config_change": {"needs_formal_tier_contraction": True},
-        }
-    if first_token == "lip_ub_s":
-        # iter155 corrected: S is the single-state convex blend, NOT the
-        # iterated map.  Failure here is informational — the gate object
-        # is `lip_ub_F`.  Treated as advisory.
-        return {
-            "failure": failure,
-            "category": "single_state_blend_loose",
-            "hypothesis": "Single-state convex blend operator norm is large; the gate-relevant object is `lip_ub_F` on the actual two-state cycle.",
-            "fix": ("`lip_ub_S` is an advisory surrogate (single-state convex blend "
-                    "Ā·I + (1-Ā)·J_T), not the iterated map.  Check `lip_ub_F` for "
-                    "the gate-relevant contraction object; if lip_ub_F<1, the actual "
-                    "two-state Parcae cycle is contractive and no rescue is needed."),
-            "config_change": {},
-        }
-    if first_token == "lip_ub_t":
-        # iter155 corrected: T is one component of the iteration, not the
-        # iterated map.  Decomposition diagnostic only — check lip_ub_F.
-        return {
-            "failure": failure,
-            "category": "transition_jacobian_loose",
-            "hypothesis": "The transition map J_T spectral norm is large; the gate-relevant object is `lip_ub_F` on the two-state Parcae cycle, which couples J_T through cross blocks β·J_T.",
-            "fix": ("`lip_ub_T` is a decomposition diagnostic; check `lip_ub_F` for "
-                    "the gate-relevant contraction object. If lip_ub_F<1, the actual "
-                    "two-state Parcae cycle is contractive and no rescue is needed; "
-                    "if lip_ub_F>=1, follow the lip_ub_F prescription (transition-map "
-                    "parameterization is required because damping alone cannot fix "
-                    "a positive expanding mode of T via the β·J_T cross terms)."),
-            "config_change": {},
-        }
-    if first_token.startswith("fp_bound"):
-        return {
-            "failure": failure,
-            "category": "fp_certificate_loose",
-            "hypothesis": "The iteration map may be contractive, but the residual divided by the contraction margin is too large",
-            "fix": "Increase deq_k_max by 4 for a smaller residual; if lip_ub_F is close to 1, follow the lip_ub_F prescription (lyapunov_target=iteration_F to jointly train Ā and θ for the actual two-state cycle, with iter156 hard governor as the escalation if soft pressure is insufficient).",
-            "config_change": {"deq_k_max_delta": 4,
-                              "needs_iteration_map_contraction": True},
         }
     if first_token.startswith("iter_conv_rel"):
         # Tier 1 (2026-05-13): iter_conv_rel is the EMPIRICAL FP
@@ -6790,122 +6718,6 @@ def _parcae_cycle_F(
     t_y_new = sb(y_new, x0, b_bar)
     z_new = a_bar_d * z + (1.0 - a_bar_d) * t_y_new
     return y_new, z_new
-
-
-def _run_spectral_norm_power(
-    z_star: Tensor,
-    x0_lyap: Tensor,
-    b_bar_d: Tensor | None,
-    sb,
-    target_dtype: torch.dtype,
-    n_iters: int,
-    ctx_factory,
-    map_kind: str = "T",
-    a_bar_d: Tensor | None = None,
-    return_v: bool = False,
-):
-    """Internal power-iteration estimate used to compute ``lip_ub_T`` /
-    ``lip_ub_S`` / ``lip_ub_F``.
-
-    ``map_kind`` selects the Jacobian probed:
-      - ``"T"`` (iter147 legacy): J of the transition map
-        ``T_θ(z, x₀) = sb(z, x₀, B̄)``.  **Decomposition diagnostic only** —
-        T is one component of the iteration, not the iterated map itself.
-      - ``"S"`` (iter155 first attempt): J of the single-state convex blend
-        ``S(z, x₀) = Ā·z + (1−Ā)·sb(z, x₀, B̄)``.  **Advisory surrogate
-        only** — S is NOT what the solver iterates (the solver is two-state),
-        and σ_max(J_S) ≤ Ā + (1−Ā)·σ_max(J_T) > 1 whenever σ_max(J_T) > 1
-        for any Ā < 1, so damping cannot rescue an expansive T via S either.
-      - ``"F"`` (iter155 corrected, gate-aligned): J of the actual two-state
-        Parcae cycle map ``F(y, z) = (Ā·y + β·T(z), Ā·z + β·T(Ā·y + β·T(z)))``
-        with β = 1−Ā.  Probe state lives in (B, T, 2D) — concatenated (y, z).
-        At the fixed point, y* = z* = z_star, so we initialize the joint
-        state at (z_star, z_star).  σ_max(J_F) < 1 is sufficient (not
-        equivalent) for ρ(J_F) < 1 (the local FP convergence condition);
-        the power-iteration estimate produced here is itself a LOWER bound
-        on σ_max, so this is an empirical metric, not a formal certificate.
-
-    Pass ``a_bar_d`` (per-dim Ā tensor, broadcast-compatible with ``z``)
-    when ``map_kind ∈ {"S", "F"}``.
-    """
-    if map_kind in ("S", "F") and a_bar_d is None:
-        raise ValueError(f"map_kind={map_kind!r} requires a_bar_d (per-dim Ā) for the Parcae blend")
-
-    torch.cuda.empty_cache()
-    # F-probe doubles the joint-state size (y, z) → (2*z numel) and the cycle
-    # map computes T twice per F-application; both effects double peak VRAM
-    # and FLOPs vs T/S probes.  Use a 2× factor in the OOM predictor for F.
-    state_factor = 2 if map_kind == "F" else 1
-    free_b, _ = torch.cuda.mem_get_info(z_star.device)
-    need_b = int(z_star.numel() * z_star.element_size() * 24 * state_factor)
-    if free_b < int(need_b * 1.25):
-        print(
-            f"lip_ub_{map_kind} skip: oom_pred need={need_b/1e9:.2f}GiB "
-            f"free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}",
-            flush=True,
-        )
-        return None
-
-    a_bar_t = a_bar_d.to(device=z_star.device, dtype=target_dtype) if a_bar_d is not None else None
-
-    if map_kind == "F":
-        # F state is concat[y, z] along the last (D) axis ⇒ (B, T, 2D).
-        # At the saved FP, y* = z* = z_star; init both halves to z_star.
-        # Cycle algebra delegates to the shared `_parcae_cycle_F` helper
-        # so the probe / residual / training paths share one definition.
-        D = z_star.shape[-1]
-
-        def _apply_map(state: Tensor) -> Tensor:
-            y, z = torch.split(state, D, dim=-1)
-            y_new, z_new = _parcae_cycle_F(y, z, x0_lyap, b_bar_d, a_bar_t, sb)
-            return torch.cat([y_new, z_new], dim=-1)
-
-        # Stack (z_star, z_star) into the joint state for power iteration.
-        seed_state = torch.cat([z_star, z_star], dim=-1).contiguous()
-    else:
-        def _apply_map(z_arg: Tensor) -> Tensor:
-            out_T = sb(z_arg, x0_lyap, b_bar_d)
-            if map_kind == "S":
-                return a_bar_t * z_arg + (1.0 - a_bar_t) * out_T
-            return out_T
-
-        seed_state = z_star
-
-    v = torch.randn_like(seed_state, dtype=torch.float32)
-    v = v / v.norm().clamp(min=1e-8)
-    sigma: float | None = None
-
-    def _jvp(v_float: Tensor) -> Tensor:
-        z_b = seed_state.detach().clone().requires_grad_(True)
-        v_b = v_float.to(device=z_b.device, dtype=z_b.dtype)
-
-        with ctx_factory(), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
-            _, jv = torch.autograd.functional.jvp(
-                _apply_map, (z_b,), (v_b,), create_graph=False, strict=False
-            )
-        del z_b, v_b
-        return jv.detach()
-
-    for _ in range(max(1, int(n_iters))):
-        jv = _jvp(v)
-        sigma = float(jv.float().norm().item())
-
-        z_b = seed_state.detach().clone().requires_grad_(True)
-        with ctx_factory(), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
-            u_b = _apply_map(z_b)
-            grad_target = jv.to(device=u_b.device, dtype=u_b.dtype)
-            jt_jv = torch.autograd.grad(
-                (u_b * grad_target).sum(), z_b,
-                create_graph=False, retain_graph=False,
-            )[0]
-        next_norm = jt_jv.float().norm().clamp(min=1e-8)
-        v = (jt_jv.float() / next_norm).detach()
-        del jv, z_b, u_b, grad_target, jt_jv
-        torch.cuda.empty_cache()
-
-    if return_v:
-        return sigma, v
-    return sigma
 
 
 def _run_spectral_radius_power(
@@ -7037,9 +6849,9 @@ def _rho_F_at_saved_fp(
 
     Returns ``|lambda_max(J_F)|`` (necessary AND sufficient for asymptotic
     local FP convergence: ``rho(J_F) < 1`` iff the fixed point is locally
-    attractive).  Companion to :func:`_lip_ub_at_saved_fp` (which returns
-    ``sigma_max(J_F)``, the operator norm -- a sufficient but
-    over-restrictive proxy).  The framework is architecture-agnostic.
+    attractive). Architecture-agnostic: same condition applies to any
+    iteration map M (alternative DEQ solvers, refinement loops, recurrent
+    layers — all subject to the same gate).
 
     Returns ``None`` if no saved FP is available (e.g., before any forward
     pass) or the OOM predictor blocks the probe.
@@ -7050,9 +6862,7 @@ def _rho_F_at_saved_fp(
     z_star, x0_lyap, b_bar_d, a_bar_d, sb, target_dtype, ctx_factory = prepared
     # Parcae-disabled fallback: when there is no Ā, the iteration map IS
     # the transition map T (the solver does z_{k+1} = T(z_k) directly),
-    # so rho(J_T) is the principled spectral-radius value.  Mirrors the
-    # `_lip_ub_at_saved_fp` fallback semantics so callers can rely on
-    # both probes returning a number for any model.
+    # so rho(J_T) is the principled spectral-radius value.
     map_kind = "F" if a_bar_d is not None else "T"
     try:
         return _run_spectral_radius_power(
@@ -7116,33 +6926,6 @@ def _prepare_saved_fp_probe(base_m, B_probe: int = 1):
     else:
         a_bar_d = None
     return z_star, x0_lyap, b_bar_d, a_bar_d, sb_call, target_dtype, _fp_probe_context_factory()
-
-
-def _lipschitz_upper_bound_metric(
-    spectral_est: float | None,
-    safety: float = 1.10,
-    margin: float = 0.0,
-) -> float | None:
-    """Conservative numerical upper-bound metric from the local spectral probe.
-
-    This is intentionally named as a metric, not a formal interval certificate:
-    power iteration estimates the top singular value from below in exact math.
-    The safety multiplier gives a stricter training/eval gate until a true
-    interval or linear-relaxation bound is practical for the full attention
-    block.
-    """
-    if spectral_est is None or not math.isfinite(float(spectral_est)):
-        return None
-    return max(0.0, float(spectral_est)) * max(1.0, float(safety)) + max(0.0, float(margin))
-
-
-def _fixed_point_error_bound_metric(
-    residual_rel: float | None,
-    lip_ub: float | None,
-) -> float | None:
-    if residual_rel is None or lip_ub is None or lip_ub >= 1.0:
-        return None
-    return max(0.0, float(residual_rel)) / max(1.0 - float(lip_ub), 1e-8)
 
 
 def _clear_saved_fp_probe_tensors(base_m) -> None:
@@ -7215,56 +6998,6 @@ def _joint_F_residual_at_saved_fp(
             # ‖(z*, z*)‖² = 2·‖z*‖²
             denom_sq = 2.0 * z_star.float().pow(2).sum().clamp_min(1e-12)
             return float((num_sq / denom_sq).sqrt().item())
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"{log_label} skip: oom_runtime {e}", flush=True)
-        torch.cuda.empty_cache()
-        return None
-    except RuntimeError as e:
-        print(f"{log_label} skip: cuda_runtime {type(e).__name__}: {e}", flush=True)
-        return None
-
-
-def _lip_ub_at_saved_fp(
-    base_m,
-    n_iters: int = 3,
-    B_probe: int = 1,
-    safety: float = 1.10,
-    margin: float = 0.0,
-    log_label: str = "lip_ub",
-    map_kind: str = "T",
-) -> float | None:
-    """Local contraction metric at the model's saved DEQ FP.
-
-    `log_label` distinguishes call sites in skip-reason log lines (e.g.
-    K-sweep passes `"ksweep_skip_reason:lip_ub_F"` so the prescription
-    parser keys on it). Narrow exceptions: OOM + CUDA RuntimeError only;
-    every other exception propagates so refactor breakage stays loud.
-
-    `map_kind` ∈ {"T", "S", "F"} (see `_run_spectral_norm_power` docstring):
-      - "T": transition-map J — decomposition diagnostic only.
-      - "S": single-state convex blend J — advisory surrogate, not the
-        iterated map.
-      - "F": full two-state Parcae cycle J — gate-aligned empirical
-        local-contraction metric (iter155 corrected; not a formal
-        certificate — see `_run_spectral_norm_power` docstring caveats).
-
-    When the model has Parcae disabled, "S" and "F" both reduce to "T"
-    and the call returns the T value.
-    """
-    prepared = _prepare_saved_fp_probe(base_m, B_probe)
-    if prepared is None:
-        return None
-    z_star, x0_lyap, b_bar_d, a_bar_d, sb, target_dtype, ctx_factory = prepared
-    if map_kind in ("S", "F") and a_bar_d is None:
-        # Parcae disabled — S/F ≡ T. Fall back to T so callers always get a value.
-        map_kind = "T"
-    try:
-        spec_est = _run_spectral_norm_power(
-            z_star, x0_lyap, b_bar_d, sb, target_dtype,
-            max(1, int(n_iters)), ctx_factory,
-            map_kind=map_kind, a_bar_d=a_bar_d,
-        )
-        return _lipschitz_upper_bound_metric(spec_est, safety=safety, margin=margin)
     except torch.cuda.OutOfMemoryError as e:
         print(f"{log_label} skip: oom_runtime {e}", flush=True)
         torch.cuda.empty_cache()
@@ -7366,10 +7099,12 @@ def _validate_hyperparameters(args) -> None:
             "transition_T, iteration_S, iteration_F"
         )
     lyap_estimator = str(getattr(args, "lyapunov_estimator", "random_fd"))
-    if lyap_estimator not in ("random_fd", "power_jvp_F"):
+    if lyap_estimator != "random_fd":
         raise SystemExit(
-            f"lyapunov_estimator={lyap_estimator!r} must be one of: "
-            "random_fd, power_jvp_F"
+            f"lyapunov_estimator={lyap_estimator!r} must be 'random_fd'. "
+            "The 'power_jvp_F' estimator was removed 2026-05-15 alongside the "
+            "lip_ub_* operator-norm probes (both refuted by iter155/iter152 "
+            "evidence). See CLAUDE.md for the principled rho_F gate."
         )
     nE, nS = int(args.num_experts), int(args.num_shared_experts)
     if nE <= 0:
@@ -8437,87 +8172,37 @@ def main() -> None:
             expert_info = format_expert_info(base_model, step=step) if master_process else ""
             _window_avg = (sum(_step_dt_window) / len(_step_dt_window)) if _step_dt_window else 0.0
             _fast_val_count += 1
-            fp_probe_every = int(getattr(args, "fp_lip_fast_val_every", 0) or 0)
-            # iter155 (corrected) directive 2026-05-13: lip_ub_F is the
-            # gate-aligned contraction object on the actual two-state Parcae
-            # cycle and MUST be reported on every FP eval, never gated by
-            # cadence.  Otherwise the gate's own evidence becomes optional
-            # — exactly the "decision based on metric we haven't measured"
-            # failure mode the audit checklist forbids.  fp_residual_F is
-            # paired with lip_ub_F in `fp_bound = fp_residual_F /
-            # (1 − lip_ub_F)` so it shares the same always-on policy.
-            # T (decomposition diagnostic) and S (single-state advisory
-            # surrogate) remain on the fp_lip_fast_val_every cadence
-            # because they cost extra JVPs without changing the gate
-            # decision — they're only useful when lip_ub_F has crossed
-            # the prescription threshold and the next iter needs to know
-            # which component (J_T magnitude vs Ā damping) is the lever.
-            run_fp_lip_probe_F = master_process
-            run_fp_lip_probe_TS = (
-                master_process
-                and fp_probe_every > 0
-                and (last_step or (_fast_val_count % fp_probe_every == 0))
-            )
-            if run_fp_lip_probe_F:
-                lip_ub_F = _lip_ub_at_saved_fp(
-                    base_model,
-                    n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
-                    safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
-                    margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
-                    map_kind="F",
-                )
+            # Always-on FP spectral probe at the saved DEQ FP. rho_F is the
+            # principled gate metric (necessary AND sufficient for asymptotic
+            # local FP convergence per Hartman-Grobman). lip_ub_T/S/F and
+            # fp_bound were removed 2026-05-15 — operator-norm proxies are
+            # over-restrictive for non-symmetric J_F and add cost without
+            # changing the gate decision.
+            if master_process:
                 fp_residual_F = _joint_F_residual_at_saved_fp(base_model)
                 rho_F = _rho_F_at_saved_fp(
                     base_model,
                     n_iters=int(getattr(args, "fp_rho_power_iters", 8)),
                 )
             else:
-                lip_ub_F = None
                 fp_residual_F = None
                 rho_F = None
-            if run_fp_lip_probe_TS:
-                lip_ub_T = _lip_ub_at_saved_fp(
-                    base_model,
-                    n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
-                    safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
-                    margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
-                    map_kind="T",
-                )
-                lip_ub_S = _lip_ub_at_saved_fp(
-                    base_model,
-                    n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
-                    safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
-                    margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
-                    map_kind="S",
-                )
-            else:
-                lip_ub_T = None
-                lip_ub_S = None
             conv_rel_t = getattr(base_model, "_deq_iter_convergence_rel_t", None)
             fp_residual_rel = (
                 float(conv_rel_t.detach().float().item())
                 if isinstance(conv_rel_t, torch.Tensor) else None
             )
-            # fp_bound uses the gate-aligned F-side pair (Banach's bound on
-            # the actual two-state cycle, joint residual + joint Lipschitz).
-            fp_bound = _fixed_point_error_bound_metric(fp_residual_F, lip_ub_F)
-            lip_str = (
-                (f" lip_ub_T:{lip_ub_T:.4f}" if lip_ub_T is not None else " lip_ub_T:N/A")
-                + (f" lip_ub_S:{lip_ub_S:.4f}" if lip_ub_S is not None else " lip_ub_S:N/A")
-                + (f" lip_ub_F:{lip_ub_F:.4f}" if lip_ub_F is not None else " lip_ub_F:N/A")
-                + (f" rho_F:{rho_F:.4f}" if rho_F is not None else " rho_F:N/A")
-            )
+            rho_str = f" rho_F:{rho_F:.4f}" if rho_F is not None else " rho_F:N/A"
             fp_resid_str = (
                 (f" fp_residual_rel:{fp_residual_rel:.6f}" if fp_residual_rel is not None else "")
                 + (f" fp_residual_F:{fp_residual_F:.6f}" if fp_residual_F is not None else "")
             )
-            fp_bound_str = f" fp_bound:{fp_bound:.6f}" if fp_bound is not None else ""
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"val_mode:fast "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
                 f"step_avg_w50:{_window_avg:.2f}ms"
-                f"{lip_str}{fp_resid_str}{fp_bound_str}"
+                f"{rho_str}{fp_resid_str}"
                 f"{deq_info}{expert_info}"
                 f"{format_k_jitter_info()}"
             )
@@ -8726,58 +8411,17 @@ def main() -> None:
                                 # At the saved FP, y* = z* = z_base (so the
                                 # initial joint state is duplicated).  Cycle
                                 # algebra delegates to `_parcae_cycle_F`.
+                                # Estimator is `random_fd` only after the
+                                # `power_jvp_F` branch was removed 2026-05-15
+                                # along with the underlying lip_ub machinery.
                                 a_bar_full = base_model._parcae_a_bar()  # NOT detached
                                 a_bar_d = a_bar_full.view(*([1] * (z_base.ndim - 1)), -1).to(dtype=z_base.dtype)
-                                lyap_estimator = str(getattr(base_model, "lyapunov_estimator", "random_fd"))
-                                if lyap_estimator == "power_jvp_F":
-                                    # Worst-direction probe: estimate the
-                                    # dominant right singular vector of J_F
-                                    # via no-grad power iteration, then split
-                                    # into (v_y, v_z) and use those as the
-                                    # FD perturbation directions.  Penalty
-                                    # bears on σ_max(J_F) directly rather
-                                    # than averaging random directions.
-                                    a_bar_for_probe = a_bar_d.detach()
-                                    with torch.no_grad():
-                                        ret = _run_spectral_norm_power(
-                                            z_base.detach(), x0_base, aux_b_bar_d,
-                                            sb, z_base.dtype, n_iters=2,
-                                            ctx_factory=_fp_probe_context_factory(),
-                                            map_kind="F", a_bar_d=a_bar_for_probe,
-                                            return_v=True,
-                                        )
-                                    if ret is None:
-                                        # Probe OOM/error — silently fall
-                                        # back to random_fd directions.
-                                        eps_dir_y = torch.randn(
-                                            z_base.shape, dtype=z_base.dtype,
-                                            device=z_base.device, generator=lyap_gen,
-                                        )
-                                        eps_unit_y = eps_dir_y / eps_dir_y.float().pow(2).mean().sqrt().clamp(min=1e-8).to(dtype=eps_dir_y.dtype)
-                                    else:
-                                        _sigma_unused, v_top = ret
-                                        D = z_base.shape[-1]
-                                        # Joint normalization (NOT per-half):
-                                        # power iteration converges to a v
-                                        # whose two halves carry the relative
-                                        # magnitudes that make it the dominant
-                                        # singular direction.  Normalizing
-                                        # each half to RMS=1 independently
-                                        # would change the direction.  Instead,
-                                        # normalize the concatenated joint
-                                        # vector once so it has joint RMS=1,
-                                        # then split — preserves ‖v_y‖/‖v_z‖.
-                                        v_joint_rms = v_top.float().pow(2).mean().sqrt().clamp(min=1e-8)
-                                        v_top_unit = (v_top / v_joint_rms.to(dtype=v_top.dtype)).to(dtype=z_base.dtype)
-                                        eps_unit_y, eps_unit = torch.split(v_top_unit, D, dim=-1)
-                                else:
-                                    # random_fd (default): independent
-                                    # random directions for u_y, u_z.
-                                    eps_dir_y = torch.randn(
-                                        z_base.shape, dtype=z_base.dtype,
-                                        device=z_base.device, generator=lyap_gen,
-                                    )
-                                    eps_unit_y = eps_dir_y / eps_dir_y.float().pow(2).mean().sqrt().clamp(min=1e-8).to(dtype=eps_dir_y.dtype)
+                                # random_fd: independent random directions for u_y, u_z.
+                                eps_dir_y = torch.randn(
+                                    z_base.shape, dtype=z_base.dtype,
+                                    device=z_base.device, generator=lyap_gen,
+                                )
+                                eps_unit_y = eps_dir_y / eps_dir_y.float().pow(2).mean().sqrt().clamp(min=1e-8).to(dtype=eps_dir_y.dtype)
                                 # F at base = F(z_base, z_base); F at perturbed
                                 # = F(z_base + ε·u_y, z_base + ε·u_z).  Cycle
                                 # algebra is the same `_parcae_cycle_F` helper
@@ -9162,11 +8806,11 @@ def main() -> None:
     # is exploiting a specific iteration count rather than a true fixed point.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
     #
-    # iter 146 diagnostic simplification (2026-05-08): K-sweep reports one
-    # local contraction metric, lip_ub. The residual-side diagnostics
-    # iter_conv_rel/fp_bound remain because they answer a separate question:
-    # whether the solved iterate is close to the local fixed point when
-    # lip_ub < 1.
+    # K-sweep reports rho_F (spectral radius, principled FP-convergence
+    # gate per Hartman-Grobman) + fp_residual_F (joint two-state-cycle
+    # residual) + iter_conv_rel (z-only step residual). lip_ub_T/S/F and
+    # fp_bound were removed 2026-05-15 — operator-norm proxies are
+    # over-restrictive for non-symmetric J_F.
     log0("k_sweep:start")
     # T-opt 15: Reset dynamo before K-sweep to prevent recompilation storm.
     # Different K values change iteration counts, triggering dynamo guards
@@ -9177,28 +8821,13 @@ def main() -> None:
     # probes without changing training behavior.
     k_sweep_values = _resolve_k_sweep_values(args)
     k_sweep_results: dict[int, float] = {}
-    # iter155 (corrected): three-way contraction diagnostics.
-    #   lip_ub_T — transition-map J (decomposition diagnostic, was `lip_ub`)
-    #   lip_ub_S — single-state convex-blend J (advisory surrogate; NOT the
-    #              iterated map of the actual two-state Parcae solver)
-    #   lip_ub_F — full two-state Parcae cycle J (gate-aligned empirical
-    #              local-contraction metric; safety-adjusted power-iteration
-    #              estimate, NOT a formal certificate — see post-int gate)
-    # The post-int contraction failure gate triggers on lip_ub_F; T and S
-    # are reported alongside for failure attribution.
-    k_sweep_lip_ubs_T: dict[int, float] = {}
-    k_sweep_lip_ubs_S: dict[int, float] = {}
-    k_sweep_lip_ubs_F: dict[int, float] = {}
-    # Tier 2 (2026-05-13): rho_F = |lambda_max(J_F)| via straight power
-    # iteration on J_F.  Necessary AND sufficient for asymptotic local
-    # FP convergence (Hartman--Grobman); replaces lip_ub_F as the
-    # principled gate-relevant signal.  Architecture-agnostic: same
-    # condition applies to any iteration map.
+    # rho_F = |lambda_max(J_F)| via straight power iteration on J_F.
+    # Necessary AND sufficient for asymptotic local FP convergence
+    # (Hartman-Grobman). Architecture-agnostic: same condition applies
+    # to any iteration map.
     k_sweep_rho_F: dict[int, float] = {}
-    # iter155 corrected (2026-05-13): joint-cycle residual paired with
-    # lip_ub_F for a principled Banach-style FP error bound.  The legacy
-    # iter_conv_rel is the z-only step residual, which doesn't pair
-    # correctly with the F-side Lipschitz constant.
+    # Joint two-state-cycle residual at the saved FP, paired with rho_F
+    # as a per-K convergence-quality diagnostic.
     k_sweep_fp_residual_F: dict[int, float] = {}
 
     # iter 100b user directive (PERMANENT 2026-04-27): emit a structured
@@ -9317,14 +8946,10 @@ def main() -> None:
         ("attn_min", 9), ("mlp_min", 9), ("attn_ortho", 11), ("mlp_ortho", 10),
         ("pertoken_ent", 13), ("pool_ent", 9), ("shared_gate", 12),
         *_dir_cols,
-        # iter155 (corrected): lip_ub_F is the gate-aligned contraction
-        # object on the actual two-state Parcae cycle; lip_ub_S is the
-        # single-state convex-blend advisory surrogate (NOT the iterated
-        # map); lip_ub_T is the transition-map decomposition diagnostic.
-        # fp_residual_F = ‖F(z*,z*)−(z*,z*)‖_RMS / ‖(z*,z*)‖_RMS pairs with
-        # lip_ub_F in fp_bound = fp_residual_F / (1 − lip_ub_F).
-        ("lip_ub_T", 10), ("lip_ub_S", 10), ("lip_ub_F", 10), ("rho_F", 9),
-        ("fp_residual_F", 14), ("fp_bound", 10), ("iter_conv_rel", 14),
+        # rho_F (principled gate per Hartman-Grobman) + fp_residual_F (joint
+        # two-state-cycle residual at the saved FP) + iter_conv_rel (z-only
+        # step residual at the K-eval forward).
+        ("rho_F", 9), ("fp_residual_F", 14), ("iter_conv_rel", 14),
     ]
     def _fmt_kdiag(value: float | None, width: int, name: str = "") -> str:
         if value is None:
@@ -9380,66 +9005,12 @@ def main() -> None:
             if conf_value is not None:
                 diag_parts.append(f"{conf_name}:{float(conf_value):.4f}")
         # Local FP contraction metric at the saved DEQ FP (z*).  Eval profile
-        # controls which K rows pay for this probe.
-        # iter155 (corrected): three probes share the saved FP and Hutchinson
-        # power-iteration machinery.  lip_ub_F (gate object) is on the actual
-        # two-state Parcae cycle; lip_ub_S (advisory) is the single-state
-        # convex-blend surrogate; lip_ub_T (decomposition) is on the
-        # transition map alone.  Combined cost ~12 extra JVPs per K-value
-        # (F probe is ~2× the others due to the two-state cycle), still
-        # dominated by the K-sweep validation forward.
-        lip_ub_T_val = None
-        lip_ub_S_val = None
-        lip_ub_F_val = None
-        # iter155 (corrected) directive 2026-05-13: lip_ub_F always probed
-        # on every K-sweep row — every K is its own FP eval, and the
-        # gate-aligned object cannot be silently absent for any K we
-        # actually report.  T/S remain on the eval-profile cadence
-        # (`submission` probes K=128 only) because they're decomposition
-        # diagnostics and only useful when lip_ub_F has crossed the
-        # prescription threshold.
-        lip_ub_F_val = _lip_ub_at_saved_fp(
-            base_m_for_roundtrip,
-            n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
-            safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
-            margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
-            log_label="ksweep_skip_reason:lip_ub_F",
-            map_kind="F",
-        )
-        if _should_probe_lip_for_k(args, k_eval):
-            lip_ub_T_val = _lip_ub_at_saved_fp(
-                base_m_for_roundtrip,
-                n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
-                safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
-                margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
-                log_label="ksweep_skip_reason:lip_ub_T",
-                map_kind="T",
-            )
-            lip_ub_S_val = _lip_ub_at_saved_fp(
-                base_m_for_roundtrip,
-                n_iters=int(getattr(args, "fp_lip_power_iters", 3)),
-                safety=float(getattr(args, "fp_lip_ub_safety", 1.10)),
-                margin=float(getattr(args, "fp_lip_ub_margin", 0.0)),
-                log_label="ksweep_skip_reason:lip_ub_S",
-                map_kind="S",
-            )
-        if lip_ub_T_val is not None:
-            diag_parts.append(f"lip_ub_T:{lip_ub_T_val:.4f}")
-            k_sweep_lip_ubs_T[k_eval] = float(lip_ub_T_val)
-        if lip_ub_S_val is not None:
-            diag_parts.append(f"lip_ub_S:{lip_ub_S_val:.4f}")
-            k_sweep_lip_ubs_S[k_eval] = float(lip_ub_S_val)
-        if lip_ub_F_val is not None:
-            diag_parts.append(f"lip_ub_F:{lip_ub_F_val:.4f}")
-            k_sweep_lip_ubs_F[k_eval] = float(lip_ub_F_val)
-        # Tier 2 (2026-05-13): rho_F is the spectral-radius estimate
-        # |lambda_max(J_F)| via straight power iteration on J_F (not
-        # J_F^T J_F).  rho < 1 is necessary AND sufficient for asymptotic
-        # local FP convergence (Hartman--Grobman); lip_ub_F (sigma_max)
-        # is sufficient but over-restrictive.  Always-on per the same
-        # gate-relevance policy as lip_ub_F.  Architecture-agnostic:
-        # any iteration map M must satisfy rho(J_M) < 1 for asymptotic
-        # local contraction, regardless of model class.
+        # Per-K spectral probe at the saved FP. rho_F is the principled
+        # gate metric (necessary AND sufficient for asymptotic FP
+        # convergence per Hartman-Grobman); lip_ub_T/S/F and fp_bound
+        # were removed 2026-05-15 — operator-norm proxies are
+        # over-restrictive for non-symmetric J_F. fp_residual_F is the
+        # joint two-state-cycle residual at the saved FP.
         rho_F_val = _rho_F_at_saved_fp(
             base_m_for_roundtrip,
             n_iters=int(getattr(args, "fp_rho_power_iters", 8)),
@@ -9448,9 +9019,6 @@ def main() -> None:
         if rho_F_val is not None:
             diag_parts.append(f"rho_F:{rho_F_val:.4f}")
             k_sweep_rho_F[k_eval] = float(rho_F_val)
-        # iter155 corrected: joint cycle residual paired with lip_ub_F —
-        # always probed for the same always-on policy as lip_ub_F.
-        # Probed at the saved FP, no autograd, ~2 sb calls.
         fp_residual_F_val = _joint_F_residual_at_saved_fp(
             base_m_for_roundtrip,
             log_label="ksweep_skip_reason:fp_residual_F",
@@ -9460,13 +9028,10 @@ def main() -> None:
             k_sweep_fp_residual_F[k_eval] = float(fp_residual_F_val)
         log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
         # iter 100b user directive (PERMANENT): tabular per-K row.
-        # fp_bound uses the gate-aligned F-side metric AND the joint cycle
-        # residual: fp_bound = fp_residual_F / (1 − lip_ub_F) is the
-        # principled Banach bound on ‖(y, z) − (z*, z*)‖ for the actual
-        # two-state Parcae cycle.  iter_conv_rel (z-only step residual)
-        # is retained as a separate diagnostic.
+        # iter_conv_rel (z-only step residual at K-eval forward) is the
+        # empirical FP-convergence diagnostic; rho_F (spectral radius)
+        # is the principled gate metric.
         conv_rel_val = float(conv_rel_t.detach().float().item()) if isinstance(conv_rel_t, torch.Tensor) else None
-        fp_bound = _fixed_point_error_bound_metric(fp_residual_F_val, lip_ub_F_val)
         kdiag_row = {
             "K": float(k_eval),
             "val_bpb": float(bpb_k),
@@ -9482,12 +9047,8 @@ def main() -> None:
             "shared_gate": kdiag.get("shared_gate"),
             **{short: kdiag.get(name) for name, _, short in ROUTER_DIRICHLET_DIAG_TERMS},
             ROUTER_DIRICHLET_BETA_TERM[2]: kdiag.get(ROUTER_DIRICHLET_BETA_TERM[0]),
-            "lip_ub_T": lip_ub_T_val,
-            "lip_ub_S": lip_ub_S_val,
-            "lip_ub_F": lip_ub_F_val,
             "rho_F": rho_F_val,
             "fp_residual_F": fp_residual_F_val,
-            "fp_bound": fp_bound,
             "iter_conv_rel": conv_rel_val,
         }
         log0("k_sweep_table:" + " ".join(_fmt_kdiag(kdiag_row[name], w, name) for name, w in _kdiag_cols))
@@ -9763,43 +9324,16 @@ def main() -> None:
     )
     conv_rel = _ddp_mean_scalar(conv_rel_local)
 
-    # 3. Local contraction + FP convergence (Tier 1+2 redesign 2026-05-13).
-    #
-    # The architecture-agnostic principled framework:
-    #   - rho(J_M) < 1 (spectral radius) is necessary AND sufficient for
-    #     asymptotic local FP convergence of any iteration map M
-    #     (Hartman--Grobman).
-    #   - sigma_max(J_M) < 1 (operator norm) is sufficient but
-    #     over-restrictive (Banach contraction); pursuing it via soft
-    #     penalty (iter155 Lyapunov-on-F) was empirically refuted as
-    #     unprincipled (iter152 baseline converges fine with
-    #     sigma_max ~ 17 because rho << sigma_max for non-symmetric J).
-    #
-    # Promotion-relevant gate triggers (gate failures escalate to retry):
-    #   - rho_F >= 1.0 at deepest K  (theoretical convergence threatened)
-    #   - iter_conv_rel >= 0.05 at any K >= 16  (empirical convergence)
-    # Advisory diagnostics (logged but DO NOT trigger gate failure):
-    #   - lip_ub_F (operator norm on F) — over-restrictive proxy
-    #   - lip_ub_T, lip_ub_S — decomposition diagnostics
-    #   - fp_residual_F, fp_bound = fp_residual_F/(1 - lip_ub_F)
-    #     (Banach bound; only meaningful when lip_ub_F < 1)
+    # 3. Local contraction + FP convergence: rho(J_F) < 1 is the gate
+    # (necessary AND sufficient for asymptotic local convergence per
+    # Hartman-Grobman). lip_ub_T/S/F operator-norm proxies were removed
+    # 2026-05-15 as over-restrictive.
     deepest_k = max(k_sweep_values) if k_sweep_values else None
     if deepest_k is not None:
         deepest_rho_F = _ddp_max_scalar(k_sweep_rho_F.get(deepest_k))
-        deepest_lip_ub_F = _ddp_max_scalar(k_sweep_lip_ubs_F.get(deepest_k))
-        deepest_lip_ub_S = _ddp_max_scalar(k_sweep_lip_ubs_S.get(deepest_k))
-        deepest_lip_ub_T = _ddp_max_scalar(k_sweep_lip_ubs_T.get(deepest_k))
         deepest_fp_resid_F = _ddp_max_scalar(k_sweep_fp_residual_F.get(deepest_k))
-        # Gate trigger: rho_F is the principled convergence signal.
-        # Missing rho_F is non-fatal (advisory only) since iter_conv_rel
-        # below provides the empirical fallback.
         if deepest_rho_F is not None and deepest_rho_F >= 1.0:
-            attribution = []
-            if deepest_lip_ub_F is not None:
-                attribution.append(f"lip_ub_F={deepest_lip_ub_F:.4f}")
-            if deepest_lip_ub_T is not None:
-                attribution.append(f"lip_ub_T={deepest_lip_ub_T:.4f}")
-            attr_str = (", " + ", ".join(attribution)) if attribution else ""
+            attr_str = f", fp_residual_F={deepest_fp_resid_F:.6f}" if deepest_fp_resid_F is not None else ""
             _failures.append(
                 f"rho_F={deepest_rho_F:.4f} >= 1.0 at K={deepest_k}{attr_str} "
                 "(spectral-radius estimate on F; necessary-and-sufficient asymptotic "

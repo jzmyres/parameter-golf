@@ -568,15 +568,18 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
         ("mos_ntp_ortho=0.61 > 0.5", "mos_head_collapse",
          {"needs_mos_output_geometry_constraint"}, set()),
         ("k-sweep delta > 0.1 at K=64", "fp_quality_loss", set(), set()),
-        # Tier 1+2 redesign 2026-05-13: lip_ub_F demoted to advisory; the
-        # gate-relevant signal is now rho_F (spectral radius, necessary AND
-        # sufficient for asymptotic convergence) and iter_conv_rel (empirical).
+        # Lip_ub_* operator-norm probes + fp_bound (Banach error bound) were
+        # removed 2026-05-15 — over-restrictive for non-symmetric J_F.
+        # Legacy failure strings now route to a single advisory prescription
+        # that points users at rho_F (the principled gate per Hartman-Grobman).
         ("lip_ub_F=45.0 >= 1.0", "operator_norm_advisory",
          set(), {"lyapunov_coef", "needs_iteration_map_contraction"}),
+        ("lip_ub_T=22.0 >= 1.0", "operator_norm_advisory", set(), {"lyapunov_coef"}),
+        ("lip_ub_S=18.0 >= 1.0", "operator_norm_advisory", set(), {"lyapunov_coef"}),
+        ("fp_bound=2.5 >= 1.0", "operator_norm_advisory", set(), {"lyapunov_coef"}),
         ("rho_F=1.2 >= 1.0", "fp_convergence_failed",
          {"needs_formal_tier_contraction"}, {"lyapunov_coef"}),
-        ("fp_bound=2.5 >= 1.0", "fp_certificate_loose", set(), set()),
-        # iter_conv_rel category renamed Tier 1: gate-relevant empirical signal.
+        # iter_conv_rel category: gate-relevant empirical signal.
         ("iter_conv_rel=0.6 > 0.3", "fp_convergence_empirical_failed",
          {"weight_decay_mult", "deq_k_max_delta"}, {"lyapunov_coef"}),
         ("deq_recon_err=1.5e-2 > 1e-3", "reversibility_broken", set(), set()),
@@ -688,10 +691,14 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
     assert p_rho["category"] == "fp_convergence_failed"
     assert "needs_formal_tier_contraction" in p_rho["config_change"]
     assert "lyapunov_coef" not in p_rho["config_change"]
-    # iter155 corrected: lip_ub_S is now an advisory surrogate, not a gate.
-    p_lip_s = _prescribe_failure_fix("lip_ub_S=45.0 >= 1.0")
-    assert p_lip_s["category"] == "single_state_blend_loose"
-    assert p_lip_s["config_change"] == {}
+    # lip_ub_T/S/F operator-norm prescriptions were collapsed into a single
+    # `operator_norm_advisory` 2026-05-15 (probes removed; legacy failure
+    # strings from pre-2026-05-15 logs still routed to advisory).
+    for legacy in ("lip_ub_S=45.0 >= 1.0", "lip_ub_T=22.0 >= 1.0",
+                   "lip_ub_F=18.0 >= 1.0", "fp_bound=2.5 >= 1.0"):
+        p_legacy = _prescribe_failure_fix(legacy)
+        assert p_legacy["category"] == "operator_norm_advisory", legacy
+        assert p_legacy["config_change"] == {}, legacy
 
 
 def test_eval_microbatch_and_mos_expert_settings_are_dry_but_independent():

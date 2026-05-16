@@ -198,27 +198,19 @@ def parse_log(logpath: str) -> dict:
                 "iter_conv_rel",
                 "residual",
                 *ROUTER_DIRICHLET_DIAG_FIELDS,
-                # iter155 (corrected): three-way contraction diagnostics.
-                #   lip_ub_F — gate-aligned (two-state Parcae cycle map)
-                #   lip_ub_S — single-state convex-blend advisory surrogate
-                #   lip_ub_T — transition-map decomposition diagnostic
-                # Pre-iter155 logs only emit `lip_ub:`; parsing the legacy
-                # key plus all three new keys keeps backward compatibility
-                # for historical training_logs/.
+                # rho_F = |lambda_max(J_F)|, the spectral-radius estimate
+                # that is necessary AND sufficient for asymptotic local FP
+                # convergence (Hartman-Grobman; architecture-agnostic).
+                # lip_ub_T/S/F + fp_bound parsing kept here as no-ops for
+                # backward compatibility with pre-2026-05-15 training_logs/
+                # — the keys never match in current logs and silently
+                # dropping legacy log parsing breaks plot comparisons
+                # against archived runs.
                 "lip_ub",
                 "lip_ub_T",
                 "lip_ub_S",
                 "lip_ub_F",
-                # Tier 2 (2026-05-13): rho_F = |lambda_max(J_F)|, the
-                # spectral-radius estimate that is necessary AND
-                # sufficient for asymptotic local FP convergence
-                # (Hartman--Grobman; architecture-agnostic).  Replaces
-                # lip_ub_F as the gate-relevant convergence signal;
-                # lip_ub_F is now an over-restrictive operator-norm
-                # diagnostic only.
                 "rho_F",
-                # iter155 corrected: joint cycle residual paired with
-                # lip_ub_F in fp_bound = fp_residual_F / (1 - lip_ub_F).
                 "fp_residual_F",
                 "fp_bound",
             ):

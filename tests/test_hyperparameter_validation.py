@@ -51,14 +51,16 @@ class TestValidateHyperparameters(unittest.TestCase):
             _validate_hyperparameters(_mut(lyapunov_target=valid))
 
     def test_lyapunov_estimator_enum_is_validated(self) -> None:
-        # iter155 (corrected): `lyapunov_estimator` ∈ {"random_fd",
-        # "power_jvp_F"}.  Default random_fd preserves iter155 cost
-        # envelope; power_jvp_F is opt-in worst-direction probe.
-        with self.assertRaises(SystemExit) as ctx:
-            _validate_hyperparameters(_mut(lyapunov_estimator="hutch_xyz"))
-        self.assertIn("lyapunov_estimator", str(ctx.exception))
-        for valid in ("random_fd", "power_jvp_F"):
-            _validate_hyperparameters(_mut(lyapunov_estimator=valid))
+        # `lyapunov_estimator` is now random_fd only — `power_jvp_F` was
+        # removed 2026-05-15 alongside the lip_ub_* operator-norm probes
+        # (both refuted by iter155/iter152 evidence; CLAUDE.md most-
+        # principled-simplest-general directive). Validator must reject
+        # both unknown values AND the removed `power_jvp_F` legacy value.
+        for invalid in ("hutch_xyz", "power_jvp_F"):
+            with self.assertRaises(SystemExit) as ctx:
+                _validate_hyperparameters(_mut(lyapunov_estimator=invalid))
+            self.assertIn("lyapunov_estimator", str(ctx.exception))
+        _validate_hyperparameters(_mut(lyapunov_estimator="random_fd"))
 
     def test_unknown_profile_key_is_rejected(self) -> None:
         # Defends `_CONFIG_PROFILES` against silent typos: a stray attribute on
