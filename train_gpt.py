@@ -6863,6 +6863,7 @@ def _rho_F_at_saved_fp(
     n_iters: int = 8,
     B_probe: int = 1,
     log_label: str = "rho_F",
+    n_seeds: int = 4,
 ) -> float | None:
     """Spectral-radius estimate ``rho(J_F)`` at the model's saved DEQ FP.
 
@@ -6871,6 +6872,15 @@ def _rho_F_at_saved_fp(
     attractive). Architecture-agnostic: same condition applies to any
     iteration map M (alternative DEQ solvers, refinement loops, recurrent
     layers — all subject to the same gate).
+
+    iter168 (2026-05-16): multi-seed power iteration. Single-seed power
+    iteration on non-symmetric J_F can give noisy estimates when the
+    starting vector has small projection onto the dominant eigenspace
+    (iter163 K-sweep observed rho_F = 1.04 at K=24, 1.15 at K=32 with
+    K=128 = 0.92 — single-seed estimator artifacts). Running power
+    iteration with ``n_seeds`` independent random starts and returning
+    the geometric median is robust to this noise (the dominant eigenvalue
+    is invariant; only the per-seed convergence speed depends on init).
 
     Returns ``None`` if no saved FP is available (e.g., before any forward
     pass) or the OOM predictor blocks the probe.
@@ -6883,12 +6893,180 @@ def _rho_F_at_saved_fp(
     # the transition map T (the solver does z_{k+1} = T(z_k) directly),
     # so rho(J_T) is the principled spectral-radius value.
     map_kind = "F" if a_bar_d is not None else "T"
+    n_seeds = max(1, int(n_seeds))
+    estimates: list[float] = []
+    for _ in range(n_seeds):
+        try:
+            est = _run_spectral_radius_power(
+                z_star, x0_lyap, b_bar_d, sb, target_dtype,
+                n_iters=n_iters,
+                ctx_factory=ctx_factory,
+                map_kind=map_kind,
+                a_bar_d=a_bar_d,
+            )
+        except torch.cuda.OutOfMemoryError:
+            print(f"{log_label} skip: oom during power iteration", flush=True)
+            return None
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                print(f"{log_label} skip: cuda oom during power iteration", flush=True)
+                return None
+            raise
+        if est is not None:
+            estimates.append(est)
+    if not estimates:
+        return None
+    estimates.sort()
+    return estimates[len(estimates) // 2]  # median; geo-median ≈ median for log-normal noise
+
+
+def _run_spectral_norm_power(
+    z_star: Tensor,
+    x0_lyap: Tensor,
+    b_bar_d: Tensor | None,
+    sb,
+    target_dtype: torch.dtype,
+    n_iters: int,
+    ctx_factory,
+    a_bar_d: Tensor | None,
+) -> float | None:
+    """Operator-norm estimate ``sigma_max(J_F)`` via power iteration on ``J^T J``.
+
+    iter168 (2026-05-16): restored as DIAGNOSTIC ONLY after the 2026-05-15
+    over-aggressive removal. ``sigma_max(J_F) < 1`` is sufficient (but NOT
+    necessary) for asymptotic convergence — refuted as a GATE by iter152's
+    empirical convergence with sigma_max ≈ 17 and rho ≈ 0.85. However, the
+    quantity itself carries useful operational information that is NOT
+    captured by rho_F:
+
+      - Per-step monotone contraction bound: ||F(z) − F(z*)|| <= sigma_max · ||z − z*||
+      - Robustness to input/weight perturbations (operator-norm Lipschitz)
+      - Basin of attraction size lower bound (smaller sigma_max → larger basin)
+
+    These properties become operationally critical when training-time
+    perturbations are introduced (iter161-QAT-late STE fake-quant on
+    weights), so the diagnostic is restored as a non-gate, non-penalty,
+    non-prescription signal emitted in fast-val + K-sweep.
+
+    Power iteration: v_{k+1} = J^T J v_k / ||J^T J v_k|| converges to the
+    dominant right-singular vector; ``||J v||/||v||`` at convergence equals
+    ``sigma_max(J)``. Implementation mirrors :func:`_run_spectral_radius_power`
+    on the same two-state Parcae cycle ``F``.
+    """
+    if a_bar_d is None:
+        # Parcae-disabled fallback: probe σ_max(J_T) on the transition map.
+        # In this branch ``F = T`` (no Ā damping), so naming is consistent.
+        pass
+
+    torch.cuda.empty_cache()
+    state_factor = 2 if a_bar_d is not None else 1
+    free_b, _ = torch.cuda.mem_get_info(z_star.device)
+    # ~2x the rho_F probe budget because JVP + VJP both fire per power-iter step.
+    need_b = int(z_star.numel() * z_star.element_size() * 32 * state_factor)
+    if free_b < int(need_b * 1.25):
+        print(
+            f"sigma_max_F skip: oom_pred need={need_b/1e9:.2f}GiB "
+            f"free={free_b/1e9:.2f}GiB B_probe={z_star.shape[0]}",
+            flush=True,
+        )
+        return None
+
+    a_bar_t = a_bar_d.to(device=z_star.device, dtype=target_dtype) if a_bar_d is not None else None
+
+    if a_bar_d is not None:
+        D = z_star.shape[-1]
+
+        def _apply_map(state: Tensor) -> Tensor:
+            y, z = torch.split(state, D, dim=-1)
+            y_new, z_new = _parcae_cycle_F(y, z, x0_lyap, b_bar_d, a_bar_t, sb)
+            return torch.cat([y_new, z_new], dim=-1)
+
+        seed_state = torch.cat([z_star, z_star], dim=-1).contiguous()
+    else:
+        def _apply_map(z_arg: Tensor) -> Tensor:
+            return sb(z_arg, x0_lyap, b_bar_d)
+
+        seed_state = z_star
+
+    v = torch.randn_like(seed_state, dtype=torch.float32)
+    v = v / v.norm().clamp(min=1e-8)
+
+    def _jvp(v_float: Tensor) -> Tensor:
+        z_b = seed_state.detach().clone().requires_grad_(True)
+        v_b = v_float.to(device=z_b.device, dtype=z_b.dtype)
+        with ctx_factory(), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
+            _, jv = torch.autograd.functional.jvp(
+                _apply_map, (z_b,), (v_b,), create_graph=False, strict=False
+            )
+        del z_b, v_b
+        return jv.detach()
+
+    def _vjp(v_float: Tensor) -> Tensor:
+        # J^T v via reverse-mode AD on _apply_map at seed_state.
+        z_b = seed_state.detach().clone().requires_grad_(True)
+        v_b = v_float.to(device=z_b.device, dtype=z_b.dtype)
+        with ctx_factory(), torch.enable_grad(), torch.autocast(device_type="cuda", dtype=target_dtype):
+            out = _apply_map(z_b)
+            (jtv,) = torch.autograd.grad(
+                outputs=out,
+                inputs=z_b,
+                grad_outputs=v_b,
+                create_graph=False,
+                retain_graph=False,
+            )
+        del z_b, v_b, out
+        return jtv.detach()
+
+    # Power iteration on J^T J: v <- J^T(Jv); sqrt(<v_old, J^T J v_old>) ≈ sigma_max.
+    n = max(2, int(n_iters))
+    avg_window = min(4, n)
+    ratios: list[float] = []
+    for k in range(n):
+        v_norm = v.float().norm().clamp(min=1e-8)
+        jv = _jvp(v)
+        jv_norm = jv.float().norm()
+        ratio = float((jv_norm / v_norm).item())  # ||Jv||/||v|| → sigma_max
+        if k >= n - avg_window:
+            ratios.append(ratio)
+        jtjv = _vjp(jv.float())
+        jtjv_norm = jtjv.float().norm().clamp(min=1e-8)
+        v = (jtjv.float() / jtjv_norm).detach()
+        del jv, jtjv
+        torch.cuda.empty_cache()
+
+    del v
+    torch.cuda.empty_cache()
+    if not ratios:
+        return None
+    return float(sum(ratios) / len(ratios))
+
+
+def _sigma_max_F_at_saved_fp(
+    base_m,
+    n_iters: int = 8,
+    B_probe: int = 1,
+    log_label: str = "sigma_max_F",
+) -> float | None:
+    """Operator-norm estimate sigma_max(J_F) at the saved DEQ FP.
+
+    DIAGNOSTIC ONLY (iter168, 2026-05-16). NOT a gate, NOT a penalty,
+    NOT a prescription input. Restored after the 2026-05-15 over-aggressive
+    removal because the operator norm carries operationally-relevant
+    information (per-step contraction bound, perturbation robustness,
+    basin size) that is not captured by rho_F alone. See
+    :func:`_run_spectral_norm_power` for full rationale.
+
+    Returns ``None`` if no saved FP is available or OOM blocks the probe.
+    """
+    prepared = _prepare_saved_fp_probe(base_m, B_probe)
+    if prepared is None:
+        return None
+    z_star, x0_lyap, b_bar_d, a_bar_d, sb, target_dtype, ctx_factory = prepared
     try:
-        return _run_spectral_radius_power(
+        return _run_spectral_norm_power(
             z_star, x0_lyap, b_bar_d, sb, target_dtype,
             n_iters=n_iters,
             ctx_factory=ctx_factory,
-            map_kind=map_kind,
             a_bar_d=a_bar_d,
         )
     except torch.cuda.OutOfMemoryError:
@@ -8203,15 +8381,26 @@ def main() -> None:
                     base_model,
                     n_iters=int(getattr(args, "fp_rho_power_iters", 8)),
                 )
+                # iter168 (2026-05-16): sigma_max_F restored as DIAGNOSTIC.
+                # NOT a gate, NOT a penalty, NOT a prescription input.
+                # Carries operational info (per-step contraction bound,
+                # perturbation robustness, basin size) that rho_F alone
+                # does not — see _sigma_max_F_at_saved_fp docstring.
+                sigma_max_F = _sigma_max_F_at_saved_fp(
+                    base_model,
+                    n_iters=int(getattr(args, "fp_rho_power_iters", 8)),
+                )
             else:
                 fp_residual_F = None
                 rho_F = None
+                sigma_max_F = None
             conv_rel_t = getattr(base_model, "_deq_iter_convergence_rel_t", None)
             fp_residual_rel = (
                 float(conv_rel_t.detach().float().item())
                 if isinstance(conv_rel_t, torch.Tensor) else None
             )
             rho_str = f" rho_F:{rho_F:.4f}" if rho_F is not None else " rho_F:N/A"
+            sigma_str = f" sigma_max_F:{sigma_max_F:.4f}" if sigma_max_F is not None else " sigma_max_F:N/A"
             fp_resid_str = (
                 (f" fp_residual_rel:{fp_residual_rel:.6f}" if fp_residual_rel is not None else "")
                 + (f" fp_residual_F:{fp_residual_F:.6f}" if fp_residual_F is not None else "")
@@ -8221,7 +8410,7 @@ def main() -> None:
                 f"val_mode:fast "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
                 f"step_avg_w50:{_window_avg:.2f}ms"
-                f"{rho_str}{fp_resid_str}"
+                f"{rho_str}{sigma_str}{fp_resid_str}"
                 f"{deq_info}{expert_info}"
                 f"{format_k_jitter_info()}"
             )
@@ -8848,6 +9037,11 @@ def main() -> None:
     # (Hartman-Grobman). Architecture-agnostic: same condition applies
     # to any iteration map.
     k_sweep_rho_F: dict[int, float] = {}
+    # iter168 (2026-05-16): sigma_max(J_F) operator-norm DIAGNOSTIC restored
+    # alongside rho_F. NOT a gate; captures per-step contraction bound,
+    # robustness to input/weight perturbations, and basin-of-attraction
+    # size — properties rho_F alone does not capture.
+    k_sweep_sigma_max_F: dict[int, float] = {}
     # Joint two-state-cycle residual at the saved FP, paired with rho_F
     # as a per-K convergence-quality diagnostic.
     k_sweep_fp_residual_F: dict[int, float] = {}
@@ -8971,7 +9165,7 @@ def main() -> None:
         # rho_F (principled gate per Hartman-Grobman) + fp_residual_F (joint
         # two-state-cycle residual at the saved FP) + iter_conv_rel (z-only
         # step residual at the K-eval forward).
-        ("rho_F", 9), ("fp_residual_F", 14), ("iter_conv_rel", 14),
+        ("rho_F", 9), ("sigma_max_F", 12), ("fp_residual_F", 14), ("iter_conv_rel", 14),
     ]
     def _fmt_kdiag(value: float | None, width: int, name: str = "") -> str:
         if value is None:
@@ -9041,6 +9235,17 @@ def main() -> None:
         if rho_F_val is not None:
             diag_parts.append(f"rho_F:{rho_F_val:.4f}")
             k_sweep_rho_F[k_eval] = float(rho_F_val)
+        # iter168 (2026-05-16): sigma_max_F restored as DIAGNOSTIC. NOT a
+        # gate, NOT a penalty, NOT a prescription input. Carries the
+        # robustness/basin-size info that rho_F alone does not.
+        sigma_max_F_val = _sigma_max_F_at_saved_fp(
+            base_m_for_roundtrip,
+            n_iters=int(getattr(args, "fp_rho_power_iters", 8)),
+            log_label="ksweep_skip_reason:sigma_max_F",
+        )
+        if sigma_max_F_val is not None:
+            diag_parts.append(f"sigma_max_F:{sigma_max_F_val:.4f}")
+            k_sweep_sigma_max_F[k_eval] = float(sigma_max_F_val)
         fp_residual_F_val = _joint_F_residual_at_saved_fp(
             base_m_for_roundtrip,
             log_label="ksweep_skip_reason:fp_residual_F",
@@ -9070,6 +9275,7 @@ def main() -> None:
             **{short: kdiag.get(name) for name, _, short in ROUTER_DIRICHLET_DIAG_TERMS},
             ROUTER_DIRICHLET_BETA_TERM[2]: kdiag.get(ROUTER_DIRICHLET_BETA_TERM[0]),
             "rho_F": rho_F_val,
+            "sigma_max_F": sigma_max_F_val,
             "fp_residual_F": fp_residual_F_val,
             "iter_conv_rel": conv_rel_val,
         }
