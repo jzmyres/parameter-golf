@@ -215,7 +215,6 @@ class TestTrainingContracts(unittest.TestCase):
             "expert_diversity_coef_eff:",
             "mos_diversity_coef_eff:",
             "consistency_anchor_loss:",
-            "consistency_ext_loss:",
         ]
         for field in required_fields:
             self.assertIn(field, text)

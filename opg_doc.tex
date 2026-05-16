@@ -192,10 +192,9 @@ Mac/MLX support, ignore \texttt{train\_gpt\_mlx.py}.
 \texttt{lyapunov\_target} & transition\_T & \multicolumn{2}{l}{\small enum: \texttt{transition\_T} (J of $T_\theta$; iter147), \texttt{iteration\_S} (J of $S=\bar A z+(1-\bar A)T_\theta$; advisory), \texttt{iteration\_F} (J of two-state Parcae cycle $F$; gate-aligned, iter155 corrected)} \\
 \texttt{denoising\_coef} & 0.0 & \texttt{denoising\_noise\_std} & 0.01 \\
 \texttt{grad\_clip\_norm} & 1.0 & \texttt{weight\_decay} & 0.015 \\
-\texttt{multi\_k\_consistency\_anchor\_coef} & 0.1 & \texttt{router\_ema\_balance\_coef} & 0.30 \\
+\texttt{multi\_k\_consistency\_anchor\_coef} & 0.1 (iter163c) & \texttt{router\_ema\_balance\_coef} & 0.30 \\
 \texttt{router\_ema\_specialization\_coef} & 0.20 & \texttt{router\_ema\_alive\_coef} & 0.02 \\
-\texttt{router\_pertoken\_entropy\_coef} & 0.1 & \texttt{multi\_k\_consistency\_extension\_coef} & 0.1 \\
-\texttt{multi\_k\_consistency\_extension\_delta} & 0 (uses $K_{\rm train}$) & \texttt{deq\_prefix\_anchors} & true \\
+\texttt{router\_pertoken\_entropy\_coef} & 0.1 & \texttt{deq\_prefix\_anchors} & true \\
 \texttt{regularizer\_warmup\_frac} & 0.07 & \texttt{expert\_diversity\_kind} & cosine max-pair \\
 \texttt{expert\_output\_diversity\_coef} & 0.30 & \texttt{mos\_output\_diversity\_coef} & 0.0 \\
 \texttt{use\_entmax\_routing} & false & \texttt{entmax\_blend\_init\_logit} & 5.0 \\
@@ -907,31 +906,38 @@ where $\lambda_{\rm denoise}$ is the runtime value of
 perturbations around the reached equilibrium and complements the infinitesimal
 Jacobian surrogate when explicitly enabled.
 
-\paragraph{iter163: Multi-K consistency loss (PROMOTED 2026-05-15).}
-A hybrid consistency-model loss \cite{songConsistencyModels2023} that
+\paragraph{iter163c: TBPTT-aligned anchor-on-deepest consistency loss (2026-05-15, supersedes iter163 extension).}
+A consistency-model loss \cite{songConsistencyModels2023} that
 \emph{trains} the iteration map to satisfy the FP equation
 $T(z^\star)=z^\star$ at the operating point, rather than enforcing it via
 a refuted soft penalty (iter155 Lyapunov, refuted by iter152's empirical
-$\rho \ll \sigma_{\max}$ gap).  Two architecture-agnostic terms:
-\begin{align}
-  \mathcal{L}_{\rm consist}^{\rm anchor}
-    &= \lambda_a \sum_{i=0}^{|A|-2}
-       \left\| z_{K_{a,i}} - \mathrm{stopgrad}(z_{K_{a,i+1}}) \right\|_2^2
-       \quad \text{(recursive on prefix anchors $A$)} \\
-  \mathcal{L}_{\rm consist}^{\rm ext}
-    &= \lambda_e
-       \left\| z_K - \mathrm{stopgrad}(z_{K+\Delta}) \right\|_2^2,
-\end{align}
-where $z_{K+\Delta}$ is computed by extending from $z_K$ via $\Delta$
-no-grad Parcae two-state iterations (initializing $y=z$, exact at the FP),
-and $\lambda_a=\lambda_e=0.1$, $\Delta=K$ by default.  The recursive
-anchor term is free (reuses the prefix-anchor $z$-stack); the extension
-term costs $\sim+50\%$ step time at $\Delta=K$.  Both implicitly enforce
-$\rho(J_F) < 1$ because consistency only minimizes if the iteration is
-contractive at the operating point.  Promotion result: full
-$\textrm{val\_bpb}=1.471598$ vs iter152's $1.471820$ (smallest possible
-margin but real); K-extrapolation gap (K=128 minus K=16) is $4\times$
-tighter than the iter158 baseline ($+0.0004$ vs $+0.0018$).
+$\rho \ll \sigma_{\max}$ gap).  A single architecture-agnostic term anchors
+every gradient-carrying intermediate to the most-converged available FP
+proxy:
+\begin{equation}
+  \mathcal{L}_{\rm consist}
+    = \lambda_a \cdot \frac{1}{|S|}
+      \sum_{i \in S}
+       \left\| z_i - \mathrm{stopgrad}(z_{K+1}) \right\|_2^2,
+\end{equation}
+where $S$ is the union of (a) the iter152 prefix-anchor depths
+$\{16, 24, 32, \ldots\}$ and (b) the last $b-1$ iterations of the
+$K$-sampled forward (TBPTT augmentation, where $b = $\texttt{deq\_bptt\_k});
+$z_{K+1}$ is computed by a \emph{single} no-grad Parcae two-state iter from
+$z_K$ (initializing $y=z_K$, exact at the FP); $\lambda_a = 0.1$ by default.
+Pairing every $z_i$ with $z_{K+1}$ (rather than with $z_{i+1}$) is strictly
+stronger than pair-with-next: signal magnitude is ``distance from FP'',
+not just one-step residual, and there is no trivial-zero collapse risk
+because the target is input-driven ($z_{K+1} = F(z_K, x_0)$, not constant).
+Implicitly enforces $\rho(J_F) < 1$ because consistency only minimizes if
+the iteration map is contractive at the operating point.
+
+Cost: $\sim$1.05--1.10$\times$ iter152 step time (was $1.6\times$ under
+iter163's extension at $\Delta = K_{\rm train} \approx 22$ no-grad iters
+per step).  iter163 (with $\mathcal{L}_{\rm ext}$ at $\Delta = K_{\rm train}$)
+measured $\rho_F: 1.30 \to 0.92$ over training; iter163c should match or
+exceed this because the anchor-on-deepest target gives stronger directional
+signal toward the actual basin's FP, not just any FP.
 
 The total loss used for backpropagation is
 \[
@@ -939,8 +945,7 @@ The total loss used for backpropagation is
     = \mathcal{L}_{\rm task}
     + \mathcal{L}_{\rm jac}
     + \mathcal{L}_{\rm denoise}
-    + \mathcal{L}_{\rm consist}^{\rm anchor}
-    + \mathcal{L}_{\rm consist}^{\rm ext}.
+    + \mathcal{L}_{\rm consist}.
 \]
 
 \section{Quantization and Validation}

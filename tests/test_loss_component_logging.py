@@ -83,7 +83,7 @@ class TestLossComponentLogging(unittest.TestCase):
             "_expert_diversity_coef_eff_t",
             "_mos_diversity_coef_eff_t",
         ]
-        optional = ["_consistency_anchor_loss_t", "_consistency_ext_loss_t"]
+        optional = ["_consistency_anchor_loss_t"]
         for name in required + optional:
             self.assertTrue(hasattr(model, name), name)
             t = getattr(model, name)

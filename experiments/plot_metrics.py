@@ -37,7 +37,6 @@ ROUTER_DIRICHLET_DIAG_FIELDS: tuple[str, ...] = (
 # `tests/test_removal_symmetry.py::test_iter163_consistency_log_fields_in_parser_and_contract`.
 CONSISTENCY_LOSS_FIELDS: tuple[str, ...] = (
     "consistency_anchor_loss",
-    "consistency_ext_loss",
 )
 
 # Consistent colors: blue for Baseline, orange for Current
