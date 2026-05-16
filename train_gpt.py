@@ -892,6 +892,18 @@ class Hyperparameters:
     # `--multi-k-consistency-anchor-coef=0`.
     multi_k_consistency_anchor_coef = 0.1
 
+    # iter161-QAT-late (2026-05-16): deterministic STE int6-SDCLIP fake-quant
+    # on CastedLinear weights (matrix tensors with numel > 8192) for the last
+    # `(total_steps - qat_late_start_step)` training steps. The model adapts
+    # to the EXACT artifact-time int6 quantizer (same per-row SDCLIP scaling
+    # as encode_scored_artifact's quantize_int6_sdclip) so the fast→full BPB
+    # gap (~22 mBPB at iter163 baseline, of which ~5-10 mBPB is quant tax)
+    # closes via training-time root-cause adaptation rather than post-hoc PTQ
+    # patches (refuted alternatives: GPTQ+LQER bundle is symptom-targeting,
+    # not principled). Default -1 means OFF. Recommended value 800 (= last
+    # 200/1000 steps = 20 %).
+    qat_late_start_step: int = -1
+
     # Architecture knobs
     # iter 6: reduced bigram hash from 65536×208 (13.7M params = 71% of model!)
     # to 4096×128 (~590K params) to match records (2026-03-25 uses 2048×128,
@@ -1078,6 +1090,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "eval-reservation-seconds",
     "ctp-weight",
     "multi-k-consistency-anchor-coef",
+    "qat-late-start-step",
     "expert-diversity-kind",
     "expert-output-diversity-coef", "expert-diversity-every", "expert-diversity-max-tokens",
     "mos-output-diversity-coef",
@@ -1551,6 +1564,84 @@ def _classify_param(name: str) -> str:
     return "matrix"
 
 
+# iter161-QAT-late (2026-05-16): deterministic STE fake-quant matching the
+# encode_scored_artifact int6 SDCLIP quantizer EXACTLY. Activated only for
+# the last 20 % of training steps so the model adapts to the deployment
+# quantization noise without slowing earlier training. Deterministic forward
+# (no randomness) → RevDEQ-safe (unlike iter20's random quant-noise injection
+# which broke reverse reconstruction). Per the most-principled-simplest-
+# general directive, this is the root-cause attack on the ~22 mBPB fast→full
+# gap: train the model to BE quant-robust, not patch frozen weights post-hoc.
+
+class _FakeQuantInt6SDClipSTE(torch.autograd.Function):
+    """STE-style int6 SDCLIP fake quantization matching
+    :func:`quantize_int6_sdclip` exactly (per-row scale on ndim>=2 weights,
+    sd-clip factor ``k=SDCLIP_K_MATRIX``).
+
+    Forward: same dequantized output that the artifact codec produces.
+    Backward: identity (straight-through estimator).
+
+    Deterministic forward (only weight values matter; no RNG, no random
+    noise) → RevDEQ reverse reconstruction works. This is the architectural
+    distinction from iter20's stochastic noise injection (refuted 2026-04
+    because random per-call noise made forward non-deterministic).
+    """
+
+    @staticmethod
+    def forward(ctx, weight, k):
+        if weight.ndim < 2:
+            return weight  # too small for per-row quant; identity
+        t32 = weight.float()
+        s = _sdclip_scale(t32, k)
+        s = s.clamp_min(torch.finfo(torch.float16).tiny)
+        s_expand = s.float().view(-1, *([1] * (t32.ndim - 1)))
+        t_2d = t32.reshape(-1, t32.shape[-1]) if t32.ndim > 2 else t32
+        s_2d = s_expand.reshape(-1, 1) if t32.ndim > 2 else s_expand
+        q_int = torch.clamp(torch.round(t_2d / s_2d), -(INT6_CLIP + 1), INT6_CLIP)
+        deq = (q_int * s_2d)
+        if t32.ndim > 2:
+            deq = deq.view(weight.shape)
+        return deq.to(weight.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None  # STE: identity gradient; no grad on k
+
+
+class _QATLateState:
+    """Module-global QAT-late activation state. Training loop sets
+    `current_step` per iteration; `start_step` is the step at which fake-
+    quant turns on (set from `Hyperparameters.qat_late_start_step`, -1
+    means OFF). `CastedLinear.forward` checks `active()` to decide whether
+    to apply STE fake-quant on the weight.
+    """
+    start_step: int = -1
+    current_step: int = -1
+    sdclip_k: float = SDCLIP_K_MATRIX
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.start_step = -1
+        cls.current_step = -1
+        cls.sdclip_k = SDCLIP_K_MATRIX
+
+    @classmethod
+    def set_step(cls, step: int) -> None:
+        cls.current_step = int(step)
+
+    @classmethod
+    def configure(cls, start_step: int, sdclip_k: float = SDCLIP_K_MATRIX) -> None:
+        cls.start_step = int(start_step)
+        cls.sdclip_k = float(sdclip_k)
+
+    @classmethod
+    def active(cls) -> bool:
+        return cls.start_step >= 0 and cls.current_step >= cls.start_step
+
+
+_QAT_LATE_STATE = _QATLateState()
+
+
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
@@ -1882,6 +1973,13 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         bias = self.bias
+        # iter161-QAT-late (2026-05-16): apply deterministic int6 SDCLIP STE
+        # fake-quant on the weight when QAT-late is active. Per CLAUDE.md
+        # most-principled-simplest-general: matches the artifact codec exactly
+        # (per-row SDCLIP scale), deterministic so RevDEQ reverse reconstruction
+        # works, no extra parameters or modules.
+        if _QAT_LATE_STATE.active() and w.numel() > 8192:
+            w = _FakeQuantInt6SDClipSTE.apply(w, _QAT_LATE_STATE.sdclip_k)
         if (x.dtype != w.dtype or (bias is not None and x.dtype != bias.dtype)) and not torch.is_autocast_enabled():
             w = w.to(dtype=x.dtype)
             if bias is not None:
@@ -7287,6 +7385,20 @@ def _validate_hyperparameters(args) -> None:
         raise SystemExit(f"num_heads ({nh}) must be divisible by num_kv_heads ({nkv}) for GQA")
     if int(args.num_layers) <= 0:
         raise SystemExit(f"num_layers ({args.num_layers}) must be positive")
+    # iter161-QAT-late: start_step is either -1 (OFF, default) or a non-
+    # negative integer (start QAT at that step). Negative values other
+    # than -1 are nonsense — fail-fast rather than silently treat as OFF.
+    qat_start = int(getattr(args, "qat_late_start_step", -1))
+    if qat_start < -1:
+        raise SystemExit(
+            f"qat_late_start_step={qat_start} must be -1 (OFF) or a non-negative integer; "
+            "negative values other than -1 are not allowed"
+        )
+    if qat_start > int(getattr(args, "iterations", 1)):
+        raise SystemExit(
+            f"qat_late_start_step={qat_start} exceeds total iterations "
+            f"({args.iterations}); QAT would never activate"
+        )
     if int(getattr(args, "lyapunov_every", 1)) <= 0:
         raise SystemExit(f"lyapunov_every ({args.lyapunov_every}) must be positive")
     if int(getattr(args, "lyapunov_max_tokens", 1)) <= 0:
@@ -7421,6 +7533,13 @@ def main() -> None:
         setattr(args, k, v)
     _resolve_training_seconds_alias(args, cli_overrides)
     _validate_hyperparameters(args)
+    # iter161-QAT-late (2026-05-16): configure the module-global QAT state
+    # at startup so CastedLinear.forward can branch on it. set_step() is
+    # called per training iteration in the main loop.
+    _QAT_LATE_STATE.reset()
+    _qat_start = int(getattr(args, "qat_late_start_step", -1))
+    if _qat_start >= 0:
+        _QAT_LATE_STATE.configure(start_step=_qat_start, sdclip_k=SDCLIP_K_MATRIX)
     if float(getattr(args, "max_training_seconds", 0.0)) > 0.0 and "iterations" not in cli_overrides:
         args.iterations = int(1_000_000_000)
     # iter 121 PE-NS gate: apply chosen coefficient set BEFORE building model
@@ -8492,6 +8611,11 @@ def main() -> None:
             base_model.deq_beta = deq_beta_for_step(next_step)
         # Iter 85: stochastic TBPTT — sample deq_bptt_k per step from {2,3,4}.
         base_model.deq_bptt_k = deq_bptt_k_for_step(next_step)
+        # iter161-QAT-late (2026-05-16): notify the global QAT state of the
+        # current step. CastedLinear.forward consults `_QAT_LATE_STATE.active()`
+        # to decide whether to apply the deterministic int6-SDCLIP STE on
+        # weights (only fires when current_step >= start_step).
+        _QAT_LATE_STATE.set_step(next_step)
 
         # Refinement gating: enable after ramp_frac of wallclock
         ramp_frac = float(getattr(args, "num_refinements_ramp_frac", 0.85))
