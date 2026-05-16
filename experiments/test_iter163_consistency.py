@@ -41,7 +41,7 @@ class TestIter163cAnchorOnDeepestConsistency(unittest.TestCase):
     """All tests use a tiny CPU-friendly model with prefix anchors at
     multiple depths so the anchor loss has multiple terms in z_stack."""
 
-    def _make(self, anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(2, 3, 4)):
+    def _make(self, anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(2, 3, 4), target_delta=1):
         torch.manual_seed(0)
         m = _make_model(
             num_experts=4, use_ctp=False,
@@ -50,6 +50,7 @@ class TestIter163cAnchorOnDeepestConsistency(unittest.TestCase):
             num_refinements=0,
             deq_bptt_k=bptt_k,
             multi_k_consistency_anchor_coef=anchor_coef,
+            multi_k_consistency_target_delta=target_delta,
             use_parcae=True,
         )
         m.train()
@@ -65,20 +66,28 @@ class TestIter163cAnchorOnDeepestConsistency(unittest.TestCase):
         )
 
     def test_hyperparameter_defaults_match_promoted_iter163c(self):
-        """iter163c (2026-05-16) keeps the iter163 anchor coef at 0.1 and
-        removes the extension knobs (`multi_k_consistency_extension_coef`,
-        `multi_k_consistency_extension_delta`) entirely. The Hyperparameter
-        class must not even expose the removed fields."""
+        """iter163c v2 (2026-05-16) keeps the iter163 anchor coef at 0.1 and
+        introduces `multi_k_consistency_target_delta` (default 1 = z_{K+1}
+        target; iter167 promotes 8). The REMOVED iter163 knobs
+        (`multi_k_consistency_extension_coef`, `multi_k_consistency_extension_delta`)
+        must NOT reappear — they controlled a separate boundary extension
+        loss that was superseded by the anchor-on-deepest design."""
         self.assertEqual(Hyperparameters.multi_k_consistency_anchor_coef, 0.1)
+        self.assertEqual(Hyperparameters.multi_k_consistency_target_delta, 1,
+            "iter163c v2 default target Δ is 1 (z_{K+1}); iter167 will A/B "
+            "test Δ=8 as a follow-up. Keep default 1 until iter167 promotes.")
         self.assertFalse(
             hasattr(Hyperparameters, "multi_k_consistency_extension_coef"),
             "iter163 extension coef was removed 2026-05-15 — must not reappear "
-            "as a Hyperparameter field via copy-paste regression."
+            "as a Hyperparameter field via copy-paste regression. The new "
+            "`multi_k_consistency_target_delta` controls anchor target depth, "
+            "NOT a separate boundary extension loss."
         )
         self.assertFalse(
             hasattr(Hyperparameters, "multi_k_consistency_extension_delta"),
-            "iter163 extension delta was removed 2026-05-15 — must not reappear "
-            "as a Hyperparameter field via copy-paste regression."
+            "iter163 extension delta was removed 2026-05-15 and replaced by "
+            "`multi_k_consistency_target_delta` with different semantics — "
+            "the old name must not reappear."
         )
 
     def test_anchor_loss_fires_on_coarse_prefix_anchors(self):
@@ -164,37 +173,81 @@ class TestIter163cAnchorOnDeepestConsistency(unittest.TestCase):
             "anchor consistency loss must produce non-zero gradients on "
             "shared_block parameters — otherwise the flag has no training effect")
 
-    def test_anchor_target_is_one_no_grad_iter_beyond_K(self):
-        """The anchor target z_{K+1} is computed via ONE no-grad Parcae iter
-        from z_K. This is the key cost/signal trade-off vs iter163's Δ=K_train
-        extension (~22 no-grad iters): we get a slightly less converged but
-        much cheaper target, which trains the model toward the FP nonetheless
-        because rho < 1 means even one iter is contractive at converged points.
+    def test_anchor_target_is_delta_no_grad_iters_beyond_K(self):
+        """The anchor target z_{K+Δ} is computed via Δ no-grad Parcae iters
+        from z_K. iter163c v2 default Δ=1; iter167 promotes Δ=8. The loop
+        starts with y_e = z_e = z_K and iterates the Parcae two-state update.
 
-        Verified structurally via source inspection: the inline no-grad iter
-        in `_run_backbone` must use the Parcae two-state update (a_bar, b_bar)
-        rather than a full Δ-iteration helper.
+        Verified structurally via source inspection: the inline no-grad loop
+        in `_run_backbone` must use the Parcae machinery (a_bar, b_bar) and
+        iterate `multi_k_consistency_target_delta` times.
         """
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
-        # The inline no-grad iter must use the Parcae machinery (a_bar, b_bar
-        # casts to z.dtype). The detached target must be passed to the loss.
         assert "with torch.no_grad():" in src, (
-            "iter163c requires a no_grad block to compute z_{K+1} without "
+            "iter163c requires a no_grad block to compute z_{K+Δ} without "
             "growing the autograd graph"
         )
-        assert "y_next = a_bar_one * z_K" in src, (
-            "iter163c inline no-grad iter must compute y_next via Parcae "
-            "two-state update with a_bar"
+        assert "delta = max(1, int(self.multi_k_consistency_target_delta))" in src, (
+            "iter167: anchor target depth Δ must be controlled by the "
+            "`multi_k_consistency_target_delta` Hyperparameter (clamped to >=1)"
         )
-        assert "z_next = a_bar_one * z_K" in src, (
-            "iter163c inline no-grad iter must compute z_next via Parcae "
-            "two-state update with a_bar"
+        assert "for _ in range(delta):" in src, (
+            "iter167: the inline no-grad block must iterate Δ times "
+            "(loop required for Δ > 1)"
+        )
+        assert "y_e = a_bar_one * y_e + one_minus_a_one * sb_inner(z_e" in src, (
+            "iter167 inline no-grad iter must use Parcae two-state update "
+            "(y_e via current z_e and a_bar damping)"
+        )
+        assert "z_e = a_bar_one * z_e + one_minus_a_one * sb_inner(y_e" in src, (
+            "iter167 inline no-grad iter must update z_e via the freshly-"
+            "computed y_e (two-state Parcae cycle)"
         )
         assert "(z_stack - target.unsqueeze(0)).pow(2).mean()" in src, (
             "iter163c loss must pair EVERY z_stack entry with the target "
             "(anchor-on-deepest) rather than pair-with-next"
         )
+
+    def test_iter167_target_delta_changes_loss_observably(self):
+        """iter167: with target_delta=8 (vs default 1), the anchor target is
+        z_{K+8} instead of z_{K+1}. For a non-trivial model the targets differ
+        and the loss values must differ — Flag-to-effect contract.
+
+        We use the same model weights / inputs / seed, varying ONLY the Δ knob.
+        At small K_train=4 with bptt_k=1, target_delta=8 reaches z_{K+8}=z_12
+        which is substantially more iters away from z_K=z_4 than z_5 is — the
+        consistency loss should observably differ.
+        """
+        torch.manual_seed(42)
+        m_d1 = self._make(anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(4,), target_delta=1)
+        torch.manual_seed(42)
+        m_d8 = self._make(anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(4,), target_delta=8)
+        x, y = self._batch(m_d1)
+        _ = m_d1(x, y)
+        _ = m_d8(x, y)
+        loss_d1 = float(m_d1._consistency_anchor_loss_t.detach())
+        loss_d8 = float(m_d8._consistency_anchor_loss_t.detach())
+        # The Δ=8 target is more converged → loss can be EITHER larger or
+        # smaller than Δ=1 (depends on whether the iteration map is overshooting
+        # or undershooting at K=4 init). The Flag-to-effect requirement is
+        # only that the values differ above the noise floor.
+        diff = abs(loss_d1 - loss_d8)
+        self.assertGreater(diff, 1e-6,
+            f"target_delta=1 vs 8 must produce observably different loss "
+            f"values (got {loss_d1:.6f} vs {loss_d8:.6f}, diff={diff:.2e}); "
+            "otherwise the Δ knob has no training effect.")
+
+    def test_iter167_target_delta_min_clamp(self):
+        """target_delta is clamped to at least 1 in the setter (max(1, int(x)))
+        so passing 0 or negative values silently becomes Δ=1, preserving the
+        iter163c v2 default behavior. Verified via attribute readback."""
+        m_zero = self._make(target_delta=0)
+        self.assertEqual(m_zero.multi_k_consistency_target_delta, 1,
+            "target_delta=0 must clamp to 1 (Δ=1 default behavior)")
+        m_neg = self._make(target_delta=-5)
+        self.assertEqual(m_neg.multi_k_consistency_target_delta, 1,
+            "target_delta<0 must clamp to 1; negative Δ is meaningless")
 
     def test_extension_helper_was_deleted(self):
         """iter163's `_consistency_extend_no_grad` helper was removed

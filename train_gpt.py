@@ -868,28 +868,41 @@ class Hyperparameters:
     # iter163c (2026-05-16, supersedes iter163 extension term):
     # Anchor-on-deepest consistency anchor. The loss pulls every gradient-
     # carrying z in the iter152 coarse prefix-anchor z_stack toward the most-
-    # converged available FP proxy z_{K+1} (computed by one no-grad Parcae
-    # iter after K_sampled):
-    #   L_anchor = anchor_coef · mean_i ‖z_{i} − z_{K+1}.detach()‖²
-    # where i ranges over the iter152 prefix-anchor depths (e.g. for
-    # K_sampled=64 with prefix set {16, 24, 32, 64}: 4 anchor terms all
-    # targeting z_{65}). Pairing every z_i with z_{K+1}.detach() (most-
-    # converged proxy) is strictly stronger than pairing with z_{i+1}.detach()
-    # (next iteration): signal magnitude is "distance from FP", not just one-
-    # step residual, and there is no trivial-zero collapse risk because the
-    # target is input-driven (z_{K+1} = F(z_K, x0), not constant).
-    # Total cost: ~1.01-1.02× iter152 baseline step time. One no-grad Parcae
-    # iter per step (~+1 %). Was 1.6× under iter163's extension at Δ=K_train
+    # converged available FP proxy z_{K+Δ_ext} (computed by Δ_ext no-grad
+    # Parcae iters after K_sampled):
+    #   L_anchor = anchor_coef · mean_i ‖z_{i} − z_{K+Δ_ext}.detach()‖²
+    # where i ranges over the iter152 prefix-anchor depths and Δ_ext defaults
+    # to 1 (the iter163c v2 design). iter167 promotes Δ_ext=8 to concentrate
+    # the anchor-target quality benefit at the common K_sampled=16 case
+    # (~50 % of training steps) — at Δ_ext=8 with ρ≈0.85, the target reaches
+    # ≈73 % of the FP gap vs ≈15 % at Δ_ext=1.
+    # Pairing every z_i with z_{K+Δ_ext}.detach() (most-converged proxy) is
+    # strictly stronger than pairing with z_{i+1}.detach() (next iteration):
+    # signal magnitude is "distance from FP", not just one-step residual,
+    # and there is no trivial-zero collapse risk because the target is
+    # input-driven (z_{K+Δ_ext} = F^{Δ_ext}(z_K, x0), not constant).
+    # Total cost: ~1.01-1.02× iter152 baseline step time at Δ_ext=1; ~1.07-
+    # 1.10× at Δ_ext=8. Was 1.6× under iter163's extension at Δ=K_train
     # ≈ 22 no-grad iters per step.
     # Architecture-agnostic per CLAUDE.md most-principled-simplest-general:
     # the FP equation z = F(z) is the universal condition for asymptotic
-    # local convergence; the deepest-K target z_{K+1} is the model's best
-    # current estimate of z* at every step. iter163 measured rho_F 1.30 →
-    # 0.92 over training; iter163c should match or exceed this because the
-    # anchor-on-deepest target gives stronger directional signal toward
-    # the actual basin's FP, not just any FP. Disable for ablation with
+    # local convergence; the deepest-K target is the model's best current
+    # estimate of z* at every step. iter163 measured rho_F 1.30 → 0.92 over
+    # training; iter163c should match or exceed this because the anchor-on-
+    # deepest target gives stronger directional signal toward the actual
+    # basin's FP, not just any FP. Disable for ablation with
     # `--multi-k-consistency-anchor-coef=0`.
     multi_k_consistency_anchor_coef = 0.1
+    # iter167 (2026-05-16): number of no-grad Parcae iters used to build the
+    # anchor target z_{K+Δ}. Default 1 = iter163c v2 behavior (target is z_{K+1}).
+    # Recommended iter167 value: 8 (~73 % of FP gap reached vs ~15 % at Δ=1,
+    # for ρ≈0.85). Cost scales linearly with Δ: at Δ=8 adds ~7 no-grad Parcae
+    # iters per step (~+7-10 % step time).
+    # Named distinctly from the REMOVED iter163 `multi_k_consistency_extension_*`
+    # knobs (which controlled a separate boundary extension loss with a paired
+    # z_K + z_{K+Δ} term, deleted 2026-05-15 alongside the helper). This knob
+    # controls the SHARED anchor target depth for ALL z_stack entries.
+    multi_k_consistency_target_delta = 1
 
     # iter161-QAT-late (2026-05-16): deterministic STE int6-SDCLIP fake-quant
     # on CastedLinear weights (matrix tensors with numel > 8192) for the last
@@ -1089,6 +1102,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "eval-reservation-seconds",
     "ctp-weight",
     "multi-k-consistency-anchor-coef",
+    "multi-k-consistency-target-delta",
     "qat-late-start-step",
     "expert-diversity-kind",
     "expert-output-diversity-coef", "expert-diversity-every", "expert-diversity-max-tokens",
@@ -5454,6 +5468,7 @@ class GPT(nn.Module):
                  router_ema_specialization_coef: float = 0.20,
                  use_reverse_kl_balance: bool = True,
                  multi_k_consistency_anchor_coef: float = 0.1,
+                 multi_k_consistency_target_delta: int = 1,
                  expert_diversity_kind: str = "cosine",
                  expert_output_diversity_coef: float = 0.30,
                  expert_diversity_every: int = 8,
@@ -5482,6 +5497,7 @@ class GPT(nn.Module):
         self.router_ema_balance_coef = float(router_ema_balance_coef)
         self.router_ema_specialization_coef = float(router_ema_specialization_coef)
         self.multi_k_consistency_anchor_coef = float(multi_k_consistency_anchor_coef)
+        self.multi_k_consistency_target_delta = max(1, int(multi_k_consistency_target_delta))
         # Stash for diagnostics + readback in compute_loss; populated in _run_backbone.
         self._consistency_anchor_loss_t: Tensor | None = None
         self.expert_diversity_kind = str(expert_diversity_kind)
@@ -6076,18 +6092,25 @@ class GPT(nn.Module):
         self._consistency_anchor_loss_raw = None
         self._consistency_anchor_loss_t = None
         if self.training and prefix_mode and self.multi_k_consistency_anchor_coef > 0.0 and z_stack.shape[0] >= 1:
-            # Compute z_{K+1} via single no-grad Parcae two-state iter. Cast
-            # Parcae coefs to z.dtype so the no-grad extension matches the
-            # with-grad forward dtype trajectory (bf16 under CLAUDE.md).
+            # Compute z_{K+Δ} via Δ no-grad Parcae two-state iters. Cast Parcae
+            # coefs to z.dtype so the no-grad extension matches the with-grad
+            # forward dtype trajectory (bf16 under CLAUDE.md). Δ defaults to 1
+            # (iter163c v2); iter167 promotes Δ=8 for stronger directional
+            # signal at common K_sampled=16 (signal magnitude reaches ~73 %
+            # of FP gap at Δ=8 vs ~15 % at Δ=1, for ρ≈0.85).
             sb_inner = _unwrap_compiled_module(self.shared_block)
             z_K = z_stack[-1]
             a_bar_one = self._parcae_a_bar().to(z_K.dtype)
             one_minus_a_one = 1.0 - a_bar_one
             b_bar_one = self._parcae_b_bar().to(z_K.dtype)
+            delta = max(1, int(self.multi_k_consistency_target_delta))
             with torch.no_grad():
-                y_next = a_bar_one * z_K + one_minus_a_one * sb_inner(z_K, x0_refined, b_bar_one)
-                z_next = a_bar_one * z_K + one_minus_a_one * sb_inner(y_next, x0_refined, b_bar_one)
-            target = z_next.detach()
+                y_e = z_K
+                z_e = z_K
+                for _ in range(delta):
+                    y_e = a_bar_one * y_e + one_minus_a_one * sb_inner(z_e, x0_refined, b_bar_one)
+                    z_e = a_bar_one * z_e + one_minus_a_one * sb_inner(y_e, x0_refined, b_bar_one)
+            target = z_e.detach()
             # Anchor every gradient-carrying z to the most-converged target.
             anchor_raw = (z_stack - target.unsqueeze(0)).pow(2).mean()
             self._consistency_anchor_loss_raw = anchor_raw
@@ -7884,6 +7907,7 @@ def main() -> None:
         router_ema_specialization_coef=float(args.router_ema_specialization_coef),
         use_reverse_kl_balance=bool(args.use_reverse_kl_balance),
         multi_k_consistency_anchor_coef=float(getattr(args, "multi_k_consistency_anchor_coef", 0.0)),
+        multi_k_consistency_target_delta=int(getattr(args, "multi_k_consistency_target_delta", 1)),
         expert_diversity_kind=str(args.expert_diversity_kind),
         expert_output_diversity_coef=float(args.expert_output_diversity_coef),
         expert_diversity_every=int(args.expert_diversity_every),
