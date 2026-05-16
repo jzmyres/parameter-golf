@@ -389,11 +389,12 @@ routing weights are $p(h) = \mathrm{acq} / \sum \mathrm{acq}$ where
 $\mathrm{acq} = \mu + \beta \sigma$ and $\beta=0.5$ anneals to zero over
 training.  With \texttt{use\_router\_sigmoid\_gate=False} the
 $\sum_e p_e(h)\le 1$ suppress-bank capability is also off — total routed mass
-is exactly $1$ at every token.  The CV regularizer
-(\texttt{router\_load\_cv\_coef}) is replaced by EMA-anchored balance and
-specialization terms plus a small strict alive hinge with a straight-through
-current-routing anchor (see the loss section).  Treat
-\texttt{train\_gpt.py::Hyperparameters} as authoritative if this mirror drifts.
+is exactly $1$ at every token.  CV-as-loss was removed entirely 2026-05-15
+(both \texttt{router\_load\_cv\_coef} and \texttt{mos\_load\_cv\_coef}); load
+balance is fully covered by EMA-anchored balance + specialization terms plus
+a small strict alive hinge with a straight-through current-routing anchor
+(see the loss section).  Treat \texttt{train\_gpt.py::Hyperparameters} as
+authoritative if this mirror drifts.
 
 The block uses one pooled router over $2R$ routed outputs, where $S$ is the
 number of shared experts and $R=E-S$.  The first $R$ entries route attention
@@ -688,13 +689,13 @@ Here $m_r$ is the combined routed mass
 \]
 i.e. the dense token-local routing probability.  The optional learned sigmoid
 router gate is default-off; when explicitly enabled, it multiplicatively
-scales this mass and is included in the same diagnostics/losses.  CV penalties
-use unbounded quadratic pressure (no target threshold), so
-the term keeps pushing $\operatorname{CV}\to0$ even when balance is already
-acceptable; this replaces the earlier hinge form $[\operatorname{CV}-\tau]_+^2$
-which went silent below a fixed target.  The default expert diversity is scale-invariant cosine diversity; the Frobenius
-variant remains a controlled ablation that bundles direction and norm pressure
-into one term.
+scales this mass and is included in the same diagnostics.  CV is computed
+and emitted as a diagnostic tensor (\texttt{\_router\_cv\_loss\_t},
+\texttt{attn\_cv}/\texttt{mlp\_cv}/\texttt{pool\_cv} step-log fields), but
+the loss multiplication was removed 2026-05-15 (subsumed by the EMA-anchored
+balance loss).  The default expert diversity is scale-invariant cosine
+diversity; the Frobenius variant remains a controlled ablation that bundles
+direction and norm pressure into one term.
 
 \paragraph{Implementation deviates from \S\ref{sec:experts} loss stack:
 iter145r promoted defaults.} The iter145r promotion (2026-05-08) moves the
@@ -731,10 +732,12 @@ large log-ratio.
 The minus sign on the specialization term reflects KL maximization: minimizing
 $-\lambda_{\rm spec}\,\mathrm{KL}$ pushes per-token routing AWAY from the
 historical mean, bounded by $\log(E)$ since $\bar p$ is normalized and clamped.
-Current coefficients: $\lambda_{\rm rcv}=0.0$ (CV off by default; remains
-available),
+Current coefficients (CV-as-loss removed 2026-05-15: $\lambda_{\rm rcv}$ and
+$\lambda_{\rm mcv}$ are gone — router CV subsumed by EMA-anchored balance,
+MoS CV subsumed by routing softmax + small head count; both remain as
+diagnostic tensors):
 $\lambda_{\rm bal}=0.30$, $\lambda_{\rm spec}=0.20$, $\lambda_{\rm alive}=0.02$,
-$\lambda_{\rm ent}=0.1$, $\lambda_{\rm mcv}=0.15$, $\lambda_{\rm div}=0.30$,
+$\lambda_{\rm ent}=0.1$, $\lambda_{\rm div}=0.30$,
 $\lambda_{\rm mosdiv}=0.0$, with all coefficients ramped linearly over the
 first \texttt{regularizer\_warmup\_frac=0.07} of training.  The
 \texttt{use\_router\_sigmoid\_gate=False} default also means $m_r$ is the bare

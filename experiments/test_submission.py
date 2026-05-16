@@ -67,8 +67,6 @@ def _build_model():
         parcae_init_b_bar=args.parcae_init_b_bar,
         use_ctp=args.use_ctp,
         ctp_weight=args.ctp_weight,
-        router_load_cv_coef=args.router_load_cv_coef,
-        mos_load_cv_coef=args.mos_load_cv_coef,
         expert_diversity_kind=args.expert_diversity_kind,
         expert_output_diversity_coef=args.expert_output_diversity_coef,
         expert_diversity_every=args.expert_diversity_every,

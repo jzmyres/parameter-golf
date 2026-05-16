@@ -81,10 +81,10 @@ def parse_log(logpath: str) -> dict:
         "router_ema_alive_loss": [], "router_ema_balance_loss": [],
         "router_ema_specialization_loss": [], "mos_cv_loss": [],
         "expert_diversity_loss": [], "mos_diversity_loss": [], "router_reg_loss": [],
-        "router_cv_coef_eff": [], "router_pertoken_entropy_coef_eff": [],
+        "router_pertoken_entropy_coef_eff": [],
         "router_ema_alive_coef_eff": [], "router_ema_balance_coef_eff": [],
         "router_ema_specialization_coef_eff": [],
-        "mos_cv_coef_eff": [], "expert_diversity_coef_eff": [],
+        "expert_diversity_coef_eff": [],
         "mos_diversity_coef_eff": [],
         "parcae_a_bar_min": [], "parcae_a_bar_mean": [], "parcae_a_bar_max": [],
         "parcae_a_bar_core_max": [],
@@ -261,10 +261,10 @@ def parse_log(logpath: str) -> dict:
                 "router_ema_alive_loss", "router_ema_balance_loss",
                 "router_ema_specialization_loss", "mos_cv_loss",
                 "expert_diversity_loss", "mos_diversity_loss", "router_reg_loss",
-                "router_cv_coef_eff", "router_pertoken_entropy_coef_eff",
+                "router_pertoken_entropy_coef_eff",
                 "router_ema_alive_coef_eff", "router_ema_balance_coef_eff",
                 "router_ema_specialization_coef_eff",
-                "mos_cv_coef_eff", "expert_diversity_coef_eff",
+                "expert_diversity_coef_eff",
                 "mos_diversity_coef_eff",
                 "parcae_a_bar_min", "parcae_a_bar_mean", "parcae_a_bar_max",
                 "parcae_a_bar_core_max",
@@ -446,13 +446,13 @@ def _populate_aux_terms(data: dict) -> None:
     update both. Cross-process import of train_gpt.py is intentionally avoided
     here because plotting must work without GPU/torch in the analysis env.
     """
+    # router_cv_term + mos_cv_term removed 2026-05-15 (CV-as-loss removed
+    # for router and MoS; CV remains diagnostic-only).
     specs = [
-        ("router_cv_term", "router_cv_loss", "router_cv_coef_eff", 1.0),
         ("router_pertoken_entropy_term", "router_pertoken_entropy_loss", "router_pertoken_entropy_coef_eff", 1.0),
         ("router_ema_alive_term", "router_ema_alive_loss", "router_ema_alive_coef_eff", 1.0),
         ("router_ema_balance_term", "router_ema_balance_loss", "router_ema_balance_coef_eff", 1.0),
         ("router_ema_specialization_term", "router_ema_specialization_loss", "router_ema_specialization_coef_eff", -1.0),
-        ("mos_cv_term", "mos_cv_loss", "mos_cv_coef_eff", 1.0),
         ("expert_diversity_term", "expert_diversity_loss", "expert_diversity_coef_eff", 1.0),
         ("mos_diversity_term", "mos_diversity_loss", "mos_diversity_coef_eff", 1.0),
     ]
@@ -953,9 +953,8 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     )
 
     aux_coef_series = [
-        ("router_cv", b.get("router_cv_coef_eff", []), c.get("router_cv_coef_eff", [])),
+        # router_cv + mos_cv coef_eff removed 2026-05-15 (CV-as-loss removed).
         ("router_pertoken_entropy", b.get("router_pertoken_entropy_coef_eff", []), c.get("router_pertoken_entropy_coef_eff", [])),
-        ("mos_cv", b.get("mos_cv_coef_eff", []), c.get("mos_cv_coef_eff", [])),
         ("expert_diversity", b.get("expert_diversity_coef_eff", []), c.get("expert_diversity_coef_eff", [])),
         ("mos_diversity", b.get("mos_diversity_coef_eff", []), c.get("mos_diversity_coef_eff", [])),
     ]

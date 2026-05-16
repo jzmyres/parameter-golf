@@ -211,9 +211,7 @@ class TestTrainingContracts(unittest.TestCase):
             "expert_diversity_loss:",
             "mos_diversity_loss:",
             "router_reg_loss:",
-            "router_cv_coef_eff:",
             "router_pertoken_entropy_coef_eff:",
-            "mos_cv_coef_eff:",
             "expert_diversity_coef_eff:",
             "mos_diversity_coef_eff:",
         ]

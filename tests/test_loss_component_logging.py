@@ -54,7 +54,6 @@ class TestLossComponentLogging(unittest.TestCase):
             bigram_vocab_size=0, bigram_dim=8, kv_latent_dim=0,
             num_refinements=0, attn_expert_rank=4, mlp_expert_rank=4,
             num_experts=4, num_shared_experts=1, use_ctp=False,
-            router_load_cv_coef=1.0, mos_load_cv_coef=1.0,
             router_pertoken_entropy_coef=0.01, expert_output_diversity_coef=0.1,
             mos_output_diversity_coef=0.0,
             expert_diversity_max_tokens=4,
@@ -70,11 +69,15 @@ class TestLossComponentLogging(unittest.TestCase):
         loss = model(input_ids, target_ids)
 
         self.assertTrue(loss.requires_grad)
+        # Note: _router_cv_loss_t and _mos_cv_loss_t are still emitted as
+        # diagnostic tensors (CV is computed for logging) but neither
+        # contributes to the loss after router_load_cv_coef and mos_load_cv_coef
+        # were removed 2026-05-15.
         for name in [
             "_router_cv_loss_t", "_router_pertoken_entropy_loss_t", "_mos_cv_loss_t",
             "_expert_diversity_loss_t", "_mos_diversity_loss_t", "_router_reg_loss_t",
-            "_router_cv_coef_eff_t", "_router_pertoken_entropy_coef_eff_t",
-            "_mos_cv_coef_eff_t", "_expert_diversity_coef_eff_t",
+            "_router_pertoken_entropy_coef_eff_t",
+            "_expert_diversity_coef_eff_t",
             "_mos_diversity_coef_eff_t",
         ]:
             t = getattr(model, name)
@@ -83,15 +86,12 @@ class TestLossComponentLogging(unittest.TestCase):
             self.assertFalse(t.requires_grad, name)
             self.assertTrue(torch.isfinite(t.detach()).item(), name)
 
-        self.assertAlmostEqual(float(model._router_cv_coef_eff_t.item()), 1.0)
         self.assertAlmostEqual(float(model._router_pertoken_entropy_coef_eff_t.item()), 0.01)
-        self.assertAlmostEqual(float(model._mos_cv_coef_eff_t.item()), 1.0)
         self.assertAlmostEqual(float(model._expert_diversity_coef_eff_t.item()), 0.1)
         self.assertAlmostEqual(float(model._mos_diversity_coef_eff_t.item()), 0.0)
+        # Router AND MoS CV terms removed from router_reg_loss 2026-05-15.
         expected_router_reg = (
-            float(model._router_cv_loss_t.item()) * float(model._router_cv_coef_eff_t.item())
-            + float(model._router_pertoken_entropy_loss_t.item()) * float(model._router_pertoken_entropy_coef_eff_t.item())
-            + float(model._mos_cv_loss_t.item()) * float(model._mos_cv_coef_eff_t.item())
+            float(model._router_pertoken_entropy_loss_t.item()) * float(model._router_pertoken_entropy_coef_eff_t.item())
             + float(model._expert_diversity_loss_t.item()) * float(model._expert_diversity_coef_eff_t.item())
             + float(model._mos_diversity_loss_t.item()) * float(model._mos_diversity_coef_eff_t.item())
         )

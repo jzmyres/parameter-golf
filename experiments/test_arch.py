@@ -521,8 +521,6 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
 
     invariant_keys = {
         "router_bias_update",
-        "router_load_cv_coef_floor",
-        "mos_load_cv_coef_mult",
         "weight_decay_mult",
         "deq_k_max_delta",
         "needs_expert_bank_geometry_constraint",
@@ -558,8 +556,12 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
           "router_ema_alive_coef_mult", "router_ema_balance_coef_floor"}),
         ("mlp_min_share=0.01 < 0.150", "router_collapse_advisory",
          set(), {"router_bias_update", "router_load_cv_coef_floor"}),
-        ("mos_ntp_min_share=0.005 < 0.150", "mos_router_collapse",
-         {"mos_load_cv_coef_mult"}, {"weight_decay_mult"}),
+        # mos_router_collapse → mos_router_collapse_advisory 2026-05-15: the
+        # mos_load_cv_coef lever was removed (subsumed by routing softmax +
+        # small head count). Prescription now returns empty config_change and
+        # is informational only — same advisory pattern as router_collapse.
+        ("mos_ntp_min_share=0.005 < 0.150", "mos_router_collapse_advisory",
+         set(), {"mos_load_cv_coef_mult", "weight_decay_mult"}),
         ("attn_ortho=0.71 > 0.5", "expert_collapse",
          {"needs_expert_bank_geometry_constraint", "expert_output_diversity_coef_mult"},
          {"weight_decay_mult"}),
@@ -613,19 +615,18 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
 
 def test_routing_regularizer_coefficients_match_promoted_defaults():
     """Current rescue stack: EMA balance handles averages, alive hinge handles
-    minimum share, router CV is off by default, and diversity uses the
+    minimum share, router/MoS CV-as-loss is removed (subsumed by EMA balance
+    and routing softmax respectively), and diversity uses the
     coefficient-first values. This locks Hyperparameters defaults and verifies
     they propagate to a constructed model so signature-default drift is loud.
     """
     from train_gpt import Hyperparameters
     # Required fields exist.
     for name in (
-        "router_load_cv_coef",
         "router_ema_balance_coef",
         "router_ema_specialization_coef",
         "router_ema_alive_coef",
         "router_pertoken_entropy_coef",
-        "mos_load_cv_coef",
         "expert_output_diversity_coef",
         "lyapunov_every",
         "lyapunov_max_tokens",
@@ -637,12 +638,10 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
     ):
         assert hasattr(Hyperparameters, name), f"missing Hyperparameters field {name}"
     # Current root-cause rescue values (2026-05-08).
-    assert float(Hyperparameters.router_load_cv_coef) == 0.0
     assert float(Hyperparameters.router_ema_balance_coef) == 0.30
     assert float(Hyperparameters.router_ema_specialization_coef) == 0.20
     assert float(Hyperparameters.router_ema_alive_coef) == 0.02
     assert float(Hyperparameters.router_pertoken_entropy_coef) == 0.1
-    assert float(Hyperparameters.mos_load_cv_coef) == 0.15
     assert float(Hyperparameters.expert_output_diversity_coef) == 0.30
     assert int(Hyperparameters.lyapunov_every) == 16
     assert int(Hyperparameters.lyapunov_max_tokens) == 64
@@ -655,16 +654,20 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
     # favor of continuous cv²; the old target knobs must NOT come back.
     assert not hasattr(Hyperparameters, "cv_target")
     assert not hasattr(Hyperparameters, "mos_cv_target")
+    # Router+MoS CV-as-loss removed 2026-05-15 (subsumed by EMA balance +
+    # routing softmax respectively). The fields must NOT come back.
+    assert not hasattr(Hyperparameters, "router_load_cv_coef")
+    assert not hasattr(Hyperparameters, "mos_load_cv_coef")
     # Verify Hyperparameters values propagate to a constructed model.  Only
     # fields that GPT.__init__ stores on `self` are public model attributes;
     # `expert_output_diversity_coef` and `router_pertoken_entropy_coef` are
     # held as `_*_target` private fields and read via the annealer/router.
     model = _make_model(num_experts=4)
-    assert float(model.router_load_cv_coef) == 0.0
     assert float(model.router_ema_alive_coef) == 0.02
     assert float(model.router_ema_balance_coef) == 0.30
     assert float(model.router_ema_specialization_coef) == 0.20
-    assert float(model.mos_load_cv_coef) == 0.15
+    assert not hasattr(model, "router_load_cv_coef")
+    assert not hasattr(model, "mos_load_cv_coef")
     assert float(model._expert_diversity_coef_target) == 0.30
     assert float(model._router_pertoken_entropy_coef_target) == 0.1
     assert float(model.regularizer_warmup_frac) == 0.07

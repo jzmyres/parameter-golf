@@ -35,8 +35,11 @@ class TestCliParser(unittest.TestCase):
             self.assertEqual(ov["use_ctp"], expected)
 
     def test_float_parsing(self):
-        ov = _parse_cli_overrides(["--router-load-cv-coef", "3.5"])
-        self.assertEqual(ov["router_load_cv_coef"], 3.5)
+        # router_load_cv_coef + mos_load_cv_coef removed 2026-05-15;
+        # use a different float-typed knob (router_pertoken_entropy_coef)
+        # for the parser-mechanism test.
+        ov = _parse_cli_overrides(["--router-pertoken-entropy-coef", "3.5"])
+        self.assertEqual(ov["router_pertoken_entropy_coef"], 3.5)
 
     def test_int_parsing(self):
         ov = _parse_cli_overrides(["--bigram-vocab-size", "4096"])
@@ -306,8 +309,9 @@ class TestCliParser(unittest.TestCase):
 
     def test_positional_passthrough(self):
         # Wrapper / profile harnesses inject positionals; parser must not reject.
-        ov = _parse_cli_overrides(["my-positional", "--router-load-cv-coef", "1.5"])
-        self.assertEqual(ov["router_load_cv_coef"], 1.5)
+        # Use router_pertoken_entropy_coef (router_load_cv_coef removed 2026-05-15).
+        ov = _parse_cli_overrides(["my-positional", "--router-pertoken-entropy-coef", "1.5"])
+        self.assertEqual(ov["router_pertoken_entropy_coef"], 1.5)
 
     def test_no_deq_backward_field(self):
         # User directive 2026-04-28: only revdeq is supported.

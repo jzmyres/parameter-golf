@@ -38,7 +38,7 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["train_loss"], [2.2])
         self.assertEqual(len(d["router_reg_loss"]), 1)
         self.assertTrue(math.isnan(d["router_reg_loss"][0]))
-        self.assertTrue(math.isnan(d["router_cv_term"][0]))
+        # router_cv_term / mos_cv_term removed from derived metrics 2026-05-15.
         self.assertEqual(len(d["parcae_a_bar_mean"]), 1)
         self.assertTrue(math.isnan(d["parcae_a_bar_mean"][0]))
         self.assertEqual(d["val_steps"], [1])
@@ -52,7 +52,7 @@ class TestPlotMetricsParse(unittest.TestCase):
                 "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
                 "router_cv_loss:0.120000 router_pertoken_entropy_loss:2.300000 mos_cv_loss:0.040000 "
                 "expert_diversity_loss:0.500000 mos_diversity_loss:0.000000 router_reg_loss:0.091625 "
-                "router_cv_coef_eff:0.5 router_pertoken_entropy_coef_eff:0.00125 mos_cv_coef_eff:0.25 "
+                "router_pertoken_entropy_coef_eff:0.00125 "
                 "expert_diversity_coef_eff:0.0375 mos_diversity_coef_eff:0 "
                 "parcae_a_bar_min:0.600000 parcae_a_bar_mean:0.700000 parcae_a_bar_max:0.800000 "
                 "parcae_a_bar_core_max:0.777778 parcae_beta_mean:0.300000 parcae_beta_max:0.400000 "
@@ -87,14 +87,12 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["expert_diversity_loss"], [0.5])
         self.assertEqual(d["mos_diversity_loss"], [0.0])
         self.assertEqual(d["router_reg_loss"], [0.091625])
-        self.assertEqual(d["router_cv_coef_eff"], [0.5])
         self.assertEqual(d["router_pertoken_entropy_coef_eff"], [0.00125])
-        self.assertEqual(d["mos_cv_coef_eff"], [0.25])
         self.assertEqual(d["expert_diversity_coef_eff"], [0.0375])
         self.assertEqual(d["mos_diversity_coef_eff"], [0.0])
-        self.assertAlmostEqual(d["router_cv_term"][0], 0.06)
+        # router_cv_term / mos_cv_term removed 2026-05-15 (CV-as-loss
+        # removed; CV remains as diagnostic only).
         self.assertAlmostEqual(d["router_pertoken_entropy_term"][0], 0.002875)
-        self.assertAlmostEqual(d["mos_cv_term"][0], 0.01)
         self.assertAlmostEqual(d["expert_diversity_term"][0], 0.01875)
         self.assertAlmostEqual(d["mos_diversity_term"][0], 0.0)
         self.assertEqual(d["parcae_a_bar_min"], [0.6])
@@ -183,7 +181,7 @@ class TestPlotMetricsParse(unittest.TestCase):
             "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "
             "router_cv_loss:0.120000 router_pertoken_entropy_loss:2.300000 mos_cv_loss:0.040000 "
             "expert_diversity_loss:0.500000 mos_diversity_loss:0.000000 router_reg_loss:0.091625 "
-            "router_cv_coef_eff:0.5 router_pertoken_entropy_coef_eff:0.00125 mos_cv_coef_eff:0.25 "
+            "router_pertoken_entropy_coef_eff:0.00125 "
             "expert_diversity_coef_eff:0.0375 mos_diversity_coef_eff:0 "
             "parcae_a_bar_min:0.600000 parcae_a_bar_mean:0.700000 parcae_a_bar_max:0.800000 "
             "parcae_a_bar_core_max:0.777778 parcae_beta_mean:0.300000 parcae_beta_max:0.400000 "

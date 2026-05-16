@@ -583,17 +583,19 @@ class Hyperparameters:
     # Direct coefficients in the flat regularization assembly. The full
     # objective is:
     #   loss = ntp + ctp_weight · ctp
-    #        + router_load_cv_coef · Σ_r cv_r²              # always-on balance
-    #        + mos_load_cv_coef    · Σ_h cv_h²              # always-on balance
     #        + router_pertoken_entropy_coef · Σ_r H_pertoken(r)
     #        + expert_output_diversity_coef · diversity(expert outputs)
     #        + mos_output_diversity_coef    · diversity(MoS low-rank states)
     # With the promoted default `regularizer_warmup_frac=0.07`, every
     # router/MoS/diversity regularizer ramps from 0 to its target over the
-    # first 7% of optimizer steps. CV is off for the main router because EMA
-    # anchoring is the promoted balance path; MoS CV remains on for head usage.
-    router_load_cv_coef = 0.0
-    mos_load_cv_coef = 0.15
+    # first 7% of optimizer steps. CV-as-loss removed entirely 2026-05-15:
+    # router CV was 0.0 since iter146 (subsumed by EMA-anchored balance),
+    # MoS CV contribution at iter163 step 1000 was 0.000242 (0.08% of
+    # router_reg_loss = 0.31) — balance maintained for free by the MoS
+    # routing softmax + small head count, no measurable loss-side pressure
+    # needed. CV (router + MoS) remains computed and emitted as diagnostic
+    # tensors `_router_cv_loss_t` / `_mos_cv_loss_t` and `attn_cv`/`mlp_cv`/
+    # `pool_cv` step-log fields, but does not contribute to the loss.
     router_pertoken_entropy_coef = 0.1
     # Per-token expert-OUTPUT diversity (replaces block_ortho_aux + iter 141 expert_gram).
     # `expert_diversity_kind`:
@@ -1095,7 +1097,6 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "lyapunov-estimator",
     "eval-reservation-seconds",
     "ctp-weight",
-    "router-load-cv-coef", "mos-load-cv-coef",
     "multi-k-consistency-anchor-coef", "multi-k-consistency-extension-coef",
     "multi-k-consistency-extension-delta",
     "expert-diversity-kind",
@@ -5372,12 +5373,10 @@ class GPT(nn.Module):
                  parcae_init_b_bar: float | None = None,
                  use_ctp: bool = False,
                  ctp_weight: float = 0.0,
-                 router_load_cv_coef: float = 0.0,
                  router_ema_alive_coef: float = 0.02,
                  router_ema_balance_coef: float = 0.30,
                  router_ema_specialization_coef: float = 0.20,
                  use_reverse_kl_balance: bool = True,
-                 mos_load_cv_coef: float = 0.15,
                  multi_k_consistency_anchor_coef: float = 0.1,
                  multi_k_consistency_extension_coef: float = 0.1,
                  multi_k_consistency_extension_delta: int = 0,
@@ -5405,11 +5404,9 @@ class GPT(nn.Module):
         super().__init__()
         self.use_ctp = bool(use_ctp)
         self.ctp_weight = float(ctp_weight)
-        self.router_load_cv_coef = float(router_load_cv_coef)
         self.router_ema_alive_coef = float(router_ema_alive_coef)
         self.router_ema_balance_coef = float(router_ema_balance_coef)
         self.router_ema_specialization_coef = float(router_ema_specialization_coef)
-        self.mos_load_cv_coef = float(mos_load_cv_coef)
         self.multi_k_consistency_anchor_coef = float(multi_k_consistency_anchor_coef)
         self.multi_k_consistency_extension_coef = float(multi_k_consistency_extension_coef)
         self.multi_k_consistency_extension_delta = int(multi_k_consistency_extension_delta)
@@ -5430,11 +5427,9 @@ class GPT(nn.Module):
         # `regularizer_warmup_frac` schedule in the training loop. With the
         # promoted default warmup=0, this is behavior-identical to step-0
         # regularization; iter145 uses warmup=0.07 for a gentler cold start.
-        self._router_load_cv_coef_target = float(router_load_cv_coef)
         self._router_ema_alive_coef_target = float(router_ema_alive_coef)
         self._router_ema_balance_coef_target = float(router_ema_balance_coef)
         self._router_ema_specialization_coef_target = float(router_ema_specialization_coef)
-        self._mos_load_cv_coef_target = float(mos_load_cv_coef)
         self._router_pertoken_entropy_coef_target = float(router_pertoken_entropy_coef)
         self._router_dirichlet_ucb_beta_target = float(router_dirichlet_ucb_beta)
         self.regularizer_warmup_frac = float(regularizer_warmup_frac)
@@ -5461,9 +5456,7 @@ class GPT(nn.Module):
         self._mos_cv_loss_t: Tensor | None = None
         self._expert_diversity_loss_t: Tensor | None = None
         self._mos_diversity_loss_t: Tensor | None = None
-        self._router_cv_coef_eff_t: Tensor | None = None
         self._router_pertoken_entropy_coef_eff_t: Tensor | None = None
-        self._mos_cv_coef_eff_t: Tensor | None = None
         self._expert_diversity_coef_eff_t: Tensor | None = None
         self._mos_diversity_coef_eff_t: Tensor | None = None
         self._router_reg_loss_t: Tensor | None = None
@@ -6133,7 +6126,6 @@ class GPT(nn.Module):
                 gives unbounded gradient on dead experts; forward KL
                 under-weights the tail.
               - router_ema_specialization_coef × Σ_r KL(P_token(r) || stopgrad(EMA_r))
-              + mos_load_cv_coef           × mos_cv²
               + eff_diversity_coef         × per_token_expert_diversity
               + eff_mos_diversity_coef     × mos_per_token_expert_diversity
 
@@ -6158,11 +6150,15 @@ class GPT(nn.Module):
             ent_coef_sum = ent_coef_sum + r._entropy_coef.to(device=device, dtype=torch.float32)
             ent_count += 1
         mos_cv = getattr(self.mos_head, "_cv_loss_raw", zero)
-        router_reg_loss = (
-            self.router_load_cv_coef * cv_sum
-            + ent_sum
-            + self.mos_load_cv_coef * mos_cv
-        )
+        # Router + MoS CV-as-loss removed entirely 2026-05-15: routed-usage
+        # balance is fully covered by the EMA-anchored balance loss
+        # (router_ema_balance_coef, reverse-KL form since iter153). MoS head
+        # balance is maintained for free by the routing softmax + small head
+        # count (iter163 step 1000 mos_cv contribution was 0.000242 = 0.08%
+        # of router_reg_loss — noise). cv_sum and mos_cv are still computed
+        # for the `_router_cv_loss_t` / `_mos_cv_loss_t` diagnostic tensors
+        # logged below; only the loss multiplication is removed.
+        router_reg_loss = ent_sum
         # Iter145r EMA-anchored terms (`alive`/`balance` add, `specialization`
         # subtracts — KL maximization pushes routing OFF the historical mean).
         # Sign comes from ROUTER_EMA_LOSS_TERMS so adding a future term cannot
@@ -6190,11 +6186,9 @@ class GPT(nn.Module):
         self._mos_diversity_loss_t = (
             mos_diversity_loss.detach() if isinstance(mos_diversity_loss, torch.Tensor) else zero.detach()
         )
-        self._router_cv_coef_eff_t = zero.new_tensor(float(self.router_load_cv_coef)).detach()
         self._router_pertoken_entropy_coef_eff_t = (
             (ent_coef_sum / float(max(ent_count, 1))).detach()
         )
-        self._mos_cv_coef_eff_t = zero.new_tensor(float(self.mos_load_cv_coef)).detach()
         self._expert_diversity_coef_eff_t = zero.new_tensor(float(eff_diversity_coef)).detach()
         self._mos_diversity_coef_eff_t = zero.new_tensor(float(eff_mos_diversity_coef)).detach()
         self._router_reg_loss_t = router_reg_loss.detach()
@@ -6529,23 +6523,24 @@ def _prescribe_failure_fix(failure: str) -> dict:
     Diagnostics identify root causes; prescriptions prefer reusable mechanisms
     over symptom-specific losses:
       - router_bias_update          — slow generic usage-prior controller
-      - router_load_cv_coef         — fallback routed-usage regularizer
       - mos_load_cv_coef            — MoS gate usage regularizer
       - expert-bank geometry        — preferred expert-collapse fix
       - transition parameterization — preferred contraction fix
+    Router CV-as-loss was removed 2026-05-15 (EMA-anchored balance fully
+    covers routed-usage balance, so the CV-floor fallback is no longer a
+    valid prescription lever).
     """
     low = failure.lower()
     first_token = low.split("=", 1)[0].split()[0] if low else ""
 
     if "min_share" in first_token:
         if first_token.startswith("mos_"):
-            cur = float(Hyperparameters.mos_load_cv_coef)
             return {
                 "failure": failure,
-                "category": "mos_router_collapse",
-                "hypothesis": "MoS gate concentrating; bump MoS load-CV pressure",
-                "fix": f"Increase mos_load_cv_coef by 1.5× (e.g. {cur:g}→{cur * 1.5:g}).",
-                "config_change": {"mos_load_cv_coef_mult": 1.5},
+                "category": "mos_router_collapse_advisory",
+                "hypothesis": "MoS CV-as-loss removed 2026-05-15 (subsumed by routing softmax + small head count, contribution was 0.08% of router_reg_loss at iter163 step 1000). FAILED Principled test once removed: there is no remaining loss-side lever for MoS head balance. Treat as informational only; if MoS heads genuinely collapse in a future iter, the principled fix is a new architectural mechanism (e.g. MoS-side EMA balance, hard head dispatch outside RevDEQ), not re-adding a per-symptom CV penalty.",
+                "fix": "Treat as informational only — no actionable config change. The CV-floor lever was removed for the same reason as router_load_cv_coef: subsumed by other mechanisms and contributing only noise.",
+                "config_change": {},
             }
         return {
             "failure": failure,
@@ -7844,12 +7839,10 @@ def main() -> None:
         parcae_init_b_bar=args.parcae_init_b_bar,
         use_ctp=args.use_ctp,
         ctp_weight=float(args.ctp_weight),
-        router_load_cv_coef=float(args.router_load_cv_coef),
         router_ema_alive_coef=float(args.router_ema_alive_coef),
         router_ema_balance_coef=float(args.router_ema_balance_coef),
         router_ema_specialization_coef=float(args.router_ema_specialization_coef),
         use_reverse_kl_balance=bool(args.use_reverse_kl_balance),
-        mos_load_cv_coef=float(args.mos_load_cv_coef),
         multi_k_consistency_anchor_coef=float(getattr(args, "multi_k_consistency_anchor_coef", 0.0)),
         multi_k_consistency_extension_coef=float(getattr(args, "multi_k_consistency_extension_coef", 0.0)),
         multi_k_consistency_extension_delta=int(getattr(args, "multi_k_consistency_extension_delta", 0)),
@@ -8557,12 +8550,10 @@ def main() -> None:
         reg_scale = (
             min(max(time_frac / max(reg_warm, 1e-8), 0.0), 1.0) if reg_warm > 0 else 1.0
         )
-        base_model.router_load_cv_coef = float(base_model._router_load_cv_coef_target) * reg_scale
         # iter145r EMA-anchored family — annealed identically; registry drives loop.
         for _name, _ in ROUTER_EMA_LOSS_TERMS:
             target = float(getattr(base_model, f"_router_ema_{_name}_coef_target"))
             setattr(base_model, f"router_ema_{_name}_coef", target * reg_scale)
-        base_model.mos_load_cv_coef = float(base_model._mos_load_cv_coef_target) * reg_scale
         ent_target = float(base_model._router_pertoken_entropy_coef_target)
         sched_routers = list(_iter_unique_routers(sb))
         if ent_target > 0.0:
@@ -8939,10 +8930,8 @@ def main() -> None:
                 f"expert_diversity_loss:{_log_tensor_attr('_expert_diversity_loss_t'):.6f} "
                 f"mos_diversity_loss:{_log_tensor_attr('_mos_diversity_loss_t'):.6f} "
                 f"router_reg_loss:{_log_tensor_attr('_router_reg_loss_t'):.6f} "
-                f"router_cv_coef_eff:{_log_tensor_attr('_router_cv_coef_eff_t'):.6g} "
                 f"router_pertoken_entropy_coef_eff:{_log_tensor_attr('_router_pertoken_entropy_coef_eff_t'):.6g} "
                 f"{ema_coef_cols} "
-                f"mos_cv_coef_eff:{_log_tensor_attr('_mos_cv_coef_eff_t'):.6g} "
                 f"expert_diversity_coef_eff:{_log_tensor_attr('_expert_diversity_coef_eff_t'):.6g} "
                 f"mos_diversity_coef_eff:{_log_tensor_attr('_mos_diversity_coef_eff_t'):.6g} "
                 f"consistency_anchor_loss:{_log_tensor_attr('_consistency_anchor_loss_t'):.6f} "
