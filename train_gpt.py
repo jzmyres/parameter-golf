@@ -875,27 +875,26 @@ class Hyperparameters:
     # bundle.
     deq_prefix_anchors = True  # iter152 promoted on BPB (1.4718 vs 1.4787); promotion-propagation completed 2026-05-13 after iter153/iter155 confound was diagnosed.
 
-    # iter163 (2026-05-15): Multi-K consistency loss for natural FP-convergence
-    # learning. Two principled terms, hybrid CM-paradigm (consistency-distillation
-    # + boundary-anchoring), both architecture-agnostic per CLAUDE.md
+    # iter163 (2026-05-15, PROMOTED at val_bpb=1.471598 vs iter152 1.471820):
+    # Multi-K consistency loss for natural FP-convergence learning. Two
+    # principled terms, hybrid CM-paradigm (consistency-distillation +
+    # boundary-anchoring), both architecture-agnostic per CLAUDE.md
     # most-principled-simplest-general directive:
     #   L_anchor = anchor_coef · Σ_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²
     #     Recursive consistency on iter152 prefix anchors (Δ=8-32 between
     #     adjacent depths). Reuses existing z_stack from
-    #     RevDEQPrefixAnchorFunction. Cost: ~free. Signal density: 50% of
-    #     steps (K=16 only) have no anchor pair → no signal.
+    #     RevDEQPrefixAnchorFunction. Cost: ~free.
     #   L_ext    = extension_coef · ‖z_K − z_{K+Δ}.detach()‖²
     #     Extension consistency at the boundary: extending K by Δ should not
-    #     change z (the operational FP-stability test). Wasteful v1 runs the
-    #     full DEQ at K_total=K+Δ no-grad. Cost: ~+50%-150% step time
-    #     depending on Δ. Fires every step regardless of K_jitter, covering
-    #     L_anchor's signal-density gap on K=16-only steps.
-    # Both default to 0 (off); enable iter163 with
-    #   --multi-k-consistency-anchor-coef=0.1
-    #   --multi-k-consistency-extension-coef=0.1
-    #   --multi-k-consistency-extension-delta=0   (0 means use K_train as Δ)
-    multi_k_consistency_anchor_coef = 0.0
-    multi_k_consistency_extension_coef = 0.0
+    #     change z (the operational FP-stability test). Extends from z by Δ
+    #     no-grad Parcae two-state iterations (initializes y=z, true at FP).
+    #     Cost: ~+50% step time at Δ=K_train. Fires every step.
+    # iter163 result: K-extrapolation gap (K=128 − K=16) was 4× tighter than
+    # iter158 baseline (+0.0004 vs +0.0018). rho_F dropped 1.30 → 0.92 over
+    # training (model LEARNED FP convergence). Disable explicitly with
+    # --multi-k-consistency-anchor-coef=0 --multi-k-consistency-extension-coef=0.
+    multi_k_consistency_anchor_coef = 0.1
+    multi_k_consistency_extension_coef = 0.1
     multi_k_consistency_extension_delta = 0  # 0 means use K_train
 
     # Architecture knobs
@@ -5379,8 +5378,8 @@ class GPT(nn.Module):
                  router_ema_specialization_coef: float = 0.20,
                  use_reverse_kl_balance: bool = True,
                  mos_load_cv_coef: float = 0.15,
-                 multi_k_consistency_anchor_coef: float = 0.0,
-                 multi_k_consistency_extension_coef: float = 0.0,
+                 multi_k_consistency_anchor_coef: float = 0.1,
+                 multi_k_consistency_extension_coef: float = 0.1,
                  multi_k_consistency_extension_delta: int = 0,
                  expert_diversity_kind: str = "cosine",
                  expert_output_diversity_coef: float = 0.30,

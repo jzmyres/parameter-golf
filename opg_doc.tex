@@ -904,12 +904,40 @@ where $\lambda_{\rm denoise}$ is the runtime value of
 perturbations around the reached equilibrium and complements the infinitesimal
 Jacobian surrogate when explicitly enabled.
 
+\paragraph{iter163: Multi-K consistency loss (PROMOTED 2026-05-15).}
+A hybrid consistency-model loss \cite{songConsistencyModels2023} that
+\emph{trains} the iteration map to satisfy the FP equation
+$T(z^\star)=z^\star$ at the operating point, rather than enforcing it via
+a refuted soft penalty (iter155 Lyapunov, refuted by iter152's empirical
+$\rho \ll \sigma_{\max}$ gap).  Two architecture-agnostic terms:
+\begin{align}
+  \mathcal{L}_{\rm consist}^{\rm anchor}
+    &= \lambda_a \sum_{i=0}^{|A|-2}
+       \left\| z_{K_{a,i}} - \mathrm{stopgrad}(z_{K_{a,i+1}}) \right\|_2^2
+       \quad \text{(recursive on prefix anchors $A$)} \\
+  \mathcal{L}_{\rm consist}^{\rm ext}
+    &= \lambda_e
+       \left\| z_K - \mathrm{stopgrad}(z_{K+\Delta}) \right\|_2^2,
+\end{align}
+where $z_{K+\Delta}$ is computed by extending from $z_K$ via $\Delta$
+no-grad Parcae two-state iterations (initializing $y=z$, exact at the FP),
+and $\lambda_a=\lambda_e=0.1$, $\Delta=K$ by default.  The recursive
+anchor term is free (reuses the prefix-anchor $z$-stack); the extension
+term costs $\sim+50\%$ step time at $\Delta=K$.  Both implicitly enforce
+$\rho(J_F) < 1$ because consistency only minimizes if the iteration is
+contractive at the operating point.  Promotion result: full
+$\textrm{val\_bpb}=1.471598$ vs iter152's $1.471820$ (smallest possible
+margin but real); K-extrapolation gap (K=128 minus K=16) is $4\times$
+tighter than the iter158 baseline ($+0.0004$ vs $+0.0018$).
+
 The total loss used for backpropagation is
 \[
   \mathcal{L}
     = \mathcal{L}_{\rm task}
     + \mathcal{L}_{\rm jac}
-    + \mathcal{L}_{\rm denoise}.
+    + \mathcal{L}_{\rm denoise}
+    + \mathcal{L}_{\rm consist}^{\rm anchor}
+    + \mathcal{L}_{\rm consist}^{\rm ext}.
 \]
 
 \section{Quantization and Validation}

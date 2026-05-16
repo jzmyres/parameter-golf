@@ -59,10 +59,14 @@ class TestIter163ConsistencyLoss(unittest.TestCase):
             torch.randint(0, 64, (B, T)).to(dev),
         )
 
-    def test_hyperparameter_defaults_disable_iter163(self):
-        """Defaults must be 0 (off) so iter163 is opt-in."""
-        self.assertEqual(Hyperparameters.multi_k_consistency_anchor_coef, 0.0)
-        self.assertEqual(Hyperparameters.multi_k_consistency_extension_coef, 0.0)
+    def test_hyperparameter_defaults_match_promoted_iter163(self):
+        """iter163 PROMOTED 2026-05-15 at val_bpb=1.471598 (vs iter152 1.471820,
+        Δ −0.000222). Defaults are now ON at λ=0.1 for both terms; Δ=0 means
+        use K_train as the extension Δ. Disable explicitly with
+        --multi-k-consistency-anchor-coef=0 --multi-k-consistency-extension-coef=0
+        to recover the iter152 baseline behavior for ablations."""
+        self.assertEqual(Hyperparameters.multi_k_consistency_anchor_coef, 0.1)
+        self.assertEqual(Hyperparameters.multi_k_consistency_extension_coef, 0.1)
         self.assertEqual(Hyperparameters.multi_k_consistency_extension_delta, 0)
 
     def test_anchor_consistency_loss_fires_with_multiple_anchors(self):
