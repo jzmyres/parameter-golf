@@ -1,22 +1,28 @@
-"""iter163c TBPTT-aligned consistency anchor tests (2026-05-15).
+"""iter163c anchor-on-deepest consistency anchor tests (2026-05-16).
 
-Single loss term — anchor every gradient-carrying z to the most-converged
-available FP proxy z_{K+1} (computed by one no-grad Parcae iter):
+Single loss term — anchor every gradient-carrying z (the iter152 coarse
+prefix-anchor entries in z_stack) to the most-converged available FP
+proxy z_{K+1} (computed by one no-grad Parcae iter):
 
     L_anchor = anchor_coef * mean_i ‖z_{i} − z_{K+1}.detach()‖²
 
-where ``i`` ranges over: (a) the iter152 prefix-anchor depths
-``{16, 24, 32, ...}``; AND (b) the last ``deq_bptt_k - 1`` iterations of
-the sampled K (TBPTT augmentation). This is strictly stronger than
-pair-with-next (`z_i, z_{i+1}.detach()`): the target z_{K+1} is most-
-converged so signal magnitude reflects "distance from FP" rather than
-just one-step residual, and there is no trivial-zero collapse risk
-because the target is input-driven (z_{K+1} = F(z_K, x0), not constant).
+where ``i`` ranges over the iter152 prefix-anchor depths. This is strictly
+stronger than pair-with-next (`z_i, z_{i+1}.detach()`): the target is
+most-converged so signal magnitude reflects "distance from FP" rather than
+just one-step residual, and there is no trivial-zero collapse risk because
+the target is input-driven (z_{K+1} = F(z_K, x0), not constant).
+
+A first iter163c attempt augmented anchors with TBPTT-window iterations
+{K-bptt_k+1, ..., K-1} for per-iter pairs at every K_sampled, but that
+OOM'd on dev L40S at step ~13 (~6 anchors × 3 bptt × T=2048 SDPA backward
+activations > 44 GB VRAM). The coarse-only design is the simplest correct
+expression of "anchor every gradient-carrying z to the most-converged
+proxy" and fits VRAM.
 
 This file was rewritten 2026-05-15 to remove iter163's extension term
 (`‖z_K − z_{K+Δ}.detach()‖²`, Δ=K_train, ~+60 % step time) which was
-superseded by TBPTT augmentation + one extension iter at ~1/30 the cost
-while preserving (and strengthening) the FP-condition signal.
+superseded by the cheaper one-iter extension target while preserving
+(and strengthening) the FP-condition signal.
 """
 import os
 import sys
@@ -31,11 +37,11 @@ from train_gpt import Hyperparameters
 from test_arch import _make_model
 
 
-class TestIter163cTBPTTAlignedConsistency(unittest.TestCase):
-    """All tests use a tiny CPU-friendly model with K_train=4 and bptt_k=2
-    so the TBPTT augmentation adds the K-1=3 anchor."""
+class TestIter163cAnchorOnDeepestConsistency(unittest.TestCase):
+    """All tests use a tiny CPU-friendly model with prefix anchors at
+    multiple depths so the anchor loss has multiple terms in z_stack."""
 
-    def _make(self, anchor_coef=0.1, bptt_k=2, prefix_anchor_set=(4,)):
+    def _make(self, anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(2, 3, 4)):
         torch.manual_seed(0)
         m = _make_model(
             num_experts=4, use_ctp=False,
@@ -59,11 +65,10 @@ class TestIter163cTBPTTAlignedConsistency(unittest.TestCase):
         )
 
     def test_hyperparameter_defaults_match_promoted_iter163c(self):
-        """iter163c (2026-05-15) keeps the iter163 anchor coef at 0.1 and
+        """iter163c (2026-05-16) keeps the iter163 anchor coef at 0.1 and
         removes the extension knobs (`multi_k_consistency_extension_coef`,
         `multi_k_consistency_extension_delta`) entirely. The Hyperparameter
-        class must not even expose the removed fields — any consumer that
-        still passes them is a stale call site."""
+        class must not even expose the removed fields."""
         self.assertEqual(Hyperparameters.multi_k_consistency_anchor_coef, 0.1)
         self.assertFalse(
             hasattr(Hyperparameters, "multi_k_consistency_extension_coef"),
@@ -76,54 +81,42 @@ class TestIter163cTBPTTAlignedConsistency(unittest.TestCase):
             "as a Hyperparameter field via copy-paste regression."
         )
 
-    def test_anchor_loss_fires_at_small_K_via_tbptt_augmentation(self):
-        """The iter163c TBPTT augmentation is the central improvement over
-        iter163: at K_sampled where iter163's coarse jitter anchors give only
-        one z_stack entry (zero pairs → zero anchor loss), iter163c adds the
-        last `bptt_k - 1` iterations as extra anchors so pairs always exist.
-        With prefix_anchor_set=(4,) and K_train=4, iter163's z_stack would
-        have length 1 → no pairs → loss=0. iter163c with bptt_k=2 augments
-        anchors to {3, 4} → 1 pair → loss > 0."""
-        m = self._make(anchor_coef=0.1, bptt_k=2, prefix_anchor_set=(4,))
+    def test_anchor_loss_fires_on_coarse_prefix_anchors(self):
+        """With multi-anchor prefix set {2,3,4} at K_train=4, z_stack has 3
+        entries (one per anchor depth). The anchor loss pairs each with
+        z_{5} = F(z_4, x0).detach() and returns the mean."""
+        m = self._make(anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(2, 3, 4))
         x, y = self._batch(m)
         _ = m(x, y)
         self.assertIsNotNone(m._consistency_anchor_loss_t,
-            "anchor loss tensor must be populated under TBPTT augmentation")
+            "anchor loss tensor must be populated when coarse anchors > 0")
         loss = float(m._consistency_anchor_loss_t.detach())
         self.assertGreater(loss, 0.0,
-            "anchor loss must be > 0 when TBPTT augmentation adds extra anchors "
-            "even at K_sampled where iter152's coarse anchors give only one entry")
+            "anchor loss must be > 0 when z_i != z_{K+1} (typical pre-trained state)")
 
-    def test_tbptt_augmentation_records_augmented_anchor_depths(self):
-        """The augmented anchor set must include both prefix-anchor depths AND
-        the TBPTT-window depths. Verified via `_deq_prefix_anchor_depths_last`."""
-        m = self._make(anchor_coef=0.1, bptt_k=3, prefix_anchor_set=(4,))
+    def test_anchor_loss_fires_with_single_anchor(self):
+        """Even when only one prefix anchor exists (e.g. K_sampled=16 in real
+        runs where only {16} <= 16), the iter163c design still fires: the
+        single anchor (z@16) is paired with z_{17}.detach() (one no-grad iter
+        beyond K). This is the key improvement over iter163's recursive
+        anchor which gave zero pairs in this case."""
+        m = self._make(anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(4,))
         x, y = self._batch(m)
         _ = m(x, y)
-        depths = m._deq_prefix_anchor_depths_last
-        # K=4, bptt_k=3 → tbptt_extra = {K-1, K-2} = {3, 2}; merged with {4} → {2, 3, 4}.
-        self.assertEqual(tuple(depths), (2, 3, 4),
-            f"expected augmented anchors (2, 3, 4), got {depths}")
-
-    def test_tbptt_augmentation_off_when_anchor_coef_zero(self):
-        """The augmentation must NOT fire when the anchor coef is 0 — adding
-        anchors costs backward work and memory, so disabling the loss must
-        also disable the augmentation."""
-        m = self._make(anchor_coef=0.0, bptt_k=3, prefix_anchor_set=(4,))
-        x, y = self._batch(m)
-        _ = m(x, y)
-        depths = m._deq_prefix_anchor_depths_last
-        # With anchor_coef=0, no augmentation → only the original prefix anchor {4}.
-        self.assertEqual(tuple(depths), (4,),
-            f"expected un-augmented anchors (4,) when anchor_coef=0, got {depths}")
+        self.assertIsNotNone(m._consistency_anchor_loss_t,
+            "single-anchor z_stack must still produce a non-None loss "
+            "(z_{K+1} target gives at least one pair).")
+        loss = float(m._consistency_anchor_loss_t.detach())
+        self.assertGreater(loss, 0.0)
 
     def test_anchor_loss_zero_when_coef_zero(self):
-        """Flag-to-effect contract: when anchor_coef=0, the loss tensor stays
-        None and the consistency term contributes nothing to total loss."""
+        """Flag-to-effect contract: when anchor_coef=0, the loss tensor
+        stays None and the consistency term contributes nothing to total
+        loss."""
         torch.manual_seed(42)
-        m_off = self._make(anchor_coef=0.0, bptt_k=2, prefix_anchor_set=(2, 3, 4))
+        m_off = self._make(anchor_coef=0.0, bptt_k=1, prefix_anchor_set=(2, 3, 4))
         torch.manual_seed(42)
-        m_on = self._make(anchor_coef=0.1, bptt_k=2, prefix_anchor_set=(2, 3, 4))
+        m_on = self._make(anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(2, 3, 4))
         x, y = self._batch(m_off)
 
         loss_off = float(m_off(x, y).detach())
@@ -136,15 +129,15 @@ class TestIter163cTBPTTAlignedConsistency(unittest.TestCase):
             "since consistency term only adds a positive penalty")
 
     def test_anchor_loss_requires_prefix_mode(self):
-        """When prefix_mode=False (deq_prefix_anchors=False), the augmented
-        anchor mechanism does not apply: there's no z_stack to compute pairwise
-        differences from."""
+        """When prefix_mode=False (deq_prefix_anchors=False), the
+        anchor-on-deepest mechanism does not apply: there's no z_stack
+        to compute distances from."""
         torch.manual_seed(0)
         m = _make_model(
             num_experts=4, use_ctp=False,
             deq_prefix_anchors=False,
             num_refinements=0,
-            deq_bptt_k=2,
+            deq_bptt_k=1,
             multi_k_consistency_anchor_coef=0.1,
             use_parcae=True,
         )
@@ -158,7 +151,7 @@ class TestIter163cTBPTTAlignedConsistency(unittest.TestCase):
         """The consistency loss must actually propagate gradient to model
         params — Flag-to-effect contract: enabling the flag must change the
         training-path tensor flow observably."""
-        m = self._make(anchor_coef=1.0, bptt_k=2, prefix_anchor_set=(4,))
+        m = self._make(anchor_coef=1.0, bptt_k=1, prefix_anchor_set=(2, 3, 4))
         x, y = self._batch(m)
         loss = m(x, y)
         loss.backward()
@@ -171,47 +164,48 @@ class TestIter163cTBPTTAlignedConsistency(unittest.TestCase):
             "anchor consistency loss must produce non-zero gradients on "
             "shared_block parameters — otherwise the flag has no training effect")
 
-    def test_anchor_on_deepest_target_structure(self):
-        """The iter163c anchor-on-deepest design: every gradient-carrying z in
-        z_stack is anchored to z_{K+1}.detach() (the most-converged available
-        FP proxy from one no-grad Parcae iter), NOT to its immediate next
-        iteration. This gives:
-          - Strong directional signal toward the model's best FP estimate
-          - Uniform target across all anchors (vs mixed coarse/fine targets)
-          - No trivial-zero collapse risk (target is input-driven)
+    def test_anchor_target_is_one_no_grad_iter_beyond_K(self):
+        """The anchor target z_{K+1} is computed via ONE no-grad Parcae iter
+        from z_K. This is the key cost/signal trade-off vs iter163's Δ=K_train
+        extension (~22 no-grad iters): we get a slightly less converged but
+        much cheaper target, which trains the model toward the FP nonetheless
+        because rho < 1 means even one iter is contractive at converged points.
 
-        The anchor-loss tensor must be a scalar (mean over |z_stack| pair
-        contributions), and the augmented anchors include both prefix-anchor
-        depths AND the TBPTT-window iterations.
+        Verified structurally via source inspection: the inline no-grad iter
+        in `_run_backbone` must use the Parcae two-state update (a_bar, b_bar)
+        rather than a full Δ-iteration helper.
         """
-        # Use K=4, bptt_k=3, prefix_anchor_set=(4,) so augmented anchors = {2, 3, 4}.
-        # z_stack has 3 entries, all targeting z_5 = F(z_4, x0).det → 3 pair
-        # contributions in the mean. NOTE: `_deq_prefix_anchor_depths_last` is
-        # populated DURING `_run_backbone`, so the depth check must come AFTER
-        # the forward call.
-        m = self._make(anchor_coef=0.1, bptt_k=3, prefix_anchor_set=(4,))
-        x, y = self._batch(m)
-        _ = m(x, y)
-        depths = m._deq_prefix_anchor_depths_last
-        self.assertEqual(tuple(depths), (2, 3, 4),
-            f"expected augmented anchors (2, 3, 4) for bptt_k=3, got {depths}")
-        loss_t = m._consistency_anchor_loss_t
-        self.assertIsNotNone(loss_t,
-            "anchor loss tensor must be populated under anchor-on-deepest")
-        self.assertEqual(loss_t.dim(), 0,
-            f"anchor loss must be a scalar (mean over pair contributions), "
-            f"got tensor of shape {tuple(loss_t.shape)}")
-        self.assertGreater(float(loss_t), 0.0,
-            "anchor-on-deepest loss must be > 0 when z != z_{K+1} (typical)")
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+        # The inline no-grad iter must use the Parcae machinery (a_bar, b_bar
+        # casts to z.dtype). The detached target must be passed to the loss.
+        assert "with torch.no_grad():" in src, (
+            "iter163c requires a no_grad block to compute z_{K+1} without "
+            "growing the autograd graph"
+        )
+        assert "y_next = a_bar_one * z_K" in src, (
+            "iter163c inline no-grad iter must compute y_next via Parcae "
+            "two-state update with a_bar"
+        )
+        assert "z_next = a_bar_one * z_K" in src, (
+            "iter163c inline no-grad iter must compute z_next via Parcae "
+            "two-state update with a_bar"
+        )
+        assert "(z_stack - target.unsqueeze(0)).pow(2).mean()" in src, (
+            "iter163c loss must pair EVERY z_stack entry with the target "
+            "(anchor-on-deepest) rather than pair-with-next"
+        )
 
     def test_extension_helper_was_deleted(self):
-        """iter163's `_consistency_extend_no_grad` helper was removed 2026-05-15.
-        Negative assertion guards against reintroduction via copy-paste.
+        """iter163's `_consistency_extend_no_grad` helper was removed
+        2026-05-15. Negative assertion guards against reintroduction via
+        copy-paste.
 
         Note: iter163c does one INLINE no-grad Parcae iter (~10 lines) inside
         `_run_backbone` to compute z_{K+1} — this is intentional and DOES NOT
         use the deleted helper. The negative assertion targets the helper
-        function definition specifically (not the inline code path)."""
+        function definition specifically (not the inline code path).
+        """
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
         self.assertNotIn("def _consistency_extend_no_grad", src,

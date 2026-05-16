@@ -865,23 +865,22 @@ class Hyperparameters:
     # bundle.
     deq_prefix_anchors = True  # iter152 promoted on BPB (1.4718 vs 1.4787); promotion-propagation completed 2026-05-13 after iter153/iter155 confound was diagnosed.
 
-    # iter163c (2026-05-15, supersedes iter163 extension term):
-    # TBPTT-aligned consistency anchor with anchor-on-deepest target. The loss
-    # pulls every gradient-carrying z toward the most-converged available FP
-    # proxy z_{K+1} (computed by one no-grad Parcae iter after K_sampled):
+    # iter163c (2026-05-16, supersedes iter163 extension term):
+    # Anchor-on-deepest consistency anchor. The loss pulls every gradient-
+    # carrying z in the iter152 coarse prefix-anchor z_stack toward the most-
+    # converged available FP proxy z_{K+1} (computed by one no-grad Parcae
+    # iter after K_sampled):
     #   L_anchor = anchor_coef · mean_i ‖z_{i} − z_{K+1}.detach()‖²
-    # where i ranges over: (a) prefix-anchor depths (iter152 coarse jitter
-    # anchors at {16, 24, 32, 64, ...}), AND (b) the last `deq_bptt_k - 1`
-    # iterations of the K_sampled forward (added by the TBPTT augmentation).
-    # Pairing every z_i with z_{K+1}.detach() (most-converged proxy) is
-    # strictly stronger than pairing with z_{i+1}.detach() (next iteration):
-    # signal magnitude is "distance from FP", not just one-step residual,
-    # and there is no trivial-zero collapse risk because the target is
-    # input-driven (z_{K+1} = F(z_K, x0), not constant).
-    # Total cost: ~1.05-1.10× iter152 baseline step time. One no-grad Parcae
-    # iter per step (~+1 %) plus the TBPTT augmentation (~+5-10 % from extra
-    # reverse iters per added anchor). Was 1.6× under iter163's extension at
-    # Δ=K_train ≈ 22 no-grad iters per step.
+    # where i ranges over the iter152 prefix-anchor depths (e.g. for
+    # K_sampled=64 with prefix set {16, 24, 32, 64}: 4 anchor terms all
+    # targeting z_{65}). Pairing every z_i with z_{K+1}.detach() (most-
+    # converged proxy) is strictly stronger than pairing with z_{i+1}.detach()
+    # (next iteration): signal magnitude is "distance from FP", not just one-
+    # step residual, and there is no trivial-zero collapse risk because the
+    # target is input-driven (z_{K+1} = F(z_K, x0), not constant).
+    # Total cost: ~1.01-1.02× iter152 baseline step time. One no-grad Parcae
+    # iter per step (~+1 %). Was 1.6× under iter163's extension at Δ=K_train
+    # ≈ 22 no-grad iters per step.
     # Architecture-agnostic per CLAUDE.md most-principled-simplest-general:
     # the FP equation z = F(z) is the universal condition for asymptotic
     # local convergence; the deepest-K target z_{K+1} is the model's best
@@ -6035,23 +6034,6 @@ class GPT(nn.Module):
             self._deq_z_init_last = z.detach()
             if prefix_mode:
                 anchors = _prefix_anchor_depths(self._deq_k_last, self.deq_prefix_anchor_set)
-                # iter163c (2026-05-15): augment anchors with the last `bptt_k`
-                # iterations of the K_sampled forward when the consistency anchor
-                # loss is active. Adding {K-bptt_k+1, ..., K-1} as fine-grained
-                # anchors makes per-iter FP-condition pairs `‖z_i − z_{i+1}.detach()‖²`
-                # fire at every K_sampled — including K=16 where coarse jitter
-                # anchors give only one z_stack entry and the recursive pair count
-                # is zero. K itself is always in `anchors` (last endpoint) so we
-                # only add the bptt_k - 1 earlier iterations. Each new anchor adds
-                # bptt_k reverse iterations in backward (~marginal cost).
-                bptt_k_eff = int(getattr(self, "deq_bptt_k", 0) or 0)
-                if (self.training and bptt_k_eff > 1
-                        and self.multi_k_consistency_anchor_coef > 0.0):
-                    tbptt_extra = tuple(
-                        self._deq_k_last - i for i in range(1, bptt_k_eff)
-                        if self._deq_k_last - i > 0
-                    )
-                    anchors = tuple(sorted(set(anchors + tbptt_extra)))
                 self._deq_prefix_anchor_depths_last = anchors
                 z_stack, z_prev_stack = self._deq_solve_prefix_anchors(x0_refined, z, anchors)
                 z = z_stack[-1]
@@ -6060,29 +6042,34 @@ class GPT(nn.Module):
                 self._deq_prefix_anchor_depths_last = ()
                 z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        # iter163c (2026-05-15): TBPTT-aligned consistency anchor with
-        # anchor-on-deepest target. The target is z_{K+1} (computed by ONE
-        # no-grad Parcae iter after K_sampled) — the most-converged available
-        # proxy for the true fixed point z*. For every gradient-carrying z_i
-        # in z_stack (coarse prefix anchors {16, 24, 32, ...} AND fine TBPTT-
-        # window iterations {K-bptt_k+1, ..., K-1, K} added by the augmentation
-        # above), the loss pairs (z_i, z_{K+1}.detach()) — pulling every
-        # iteration toward the model's best FP estimate, NOT toward the
-        # immediate next iteration. This is strictly stronger than pair-with-
-        # next: the target is most-converged (highest-quality FP proxy),
-        # signal magnitude is "distance from FP" (not just one-step residual),
-        # and there is no trivial-zero collapse risk (the target z_{K+1} is
-        # input-driven via F(z_K, x0), not constant).
+        # iter163c (2026-05-16): anchor-on-deepest consistency anchor.
+        # Every gradient-carrying z in z_stack (the iter152 coarse prefix
+        # anchors at depths {16, 24, 32, 64, ...} that <= K_sampled) is
+        # paired with the most-converged available FP proxy z_{K+1}
+        # (computed by ONE no-grad Parcae iter after K_sampled):
         #
-        # Total pair count: |z_stack| (all coarse + fine anchors, each paired
-        # with z_{K+1}). With bptt_k=3 augmentation at K_sampled=64 and prefix
-        # anchors {16, 24, 32, 64}, that's 6 augmented anchors each anchored
-        # to z_65 = 6 consistency pair contributions per step.
+        #   L_anchor = mean_i ‖z_i − z_{K+1}.detach()‖²
+        #
+        # Pulling every iteration toward the model's best FP estimate is
+        # strictly stronger than pair-with-next (`z_i, z_{i+1}.detach()`):
+        # the target is most-converged (highest-quality FP proxy), signal
+        # magnitude is "distance from FP" (not just one-step residual), and
+        # there is no trivial-zero collapse risk (target z_{K+1} is input-
+        # driven via F(z_K, x0), not constant).
+        #
+        # Per the most-principled-simplest-general directive, this version
+        # uses ONLY the existing coarse prefix anchors — no TBPTT-window
+        # augmentation. A first iter163c attempt augmented anchors with
+        # {K-bptt_k+1, ..., K-1} for fine per-iter pairs, but that OOM'd
+        # on the dev L40S at step ~13 (~6 anchors × 3 bptt × T=2048 SDPA
+        # backward activations exceeds 44 GB VRAM). The coarse-only design
+        # is the simplest correct expression of "anchor every gradient-
+        # carrying z to the most-converged proxy" and stays within VRAM.
         #
         # Compared with iter163's extension (Δ=K_train ≈ 22 no-grad iters per
         # step, ~+60 % step time), iter163c does ~1 no-grad iter per step
-        # (~+1 %) and gives anchor-on-deepest pairs at every gradient-carrying
-        # z, rather than one (z_K, z_{K+Δ}) pair at the boundary only.
+        # (~+1 % step time) while giving anchor-on-deepest pairs at every
+        # coarse anchor (vs one boundary pair at Δ=K_train under iter163).
         # The `_*_loss_raw` field holds the with-grad tensor that crosses the
         # `_run_backbone` → `forward` boundary; the `_*_loss_t` field is the
         # detached log copy. Same separation as `_ntp_loss_t` / `ntp_loss`.
