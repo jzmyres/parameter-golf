@@ -110,10 +110,14 @@ class TestSamplerSetWeights(unittest.TestCase):
 
 class TestHyperparameterDefaults(unittest.TestCase):
     def test_anneal_defaults_disabled(self):
-        """iter173 default OFF — empty final tuple preserves iter172 behavior."""
+        """iter173 default OFF — empty final tuple preserves iter172 behavior.
+        When enabled (via --deq-k-jitter-weights-final), the annealing window
+        defaults to the final 80% of training: [0.2, 1.0] · N_steps. The
+        first 20% locks in iter172's baseline FP convergence before pushing
+        depth, then the remaining 80% smoothly shifts weights to deeper K."""
         self.assertEqual(Hyperparameters.deq_k_jitter_weights_final, ())
-        self.assertEqual(Hyperparameters.deq_k_jitter_anneal_start_frac, 0.3)
-        self.assertEqual(Hyperparameters.deq_k_jitter_anneal_end_frac, 0.9)
+        self.assertEqual(Hyperparameters.deq_k_jitter_anneal_start_frac, 0.2)
+        self.assertEqual(Hyperparameters.deq_k_jitter_anneal_end_frac, 1.0)
 
 
 if __name__ == "__main__":

@@ -875,16 +875,17 @@ class Hyperparameters:
     # gradually shifting probability mass toward K∈{64,96,128} over training,
     # the model practices the deep-K regime that K-sweep eval actually uses.
     # Final distribution (0.125,0.125,0.125,0.125,0.25,0.25) → E[K] ≈ 51 vs
-    # the iter172 start E[K] ≈ 22.9 (~2.2× deeper). Anneal window [0.3, 0.9]
-    # leaves the first 30% of training at iter172's biased weights (so basic
-    # FP convergence is locked in before pushing depth), and finishes by
-    # step 0.9·N to let the optimizer settle at the deep distribution before
-    # final eval. Cost: deep-K steps are slower (K=128 ≈ 6× K=16 cost), so
-    # E[step_cost] increases ~2.2× over the anneal window — expected total
-    # wallclock impact ~1.5× iter172 baseline at default schedule.
+    # the iter172 start E[K] ≈ 22.9 (~2.2× deeper). Anneal window [0.2, 1.0]
+    # leaves the first 20% of training at iter172's biased weights (so basic
+    # FP convergence is locked in before pushing depth) and spans the final
+    # 80% smoothly — no settling buffer at the end because the deeper-K
+    # regime is what the K-sweep eval measures, so the model should be at
+    # the final distribution exactly when training stops. Cost: deep-K steps
+    # are slower (K=128 ≈ 6× K=16 cost), so E[step_cost] increases ~2.2× by
+    # end-of-training — expected total wallclock ~1.5× iter172 baseline.
     deq_k_jitter_weights_final: tuple[float, ...] = ()
-    deq_k_jitter_anneal_start_frac: float = 0.3
-    deq_k_jitter_anneal_end_frac: float = 0.9
+    deq_k_jitter_anneal_start_frac: float = 0.2
+    deq_k_jitter_anneal_end_frac: float = 1.0
     deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
     # iter152: conditional prefix-K multi-anchor supervision. Default OFF.
     # When enabled, a sampled K still performs one K-step solve, but the train
