@@ -875,17 +875,20 @@ class Hyperparameters:
     # pure finite-depth task-supervision change rather than another coefficient
     # bundle.
     deq_prefix_anchors = True  # iter152 promoted on BPB (1.4718 vs 1.4787); promotion-propagation completed 2026-05-13 after iter153/iter155 confound was diagnosed.
-    # iter170 (2026-05-16): explicit prefix-anchor depths, decoupled from
-    # the K-jitter set. Default empty tuple means "fall back to jitter set"
-    # (preserves pre-iter170 behavior). Set explicitly via CLI to test
-    # designs like `--deq-prefix-anchor-set "4,16,32,64,96,128"` which adds
-    # K=4 as a shallow anchor to give iter170's anchor-on-deepest loss a
-    # non-trivial pair (z_4, z_K_sampled.detach()) even at K_sampled=16.
-    deq_prefix_anchor_set: tuple[int, ...] = ()
+    # iter172 (2026-05-17, PROMOTED at full val_bpb=1.462898 vs iter163's
+    # 1.471598 = −8.7 mBPB win, 39× iter163's margin over iter152). Explicit
+    # prefix-anchor depths, decoupled from the K-jitter set. The K=8 shallow
+    # anchor (gap=8 to next-deeper K=16) matches iter163's healthy regime
+    # while giving a non-trivial consistency-pair at K_sampled=16 (which
+    # samples ~88% of training steps). iter170's K=4 (gap=12) collapsed
+    # rho_F→0 by anchoring an unconverged shallow state to the deep target;
+    # iter172's K=8 preserves contraction (final rho_F=0.77 at K=128 vs
+    # iter163's 0.92). Default falls back to deq_k_jitter_set if set to ().
+    deq_prefix_anchor_set: tuple[int, ...] = (8, 16, 24, 32, 64, 128)
 
-    # iter171 (2026-05-16, supersedes iter170 which was REFUTED):
-    # Recursive nearest-neighbor consistency loss. Each prefix-anchor z_i
-    # is paired with its NEXT-DEEPER z_{i+1} (not the deepest z_K):
+    # iter172 (2026-05-17, PROMOTED at val_bpb=1.462898 vs iter163's
+    # 1.471598 = −8.7 mBPB): recursive nearest-neighbor consistency loss.
+    # Each prefix-anchor z_i is paired with its NEXT-DEEPER z_{i+1}.detach():
     #   L_anchor = anchor_coef · mean_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²
     # This is literally iter163's promoted recursive anchor formula.
     #
@@ -899,27 +902,22 @@ class Hyperparameters:
     # over each LOCAL depth range, allowing ρ ≈ 0.85 (iter163's healthy
     # regime) without degenerating to ρ → 0.
     #
-    # Trade-offs vs prior designs:
-    #   iter163  (recursive + Δ=K_train extension): PROMOTED champion;
+    # Trade-offs vs prior designs (REFUTED alternatives kept for the
+    # `removal-symmetry-sweep` audit row; do NOT reintroduce as ablations
+    # without re-reading the closure note in hypotheses.md):
+    #   iter163  (recursive + Δ=K_train extension): prior champion;
     #     ~1.6× iter152 step time due to deep no-grad extension forward.
     #   iter163c v2 (Δ=1 no-grad iter): REFUTED at full val, +22 mBPB.
     #   iter167 (Δ=8 no-grad iters):   subsumed (z_K_sampled free).
     #   iter170 (all-to-deepest):      REFUTED at s200, +65 mBPB; ρ → 0
-    #     degeneracy. The smoke already showed the K-sweep direction
-    #     reversed (K=4 < K=16 < K=128) — pseudo-FP at K=4.
-    #   iter171 (this design):         recursive only (no extension),
-    #     with broadened anchor set including K=4 (shallow, fixes
-    #     K_sampled=16 coverage gap) and K=256 (deep boundary pair
-    #     `(z_128, z_256.det)` tests true asymptotic FP). Cost ~1.00×
-    #     iter152 step time.
-    #
-    # iter171 run uses CLI overrides:
-    #   --deq-prefix-anchor-set "4,16,32,64,128,256"  # K=4 shallow + K=256 deep; drop K=96 from anchors for OOM safety
-    #   --deq-k-jitter-set      "16,32,64,96,128,256"  # K=24 dropped, K=256 added
-    #   --deq-k-jitter-weights  "0.88,0.07,0.03,0.015,0.0075,0.00375"
-    #   --fast-val-k-sweep-set  "4,128"               # K-sweep diagnostic at every val
-    # Worst-case backward chain count at K_sampled=256: 6 anchors × 3 bptt
-    # = 18 chains = iter163-baseline-safe memory.
+    #     degeneracy. K=4 anchor (gap=12 to K=16) further collapsed rho_F.
+    #   iter171 (recursive, K=4 + K=256 anchors): superseded by iter172.
+    #   iter172 (this design, PROMOTED): recursive only (no extension),
+    #     anchor set (8, 16, 24, 32, 64, 128). K=8 gives non-trivial
+    #     consistency pair at K_sampled=16 without iter170's gap=12
+    #     rho_F collapse. Cost ~1.00× iter152 step time. Worst-case
+    #     backward chain count at K_sampled=128: 6 anchors × 3 bptt = 18
+    #     chains = iter163-baseline-safe memory.
     #
     # Architecture-agnostic per CLAUDE.md most-principled-simplest-general.
     # Disable for ablation with `--multi-k-consistency-anchor-coef=0`.
@@ -5479,7 +5477,7 @@ class GPT(nn.Module):
                  lyapunov_target: str = "transition_T",
                  lyapunov_estimator: str = "random_fd",
                  deq_prefix_anchors: bool = True,
-                 deq_prefix_anchor_set: tuple[int, ...] | None = None,
+                 deq_prefix_anchor_set: tuple[int, ...] | None = (8, 16, 24, 32, 64, 128),
                  use_parcae: bool = True,
                  parcae_init_a_bar: float = 0.7,
                  parcae_init_b_bar: float | None = None,
@@ -6078,53 +6076,34 @@ class GPT(nn.Module):
                 self._deq_prefix_anchor_depths_last = ()
                 z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
 
-        # iter170 (2026-05-16): anchor-on-deepest with z_K_sampled as target.
-        # The deepest gradient-carrying z in z_stack IS the model's best FP
-        # estimate at the current step — pairing all shallower z_i with it
-        # gives the strongest principled signal at ZERO extra forward cost.
+        # iter172 (2026-05-17, PROMOTED at val_bpb=1.462898 vs iter163's
+        # 1.471598 = −8.7 mBPB): recursive nearest-neighbor consistency loss.
+        # Each prefix-anchor z_i is paired with its NEXT-DEEPER z_{i+1}.detach():
         #
-        #   L_anchor = mean_{i in z_stack[:-1]} ‖z_i − z_stack[-1].detach()‖²
+        #   L_anchor = anchor_coef · mean_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²
         #
-        # Compared with prior anchor-on-deepest designs:
-        #   iter163c v2 (target = z_{K+1} via 1 no-grad iter): REFUTED at full
-        #     val (val_bpb +22 mBPB regression) — target only 1 iter deeper
-        #     than z_K provides too weak a signal.
-        #   iter167 (target = z_{K+8}): no-grad iters cost ~+7-10 % step time
-        #     and target is still not deeper than z_K_sampled at deep K.
-        #   iter170 (this design): target IS z_K_sampled; target depth scales
-        #     fully with K_sampled (z_16 at K=16, z_128 at K=128); ~1.00× step
-        #     time. At K_sampled=128 the target is z_128 — the model's truest
-        #     FP proxy possible at this scale.
+        # Zero extra forward compute — target is the next z already produced
+        # by the gradient-carrying prefix-anchor forward. Default anchor set
+        # (8, 16, 24, 32, 64, 128) gives a non-trivial (z_8, z_16.det) pair at
+        # K_sampled=16 (~88 % of steps) while keeping the deepest backward
+        # chain count at 6 anchors (iter163-baseline-safe memory).
         #
-        # K_sampled=16 case: with only one prefix anchor, z_stack.shape[0]=1
-        # and z_stack[:-1] is empty → no pairs → loss skipped. The principled
-        # fix is to broaden deq_prefix_anchor_set to include shallow K (e.g.
-        # K=4) so even K_sampled=16 produces a strong-signal pair (z_4 is far
-        # from FP, anchoring it to z_16 is meaningful). iter170 run uses CLI:
-        #   --deq-prefix-anchor-set "4,16,32,64,96,128"
-        #   --deq-k-jitter-set      "16,32,64,96,128"
-        #   --deq-k-jitter-weights  "0.9,0.07,0.03,0.015,0.0075"
-        # Dropping K=24 from jitter trades K=24's anchor budget for K=4's,
-        # keeping the K_sampled=128 backward chain count at 6 anchors —
-        # identical to iter163's known-safe memory profile.
+        # Recursive (not all-to-deepest) avoids iter170's degeneracy: all-to-
+        # deepest pressures the iteration map to be FLAT in z (ρ → 0) so all
+        # pairs collapse to a pseudo-FP — REFUTED at step 200 (val_bpb=2.07
+        # vs baseline 2.00, +65 mBPB). Recursive pairs require only LOCAL
+        # contraction over each depth range, allowing ρ ≈ 0.85 (iter163's
+        # healthy regime). iter170's K=4 anchor (gap=12 to K=16) further
+        # collapsed rho_F → 0 by anchoring an unconverged shallow state to
+        # the deep target; iter172's K=8 (gap=8) preserves contraction
+        # (final rho_F=0.77 at K=128 vs iter163's 0.92).
+        #
         # The `_*_loss_raw` field holds the with-grad tensor that crosses the
         # `_run_backbone` → `forward` boundary; the `_*_loss_t` field is the
         # detached log copy. Same separation as `_ntp_loss_t` / `ntp_loss`.
         self._consistency_anchor_loss_raw = None
         self._consistency_anchor_loss_t = None
         if self.training and prefix_mode and self.multi_k_consistency_anchor_coef > 0.0 and z_stack.shape[0] >= 2:
-            # iter171: recursive nearest-neighbor consistency pairs. Each
-            # z_i is paired with its NEXT prefix-anchor depth z_{i+1}, NOT
-            # with the deepest z_K. This avoids iter170's degeneracy
-            # (REFUTED at step 200 val_bpb=2.07 vs baseline 2.00, +65 mBPB):
-            # iter170's all-to-deepest pairing pressured the iteration map
-            # to be FLAT in z (ρ → 0), which trains the model into a
-            # pseudo-FP that's terrible at the actual task. Recursive
-            # pairs only require contraction over each LOCAL depth range,
-            # allowing ρ ≈ 0.85 (iter163's healthy regime) without
-            # degenerating to ρ → 0. Each pair carries small but non-zero
-            # signal at deep K (verifying continued convergence) and large
-            # signal at shallow K (where z is far from FP).
             anchor_raw = (z_stack[:-1] - z_stack[1:].detach()).pow(2).mean()
             self._consistency_anchor_loss_raw = anchor_raw
             self._consistency_anchor_loss_t = anchor_raw.detach()
@@ -7890,10 +7869,10 @@ def main() -> None:
         deq_beta=args.deq_beta,
         deq_bptt_k=args.deq_bptt_k,
         deq_prefix_anchors=bool(getattr(args, "deq_prefix_anchors", False)),
-        # iter170 (2026-05-16): prefer explicit --deq-prefix-anchor-set CLI
-        # override; fall back to the jitter set when not provided. This lets
-        # the anchor set differ from the jitter set (e.g. iter170 adds K=4
-        # to anchors while dropping K=24 from jitter).
+        # iter172 default is the explicit anchor set (8, 16, 24, 32, 64, 128);
+        # prefer a CLI override when supplied, else fall back to the jitter
+        # set (legacy behavior — the anchor set may differ from the jitter
+        # set, e.g. shallow K=8 anchor but no K=8 in jitter weights).
         deq_prefix_anchor_set=tuple(int(k) for k in (
             getattr(args, "deq_prefix_anchor_set", None)
             or getattr(args, "deq_k_jitter_set", ())

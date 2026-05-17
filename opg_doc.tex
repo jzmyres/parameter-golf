@@ -192,7 +192,7 @@ Mac/MLX support, ignore \texttt{train\_gpt\_mlx.py}.
 \texttt{lyapunov\_target} & transition\_T & \multicolumn{2}{l}{\small enum: \texttt{transition\_T} (J of $T_\theta$; iter147), \texttt{iteration\_S} (J of $S=\bar A z+(1-\bar A)T_\theta$; advisory), \texttt{iteration\_F} (J of two-state Parcae cycle $F$; gate-aligned, iter155 corrected)} \\
 \texttt{denoising\_coef} & 0.0 & \texttt{denoising\_noise\_std} & 0.01 \\
 \texttt{grad\_clip\_norm} & 1.0 & \texttt{weight\_decay} & 0.015 \\
-\texttt{multi\_k\_consistency\_anchor\_coef} & 0.1 (iter163c) & \texttt{router\_ema\_balance\_coef} & 0.30 \\
+\texttt{multi\_k\_consistency\_anchor\_coef} & 0.1 (iter172) & \texttt{router\_ema\_balance\_coef} & 0.30 \\
 \texttt{router\_ema\_specialization\_coef} & 0.20 & \texttt{router\_ema\_alive\_coef} & 0.02 \\
 \texttt{router\_pertoken\_entropy\_coef} & 0.1 & \texttt{deq\_prefix\_anchors} & true \\
 \texttt{regularizer\_warmup\_frac} & 0.07 & \texttt{expert\_diversity\_kind} & cosine max-pair \\
@@ -906,38 +906,46 @@ where $\lambda_{\rm denoise}$ is the runtime value of
 perturbations around the reached equilibrium and complements the infinitesimal
 Jacobian surrogate when explicitly enabled.
 
-\paragraph{iter163c: TBPTT-aligned anchor-on-deepest consistency loss (2026-05-15, supersedes iter163 extension).}
+\paragraph{iter172: recursive nearest-neighbor consistency loss (PROMOTED 2026-05-17, val\_bpb=1.462898 vs iter163's 1.471598 = $-8.7$ mBPB; supersedes iter163c).}
 A consistency-model loss \cite{songConsistencyModels2023} that
 \emph{trains} the iteration map to satisfy the FP equation
 $T(z^\star)=z^\star$ at the operating point, rather than enforcing it via
 a refuted soft penalty (iter155 Lyapunov, refuted by iter152's empirical
 $\rho \ll \sigma_{\max}$ gap).  A single architecture-agnostic term anchors
-every gradient-carrying intermediate to the most-converged available FP
-proxy:
+each gradient-carrying intermediate to its NEXT-DEEPER intermediate:
 \begin{equation}
   \mathcal{L}_{\rm consist}
-    = \lambda_a \cdot \frac{1}{|S|}
-      \sum_{i \in S}
-       \left\| z_i - \mathrm{stopgrad}(z_{K+1}) \right\|_2^2,
+    = \lambda_a \cdot \frac{1}{|S|-1}
+      \sum_{i \in [0, |S|-2]}
+       \left\| z_{S_i} - \mathrm{stopgrad}(z_{S_{i+1}}) \right\|_2^2,
 \end{equation}
-where $S$ is the union of (a) the iter152 prefix-anchor depths
-$\{16, 24, 32, \ldots\}$ and (b) the last $b-1$ iterations of the
-$K$-sampled forward (TBPTT augmentation, where $b = $\texttt{deq\_bptt\_k});
-$z_{K+1}$ is computed by a \emph{single} no-grad Parcae two-state iter from
-$z_K$ (initializing $y=z_K$, exact at the FP); $\lambda_a = 0.1$ by default.
-Pairing every $z_i$ with $z_{K+1}$ (rather than with $z_{i+1}$) is strictly
-stronger than pair-with-next: signal magnitude is ``distance from FP'',
-not just one-step residual, and there is no trivial-zero collapse risk
-because the target is input-driven ($z_{K+1} = F(z_K, x_0)$, not constant).
-Implicitly enforces $\rho(J_F) < 1$ because consistency only minimizes if
-the iteration map is contractive at the operating point.
+where $S = (8, 16, 24, 32, 64, 128)$ is the iter172 default prefix-anchor
+depth set (\texttt{deq\_prefix\_anchor\_set}), and the K=8 shallow anchor
+ensures non-trivial consistency-pair coverage at K\_sampled=16 (~88\% of
+training steps under the iter163-default jitter weights).  Transitivity at
+the FP makes recursive pairing asymptotically equivalent to a single
+``Final-K-as-GT'' target $\|z_i - \mathrm{stopgrad}(z_{K+1})\|^2$, but
+\emph{the recursive form preserves the optimization landscape}: iter170's
+all-to-deepest variant (target $= z_K$ for all $i$) was REFUTED at $+65$
+mBPB regression (\texttt{rho\_F} collapsed to $\sim 0$ as the optimizer
+flattened $F$ along every degenerate direction).  Recursive pairs only
+require LOCAL contraction over each depth range $[S_i, S_{i+1}]$, a
+feasible non-degenerate solution.  Implicitly enforces $\rho(J_F) < 1$
+because consistency only minimizes if the iteration map is contractive at
+the operating point: empirically iter172 achieves $\rho_F = 0.77$ at
+$K=128$ (vs iter163's 0.92).
+$\lambda_a = 0.1$ by default; no extension term (iter163's
+$\mathcal{L}_{\rm ext}$ refuted by iter163c v2, $+22$ mBPB regression at
+$\Delta = 1$ and $1.6\times$ step time at $\Delta = K_{\rm train}$).
 
-Cost: $\sim$1.05--1.10$\times$ iter152 step time (was $1.6\times$ under
-iter163's extension at $\Delta = K_{\rm train} \approx 22$ no-grad iters
-per step).  iter163 (with $\mathcal{L}_{\rm ext}$ at $\Delta = K_{\rm train}$)
-measured $\rho_F: 1.30 \to 0.92$ over training; iter163c should match or
-exceed this because the anchor-on-deepest target gives stronger directional
-signal toward the actual basin's FP, not just any FP.
+Cost: $\sim$1.00$\times$ iter152 step time (target $z_{S_{i+1}}$ is
+already produced by the main prefix-anchor forward; zero extra forward
+compute).  K-sweep uniformly $\sim 9$ mBPB better than iter163 across
+$K \in [16, 128]$.  The K=8 shallow anchor is the only departure from
+iter163's anchor set ($S_{\rm iter163} = (16, 24, 32, 64, 96, 128)$,
+itself fallback to \texttt{deq\_k\_jitter\_set}); the gap$=$8 (between K=8
+and K=16) preserves iter163's healthy regime while iter170/171's K=4
+(gap$=$12) collapsed $\rho_F \to 0$.
 
 The total loss used for backpropagation is
 \[

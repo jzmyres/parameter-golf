@@ -58,12 +58,22 @@ class TestIter171RecursiveAnchor(unittest.TestCase):
             torch.randint(0, 64, (B, T)).to(dev),
         )
 
-    def test_hyperparameter_defaults_match_promoted_iter163c(self):
-        """iter170 (2026-05-16) keeps anchor_coef=0.1 as the only consistency
-        knob. The REMOVED knobs (`multi_k_consistency_extension_coef`,
+    def test_hyperparameter_defaults_match_promoted_iter172(self):
+        """iter172 (2026-05-17, PROMOTED at val_bpb=1.462898 vs iter163's
+        1.471598 = −8.7 mBPB) anchor_coef=0.1 + prefix_anchor_set with K=8
+        shallow anchor. The REMOVED knobs (`multi_k_consistency_extension_coef`,
         `multi_k_consistency_extension_delta`, `multi_k_consistency_target_delta`)
         must NOT reappear via copy-paste regression."""
         self.assertEqual(Hyperparameters.multi_k_consistency_anchor_coef, 0.1)
+        self.assertEqual(
+            Hyperparameters.deq_prefix_anchor_set,
+            (8, 16, 24, 32, 64, 128),
+            "iter172 promoted with K=8 shallow anchor (gap=8 to next-deeper "
+            "K=16, matching iter163's healthy regime). Default must NOT revert "
+            "to () fallback (loses the K=8 anchor that gives consistency loss "
+            "a non-trivial pair at K_sampled=16) or to iter170's K=4 (gap=12 "
+            "collapsed rho_F→0)."
+        )
         for removed in (
             "multi_k_consistency_extension_coef",
             "multi_k_consistency_extension_delta",
@@ -72,37 +82,41 @@ class TestIter171RecursiveAnchor(unittest.TestCase):
             self.assertFalse(
                 hasattr(Hyperparameters, removed),
                 f"{removed} was removed — must not reappear as a Hyperparameter "
-                "field; iter170 uses z_K_sampled as target with no extra knobs."
+                "field; iter172 uses recursive z_{i+1}.detach() target with no "
+                "extra knobs."
             )
 
     def test_anchor_loss_fires_on_multi_anchor_z_stack(self):
         """With prefix anchors {2, 3, 4} at K_sampled=4, z_stack has 3 entries
-        (z_2, z_3, z_4). Target = z_4.detach(); pairs are (z_2, z_4.det) and
-        (z_3, z_4.det) = 2 non-trivial pairs."""
+        (z_2, z_3, z_4). iter172 uses RECURSIVE nearest-neighbor pairing:
+        pairs are (z_2, z_3.det) and (z_3, z_4.det) = 2 non-trivial pairs.
+        (iter170's all-to-deepest variant pairing both z_2 and z_3 with z_4
+        was REFUTED at +65 mBPB regression; do NOT reintroduce.)"""
         m = self._make(anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(2, 3, 4))
         x, y = self._batch(m)
         _ = m(x, y)
         self.assertIsNotNone(m._consistency_anchor_loss_t)
         loss = float(m._consistency_anchor_loss_t.detach())
         self.assertGreater(loss, 0.0,
-            "anchor loss must be > 0 when z_2 != z_4 (typical pre-trained state)")
+            "anchor loss must be > 0 when consecutive anchors differ")
 
     def test_anchor_loss_skipped_with_single_anchor(self):
-        """K_sampled=16 with default prefix anchor set (= jitter set) has only
-        one anchor (z_16) — z_stack.shape[0] == 1 → z_stack[:-1] is empty →
+        """K_sampled=16 with a prefix anchor set containing only one match
+        (e.g. {16}) has z_stack.shape[0] == 1 → z_stack[:-1] is empty →
         loss must NOT fire (no pairs to compute). This is the K_sampled=16
-        coverage gap that iter170's CLI override fixes by adding K=4 to
-        prefix_anchor_set."""
+        coverage gap that iter172's default anchor set fixes by including
+        K=8 as a shallow anchor."""
         m = self._make(anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(4,))
         x, y = self._batch(m)
         _ = m(x, y)
         self.assertIsNone(m._consistency_anchor_loss_t,
             "z_stack with only 1 entry produces no pairs; loss must be None")
 
-    def test_anchor_loss_with_k4_addition_fires_at_small_K(self):
-        """iter170 CLI override: add K=4 to prefix_anchor_set. At K_sampled=4
-        (test proxy for K_sampled=16 in production), anchors = {2, 4} → 1 pair
-        (z_2, z_4.det). This is the principled fix for the single-anchor gap."""
+    def test_anchor_loss_with_shallow_anchor_fires_at_small_K(self):
+        """iter172 design: include a shallow anchor (K=8 in production) so
+        even small K_sampled produces a pair. At K_sampled=4 (test proxy for
+        K_sampled=16 in production), anchors = {2, 4} → 1 pair (z_2, z_4.det).
+        This is the principled fix for the single-anchor coverage gap."""
         m = self._make(anchor_coef=0.1, bptt_k=1, prefix_anchor_set=(2, 4))
         x, y = self._batch(m)
         _ = m(x, y)
