@@ -1,22 +1,22 @@
-"""iter170 anchor-on-deepest consistency anchor tests (2026-05-16).
+"""iter171 recursive nearest-neighbor consistency anchor tests (2026-05-16).
 
-Single loss term — anchor every shallower gradient-carrying z to the DEEPEST
-gradient-carrying z in z_stack (= z at K_sampled, the final TBPTT depth):
+Single loss term — pair each prefix-anchor z_i with its NEXT-DEEPER z_{i+1}:
 
-    L_anchor = anchor_coef * mean_{i in z_stack[:-1]} ‖z_i − z_stack[-1].detach()‖²
+    L_anchor = anchor_coef * mean_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²
 
-The target is z_K_sampled itself (the last entry in z_stack from the prefix-
-anchor forward). Zero extra forward compute — the target is already produced
-by the main gradient-carrying forward. Architecture-agnostic per CLAUDE.md
-most-principled-simplest-general directive.
+This is iter163's PROMOTED recursive anchor formula. Zero extra forward
+compute. Architecture-agnostic per CLAUDE.md most-principled-simplest-general.
 
-Supersedes prior designs:
-  iter163c v2 (target z_{K+1} via 1 no-grad iter): REFUTED, val_bpb +22 mBPB.
-  iter167 (target z_{K+8}, Δ=8 no-grad iters): subsumed (z_K_sampled is free).
+Supersedes iter170's all-to-deepest design (REFUTED at step 200 val with
+val_bpb=2.067 vs baseline 2.003, +65 mBPB regression). iter170's all-to-
+deepest pairing had ρ → 0 as its unique global minimum — model satisfied
+all pairs simultaneously by making F flat in z (degenerate DEQ, mlp_ortho
+exploded +0.40). Recursive pairs only require LOCAL contraction over each
+depth range; ρ ≈ 0.85 is a feasible solution.
 
-K_sampled=16 case: with only one prefix anchor, z_stack[:-1] is empty and no
-consistency pair fires; the principled fix is to broaden deq_prefix_anchor_set
-to include a shallow K (e.g. K=4), tested via the iter170 CLI override.
+K_sampled=16 case: with only one prefix anchor, no pair fires; the
+principled fix is to add a shallow anchor (K=4) via the CLI override
+`--deq-prefix-anchor-set "4,16,32,64,128,256"`.
 """
 import os
 import sys
@@ -31,7 +31,7 @@ from train_gpt import Hyperparameters
 from test_arch import _make_model
 
 
-class TestIter170AnchorOnDeepest(unittest.TestCase):
+class TestIter171RecursiveAnchor(unittest.TestCase):
     """All tests use a tiny CPU-friendly model with prefix anchors at
     multiple depths so the anchor loss has multiple z_stack entries."""
 
@@ -159,26 +159,32 @@ class TestIter170AnchorOnDeepest(unittest.TestCase):
         self.assertTrue(had_grad,
             "anchor consistency loss must produce non-zero gradients")
 
-    def test_anchor_loss_uses_z_stack_last_as_target(self):
-        """Structural assertion via source inspection: iter170 target must be
-        `z_stack[-1].detach()` and pairs must be `z_stack[:-1] - target`. No
-        no-grad Parcae two-state extension loop (that was iter163c v2 / iter167)."""
+    def test_anchor_loss_uses_recursive_pairs(self):
+        """Structural assertion via source inspection: iter171 uses recursive
+        pairs `(z_stack[:-1] - z_stack[1:].detach()).pow(2).mean()`. The
+        all-to-deepest formula `(z_stack[:-1] - z_stack[-1].unsqueeze(0).detach())`
+        from iter170 must NOT appear (it caused ρ → 0 degeneracy at s200)."""
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
-        self.assertIn("target = z_stack[-1].detach()", src,
-            "iter170: target must be the deepest gradient-carrying z (z_stack[-1])")
-        self.assertIn("(z_stack[:-1] - target.unsqueeze(0)).pow(2).mean()", src,
-            "iter170: pairs must use z_stack[:-1] vs target (skip degenerate "
-            "(z_K, z_K) pair)")
-        # Negative assertions: extension/no-grad-loop machinery must be gone.
+        # iter171 recursive formula — pairs adjacent z_stack entries
+        self.assertIn("(z_stack[:-1] - z_stack[1:].detach()).pow(2).mean()", src,
+            "iter171: anchor loss must use recursive nearest-neighbor pairs "
+            "(z_stack[:-1] vs z_stack[1:].detach()); the all-to-deepest "
+            "formula from iter170 caused ρ → 0 degeneracy at s200.")
+        # Negative assertion: iter170's all-to-deepest pattern must NOT reappear
+        self.assertNotIn("target = z_stack[-1].detach()", src,
+            "iter170's all-to-deepest target (`z_stack[-1].detach()`) was "
+            "REFUTED at s200 (val_bpb +65 mBPB, mlp_ortho +0.40). Must not "
+            "reappear via copy-paste regression.")
+        self.assertNotIn("(z_stack[:-1] - target.unsqueeze(0)).pow(2).mean()", src,
+            "iter170's all-to-deepest pair formula was REFUTED.")
+        # Negative assertions for removed extension/no-grad-loop machinery
         self.assertNotIn("def _consistency_extend_no_grad", src,
-            "_consistency_extend_no_grad helper was removed; iter170 uses no "
-            "no-grad extension at all.")
+            "_consistency_extend_no_grad helper was removed.")
         self.assertNotIn("multi_k_consistency_target_delta", src,
-            "multi_k_consistency_target_delta was removed; iter170 has no Δ "
-            "knob because the target is z_stack[-1] itself.")
+            "multi_k_consistency_target_delta was removed.")
         self.assertNotIn("multi_k_consistency_extension_coef", src,
-            "iter163 extension term was removed and must not reappear.")
+            "iter163 extension term was removed.")
 
 
 if __name__ == "__main__":
