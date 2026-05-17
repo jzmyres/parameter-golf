@@ -1033,7 +1033,14 @@ _EVAL_PROFILES: dict[str, EvalProfile] = {
     "debug": EvalProfile(k_sweep_values=(16,)),
     "submission": EvalProfile(k_sweep_values=(16, 24, 64, 128)),
     "diagnostic": EvalProfile(
-        k_sweep_values=(4, 8, 16, 17, 24, 32, 37, 64, 113, 128),
+        # K=192 added 2026-05-17 for extrapolation perf test: 50% deeper than
+        # max-trained K=128 in iter172/iter173, tests whether the rho_F<1
+        # contraction basin extends beyond the trained-K cap. If val_bpb at
+        # K=192 ≈ K=128, the model has wide-basin convergence (good); if
+        # K=192 degrades, the consistency loss is overfitting to trained K.
+        # For iter174 (K=256 in jitter), K=192 becomes an interpolation point
+        # between trained K=128 and K=256.
+        k_sweep_values=(4, 8, 16, 17, 24, 32, 37, 64, 113, 128, 192),
     ),
 }
 
