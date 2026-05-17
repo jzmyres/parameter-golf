@@ -866,6 +866,25 @@ class Hyperparameters:
     # Framework normalizes weights internally; raw values shown for clarity.
     deq_k_jitter_set = (16, 24, 32, 64, 96, 128)
     deq_k_jitter_weights = (0.50, 0.40, 0.07, 0.03, 0.015, 0.0075)
+    # iter173 (2026-05-17): K-jitter weight annealing curriculum. Linearly
+    # interpolates `deq_k_jitter_weights` → `deq_k_jitter_weights_final` over
+    # the training window [anneal_start_frac, anneal_end_frac] · total_steps.
+    # Empty `deq_k_jitter_weights_final` = annealing DISABLED (default OFF
+    # preserves iter172 behavior). Hypothesis: iter172 achieved rho_F=0.77
+    # at K=128 (vs iter163's 0.92) — model is "ready" for deeper K. By
+    # gradually shifting probability mass toward K∈{64,96,128} over training,
+    # the model practices the deep-K regime that K-sweep eval actually uses.
+    # Final distribution (0.125,0.125,0.125,0.125,0.25,0.25) → E[K] ≈ 51 vs
+    # the iter172 start E[K] ≈ 22.9 (~2.2× deeper). Anneal window [0.3, 0.9]
+    # leaves the first 30% of training at iter172's biased weights (so basic
+    # FP convergence is locked in before pushing depth), and finishes by
+    # step 0.9·N to let the optimizer settle at the deep distribution before
+    # final eval. Cost: deep-K steps are slower (K=128 ≈ 6× K=16 cost), so
+    # E[step_cost] increases ~2.2× over the anneal window — expected total
+    # wallclock impact ~1.5× iter172 baseline at default schedule.
+    deq_k_jitter_weights_final: tuple[float, ...] = ()
+    deq_k_jitter_anneal_start_frac: float = 0.3
+    deq_k_jitter_anneal_end_frac: float = 0.9
     deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
     # iter152: conditional prefix-K multi-anchor supervision. Default OFF.
     # When enabled, a sampled K still performs one K-step solve, but the train
@@ -1096,6 +1115,8 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
     "deq-k-min", "deq-k-max", "deq-k-step", "deq-k-eval",
     "deq-k-jitter-set", "deq-k-jitter-weights", "deq-bptt-k",
+    "deq-k-jitter-weights-final", "deq-k-jitter-anneal-start-frac",
+    "deq-k-jitter-anneal-end-frac",
     "deq-prefix-anchor-set",
     "fast-val-k-sweep-set",
     "deq-beta", "deq-beta-jitter-set",
@@ -2122,6 +2143,45 @@ def _normalize_k_jitter_weights(values, weights) -> tuple[list[int], list[float]
     return vals, [w / weight_sum for w in ws]
 
 
+def _compute_annealed_k_jitter_weights(
+    initial: tuple[float, ...] | list[float],
+    final: tuple[float, ...] | list[float],
+    step: int,
+    total_steps: int,
+    start_frac: float,
+    end_frac: float,
+) -> tuple[float, ...]:
+    """iter173 K-jitter weight annealing curriculum (2026-05-17).
+
+    Returns weights interpolated linearly between `initial` and `final` over
+    the training window [start_frac, end_frac] · total_steps. Returns
+    `initial` unchanged when `final` is empty (annealing disabled), when
+    `step` is before `start_frac · total_steps`, or when lengths don't match.
+    Returns `final` after `end_frac · total_steps`.
+
+    Hypothesis (iter173): iter172 achieved rho_F=0.77 at K=128 (vs iter163's
+    0.92), so the model is "ready" for deeper K. Gradually shifting K-jitter
+    probability mass toward larger K teaches the model to use the depth that
+    K-sweep eval actually uses, without paying deep-K compute cost for the
+    full training run."""
+    init_t = tuple(float(w) for w in initial)
+    if not final or len(final) != len(init_t) or total_steps <= 0:
+        return init_t
+    final_t = tuple(float(w) for w in final)
+    start_step = int(total_steps * float(start_frac))
+    end_step = int(total_steps * float(end_frac))
+    if step <= start_step:
+        return init_t
+    if step >= end_step:
+        return final_t
+    span = max(1, end_step - start_step)
+    alpha = float(step - start_step) / float(span)
+    return tuple(
+        (1.0 - alpha) * i + alpha * f
+        for i, f in zip(init_t, final_t)
+    )
+
+
 def _prefix_anchor_depths(sampled_k: int, values) -> tuple[int, ...]:
     """Return traversed prefix anchors for iter152 multi-anchor supervision.
 
@@ -2208,6 +2268,17 @@ class KShuffleBagSampler:
         return int(self._bag.pop())
 
     def reset(self) -> None:
+        self._bag.clear()
+
+    def set_weights(self, weights: list[float] | tuple[float, ...]) -> None:
+        """Update per-K weights and clear cached bag so next sample() rebuilds
+        with the new distribution. Used by iter173 K-jitter annealing curriculum
+        to gradually shift sampling mass toward larger K over training. No-op
+        when the new weights equal the current ones (caller's responsibility
+        to discretize if avoiding bag-rebuild churn matters)."""
+        if self.values is None:
+            raise ValueError("set_weights requires explicit values")
+        self.values, self.weights = _normalize_k_jitter_weights(self.values, list(weights))
         self._bag.clear()
 
     def state_dict(self) -> dict[str, object]:
@@ -7753,6 +7824,38 @@ def main() -> None:
                                     values=list(_k_jitter_set) if _k_jitter_set else None,
                                     weights=list(_k_jitter_weights) if _k_jitter_weights else None)
     k_sample_counts: Counter[int] = Counter()
+    # iter173 K-jitter annealing curriculum: re-discretize the current weights
+    # at integer permille resolution and only rebuild the sampler bag when
+    # the rounded weights actually changed. This keeps per-step overhead at
+    # one short tuple comparison while still tracking the linear interpolation
+    # smoothly enough (1000 distinct stages over the anneal window).
+    _k_jitter_weights_final = tuple(getattr(args, "deq_k_jitter_weights_final", ()) or ())
+    _k_jitter_anneal_active = bool(
+        _k_jitter_weights_final
+        and len(_k_jitter_weights_final) == len(_k_jitter_weights or ())
+    )
+    _k_jitter_anneal_start = float(getattr(args, "deq_k_jitter_anneal_start_frac", 0.3))
+    _k_jitter_anneal_end = float(getattr(args, "deq_k_jitter_anneal_end_frac", 0.9))
+    _k_jitter_anneal_total = int(args.iterations)
+    _last_quantized_weights: tuple[int, ...] = ()
+
+    def _maybe_anneal_k_jitter_weights(step_i: int) -> None:
+        nonlocal _last_quantized_weights
+        if not _k_jitter_anneal_active:
+            return
+        new_weights = _compute_annealed_k_jitter_weights(
+            initial=_k_jitter_weights or (),
+            final=_k_jitter_weights_final,
+            step=step_i,
+            total_steps=_k_jitter_anneal_total,
+            start_frac=_k_jitter_anneal_start,
+            end_frac=_k_jitter_anneal_end,
+        )
+        quantized = tuple(int(round(w * 1000.0)) for w in new_weights)
+        if quantized != _last_quantized_weights:
+            if rank == 0:
+                k_sampler.set_weights(list(new_weights))
+            _last_quantized_weights = quantized
 
     def deq_k_for_step(step_i: int) -> int:
         # Short-circuit when jitter is disabled — broadcasting a constant
@@ -7762,6 +7865,7 @@ def main() -> None:
             k_fixed = int(args.deq_k_max)
             k_sample_counts[k_fixed] += 1
             return k_fixed
+        _maybe_anneal_k_jitter_weights(step_i)
         k = 0
         if rank == 0:
             k = int(k_sampler.sample())
