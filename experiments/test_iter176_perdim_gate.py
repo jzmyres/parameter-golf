@@ -53,21 +53,39 @@ class TestIter176PerdimGateConstruction(unittest.TestCase):
         self.assertEqual(m.perdim_gate_bias.shape, (4, 32))
 
     def test_gate_params_per_expert_independent(self):
-        """Per CLAUDE.md expert independence: each expert owns its own U/V/b."""
+        """Per CLAUDE.md expert independence: each expert owns its own U/V/b
+        as distinct Parameters. iter176b's standard-LoRA init makes U xavier-
+        random per expert (distinct by sampling) and V zero. Independence test:
+        modifying expert 0's slice must not affect expert 1's slice."""
         m = MLP(dim=16, mlp_mult=2.0, num_experts=4, expert_rank=4,
                 use_perdim_gate=True, perdim_gate_rank=4)
-        # Check that init produced different values per expert (xavier_uniform_
-        # is stochastic per expert), confirming the params are not shared.
-        u0, u1 = m.perdim_gate_u.data[0], m.perdim_gate_u.data[1]
-        v0, v1 = m.perdim_gate_v.data[0], m.perdim_gate_v.data[1]
-        self.assertFalse(torch.equal(u0, u1),
-            "perdim_gate_u[0] and [1] must differ (per-expert independence)")
-        self.assertFalse(torch.equal(v0, v1),
-            "perdim_gate_v[0] and [1] must differ (per-expert independence)")
+        u1_before = m.perdim_gate_u.data[1].clone()
+        # Per-expert slices are distinct objects, modifiable independently.
+        with torch.no_grad():
+            m.perdim_gate_u.data[0].fill_(0.5)
+        self.assertTrue(torch.all(m.perdim_gate_u.data[0] == 0.5))
+        self.assertTrue(torch.equal(m.perdim_gate_u.data[1], u1_before),
+            "modifying expert 0 must not affect expert 1 (no parameter sharing)")
+        # Also verify xavier init produced distinct U slices across experts.
+        u0_init = m.perdim_gate_u.data.clone()  # all xavier
+        with torch.no_grad():
+            m.perdim_gate_u.data.zero_()
+            for e in range(4):
+                torch.nn.init.xavier_uniform_(m.perdim_gate_u.data[e])
+        # All four slices should differ (probability ~1 with xavier_uniform_)
+        for i in range(4):
+            for j in range(i + 1, 4):
+                self.assertFalse(torch.equal(m.perdim_gate_u.data[i],
+                                              m.perdim_gate_u.data[j]),
+                    f"xavier init: U[{i}] and U[{j}] must differ")
 
 
-class TestIter176PerdimGateEffect(unittest.TestCase):
-    """Flag-to-effect contract: flipping the flag changes the MLP output."""
+class TestIter176bIdentityInit(unittest.TestCase):
+    """iter176b strict-generalization principle: at init, the gated forward
+    must be ≈ identical to the disabled-gate forward (gate ≈ 1.0). Per
+    CLAUDE.md strict-generalization rule, the functional class contains
+    iter172 AND the init matches iter172 — so the optimizer is free to
+    learn deviations only if they reduce loss."""
 
     def _setup_pair(self):
         torch.manual_seed(0)
@@ -76,7 +94,7 @@ class TestIter176PerdimGateEffect(unittest.TestCase):
         torch.manual_seed(0)
         m_on = MLP(dim=32, mlp_mult=2.0, num_experts=4, expert_rank=8,
                    use_perdim_gate=True, perdim_gate_rank=8)
-        # Copy shared params so only the gate creates the divergence
+        # Copy shared (non-gate) params so only the gate creates any divergence
         with torch.no_grad():
             m_on.expert_gate.copy_(m_off.expert_gate)
             m_on.expert_fc.copy_(m_off.expert_fc)
@@ -86,26 +104,11 @@ class TestIter176PerdimGateEffect(unittest.TestCase):
             m_on.hidden_norm_weight.copy_(m_off.hidden_norm_weight)
         return m_off, m_on
 
-    def test_gated_output_differs_from_disabled(self):
-        """Flag-to-effect: with all shared params copied, the gate alone must
-        change the per-token output."""
-        m_off, m_on = self._setup_pair()
-        torch.manual_seed(42)
-        x = torch.randn(2, 8, 32)
-        # Mock router weights (uniform over 4 experts so off-path doesn't
-        # collapse the difference).
-        w = torch.ones(2 * 8, 4) / 4
-        with torch.no_grad():
-            out_off = m_off.mix_experts(x, w)
-            out_on = m_on.mix_experts(x, w)
-        max_abs_diff = (out_on - out_off).abs().max().item()
-        self.assertGreater(max_abs_diff, 1e-4,
-            f"gated output must differ from disabled (max |Δ|={max_abs_diff:.2e})")
-
-    def test_gated_output_near_half_at_init(self):
-        """At init with xavier U/V and zero b, σ(VU·x) ≈ σ(small ≈ 0) ≈ 0.5,
-        so gated output magnitude is ~half the disabled output. Confirms
-        the init doesn't accidentally produce extreme on/off mask."""
+    def test_strict_generalization_at_init(self):
+        """STRICT-GEN: at init, gated output must be ≈ disabled output.
+        With U=0 and bias=+6.0, gate = σ(0·V + 6.0) = σ(6.0) ≈ 0.9975 ≈ 1.0.
+        Relative error per element should be < 0.5% (the 0.25% sigmoid
+        deviation from 1.0)."""
         m_off, m_on = self._setup_pair()
         torch.manual_seed(42)
         x = torch.randn(2, 8, 32)
@@ -113,18 +116,41 @@ class TestIter176PerdimGateEffect(unittest.TestCase):
         with torch.no_grad():
             out_off = m_off.mix_experts(x, w)
             out_on = m_on.mix_experts(x, w)
-        # Ratio should be roughly 0.4-0.6 elementwise (mostly near 0.5)
+        # Gate ≈ 0.9975 → output is 0.9975× the disabled output. Max relative
+        # error should be near 0.5% (sigmoid deviation + softmax_route renorm).
         nz = out_off.abs() > 1e-4
         if nz.any():
-            ratio = (out_on[nz].abs() / out_off[nz].abs()).mean().item()
-            self.assertGreater(ratio, 0.2,
-                f"gated/disabled ratio={ratio:.3f} suspiciously small at init")
-            self.assertLess(ratio, 1.0,
-                f"gated/disabled ratio={ratio:.3f} should be < 1 at init "
-                "(sigmoid masks at ~0.5)")
+            ratio = (out_on[nz] / out_off[nz]).abs()
+            mean_ratio = ratio.mean().item()
+            max_ratio = ratio.max().item()
+            min_ratio = ratio.min().item()
+            # All ratios should be very close to 1.0
+            self.assertAlmostEqual(mean_ratio, 1.0, places=2,
+                msg=f"identity init: mean(out_on/out_off)={mean_ratio:.4f} should be ≈ 1.0")
+            self.assertGreater(min_ratio, 0.95,
+                f"identity init: min ratio={min_ratio:.4f} should be > 0.95")
+            self.assertLess(max_ratio, 1.05,
+                f"identity init: max ratio={max_ratio:.4f} should be < 1.05")
 
-    def test_gradient_flows_to_gate_params(self):
-        """The gate must produce nonzero gradients on U / V / b."""
+    def test_init_values_are_strict_identity(self):
+        """U is xavier-random, V is exactly zero, bias is exactly +6.0 —
+        standard LoRA convention (Hu et al. 2021) per iter176b strict-gen fix.
+        Forward: gate = σ(V·U·x + b) = σ(0·U·x + 6.0) = σ(6.0) ≈ 1.0."""
+        m = MLP(dim=16, mlp_mult=2.0, num_experts=4, expert_rank=4,
+                use_perdim_gate=True, perdim_gate_rank=4)
+        # U must be NONZERO (xavier_uniform_ produces random values bounded
+        # away from zero — std ~ sqrt(2/(D+R)))
+        self.assertGreater(m.perdim_gate_u.abs().sum().item(), 0.0,
+            "perdim_gate_u must be xavier-nonzero (gives V immediate gradient)")
+        self.assertTrue(torch.all(m.perdim_gate_v.data == 0.0),
+            "perdim_gate_v must be zero at init (LoRA up-projection zero-init)")
+        self.assertTrue(torch.all(m.perdim_gate_bias.data == 6.0),
+            "perdim_gate_bias must be +6.0 at init (σ(6.0) ≈ 1.0)")
+
+    def test_gradient_flows_after_first_step(self):
+        """V and bias must have nonzero grad at init. U has zero grad at init
+        (since V=0 → ∂gate/∂U = 0), but receives grad once V drifts. Standard
+        LoRA training-dynamics property (warm-start through V)."""
         torch.manual_seed(0)
         m = MLP(dim=16, mlp_mult=2.0, num_experts=4, expert_rank=4,
                 use_perdim_gate=True, perdim_gate_rank=4)
@@ -134,11 +160,13 @@ class TestIter176PerdimGateEffect(unittest.TestCase):
         out = m.mix_experts(x, w)
         loss = out.pow(2).mean()
         loss.backward()
-        for pname in ("perdim_gate_u", "perdim_gate_v", "perdim_gate_bias"):
-            p = getattr(m, pname)
-            self.assertIsNotNone(p.grad, f"{pname} grad is None")
-            self.assertGreater(p.grad.abs().sum().item(), 0.0,
-                f"{pname} grad is all-zero (no learning signal)")
+        # V and bias receive immediate gradient (V via U·x; bias via direct path)
+        self.assertGreater(m.perdim_gate_v.grad.abs().sum().item(), 0.0,
+            "perdim_gate_v grad must flow at init (∂L/∂V = ∂L/∂pre · U·x ≠ 0)")
+        self.assertGreater(m.perdim_gate_bias.grad.abs().sum().item(), 0.0,
+            "perdim_gate_bias grad must flow at init")
+        # U grad at init is ZERO (∂L/∂U = ∂L/∂pre · V = 0 when V=0).
+        # This is expected LoRA zero-init behavior; U warms up via V's drift.
 
 
 class TestIter176PerdimGateDisabledBitParity(unittest.TestCase):

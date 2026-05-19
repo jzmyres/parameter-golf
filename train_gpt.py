@@ -978,15 +978,20 @@ class Hyperparameters:
     attn_expert_rank = 64
     mlp_expert_rank = 96
 
-    # iter176 (2026-05-18): per-dim sigmoid gate per MLP expert. Each expert's
+    # iter176 (2026-05-18) — per-dim sigmoid gate per MLP expert. Each expert's
     # output (after expert_down) is multiplied element-wise by a per-expert
     # per-token sigmoid gate computed from the input x via a low-rank LoRA
-    # projection: gate_e(x) = σ(V_e (U_e x) + b_e) ∈ (0, 1)^D. Tests whether
-    # turning each expert from a fixed feature direction into a CONDITIONAL
-    # family of feature directions (input-dependent per-dim masking) lifts
-    # val_bpb on top of iter172. Default OFF preserves iter172 behavior.
-    # Distinct from iter146-disabled per-expert SCALAR sigmoid gate: this
-    # gives O(E*D) bits of conditional info vs O(E) — 768× richer.
+    # projection: gate_e(x) = σ(V_e (U_e x) + b_e) ∈ (0, 1)^D.
+    # iter176b (2026-05-19) — STRICT-GENERALIZATION init (LoRA convention,
+    # Hu et al. 2021): U xavier (down), V zeros (up), bias +6.0 → at init
+    # gate = σ(V·U·x + b) = σ(0·U·x + 6.0) ≈ 0.9975 ≈ 1.0 → forward
+    # ≡ iter172 baseline. Optimizer is free to learn V ≠ 0 only if it
+    # reduces loss; if redundant with the diversity loss, V stays near zero
+    # and val_bpb matches iter172. Per CLAUDE.md strict-generalization:
+    # at worst this matches iter172, never regresses.
+    # (iter176 used the wrong init — xavier U/V + bias=0 → σ ≈ 0.5 →
+    # halved expert outputs at init, violating strict-gen and showing
+    # transient early lead followed by regression as warmup completed.)
     # Cost at rank=16: 16 (rank) * 768 (D) * 2 (U+V) * 16 (experts) +
     # 16 * 768 (bias) = 405K params per MLP layer. Step time +5-10%.
     # RevDEQ-safe: sigmoid is differentiable + bounded + monotonic;
@@ -1144,7 +1149,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "deq-k-jitter-anneal-end-frac",
     "deq-prefix-anchor-set",
     "fast-val-k-sweep-set",
-    "use-expert-perdim-gate", "expert-perdim-gate-rank",
+    "expert-perdim-gate-rank",
     "deq-beta", "deq-beta-jitter-set",
     "warmdown-frac", "num-refinements-ramp-frac",
     "weight-decay",
@@ -3824,16 +3829,30 @@ class MLP(nn.Module):
         self.perdim_gate_rank = int(perdim_gate_rank) if self.use_perdim_gate else 0
         if self.use_perdim_gate:
             R_g = self.perdim_gate_rank
+            # iter176b (2026-05-19) — STRICT-GENERALIZATION init (CLAUDE.md rule):
+            #   U init xavier (LoRA "down" projection, like LoRA A)
+            #   V init ZEROS  (LoRA "up" projection, like LoRA B)
+            #   bias init +6.0
+            # Forward: gate = σ(V·(U·x) + b) = σ(0·U·x + 6.0) = σ(6.0) ≈ 0.9975
+            # → gate ≈ 1.0 at init → e_i_gated ≈ e_i → forward ≡ iter172 baseline
+            # Gradient at init: ∂L/∂V = ∂L/∂pre · U·x ≠ 0 (V trains immediately);
+            # ∂L/∂U = ∂L/∂pre · V = 0 (U trains only after V drifts from zero)
+            # — matches the standard LoRA convention (Hu et al. 2021).
+            # The previous iter176 init (xavier U/V + bias=0 → σ ≈ 0.5) HALVED
+            # each expert's output at init, violating strict-generalization: the
+            # functional class contained iter172 but the INIT did not match it.
+            # iter176 ran with that bug and showed transient early lead followed
+            # by lead evaporation as the regularizer-warmup completed (the gate
+            # was double-counted with diversity loss). iter176b: optimizer is
+            # free to learn V ≠ 0 ONLY if it reduces loss; if redundant with
+            # the diversity loss, V stays near zero and val_bpb matches iter172.
+            # Per CLAUDE.md strict-generalization: at worst this matches iter172,
+            # never regresses.
             self.perdim_gate_u = nn.Parameter(torch.empty(num_experts, R_g, dim))
-            self.perdim_gate_v = nn.Parameter(torch.empty(num_experts, dim, R_g))
-            # Init bias to a small negative value so the sigmoid starts near 0.5
-            # (logit 0 ↔ gate 0.5) but slightly biased toward 0.5 — keeps the
-            # gated forward close to identity at init so the model doesn't
-            # have to fight a strong on/off mask before learning.
-            self.perdim_gate_bias = nn.Parameter(torch.zeros(num_experts, dim))
+            self.perdim_gate_v = nn.Parameter(torch.zeros(num_experts, dim, R_g))
+            self.perdim_gate_bias = nn.Parameter(torch.full((num_experts, dim), 6.0))
             for e in range(num_experts):
                 nn.init.xavier_uniform_(self.perdim_gate_u.data[e])
-                nn.init.xavier_uniform_(self.perdim_gate_v.data[e])
 
     def mix_experts(self, x: Tensor, w: Tensor, *,
                     num_shared: int = 0, shared_gate: Tensor | None = None) -> Tensor:
