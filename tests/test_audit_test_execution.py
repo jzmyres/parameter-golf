@@ -26,12 +26,14 @@ SCRIPT_PATH = REPO_ROOT / "experiments" / "run_audit_tests.sh"
 CLAUDE_MD = REPO_ROOT / "CLAUDE.md"
 
 
+_SCRIPT_PARSE_CACHE: list[str] | None = None
+_CLAUDE_PARSE_CACHE: list[str] | None = None
+
+
 def _parse_audit_tests_from_script() -> list[str]:
     """Extract the AUDIT_TESTS bash-array entries from run_audit_tests.sh,
-    returned as a sorted unique list to match the CLAUDE.md parser's shape
-    (set-comparison contract). Duplicate entries in the script array are
-    flagged via a focused assertion in the test below — they indicate a
-    copy-paste mistake, not a meaningful duplicate-run intent.
+    returned in source order with duplicates preserved so the dedicated
+    duplicate-entry test can flag copy-paste mistakes.
 
     The script defines the array as:
         AUDIT_TESTS=(
@@ -40,7 +42,13 @@ def _parse_audit_tests_from_script() -> list[str]:
         )
     This parser is intentionally narrow: it expects double-quoted relative
     paths on their own lines between the opening `AUDIT_TESTS=(` and the
-    closing `)`. Comments after the value are allowed."""
+    closing `)`. Comments after the value are allowed. Memoized at module
+    scope (mirrors `_TEST_SOURCES_CACHE` in
+    `tests/test_optional_component_flag_contract.py:128`) so 4 test methods
+    don't trigger 4 file reads + regex passes."""
+    global _SCRIPT_PARSE_CACHE
+    if _SCRIPT_PARSE_CACHE is not None:
+        return _SCRIPT_PARSE_CACHE
     text = SCRIPT_PATH.read_text(encoding="utf-8")
     m = re.search(r"AUDIT_TESTS=\((.*?)\)", text, flags=re.DOTALL)
     if not m:
@@ -57,6 +65,7 @@ def _parse_audit_tests_from_script() -> list[str]:
         match = re.match(r'^"([^"]+)"', line)
         if match:
             raw.append(match.group(1))
+    _SCRIPT_PARSE_CACHE = raw
     return raw
 
 
@@ -84,7 +93,13 @@ def _parse_audit_tests_from_claude_md() -> list[str]:
     markers into a sibling row (e.g. "Audit-row executability") and parity
     would silently keep passing while the registry referred to the wrong
     rule. The header-before-marker invariant pins the markers to the
-    correct row even if line numbers shift."""
+    correct row even if line numbers shift.
+
+    Memoized at module scope (CLAUDE.md is ~47 KB; 4 test methods would
+    otherwise read + parse it independently)."""
+    global _CLAUDE_PARSE_CACHE
+    if _CLAUDE_PARSE_CACHE is not None:
+        return _CLAUDE_PARSE_CACHE
     text = CLAUDE_MD.read_text(encoding="utf-8")
     header = text.find(_AUDIT_ROW_HEADER)
     if header == -1:
@@ -126,7 +141,8 @@ def _parse_audit_tests_from_claude_md() -> list[str]:
             f"No `tests/test_*.py` filename inside the CLAUDE.md registry "
             f"markers — got: {span!r}"
         )
-    return sorted(set(found))
+    _CLAUDE_PARSE_CACHE = sorted(set(found))
+    return _CLAUDE_PARSE_CACHE
 
 
 class TestAuditTestExecution(unittest.TestCase):
@@ -199,6 +215,25 @@ class TestAuditTestExecution(unittest.TestCase):
             "core contracts: optional-component-flag, removal-symmetry, "
             "enforcement-config-staged, audit-test-execution-self-check.",
         )
+
+    def test_marker_string_constants_match_claude_md_literals(self) -> None:
+        """Direct rename-drift gate: the test's `_BEGIN_MARKER` and
+        `_END_MARKER` Python constants must literally appear in CLAUDE.md.
+        Without this, a future rename of just the constants (or just the
+        markdown text) would leave `_parse_audit_tests_from_claude_md`
+        failing with a less-actionable "markers not found" message — this
+        test pins the rename failure to the exact mismatch."""
+        text = CLAUDE_MD.read_text(encoding="utf-8")
+        for marker in (_BEGIN_MARKER, _END_MARKER):
+            self.assertIn(
+                marker, text,
+                msg=(
+                    f"The Python constant {marker!r} (used by "
+                    f"`_parse_audit_tests_from_claude_md`) must appear "
+                    "literally in CLAUDE.md. If you renamed one, rename "
+                    "both in the same edit."
+                ),
+            )
 
     def test_audit_tests_registry_has_no_duplicates(self) -> None:
         """Script `AUDIT_TESTS` array must not contain duplicate entries —
