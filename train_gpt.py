@@ -978,27 +978,6 @@ class Hyperparameters:
     attn_expert_rank = 64
     mlp_expert_rank = 96
 
-    # iter176 (2026-05-18) — per-dim sigmoid gate per MLP expert. Each expert's
-    # output (after expert_down) is multiplied element-wise by a per-expert
-    # per-token sigmoid gate computed from the input x via a low-rank LoRA
-    # projection: gate_e(x) = σ(V_e (U_e x) + b_e) ∈ (0, 1)^D.
-    # iter176b (2026-05-19) — STRICT-GENERALIZATION init (LoRA convention,
-    # Hu et al. 2021): U xavier (down), V zeros (up), bias +6.0 → at init
-    # gate = σ(V·U·x + b) = σ(0·U·x + 6.0) ≈ 0.9975 ≈ 1.0 → forward
-    # ≡ iter172 baseline. Optimizer is free to learn V ≠ 0 only if it
-    # reduces loss; if redundant with the diversity loss, V stays near zero
-    # and val_bpb matches iter172. Per CLAUDE.md strict-generalization:
-    # at worst this matches iter172, never regresses.
-    # (iter176 used the wrong init — xavier U/V + bias=0 → σ ≈ 0.5 →
-    # halved expert outputs at init, violating strict-gen and showing
-    # transient early lead followed by regression as warmup completed.)
-    # Cost at rank=16: 16 (rank) * 768 (D) * 2 (U+V) * 16 (experts) +
-    # 16 * 768 (bias) = 405K params per MLP layer. Step time +5-10%.
-    # RevDEQ-safe: sigmoid is differentiable + bounded + monotonic;
-    # reverse pass recomputes the gate via one matmul. No batch coupling.
-    use_expert_perdim_gate = False
-    expert_perdim_gate_rank = 16
-
     # Weight averaging
     # iter 1: disabled.  At 1h budget (~822 steps) ema_decay 0.997 leaves
     # ~8.6% of random init in the EMA average (0.997^822); SWA averages 4
@@ -1121,7 +1100,6 @@ _OPTIONAL_COMPONENT_CAPABILITIES: tuple[OptionalComponentCapability, ...] = (
     OptionalComponentCapability("use_sparse_dispatch", "sparse_dispatch", "rejected"),
     OptionalComponentCapability("deq_prefix_anchors", "deq_prefix_anchors", "training_effect"),
     OptionalComponentCapability("use_reverse_kl_balance", "reverse_kl_balance", "training_effect"),
-    OptionalComponentCapability("use_expert_perdim_gate", "expert_perdim_gate", "training_effect"),
 )
 
 
@@ -1149,7 +1127,6 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "deq-k-jitter-anneal-end-frac",
     "deq-prefix-anchor-set",
     "fast-val-k-sweep-set",
-    "expert-perdim-gate-rank",
     "deq-beta", "deq-beta-jitter-set",
     "warmdown-frac", "num-refinements-ramp-frac",
     "weight-decay",
@@ -3796,8 +3773,7 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     """SwiGLU-gated MLP expert bank (doc §3.4)."""
     def __init__(self, dim: int, mlp_mult: float, num_experts: int = 16,
-                 expert_rank: int = 0, router: SoftDenseRouter | None = None,
-                 *, use_perdim_gate: bool = False, perdim_gate_rank: int = 16):
+                 expert_rank: int = 0, router: SoftDenseRouter | None = None):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.num_experts = num_experts
@@ -3819,40 +3795,6 @@ class MLP(nn.Module):
         # Per-expert RMSNorm on hidden — no shared learned weights across experts.
         # Shape: (E, R) scale weight, applied after normalization.
         self.hidden_norm_weight = nn.Parameter(torch.ones(num_experts, self.expert_rank))
-        # iter176 (2026-05-18) per-dim sigmoid gate per expert. When enabled,
-        # each expert's output is multiplied element-wise by a per-expert per-
-        # token gate computed from the input x via a low-rank LoRA projection:
-        #   gate_e(x) = σ(V_e (U_e x) + b_e) ∈ (0, 1)^D
-        # Default OFF preserves iter172 behavior; non-zero rank materializes
-        # the U / V / b parameters and triggers the eager gated path.
-        self.use_perdim_gate = bool(use_perdim_gate)
-        self.perdim_gate_rank = int(perdim_gate_rank) if self.use_perdim_gate else 0
-        if self.use_perdim_gate:
-            R_g = self.perdim_gate_rank
-            # iter176b (2026-05-19) — STRICT-GENERALIZATION init (CLAUDE.md rule):
-            #   U init xavier (LoRA "down" projection, like LoRA A)
-            #   V init ZEROS  (LoRA "up" projection, like LoRA B)
-            #   bias init +6.0
-            # Forward: gate = σ(V·(U·x) + b) = σ(0·U·x + 6.0) = σ(6.0) ≈ 0.9975
-            # → gate ≈ 1.0 at init → e_i_gated ≈ e_i → forward ≡ iter172 baseline
-            # Gradient at init: ∂L/∂V = ∂L/∂pre · U·x ≠ 0 (V trains immediately);
-            # ∂L/∂U = ∂L/∂pre · V = 0 (U trains only after V drifts from zero)
-            # — matches the standard LoRA convention (Hu et al. 2021).
-            # The previous iter176 init (xavier U/V + bias=0 → σ ≈ 0.5) HALVED
-            # each expert's output at init, violating strict-generalization: the
-            # functional class contained iter172 but the INIT did not match it.
-            # iter176 ran with that bug and showed transient early lead followed
-            # by lead evaporation as the regularizer-warmup completed (the gate
-            # was double-counted with diversity loss). iter176b: optimizer is
-            # free to learn V ≠ 0 ONLY if it reduces loss; if redundant with
-            # the diversity loss, V stays near zero and val_bpb matches iter172.
-            # Per CLAUDE.md strict-generalization: at worst this matches iter172,
-            # never regresses.
-            self.perdim_gate_u = nn.Parameter(torch.empty(num_experts, R_g, dim))
-            self.perdim_gate_v = nn.Parameter(torch.zeros(num_experts, dim, R_g))
-            self.perdim_gate_bias = nn.Parameter(torch.full((num_experts, dim), 6.0))
-            for e in range(num_experts):
-                nn.init.xavier_uniform_(self.perdim_gate_u.data[e])
 
     def mix_experts(self, x: Tensor, w: Tensor, *,
                     num_shared: int = 0, shared_gate: Tensor | None = None) -> Tensor:
@@ -3900,8 +3842,6 @@ class MLP(nn.Module):
         # tensor; kernel handles the per-expert weighted contraction with
         # H101-safe sparsity skip. Bench: 2.86× dense, 7.36× at 87.5% sparse.
         # Training (grad enabled) and any non-bf16 path fall through to eager.
-        # iter176: per-dim gate forces eager (kernel doesn't support per-expert
-        # per-dim output mask); only kicks in when use_perdim_gate=False.
         if (
             _USE_UNIFIED_ROUTED_DOWN
             and not torch.is_grad_enabled()
@@ -3910,7 +3850,6 @@ class MLP(nn.Module):
             and D % 16 == 0
             and h.shape[2] <= 128       # R_PAD register-pressure bound
             and E <= 64
-            and not self.use_perdim_gate
         ):
             from experiments.components.fused_routed_down import fused_routed_down
             if S > 0 and shared_gate is not None:
@@ -3939,22 +3878,6 @@ class MLP(nn.Module):
             h = h * w_flat.unsqueeze(-1)
         Dwn_T = self.expert_down.to(dtype=x_flat.dtype).transpose(1, 2)  # (E, R, D)
         out_e = torch.bmm(h.transpose(0, 1), Dwn_T)  # (E, N, D)
-        # iter176: per-dim sigmoid gate per expert. Each expert's output is
-        # multiplied element-wise by a per-token per-dim gate computed from
-        # the (pre-RMS-normalized) input x via a low-rank LoRA projection.
-        # Both the routing weight (already applied to h above) and this gate
-        # are multiplicative on out_e — they commute and we apply gate post-
-        # routing so the dtype-matched bmm above is unchanged. Per CLAUDE.md
-        # "Expert independence is hard": U/V/b are per-expert parameters.
-        if self.use_perdim_gate:
-            U = self.perdim_gate_u.to(dtype=x_flat.dtype)        # (E, R_g, D)
-            V = self.perdim_gate_v.to(dtype=x_flat.dtype)        # (E, D, R_g)
-            b = self.perdim_gate_bias.to(dtype=x_flat.dtype)     # (E, D)
-            # x_flat: (N, D); inter: (E, N, R_g); pre: (E, N, D)
-            inter = torch.einsum("nd,erd->enr", x_flat, U)
-            pre = torch.einsum("enr,edr->end", inter, V) + b.unsqueeze(1)
-            gate_mask = torch.sigmoid(pre)
-            out_e = out_e * gate_mask
         out = out_e.sum(dim=0)  # (N, D)
 
         # Eager-only diagnostic — see helper docstring.
@@ -4383,8 +4306,6 @@ class Block(nn.Module):
                  rr_block_size: int = 64,
                  rr_tau: float = 0.95,
                  chained_stages_preset: str | None = None,
-                 use_expert_perdim_gate: bool = False,
-                 expert_perdim_gate_rank: int = 16,
                  **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
@@ -4523,10 +4444,7 @@ class Block(nn.Module):
                                          rr_stride=rr_stride,
                                          rr_block_size=rr_block_size,
                                          rr_tau=rr_tau)
-        self.mlp = MLP(dim, mlp_mult, num_experts=num_experts,
-                       expert_rank=mlp_expert_rank, router=self.router,
-                       use_perdim_gate=use_expert_perdim_gate,
-                       perdim_gate_rank=expert_perdim_gate_rank)
+        self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
 
     def _init_chained_stage0_aliases(self) -> None:
         """Stage-0-only compatibility aliases for legacy diagnostics and tests
@@ -5648,8 +5566,6 @@ class GPT(nn.Module):
                  router_ema_balance_coef: float = 0.30,
                  router_ema_specialization_coef: float = 0.20,
                  use_reverse_kl_balance: bool = True,
-                 use_expert_perdim_gate: bool = False,
-                 expert_perdim_gate_rank: int = 16,
                  multi_k_consistency_anchor_coef: float = 0.1,
                  expert_diversity_kind: str = "cosine",
                  expert_output_diversity_coef: float = 0.30,
@@ -5777,8 +5693,6 @@ class GPT(nn.Module):
                                    rr_block_size=rr_block_size,
                                    rr_tau=rr_tau,
                                    chained_stages_preset=chained_stages_preset,
-                                   use_expert_perdim_gate=use_expert_perdim_gate,
-                                   expert_perdim_gate_rank=expert_perdim_gate_rank,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-style per-dim diagonal damping with
@@ -8104,8 +8018,6 @@ def main() -> None:
         router_ema_balance_coef=float(args.router_ema_balance_coef),
         router_ema_specialization_coef=float(args.router_ema_specialization_coef),
         use_reverse_kl_balance=bool(args.use_reverse_kl_balance),
-        use_expert_perdim_gate=bool(getattr(args, "use_expert_perdim_gate", False)),
-        expert_perdim_gate_rank=int(getattr(args, "expert_perdim_gate_rank", 16)),
         multi_k_consistency_anchor_coef=float(getattr(args, "multi_k_consistency_anchor_coef", 0.0)),
         expert_diversity_kind=str(args.expert_diversity_kind),
         expert_output_diversity_coef=float(args.expert_output_diversity_coef),
