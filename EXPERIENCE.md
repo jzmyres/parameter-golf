@@ -46,6 +46,7 @@ This file has two roles, in this order:
 | 2026-05-12 | [#audit-row-self-enforcement](#audit-row-self-enforcement)   | iter152 profile-system + capability-registry diff added the "Root-cause fix preference" audit row, yet the same diff's `_prescribe_failure_fix.mos_ortho` branch returned a per-symptom loss bump with no exit-ablation framing — exactly the failure mode the new policy forbids. A 5-agent parallel review found that the witness for the new rule covered only 2 of 8 sibling branches |
 | 2026-05-15 | [#removal-symmetry-sweep](#removal-symmetry-sweep)           | cleanup #47 + cleanup #50 (commits 7410cb9 + 56b2f29) removed `lip_ub_T/S/F` + `fp_bound` + `power_jvp_F` + `router_load_cv_coef` + `mos_load_cv_coef` from `Hyperparameters` and loss assembly, but left ~14 stale references across `opg_doc.tex` (parameter table rows + equation blocks still showing the removed CV terms, feature table still claiming `deq_prefix_anchors=false`, Local Stability section still describing `lip_ub_F` as an "auxiliary K-sweep estimator") and ~10 fossil docstrings/comments in `train_gpt.py`. iter163 promotion commit (884b132) simultaneously violated the Sibling-fanout DRY gate by emitting `consistency_anchor_loss`/`consistency_ext_loss` log fields with no `plot_metrics.py` parser entries, no `test_training_contracts.py` required_fields update, and no `test_plot_metrics_parse.py` fixture. Cleanup #51 added the "Removal-symmetry sweep" audit row, the companion `tests/test_removal_symmetry.py` enforcement test, and swept all sibling sites in the same commit |
 | 2026-05-19 | [#audit-test-execution](#audit-test-execution)               | iter176 commit a0873fe added `use_expert_perdim_gate` to `_OPTIONAL_COMPONENT_CAPABILITIES` (and its derived `_OPTIONAL_COMPONENT_FLAGS` projection) plus an MLP-internal test (`use_perdim_gate=True` kwarg), but the existing flag-to-effect contract test (`tests/test_optional_component_flag_contract.py`) — created 2026-05-12 in commit f4b9da5, would have caught the gap — was never executed before commit. Iter176b commit 6bb59e0 then doubled down by changing the init without re-running the gate. The failure surfaced 2026-05-19 only during a manual code-review pass. Rule added: every commit touching `_OPTIONAL_COMPONENT_FLAGS`, any `use_X` Hyperparameter, removal-symmetry tracked symbols, or enforcement-config files must run `bash experiments/run_audit_tests.sh` and confirm green before staging |
+| 2026-05-13 | [#gpu-preflight-protocol](#gpu-preflight-protocol)           | Two consecutive smoke launches OOM'd silently because PIDs 256182/256183 held 33 GB each across both H100s — a prior dynamo-compile had stuck mid-compile and held memory indefinitely without log output. Preflight `pgrep` + `nvidia-smi --query-compute-apps` would have surfaced the owner before relaunch |
 
 ### Section template
 
@@ -907,13 +908,41 @@ Pre-production review with two parallel reviewer subagents (coderabbit + pr-revi
 
 ---
 
+### gpu-preflight-protocol
+
+**Date:** 2026-05-13 incident, rule subsequently codified in CLAUDE.md Standing Directives.
+**Rule in CLAUDE.md:** Standing Directives bullet "Before EVERY GPU launch".
+
+**What happened.** Two consecutive smoke launches OOM'd silently before producing any log output. `nvidia-smi` then revealed that PIDs 256182 and 256183 from an earlier session were each holding ~33 GB across both H100s. The originating job had been a `torch.compile` invocation that stalled mid-compile hours earlier; the Python process was still alive (`pgrep -fal "train_gpt|torchrun"` would have shown it) but had stopped producing any log output. Without a preflight check, both relaunches collided at allocation time.
+
+**Root cause.** Stuck dynamo-compiles hold GPU memory indefinitely without log activity. The owning process appears idle to a casual observer and there is no signal in `run.log` that something is wrong — the only evidence is `nvidia-smi` memory usage and a live PID. Two reasonable-looking relaunches will both OOM unless preflight is mandatory.
+
+**The rule.** Before EVERY GPU launch — smoke or long run — preflight BOTH of:
+
+```bash
+pgrep -fal "train_gpt|torchrun"
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+If either reports an active training process or non-trivial GPU memory (>100 MB on any device), STOP it (TaskStop on the owning shell if it is one you launched; otherwise identify the owner and request termination) and verify GPU memory drops to ~0 before launching the new job. Also verify data/tokenizer paths at the same checkpoint.
+
+**Verification recipe.**
+- Run both `pgrep` and `nvidia-smi` commands BEFORE issuing `torchrun`.
+- Treat any non-zero match as a blocker, not a warning.
+- After stopping the owner, re-run `nvidia-smi`; expect ≤100 MB per device before relaunch.
+- Memory: `feedback_check_gpu_free.md` records the user directive form of this rule.
+
+**Cross-references.** Adjacent operational guardrails: [#runbook](#runbook), [#environment-and-files](#environment-and-files).
+
+---
+
 ## §2. Lessons Learned
 
 Generic guardrails distilled from research-process experience. Not tied to specific code paths or dated incidents — background principles, not enforcement.
 
 - Learned parameters inside an expert path, including norm scales and output heads, must be per-expert.
 
-### Reading derived metrics
+### reading-derived-metrics
 
 Every metric you read in a healthcheck or postmortem is a *function* of raw signals: a running average, a windowed smooth, a per-batch normalization, a post-softmax probability, a cumulative count divided by step number, a log-loss in some unit. Treating the displayed value as if it were the underlying signal is the most common analysis-error class on this project (see [#cumulative-metric-misread](#cumulative-metric-misread) for the canonical 2026-05-02 incident).
 
@@ -1015,7 +1044,7 @@ Every metric you read in a healthcheck or postmortem is a *function* of raw sign
 ### Randomness
 - When you need randomness *and* coverage, use a shuffle-bag sampler instead of i.i.d. draws.
 
-### Diagnostics
+### diagnostics
 - Match plotting scale and summaries to the metric's dynamic range and sampling scheme so you don't mistake artifacts for behavior.
 - When experiments have hard constraints, bias toward changes that can be bounded and verified early (avoid hour-long runs that only fail at the end).
 - Metric contract rule: every required diagnostic needs a compute site, a freshness tag when it is tied to a forward pass, human log emission, parser support, and a focused test. Independent metrics must not be gated by unrelated diagnostic availability.
@@ -1027,14 +1056,14 @@ Every metric you read in a healthcheck or postmortem is a *function* of raw sign
 ### Distributed
 - Any rank-conditional control flow around collectives is a correctness bug; all ranks must execute collectives in the same order.
 
-### DRY Function Orthogonality
+### dry-function-orthogonality
 - Shared tensor preparation, context selection, DDP reduction, metric formulas, and log formatting should each have one implementation. If fast validation and K-sweep need the same fixed-point probe, both call the same setup helper.
 - Keep functions orthogonal: a probe returns raw measurements, a metric helper transforms raw measurements into a gate value, and a logger formats fields. Do not hide policy decisions inside measurement routines.
 - When adding a metric, name the mathematical object precisely. If a value is a numerical estimate or conservative metric rather than a formal proof, the function name, log label, and docs must say so.
 
 ---
 
-### Routing Health Metrics
+### routing-health-metrics
 
 `CLAUDE.md` keeps the concise metric principle; this section holds the definitions, targets, and decompositions (moved out of `CLAUDE.md` to keep it concise — see [#claude-md-size-budget](#claude-md-size-budget)).
 
@@ -1107,6 +1136,94 @@ EMA usage/liveness; output Gram alone cannot rule out unused experts.
 **Prefix convention** (iter 100b). The SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components. Routing-distribution metrics decompose into THREE values: `attn_*` (per-slice renormalized), `mlp_*` (per-slice renormalized), and `pool_*` (full 2R distribution). Metrics derived from **expert outputs** (usage, ortho, min_share per slice) keep `attn_*`/`mlp_*` only — there is no pool variant.
 
 **K-sweep tabular emission** (PERMANENT iter 100b; simplified 2026-05-08). The eval K-sweep emits a `k_sweep_table:` row per K with fixed-width columns: `K val_bpb attn_cv mlp_cv pool_cv attn_min mlp_min attn_ortho mlp_ortho pertoken_ent pool_ent shared_gate dir_S dir_U dir_sigma dir_evid dir_Hmu ucb_beta lip_ub fp_bound iter_conv_rel`. A header row precedes data rows. `N/A` indicates an unavailable field. The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[…] router_gate_iter:[…] iter_conv_rel:… residual:…` line is preserved for `experiments/plot_metrics.py` back-compat and now also emits full `router_dir_*` confidence fields plus `lip_ub` for parser-friendly grep. Use `k_sweep_table:` for cross-K and cross-iter routing-health comparisons; use `k_sweep:` for per-iter gate trajectories. Fast validation logs the same fixed-point certificate fields when `fp_lip_fast_val_every > 0`.
+
+### principled-simplest-general
+
+User directive 2026-05-15. Three operational tests for ANY fix, optimization, regularizer, prescription, or new mechanism — **all must pass**.
+
+1. **Principled** — targets the root-cause invariant (the actual mathematical property we want), not a symptom or a correlated proxy.
+2. **Simplest** — smallest mechanism that achieves the goal. Element-wise loss term beats new optimizer group; reusing existing infrastructure (e.g. iter152 prefix anchors) beats new bespoke machinery; one CLI flag beats four; no new dependency unless the goal is unreachable without it.
+3. **General** — architecture-agnostic, applies broadly across the model class. Beats component-specific.
+
+**Worked examples.**
+
+| Domain | Principled | Proxy (sufficient but over-restrictive) | Symptom (correlated, not causal) |
+|---|---|---|---|
+| FP convergence | `ρ(J_F) < 1` (necessary AND sufficient by Hartman–Grobman) | `σ_max(J_F) < 1` (operator norm; over-restrictive for non-symmetric J_F) | `attn_min_share > τ` (correlated with collapse but not causal for BPB) |
+| Expert specialization | Normalized expert-output Gram/cosine on active tokens | Router-row orthogonality (only a weak conditioning prior) | Per-expert variance of routed weights |
+| Load balance | EMA-anchored balance loss with reverse-KL gradient | CV of softmax | Per-step min-share gauge |
+
+**Generality tie-break.** When two designs tie on principled-ness and simplicity, pick the one that ALSO works for alternative DEQ solvers, refinement loops, recurrent layers, etc., not just the current Parcae cycle.
+
+**Application surfaces.** Apply this test to all three: (a) docs (CLAUDE.md / EXPERIENCE.md / opg_doc.tex / hypotheses.md prescriptions), (b) code (loss terms, regularizers, gate definitions), and (c) prescriptions (`_prescribe_failure_fix` recommendations).
+
+**Closure note discipline.** When closing or refuting a prescription/iter, the closure note must explain WHICH of the three tests it failed.
+
+| Closure | Failed test | Reason |
+|---|---|---|
+| iter155 Lyapunov soft penalty | Principled | Operator norm is an over-restrictive proxy for spectral radius; soft pressure cannot reliably constrain the spectrum anyway |
+| iter160 / iter162 / iter165 routing-balance pushes | Principled | Symptom-targeting (min-share, CV); the failing invariant is FP convergence, not balance |
+| Spectral normalization on `T_θ` | General | Component-specific to weight-parameterized transition maps; does not transfer to other iteration mechanisms |
+| iter170 anchor-on-deepest | Empirical | A principled design that turned out to break the optimization landscape; closure type is "empirical refutation" rather than failed-test, but should still cite which design property the empirical test challenged |
+
+### fp-convergence-framework
+
+User directive 2026-05-13 (framework), 2026-05-15 (consistency-loss form shipped), 2026-05-17 (iter172 promoted).
+
+**Goal.** Asymptotic local FP convergence is the architecture-agnostic ultimate goal for any iteration mechanism — NOT strict per-step contraction.
+
+**Mathematical foundation (Hartman–Grobman).**
+- `ρ(J_M) < 1` (spectral radius of the iteration map's Jacobian) is the **necessary AND sufficient** condition for local asymptotic contraction.
+- `σ_max(J_M) < 1` (operator norm) is **sufficient but over-restrictive**. For non-symmetric `J_M` the gap can be huge.
+
+**Empirical confirmation, iter152.** `σ_max ≈ 17`, `iter_conv_rel ≈ 0.02` — clearly converging despite `σ_max ≫ 1`. This single observation refutes the operator-norm framing as a usable gate.
+
+**Promotion gate.** `rho_F < 1` (theoretical) OR `iter_conv_rel < 0.05` at deepest K (empirical).
+
+**rho_F always-on mandate.** `rho_F` (spectral radius on the actual two-state Parcae cycle) MUST be reported on EVERY FP eval — train-time fast-val emission and every K-sweep row. A profile knob silently dropping the gate evidence is a "decision based on a metric we haven't measured" failure mode. Enforced by `experiments/test_rho_F.py::test_rho_F_is_emitted_in_fast_val_alongside_residual`.
+
+**Removed proxies (2026-05-15).** The `lip_ub_T/S/F` operator-norm probes and `fp_bound` (Banach error bound) were removed entirely — over-restrictive and refuted by the iter152 evidence above. The "Removal-symmetry sweep" audit row tracks the cleanup (see [#removal-symmetry-sweep](#removal-symmetry-sweep)).
+
+**Refuted alternative: soft Lyapunov / operator-norm penalties.** Default `lyapunov_coef=0`. The closure (iter155, +0.0095 BPB regression for zero contraction benefit; failed *Principled* — operator norm is over-restrictive and soft pressure cannot reliably constrain spectral properties) is catalogued in the [#principled-simplest-general](#principled-simplest-general) closure table. If `rho_F` / `iter_conv_rel` actually fail, escalate to formal-tier mechanisms (spectral normalization on `T_θ`, bounded-Lipschitz block parameterization), not soft penalties on operator norms.
+
+**Principled mechanism to learn FP convergence naturally (not enforce via direct ρ penalty).**
+
+- Form: **iter172 multi-K consistency loss** (PROMOTED 2026-05-17, full val_bpb = 1.462898 vs iter163's 1.471598 = −8.7 mBPB, 39× iter163's margin over iter152).
+- Recursive nearest-neighbor pairing: `L_anchor = anchor_coef · mean_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²` on the iter152 prefix-anchor z_stack.
+- Each shallow anchor targets the next-deeper anchor; transitivity at the FP makes this asymptotically equivalent to a single "Final-K-as-GT" target, but consecutive-pair recursion preserves the optimization landscape better.
+- Zero extra forward compute — target `z_{i+1}` is produced by the main gradient-carrying prefix-anchor forward.
+- Architecture-agnostic — the FP equation `z = F(z)` is universal.
+- Cost: ~1.00× iter152 step time.
+- Default `deq_prefix_anchor_set = (8, 16, 24, 32, 64, 128)`. The K=8 shallow anchor (gap=8 to next-deeper K=16) gives consistency loss a non-trivial pair at K_sampled=16 (~88% of training steps) without collapsing rho_F like iter170/iter171's K=4 (gap=12) did.
+- Outcome: iter172 final K=128 `rho_F=0.77` vs iter163's `0.92` — principled FP-convergence dramatically improved; K-sweep uniformly 8.5-9.5 mBPB better than iter163 across K=16 through K=128.
+- The remaining recursive term implicitly enforces `ρ(J_F) < 1` because the consistency loss can only minimize if the iteration map IS contractive.
+
+**Refuted variants.**
+
+| Variant | Result | Why |
+|---|---|---|
+| iter170 anchor-on-deepest | REFUTED at +65 mBPB regression, rho_F collapse | Concentrates the supervision signal on the last anchor only; recursive consecutive-pair preserves landscape better |
+| iter163 extension term `‖z_K − z_{K+Δ}.detach()‖²` (Δ=1) | REFUTED, +22 mBPB regression | Adds compute and bias for no spectral benefit |
+| iter163 extension term (Δ=K_train) | REFUTED, 1.6× step time | Compute cost without quality improvement |
+| Pure IFT (iter144) | Empirical refutation | Different mechanism class; covered separately in hypotheses.md |
+| Spectral normalization on `T_θ` | Failed General test | Component-specific to weight-parameterized transition maps |
+
+**Constraint on any future iteration mechanism.** Must satisfy `ρ(J) < 1` for asymptotic local contraction, regardless of model class — alternative DEQ solvers, refinement loops, recurrent layers, etc., all subject to the same gate AND the same arch-agnostic principled-fix path (consistency loss). See also [#principled-simplest-general](#principled-simplest-general).
+
+### iter-progress-reporting
+
+User directive 2026-05-13. When reporting iter progress to the user, ALWAYS include:
+
+1. **Current-step metric** — the value at the present healthcheck.
+2. **Prior-healthcheck delta** — change since the *previous healthcheck*, NOT since launch.
+3. **Active baseline at the same step** — parse the baseline `run.log` via `grep '^step:N '` for matching N.
+
+**Bad:** "Step 80, val_bpb 1.49"
+**Good:** "Step 80: val_bpb 1.49 (baseline iter152 @ step 80: 1.51, Δ −0.02; +0.05 since step 30)"
+
+If the baseline log is absent, say so explicitly so the user can produce one before drawing conclusions.
+
+Per-iter improvements only mean something against a same-step reference; see [#cumulative-metric-misread](#cumulative-metric-misread) for the related-but-distinct misread failure mode.
 
 ---
 
@@ -1322,7 +1439,7 @@ Dispatch rules:
 - combine it with actual tensor/parameter grad requirements when deciding whether a custom kernel must preserve gradients;
 - test both training and no-grad/validation paths.
 
-### Bottleneck Experts (closed)
+### bottleneck-experts-closed
 
 **Decision.** Do NOT re-introduce bottleneck-style experts (`BottleneckIn` `D→proj_rank→r` + `ExpertBody` at small `r` + `BottleneckOut` `r→proj_rank→D`) as a scaling axis. Tested as Group D (iter 90, 91+92) and NOT PROMOTED.
 
@@ -1350,7 +1467,7 @@ then measures how far the forward FP *travelled* in the un-reconstructed iterati
 
 ---
 
-### Disabled Techniques
+### disabled-techniques
 
 Maintained here so removed/disabled techniques don't accrete annotations in `CLAUDE.md` or the config mirror.
 
