@@ -47,6 +47,9 @@ This file has two roles, in this order:
 | 2026-05-15 | [#removal-symmetry-sweep](#removal-symmetry-sweep)           | cleanup #47 + cleanup #50 (commits 7410cb9 + 56b2f29) removed `lip_ub_T/S/F` + `fp_bound` + `power_jvp_F` + `router_load_cv_coef` + `mos_load_cv_coef` from `Hyperparameters` and loss assembly, but left ~14 stale references across `opg_doc.tex` (parameter table rows + equation blocks still showing the removed CV terms, feature table still claiming `deq_prefix_anchors=false`, Local Stability section still describing `lip_ub_F` as an "auxiliary K-sweep estimator") and ~10 fossil docstrings/comments in `train_gpt.py`. iter163 promotion commit (884b132) simultaneously violated the Sibling-fanout DRY gate by emitting `consistency_anchor_loss`/`consistency_ext_loss` log fields with no `plot_metrics.py` parser entries, no `test_training_contracts.py` required_fields update, and no `test_plot_metrics_parse.py` fixture. Cleanup #51 added the "Removal-symmetry sweep" audit row, the companion `tests/test_removal_symmetry.py` enforcement test, and swept all sibling sites in the same commit |
 | 2026-05-19 | [#audit-test-execution](#audit-test-execution)               | iter176 commit a0873fe added `use_expert_perdim_gate` to `_OPTIONAL_COMPONENT_CAPABILITIES` (and its derived `_OPTIONAL_COMPONENT_FLAGS` projection) plus an MLP-internal test (`use_perdim_gate=True` kwarg), but the existing flag-to-effect contract test (`tests/test_optional_component_flag_contract.py`) — created 2026-05-12 in commit f4b9da5, would have caught the gap — was never executed before commit. Iter176b commit 6bb59e0 then doubled down by changing the init without re-running the gate. The failure surfaced 2026-05-19 only during a manual code-review pass. Rule added: every commit touching `_OPTIONAL_COMPONENT_FLAGS`, any `use_X` Hyperparameter, removal-symmetry tracked symbols, or enforcement-config files must run `bash experiments/run_audit_tests.sh` and confirm green before staging |
 | 2026-05-13 | [#gpu-preflight-protocol](#gpu-preflight-protocol)           | Two consecutive smoke launches OOM'd silently because PIDs 256182/256183 held 33 GB each across both H100s — a prior dynamo-compile had stuck mid-compile and held memory indefinitely without log output. Preflight `pgrep` + `nvidia-smi --query-compute-apps` would have surfaced the owner before relaunch |
+| 2026-05-30 | [#vendored-workspace-hygiene](#vendored-workspace-hygiene)   | New `baselines/` replication workspace nearly committed 294 MB of third-party source (13 embedded `.git` repos under `worktrees/`) plus volatile run JSON; `.gitignore` for `worktrees/`/`runs/`/`.envs/` + a `git add -An` dry-run kept the committable set to ~250 KB of manifest+scripts+docs |
+| 2026-05-30 | [#committed-report-tracked-evidence](#committed-report-tracked-evidence) | Committed `baselines/REPLICATION_REPORT.md` cited gitignored, regenerable `runs/*.json`; a 0-GPU login-node rerun flipped `parcae-fixed-k16` to `blocked_hardware` and overwrote the consolidated DDP report, so the tracked summary contradicted its own evidence. Fix: dated provenance banner + frozen `runs_snapshot_2026-05-24/` |
+| 2026-05-30 | [#smoke-must-exercise-target](#smoke-must-exercise-target)   | Import-adapter DDP smoke trained a generic `TinyDenseModel` (and ran with empty `ddp_imports`) yet emitted `DDP_IMPORT_SMOKE_PASSED` → recorded `ddp_smoke_passed`; `classify_failure` substring-scanned the whole log so a real crash mentioning "ImportError" downgraded to a non-failing `blocked_*` |
 
 ### Section template
 
@@ -933,6 +936,46 @@ If either reports an active training process or non-trivial GPU memory (>100 MB 
 - Memory: `feedback_check_gpu_free.md` records the user directive form of this rule.
 
 **Cross-references.** Adjacent operational guardrails: [#runbook](#runbook), [#environment-and-files](#environment-and-files).
+
+### vendored-workspace-hygiene
+
+**Rule.** A workspace that fetches or vendors third-party code (replication harnesses, baseline clones, reference checkouts) MUST NOT commit the third-party source trees or volatile run artifacts. Gitignore the heavy/regenerable subtrees at the **directory level** — `worktrees/`, `runs/`, `.envs/` (the global `__pycache__/` rule already covers bytecode) — and commit only the pinned manifest, the fetch/smoke scripts, and the docs. Before any commit that touches such a workspace, run `git add -An` (dry-run) and read the staged list; it is the only reliable guard.
+
+**Root cause.** The 2026-05-30 `baselines/` workspace held 294 MB across 13 cloned upstream repos, each with its own embedded `.git`. A plain `git add -A` / `git commit -am` would have vendored them (and the regenerable run JSON). Directory-level ignores matter specifically because an embedded `.git` ignored at the directory level is never descended into, so it cannot enter as a broken gitlink/submodule.
+
+**Verification recipe.**
+- `git add -An` shows ONLY manifest + scripts + docs (no `worktrees/`, `runs/`, `.envs/`, `__pycache__`).
+- `git check-ignore -v baselines/worktrees/<any> baselines/runs/<any>` resolves to the ignore rule.
+- A witness test asserts `git check-ignore` covers `baselines/{worktrees,runs,.envs}`.
+
+**Cross-references.** Companion to [#move-tracked-invariant](#move-tracked-invariant) and [#enforcement-config-staging](#enforcement-config-staging) (staging-omission failure modes); the unifying theme: **inspect what will actually be staged, never trust `git add -A` blind.**
+
+### committed-report-tracked-evidence
+
+**Rule.** Any committed human-readable report (pass/fail counts, metrics, comparison tables) MUST be backed by **tracked** evidence — a frozen snapshot committed outside the ignored glob — OR carry a dated provenance caveat naming the run that produced it. A tracked summary must never cite gitignored, regenerable artifacts as standing fact.
+
+**Root cause.** `baselines/REPLICATION_REPORT.md` summarized `baselines/runs/*.json`, which is gitignored. Regeneration on a different host (a GPU-less login node, via the `gpu_count()→0` path) silently rewrote the evidence: the report still claimed `parcae-fixed-k16` passed at BPB 3.7456 while the on-disk JSON had flipped it to `blocked_hardware`. A fresh clone had no evidence at all. Fix shipped: a dated banner + a frozen `runs_snapshot_2026-05-24/` holding the surviving authoritative artifacts.
+
+**Verification recipe.**
+- Every numeric "passed"/metric claim in a committed report resolves to a tracked file (snapshot dir), not to an ignored path.
+- The report's top carries the run date, hardware, and "regenerating elsewhere is expected to differ" note.
+- A witness test asserts the snapshot files referenced by the report exist and are tracked.
+
+**Cross-references.** Sibling of [#partial-preview-completeness](#partial-preview-completeness) (report integrity under incomplete data) and [#vendored-workspace-hygiene](#vendored-workspace-hygiene) (what is/ isn't committed).
+
+### smoke-must-exercise-target
+
+**Rule.** A "smoke passed" status must verify the thing it names. A harness that runs a generic stand-in, or imports nothing, must report a scope-explicit status (e.g. `IMPORT_OK_GENERIC_DDP` with "baseline model NOT exercised"), never the target's pass token. Failure classifiers key off the **terminal traceback**, not a whole-log substring scan, and heuristic `blocked_*` labels must not silence the failure gate.
+
+**Root cause.** `import_ddp_smoke.py` trained a 2-layer `TinyDenseModel` for any baseline outside `{torchdeq, moeut}`, and entries with empty `ddp_imports` imported nothing — yet all printed `DDP_IMPORT_SMOKE_PASSED`, recorded as `ddp_smoke_passed`. Separately, `classify_failure` scanned the whole (truncated) log for "ImportError"/"out of memory", so a real crash that merely mentioned those words downgraded to a non-failing `blocked_*` and the runner exited 0.
+
+**Verification recipe.**
+- Adapter smoke with empty `ddp_imports` returns `failed`, not a pass (refused).
+- Generic-model runs emit `IMPORT_OK_GENERIC_DDP`; only `torchdeq`/`moeut` emit `DDP_BASELINE_MODEL_SMOKE_PASSED`.
+- `classify_failure` inspects only the terminal log lines; an unknown `ddp_mode` is a loud `failed`, not a silent "blocked".
+- The two runners' gate divergence (external-code "blocked" is non-failing; native-`train_gpt.py` dependency errors fail) is intentional and documented at each call site.
+
+**Cross-references.** Companion to [#partial-preview-completeness](#partial-preview-completeness) and [#committed-report-tracked-evidence](#committed-report-tracked-evidence) (a false-positive smoke is what makes a report lie).
 
 ---
 

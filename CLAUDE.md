@@ -50,6 +50,7 @@ Before any action, read [`EXPERIENCE.md`](EXPERIENCE.md) in full — §1 inciden
 - Optional debug plotting via `auto_plot_on_val=True` (default): refreshes `experiments/*.png` per validation via `experiments/plotting_hook.py` (rank-0 only; silent no-op if matplotlib or `experiments/plot_*.py` modules are absent).
 - Historical submissions in `records/` are read-only.
 - Reference implementations are read-only: RevDEQ at `/home/mzhong4/work/research/rdeq/WIP-ARWDEQ/code/arwdeq/qwen3_utmoe_revdeq.py`; TSU/CTP/NTP/MoS at `/home/mzhong4/work/research/tsu/WIP-TSU/code/model.py`.
+- `baselines/` is the external recurrent-depth replication workspace (pinned manifest + fetch/smoke scripts + docs). Heavy/regenerable subtrees (`worktrees/`, `runs/`, `.envs/`) are gitignored; commit only manifest+scripts+docs and verify with `git add -An`. See [`EXPERIENCE.md#vendored-workspace-hygiene`](EXPERIENCE.md#vendored-workspace-hygiene). `CONTEXT.md` holds cross-iteration baseline vocabulary; per-baseline inventory is `experiments/docs/recurrent_depth_baselines.md`.
 
 ## Current Architecture
 
@@ -57,7 +58,7 @@ Orientation mirror only. Check `train_gpt.py::Hyperparameters` before launch.
 
 - **Core:** 12-layer RevDEQ-style shared block, `model_dim=768`, 8 query heads, 4 KV heads, sequence length 2048, vocab 1024, tied embeddings, train batch tokens 524,288.
 - **Experts:** 16 total routed experts (no shared/always-on expert by default; `--num-shared-experts=1` to opt in); routed experts are full-D LoRA-style with attention rank 64 and MLP rank 96.
-- **Solver:** Parcae-style per-dim damping/injection enabled; `parcae_reversibility_floor=0.1`; `deq_bptt_k=3`; weighted K-jitter `{16:0.50, 24:0.40, 32:0.07, 64:0.03}`; scalar beta path is fallback only.
+- **Solver:** Parcae-style per-dim damping/injection enabled; `parcae_reversibility_floor=0.1`; `deq_bptt_k=3`; weighted K-jitter `{16:0.50, 24:0.40, 32:0.07, 64:0.03, 96:0.015, 128:0.0075}` normalized at launch; scalar beta path is fallback only.
 - **Profiles:** `config_profile=fast_default` preserves current defaults. `score_iter152` is the BPB-winning reference. CLI flags override profile values.
 - **Iter172 FP-convergence stack default-on:** prefix anchors (`deq_prefix_anchors=True`) plus recursive multi-K consistency anchor (`multi_k_consistency_anchor_coef=0.1`, `deq_prefix_anchor_set=(8,16,24,32,64,128)`). Mechanism, ablation flags, and iter history: [`EXPERIENCE.md#fp-convergence-framework`](EXPERIENCE.md#fp-convergence-framework), `experiments/docs/hypotheses.md` iter152/iter170–iter172.
 - **Default-off paths:** `num_refinements=0`, `use_ctp=False`, `use_nsa_attention=False`, `lyapunov_coef=0`, `denoising_coef=0`, `mos_output_diversity_coef=0`, `logit_softcap=0`, `bigram_vocab_size=0`.
@@ -168,6 +169,9 @@ Run before commits that touch `train_gpt.py`, model tests, `CLAUDE.md`, `EXPERIE
 - **Scalar-semantic shift triple-touch** — meaning changes (units, ownership, inclusion, nullability) update implementation + every caller + every doc surface, with a numeric test. See [#scalar-semantic-shift](EXPERIENCE.md#scalar-semantic-shift).
 - **Flag-to-effect contract.** Every new `use_X` Hyperparameter MUST have an observable, asserted effect on the training-path tensor flow OR scored artifact at the project's default `train_seq_len`, exercised by a flip-True-vs-baseline test. Enforced by `tests/test_optional_component_flag_contract.py`. See [#flag-to-effect-contract](EXPERIENCE.md#flag-to-effect-contract).
 - **Removal-symmetry sweep** — removing a Hyperparameter / loss / diagnostic is a same-commit sweep across code, `opg_doc.tex`, docstrings, prescriptions, and tests. Enforced by `tests/test_removal_symmetry.py`. See [#removal-symmetry-sweep](EXPERIENCE.md#removal-symmetry-sweep).
+- **Vendored-workspace hygiene.** Replication/vendoring workspaces gitignore third-party source trees and volatile run artifacts (`worktrees/`/`runs/`/`.envs/`) at the directory level; commit only manifest+scripts+docs; verify with `git add -An` before commit. Enforced by `tests/test_baselines_workspace_hygiene.py`. See [#vendored-workspace-hygiene](EXPERIENCE.md#vendored-workspace-hygiene).
+- **Committed-report tracked evidence.** A committed report's numbers must resolve to tracked evidence (a frozen snapshot) or carry a dated provenance caveat — never cite gitignored, regenerable artifacts as standing fact. Enforced by `tests/test_baselines_workspace_hygiene.py`. See [#committed-report-tracked-evidence](EXPERIENCE.md#committed-report-tracked-evidence).
+- **Smoke must exercise target.** A "passed" smoke verifies the named target (not a generic stand-in / empty import); failure classifiers key off the terminal traceback, and heuristic `blocked_*` must not silence the gate. Enforced by `tests/test_baselines_workspace_hygiene.py`. See [#smoke-must-exercise-target](EXPERIENCE.md#smoke-must-exercise-target).
 
 ## Promotion Rules
 
