@@ -1,0 +1,156 @@
+{
+  "generated_at": "2026-05-24T21:47:02.063259+00:00",
+  "python": "3.11.15",
+  "results": [
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "active-revdeq-parcae",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/active-revdeq-parcae",
+      "status": "adapted_eval_run"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "record-2026-03-25",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/record-2026-03-25",
+      "status": "adapted_eval_run"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "deq-locuslab",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/deq-locuslab",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "torchdeq",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/torchdeq",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "revdeq",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/revdeq",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "universal-transformer-t2t",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/universal-transformer-t2t",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "moeut",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/moeut",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "parcae",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/parcae",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "ouro-looplm",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/ouro-looplm",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "latent-thoughts-looped-transformer",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/latent-thoughts-looped-transformer",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "iso-depth-looped-lm",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/iso-depth-looped-lm",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "sparse-looped-moe",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/sparse-looped-moe",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "moeut-training-code",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/moeut-training-code",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "huginn-recurrent-pretraining",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/huginn-recurrent-pretraining",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "hyperloop-transformers",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/hyperloop-transformers",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "retrofitting-recurrence",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/retrofitting-recurrence",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "modr",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/modr",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "mixture-of-recursions",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/mixture-of-recursions",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "Exact pinned commit present; README files: README.md; Python syntax compilation passed.",
+      "id": "think-at-hard",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/think-at-hard",
+      "status": "smoke_passed"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "relaxed-recursive-transformers",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/relaxed-recursive-transformers",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "dynamic-nested-depth",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/dynamic-nested-depth",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "parallel-loop-transformer",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/parallel-loop-transformer",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "thinking-deeper-not-longer",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/thinking-deeper-not-longer",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "loop-think-generalize",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/loop-think-generalize",
+      "status": "blocked_no_code"
+    },
+    {
+      "detail": "No fetchable pinned GitHub source in manifest.",
+      "id": "mechanistic-looped-reasoning",
+      "path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/mechanistic-looped-reasoning",
+      "status": "blocked_no_code"
+    }
+  ]
+}

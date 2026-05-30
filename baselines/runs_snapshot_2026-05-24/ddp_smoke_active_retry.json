@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-05-24T22:08:30.230463+00:00",
+  "gpu_count": 2,
+  "nproc": 2,
+  "python": "3.11.15",
+  "results": [
+    {
+      "command": "conda run --no-capture-output -n opg torchrun --standalone --nproc_per_node=2 train_gpt.py --iterations=2 --max-training-seconds=0 --val-loss-every=0 --eval-profile=debug --final-full-validation=0",
+      "detail": "Command exited 0.",
+      "duration_s": 210.659,
+      "id": "active-revdeq-parcae",
+      "log_path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/runs/active-revdeq-parcae/ddp_smoke_20260524T220459Z.log",
+      "mode": "local_script",
+      "status": "ddp_smoke_passed",
+      "title": "Parameter Golf active RevDEQ + Parcae baseline"
+    }
+  ],
+  "timeout_s": 900
+}

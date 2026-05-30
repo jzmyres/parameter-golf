@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-05-24T22:09:47.632572+00:00",
+  "gpu_count": 2,
+  "nproc": 2,
+  "python": "3.11.15",
+  "results": [
+    {
+      "command": "conda run --no-capture-output -n opg torchrun --standalone --nproc_per_node=2 baselines/ddp_harnesses/import_ddp_smoke.py --baseline-id deq-locuslab --worktree /project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/deq-locuslab --imports lib.layer_utils --steps 2",
+      "detail": "Command exited 0.",
+      "duration_s": 6.727,
+      "id": "deq-locuslab",
+      "log_path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/runs/deq-locuslab/ddp_smoke_20260524T220940Z.log",
+      "mode": "pytorch_import_adapter",
+      "status": "ddp_smoke_passed",
+      "title": "Deep Equilibrium Models"
+    }
+  ],
+  "timeout_s": 300
+}

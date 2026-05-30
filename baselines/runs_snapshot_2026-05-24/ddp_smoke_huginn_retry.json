@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-05-24T22:12:24.704762+00:00",
+  "gpu_count": 2,
+  "nproc": 2,
+  "python": "3.11.15",
+  "results": [
+    {
+      "command": "conda run --no-capture-output -n opg torchrun --standalone --nproc_per_node=2 baselines/ddp_harnesses/import_ddp_smoke.py --baseline-id huginn-recurrent-pretraining --worktree /project/ylin/mzhong4/research/opg/parameter-golf/baselines/worktrees/huginn-recurrent-pretraining --imports file:recpre/misc.py --steps 2",
+      "detail": "Command exited 0.",
+      "duration_s": 6.276,
+      "id": "huginn-recurrent-pretraining",
+      "log_path": "/project/ylin/mzhong4/research/opg/parameter-golf/baselines/runs/huginn-recurrent-pretraining/ddp_smoke_20260524T221218Z.log",
+      "mode": "pytorch_import_adapter",
+      "status": "ddp_smoke_passed",
+      "title": "Huginn / Scaling up Test-Time Compute with Latent Reasoning"
+    }
+  ],
+  "timeout_s": 300
+}

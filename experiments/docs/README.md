@@ -12,6 +12,8 @@ code or launching training.
   evidence, verdicts, and follow-up decisions.
 - `hypotheses_archive.md` preserves historical records and long-form evidence
   that no longer belongs in the active ledger.
+- `recurrent_depth_baselines.md` summarizes external recurrent-depth baselines
+  and points to `baselines/` for source pins and replication status.
 - `iterNNN_*.md` files are focused design or implementation plans for a single
   iteration.
 
