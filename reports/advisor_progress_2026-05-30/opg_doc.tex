@@ -1,0 +1,1026 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black
+}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\simplex}{\Delta}
+\newcommand{\RMSUnit}{\operatorname{RMSUnit}}
+\newcommand{\RMSNorm}{\operatorname{RMSNorm}}
+\newcommand{\SDPA}{\operatorname{SDPA}}
+\newcommand{\silu}{\operatorname{SiLU}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\stopgrad}{\operatorname{sg}}
+\newcommand{\rank}{\operatorname{rank}}
+\newcommand{\spn}{\operatorname{span}}
+\newcommand{\rhoF}{\rho(J_F)}
+\newcommand{\bpb}{\textsc{bpb}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+% wrapping fixed-width column
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\title{OPG (parameter-golf): An Inference-Scaling Fixed-Point\\
+Mixture-of-Experts Language Model\\
+\large Goal, theory, design, and current results}
+\author{Project document for \texttt{train\_gpt.py}}
+\date{2026-06-02}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+
+%==============================================================================
+\section{Problem and Goal}
+\label{sec:problem}
+
+\subsection{Setting and measurement}
+\label{sec:setting}
+
+We target a small, parameter-efficient language model and measure it by validation
+bits-per-byte (\bpb) on a held-out language-modeling corpus (FineWeb, with a
+$1024$-entry SentencePiece vocabulary).  All development numbers in this document are
+controlled $\sim$1000-step runs that vary a single factor at a time, so comparisons
+are made at equal training-step count unless noted otherwise.
+
+\subsection{Goal: inference-scaling from a small parameter count}
+\label{sec:goal}
+
+A large, deep, dense transformer is expressive because it has many distinct
+layers, each with its own weights; its parameter count grows linearly with depth.
+Our goal is to recover that expressiveness \emph{without} paying for the depth in
+parameters, and to do so in a way that scales with test-time compute.  Concretely
+the design rests on two complementary levers and one organizing objective.
+
+\paragraph{Lever 1 --- recurrent depth (parameter efficiency).}
+We tie the weights of one shared block $b_\theta$ and obtain depth by
+\emph{iterating} it.  Depth is then a runtime quantity (how many times we apply
+$b_\theta$), not a parameter-count quantity.  This is the standard
+recurrent-depth / looped-transformer route to small models
+(Universal Transformer~\cite{ut}, Parcae~\cite{parcae}, Huginn~\cite{huginn}).
+
+\paragraph{Lever 2 --- mixture-of-experts (expressiveness recovery).}
+Tying a single block strictly reduces the function class relative to using
+independent per-layer weights (made precise in Theorem~\ref{thm:tied-gap}).  We
+recover the lost expressiveness by making the shared block a \emph{dense soft
+mixture of $E$ experts}.  At each application the block computes a
+token-dependent convex combination $\sum_e p_e(z)\,M_e(z)$ of the experts.  The
+experts act as a learned \emph{weight basis} and the routing weights $p(z)$ as
+\emph{coordinates}: one shared block can realize a combinatorially large set of
+distinct effective weights, and --- if its routing varies across iterations ---
+the $K$-step recurrence can emulate the $K$ distinct layers of a deep dense
+network (Theorem~\ref{thm:moe-depth}).  This is the expressiveness-recovery role
+that MoE plays for layer-shared transformers in MoEUT~\cite{moeut} and the
+sparse-looped-MoE line.
+
+\paragraph{Objective --- inference-scaling.}
+The property we ultimately require is \emph{inference-scaling}: increasing the
+test-time compute budget (the recurrence length $K$) should not degrade and
+should, in the useful regime, \emph{improve} accuracy, and the useful budget
+should be \emph{larger for harder inputs}.  This is the test-time-compute-scaling
+property of Huginn~\cite{huginn}, Mixture-of-Recursions~\cite{mor}, and
+Think-at-Hard~\cite{tah}.  Inference-scaling --- not merely ``reach a stable
+state'' --- is the goal against which the design is judged.
+
+\paragraph{Approach --- the fixed point.}
+The approach we pursue toward that goal is to define the model's representation as
+the \emph{fixed point} of the shared block: for input embeddings $x_0$,
+$z^\star = T_\theta(z^\star, x_0)$.  Three properties make the fixed point an
+attractive vehicle for inference-scaling.  (i) It is a well-defined
+$K\!\to\!\infty$ limit, so ``run the model longer'' has a precise meaning.
+(ii) The number of iterations required to reach it is \emph{input-dependent} ---
+governed by how contractive the map is at that input --- which is exactly the
+adaptive-compute behaviour we want (Section~\ref{sec:theory},
+Theorem~\ref{thm:scaling}).  (iii) A reversible solver trains the limit in $O(1)$
+activation memory, independent of depth (Section~\ref{sec:revdeq}).
+
+We are explicit, throughout, that a fixed point is the \emph{means} and not the
+end.  A strictly contractive map that converges \emph{uniformly fast} for all
+inputs would plateau immediately and exhibit \emph{no} inference-scaling.  The
+theory in Section~\ref{sec:theory} therefore treats the contraction rate as a
+spectrum and identifies where on that spectrum inference-scaling lives, and where
+one would have to leave the fixed-point regime altogether.
+
+\subsection{Design requirements}
+\label{sec:constraints}
+
+Two requirements follow from the goal itself, not from any external budget:
+\begin{itemize}[leftmargin=2em,itemsep=0.2em]
+  \item \textbf{Resource-constrained training and inference.} The model should train
+        and run within the memory of a single commodity GPU (development uses one
+        48\,GB L40S-class card); the reversible solver (Section~\ref{sec:revdeq})
+        makes deep solves feasible there by keeping activation memory $O(1)$ in the
+        solve depth.
+  \item \textbf{Reversibility.} The solve must remain exactly invertible, so all
+        routing is dense and soft --- hard top-$k$ dispatch, capacity dropping, and
+        argmax selection are forbidden inside the solved block
+        (Section~\ref{sec:design}).
+\end{itemize}
+
+%==============================================================================
+\section{Related Work and Baselines}
+\label{sec:related}
+
+The design sits inside the recurrent-depth / equilibrium-model family: models that
+trade extra compute for fewer unique parameters.  We organize the comparison set
+by the mechanism each uses for depth and by whether it targets a fixed point or
+open-ended test-time computation, and we inherit several evaluation axes from this
+literature (Section~\ref{sec:inherited}).  Replication state for each baseline is
+tracked in \texttt{experiments/docs/recurrent\_depth\_baselines.md} and the
+\texttt{baselines/} workspace.
+
+\subsection{Comparison set}
+\label{sec:comparison-set}
+
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+  \item \textbf{DEQ / TorchDEQ}~\cite{deq,torchdeq}. The original deep-equilibrium
+    models: solve for a fixed point of one block rather than stacking layers.
+    Convergence is treated through implicit fixed-point solvers; our backbone is a
+    reversible DEQ variant.
+  \item \textbf{RevDEQ}~\cite{revdeq}. Reversible DEQ with exact gradients and
+    fewer function evaluations --- the method closest to ours, which we extend with
+    dense expert routing, Parcae damping, and explicit spectral diagnostics.
+  \item \textbf{Universal Transformer}~\cite{ut}. The seminal shared-block-through-depth
+    model, optionally with adaptive per-position halting --- an early adaptive-compute
+    comparator.
+  \item \textbf{Parcae}~\cite{parcae}. Stable looped language models via per-dimension
+    damping and input injection, treating loop depth as a separate scaling axis; we
+    adopt its damping in our solver.
+  \item \textbf{Huginn / recurrent-pretraining}~\cite{huginn}. A large latent-recurrent
+    LM with \emph{variable test-time compute} --- the canonical inference-scaling
+    comparator.
+  \item \textbf{MoEUT}~\cite{moeut}. Sparse mixture-of-experts capacity to recover the
+    expressivity lost under Universal-Transformer-style layer sharing --- the direct
+    precedent for our Lever 2.
+  \item \textbf{Mixture-of-Recursions}~\cite{mor} and \textbf{MoDR}. Adaptive
+    \emph{token-level} recursion depth: route tokens to different numbers of recurrent
+    passes --- the adaptive-depth comparator most aligned with our goal.
+  \item \textbf{Think-at-Hard}~\cite{tah}. Selective latent iterations for \emph{hard
+    tokens} --- explicitly ``compute more where it is harder.''
+  \item \textbf{Iso-Depth Looped-LM Scaling}~\cite{isodepth}. Measures the value of
+    recurrence via a \emph{recurrence-equivalence exponent} $\phi$ that separates true
+    loop capacity from token-budget effects --- a metric we inherit
+    (Section~\ref{sec:inherited}).
+\end{itemize}
+
+\subsection{Spectrum positioning}
+\label{sec:positioning}
+
+The framework of Section~\ref{sec:theory} places these models on a single axis: the
+per-input contraction rate $\rho(x)$ of the iteration map (formally
+Definition~\ref{def:rho-x}).  Two camps emerge.  The \emph{equilibrium camp}
+(DEQ, TorchDEQ, RevDEQ, Parcae) drives the iteration to a fixed point; it gains a
+well-defined deep limit and stability, but a strictly converged solve plateaus and
+does not scale with extra test-time compute.  The \emph{test-time-scaling camp}
+(Huginn, Mixture-of-Recursions, Think-at-Hard) keeps the recurrence doing useful
+work --- effectively operating away from a trivial equilibrium --- and gains
+open-ended scaling at the cost of a convergence guarantee.  This project aims to
+\emph{bridge} the two: an expressive fixed point whose \emph{approach} is
+input-adaptive, so that easy inputs converge quickly and hard inputs spend more
+iterations to reach a richer equilibrium.  Table~\ref{tab:related} summarizes the
+positioning.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}L{0.16\textwidth} L{0.155\textwidth} L{0.135\textwidth} L{0.12\textwidth} L{0.255\textwidth}@{}}
+\toprule
+\textbf{Model} & \textbf{Depth mechanism} & \textbf{Convergence guarantee} & \textbf{Test-time scaling} & \textbf{Expressivity recovery} \\
+\midrule
+DEQ / TorchDEQ & implicit fixed point & solver residual & no (plateaus at FP) & none (single block) \\
+RevDEQ & reversible fixed point & solver residual & no (plateaus at FP) & none (single block) \\
+Universal Transformer & shared block $\times K$, ACT halting & none & adaptive halting & none \\
+Parcae & damped looped block & stability via damping & loop-depth scaling law & none \\
+Huginn & latent recurrence & none (by design) & \textbf{yes, variable} & large latent state \\
+MoEUT & shared block $+$ sparse MoE & none & no & \textbf{sparse MoE} \\
+Mixture-of-Recursions / MoDR & per-token recursion depth & none & \textbf{yes, adaptive} & depth routing \\
+Think-at-Hard & selective hard-token iterations & none & \textbf{yes, hard-token} & selective depth \\
+\midrule
+\textbf{This work} & \textbf{reversible FP of dense-MoE block} & \textbf{$\rhoF<1$ (spectral)} & \textbf{target: adaptive via $\rho(x)\!\to\!1^-$} & \textbf{dense soft MoE (weight basis)} \\
+\bottomrule
+\end{tabular}
+\caption{Positioning against the recurrent-depth / equilibrium literature.  Our
+design is the only entry combining a reversible expressive fixed point with a
+spectral convergence guarantee \emph{and} an explicit inference-scaling target; the
+contraction rate $\rho(x)$ (Section~\ref{sec:theory}) is the axis that unifies the
+``convergence guarantee'' and ``test-time scaling'' columns.}
+\label{tab:related}
+\end{table}
+
+\subsection{Inherited evaluation axes}
+\label{sec:inherited}
+
+Several evaluation axes are imported from these comparators and instantiated as
+metrics in Section~\ref{sec:metrics}:
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt]
+  \item \textbf{Loss-vs-compute scaling curve} (Huginn, Mixture-of-Recursions): \bpb{}
+    as a function of the test-time recurrence budget $K$.  Our $K$-sweep is the
+    population form of this curve; the per-input form is the new effective-depth
+    metric of Section~\ref{sec:metrics}.
+  \item \textbf{Recurrence-equivalence exponent $\phi$} (Iso-Depth~\cite{isodepth}):
+    the exponent relating a looped model's effective capacity to an equivalent number
+    of unique layers, separating genuine loop value from token-budget effects.
+  \item \textbf{Fixed-point residual / convergence} (DEQ, RevDEQ): the relative change
+    of the iterate at the deepest solve depth, our \code{iter\_conv\_rel}.
+  \item \textbf{Expressivity-under-sharing} (MoEUT): whether the expert capacity is
+    actually exercised, measured here through routing entropy, output orthogonality,
+    and the across-depth routing variation.
+\end{itemize}
+
+%==============================================================================
+\section{Evaluation Metrics and Theoretical Guarantees}
+\label{sec:theory}
+
+This section is mathematical and self-contained.  It defines the objects, states the
+goal formally, proves the guarantees the design relies on, and derives the evaluation
+metrics from those guarantees.  Nothing here depends on any particular training run;
+measured values appear only in Section~\ref{sec:results}.
+
+\subsection{Setup and notation}
+\label{sec:setup}
+
+Let $D$ be the model width and $V$ the vocabulary size.  An input is a token sequence
+$x$; write $x_0\in\R^{D}$ for a single token's input embedding (state tensors carry
+batch and sequence axes, suppressed here).  The shared block defines a parameterized
+map $T_\theta(\cdot, x_0):\R^{D}\to\R^{D}$ for each fixed input $x_0$.  The block has
+the input-injected form
+\begin{equation}
+  T_\theta(z, x_0) = \bar B \odot \RMSNorm(x_0) + \Delta_\theta(z, x_0),
+  \label{eq:Tmap}
+\end{equation}
+where $\bar B$ is a learned per-dimension input gain and $\Delta_\theta$ is the
+expert-mixture update of Section~\ref{sec:design}.  The model is solved by a damped
+two-state iteration (Section~\ref{sec:revdeq}) whose joint update we write as
+$F(\cdot, x_0)$; its fixed point $z^\star(x_0)$ satisfies $z^\star = T_\theta(z^\star, x_0)$.
+The head $g:\R^D\to\R^V$ maps the solved representation to next-token logits, and the
+task loss at depth $K$ is $L_K(x) = \ell\bigl(g(z_K(x)),\, y\bigr)$ with $\ell$ the
+cross-entropy (the basis of \bpb).  Write $L_\infty(x) = \ell\bigl(g(z^\star(x)),\, y\bigr)$
+for the loss of the \emph{defined} (fixed-point) model.
+
+\begin{definition}[Per-input contraction rate]
+\label{def:rho-x}
+For input $x$ let $J_F(x) = \nabla_{(y,z)} F\bigl(z^\star(x), z^\star(x); x_0(x)\bigr)$ be
+the Jacobian of the joint iteration map at the fixed point, and define the
+\emph{contraction rate}
+\[
+  \rho(x) \;=\; \rho\bigl(J_F(x)\bigr) \;=\; \max\{|\lambda| : \lambda \text{ eigenvalue of } J_F(x)\}.
+\]
+\end{definition}
+
+The contraction rate is the single control variable of the framework: $\rho(x)$
+governs both whether the solve converges (Theorem~\ref{thm:lyap}) and how many
+iterations it takes (Theorem~\ref{thm:scaling}).
+
+\begin{definition}[Inference-scaling]
+\label{def:scaling}
+A recurrent model \emph{exhibits inference-scaling} if (i) the expected loss
+$\E_x[L_K(x)]$ is non-increasing in the compute budget $K$ over the operating range,
+and (ii) the budget $K^\star(x)$ required to reach a fixed loss tolerance is larger
+for harder inputs, where hardness is any input statistic monotone in $\rho(x)$ or in
+the initial distance $\|z_0(x)-z^\star(x)\|$.  Property (i) is \emph{no-degradation
+plus monotone improvement}; property (ii) is \emph{adaptivity}.
+\end{definition}
+
+\subsection{T1 --- The weight-tying expressiveness gap}
+\label{sec:t1}
+
+We first make precise why a tied recurrent block needs expressiveness recovery.
+
+\begin{theorem}[Weight-tying strictly shrinks the function class]
+\label{thm:tied-gap}
+Fix a block family $\{b_\theta : \theta\in\Theta\}$ with $\Theta\subseteq\R^p$ open and
+$b_\theta(\cdot)$ jointly smooth in $(\theta, z)$.  For depth $L\ge 2$ define the
+independent-layer class $\mathcal F^{\mathrm{ind}}_L = \{b_{\theta_L}\circ\cdots\circ b_{\theta_1} : \theta_i\in\Theta\}$
+and the tied class $\mathcal F^{\mathrm{tie}}_L = \{b_\theta^{\circ L} : \theta\in\Theta\}$.
+Then $\mathcal F^{\mathrm{tie}}_L \subseteq \mathcal F^{\mathrm{ind}}_L$, and the inclusion
+is strict for generic $b$: $\mathcal F^{\mathrm{tie}}_L$ is the image of a $p$-dimensional
+parameter manifold, while $\mathcal F^{\mathrm{ind}}_L$ is the image of an
+$Lp$-dimensional one, so $\mathcal F^{\mathrm{tie}}_L$ is a measure-zero subset of
+$\mathcal F^{\mathrm{ind}}_L$ whenever the independent parameterization has rank $>p$ at
+some point.
+\end{theorem}
+
+\begin{proof}
+Inclusion: set $\theta_i=\theta$ for all $i$.  Strictness: the tied map
+$\theta\mapsto b_\theta^{\circ L}$ factors through the diagonal
+$\theta\mapsto(\theta,\dots,\theta)\in\Theta^L$, so its image lies in a $p$-dimensional
+immersed submanifold of the function space spanned by the full
+$\theta_{1:L}\mapsto b_{\theta_L}\circ\cdots\circ b_{\theta_1}$ parameterization.  If the
+latter has Jacobian rank $>p$ at any $\theta_{1:L}$ --- which holds for generic smooth
+$b$ with $L\ge 2$, since distinct layers can be perturbed independently --- its image is
+a manifold of dimension $>p$, of which the $p$-dimensional diagonal image is a
+measure-zero subset.  Hence there exist $L$-layer maps not realizable by any single
+iterated block.
+\end{proof}
+
+Theorem~\ref{thm:tied-gap} is the formal statement of ``recurrent use of a shared block
+constrains performance.''  The remedy is to enlarge the per-step family so that
+\emph{different applications can realize different effective layers} --- the role of the
+mixture of experts.
+
+\subsection{T2 --- Mixture-of-experts depth recovery}
+\label{sec:t2}
+
+Let the block update be a dense soft mixture over $E$ experts,
+\begin{equation}
+  \Delta_\theta(z,x_0) \;=\; \sum_{e=1}^{E} p_e(z)\, M_e(z), \qquad p(z)\in\simplex^{E-1},
+  \label{eq:mixture}
+\end{equation}
+with routing weights $p(z)$ on the probability simplex and experts $M_e$.  The
+\emph{effective per-step map} at routing $p$ is $T_p(z) = \bar B\odot\RMSNorm(x_0) + \sum_e p_e M_e(z)$.
+
+\begin{proposition}[Per-step capacity: experts as a basis]
+\label{prop:rank}
+Suppose each expert has a linear read-out, $M_e(z) = W^o_e\, \phi_e(z)$ with
+$W^o_e\in\R^{D\times r}$.  Then for any state $z$ the achievable update directions lie in
+$\spn\{W^o_1,\dots,W^o_E\}$, a subspace of dimension at most $\min(\sum_e r,\ D)$; if the
+read-outs are mutually orthogonal (e.g.\ a Cayley-parameterized stacked
+$[W^o_1\,\|\cdots\|\,W^o_E]$ with orthonormal columns), the achievable subspace has
+dimension exactly $\min(Er, D)$.  In particular the function-space rank of one
+soft-MoE block is $\min(Er, D)$, recovering full dense width when $Er\ge D$.
+\end{proposition}
+
+\begin{proof}
+$\Delta_\theta(z,x_0)=\sum_e p_e(z) W^o_e \phi_e(z)$ is a linear combination of the
+columns of the $W^o_e$, hence lies in their joint span; its dimension is the rank of the
+stacked matrix, $\le\min(Er,D)$, with equality under orthonormal columns.
+\end{proof}
+
+\begin{theorem}[Depth recovery from a single shared MoE block]
+\label{thm:moe-depth}
+Consider the $K$-fold composition of the shared block along a solve trajectory
+$z_{k+1}=T_{p(z_k)}(z_k)$, $k=0,\dots,K-1$.
+\begin{enumerate}[leftmargin=2em,itemsep=0.2em]
+  \item \emph{(Combinatorial layer count.)} Under an idealized hard routing that selects
+    one expert per application, the $K$-step recurrence realizes one of up to $E^{K}$
+    distinct ordered expert-sequences, i.e.\ up to $E^{K}$ distinct depth-$K$ composite
+    maps from a single stored block.  (With separate attention and MLP banks of $E$
+    experts the count is $(E\cdot E)^{K}$.)  Soft routing~\eqref{eq:mixture} is the
+    differentiable convex relaxation of this selection, required for a reversible solve
+    (Section~\ref{sec:design}).
+  \item \emph{(Recovery condition.)} If the routing is constant along the trajectory,
+    $p(z_k)\equiv p$, the composite collapses to $T_p^{\circ K}$, a single iterated map
+    --- back inside the tied class $\mathcal F^{\mathrm{tie}}_K$ of
+    Theorem~\ref{thm:tied-gap}.  The expressiveness of an independent-layer network is
+    recovered only to the extent that the routing \emph{varies across iterations}, i.e.\
+    only when the across-depth routing variation
+    $\frac1{K-1}\sum_k \|p(z_{k+1})-p(z_k)\|$ is bounded away from zero.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(1) Each application chooses among $E$ experts independently; the number of ordered
+length-$K$ choices is $E^K$, each inducing a distinct composite for generic experts.
+The soft case replaces the choice by a point in $\simplex^{E-1}$, a convex superset of
+the $E$ vertices.  (2) If $p(z_k)\equiv p$ then $z_{k+1}=T_p(z_k)$ for a fixed map $T_p$,
+so $z_K=T_p^{\circ K}(z_0)\in\mathcal F^{\mathrm{tie}}_K$; conversely distinct $T_{p(z_k)}$
+across $k$ produce a composition of distinct maps, which by Theorem~\ref{thm:tied-gap}
+can lie outside the tied class.
+\end{proof}
+
+Theorem~\ref{thm:moe-depth} is the precise content of ``MoE creates an exponential number
+of effective weights across depth that emulate the distinct layers of a dense deep
+transformer.''  Crucially it also identifies the \emph{condition} for the recovery to
+occur --- across-depth routing variation --- which Section~\ref{sec:metrics} turns into a
+directly measurable metric, and which Section~\ref{sec:results} shows the current pipeline
+does not yet satisfy.
+
+\subsection{T3 --- Local stability of the fixed point}
+\label{sec:t3}
+
+The fixed point is the approach (Section~\ref{sec:goal}); for it to be a well-defined,
+attracting limit we need the iteration to be locally contractive.
+
+\begin{definition}[Local exponential stability]
+\label{def:stable}
+Let $x^\star=M(x^\star)$ for an iteration $x_{k+1}=M(x_k)$.  The fixed point is locally
+exponentially stable if there exist $\delta,C>0$ and $\eta\in(0,1)$ with
+$\|x_0-x^\star\|<\delta \Rightarrow \|x_k-x^\star\|\le C\eta^k\|x_0-x^\star\|$ for all $k$.
+\end{definition}
+
+\begin{theorem}[Spectral radius below one $\Rightarrow$ local exponential stability]
+\label{thm:lyap}
+Let $M$ be $C^1$ near $x^\star=M(x^\star)$.  If $\rho(\nabla M(x^\star))<1$, then $x^\star$
+is locally exponentially stable, and for every $\eta\in(\rho,1)$ there is $C_\eta$ with
+$\|x_k-x^\star\|\le C_\eta\,\eta^k\,\|x_0-x^\star\|$ near $x^\star$.
+\end{theorem}
+
+\begin{proof}
+Let $J=\nabla M(x^\star)$ with $\rho(J)<1$.  By the discrete Lyapunov theorem, for any
+$Q\succ0$ there is a unique $P\succ0$ with $J^\top P J - P = -Q$ (equivalently
+$P=\sum_{i\ge0}(J^\top)^i Q J^i$, convergent since $\rho(J)<1$).  For the linearized error
+$e_{k+1}=Je_k$, $V(e)=e^\top Pe$ obeys $V(Je)-V(e)=-e^\top Qe<0$.  For the nonlinear map,
+$M(x^\star+e)-x^\star = Je+r(e)$ with $\|r(e)\|=o(\|e\|)$; choosing a neighborhood with
+$\|r(e)\|\le\varepsilon\|e\|$,
+\[
+  V(Je+r)-V(e) \le -\lambda_{\min}(Q)\|e\|^2 + 2\|J^\top P\|\varepsilon\|e\|^2 + \|P\|\varepsilon^2\|e\|^2,
+\]
+which is $\le-\tfrac12\lambda_{\min}(Q)\|e\|^2$ for $\varepsilon$ small.  Hence $V$
+decreases geometrically, giving local exponential stability; the rate $\eta$ can be taken
+arbitrarily close to $\rho(J)$ by the spectral radius formula
+$\rho(J)=\lim_k\|J^k\|^{1/k}$.
+\end{proof}
+
+\begin{remark}[The relevant Jacobian is the two-state cycle $F$, not $T_\theta$]
+\label{rem:F}
+The Parcae solver (Section~\ref{sec:revdeq}) iterates a \emph{joint two-state} map
+$F(y,z)$, not $T_\theta$ in isolation.  With $D_A=\diag(\bar A)$ and
+$D_\beta=\diag(1-\bar A)$ the per-dimension damping gates, and $J_T=\nabla T_\theta(z^\star)$,
+\[
+  F(y,z)=\bigl(D_A y + D_\beta T_\theta(z),\; D_A z + D_\beta T_\theta(D_A y + D_\beta T_\theta(z))\bigr),
+  \quad
+  \nabla F=\begin{bmatrix} D_A & D_\beta J_T \\ D_\beta J_T D_A & D_A + D_\beta J_T D_\beta J_T \end{bmatrix}.
+\]
+The relevant condition is therefore $\rhoF<1$, evaluated directly on $F$
+(Definition~\ref{def:rho-x}).  Because $D_A,D_\beta$ are per-dimension and do not commute
+with the dense $J_T$, damping alone cannot contract an expansive transition mode: the
+off-diagonal $D_\beta J_T$ blocks scale with $\|J_T\|$, so bringing $\rhoF<1$ requires
+\emph{joint} pressure on the damping \emph{and} on the transition parameters.  This is why
+$\rhoF$ --- not the damping coefficients, and not the transition map $T_\theta$ alone --- is
+the principled gate.
+\end{remark}
+
+\begin{remark}[Spectral radius, not operator norm]
+\label{rem:rho-vs-sigma}
+$\rhoF<1$ is \emph{necessary and sufficient} for local exponential stability
+(Theorem~\ref{thm:lyap} and its converse via $\rho=\lim\|J^k\|^{1/k}$).  The operator-norm
+condition $\sigma_{\max}(J_F)<1$ is \emph{sufficient but not necessary}, and for
+non-normal $J_F$ the gap is large: a Jacobian can satisfy $\rho\ll1$ while $\sigma_{\max}\gg1$
+(transient amplification that decays geometrically).  We therefore gate on $\rhoF$ and report
+$\sigma_{\max}$ only as a diagnostic; a soft penalty on $\sigma_{\max}$ targets the wrong
+condition and is not used (Section~\ref{sec:metrics}).
+\end{remark}
+
+\subsection{T4 --- Adaptive inference-scaling on the contraction spectrum}
+\label{sec:t4}
+
+We now connect the convergence metric $\rho(x)$ to the goal of
+Definition~\ref{def:scaling}.
+
+\begin{assumption}[Local Lipschitz head]
+\label{ass:lip}
+The composed head-and-loss $z\mapsto \ell(g(z),y)$ is $L_{\mathrm{head}}$-Lipschitz on a
+neighborhood of $z^\star(x)$ containing the solve trajectory.  (This holds for the
+architecture of Section~\ref{sec:design}: $\RMSNorm$ is smooth away from $0$, the read-out
+is linear, and log-softmax cross-entropy is $1$-Lipschitz in the logits in total variation.)
+\end{assumption}
+
+\begin{theorem}[Contraction rate controls the loss gap and the adaptive budget]
+\label{thm:scaling}
+Fix $x$ with $\rho(x)<1$ (so by Theorem~\ref{thm:lyap} the solve converges locally) and let
+Assumption~\ref{ass:lip} hold.  Then for every $\eta\in(\rho(x),1)$ there is $C(x)>0$ with
+\begin{equation}
+  \|z_K(x)-z^\star(x)\| \le C(x)\,\eta^{K}\,\|z_0(x)-z^\star(x)\|,
+  \qquad
+  |L_K(x)-L_\infty(x)| \le L_{\mathrm{head}}\,C(x)\,\eta^{K}\,\|z_0(x)-z^\star(x)\|.
+  \label{eq:lossgap}
+\end{equation}
+Consequently the compute required to bring the loss gap below a tolerance $\delta>0$ is
+\begin{equation}
+  K^\star(x) \;=\; \left\lceil \frac{\log\!\bigl(L_{\mathrm{head}} C(x)\,\|z_0(x)-z^\star(x)\|/\delta\bigr)}{\log(1/\eta)} \right\rceil,
+  \label{eq:Kstar}
+\end{equation}
+which (i) is finite and the loss is monotonically non-increasing for $K<K^\star(x)$, and
+(ii) \emph{increases as the contraction weakens} ($\rho(x)\to 1^-$ forces $\eta\to 1^-$, so
+$\log(1/\eta)\to 0^+$ and $K^\star(x)\to\infty$) \emph{and as the initial distance
+$\|z_0(x)-z^\star(x)\|$ grows}.  Hence a family of fixed-point solves with
+input-dependent $\rho(x)<1$ satisfies both clauses of Definition~\ref{def:scaling}:
+monotone improvement to the equilibrium, with per-input budget increasing in hardness.
+\end{theorem}
+
+\begin{proof}
+Equation~\eqref{eq:lossgap}: the first bound is Theorem~\ref{thm:lyap} applied to $F$
+(Remark~\ref{rem:F}), projected to the $z$-coordinate; the second composes it with
+Assumption~\ref{ass:lip}.  Equation~\eqref{eq:Kstar}: solve
+$L_{\mathrm{head}}C(x)\eta^{K}\|z_0-z^\star\|\le\delta$ for $K$.  Monotonicity on
+$K<K^\star(x)$ follows because the right side of~\eqref{eq:lossgap} is strictly decreasing in
+$K$; the limits in (ii) are immediate from $\log(1/\eta)\to0^+$ as $\eta\to1^-$ and the
+linear dependence on $\|z_0-z^\star\|$.
+\end{proof}
+
+\begin{corollary}[The contraction spectrum]
+\label{cor:spectrum}
+Reading $K^\star(x)$ as the effective test-time depth, Theorem~\ref{thm:scaling} partitions
+the design space by $\rho(x)$:
+\begin{itemize}[leftmargin=2em,itemsep=0.2em]
+  \item \textbf{$\rho(x)\ll1$ (strongly contractive):} $K^\star(x)\approx1$ for all inputs ---
+    the solve settles immediately, there is \emph{no} inference-scaling (effective depth
+    $\approx1$).
+  \item \textbf{$\rho(x)\to1^-$ (critical):} $K^\star(x)$ is large and \emph{heterogeneous},
+    growing with input hardness --- this is the regime in which inference-scaling holds and,
+    by Theorem~\ref{thm:moe-depth}(2), the long transient composes many distinct MoE layers.
+  \item \textbf{$\rho(x)\ge1$ (non-equilibrium):} no fixed point is reached; open-ended
+    test-time computation is possible (the Huginn/MoR regime) but the convergence certificate
+    of Theorem~\ref{thm:lyap} is forfeited.  This is the \emph{relax-FP fork}: it is reachable
+    without losing the $O(1)$-memory reversible training (which needs only floored
+    invertibility, Section~\ref{sec:revdeq}), but it trades the guarantee for the scaling.
+\end{itemize}
+The design goal is to operate at criticality from below ($\rho(x)\to1^-$) with $\rho(x)$
+heterogeneous across inputs.
+\end{corollary}
+
+\subsection{The explicit guarantee: optimizing the metric drives the goal}
+\label{sec:guarantee}
+
+We close the loop by exhibiting a training objective whose minimization provably advances
+the premises of Theorem~\ref{thm:scaling}.  Let $S_0<S_1<\cdots<S_m$ be solve depths along a
+single trajectory and define the recursive multi-$K$ consistency loss
+\begin{equation}
+  \mathcal L_{\mathrm{consist}}
+   = \frac1m\sum_{i=0}^{m-1}\bigl\|z_{S_i}-\stopgrad(z_{S_{i+1}})\bigr\|^2 .
+  \label{eq:consist}
+\end{equation}
+
+\begin{proposition}[Consistency bounds representation error and forces contraction]
+\label{prop:consist}
+The consistency loss upper-bounds the trajectory's terminal displacement,
+$\|z_{S_0}-z_{S_m}\| \le \sum_{i} \|z_{S_i}-z_{S_{i+1}}\| \le \sqrt{m}\,\bigl(\sum_i\|z_{S_i}-z_{S_{i+1}}\|^2\bigr)^{1/2}$,
+so driving $\mathcal L_{\mathrm{consist}}\to0$ makes the trajectory Cauchy and hence (with a
+fixed point present) drives the representation error $\|z_{S_m}-z^\star\|\to0$, the premise of
+Theorem~\ref{thm:scaling}.  Moreover $\mathcal L_{\mathrm{consist}}=0$ on a non-stationary
+trajectory is achievable only if the iterates have stopped moving, i.e.\ only if the map is
+contractive at the operating point ($\rhoF<1$); the recursive (consecutive-pair) form, unlike
+an all-to-deepest target, only requires \emph{local} contraction over each depth range
+$[S_i,S_{i+1}]$ and so does not collapse the map to a trivial $\rho\to0$ degenerate solution.
+\end{proposition}
+
+\begin{proof}
+The displacement bound is the triangle inequality followed by Cauchy--Schwarz; a Cauchy solve
+with a fixed point converges to it.  For the contraction statement, if consecutive iterates
+coincide then $z_{S_{i+1}}=F(z_{S_i})\Rightarrow z_{S_i}$ is fixed, which near a hyperbolic
+fixed point requires $\rhoF<1$ (Theorem~\ref{thm:lyap}); the locality of the consecutive-pair
+constraint is immediate since each term involves only adjacent depths.
+\end{proof}
+
+\paragraph{What is proven, and what is open.}
+Proposition~\ref{prop:consist} with Theorems~\ref{thm:lyap}--\ref{thm:scaling} establishes the
+following honest chain: \emph{optimizing} the consistency objective and the $\rhoF$ gate
+\emph{provably} yields a well-defined, locally stable fixed-point model whose finite-$K$ solve
+is a faithful surrogate for the infinite-depth limit (loss gap~\eqref{eq:lossgap}), with the
+adaptive-budget structure~\eqref{eq:Kstar} required for inference-scaling, and a per-step
+expressiveness floor $\min(Er,D)$ (Proposition~\ref{prop:rank}).  Four things are
+\emph{not} proven and are flagged as open: (a) the \emph{absolute} quality of the fixed-point
+predictor (no universal-approximation result is claimed --- expressiveness is a capacity floor,
+not a guarantee of fit); (b) \emph{global} convergence from arbitrary initialization (the
+theory is local at the reached equilibrium); (c) that training can be driven to the
+\emph{critical, heterogeneous} $\rho(x)\to1^-$ regime --- the consistency loss bounds
+representation error and enforces $\rho<1$, but it does not by itself push $\rho$ toward $1$
+from below, which is the central tension between expressiveness and contraction
+(Corollary~\ref{cor:spectrum}; Section~\ref{sec:gap}); and (d), most consequential for the goal,
+\emph{that more recurrence improves task performance at all}.  The contraction bound guarantees
+only that $L_K\!\to\!L_\infty$ --- faithful convergence to the fixed-point model's \emph{own}
+loss; it controls the magnitude $|L_K-L_\infty|$ but not its sign, so it neither implies that
+$L_K$ decreases with $K$ in task terms nor that $L_\infty$ is small.  \textbf{Inference-scaling
+is therefore an empirical property, not a theorem}: the $\rhoF$ gate (the local contraction /
+local-Lipschitz condition at the fixed point) certifies \emph{convergence} but says nothing about
+whether spending more compute \emph{helps}.  Establishing that requires a dedicated
+inference-scaling metric \emph{in addition} to $\rhoF$ --- the scaling gain and its
+hardness-adaptivity defined next (Section~\ref{sec:metrics}) --- which the contraction theory
+cannot supply.
+
+\subsection{Metrics derived from the theory}
+\label{sec:metrics}
+
+Each metric is justified by the theorem it gates and is tagged by instrumentation status:
+\textbf{[emitted]} = computed every evaluation by the current pipeline; \textbf{[target]} =
+required by the goal but not yet instrumented (with the instrumentation it needs).
+
+\begin{table}[H]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}L{0.155\textwidth} L{0.30\textwidth} L{0.125\textwidth} L{0.31\textwidth}@{}}
+\toprule
+\textbf{Metric} & \textbf{What it measures} & \textbf{Gated by} & \textbf{Status / instrumentation} \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Objective}}\\
+\midrule
+\bpb{} & bits/byte on full validation, post-quant & --- (the score) & \textbf{[emitted]} \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Convergence (T3, Thm.~\ref{thm:lyap})}}\\
+\midrule
+$\rhoF$ & spectral radius of the iteration Jacobian, per $K$ & Thm.~\ref{thm:lyap} (nec.\ \& suff.) & \textbf{[emitted]} (power iteration on $J_F$) \\
+$\sigma_{\max}(J_F)$ & operator norm of the Jacobian & reported only (Rmk.~\ref{rem:rho-vs-sigma}) & \textbf{[emitted]}, not gated \\
+\code{iter\_conv\_rel} & relative iterate change at deepest $K$ & empirical conv.\ ($<0.05$) & \textbf{[emitted]} \\
+\code{deq\_recon\_err} & forward distance travelled (TBPTT) & not a recon error & \textbf{[emitted]}, interpret per def. \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Inference-scaling (T4, Thm.~\ref{thm:scaling}; Def.~\ref{def:scaling}) --- the goal is empirical, so these are required \emph{beyond} $\rhoF$}}\\
+\midrule
+scaling gain $G$ & \bpb{} drop from a shallow to a deep budget; rate $b$ in $L_K\!\approx\!L_\infty\!+\!aK^{-b}$ & Def.~\ref{def:scaling}(i) & \textbf{[target]}: \bpb$(K_{\rm lo})\!-\!$\bpb$(K_{\rm hi})$ and fitted $b$ \\
+scaling adaptivity & does the per-input gain $L_{K_{\rm lo}}(x)\!-\!L_\infty(x)$ grow with hardness & Def.~\ref{def:scaling}(ii) & \textbf{[target]}: corr.\ of per-input gain with $\rho(x)$/$K^\star(x)$ \\
+loss-vs-$K$ curve & \bpb{} vs.\ test-time budget $K$ (population) & Def.~\ref{def:scaling}(i) & \textbf{[emitted]} (the $K$-sweep) \\
+eff.\ depth $K^\star(x)$ dist. & per-input iterations-to-tolerance & Def.~\ref{def:scaling}(ii) & \textbf{[target]}: log per-token convergence step within the solve \\
+$\rho(x)$ heterogeneity & spread of contraction rate over inputs & Cor.~\ref{cor:spectrum} & \textbf{[target]}: bucketed power-iteration of $J_F(x)$ \\
+$\phi$ (recurrence-equiv.) & loop value vs.\ unique-layer count~\cite{isodepth} & Def.~\ref{def:scaling} & \textbf{[target]}: fit depth-vs-loss across $K$ \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Expressiveness (T1/T2, Thm.~\ref{thm:tied-gap}/\ref{thm:moe-depth})}}\\
+\midrule
+across-depth routing var. & $\frac1{K-1}\sum_k\|p(z_{k+1})-p(z_k)\|$ & Thm.~\ref{thm:moe-depth}(2) & \textbf{[emitted]} as iteration-variation \\
+output orthogonality & cosine between expert outputs & Prop.~\ref{prop:rank} (basis rank) & \textbf{[emitted]} \\
+per-token entropy & routing concentration per token & specialization & \textbf{[emitted]} \\
+utilization entropy & usage spread across the batch & whether all experts used & \textbf{[emitted]} \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Health and budget}}\\
+\midrule
+load-balance CV; min share & balance; dead-expert detection & routing health & \textbf{[emitted]} \\
+artifact bytes; quant gap & compressed size; cost of int6 & deployability & \textbf{[emitted]} \\
+peak VRAM; param count & single-GPU fit; model size & constraint & \textbf{[emitted]} \\
+NTP descent rate & per-step \& per-wallclock loss slope & training health & \textbf{[emitted]} \\
+\bottomrule
+\end{tabular}
+\caption{Theory-driven metric set.  The convergence and expressiveness metrics are emitted
+today; the inference-scaling metrics ($K^\star(x)$ distribution, $\rho(x)$ heterogeneity, $\phi$)
+are the targets that directly measure the goal and are not yet instrumented.  Promotion gate:
+$\rhoF<1$ (theoretical) or \code{iter\_conv\_rel}$<0.05$ at deepest $K$ (empirical).}
+\label{tab:metrics}
+\end{table}
+
+%==============================================================================
+\section{Current Design and Training Setup}
+\label{sec:design}
+
+\texttt{train\_gpt.py::Hyperparameters} is the source of truth; this section mirrors it and
+states, for each component, which theorem of Section~\ref{sec:theory} it serves.
+
+\subsection{Backbone and the fixed-point map}
+\label{sec:backbone}
+
+For token embeddings the input state is $x_0=\RMSNorm(E[x])$ (BigramHash disabled by default).
+For a tensor $u$, $\RMSUnit(u)=u/\sqrt{D^{-1}\sum_i u_i^2+\epsilon}$ with $\epsilon=10^{-6}$, and a
+learned scale gives $\RMSNorm(u;g)=\RMSUnit(u)\odot g$.  The block uses the parameter-free
+preconditioner $h=\RMSUnit(z+x_0)$ and forms the expert-mixture update
+$\Delta_\theta(z,x_0)=\Delta^A_\theta+\Delta^M_\theta$ (attention and MLP banks,
+Section~\ref{sec:experts}).  The fixed-point map is the input-injected
+form~\eqref{eq:Tmap}: $T_\theta(z,x_0;\bar B)=\bar B\odot\RMSNorm_{x_0}(x_0)+\Delta_\theta(z,x_0)$,
+with learned input-injection scale $\RMSNorm_{x_0}(x_0)=\RMSUnit(x_0)\odot g_{x0}$.  There is no
+unconditional residual $x_0+\Delta_\theta$: the input conditions the map both structurally
+(through $h$) and explicitly (through $\bar B$).  \emph{Serves:} defines $z^\star$ as the
+infinite-depth limit (Section~\ref{sec:goal}), the object of Theorem~\ref{thm:lyap}.
+
+\subsection{Dense soft-routed mixture of experts (Lever 2)}
+\label{sec:router}
+
+All experts process all tokens; the router forms continuous mixture weights.  The default
+scorer is evidential Dirichlet-UCB: per token, $\alpha=\operatorname{softplus}(\ell(h))+1$ defines
+a Dirichlet posterior with mean $\mu=\alpha/\!\sum\alpha$ and per-expert standard deviation
+$\sigma_e$, and routing weights are $p=\mathrm{acq}/\!\sum\mathrm{acq}$ with
+$\mathrm{acq}=\mu+\beta\sigma$, $\beta=0.5$ annealing to zero.  The routed sigmoid gate is
+disabled by default, so $\sum_e p_e=1$ exactly.  One pooled router over $2R$ outputs routes the
+$R$ attention and $R$ MLP experts ($R=E$ with no shared experts).  \emph{Serves:}
+Theorem~\ref{thm:moe-depth} (the weight basis) and Proposition~\ref{prop:rank} (rank $\min(Er,D)$).
+Routing must be soft and dense: hard top-$k$, capacity, and argmax are discrete inside
+$T_\theta$ and break the reversible solve, and are rejected by startup validation.
+
+\subsection{Independent experts: MLA attention and SwiGLU MLP}
+\label{sec:experts}
+
+Each attention expert owns a full multi-head latent-attention (MLA) pipeline: low-rank query
+projection with per-head gate logits, low-rank KV compression, independent K/V decompression,
+independent low-rank RoPE key projection, per-expert Q/K RMS scales, and a low-rank output
+projection (attention rank $64$).  Expert index is packed into the head dimension so one SDPA call
+with grouped-query attention evaluates all experts.  Each MLP expert is a full-$D$ low-rank
+SwiGLU bank, $r_e(h)=\silu(W^g_e(h\odot g^g_e))\odot W^f_e(h\odot g^f_e)$,
+$M_e(h)=W^o_e(\RMSUnit(r_e(h))\odot g^o_e)$ (MLP rank $96$, $\code{mlp\_mult}=3$).  Every
+expert-path parameter is per-expert; no learned scale is shared across experts.  \emph{Serves:}
+the orthogonalizable read-outs of Proposition~\ref{prop:rank} (the iter175 Cayley-orthogonal
+read-out, queued, would make the basis exactly orthonormal).
+
+\subsection{Parcae damping and the reversible solve (the approach)}
+\label{sec:revdeq}
+
+Raw Parcae parameters produce positive magnitudes $\delta,a,b$ (softplus$+10^{-3}$), and with
+reversibility floor $\epsilon_{\mathrm{rev}}=0.1$,
+\[
+  \bar A=\epsilon_{\mathrm{rev}}+(1-\epsilon_{\mathrm{rev}})\exp(-\delta\odot a),
+  \qquad \beta=1-\bar A,\qquad \bar B=\delta\odot b,
+\]
+so $\bar A\in(\epsilon_{\mathrm{rev}},1)$ (init $\approx0.7$) and $\bar B$ is the input gain
+(init $\approx0.3$).  The forward solve runs the two-state damped iteration from $y_0=z_0=x_0$,
+\[
+  y_{k+1}=\bar A\odot y_k+\beta\odot T_\theta(z_k,x_0;\bar B),\qquad
+  z_{k+1}=\bar A\odot z_k+\beta\odot T_\theta(y_{k+1},x_0;\bar B),
+\]
+which at a common equilibrium reduces to $z^\star=T_\theta(z^\star,x_0;\bar B)$.  The update is
+exactly invertible: $z_k=(z_{k+1}-\beta\odot T_\theta(y_{k+1}))/\bar A$ and
+$y_k=(y_{k+1}-\beta\odot T_\theta(z_k))/\bar A$, evaluated in fp64; the backward pass
+\emph{reconstructs} states from the terminal state, so activation memory is $O(1)$ in $K$.  The
+floor on $\bar A$ is a correctness constant (the reverse denominator), not a tuning knob; $\bar B$
+is never a divisor and is not floored.  \emph{Serves:} Theorem~\ref{thm:lyap}/Remark~\ref{rem:F}
+(the iterated map is $F$, whose damping sets the $\rho$ axis) and the $O(1)$-memory claim that
+makes training the infinite-depth limit feasible on one GPU --- a property that, as
+Corollary~\ref{cor:spectrum} notes, survives even the relax-FP fork since it needs only floored
+invertibility.
+
+Training samples the forward depth $K$ from \code{deq\_k\_jitter\_set}
+$=\{16,24,32,64,96,128\}$, with most mass on the shallow depths ($K{=}16$ and $K{=}24$ carry
+weights $0.50$ and $0.40$) and a light deep tail ($K{=}96,128$ share $\approx2\%$); evaluation
+defaults to $K{=}16$; the gradient is truncated to the last $K_{\mathrm{bptt}}{=}3$ iterations.
+
+\subsection{Consistency anchors (the explicit-guarantee objective)}
+\label{sec:anchors}
+
+With \code{deq\_prefix\_anchors=True} (default), the task cross-entropy is averaged over every
+prefix anchor depth traversed within the single sampled-$K$ solve, and the recursive multi-$K$
+consistency loss~\eqref{eq:consist} anchors each gradient-carrying intermediate to its
+next-deeper neighbor over the depth set $S=(8,16,24,32,64,128)$ with coefficient
+$\lambda_a=\code{multi\_k\_consistency\_anchor\_coef}=0.1$.  The targets $z_{S_{i+1}}$ are produced
+by the same forward pass, so there is no extra forward compute.  \emph{Serves:}
+Proposition~\ref{prop:consist} --- this is the objective whose minimization provably bounds the
+representation error and enforces $\rhoF<1$.
+
+\subsection{Head, losses, optimizer, quantization}
+\label{sec:rest}
+
+\paragraph{Head.} The output uses a low-rank mixture-of-softmaxes (MoS) over the solved
+representation $h_{\mathrm{out}}=\RMSNorm(z^\star)$ (two shared $+$ one specialized component, pure
+softmax routing, FSQ disabled, NTP-only; CTP banks are not allocated by default).  Its smoothness
+is the basis of Assumption~\ref{ass:lip}.
+
+\paragraph{Training loss.} $\mathcal L=\mathcal L_{\mathrm{NTP}}+\mathcal L_{\mathrm{router}}+\mathcal L_{\mathrm{consist}}$
+(the Jacobian and denoising regularizers $\lambda_J=\lambda_D=0$ by default).  The router term is a
+flat stack: per-token entropy ($\lambda_{\mathrm{ent}}=0.1$), EMA-anchored balance via reverse
+KL ($\lambda_{\mathrm{bal}}=0.30$), EMA-anchored specialization ($\lambda_{\mathrm{spec}}=0.20$),
+a straight-through alive hinge ($\lambda_{\mathrm{alive}}=0.02$), and worst-pair cosine expert-output
+diversity ($\lambda_{\mathrm{div}}=0.30$), all ramped over the first $7\%$ of training.  Load CV is
+diagnostic-only (removed as a loss).
+
+\paragraph{Optimizer.} Matrix parameters use Muon with Polar-Express Newton--Schulz
+($7$ backend steps, momentum $0.99$, matrix lr $0.022$); scalars and embeddings use Adam
+($\beta_1{=}0.85$, $\beta_2{=}0.90$, tied-embed lr $0.03$); Parcae raw parameters use a dedicated
+lr $0.002$ with no weight decay.  Global weight decay is $0.015$ and the gradient-norm clip is
+$1.0$.
+
+\paragraph{Quantization and validation.} Matrix tensors are int6 per-row quantized (token
+embeddings kept fp16) and zstd-22 compressed via \code{encode\_scored\_artifact} into a compact
+deployable artifact; the model is then dequantized and re-validated, and the post-quantization
+\bpb{} is the reported score.  The diagnostic eval profile
+sweeps $K\in\{4,8,16,17,24,\allowbreak 32,37,64,113,128,192\}$ (primes $17,37,113$ are acyclicity
+checks; $192$ is an extrapolation point) and emits $\rhoF$ on every row.
+
+\paragraph{Default configuration table.}
+(\code{num\_layers}$=12$ is the maximum solver depth $K$.)
+\begin{center}\footnotesize
+\setlength{\tabcolsep}{4pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{ll|ll}
+\toprule
+\textbf{field} & \textbf{default} & \textbf{field} & \textbf{default}\\
+\midrule
+\code{vocab\_size} & 1024 & \code{train\_seq\_len} & 2048\\
+\code{train\_batch\_tokens} & 524{,}288 & \code{iterations} & 1000\\
+\code{num\_layers} (max depth $K$) & 12 & \code{model\_dim} & 768\\
+\code{num\_heads} & 8 & \code{num\_kv\_heads} & 4\\
+\code{num\_experts} ($E$) & 16 & \code{num\_shared\_experts} & 0\\
+\code{attn\_expert\_rank} & 64 & \code{mlp\_expert\_rank} & 96\\
+\code{mlp\_mult} & 3.0 & \code{tie\_embeddings} & true\\
+\code{use\_parcae} & true & \code{parcae\_reversibility\_floor} & 0.1\\
+\code{parcae\_init\_a\_bar} & 0.7 & \code{parcae\_init\_b\_bar} & 0.3\\
+\code{deq\_k\_jitter\_set} & $(16,24,32,64,96,128)$ & \code{deq\_k\_eval} & 16\\
+\code{deq\_bptt\_k} & 3 & \code{router\_scoring} & dirichlet\_ucb\\
+\code{deq\_prefix\_anchors} & true & \code{deq\_prefix\_anchor\_set} & $(8,16,24,32,64,128)$\\
+\code{multi\_k\_consistency\_anchor\_coef} & 0.1 & \code{use\_router\_sigmoid\_gate} & false\\
+\code{router\_ema\_balance\_coef} & 0.30 & \code{router\_ema\_specialization\_coef} & 0.20\\
+\code{router\_pertoken\_entropy\_coef} & 0.1 & \code{expert\_output\_diversity\_coef} & 0.30\\
+\code{router\_ema\_alive\_coef} & 0.02 & \code{regularizer\_warmup\_frac} & 0.07\\
+\code{use\_ctp} & false & \code{num\_refinements} & 0\\
+\code{lyapunov\_coef} & 0.0 & \code{denoising\_coef} & 0.0\\
+\code{matrix\_lr} & 0.022 & \code{parcae\_lr} & 0.002\\
+\code{weight\_decay} & 0.015 & \code{grad\_clip\_norm} & 1.0\\
+\bottomrule
+\end{tabular}}
+\end{center}
+
+\paragraph{Where the current design sits on the spectrum.}
+By Corollary~\ref{cor:spectrum}, the design choices above --- Parcae damping initialized at
+$\bar A\approx0.7$, a consistency loss that enforces $\rho<1$ --- place the model in the strongly
+contractive regime $\rho\ll1$.  The theory therefore \emph{predicts} effective depth
+$\approx1$ and no inference-scaling for the current configuration, and identifies the lever that
+would move it toward criticality: increasing across-depth routing variation
+(Theorem~\ref{thm:moe-depth}(2)) so that the transient does genuine per-depth work while $\rho(x)$
+rises toward $1$ from below.  Section~\ref{sec:results} confirms this prediction empirically.
+
+%==============================================================================
+\section{Experimental Results}
+\label{sec:results}
+
+The numbers below are a snapshot of the current pipeline (the iter172 development champion, a
+controlled $\sim$1000-step run); the pipeline is still improving.  They are reported against the
+metric set of Table~\ref{tab:metrics}, and the gap to the theoretical targets of
+Section~\ref{sec:theory} is made explicit in Section~\ref{sec:gap}.
+
+\subsection{Headline metrics}
+\label{sec:headline}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}L{0.185\textwidth} L{0.30\textwidth} L{0.235\textwidth} L{0.155\textwidth}@{}}
+\toprule
+\textbf{Metric} & \textbf{Meaning} & \textbf{Value} & \textbf{Target / cap} \\
+\midrule
+\bpb{} (primary) & full-validation, post-int6-quant & $\mathbf{1.462898}$ & lower is better \\
+$\rhoF$ @ $K{=}128$ & spectral radius of $J_F$ & $0.77$ & $<1$ (contractive) \\
+$\sigma_{\max}(J_F)$ & operator norm (reported only) & $\approx14.5$ & not gated \\
+conv.\ residual @ deepest $K$ & relative iterate change & $0.011$ & $<0.05$ \\
+$K$-extrap.\ drift & \bpb{} from $K{=}16$ to $K{=}128$ & $+0.6$\,m\bpb & flat \\
+artifact size & int6 weights $+$ code & $7.40$\,MB ($7{,}432{,}396$\,B; $7.96$\,MB w/ code) & --- \\
+quantization gap & fast proxy $\to$ full post-quant & $+26$\,m\bpb ($1.4369\!\to\!1.4629$) & smaller \\
+peak VRAM & deep solve, single GPU & $36.9$\,GB & $<48$\,GB \\
+parameters & total & $\approx13.9$\,M & --- \\
+\bottomrule
+\end{tabular}
+\caption{Headline values for the current model.  The convergence gate is met ($\rhoF=0.77<1$,
+residual $0.011<0.05$); the operator norm is large but ungated (Remark~\ref{rem:rho-vs-sigma}); the
+compressed int6 artifact is $7.40$\,MB and the deep solve fits one 48\,GB GPU.}
+\label{tab:headline}
+\end{table}
+
+\subsection{Behaviour across solver depth (the loss-vs-compute curve)}
+\label{sec:ksweep}
+
+Table~\ref{tab:ksweep} sweeps fixed solver depths, the population form of the inherited
+loss-vs-compute curve.  \bpb{} is flat once $K\ge16$ and the residual falls monotonically to
+$\approx0.011$, while the shallow solves ($K=4,8$) are still settling --- the model has learned a
+genuine equilibrium, not a memorized step count.  $\rhoF$ is a power-iteration estimate, noisy at
+individual $K$ but settling to $\approx0.77$ deep; $\sigma_{\max}\gg1$ throughout, which is exactly
+why it is not the gate (Remark~\ref{rem:rho-vs-sigma}).  The expert-health columns are essentially
+$K$-invariant --- routing does not vary with eval depth, the direct signature of the
+effective-depth-$\approx1$ regime (Section~\ref{sec:gap}).
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}r r r r r c c r@{}}
+\toprule
+$K$ & \bpb{} & resid. & $\rhoF$ & $\sigma_{\max}$ & CV$_{a/m}$ & ortho$_{a/m}$ & $H_{\text{tok}}$ \\
+\midrule
+$4$   & $1.6235$ & $0.304$ & $1.08$ & $13.3$ & $0.34/0.10$ & $0.05/0.23$ & $3.24$ \\
+$8$   & $1.4745$ & $0.076$ & $0.79$ & $14.0$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$16$  & $1.4716$ & $0.013$ & $1.25$ & $15.0$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$24$  & $1.4720$ & $0.011$ & $0.87$ & $14.6$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$32$  & $1.4721$ & $0.011$ & $1.02$ & $14.7$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$64$  & $1.4722$ & $0.011$ & $0.77$ & $14.3$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$128$ & $1.4722$ & $0.011$ & $0.77$ & $14.5$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+\bottomrule
+\end{tabular}
+\caption{Fixed-$K$ post-quant diagnostic sweep (the headline full-validation \bpb{} is $1.4629$).
+``$a/m$'' $=$ attention\,/\,MLP routers; $H_{\text{tok}}$ is per-token routing entropy.  \bpb{} is
+flat for $K\ge16$; the expert metrics are $K$-invariant.}
+\label{tab:ksweep}
+\end{table}
+
+\subsection{The convergence arc}
+\label{sec:arc}
+
+The development trajectory shows \bpb{} and convergence improving \emph{together}
+(Table~\ref{tab:trajectory}): the consistency signal first pulled $\rhoF$ from a divergent
+$\approx1.30$ to $0.92$ at near-flat \bpb, then its recursive multi-$K$ form pushed $\rhoF$ to
+$0.77$ and delivered the largest \bpb{} gain.  This is consistent with Proposition~\ref{prop:consist}
+(consistency enforces $\rho<1$) and with the loss-gap bound~\eqref{eq:lossgap} (a more faithful FP
+surrogate lowers the trained loss); it is reported as an observed development arc, not as evidence
+for any theorem.
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lll L{0.46\textwidth}@{}}
+\toprule
+\textbf{Stage} & \textbf{\bpb} & \textbf{$\rhoF$} & \textbf{Change} \\
+\midrule
+baseline & $1.4718$ & $\approx1.30^\dagger$ & no convergence signal; solve not yet contractive \\
+$+$ consistency signal & $1.4716$ & $0.92$ & convergence, not \bpb, was the win \\
+$+$ recursive multi-$K$ & $\mathbf{1.4629}$ & $\mathbf{0.77}$ & $-8.7$\,m\bpb; current model \\
+\bottomrule
+\end{tabular}
+\caption{Controlled $\sim$1000-step development runs.  $^\dagger$Without the convergence signal the
+solve is not contractive; the signal trains $\rhoF$ below $1$.}
+\label{tab:trajectory}
+\end{table}
+
+\subsection{Expert and routing health}
+\label{sec:health}
+
+All $16$ experts are active and well utilized: load-balance CV $0.32/0.10$ (attn/MLP), minimum
+per-expert share $3.9\%/5.6\%$ (no dead experts), per-token entropy $3.25$, utilization entropy
+$3.44$ (of a maximum $3.47$, i.e.\ $99\%$ of experts used), output orthogonality $0.05/0.23$ (experts
+are distinct).  By Proposition~\ref{prop:rank} the capacity floor is being exercised across experts;
+by Theorem~\ref{thm:moe-depth}(2) the relevant unmet quantity is across-depth variation
+(next subsection).
+
+\subsection{Gap to the theoretical targets}
+\label{sec:gap}
+
+The framework's central prediction for the current configuration ($\rho\ll1$,
+Corollary~\ref{cor:spectrum}) is confirmed: the across-depth routing variation (iteration-variation)
+is $0.001$--$0.005$, i.e.\ routing is essentially constant across solver iterations.  By
+Theorem~\ref{thm:moe-depth}(2) the $K$-step composite therefore collapses toward a single iterated
+map (\textbf{effective depth $\approx1$}), and by Corollary~\ref{cor:spectrum} the strongly
+contractive solve yields a homogeneous $K^\star(x)\approx1$ --- so \textbf{inference-scaling is not
+yet realized}: extra test-time compute past $K\!=\!16$ does not improve \bpb{} (Table~\ref{tab:ksweep}),
+and there is no evidence of harder inputs using more effective depth.  Critically, the
+inference-scaling metrics that would \emph{measure} the goal --- the scaling gain $G$ and its
+hardness-adaptivity, the effective-depth distribution $K^\star(x)$, the per-input $\rho(x)$
+heterogeneity, and the recurrence-equivalence exponent $\phi$ --- are \textbf{not yet
+instrumented} (Table~\ref{tab:metrics}, status \textbf{[target]}).  This is not incidental: since
+inference-scaling is not implied by the contraction guarantee (Section~\ref{sec:guarantee}), it
+can only be established empirically, so the absence of a scaling-gain metric means the goal is
+currently \emph{unquantified}, not merely unmet.  Today's expressiveness comes from the richness
+of the converged MoE map (Proposition~\ref{prop:rank}), not from depth-specialization.
+
+\subsection{Open problems and next steps}
+\label{sec:next}
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+  \item \textbf{Instrument the inference-scaling metrics (first priority).} Add the scaling gain
+    $G$ and its hardness-adaptivity, per-token convergence-step logging ($K^\star(x)$ distribution),
+    bucketed $\rho(x)$ estimation, and a $\phi$ fit (Table~\ref{tab:metrics}).  Because
+    inference-scaling is empirical, not implied by $\rhoF$ (Section~\ref{sec:guarantee}), the goal
+    is \emph{unquantified} until these exist --- this gates all of the following steps.
+  \item \textbf{Drive across-depth routing variation toward criticality.} Push the model from
+    $\rho\ll1$ toward $\rho(x)\to1^-$ with $\rho(x)$ heterogeneous, so the transient composes many
+    distinct MoE layers (Theorem~\ref{thm:moe-depth}(2)) and hard inputs use more depth
+    (Theorem~\ref{thm:scaling}).  This is the central expressiveness-vs-contraction tension flagged
+    as open in Section~\ref{sec:guarantee}.
+  \item \textbf{Strengthen the expert basis.} The queued $E{=}64$ Cayley-orthogonal read-out
+    (Proposition~\ref{prop:rank}) raises the per-step rank ceiling from $15$-D to $63$-D.
+  \item \textbf{Differentiated per-depth state (DeepSeek mHC).} Manifold-constrained hyper-connections
+    --- several parallel streams mixed by a magnitude-preserving doubly-stochastic matrix --- are a
+    candidate source of the differentiated state that step~2 needs, and their magnitude preservation
+    aligns with reversibility and $\rhoF<1$.
+  \item \textbf{Matched-baseline comparison.} Benchmark against the Section~\ref{sec:related} set on
+    the inherited axes (loss-vs-compute, $\phi$).
+  \item \textbf{The relax-FP fork.} If criticality from below proves insufficient for the required
+    scaling, deliberately enter the $\rho\ge1$ non-equilibrium regime (Corollary~\ref{cor:spectrum})
+    --- retaining $O(1)$-memory reversible training but replacing the spectral certificate with an
+    operational scaling guarantee.
+\end{enumerate}
+
+%==============================================================================
+\appendix
+
+\section{Implementation Checklist}
+\label{app:checklist}
+
+Keep this document synchronized with \texttt{train\_gpt.py} if any of the following change: the
+block equation~\eqref{eq:Tmap}; the Parcae coefficients or reversibility floor; the router scoring or
+pooled-router layout; the consistency objective~\eqref{eq:consist} or its anchor set; the
+flattened router/diversity coefficients or warmup; the training timer semantics; the default CTP,
+refinement, Lyapunov, denoising, or TBPTT settings; the post-int6 validation gates or $K$-sweep
+values; the parameter count, artifact serialization, or eval profiles.
+
+\begin{thebibliography}{99}
+
+\bibitem{deq} S.~Bai, J.~Z.~Kolter, V.~Koltun. \emph{Deep Equilibrium Models}. NeurIPS 2019; arXiv:1909.01377.
+\bibitem{torchdeq} Z.~Geng, J.~Z.~Kolter. \emph{TorchDEQ: A Library for Deep Equilibrium Models}. arXiv:2310.18605.
+\bibitem{revdeq} S.~McCallum, K.~Arora, J.~Foster. \emph{Reversible Deep Equilibrium Models}. arXiv:2509.12917.
+\bibitem{ut} M.~Dehghani et al. \emph{Universal Transformers}. ICLR 2019; arXiv:1807.03819.
+\bibitem{parcae} \emph{Parcae: Stable Looped Language Models via Per-Dimension Damping and Input Injection}. arXiv:2604.12946.
+\bibitem{huginn} \emph{Huginn / Scaling up Test-Time Compute with Latent Reasoning: A Recurrent-Depth Approach}. arXiv:2502.05171.
+\bibitem{moeut} R.~Csord\'as et al. \emph{MoEUT: Mixture-of-Experts Universal Transformers}. arXiv:2405.16039.
+\bibitem{mor} \emph{Mixture-of-Recursions: Adaptive Token-Level Recursive Depth}. arXiv:2507.10524.
+\bibitem{tah} \emph{Think-at-Hard: Selective Latent Iterations for Hard Tokens}. arXiv:2511.08577.
+\bibitem{isodepth} K.~Schwethelm et al. \emph{Iso-Depth Looped-LM Scaling: A Recurrence-Equivalence Exponent}. arXiv:2604.21106.
+\bibitem{consistency} Y.~Song et al. \emph{Consistency Models}. ICML 2023; arXiv:2303.01469.
+\bibitem{bai2021} S.~Bai, V.~Koltun, J.~Z.~Kolter. \emph{Stabilizing Equilibrium Models by Jacobian Regularization}. ICML 2021; arXiv:2106.14342.
+\bibitem{khalil} H.~K.~Khalil. \emph{Nonlinear Systems}, 3rd ed. Prentice Hall, 2002.
+
+\end{thebibliography}
+
+\end{document}

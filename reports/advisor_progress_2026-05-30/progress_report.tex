@@ -1,0 +1,311 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\rhoF}{\rho(J_F)}
+\newcommand{\bpb}{\textsc{bpb}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\RMSNorm}{\operatorname{RMSNorm}}
+
+% wrapping fixed-width column
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\setlength{\parskip}{2pt}
+\setlength{\emergencystretch}{3em}
+
+\begin{document}
+
+\begin{center}
+{\Large\bfseries DEQ project update}
+\end{center}
+\vspace{0.3em}
+
+\section{Executive summary}
+
+This project develops a reversible deep-equilibrium (RevDEQ) language model for the
+Parameter Golf budget (16\,MB artifact, 600\,s on 8$\times$H100, scored by
+validation bits-per-byte, \bpb). Unlike a fixed stack or loop of layers, it computes
+its output as the \emph{fixed point} of one shared block --- so its central question
+is convergence: does the iteration actually settle? We track the spectral radius
+$\rhoF<1$ as the convergence criterion and add a consistency signal that makes the
+model \emph{learn} to converge. In the current model the solve moved from divergent
+($\rhoF=1.30$) to contractive ($\rhoF=0.77$) while \bpb{} improved monotonically to
+$1.4629$ --- stability and accuracy advancing together. A reversible backward pass
+keeps activation memory independent of solve depth, so deep iterations train on a
+single 48\,GB GPU. Next, we will rigorously justify a convergence guarantee at no
+cost to performance and benchmark against the recurrent-depth literature; we seek the
+advisor's read on the direction.
+
+\section{Problem and goal}
+
+The goal is a language model formulated as a genuine fixed-point solve --- with
+measurable, provable convergence and aggressive parameter reuse --- that is
+competitive under the Parameter Golf budget (artifact $\le 16$\,MB, training
+$\le 600$\,s on 8$\times$H100, FineWeb, vocab $1024$, scored by \bpb). Parameter
+reuse (``recurrent depth'') is a leading route to small models, but most
+implementations loop a block a fixed number of times with no guarantee that the
+iteration converges; we aim to close that gap and contribute a convergence framework
+that transfers across iterative architectures. All numbers here are controlled
+$\sim$1000-step development runs (one variable at a time); the public leaderboard's
+$\sim$1.06\,\bpb{} is a long-term target, not a matched comparison (different
+tokenizer, $\sim$5$\times$ compute, and an evaluation/quantization stack we omit).
+
+\section{Approach}
+\label{sec:impl}
+
+The model computes its representation as the fixed point of one shared, weight-tied
+block. For input embeddings $x_0$,
+\[
+z^\star = T_\theta(z^\star, x_0),
+\qquad
+T_\theta(z,x_0) = \bar B \odot \RMSNorm(x_0) + \Delta_\theta(z, x_0),
+\]
+where the $\bar B$ term injects the input and $\Delta_\theta$ is the block update.
+Capacity comes from $16$ experts in a dense \emph{soft}-routed mixture: every expert
+sees every token through smooth softmax routing (hard top-$K$ dispatch would break
+the reversible solve), and each owns a low-rank multi-head latent attention
+(MLA, rank $64$) and MLP (rank $96$) path. The model totals $13.9$\,M parameters
+(model dim $768$, sequence length $2048$, tied embeddings); ``12 layers'' denotes the
+\emph{maximum solver depth} $K$, not twelve distinct parameter sets.
+
+\paragraph{Forward solve.} The fixed point is reached by a two-state damped (Parcae)
+iteration. With a learned per-dimension retention $\bar A \in [\varepsilon,1)$ and
+blend $\beta = 1-\bar A$,
+\[
+\begin{aligned}
+y_{k+1} &= \bar A \odot y_k + \beta \odot T_\theta(z_k),\\
+z_{k+1} &= \bar A \odot z_k + \beta \odot T_\theta(y_{k+1}),
+\end{aligned}
+\]
+run for $K$ steps from an initial state, with $z_K \approx z^\star$ (we suppress the
+fixed input $x_0$ inside $T_\theta$). The damping $\bar A$ keeps each step a small,
+stable move toward equilibrium.
+
+\paragraph{Reversible backward and VRAM efficiency.} The update is \emph{exactly
+invertible}: given $(y_{k+1}, z_{k+1})$ the previous state is recovered by
+\[
+\begin{aligned}
+z_k &= \bigl(z_{k+1} - \beta \odot T_\theta(y_{k+1})\bigr) \oslash \bar A,\\
+y_k &= \bigl(y_{k+1} - \beta \odot T_\theta(z_k)\bigr) \oslash \bar A,
+\end{aligned}
+\]
+where $\oslash$ denotes per-dimension division.
+A naive $K$-step unroll must \emph{store} all $K$ intermediate states for
+backpropagation, so activation memory grows as $O(K)$. Instead, the backward pass
+\emph{reconstructs} each state by running these inverses from the final state ---
+activation memory is therefore $O(1)$ in $K$, independent of how deep the solve runs.
+The reciprocals require $\bar A$ to stay off zero (a reversibility floor
+$\varepsilon=0.1$) and are evaluated in fp64 so the reconstruction matches the forward
+to machine precision; gradients then flow through a short truncated window (depth
+$3$). The payoff is concrete: deep solves ($K$ up to $128$) train in
+$\approx38$\,GB --- within a single 48\,GB (L40S-class) GPU --- where an $O(K)$ unroll
+of the same depth would not fit. Reversibility is what makes a low-resource machine
+sufficient for this research.
+
+\section{Convergence and evaluation}
+\label{sec:fp}
+
+A fixed-point model is only meaningful if the iteration actually settles. For the
+solve to reach a fixed point the map must be locally contractive, and the standard
+certificate is that the spectral radius of its Jacobian stays below one
+($\rhoF<1$). We therefore track $\rhoF$ as a first-class metric --- not the cruder
+operator-norm bound, which would flag as ``divergent'' solves that in fact converge
+--- and we make the model \emph{achieve} convergence with a consistency signal that
+ties shallow and deeper solves to the same answer, a target it can only meet if its
+iteration contracts. Convergence is thus learned, not hand-tuned; the results below
+show it improving \emph{together} with accuracy.
+
+\paragraph{What we measure.} Table~\ref{tab:metrics} lists every tracked metric, why
+it matters, and its current value. Beyond the score, the metrics certify the two
+things the architecture relies on: that the solve \emph{converges} ($\rhoF$ and the
+residual), and that the $16$ experts stay \emph{healthy} (balanced, distinct, and
+actually used).
+
+\begin{table}[H]
+\centering
+\footnotesize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}L{0.155\textwidth} L{0.265\textwidth} L{0.31\textwidth} L{0.115\textwidth}@{}}
+\toprule
+\textbf{Metric} & \textbf{What it measures} & \textbf{Why we measure it} & \textbf{Value} \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Objective and convergence}}\\
+\midrule
+\bpb{} (primary) & bits/byte on full validation, post-quant & the scored objective --- the bottom line & $\mathbf{1.4629}$ \\
+\midrule
+$\rhoF$ & spectral radius of the iteration Jacobian & certifies the fixed point converges (the model's premise) & $0.77$ \\
+\midrule
+$\sigma_{\max}(J_F)$ & operator norm of the Jacobian & shows the operator-norm bound is too conservative (reported, not gated) & $\approx 14.5$ \\
+\midrule
+conv.\ residual & relative change at the deepest $K$ & empirical check that the solve has settled ($<0.05$ healthy) & $0.011$ \\
+\midrule
+$K$-extrap.\ drift & \bpb{} from $K{=}16$ to $K{=}128$ & confirms the solve holds at test depths beyond training & $+0.6$\,m\bpb \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Expert / routing health (16 experts; attn\,/\,MLP pairs)}}\\
+\midrule
+load balance (CV) & spread of token mass over experts & detects imbalance or collapse onto a few experts & $0.32$\,/\,$0.10$ \\
+\midrule
+min share & smallest per-expert usage & flags dead experts (wasted capacity) & $3.9\%$\,/\,$5.6\%$ \\
+\midrule
+per-token entropy & how concentrated each token's routing is & measures specialization (tokens using few experts) & $3.25$ \\
+\midrule
+utilization entropy & usage spread across the batch (max $3.47$) & measures whether \emph{all} experts are used & $3.44$ \\
+\midrule
+output orthogonality & cosine between expert outputs & detects redundant (collinear) experts & $0.05$\,/\,$0.23$ \\
+\midrule
+iteration variation & routing change across solver steps & whether the iterative depth is actually used & $0.001$--$0.005$ \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Budget}}\\
+\midrule
+artifact size & total bytes (weights $+$ code) & must fit the 16\,MB cap & $7.9$\,MB \\
+\midrule
+quantization gap & \bpb{} pre- vs.\ post-int6 quant & cost of compressing the model into the artifact & $+26$\,m\bpb \\
+\bottomrule
+\end{tabular}
+\caption{Metrics tracked every evaluation. Paired values (e.g.\ $0.31$/$0.09$) are
+the attention and MLP routers.}
+\label{tab:metrics}
+\end{table}
+
+\paragraph{Behaviour across solver depth.} Table~\ref{tab:ksweep} complements
+Table~\ref{tab:metrics} by sweeping fixed solver depths $K$, now including the
+expert-health metrics. The model has learned a
+genuine equilibrium, not a memorized step count: \bpb{} is essentially flat once
+$K\ge 16$ and the convergence residual falls monotonically to $\approx\!0.011$, while
+the shallow solves ($K{=}4,8$) are still settling. $\rhoF$ here is a power-iteration
+estimate and is noisy at individual $K$; the dependable evidence is the residual and
+the settled deep-$K$ value ($\approx\!0.77$), while $\sigma_{\max}$ stays $\gg 1$
+throughout --- which is exactly why it is the wrong gate. The expert-health columns
+barely move with $K$ --- routing is insensitive to eval depth, the same signal behind
+the effective-depth-$1$ problem. Hardening the $\rhoF$ estimator is the first next
+step (Section~\ref{sec:next}).
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4.5pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}r r r r r c c r@{}}
+\toprule
+$K$ & \bpb{} & resid. & $\rhoF$ & $\sigma_{\max}$ & CV$_{a/m}$ & ortho$_{a/m}$ & $H_{\text{tok}}$ \\
+\midrule
+$4$   & $1.6235$ & $0.304$ & $1.08$ & $13.3$ & $0.34/0.10$ & $0.05/0.23$ & $3.24$ \\
+$8$   & $1.4745$ & $0.076$ & $0.79$ & $14.0$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$16$  & $1.4716$ & $0.013$ & $1.25$ & $15.0$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$24$  & $1.4720$ & $0.011$ & $0.87$ & $14.6$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$32$  & $1.4721$ & $0.011$ & $1.02$ & $14.7$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$64$  & $1.4722$ & $0.011$ & $0.77$ & $14.3$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+$128$ & $1.4722$ & $0.011$ & $0.77$ & $14.5$ & $0.32/0.10$ & $0.05/0.23$ & $3.25$ \\
+\bottomrule
+\end{tabular}
+\caption{Comprehensive $K$-sweep of the current model (fixed-$K$ post-quant
+diagnostic; the headline full-validation \bpb{} is $1.4629$). Columns span both
+convergence (\bpb, conv.\ residual, $\rhoF$, $\sigma_{\max}$) and expert health
+(load-balance CV, output orthogonality, per-token entropy $H_{\text{tok}}$; ``$a/m$''
+$=$ attention\,/\,MLP routers). \bpb{} is flat for $K\ge 16$ and the residual falls
+monotonically; $\rhoF$ is a power-iteration estimate, noisy at individual $K$
+($>1$ at points) but settling to $\approx 0.77$ deep, while $\sigma_{\max}\!\gg\!1$
+throughout (the over-restrictive gate). The expert metrics are essentially
+$K$-invariant --- routing does not vary with eval depth, consistent with the
+effective-depth-$1$ observation.}
+\label{tab:ksweep}
+\end{table}
+
+\paragraph{The convergence arc.} The decisive result is that \bpb{} and convergence
+improved \emph{together} (Table~\ref{tab:trajectory}): the consistency signal first
+pulled $\rhoF$ from a divergent $1.30$ to $0.92$ at near-flat \bpb, then its recursive
+multi-$K$ form pushed $\rhoF$ to $0.77$ \emph{and} delivered the largest \bpb{} gain.
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lll L{0.50\textwidth}@{}}
+\toprule
+\textbf{Stage} & \textbf{\bpb} & \textbf{$\rhoF$} & \textbf{Change} \\
+\midrule
+baseline & $1.4718$ & $\approx\!1.30$\,$^\dagger$ & no convergence signal; solve not yet contractive \\
+\midrule
+$+$ consistency signal & $1.4716$ & $0.92$ & convergence, not \bpb, was the win \\
+\midrule
+$+$ recursive multi-$K$ & $\mathbf{1.4629}$ & $\mathbf{0.77}$ & $-8.7$\,m\bpb; current model \\
+\bottomrule
+\end{tabular}
+\caption{Controlled $\sim$1000-step development runs. $^\dagger$Without the convergence
+signal the solve is not contractive: $\rhoF\approx 1.30$ at training onset; the signal
+then trains it below $1$ --- to $0.92$, then $0.77$.}
+\label{tab:trajectory}
+\end{table}
+
+\paragraph{Health and budget.} The expert metrics are healthy --- all $16$ experts
+active and well utilized --- and the artifact uses only $50\%$ of budget, leaving
+room to grow capacity.
+
+\section{Related work (comparison set)}
+\label{sec:baselines}
+
+We will benchmark against the recurrent-depth and equilibrium-model literature. The
+principal comparators:
+
+\begin{itemize}[leftmargin=1.2em, itemsep=2pt]
+\item \textbf{DEQ / TorchDEQ.} The original deep-equilibrium models: solve for a fixed point instead of stacking layers. Our backbone is a reversible DEQ variant.
+\item \textbf{RevDEQ.} Reversible DEQ with exact gradients and fewer function evaluations; the method closest to ours, which we extend with dense expert routing and explicit $\rhoF$ diagnostics.
+\item \textbf{Universal Transformer.} The seminal model that applies one shared block recurrently through depth.
+\item \textbf{Parcae.} Stable looped LMs via per-dimension damping and input injection; we adopt its damping in our solver.
+\item \textbf{Huginn.} A large latent-recurrent LM with variable test-time compute.
+\item \textbf{MoEUT.} Adds sparse mixture-of-experts capacity to recover the expressivity lost under block sharing.
+\item \textbf{Mixture-of-Recursions.} Routes tokens to adaptive recursion depths --- a dynamic-depth comparator.
+\end{itemize}
+
+\section{Open problems and next steps}
+\label{sec:next}
+
+\paragraph{Open problems.}
+\begin{itemize}[leftmargin=1.2em, itemsep=2pt]
+\item \textbf{Effective depth $\approx 1$ / weak expert specialization.} Routing barely changes across iterations (variation $\approx 0.001$--$0.005$), so experts do not specialize by depth and the model under-uses its iterative computation.
+\item \textbf{$K$-extrapolation.} Trained shallow ($\E[K]\!\approx\!24$) but must hold at $K{=}128$; eased, not eliminated, by the consistency signal.
+\item \textbf{Quantization gap.} Fast proxy $1.4369 \to$ full post-quant $1.4629$ ($+26$\,m\bpb).
+\end{itemize}
+
+\paragraph{Next steps.}
+\begin{enumerate}[leftmargin=1.4em, itemsep=2pt]
+\item \emph{Rigorously justify a convergence metric} that guarantees asymptotic fixed-point convergence with no worse performance, and design the training so this convergence is reached by the time training itself converges.
+\item \emph{Drive expert specialization across depth.} Push the routing to differentiate from one solver iteration to the next, so experts specialize by depth and the iterative computation is genuinely used (today's effective depth is $\approx 1$).
+\item \emph{Enrich the Parcae damping/mixing with manifold-constrained hyper-connections} (DeepSeek mHC): replace the single damped residual stream with several parallel streams mixed by a doubly-stochastic, magnitude-preserving matrix. That magnitude preservation aligns naturally with our reversibility and $\rhoF<1$ requirements, and the extra streams are a candidate source of the differentiated state that step~2 needs.
+\item \emph{Compare under a matched (baseline) setting} against the related work in Section~\ref{sec:baselines}.
+\item \emph{Optional.} Sparsity and similar architectural changes, pursued only as throughput optimizations, not part of the core objective.
+\end{enumerate}
+
+\section{Summary}
+
+The convergence bet is working: we adopted the spectral radius $\rhoF<1$ as the
+criterion, measure it directly rather than a conservative proxy, and made the model
+\emph{learn} convergence --- the solve is now contractive ($\rhoF=0.77$) and \bpb{}
+improved as a consequence, within budget and within a single 48\,GB GPU thanks to the
+reversible backward. The next step is to make that convergence guarantee rigorous at
+no performance cost and benchmark it against the recurrent-depth literature. We
+welcome the advisor's read on the direction.
+
+\end{document}
