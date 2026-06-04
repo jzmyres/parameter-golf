@@ -55,7 +55,7 @@ This file is the **single binding directive** for working in this repo, and a th
 - Runtime outputs untracked unless promoted: `run.log`, `results.tsv`, `experiments/training_logs/*`, `experiments/weights/*`, `experiments/checkpoints/*`.
 - Optional debug plotting via `auto_plot_on_val=True` (default): refreshes `experiments/*.png` per validation via `experiments/plotting_hook.py` (rank-0 only; silent no-op if matplotlib or `experiments/plot_*.py` modules are absent).
 - Historical submissions in `records/` are read-only.
-- Reference implementations are read-only: RevDEQ at `/home/mzhong4/work/research/rdeq/WIP-ARWDEQ/code/arwdeq/qwen3_utmoe_revdeq.py`; TSU/CTP/NTP/MoS at `/home/mzhong4/work/research/tsu/WIP-TSU/code/model.py`.
+- External baseline references live in the `baselines/` workspace (pinned manifest + smoke scripts) and are catalogued in `experiments/docs/recurrent_depth_baselines.md` (RevDEQ, RevFFN, MoEUT, ReMoE, Universal Transformer, Parcae, Iso-Depth/φ, etc.). The former local `/home/mzhong4/work/research/{rdeq,tsu}/...` reference paths are gone; do not cite them.
 - `baselines/` is the external recurrent-depth replication workspace (pinned manifest + fetch/smoke scripts + docs). Heavy/regenerable subtrees (`worktrees/`, `runs/`, `.envs/`) are gitignored; commit only manifest+scripts+docs and verify with `git add -An`. See [`EXPERIENCE.md#vendored-workspace-hygiene`](EXPERIENCE.md#vendored-workspace-hygiene). `CONTEXT.md` holds cross-iteration baseline vocabulary; per-baseline inventory is `experiments/docs/recurrent_depth_baselines.md`.
 
 ## Current Implementation Versus Final P1 Target

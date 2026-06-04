@@ -613,6 +613,53 @@ harness, autonomous depth signal, block expressivity, or MoE routing.  The final
 fixes that attribution problem before revisiting MoE or deployment features.
 
 %==============================================================================
+\section{Related Work}
+\label{sec:related}
+
+The mechanisms retained under the resource/expressiveness goals are each grounded in prior
+work; this section records the findings that justify them.
+
+\paragraph{Reversible recurrence and reversible MoE.}
+Reversible residual coupling~\cite{revnet} reconstructs layer inputs from outputs, removing
+activation storage; Reformer~\cite{reformer} applies it to Transformers. RevFFN~\cite{revffn}
+combines reversible two-stream blocks with a Mixture-of-Experts FFN for memory-efficient
+full-parameter MoE training (\(\approx\)49\% peak-VRAM reduction, \emph{no} floor/contraction
+requirement), directly validating the reversible\(\times\)MoE combination used here. Our
+additive coupling (\S\ref{sec:models}) drives each update from the \emph{opposite} stream,
+yielding an exact \emph{explicit} inverse (no fixed-point iteration, unlike RevFFN's
+cross-attention coupling).
+
+\paragraph{Recurrent depth, weight tying, and expressivity recovery.}
+Universal Transformers~\cite{ut}, Huginn~\cite{huginn}, and Parcae~\cite{parcae} treat
+recurrent depth as a parameter-saving axis. Weight tying loses per-layer diversity, and sparse
+MoE recovers it: MoEUT~\cite{moeut} shows MoE capacity compensates for UT-style layer sharing,
+Sparse-Looped-MoE~\cite{sparseloopedmoe} recovers functional diversity across loop passes, and
+Relaxed Recursive Transformers~\cite{relaxedrec} relax tied layers with layer-wise LoRA. This
+is exactly our mechanism: low-rank experts shared across recurrence steps, composed per step
+into high \emph{effective} depth.
+
+\paragraph{Smooth, reversibility-safe sparse routing.}
+Hard top-\(k\) routing is non-smooth and reconstruction-unstable under reversibility. ReMoE's
+ReLU routing~\cite{remoe} is continuous and fully differentiable yet yields exact-zero (sparse)
+gates, with adaptive-\(L_1\) sparsity control and load balancing; it matches top-\(k\) FLOPs,
+exceeds top-\(k\) accuracy, and shows 2--3\(\times\) lower activation flip-rate (hence more
+reconstruction-stable). We expose \texttt{router\_type}\(\in\{\texttt{relu},\texttt{softmax}\}\)
+as a control experiment.
+
+\paragraph{Effective-depth and rank metrics.}
+The recurrence-equivalence exponent \(\varphi\)~\cite{isodepth} measures whether looping a block
+\(r\) times yields the capacity of \(r\) unique blocks (\(\varphi{=}1\)) or none
+(\(\varphi{=}0\)), separating true loop capacity from token-budget effects; truncated BPTT
+lowers \(\varphi\), motivating our full reversible BPTT. Effective rank (spectral entropy of
+singular values)~\cite{effrank} sets each low-rank matrix's ``sufficient rank'' on the
+resource/expressiveness frontier.
+
+\paragraph{Attention and output expressiveness under a resource budget.}
+Multi-head Latent Attention~\cite{deepseekv2} low-rank-compresses the KV cache (to 4--14\% of
+MHA), the basis for the MLA block. The Mixture-of-Softmaxes head~\cite{mos} breaks the
+softmax-rank bottleneck for output-distribution expressiveness; at vocabulary size 1024 its
+per-component cost is small.
+
 \begin{thebibliography}{99}
 
 \bibitem{barrington}
@@ -659,6 +706,56 @@ A. N. Gomez, M. Ren, R. Urtasun, and R. B. Grosse.
 \newblock The Reversible Residual Network: Backpropagation Without Storing Activations.
 \newblock \emph{NeurIPS}, 2017.
 \newblock \url{https://arxiv.org/abs/1707.04585}.
+
+\bibitem{reformer}
+N. Kitaev, {\L}. Kaiser, and A. Levskaya.
+\newblock Reformer: The Efficient Transformer.
+\newblock \emph{International Conference on Learning Representations}, 2020.
+\newblock \url{https://arxiv.org/abs/2001.04451}.
+
+\bibitem{revffn}
+RevFFN: Memory-Efficient Full-Parameter Fine-Tuning of Mixture-of-Experts LLMs with Reversible Blocks.
+\newblock arXiv:2512.20920, 2025.
+\newblock \url{https://arxiv.org/abs/2512.20920}.
+
+\bibitem{remoe}
+Z. Wang, J. Chen, and J. Zhu.
+\newblock ReMoE: Fully Differentiable Mixture-of-Experts with ReLU Routing.
+\newblock \emph{International Conference on Learning Representations}, 2025.
+\newblock \url{https://arxiv.org/abs/2412.14711}.
+
+\bibitem{relaxedrec}
+S. Bae, A. Fisch, H. Harutyunyan, Z. Ji, S. Kim, and T. Schuster.
+\newblock Relaxed Recursive Transformers: Effective Parameter Sharing with Layer-wise LoRA.
+\newblock arXiv:2410.20672, 2024.
+\newblock \url{https://arxiv.org/abs/2410.20672}.
+
+\bibitem{sparseloopedmoe}
+Sparse Looped-MoE: Recovering Functional Diversity Across Loop Passes.
+\newblock arXiv:2605.09165, 2026.
+\newblock \url{https://arxiv.org/abs/2605.09165}.
+
+\bibitem{parcae}
+Parcae: Stable Looped Language Models with Loop Depth as a Scaling Axis.
+\newblock arXiv:2604.12946, 2026.
+\newblock \url{https://arxiv.org/abs/2604.12946}.
+
+\bibitem{deepseekv2}
+DeepSeek-AI.
+\newblock DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.
+\newblock arXiv:2405.04434, 2024.
+\newblock \url{https://arxiv.org/abs/2405.04434}.
+
+\bibitem{mos}
+Z. Yang, Z. Dai, R. Salakhutdinov, and W. W. Cohen.
+\newblock Breaking the Softmax Bottleneck: A High-Rank RNN Language Model.
+\newblock \emph{International Conference on Learning Representations}, 2018.
+\newblock \url{https://arxiv.org/abs/1711.03953}.
+
+\bibitem{effrank}
+O. Roy and M. Vetterli.
+\newblock The Effective Rank: A Measure of Effective Dimensionality.
+\newblock \emph{European Signal Processing Conference (EUSIPCO)}, 2007.
 
 \end{thebibliography}
 
