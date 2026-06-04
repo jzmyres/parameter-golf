@@ -1,0 +1,665 @@
+\documentclass[11pt]{article}
+
+%==============================================================================
+% Packages
+%==============================================================================
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs,tabularx,array,longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black,citecolor=blue!50!black]{hyperref}
+\usepackage{url}
+
+%==============================================================================
+% Macros
+%==============================================================================
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\RMSNorm}{\operatorname{RMSNorm}}
+\newcommand{\bpb}{\textsc{bpb}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\vram}{\mathrm{VRAM}}
+\newcommand{\erank}{\operatorname{erank}}
+\newcommand{\MI}{I}
+\newcommand{\Entropy}{H}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\definecolor{gate}{rgb}{0.07,0.40,0.18}
+\definecolor{diag}{rgb}{0.55,0.40,0.00}
+\newcommand{\GATE}{\textcolor{gate}{\textbf{GATE}}}
+\newcommand{\DIAG}{\textcolor{diag}{\textbf{DIAG}}}
+
+%==============================================================================
+% Title
+%==============================================================================
+\title{
+OPG, Final Minimal Design\\
+\large Necessary-and-Sufficient Models, Metrics, Assumptions, and Protocol for P1
+}
+\author{Consolidated revision for \code{train\_gpt.py}}
+\date{2026-06-04}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+%==============================================================================
+\section{Goal and Claim Hierarchy}
+\label{sec:goal}
+
+The project should first establish the smallest decisive claim: under a fixed memory budget,
+recurrent depth buys task utility on data that actually requires depth.  The claims are ordered so
+that later mechanisms cannot substitute for a failed primary result:
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+  \item \textbf{P1, primary:} \(G_T(K_{\rm lo},K_{\rm hi})>0\) at fixed memory on a depth-hard
+  task, with a passing positive control.
+  \item \textbf{P2, memory:} reversible reconstruction makes activation memory approximately
+  constant in recurrent depth \(K\).  This claim is largely severable from P1 and must be measured
+  independently.
+  \item \textbf{P3, secondary:} an MoE basis recovers the depth diversity lost by weight tying.
+  This claim is staged only after P1 holds.
+\end{itemize}
+
+The design serves P1.  P2 verifies the training-memory niche.  P3 is optional capacity recovery, not
+the premise of the first experiment.  Therefore the final minimal core deliberately removes feature
+stacks that obscure P1 failure attribution: dense MoE, Dirichlet--UCB routing, MLA, MoS,
+quantization, implicit/DEQ-style backward, fixed-point consistency, spectral or Lyapunov pressure,
+UFID, distillation, and anytime losses are excluded from the P1 science path.  The executable
+pipeline is only the positive-control, \(M_0\), and \(M_{\rm clk}\) triage.  MoE, cache, and
+deployment axes are executable only through a separate staged diagnostic harness.  This preserves
+the causal split: S+0 promotes or fails P1, while S+1/S+2/S+3 report mechanism and deployment
+diagnostics without becoming explanations for a failed P1 gate.
+
+%==============================================================================
+\section{Models: The Necessary Set}
+\label{sec:models}
+
+\paragraph{Core \(M_0\).}
+The core model is a tied, token-injected, additive-coupling reversible recurrence with standard MHA/GQA plus SwiGLU and a halting readout.  The recurrent state is
+\(s_k=(a_k,b_k)\), with input embedding state \(x_0\):
+\begin{align}
+  a_{k+1}
+  &=
+  a_k+F_\theta\!\left(\RMSNorm(b_k+x_0)\right),
+  \\
+  b_{k+1}
+  &=
+  b_k+G_\theta\!\left(\RMSNorm(a_{k+1}+x_0)\right).
+\end{align}
+The inverse is structural and floor-free:
+\begin{align}
+  b_k
+  &=
+  b_{k+1}-G_\theta\!\left(\RMSNorm(a_{k+1}+x_0)\right),
+  \\
+  a_k
+  &=
+  a_{k+1}-F_\theta\!\left(\RMSNorm(b_k+x_0)\right).
+\end{align}
+Invertibility is therefore an algebraic property of the additive coupling, not a consequence of
+contraction.  The core does not require a fixed point.
+
+The readout uses a halting gate \(g_k=\sigma(w^\top z_k)\), where \(z_k\) denotes the readable
+state derived from \(s_k\).  For a recurrent budget \(K\):
+\begin{equation}
+  o_K
+  =
+  \sum_{k=1}^{K}
+  \left(
+    g_k\prod_{j<k}(1-g_j)
+  \right)z_k .
+  \label{eq:halting-readout}
+\end{equation}
+If \(g_{K_{\rm lo}}=1\), the depth-\(K_{\rm lo}\) output is reproducible inside the
+depth-\(K_{\rm hi}\) hypothesis class for \(K_{\rm hi}>K_{\rm lo}\).  This gives the desired
+nestedness:
+\[
+  \mathcal F_{K_{\rm lo}}\subseteq\mathcal F_{K_{\rm hi}},
+\]
+and hence achievable risk monotonicity.  The trained model can still fail; the point is that the
+architecture no longer makes deeper inference intrinsically non-nested.
+
+The memory-critical target implementation uses reversible full BPTT through \(K_{\rm hi}\).
+Truncation is only a calibrated fallback, because full reversible BPTT is the core advantage for
+P2.  The Tier-1 executable harness may use ordinary stored-activation autograd for detectability
+and structural-inverse tests; it must not claim P2 activation-memory scaling until the
+memory-saving backward path is implemented and measured.  The P1 loss is:
+\begin{equation}
+  \mathcal L
+  =
+  \E_{K_{\rm hi}\sim q_{\rm deep}}\!\left[L_T(K_{\rm hi})\right]
+  +
+  \lambda_h
+  \left[
+    L_T(K_{\rm hi})-\sg(L_T(K_{\rm lo}))+m
+  \right]_+,
+  \qquad
+  \lambda_h\ \text{small}.
+  \label{eq:p1-loss}
+\end{equation}
+Hard \(\mathrm{NaN}/\mathrm{Inf}\) guards and a light boundedness penalty,
+\[
+  [\|z_k\|_{\rm RMS}-B_z]_+^2,
+\]
+are stability guards, not fixed-point losses.
+
+\emph{Implementation note (Tier-1 harness).}  The executable Tier-1 harness
+(\code{experiments/p1\_synthetic.py}) currently optimizes only the
+\(L_T(K_{\rm hi})\) cross-entropy term; it does \emph{not} yet apply the
+\(\lambda_h\) no-degradation hinge or the boundedness penalty above.  Those terms
+are realized in the \code{train\_gpt.py} finite-horizon path.  The S+0 detectability
+results are therefore from the plain-\(L_T\) objective.
+
+\paragraph{Clock diagnostic \(M_{\rm clk}\).}
+\(M_{\rm clk}\) is \(M_0\) with an explicit step embedding \(e_k\) injected into
+\emph{both} half-step updates each iteration:
+\[
+  a_{k+1}=a_k+F_\theta\!\left(\RMSNorm(b_k+x_0+e_k)\right),\qquad
+  b_{k+1}=b_k+G_\theta\!\left(\RMSNorm(a_{k+1}+x_0+e_k)\right),
+\]
+where \(e_k\) is sinusoidal or learned.  This model is the upper bound on depth-conditioned
+computation.  It is diagnostic only and excluded from the final model unless its extrapolation cost
+is measured and accepted.
+
+\paragraph{Positive control.}
+The harness must include a vanilla looped-transformer positive control: input-injected, recurrent
+depth exposed, activations stored rather than reconstructed, and otherwise deliberately ordinary.
+If this model does not scale on the Tier-1 depth-hard task, the harness, task, or scoring is broken.
+
+\paragraph{Future ablation models.}
+\(M_0\) is the tied non-MoE control.  \(M_{\rm MoE}\) uses a plain softmax or sparse top-\(r\)
+router and marginal-load balance only for S+1; \(M_{\rm static}\) freezes routes across depth.
+\(M_{\rm nonrev}\) stores activations and isolates the reversible-memory benefit.  These are not
+part of the current P1 executable interface.  Their code path lives in
+\code{experiments/p1\_feedback\_stages.py} and is diagnostic until the positive control and \(M_0\)
+make depth utility detectable.
+
+\paragraph{Explicit exclusions from P1.}
+The following are not part of the core science path: Dirichlet--UCB router, MLA, mixture-of-softmaxes
+head, int6 quantization, DEQ or implicit backward, prefix-anchor consistency, spectral or Lyapunov
+pressure, UFID, distillation, and anytime losses.  They may remain in the repository as legacy,
+deployment, or later-stage axes, but they should not be used to establish P1.
+
+%==============================================================================
+\section{Experimental Protocol}
+\label{sec:protocol}
+
+\paragraph{Tier 1: detectability on synthetic depth-hard tasks.}
+The primary task is iterated \(S_5\) permutation composition, with sequence length \(\ell\) tuning
+the required depth.  Barrington's theorem shows that bounded-width polynomial-size branching
+programs recognize exactly nonuniform \(\mathrm{NC}^1\), and the \(S_5\) permutation construction
+is the canonical reason this task is a principled depth probe \cite{barrington}.  It is not a
+language-modeling benchmark; it is the depth-demand smoke test.  Alternates are parity as a sanity
+floor and \(s\)-\(t\) graph reachability with tunable diameter.
+
+Run \(M_0\), the vanilla positive control, and \(M_{\rm clk}\) through the identical harness.  The
+purpose is to confirm that \(G_T>0\) is detectable and to localize failure before spending compute
+on small language modeling.  The in-repository executable harness is
+\code{experiments/p1\_synthetic.py}; its P1-promotion variants are \code{control}, \code{m0}, and
+\code{mclk}.  The same runner deliberately rejects MoE, cache-slope, and int6 switches.  That
+small interface is part of the experiment: a failed positive control should trigger task, budget,
+or block-capacity debugging, not another mechanism.  The reproducible DDP pipeline is
+\code{experiments/run\_p1\_synthetic\_pipeline.sh}.  The separate feedback-stage runner
+\code{experiments/run\_feedback\_stage\_pipeline.sh} composes the S+0 run with later-stage
+diagnostics; its outputs are not P1-promotion evidence.
+
+\paragraph{Tier 2: deployment relevance.}
+After Tier 1 passes, evaluate small language modeling on byte/char-level \code{text8} or
+\code{enwik8}, or on TinyStories.  Report \bpb{} where natural, and compare against a matched small
+dense transformer on the Pareto frontier.
+
+\paragraph{Curriculum.}
+Use Huginn-style recurrence-count sampling for \(q_{\rm deep}\) and test-time depth scaling, plus
+per-step input injection \cite{huginn}.  Do not borrow truncated BPTT for the core: reversibility
+affords full BPTT and is the memory advantage being tested.
+
+\paragraph{Scale and statistics.}
+Use \(d_{\rm model}\in[256,512]\), one reversible block, context length at most 1024, and multiple
+seeds.  Evaluate
+\[
+  K\in\{4,8,16,32,64,128\}.
+\]
+Report the convergence knee first, then choose \((K_{\rm lo},K_{\rm hi})\) to straddle it.  Every
+headline \(G_T\) uses paired confidence intervals.  The executable DDP harness emits a streaming
+paired normal-approximation interval from all-reduced sums and squared sums; offline reports may
+replace this with a paired bootstrap over saved per-example gains.
+
+%==============================================================================
+\section{Metrics: Gates Versus Diagnostics}
+\label{sec:metrics}
+
+\renewcommand{\arraystretch}{1.2}
+\begin{center}
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}L{0.27\textwidth} c L{0.50\textwidth}@{}}
+\toprule
+\textbf{Metric} & \textbf{Role} & \textbf{Rule / mechanics} \\
+\midrule
+\(G_T(K_{\rm lo},K_{\rm hi})\) & \GATE\ (P1) & Paired CI, lower bound \(>0\), on a depth-hard task, with knee-straddling pairs and a passing positive control. \\
+\(\mathrm{NDR}_\epsilon\) & \GATE\ (guard) & No-degradation rate \(\le\delta_{\rm task}\). \\
+\(\alpha_{\rm act}\), \(R_{\rm rec}\), \(\vram\) & \GATE\ (P2) & \(R_{\rm act}(K,2K)\le1.10\); reconstruction error acceptable under actual training stochasticity; \(\vram\le B\), reported per component. \\
+Pareto \((S_T,\vram,\mathrm{ms/token})\) & \GATE\ (sufficiency) & On or above frontier versus a matched small dense transformer.  This, not \(G_T>0\) alone, is project success. \\
+\midrule
+Recurrence-equivalence exponent & \DIAG\ (headline) & \(K\) recurrent loops are worth how many untied layers; fit on the synthetic task where hardness is known. \\
+Convergence-depth \(k^\star(x)\) vs. hardness & \DIAG & Correlate with \(\ell\) or graph diameter.  Flat and small \(k^\star\) is the plateau signature. \\
+\(\mathrm{WFIR}\) & \DIAG & Use task-aligned readout, such as correct-token log-probability or NLL contribution; do not use random projections as the headline.  Report \(\mathrm{WFIR}_{\rm real}-\mathrm{WFIR}_{\rm shuffled}\). \\
+\(\Delta_{\rm MoE}\), \(\mathrm{AEBR}\), route-depth NMI & \DIAG\ (future P3) & Use only after P1 passes and only in a separate MoE ablation.  They are not emitted by the P1 harness. \\
+\(\rho_F\), residual, \(\sigma_{\max}(J_F)\) & \DIAG & Convergence diagnostics only; feed \(k^\star\) and fallback decisions. \\
+\(\mathrm{Gap}_{\rm dense}\), \(\mathrm{KL}_{\rm teacher}\) & \DIAG & Dense simulation is the weakest claim and never a gate. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{Useful function-space depth.}
+For a fixed probe set \(X\), let \(f_k(X)\) be a task-aligned readout at recurrent depth \(k\).
+Define increments:
+\[
+  \Delta_k(X)=f_{k+1}(X)-f_k(X).
+\]
+\(\mathrm{WFIR}\) is the effective rank of centered, regularized functional increments, reported
+against a shuffled-depth baseline.  It is diagnostic because diversity alone can be noise; it
+becomes meaningful only when paired with positive \(G_T\) and controlled \(\mathrm{NDR}_\epsilon\).
+Legacy internal metrics such as \code{\detokenize{ED_update}},
+\code{\detokenize{ED_logit}}, \code{\detokenize{route_depth_nmi_mean}},
+\code{\detokenize{route_depth_nmi_max}}, and \code{\detokenize{expert_util_mean}}
+map to older ED\(_u\), ED\(_\ell\), route-depth NMI, and expert-utilization traces.  They are useful
+for failure analysis, but they are not P1 gates.
+
+%==============================================================================
+\section{Clock Diagnostic and Failure Triage}
+\label{sec:triage}
+
+Run \(M_0\), the vanilla control, and \(M_{\rm clk}\) on Tier 1.  Interpret outcomes as follows:
+\renewcommand{\arraystretch}{1.2}
+\begin{center}
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}L{0.46\textwidth} L{0.46\textwidth}@{}}
+\toprule
+\textbf{Observation} & \textbf{Localized cause / action} \\
+\midrule
+Control does not scale on a provably depth-hard task & Harness or metric is broken: pairs may not straddle the knee, scoring may be wrong, or the task is too easy.  Fix this before model work. \\
+Control scales; \(M_0\) scales & Core is sound.  Proceed to Tier 2, then optional P3 work. \\
+Control scales; \(M_0\) does not; \(M_{\rm clk}\) scales & Bottleneck is autonomous depth signal, such as vanishing displacement.  Pursue sustained dynamics, velocity-state routing, or accept a mild clock with measured extrapolation cost. \\
+Control scales; neither \(M_0\) nor \(M_{\rm clk}\) scales & Bottleneck is block expressivity or parameterization, not the signal.  Repair the block, not the router. \\
+\(M_{\rm clk}\) raises \(G_T\), but extrapolates poorly & Clock works as an upper bound and its cost is extrapolation.  This justifies investing in an autonomous substitute. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+The clock is a diagnostic ceiling, not a design commitment.  It answers whether depth-conditioned
+computation is useful on the data before investing in autonomous routing.
+
+%==============================================================================
+\section{Assumptions and Checks}
+\label{sec:assumptions}
+
+\renewcommand{\arraystretch}{1.2}
+\begin{center}
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}c L{0.42\textwidth} L{0.40\textwidth}@{}}
+\toprule
+& \textbf{Assumption} & \textbf{How it is checked, not assumed} \\
+\midrule
+A1 & The task requires depth & Provable depth-hard synthetic task plus positive control.  If neither control nor clock scales, the harness or block is the issue. \\
+A2 & Reversibility holds numerically & \(R_{\rm rec}\) measured with real stochasticity; replay RNG state for stochastic operations in the recurrent path. \\
+A3 & Memory is binding and latency tolerable & Pareto gate versus a small dense model.  If a small dense model wins, the memory-bound niche is absent. \\
+A4 & Halting gate can saturate & Verify \(g_k\to1\) is reachable; otherwise nestedness is only approximate. \\
+A5 & Additive coupling stays bounded over \(K\) & Boundedness penalty plus hard guards; monitor norm growth as a stability and throughput cost. \\
+A6 & Optional P3 capacity recovery is needed & Tested only after P1 holds; otherwise capacity mechanisms are premature. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The following are demoted from assumptions to tested hypotheses: routes specialize without a clock,
+and dense soft routing is affordable.  The latter is moot in the P1 core and re-enters only in S+1.
+
+%==============================================================================
+\section{Staging}
+\label{sec:staging}
+
+\begin{description}[leftmargin=2.2em,itemsep=2pt]
+  \item[S+0.] \(M_0\) on Tier 1, then Tier 2, with the clock triage.  Gate: P1 paired CI, P2 memory,
+  and Pareto.  Current executable: \code{experiments/p1\_synthetic.py --variant m0}, compared
+  against \code{--variant control} and \code{--variant mclk}.
+  \item[S+1, P3.] A separate \(M_{\rm MoE}\) ablation uses plain or sparse routing and
+  marginal-load balance only.  Dirichlet--UCB stays deleted from the science path.  Gate after S+0
+  passes: \(\Delta_{\rm MoE}>0\) at matched budget; \(\mathrm{AEBR}\), route-depth NMI, and expert
+  utilization are mechanism diagnostics.  This stage is intentionally not wired into
+  \code{experiments/p1\_synthetic.py}.
+  \item[S+2, KV axis.] Terminal hidden-state cache (emitted in log contracts as
+  \code{hidden\_state\_proxy\_not\_autoregressive\_kv}), with matched training including
+  terminal-context attention.  Compare exact multi-depth cache and shared-cache baselines.  Gate:
+  \(\alpha_{\rm kv}\approx0\) and quality gap \(\le\tau_{\rm cache}\).  The staged synthetic runner
+  emits only a hidden-state memory proxy and explicitly marks the autoregressive KV quality gap as
+  untested; an autoregressive LM harness is required before claiming constant-KV correctness.
+  \item[S+3, deployment.] Add int6, MLA/GQA, sparse inference, and other deployment features.
+  Gate: post-quant Pareto with quantization gap reported.  The current staged runner implements a
+  fake-int6 linear-weight sensitivity check only; it is outside the P1 harness.
+  \item[Fallback.] Fixed-point pressure only if S+0 fails by instability, severe overthinking, or
+  extrapolation.  Use the weakest sufficient stabilizer first.
+\end{description}
+
+%==============================================================================
+\section{Pipeline Simplification Audit}
+\label{sec:pipeline-audit}
+
+The active pipeline should have the smallest interface that can falsify or support P1.  A mechanism
+is included only if removing it would make the P1/P2 question unanswerable.  This gives the
+following first-principles pruning rule:
+\[
+  \text{keep}(m)
+  \Longleftrightarrow
+  m\ \text{is necessary to test P1/P2 now, or is the positive-control/clock diagnostic needed to localize failure.}
+\]
+Everything else is staged.
+
+\begin{center}
+\footnotesize
+\renewcommand{\arraystretch}{1.18}
+\begin{tabularx}{\textwidth}{@{}L{0.28\textwidth} L{0.34\textwidth} L{0.28\textwidth}@{}}
+\toprule
+\textbf{Pipeline surface} & \textbf{First-principles critique} & \textbf{Current fix} \\
+\midrule
+MoE, static-route MoE, expert-basis metrics & P3 mechanisms cannot rescue a failed P1 result and make failure attribution ambiguous. & Removed from the P1 harness; available only in the separate S+1 diagnostic runner. \\
+Dirichlet--UCB, MLA, MoS, cache modes & Deployment/capacity features do not answer whether recurrence itself buys utility. & Dirichlet--UCB/MLA/MoS remain excluded; cache appears only as an S+2 proxy diagnostic. \\
+Mean-only \(G_T\) reporting & A tiny positive mean can be noise and should not be promoted. & Pair rows now include \(G_{\rm nll}\), \(G_{\rm acc}\), and confidence intervals. \\
+Hardcoded task budget in the shell runner & A failed positive control could be task hardness, insufficient iterations, or model failure; hardcoding prevents localization. & Runner exposes only task and budget knobs such as \code{SEQ\_LEN}, \code{ITERATIONS}, \code{TRAIN\_DEPTHS}, and \code{PAIRS}. \\
+Legacy hypothesis queue & It still described the old RevDEQ/Parcae/MoE stack as active, steering agents toward refuted or non-P1 work. & The active snapshot is final-minimal P1; the older dense-MoE ledger is historical evidence. \\
+Soft Lyapunov or Lipschitz-band pressure & It optimizes a diagnostic proxy rather than task utility and previously hurt validation. & Launch validation rejects nonzero \code{lyapunov\_coef}; FP quantities remain diagnostics. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+This audit leaves one intentionally small P1 promotion surface:
+\[
+  \code{control},\quad \code{m0},\quad \code{mclk}.
+\]
+It has one job: determine whether depth utility is detectable at all.  It should not grow options
+for P3, KV, or deployment while the positive-control gate is failing.  The audit also leaves one known
+implementation gap: \code{experiments/p1\_synthetic.py} verifies
+structural reversibility and P1 detectability, but it does not yet implement custom reversible
+activation reconstruction for training memory.  That is intentional staging, not a P2 claim.  P2 is
+promoted only after activation-memory slope and reconstruction error are measured in the actual
+memory-saving backward path.
+
+\subsection{Feedback-stage implementation split}
+
+The repository now has two executable surfaces:
+\begin{itemize}[leftmargin=1.4em,itemsep=2pt]
+  \item \code{experiments/p1\_synthetic.py}: the minimal S+0/P1 harness.  It accepts only
+  \code{control}, \code{m0}, and \code{mclk}.
+  \item \code{experiments/p1\_feedback\_stages.py}: non-core staged diagnostics.  S+1 runs
+  \code{m0}, \code{moe}, and \code{static\_moe}; S+2 emits a hidden-state cache proxy labelled
+  \code{hidden\_state\_proxy\_not\_autoregressive\_kv}; S+3 emits fake-int6 K-sweep and pair
+  diagnostics.
+\end{itemize}
+The full feedback-stage command is:
+\[
+\code{CUDA\_VISIBLE\_DEVICES=6,7\ ITERATIONS=1000\ RUN\_TAG=gpu67\_feedback\_all\_i1000\ bash\ experiments/run\_feedback\_stage\_pipeline.sh}.
+\]
+This command is useful for executable coverage of the feedback document.  Its S+1/S+2/S+3 rows are
+mechanism/deployment diagnostics, not substitutes for a passing S+0 positive-control gate.
+
+%==============================================================================
+\section{Current Simplified S+0 DDP Verification}
+\label{sec:s0-smoke}
+
+On June 4, 2026, after pruning the executable harness to the necessary P1 surface, the simplified
+S+0 pipeline was run with
+\[
+\code{CUDA\_VISIBLE\_DEVICES=6,7\ ITERATIONS=1000\ RUN\_TAG=gpu67\_s0\_pruned\_i1000}.
+\]
+The run used two A100 GPUs, \(\ell=16\), train depths \(\{16,32,64\}\), eval depths
+\(\{4,8,16,32,64\}\), and 4096 paired evaluation examples per depth pair.
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}L{0.13\textwidth} r r r r L{0.22\textwidth} L{0.22\textwidth} r@{}}
+\toprule
+\textbf{Variant} & \textbf{Params} & \textbf{Peak MB} & \textbf{Best \(K\)} & \textbf{Best loss} & \textbf{\(G_{\rm nll}(16,64)\) [95\% CI]} & \textbf{\(G_{\rm acc}(16,64)\) [95\% CI]} & \textbf{NDR} \\
+\midrule
+\code{control} & 198{,}521 & 1316.0 & 16 & 4.7930 & \(-0.000477\ [-0.000951,\ -0.000002]\) & \(0.000488\ [-0.000188,\ 0.001165]\) & 0.5122 \\
+\code{m0} & 363{,}897 & 2539.1 & 16 & 4.7934 & \(0.000071\ [-0.000270,\ 0.000412]\) & \(-0.000977\ [-0.002767,\ 0.000814]\) & 0.4968 \\
+\code{mclk} & 429{,}433 & 2540.1 & 16 & 4.7932 & \(-0.000073\ [-0.000351,\ 0.000205]\) & \(0.000000\ [0.000000,\ 0.000000]\) & 0.5146 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}L{0.15\textwidth} L{0.28\textwidth} L{0.28\textwidth} r r@{}}
+\toprule
+\textbf{Variant} & \textbf{\(G_{\rm nll}(8,32)\) [95\% CI]} & \textbf{\(G_{\rm acc}(8,32)\) [95\% CI]} & \textbf{NDR} & \textbf{\(R_{\rm rec}\)} \\
+\midrule
+\code{control} & \(-0.000203\ [-0.001380,\ 0.000974]\) & \(-0.000732\ [-0.001998,\ 0.000534]\) & 0.5151 & N/A \\
+\code{m0} & \(0.000203\ [-0.000573,\ 0.000979]\) & \(-0.000244\ [-0.002098,\ 0.001609]\) & 0.5039 & \(9.57{\times}10^{-6}\) \\
+\code{mclk} & \(0.000658\ [0.000027,\ 0.001289]\) & \(0.000000\ [0.000000,\ 0.000000]\) & 0.4917 & \(1.12{\times}10^{-5}\) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The verification validates the simplified interface, DDP operation, finite-loss training,
+CI-backed pair reporting, and structural reversibility.  It does not promote P1.  The positive
+control is negative on the main \(16\to64\) NLL gain and \(\mathrm{NDR}_\epsilon\) remains near one
+half.  \(M_{\rm clk}\) shows a small positive \(8\to32\) NLL interval, but the clock diagnostic
+cannot rescue the failing positive-control gate.  Following the triage table, the next principled
+step is detectability repair: verify the target representation and positive-control capacity, use
+a shorter or curriculum-shaped composition task, or add a simpler positive control known to solve
+the task before testing \(M_0\).  Adding MoE, cache, quantization, or fixed-point pressure would not
+address this blocker.
+
+%==============================================================================
+\section{Current Feedback-Stage DDP Verification}
+\label{sec:feedback-stage-run}
+
+The separate feedback-stage pipeline was run on June 4, 2026 with
+\[
+\code{CUDA\_VISIBLE\_DEVICES=6,7\ ITERATIONS=1000\ RUN\_TAG=gpu67\_feedback\_all\_i1000}.
+\]
+It wrote current S+0 outputs plus S+1/S+2/S+3 diagnostic outputs under
+\code{experiments/training\_logs/p1\_feedback\_gpu67\_feedback\_all\_i1000}.  This run verifies
+the code coverage requested by the feedback document while preserving the minimal P1 interface.
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}L{0.15\textwidth} r r r r L{0.23\textwidth} r r@{}}
+\toprule
+\textbf{Run} & \textbf{Params} & \textbf{Peak MB} & \textbf{Best \(K\)} & \textbf{Best loss} & \textbf{\(G_{\rm nll}(16,64)\) [95\% CI]} & \textbf{NDR} & \textbf{\(R_{\rm rec}\)} \\
+\midrule
+\code{s0\_control} & 198{,}521 & 1316.0 & 16 & 4.7930 & \(-0.000477\ [-0.000951,\ -0.000002]\) & 0.5122 & N/A \\
+\code{s0\_m0} & 363{,}897 & 2541.0 & 16 & 4.7934 & \(0.000071\ [-0.000270,\ 0.000412]\) & 0.4968 & \(9.57{\times}10^{-6}\) \\
+\code{s0\_mclk} & 429{,}433 & 2540.1 & 16 & 4.7932 & \(-0.000073\ [-0.000351,\ 0.000205]\) & 0.5146 & \(1.12{\times}10^{-5}\) \\
+\code{s1\_m0} & 363{,}897 & 2539.1 & 16 & 4.7934 & \(0.000071\ [-0.000270,\ 0.000412]\) & 0.4968 & \(9.57{\times}10^{-6}\) \\
+\code{s1\_moe} & 958{,}593 & 6142.5 & 16 & 4.7943 & \(-0.000133\ [-0.000396,\ 0.000130]\) & 0.5159 & \(9.47{\times}10^{-6}\) \\
+\code{s1\_static} & 958{,}593 & 6142.5 & 16 & 4.7943 & \(-0.000134\ [-0.000393,\ 0.000125]\) & 0.5110 & \(1.05{\times}10^{-5}\) \\
+\code{s2\_m0} & 363{,}897 & 2539.1 & 16 & 4.7934 & \(0.000071\ [-0.000270,\ 0.000412]\) & 0.4968 & \(9.57{\times}10^{-6}\) \\
+\code{s3\_m0} & 363{,}897 & 2539.1 & 16 & 4.7934 & \(0.000071\ [-0.000270,\ 0.000412]\) & 0.4968 & \(9.57{\times}10^{-6}\) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}L{0.20\textwidth} L{0.70\textwidth}@{}}
+\toprule
+\textbf{Stage} & \textbf{Diagnostic result} \\
+\midrule
+S+1 MoE basis & \code{s1\_moe} reported route-depth NMI \(8.02{\times}10^{-6}\), \(\mathrm{AEBR}=1.385\), and expert utilization \(0.9992\).  \code{s1\_static\_moe} reported route-depth NMI \(4.93{\times}10^{-6}\), \(\mathrm{AEBR}=1.512\), and utilization \(0.9995\).  Both are executable mechanism diagnostics, but neither improves the failed S+0 gate. \\
+S+2 cache axis & The hidden-state proxy emitted \(\alpha_{\rm exact}=1.0\), \(\alpha_{\rm terminal}=0.0\), and \(\alpha_{\rm shared}=0.0\), with \(2{,}097{,}152\) bytes per terminal hidden state.  The JSON label is \code{hidden\_state\_proxy\_not\_autoregressive\_kv}; the quality gap is explicitly \code{not\_tested\_requires\_autoregressive\_terminal\_context\_attention}. \\
+S+3 deployment & Fake-int6 linear-weight sensitivity reported best-loss gap \(+0.000907\).  The post-int6 \(G_{\rm nll}(16,64)\) was \(0.000044\) with 95\% CI \([-0.000295,0.000383]\) and \(\mathrm{NDR}=0.5005\), so quantization does not rescue depth scaling. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The outcome is the desired implementation split.  All feedback stages execute under DDP on the
+requested GPU pair, but the S+0 positive-control gate still fails.  Therefore the next scientific
+move remains detectability repair, not mechanism escalation.
+
+%==============================================================================
+\section{Superseded All-Stage DDP Run}
+\label{sec:allstage-run}
+
+Before the final simplification, the full staged pipeline was run on June 4, 2026 with
+\[
+\code{CUDA\_VISIBLE\_DEVICES=6,7\ STAGES=all\ SEQ\_LEN=8\ ITERATIONS=1000\ RUN\_TAG=gpu67\_allstages\_seq8\_i1000\_fix}.
+\]
+That now-superseded runner completed and wrote eight stage outputs:
+\[
+\{\code{s0\_control},\code{s0\_m0},\code{s0\_mclk},
+\code{s1\_m0},\code{s1\_moe},\code{s1\_static\_moe},
+\code{s2\_m0},\code{s3\_m0}\}.
+\]
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}L{0.17\textwidth} r r r L{0.22\textwidth} L{0.22\textwidth} r@{}}
+\toprule
+\textbf{Run} & \textbf{Params} & \textbf{Peak MB} & \textbf{Best loss} & \textbf{\(G_{\rm nll}(16,64)\) [95\% CI]} & \textbf{\(G_{\rm acc}(16,64)\) [95\% CI]} & \textbf{NDR} \\
+\midrule
+\code{s0\_control} & 197{,}497 & 651.9 & 4.7896 & \(0.000173\ [-0.000449,\ 0.000795]\) & \(0.001465\ [-0.001781,\ 0.004710]\) & 0.4968 \\
+\code{s0\_m0} & 362{,}873 & 1244.5 & 4.7899 & \(0.000000\ [-0.000392,\ 0.000392]\) & \(0.000977\ [-0.000938,\ 0.002891]\) & 0.5002 \\
+\code{s0\_mclk} & 428{,}409 & 1246.1 & 4.7909 & \(0.000027\ [-0.000331,\ 0.000384]\) & \(0.000000\ [0.000000,\ 0.000000]\) & 0.4949 \\
+\code{s1\_moe} & 957{,}569 & 3095.6 & 4.7908 & \(0.000112\ [-0.000228,\ 0.000453]\) & \(-0.000732\ [-0.003027,\ 0.001563]\) & 0.5044 \\
+\code{s1\_static} & 956{,}545 & 3095.6 & 4.7914 & \(0.000317\ [-0.000075,\ 0.000709]\) & \(0.000488\ [-0.000865,\ 0.001842]\) & 0.4885 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The longer, easier S+0 run still does not promote P1.  The positive-control lower confidence bound
+is negative for both tested depth pairs and \(\mathrm{NDR}_\epsilon\) remains near \(0.5\).  This is
+stronger evidence than the 300-iteration smoke: the bottleneck is not a missing MoE, quantizer, or
+cache feature.  The next experimental move should be a detectability repair: either make the
+synthetic task expose an actually depth-dependent target to the current architecture, increase the
+training signal substantially, or add a simpler positive-control architecture that is known to solve
+the task before testing \(M_0\).
+
+This run is treated as evidence for deletion, not as an active run shape.  S+1 code-path evidence
+was limited to executability: both \code{moe} and \code{static\_moe} trained under DDP and reported
+expert utilization \(1.0\), but they did not improve the S+0 gate and are no longer options on the
+P1 runner.  S+2 emitted the expected hidden-state proxy slopes:
+\[
+  \alpha_{\rm exact}=1.0,\qquad
+  \alpha_{\rm terminal}=0.0,\qquad
+  \alpha_{\rm shared}=0.0,
+\]
+with \(2{,}097{,}152\) bytes per terminal state at the tested shape.  This remains a synthetic
+proxy, not an autoregressive KV-cache proof.  S+3 int6 evaluation ran; the post-int6
+\(G_{\rm nll}(16,64)\) for \code{s3\_m0} was \(-0.000046\) with 95\% CI
+\([-0.000432,0.000340]\), so deployment quantization also does not rescue depth scaling.
+
+%==============================================================================
+\appendix
+\section{Prior Diagnostic Evidence: 16x1 Dense-MoE Path}
+\label{app:prior}
+
+The previous in-repo path was a \(16\times1\) dense-MoE recurrent model with Dirichlet--UCB routing,
+MLA-style expert attention, MoS output head, Parcae-style damping, int6 artifact scoring, and
+diagnostic K-sweeps.  It is useful evidence because it failed P1 despite stable fixed-point
+diagnostics, motivating the final minimal design.
+
+\begin{center}
+\footnotesize
+\renewcommand{\arraystretch}{1.12}
+\begin{tabularx}{\textwidth}{@{}L{0.35\textwidth} L{0.25\textwidth} L{0.30\textwidth}@{}}
+\toprule
+\textbf{Metric} & \textbf{Observed value} & \textbf{Interpretation} \\
+\midrule
+Full validation \bpb{} & 3.702038 & Diagnostic smoke score, not a promoted result. \\
+\(G_T(16,64)\), \(G_T(16,128)\), \(G_T(32,128)\) & \(-0.012196\), \(-0.012865\), \(-0.004076\) & Extra recurrence hurt paired task score. \\
+\(\mathrm{NDR}_\epsilon\) & 1.000000 & Every tested pair degraded under the chosen threshold. \\
+\(\rho_F\), \(\sigma_{\max}(J_F)\) at \(K=128\) & 0.7525, 0.9633 & Stable/cache-ready diagnostics did not imply useful recurrence. \\
+Route-depth NMI and utilization & near 0; near 0.99 & Experts were broadly used but the mixture was nearly static across depth. \\
+Peak VRAM & 35632 MB & Memory feasible for the smoke profile. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{center}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.10}
+\begin{tabular}{@{}r r r r r r r r r r@{}}
+\toprule
+\(K\) & \bpb{} & ED$_u$ & ED$_\ell$ & NMI mean & NMI max & util & \(\rho_F\) & \(\sigma_{\max}\) & iter rel. \\
+\midrule
+4   & 3.7478 & 1.0484   & 1.0400  & 0.0001 & 0.0002 & 0.9944 & 0.7645 & 0.9853 & 0.1193 \\
+8   & 3.7556 & 1.1531   & 1.1738  & 0.0001 & 0.0001 & 0.9930 & 0.7564 & 0.9632 & 0.0317 \\
+16  & 3.7625 & 1.5920   & 2.3193  & 0.0001 & 0.0001 & 0.9919 & 0.7537 & 0.9623 & 0.0061 \\
+24  & 3.7655 & 2.7455   & 5.7373  & 0.0000 & 0.0001 & 0.9915 & 0.7530 & 0.9284 & 0.0027 \\
+32  & 3.7670 & 5.3277   & 10.0747 & 0.0000 & 0.0000 & 0.9913 & 0.7529 & 0.9533 & 0.0018 \\
+64  & 3.7687 & 24.0905  & 29.1213 & 0.0000 & 0.0000 & 0.9909 & 0.7528 & 0.9169 & 0.0014 \\
+128 & 3.7690 & 69.4624  & 62.6883 & 0.0000 & 0.0000 & 0.9908 & 0.7525 & 0.9633 & 0.0013 \\
+192 & 3.7690 & 113.3975 & 88.6915 & 0.0000 & 0.0000 & 0.9907 & 0.7526 & 1.0148 & 0.0013 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The root-cause read is objective and measurement mismatch: the old stack contained many mechanisms,
+but no depth-hard positive control and no clean way to localize whether failure came from the
+harness, autonomous depth signal, block expressivity, or MoE routing.  The final minimal protocol
+fixes that attribution problem before revisiting MoE or deployment features.
+
+%==============================================================================
+\begin{thebibliography}{99}
+
+\bibitem{barrington}
+D. A. M. Barrington.
+\newblock Bounded-width polynomial-size branching programs recognize exactly those languages in
+\(\mathrm{NC}^{1}\).
+\newblock \emph{Journal of Computer and System Sciences}, 38(1):150--164, 1989.
+\newblock \url{https://doi.org/10.1016/0022-0000(89)90037-8}.
+
+\bibitem{ut}
+M. Dehghani, S. Gouws, O. Vinyals, J. Uszkoreit, and L. Kaiser.
+\newblock Universal Transformers.
+\newblock \emph{International Conference on Learning Representations}, 2019.
+\newblock \url{https://arxiv.org/abs/1807.03819}.
+
+\bibitem{huginn}
+J. Geiping, S. McLeish, N. Jain, J. Kirchenbauer, S. Singh, B. R. Bartoldson,
+B. Kailkhura, A. Bhatele, and T. Goldstein.
+\newblock Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach.
+\newblock arXiv:2502.05171, 2025.
+\newblock \url{https://arxiv.org/abs/2502.05171}.
+
+\bibitem{isodepth}
+K. Schwethelm, D. Rueckert, and G. Kaissis.
+\newblock How Much Is One Recurrence Worth? Iso-Depth Scaling Laws for Looped Language Models.
+\newblock arXiv:2604.21106, 2026.
+\newblock \url{https://arxiv.org/abs/2604.21106}.
+
+\bibitem{melt}
+V. C. Vendrell, A. P. Masdemont, N. Grillo, J. Ros-Giralt, A. Behboodi, and
+F. V. Massoli.
+\newblock Memory-Efficient Looped Transformer: Decoupling Compute from Memory in Looped Language Models.
+\newblock arXiv:2605.07721, 2026.
+\newblock \url{https://arxiv.org/abs/2605.07721}.
+
+\bibitem{moeut}
+R. Csordas, K. Irie, J. Schmidhuber, C. Potts, and C. D. Manning.
+\newblock MoEUT: Mixture-of-Experts Universal Transformers.
+\newblock \emph{NeurIPS}, 2024.
+\newblock \url{https://arxiv.org/abs/2405.16039}.
+
+\bibitem{revnet}
+A. N. Gomez, M. Ren, R. Urtasun, and R. B. Grosse.
+\newblock The Reversible Residual Network: Backpropagation Without Storing Activations.
+\newblock \emph{NeurIPS}, 2017.
+\newblock \url{https://arxiv.org/abs/1707.04585}.
+
+\end{thebibliography}
+
+\end{document}

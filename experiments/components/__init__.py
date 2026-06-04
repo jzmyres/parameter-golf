@@ -12,7 +12,7 @@ individual files into this directory before reactivating; see
 
 from . import artifact_compression  # noqa: F401
 from . import caseops_tokenizer  # noqa: F401
-from . import chained_routing  # noqa: F401
+from . import expert_layout  # noqa: F401
 from . import gptq_lqer  # noqa: F401
 from . import phased_ttt  # noqa: F401
 from . import rr_attention  # noqa: F401

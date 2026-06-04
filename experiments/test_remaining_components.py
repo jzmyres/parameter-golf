@@ -5,6 +5,7 @@ import os
 import sys
 import zlib
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -97,32 +98,15 @@ def test_gpt_train_time_components_forward_backward():
     assert hasattr(model.shared_block.attn, "sparse_attn_head_gate")
 
 
-def test_gpt_deq_prefix_anchors_forward_backward():
-    # iter152 / flag-to-effect contract: prove the prefix-anchor branch in
-    # GPT._forward_hidden runs forward+backward and produces finite gradients
-    # at the project's actual sampled-K range. Untested-path executability
-    # gate.
-    torch.manual_seed(3)
-    model = _tiny_gpt(
-        deq_prefix_anchors=True,
-        deq_prefix_anchor_set=(1, 2),
-    )
-    # Force K=2 so _prefix_anchor_depths(2, (1,2)) returns (1, 2) → 2 anchors.
-    model._deq_k_override = 2
-    model.train()
-    x = torch.randint(0, 64, (1, 8))
-    y = torch.randint(0, 64, (1, 8))
-    loss = model(x, y)
-    assert torch.isfinite(loss), f"prefix-anchor loss is non-finite: {loss.item()}"
-    anchors_used = model._deq_prefix_anchor_depths_last
-    assert anchors_used == (1, 2), f"expected anchors (1,2), got {anchors_used}"
-    loss.backward()
-    any_grad = any(
-        p.grad is not None and torch.isfinite(p.grad).all()
-        for p in model.parameters()
-        if p.requires_grad
-    )
-    assert any_grad, "no finite gradient produced on any parameter"
+def test_gpt_deq_prefix_anchors_are_legacy_rejected():
+    # Prefix-anchor consistency is archived as a fixed-point legacy path.
+    # Startup validation must reject attempts to re-enable it.
+    from train_gpt import Hyperparameters, _validate_hyperparameters
+
+    cfg = Hyperparameters()
+    cfg.deq_prefix_anchors = True
+    with pytest.raises(SystemExit, match="legacy.*consistency|consistency.*legacy"):
+        _validate_hyperparameters(cfg)
 
 
 def test_use_reverse_kl_balance_output_differs():

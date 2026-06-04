@@ -45,6 +45,23 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(ov["bigram_vocab_size"], 4096)
         ov = _parse_cli_overrides(["--val-micro-batch-seqs", "48"])
         self.assertEqual(ov["val_micro_batch_seqs"], 48)
+        ov = _parse_cli_overrides([
+            "--experts-per-slot", "4",
+            "--expert-slots", "4",
+            "--expert-slot-order", "parallel",
+        ])
+        self.assertEqual(ov["experts_per_slot"], 4)
+        self.assertEqual(ov["expert_slots"], 4)
+        self.assertEqual(ov["expert_slot_order"], "parallel")
+
+    def test_old_chained_routing_flags_are_not_public_cli(self):
+        for flag, value in (
+            ("--use-chained-routing", "1"),
+            ("--chained-stages-preset", "split_2stage"),
+        ):
+            with self.subTest(flag=flag):
+                with self.assertRaises(SystemExit):
+                    _parse_cli_overrides([flag, value])
 
     def test_tuple_parsing(self):
         ov = _parse_cli_overrides(["--deq-beta-jitter-set", "0.25,0.45,0.65"])
@@ -56,7 +73,7 @@ class TestCliParser(unittest.TestCase):
 
     def test_config_profile_applies_before_cli_overrides(self):
         ov = _parse_cli_overrides([
-            "--config-profile", "score_iter152",
+            "--config-profile", "debug",
             "--router-ema-balance-coef", "0.7",
         ])
         args = Hyperparameters()
@@ -64,10 +81,9 @@ class TestCliParser(unittest.TestCase):
         _apply_config_profile(args, profile)
         for key, value in ov.items():
             setattr(args, key, value)
-        self.assertEqual(args.config_profile, "score_iter152")
-        self.assertTrue(args.deq_prefix_anchors)
-        self.assertEqual(args.eval_profile, "submission")
-        self.assertAlmostEqual(args.router_ema_specialization_coef, 0.40)
+        self.assertEqual(args.config_profile, "debug")
+        self.assertFalse(args.final_full_validation)
+        self.assertEqual(args.eval_profile, "debug")
         self.assertAlmostEqual(args.router_ema_balance_coef, 0.70)
 
     def test_eval_profiles_own_k_sweep(self):

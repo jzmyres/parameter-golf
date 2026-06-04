@@ -8,8 +8,13 @@ relevant archive or `iterNNN_*.md` design notes. The goal is to catch active
 queue decisions, superseded ideas, and implementation plans before touching
 code or launching training.
 
-- `hypotheses.md` is the active iteration ledger: current baseline, queue,
-  evidence, verdicts, and follow-up decisions.
+- `hypotheses.md` is the active iteration ledger. Its current snapshot is the
+  final-minimal P1 pipeline. The Tier-1 runner exposes only the
+  `control`/`m0`/`mclk` triage. MoE, cache, and deployment diagnostics live in
+  `experiments/p1_feedback_stages.py` and `experiments/run_feedback_stage_pipeline.sh`;
+  they are separate later-stage diagnostics and do not widen the P1 runner.
+  Dense-MoE/Parcae/RevDEQ queue material in that file is legacy evidence unless
+  explicitly pulled forward by `reports/opg_doc.tex`.
 - `hypotheses_archive.md` preserves historical records and long-form evidence
   that no longer belongs in the active ledger.
 - `recurrent_depth_baselines.md` summarizes external recurrent-depth baselines

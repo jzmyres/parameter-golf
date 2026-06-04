@@ -14,10 +14,9 @@ def _make_model(**overrides):
     # code. Production defaults (use_ctp=False, num_refinements=0) flipped in
     # iter146 and are pinned by `test_gpt_constructor_defaults_track_hyperparameters`
     # which constructs `GPT()` without going through this helper.
-    # `deq_prefix_anchors=False` pinned explicitly in 2026-05-13 because the
-    # production default flipped to True (iter152 promotion-propagation fix)
-    # but prefix anchors are incompatible with num_refinements=1 (validator
-    # rejects the combo).  Tests that need prefix anchors must override.
+    # Keep this helper on the base RevDEQ solver. Finite-horizon OPG tests
+    # explicitly override `finite_horizon_scale_coef` when they need the new
+    # two-endpoint stack.
     from train_gpt import GPT
     defaults = dict(
         vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
@@ -27,6 +26,7 @@ def _make_model(**overrides):
         kv_latent_dim=0, num_refinements=1,
         use_ctp=True,
         deq_prefix_anchors=False,
+        finite_horizon_scale_coef=0.0,
     )
     defaults.update(overrides)
     dev = _get_device()
@@ -527,14 +527,9 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
         "needs_mos_output_geometry_constraint",
         "needs_transition_parameterization",
         "needs_transition_jacobian_control",
-        # iter155 corrected: contraction-object key was needs_iteration_map_contraction
-        # (Lyapunov-on-F target). Tier 1+2 redesign 2026-05-13 reframed the gate
-        # from operator norm (lip_ub_F, over-restrictive) to spectral radius
-        # (rho_F, necessary AND sufficient for asymptotic local convergence).
-        # The lip_ub_F branch became advisory; rho_F branch routes to
-        # needs_formal_tier_contraction (formal-tier mechanism: spectral
-        # normalization, bounded-Lipschitz block, learned c·Δ gain — all
-        # reusable, NOT a per-symptom loss).
+        # Historical/fallback-only contraction keys. Under the active Pure
+        # Finite Reversible OPG profile, rho_F and iter_conv_rel are advisory
+        # terminal-cache readiness signals and must not prescribe these keys.
         "needs_iteration_map_contraction",
         "needs_formal_tier_contraction",
     }
@@ -567,21 +562,21 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
          {"weight_decay_mult"}),
         ("mos_ntp_ortho=0.61 > 0.5", "mos_head_collapse",
          {"needs_mos_output_geometry_constraint"}, set()),
-        ("k-sweep delta > 0.1 at K=64", "fp_quality_loss", set(), set()),
+        ("k-sweep delta > 0.1 at K=64", "terminal_cache_quality_advisory", set(), set()),
         # Lip_ub_* operator-norm probes + fp_bound (Banach error bound) were
         # removed 2026-05-15 — over-restrictive for non-symmetric J_F.
         # Legacy failure strings now route to a single advisory prescription
-        # that points users at rho_F (the principled gate per Hartman-Grobman).
+        # that points users at rho_F as an advisory terminal-cache readiness signal.
         ("lip_ub_F=45.0 >= 1.0", "operator_norm_advisory",
          set(), {"lyapunov_coef", "needs_iteration_map_contraction"}),
         ("lip_ub_T=22.0 >= 1.0", "operator_norm_advisory", set(), {"lyapunov_coef"}),
         ("lip_ub_S=18.0 >= 1.0", "operator_norm_advisory", set(), {"lyapunov_coef"}),
         ("fp_bound=2.5 >= 1.0", "operator_norm_advisory", set(), {"lyapunov_coef"}),
-        ("rho_F=1.2 >= 1.0", "fp_convergence_failed",
-         {"needs_formal_tier_contraction"}, {"lyapunov_coef"}),
-        # iter_conv_rel category: gate-relevant empirical signal.
-        ("iter_conv_rel=0.6 > 0.3", "fp_convergence_empirical_failed",
-         {"weight_decay_mult", "deq_k_max_delta"}, {"lyapunov_coef"}),
+        ("rho_F=1.2 >= 1.0", "terminal_cache_convergence_advisory",
+         set(), {"lyapunov_coef", "needs_formal_tier_contraction"}),
+        # iter_conv_rel category: advisory empirical terminal-drift signal.
+        ("iter_conv_rel=0.6 > 0.3", "terminal_cache_drift_advisory",
+         set(), {"lyapunov_coef", "weight_decay_mult", "deq_k_max_delta"}),
         ("deq_recon_err=1.5e-2 > 1e-3", "reversibility_broken", set(), set()),
     ]
     for failure, expected_category, required, forbidden in cases:
@@ -595,10 +590,9 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
         for key in forbidden:
             assert key not in change_keys, f"{failure!r}: forbidden key {key!r} appears in {change_keys}"
         # Root-cause fix preference: invariant mechanism OR explicit ablation
-        # framing OR advisory-only category (Tier 1 redesign 2026-05-13:
-        # operator-norm proxies like lip_ub_F are now diagnostic-only and
-        # legitimately have no config_change; the gate-relevant prescriptions
-        # are rho_F and iter_conv_rel which DO have invariant_keys.)
+        # framing OR advisory-only category. Operator-norm proxies, rho_F, and
+        # iter_conv_rel are diagnostic-only under the active finite-horizon
+        # profile and legitimately have no config_change.
         has_invariant = bool(change_keys & invariant_keys)
         has_metric_only = bool(change_keys & metric_specific_keys)
         fix_text = p["fix"].lower()
@@ -679,17 +673,15 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
         assert bool(r.use_router_sigmoid_gate) is False
 
     from train_gpt import _prescribe_failure_fix
-    # Tier 1 redesign 2026-05-13: lip_ub_F demoted to advisory diagnostic
-    # (operator norm is sufficient but over-restrictive for asymptotic
-    # convergence; the gate-relevant signal is rho_F).
+    # Active finite-horizon profile: lip_ub_F is a legacy advisory diagnostic.
     p_lip = _prescribe_failure_fix("lip_ub_F=45.0 >= 1.0")
     assert p_lip["category"] == "operator_norm_advisory"
     assert "lyapunov_coef" not in p_lip["config_change"]
-    # New gate-relevant prescription: rho_F (spectral radius) routes to
-    # the formal-tier mechanism, NOT a soft penalty.
+    # rho_F is also advisory under the active profile; formal-tier
+    # contraction belongs only to an explicit terminal-cache/fallback profile.
     p_rho = _prescribe_failure_fix("rho_F=1.2 >= 1.0")
-    assert p_rho["category"] == "fp_convergence_failed"
-    assert "needs_formal_tier_contraction" in p_rho["config_change"]
+    assert p_rho["category"] == "terminal_cache_convergence_advisory"
+    assert "needs_formal_tier_contraction" not in p_rho["config_change"]
     assert "lyapunov_coef" not in p_rho["config_change"]
     # lip_ub_T/S/F operator-norm prescriptions were collapsed into a single
     # `operator_norm_advisory` 2026-05-15 (probes removed; legacy failure

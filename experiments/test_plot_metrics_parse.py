@@ -131,6 +131,29 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertTrue(math.isnan(d["deq_residual"][-1]))
         self.assertTrue(math.isnan(d["mlp_entropy"][-1]))
 
+    def test_parse_k_sweep_effective_depth_fields(self):
+        log = "\n".join(
+            [
+                "k_sweep:k=16 val_bpb:1.234500 ED_update:3.2500 ED_logit:2.5000 "
+                "route_depth_nmi_mean:0.1200 route_depth_nmi_max:0.2000 "
+                "expert_util_mean:0.9000 expert_output_erank_mean:7.0000 "
+                "rho_F:0.8000 sigma_max_F:0.9700 fp_residual_F:0.001000",
+                "k_sweep_table:    K   val_bpb ED_update  ED_logit route_depth_nmi_mean route_depth_nmi_max expert_util_mean expert_output_erank_mean rho_F sigma_max_F fp_residual_F iter_conv_rel",
+                "k_sweep_table:   16    1.2345    3.2500    2.5000               0.1200              0.2000           0.9000                   7.0000 0.8000      0.9700       0.001000       0.0100",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        self.assertEqual(d["k_sweep"][0]["ED_update"], 3.25)
+        self.assertEqual(d["k_sweep"][0]["route_depth_nmi_mean"], 0.12)
+        self.assertEqual(d["k_sweep"][0]["sigma_max_F"], 0.97)
+        self.assertEqual(d["k_sweep_table"][0]["ED_logit"], 2.5)
+        self.assertEqual(d["k_sweep_table"][0]["expert_output_erank_mean"], 7.0)
+
     def test_parse_log_orthogonality_fields(self):
         log = "\n".join(
             [

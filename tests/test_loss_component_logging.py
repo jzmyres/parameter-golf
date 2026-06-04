@@ -72,18 +72,16 @@ class TestLossComponentLogging(unittest.TestCase):
         # _router_cv_loss_t and _mos_cv_loss_t are still emitted as diagnostic
         # tensors (CV is computed for logging) but neither contributes to the
         # loss after router_load_cv_coef and mos_load_cv_coef were removed
-        # 2026-05-15. The iter163 consistency-loss tensors (`*_loss_t`) are
-        # detached log copies of the with-grad `*_loss_raw`; they may be None
-        # when the gating conditions don't fire (prefix_anchors=False here so
-        # the anchor term stays None; use_parcae=True so the extension fires).
+        # 2026-05-15. The finite-horizon scale-hinge tensor is a detached log
+        # copy of the with-grad hinge term.
         required = [
             "_router_cv_loss_t", "_router_pertoken_entropy_loss_t", "_mos_cv_loss_t",
             "_expert_diversity_loss_t", "_mos_diversity_loss_t", "_router_reg_loss_t",
             "_router_pertoken_entropy_coef_eff_t",
             "_expert_diversity_coef_eff_t",
-            "_mos_diversity_coef_eff_t",
+            "_mos_diversity_coef_eff_t", "_scale_hinge_loss_t",
         ]
-        optional = ["_consistency_anchor_loss_t"]
+        optional = []
         for name in required + optional:
             self.assertTrue(hasattr(model, name), name)
             t = getattr(model, name)

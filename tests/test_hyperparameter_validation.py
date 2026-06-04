@@ -62,6 +62,15 @@ class TestValidateHyperparameters(unittest.TestCase):
             self.assertIn("lyapunov_estimator", str(ctx.exception))
         _validate_hyperparameters(_mut(lyapunov_estimator="random_fd"))
 
+    def test_nonzero_lyapunov_coef_is_rejected_globally(self) -> None:
+        for value in (1e-6, -1e-6, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit) as ctx:
+                    _validate_hyperparameters(_mut(lyapunov_coef=value))
+                message = str(ctx.exception).lower()
+                self.assertIn("lyapunov_coef", message)
+                self.assertIn("diagnostic", message)
+
     def test_unknown_profile_key_is_rejected(self) -> None:
         # Defends `_CONFIG_PROFILES` against silent typos: a stray attribute on
         # `args` would let the run proceed with the real Hyperparameter at its
@@ -144,18 +153,36 @@ class TestValidateHyperparameters(unittest.TestCase):
             _validate_hyperparameters(_mut(num_experts=0, num_shared_experts=0))
         self.assertIn("num_experts", str(ctx.exception))
 
-    def test_num_shared_experts_cannot_exceed_total_experts(self) -> None:
+    def test_num_shared_experts_cannot_exceed_experts_per_slot(self) -> None:
         with self.assertRaises(SystemExit) as ctx:
-            _validate_hyperparameters(_mut(num_experts=1, num_shared_experts=2))
+            _validate_hyperparameters(_mut(experts_per_slot=1, num_shared_experts=2))
         self.assertIn("num_shared_experts", str(ctx.exception))
-        self.assertIn("num_experts", str(ctx.exception))
+        self.assertIn("experts_per_slot", str(ctx.exception))
         self.assertIn("routed expert", str(ctx.exception))
 
     def test_at_least_one_routed_expert_required(self) -> None:
-        # nS == nE is the boundary case: zero routed experts after shared.
+        # nS == experts_per_slot is the boundary case: zero routed experts after shared.
         with self.assertRaises(SystemExit) as ctx:
-            _validate_hyperparameters(_mut(num_experts=2, num_shared_experts=2))
+            _validate_hyperparameters(_mut(experts_per_slot=2, num_shared_experts=2))
         self.assertIn("routed expert", str(ctx.exception))
+
+    def test_expert_layout_fields_are_validated(self) -> None:
+        for field, value in (
+            ("experts_per_slot", 0),
+            ("expert_slots", 0),
+            ("expert_slot_order", "bad_order"),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(SystemExit) as ctx:
+                    _validate_hyperparameters(_mut(**{field: value}))
+                self.assertIn(field, str(ctx.exception))
+
+    def test_shared_experts_are_per_slot_and_must_leave_routed_experts(self) -> None:
+        _validate_hyperparameters(_mut(experts_per_slot=4, expert_slots=4, num_shared_experts=1))
+        with self.assertRaises(SystemExit) as ctx:
+            _validate_hyperparameters(_mut(experts_per_slot=1, expert_slots=4, num_shared_experts=1))
+        self.assertIn("num_shared_experts", str(ctx.exception))
+        self.assertIn("experts_per_slot", str(ctx.exception))
 
     def test_sparse_dispatch_rejected_for_training(self) -> None:
         with self.assertRaises(SystemExit) as ctx:
@@ -163,11 +190,12 @@ class TestValidateHyperparameters(unittest.TestCase):
         self.assertIn("use_sparse_dispatch", str(ctx.exception))
         self.assertIn("RevDEQ-safe", str(ctx.exception))
 
-    def test_prefix_anchors_reject_refinements(self) -> None:
+    def test_prefix_anchors_are_legacy_rejected(self) -> None:
         with self.assertRaises(SystemExit) as ctx:
-            _validate_hyperparameters(_mut(deq_prefix_anchors=True, num_refinements=1))
+            _validate_hyperparameters(_mut(deq_prefix_anchors=True))
         self.assertIn("deq_prefix_anchors", str(ctx.exception))
-        self.assertIn("num_refinements=0", str(ctx.exception))
+        self.assertIn("legacy", str(ctx.exception).lower())
+        self.assertIn("consistency", str(ctx.exception).lower())
 
     def test_rr_attention_rejects_nsa_combo(self) -> None:
         with self.assertRaises(SystemExit) as ctx:

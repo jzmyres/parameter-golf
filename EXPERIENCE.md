@@ -1,11 +1,13 @@
 # EXPERIENCE — Incident Archive & Lessons Learned
 
-This file has two roles, in this order:
+This file is **historical context, not a rule book.** [`CLAUDE.md`](CLAUDE.md) is the single binding directive; this file records *why* rules exist and what was learned, as reference an agent consults *by topic* — it is not authoritative for the current state and need not be read in full before acting.
 
-1. **Incident-Driven Rules Archive (§1)** — dated postmortems, ported from former `CLAUDE.md` development-practice text. Each section documents one bug class that shipped, the root cause, and the verification recipe. `CLAUDE.md` cites these from its audit checklist.
-2. **Lessons Learned (§2)** — generic guardrails from research-process experience, not tied to specific code paths. Background reading; not enforcement.
+It has two parts:
 
-`CLAUDE.md` is the **enforcement surface** (principle + concise rationale + reference). This file is the **historical record and detail store** (why the rule exists, examples, verification recipes, and runbook detail). New rules from pre-commit reviews are added to §1, then cited from the `CLAUDE.md` audit checklist — they MUST NOT accrete in `CLAUDE.md` itself.
+1. **Incident-Driven Rules Archive (§1)** — dated postmortems. Each documents one bug class that shipped, its root cause, and a verification recipe. `CLAUDE.md` audit rows cite these for detail.
+2. **Lessons Learned (§2)** — generic research-process guardrails, not tied to specific code paths. Background reading.
+
+**Entries may be outdated** where the code they describe has since changed or been deleted — verify against current code (`train_gpt.py::Hyperparameters`, `docs/adr/`) before relying on a lesson. On any **context-vs-code conflict, STOP and clarify with the user, then prune/supersede the stale entry** rather than enforcing it. New incident rules are added to §1 and cited from the `CLAUDE.md` audit checklist; they MUST NOT accrete in `CLAUDE.md` itself.
 
 ---
 
@@ -711,6 +713,8 @@ Magnitude-only edits keep using the existing four-touch hyperparameter rule. Str
 1. The new resume path (`--resume-from`/`--resume-latest`) restored `step` from `ckpt.get("step", step)`, then a flat `step = 0` further down the function unconditionally erased the resumed value. Anyone calling resume would silently restart the loop counter from 0, double-count gradient updates, replay the LR/regularizer warmup, and contaminate `training_time_ms`. A second bug in the same block — `step` was used as a fallback name before any prior assignment — would have raised `NameError` if the checkpoint key was missing.
 2. The chained-routing `Block` constructor set stage-0 backward-compat aliases `self.attn = chained_stack.attns[0]`, `self.mlp = ...`, `self.router = ...`. Today's hot-path consumers all early-return on `chained_stack is not None`, but the alias pattern was a future-proof landmine: a new diagnostic that forgot the guard would silently see only stage-0 and report on it.
 
+**2026-06-03 update.** The active layout API is now `experts_per_slot x expert_slots` with `expert_slot_order`. Multi-slot diagnostics must use `active_attn_modules()`, `active_mlp_modules()`, and `active_routers()`; do not reintroduce stage-0 aliases for `shared_block.attn`, `shared_block.mlp`, or `shared_block.router` in multi-slot mode.
+
 **Root cause.** Static review of an "obvious" branch is a different signal than a runtime witness. A branch that compiles and reads correctly is not the same thing as a branch that runs. The resume reset survived precisely because nobody had run a `--resume-latest` smoke after the rest of the resume infrastructure landed.
 
 **The rule.** Every new top-level control-flow branch — resume path, preset, scoring mode, optimizer group, alias surface — needs at least one of (a) a focused unit test that visits the branch, (b) a smoke run whose log shows the branch fired, or (c) an explicit "manually verified at <commit-sha>" note in the PR description. A branch with no executable witness is dead code: either delete it or add the test that proves it works. If the branch can only be witnessed under DDP / multi-GPU / hardware-specific conditions, document the manual recipe in the PR.
@@ -1117,9 +1121,9 @@ Every metric you read in a healthcheck or postmortem is a *function* of raw sign
 - **`*_cv`** — coefficient of variation. Per-slice CV uses the renormalized within-slice distribution; pool CV uses the full 2R unrenormalized distribution. Diagnostic: large gap between attn_cv and mlp_cv = role-asymmetric routing (e.g. iter 100b s120 attn_cv≈1.07 / mlp_cv≈0.18: attn winner-take-all, MLP uniform). Large pool_cv with small per-slice CVs = cross-slice dominance.
 - **`*_ortho`** — `max|cos_sim|` between expert OUTPUT means. Reported per-slice because attn experts and MLP experts produce DIFFERENT outputs even with the shared (pooled) router.
 - **`router_mass`** — mean `sigmoid(gate)`. Drops when the model gates the mixture down.
-- **`lip_ub`** — the single logged numerical local-contraction metric at the saved DEQ FP `z*`. Internally it is a power-iteration estimate of `||∂T_θ/∂z||_2` with `fp_lip_ub_safety` / `fp_lip_ub_margin` applied. `lip_ub < 1` is the operational sufficient local contraction check, but it is still a numerical metric, not a formal interval/linear-relaxation certificate.
+- **`lip_ub`** — historical pre-2026-05-15 local-contraction metric at the saved DEQ FP `z*`. Current logs use `rho_F`, `sigma_max_F`, `fp_residual_F`, and `iter_conv_rel` as advisory fixed-point/cache-readiness diagnostics; they are not active finite-horizon promotion gates.
 - **`fp_residual_rel`** — direct relative fixed-point residual proxy from the saved solve, currently `deq_iter_conv_rel` / `iter_conv_rel` under the existing solver diagnostics.
-- **`fp_bound`** — a posteriori relative fixed-point distance proxy `fp_residual_rel / (1 - lip_ub)` when `lip_ub < 1`. This is the compact convergence certificate: small residual plus a contraction margin bounds distance to the local fixed point. `N/A` means `lip_ub` was missing or not below 1.
+- **`fp_bound`** — historical a posteriori relative fixed-point distance proxy `fp_residual_rel / (1 - lip_ub)`. Removed with the `lip_ub_*` gate surface; retained here only to interpret archived logs.
 
 **Parcae and contraction attribution.** In the active Parcae path, scalar
 `deq_beta` is not the solver blend; Parcae computes per-dim
@@ -1178,21 +1182,21 @@ EMA usage/liveness; output Gram alone cannot rule out unused experts.
 
 **Prefix convention** (iter 100b). The SoftDenseRouter is a SINGLE pooled router shared across attn and mlp components. Routing-distribution metrics decompose into THREE values: `attn_*` (per-slice renormalized), `mlp_*` (per-slice renormalized), and `pool_*` (full 2R distribution). Metrics derived from **expert outputs** (usage, ortho, min_share per slice) keep `attn_*`/`mlp_*` only — there is no pool variant.
 
-**K-sweep tabular emission** (PERMANENT iter 100b; simplified 2026-05-08). The eval K-sweep emits a `k_sweep_table:` row per K with fixed-width columns: `K val_bpb attn_cv mlp_cv pool_cv attn_min mlp_min attn_ortho mlp_ortho pertoken_ent pool_ent shared_gate dir_S dir_U dir_sigma dir_evid dir_Hmu ucb_beta lip_ub fp_bound iter_conv_rel`. A header row precedes data rows. `N/A` indicates an unavailable field. The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[…] router_gate_iter:[…] iter_conv_rel:… residual:…` line is preserved for `experiments/plot_metrics.py` back-compat and now also emits full `router_dir_*` confidence fields plus `lip_ub` for parser-friendly grep. Use `k_sweep_table:` for cross-K and cross-iter routing-health comparisons; use `k_sweep:` for per-iter gate trajectories. Fast validation logs the same fixed-point certificate fields when `fp_lip_fast_val_every > 0`.
+**K-sweep tabular emission** (PERMANENT iter 100b; updated 2026-06-03). The eval K-sweep emits a `k_sweep_table:` row per K with fixed-width columns for BPB, routing health, layout-agnostic effective-depth diagnostics (`ED_update`, `ED_logit`, `route_depth_nmi_mean`, `route_depth_nmi_max`, `expert_util_mean`, `expert_output_erank_mean`), Dirichlet confidence fields, and advisory FP/cache-readiness fields (`rho_F`, `sigma_max_F`, `fp_residual_F`, `iter_conv_rel`). A header row precedes data rows. `N/A` indicates an unavailable field. The legacy `k_sweep:k=N val_bpb:... attn_gate_iter:[...] router_gate_iter:[...] iter_conv_rel:... residual:...` line is preserved for `experiments/plot_metrics.py` back-compat; gate trajectories are debugging traces, not promotion metrics.
 
 ### principled-simplest-general
 
 User directive 2026-05-15. Three operational tests for ANY fix, optimization, regularizer, prescription, or new mechanism — **all must pass**.
 
 1. **Principled** — targets the root-cause invariant (the actual mathematical property we want), not a symptom or a correlated proxy.
-2. **Simplest** — smallest mechanism that achieves the goal. Element-wise loss term beats new optimizer group; reusing existing infrastructure (e.g. iter152 prefix anchors) beats new bespoke machinery; one CLI flag beats four; no new dependency unless the goal is unreachable without it.
+2. **Simplest** — smallest mechanism that achieves the goal. Element-wise loss term beats new optimizer group; reusing existing infrastructure beats new bespoke machinery; one CLI flag beats four; no new dependency unless the goal is unreachable without it.
 3. **General** — architecture-agnostic, applies broadly across the model class. Beats component-specific.
 
 **Worked examples.**
 
 | Domain | Principled | Proxy (sufficient but over-restrictive) | Symptom (correlated, not causal) |
 |---|---|---|---|
-| FP convergence | `ρ(J_F) < 1` (necessary AND sufficient by Hartman–Grobman) | `σ_max(J_F) < 1` (operator norm; over-restrictive for non-symmetric J_F) | `attn_min_share > τ` (correlated with collapse but not causal for BPB) |
+| Terminal-cache FP readiness (fallback only) | `ρ(J_F) < 1` (necessary AND sufficient by Hartman–Grobman if FP convergence is the active fallback) | `σ_max(J_F) < 1` (operator norm; over-restrictive for non-symmetric J_F) | `attn_min_share > τ` (correlated with collapse but not causal for BPB) |
 | Expert specialization | Normalized expert-output Gram/cosine on active tokens | Router-row orthogonality (only a weak conditioning prior) | Per-expert variance of routed weights |
 | Load balance | EMA-anchored balance loss with reverse-KL gradient | CV of softmax | Per-step min-share gauge |
 
@@ -1205,7 +1209,7 @@ User directive 2026-05-15. Three operational tests for ANY fix, optimization, re
 | Closure | Failed test | Reason |
 |---|---|---|
 | iter155 Lyapunov soft penalty | Principled | Operator norm is an over-restrictive proxy for spectral radius; soft pressure cannot reliably constrain the spectrum anyway |
-| iter160 / iter162 / iter165 routing-balance pushes | Principled | Symptom-targeting (min-share, CV); the failing invariant is FP convergence, not balance |
+| iter160 / iter162 / iter165 routing-balance pushes | Principled | Symptom-targeting (min-share, CV); under the older FP framework the target invariant was convergence, not balance |
 | Spectral normalization on `T_θ` | General | Component-specific to weight-parameterized transition maps; does not transfer to other iteration mechanisms |
 | iter170 anchor-on-deepest | Empirical | A principled design that turned out to break the optimization landscape; closure type is "empirical refutation" rather than failed-test, but should still cite which design property the empirical test challenged |
 
@@ -1213,7 +1217,11 @@ User directive 2026-05-15. Three operational tests for ANY fix, optimization, re
 
 User directive 2026-05-13 (framework), 2026-05-15 (consistency-loss form shipped), 2026-05-17 (iter172 promoted).
 
-**Goal.** Asymptotic local FP convergence is the architecture-agnostic ultimate goal for any iteration mechanism — NOT strict per-step contraction.
+**Superseded active-goal note (2026-06-03).** This section records the older FP-convergence framework. The active baseline became Pure Finite Reversible OPG: finite-horizon task gain plus reversible-memory behavior. FP metrics remain useful for terminal-cache readiness and fallback design, but they are not finite-horizon promotion gates.
+
+**Final minimal P1 pivot (2026-06-04).** The paper-facing target is now the final minimal P1 design in `reports/opg_doc.tex` and ADR 0002. P1 should be established first with `M0` (tied, token-injected, additive-coupling reversible recurrence with standard MHA/GQA + SwiGLU and halting readout), a depth-hard synthetic task, a vanilla positive control, and a clock diagnostic. The richer current code path (dense MoE, Dirichlet-UCB, MLA, MoS, quantization, Parcae-style damping) is prior diagnostic evidence and implementation debt for P1, not the canonical target. Keep `lyapunov_coef=0` and FP diagnostics advisory.
+
+**Historical goal.** Asymptotic local FP convergence was treated as the architecture-agnostic ultimate goal for any iteration mechanism — NOT strict per-step contraction.
 
 **Mathematical foundation (Hartman–Grobman).**
 - `ρ(J_M) < 1` (spectral radius of the iteration map's Jacobian) is the **necessary AND sufficient** condition for local asymptotic contraction.
@@ -1221,25 +1229,15 @@ User directive 2026-05-13 (framework), 2026-05-15 (consistency-loss form shipped
 
 **Empirical confirmation, iter152.** `σ_max ≈ 17`, `iter_conv_rel ≈ 0.02` — clearly converging despite `σ_max ≫ 1`. This single observation refutes the operator-norm framing as a usable gate.
 
-**Promotion gate.** `rho_F < 1` (theoretical) OR `iter_conv_rel < 0.05` at deepest K (empirical).
+**Historical promotion gate.** `rho_F < 1` (theoretical) OR `iter_conv_rel < 0.05` at deepest K (empirical). Superseded for the active pure-finite baseline; current promotion uses paired task gain, no-degradation, and resource gates.
 
-**rho_F always-on mandate.** `rho_F` (spectral radius on the actual two-state Parcae cycle) MUST be reported on EVERY FP eval — train-time fast-val emission and every K-sweep row. A profile knob silently dropping the gate evidence is a "decision based on a metric we haven't measured" failure mode. Enforced by `experiments/test_rho_F.py::test_rho_F_is_emitted_in_fast_val_alongside_residual`.
+**rho_F always-on mandate.** `rho_F` (spectral radius on the actual two-state Parcae cycle) MUST be reported on EVERY FP/cache-readiness eval — train-time fast-val emission and every K-sweep row. A profile knob silently dropping the diagnostic evidence is a "decision based on a metric we haven't measured" failure mode. Enforced by `experiments/test_rho_F.py::test_rho_F_is_emitted_in_fast_val_alongside_residual`.
 
 **Removed proxies (2026-05-15).** The `lip_ub_T/S/F` operator-norm probes and `fp_bound` (Banach error bound) were removed entirely — over-restrictive and refuted by the iter152 evidence above. The "Removal-symmetry sweep" audit row tracks the cleanup (see [#removal-symmetry-sweep](#removal-symmetry-sweep)).
 
 **Refuted alternative: soft Lyapunov / operator-norm penalties.** Default `lyapunov_coef=0`. The closure (iter155, +0.0095 BPB regression for zero contraction benefit; failed *Principled* — operator norm is over-restrictive and soft pressure cannot reliably constrain spectral properties) is catalogued in the [#principled-simplest-general](#principled-simplest-general) closure table. If `rho_F` / `iter_conv_rel` actually fail, escalate to formal-tier mechanisms (spectral normalization on `T_θ`, bounded-Lipschitz block parameterization), not soft penalties on operator norms.
 
-**Principled mechanism to learn FP convergence naturally (not enforce via direct ρ penalty).**
-
-- Form: **iter172 multi-K consistency loss** (PROMOTED 2026-05-17, full val_bpb = 1.462898 vs iter163's 1.471598 = −8.7 mBPB, 39× iter163's margin over iter152).
-- Recursive nearest-neighbor pairing: `L_anchor = anchor_coef · mean_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²` on the iter152 prefix-anchor z_stack.
-- Each shallow anchor targets the next-deeper anchor; transitivity at the FP makes this asymptotically equivalent to a single "Final-K-as-GT" target, but consecutive-pair recursion preserves the optimization landscape better.
-- Zero extra forward compute — target `z_{i+1}` is produced by the main gradient-carrying prefix-anchor forward.
-- Architecture-agnostic — the FP equation `z = F(z)` is universal.
-- Cost: ~1.00× iter152 step time.
-- Default `deq_prefix_anchor_set = (8, 16, 24, 32, 64, 128)`. The K=8 shallow anchor (gap=8 to next-deeper K=16) gives consistency loss a non-trivial pair at K_sampled=16 (~88% of training steps) without collapsing rho_F like iter170/iter171's K=4 (gap=12) did.
-- Outcome: iter172 final K=128 `rho_F=0.77` vs iter163's `0.92` — principled FP-convergence dramatically improved; K-sweep uniformly 8.5-9.5 mBPB better than iter163 across K=16 through K=128.
-- The remaining recursive term implicitly enforces `ρ(J_F) < 1` because the consistency loss can only minimize if the iteration map IS contractive.
+**SUPERSEDED — prefix-anchor / multi-K consistency loss (formerly the "principled FP-convergence" mechanism).** Under the fixed-point framing, the iter163/iter172 multi-K consistency loss was the promoted champion (it lowered `rho_F` 0.92→0.77). The **finite-horizon / final-minimal P1 pivot rejects it at launch** — `deq_prefix_anchors=False`, `multi_k_consistency_anchor_coef=0`, and the launch validator raises on a nonzero coefficient. It is **no longer an active mechanism**; FP convergence is now an advisory cache-readiness signal, not a training objective. Current decision: see [`docs/adr/`](docs/adr/). Kept here only as history of what the FP-framing tried. (Historical detail of the iter172 result lives in `experiments/docs/hypotheses_archive.md`.)
 
 **Refuted variants.**
 
@@ -1251,7 +1249,7 @@ User directive 2026-05-13 (framework), 2026-05-15 (consistency-loss form shipped
 | Pure IFT (iter144) | Empirical refutation | Different mechanism class; covered separately in hypotheses.md |
 | Spectral normalization on `T_θ` | Failed General test | Component-specific to weight-parameterized transition maps |
 
-**Constraint on any future iteration mechanism.** Must satisfy `ρ(J) < 1` for asymptotic local contraction, regardless of model class — alternative DEQ solvers, refinement loops, recurrent layers, etc., all subject to the same gate AND the same arch-agnostic principled-fix path (consistency loss). See also [#principled-simplest-general](#principled-simplest-general).
+**Constraint on any future fixed-point/cache fallback.** If a future design claims terminal fixed-point caching or asymptotic convergence, it must test `rho(J)`, terminal drift, and cache quality directly. Do not impose this as a hard constraint on the active finite-horizon training objective. See also [#principled-simplest-general](#principled-simplest-general).
 
 ### iter-progress-reporting
 
@@ -1321,6 +1319,11 @@ torchrun --standalone --nproc_per_node=gpu train_gpt.py
 ```
 
 Shorter dev run: add `--iterations=N`. Explicit GPU count: `torchrun --standalone --nproc_per_node=2 train_gpt.py`. Single-GPU `python train_gpt.py` is debug-only.
+
+For agent-launched training runs, keep the process attached or actively monitor
+the run log and check/report progress only every 10 minutes, unless the run
+completes or fails sooner. This is a progress polling/reporting cadence, not a
+`--max-training-seconds=600` wallclock cap.
 
 Submission-style run:
 
@@ -1392,9 +1395,10 @@ Current default families to check in code before launch:
 
 ### revdeq-architecture-details
 
-RevDEQ model class:
+Reversible finite recurrent model class:
 
-- The DEQ solver loop updates coupled states and should be treated as a fixed-point solve, not as a stack of independent transformer layers.
+- The solver loop updates coupled reversible states and is evaluated as a finite recurrent trajectory under the active OPG profile, not as an enforced fixed-point solve.
+- Fixed-point diagnostics (`rho_F`, `sigma_max_F`, `iter_conv_rel`, residuals) are retained for terminal-cache/fallback readiness and extrapolation risk, not as promotion gates.
 - Optional refinement is a separate predict -> soft-embed -> re-solve loop. `num_refinements=0` keeps it off by default; preserving the path enables future diffusion/AR experiments without changing the solver definition.
 - Warm start uses token embedding `x0`; refinement warm start uses the refined input.
 - Add/sub reconstruction uses fp64 because reversibility is a numerical correctness requirement.
@@ -1517,7 +1521,7 @@ Maintained here so removed/disabled techniques don't accrete annotations in `CLA
 - **SWA (Sliding-Window Attention)** — disabled iter 1: dragged gates toward identity at the 1 h budget. Sliding-window EVAL (stride = 64) is unrelated and stays enabled.
 - **BigramHash** — `bigram_vocab_size = 0` (iter 93 / H64). Code retained behind the flag.
 - **FSQ in MoS head** — `fsq_levels = 0` (iter 62 / H53). Low-rank MoS projection alone is sufficient; FSQ code retained for re-enabling.
-- **Lyapunov regularizer** — `lyapunov_coef = 0.0` (iter 88). Parcae per-dim Ā already bounds spectral radius.
+- **Lyapunov regularizer** — `lyapunov_coef = 0.0` (iter 88; active validator rejects nonzero). Refuted as global FP pressure for the pure-finite baseline; keep FP/cache-readiness as diagnostics unless a measured terminal-cache failure justifies a cache-local fallback.
 - **HyDRA denoising** — `denoising_coef = 0.0` (iter 89). Same Parcae-redundancy logic as iter 88.
 - **CTP head** — `use_ctp = False` (iter 94 / H60). NTP-only; CTP param banks not allocated.
 - **Variance regularizer** — removed entirely (iter 117 v3). Was the underlying driver of the iter 121 PE-NS NaN cascade — see [#variance-reg-ns-cascade](#variance-reg-ns-cascade).

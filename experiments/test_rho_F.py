@@ -2,9 +2,10 @@
 at the saved DEQ FP.
 
 rho_F = |lambda_max(J_F)| via straight power iteration on J_F. Necessary
-AND sufficient for asymptotic local FP convergence per Hartman-Grobman;
-this is the principled GATE metric. iter168 (2026-05-16) added multi-seed
-median aggregation to close the K=24/32 estimator-artifact issue where
+and sufficient for asymptotic local FP convergence per Hartman-Grobman
+when a fixed-point fallback is active; under Pure Finite Reversible OPG it is
+an advisory terminal-cache readiness diagnostic. iter168 (2026-05-16) added
+multi-seed median aggregation to close the K=24/32 estimator-artifact issue where
 single-seed power iteration on non-symmetric J gave noisy estimates with
 small projection onto the dominant eigenspace.
 
@@ -114,10 +115,9 @@ def test_sigma_max_F_at_saved_fp_returns_finite_float():
 
 
 def test_rho_F_is_emitted_in_fast_val_alongside_residual():
-    """rho_F (necessary AND sufficient FP-convergence gate per Hartman-Grobman)
-    MUST be probed and emitted in the train-time fast-val site. The lip_ub_*
-    operator-norm proxies were removed 2026-05-15 — rho_F is now the sole
-    spectral GATE metric.
+    """rho_F MUST be probed and emitted in the train-time fast-val site as an
+    advisory terminal-cache/fallback-readiness diagnostic. The lip_ub_*
+    operator-norm proxies were removed 2026-05-15 as active gates.
 
     Static text-search test on train_gpt.py because the fast-val site lives
     deep inside the train loop; we assert the structural invariant rather
@@ -134,8 +134,8 @@ def test_rho_F_is_emitted_in_fast_val_alongside_residual():
 
     # The fast-val log string must format rho_F so it appears on every line.
     assert "f\" rho_F:{rho_F:.4f}\" if rho_F is not None else \" rho_F:N/A\"" in src, (
-        "fast-val log string missing rho_F formatting; the principled gate "
-        "metric must appear in user-facing logs at every fast-val emission."
+        "fast-val log string missing rho_F formatting; the advisory "
+        "diagnostic must appear in user-facing logs at every fast-val emission."
     )
 
     # Negative assertions: the removed lip_ub_* PROBE surface (operator-norm
@@ -203,7 +203,8 @@ def test_sigma_max_F_is_not_used_as_prescription_or_gate():
     assert "sigma_max_F" not in prescribe_body, (
         "sigma_max_F must NOT appear in _prescribe_failure_fix — it is a "
         "DIAGNOSTIC ONLY (operator-norm proxy; over-restrictive as gate per "
-        "iter155 refutation). Use rho_F + iter_conv_rel for FP-convergence gates."
+        "iter155 refutation). Use rho_F + iter_conv_rel only as advisory "
+        "terminal-cache/fallback-readiness diagnostics under the active profile."
     )
 
 

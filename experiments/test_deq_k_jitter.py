@@ -1,9 +1,4 @@
-"""K-jitter / sampler tests aligned to current defaults.
-
-Current baseline enables weighted forward-K jitter over {16, 24, 32, 64};
-TBPTT-k jitter remains disabled with fixed k=3. Tests cover the sampler mechanics and the
-Hyperparameters defaults that gate it.
-"""
+"""K-jitter / sampler tests aligned to finite-horizon OPG defaults."""
 import os
 import sys
 import unittest
@@ -21,12 +16,12 @@ class TestDeqKJitterDefaults(unittest.TestCase):
         for f in ("deq_k_jitter", "deq_k_min", "deq_k_max", "deq_k_eval",
                   "deq_k_jitter_set", "deq_k_jitter_weights"):
             self.assertTrue(hasattr(Hyperparameters, f), f"missing field: {f}")
-        # Current baseline: weighted forward-K jitter; eval remains K=16.
+        # Current baseline: weighted finite-horizon forward-K sampling.
         self.assertEqual(Hyperparameters.deq_k_jitter, True)
         self.assertEqual(Hyperparameters.deq_k_max, 128)
         self.assertEqual(Hyperparameters.deq_k_eval, 16)
-        self.assertEqual(Hyperparameters.deq_k_jitter_set, (16, 24, 32, 64, 96, 128))
-        self.assertEqual(Hyperparameters.deq_k_jitter_weights, (0.50, 0.40, 0.07, 0.03, 0.015, 0.0075))
+        self.assertEqual(Hyperparameters.deq_k_jitter_set, (32, 64, 128))
+        self.assertEqual(Hyperparameters.deq_k_jitter_weights, (0.20, 0.40, 0.40))
         self.assertGreaterEqual(Hyperparameters.deq_k_min, 2)
 
     def test_bptt_k_jitter_defaults(self):
@@ -44,11 +39,11 @@ class TestDeqKJitterDefaults(unittest.TestCase):
         self.assertTrue(ov["deq_prefix_anchors"])
 
     def test_prefix_anchor_depths_are_conditional_prefixes(self):
-        values = (16, 24, 32, 64)
+        values = (16, 32, 64, 128)
         self.assertEqual(_prefix_anchor_depths(16, values), (16,))
-        self.assertEqual(_prefix_anchor_depths(24, values), (16, 24))
-        self.assertEqual(_prefix_anchor_depths(32, values), (16, 24, 32))
-        self.assertEqual(_prefix_anchor_depths(64, values), (16, 24, 32, 64))
+        self.assertEqual(_prefix_anchor_depths(32, values), (16, 32))
+        self.assertEqual(_prefix_anchor_depths(64, values), (16, 32, 64))
+        self.assertEqual(_prefix_anchor_depths(128, values), (16, 32, 64, 128))
         # Non-jitter K still includes the actual sampled endpoint.
         self.assertEqual(_prefix_anchor_depths(20, values), (16, 20))
 

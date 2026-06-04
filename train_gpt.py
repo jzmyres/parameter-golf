@@ -8,6 +8,7 @@ Architecture: RevDEQ + Soft Dense MoE + MLA + Gated Attention + FSQ/MoS + Diffus
 from __future__ import annotations
 
 import contextlib
+import ast
 import glob
 import io
 import argparse
@@ -104,8 +105,8 @@ def _unwrap_compiled_module(m: nn.Module) -> nn.Module:
 def _iter_unique_routers(sb: nn.Module) -> Iterator["SoftDenseRouter"]:
     """Yield each routing module owned by `sb` exactly once, deduping by id().
 
-    Under unified routing the attn and MLP routers are the same instance
-    (one shared SoftDenseRouter); under chained routing each stage owns its
+    Under single-slot routing the attn and MLP routers are the same instance
+    (one shared SoftDenseRouter); under expert-slot layouts each slot owns its
     own router. Schedulers, EMA updates, bias updates, and diagnostic
     materialization all need every distinct router visited once — this helper
     is the single source of that iteration so adding a new router-iter site
@@ -234,6 +235,126 @@ def _share_entropy(p: list[float]) -> float:
     contribution is then 0, so no explicit guard is needed).
     """
     return -sum(x * math.log(x + 1e-8) for x in p)
+
+
+def _effective_rank_from_signatures(signatures: Tensor, eps: float = 1e-8) -> Tensor:
+    """Entropy effective rank of recurrent-step signatures.
+
+    The first axis is recurrent step; all remaining axes are feature axes.
+    This makes the metric independent of expert layout: callers can pass
+    update, state, logit, or route signatures without exposing architecture
+    details such as slots-per-block.
+    """
+    if not isinstance(signatures, torch.Tensor) or signatures.numel() == 0:
+        return torch.tensor(float("nan"))
+    x = signatures.detach().float()
+    if x.ndim == 1:
+        x = x.unsqueeze(-1)
+    x = x.reshape(x.shape[0], -1)
+    if x.shape[0] <= 0:
+        return x.new_tensor(float("nan"))
+    row_norm = x.norm(dim=-1, keepdim=True)
+    keep = row_norm.squeeze(-1) > eps
+    if int(keep.sum().item()) == 0:
+        return x.new_tensor(0.0)
+    x = x[keep] / row_norm[keep].clamp_min(eps)
+    gram = x @ x.transpose(0, 1)
+    eig = torch.linalg.eigvalsh(gram.float()).clamp_min(0.0)
+    total = eig.sum()
+    if float(total.detach().cpu().item()) <= eps:
+        return x.new_tensor(0.0)
+    q = eig / total.clamp_min(eps)
+    entropy = -(q * q.clamp_min(eps).log()).sum()
+    return entropy.exp()
+
+
+def _route_depth_metrics_from_weight_tracks(weights: Tensor, eps: float = 1e-8) -> dict[str, Tensor]:
+    """Layout-agnostic route-depth diagnostics from K-by-slot expert weights.
+
+    Accepts either ``(K, E)`` for a single router or ``(K, S, E)`` for a
+    serial-slot layout.  The returned normalized mutual information measures
+    whether router choices vary with recurrent step; expert utilization
+    measures whether the average route uses the available basis.
+    """
+    if not isinstance(weights, torch.Tensor) or weights.numel() == 0:
+        nan = torch.tensor(float("nan"))
+        return {
+            "route_depth_nmi_mean": nan,
+            "route_depth_nmi_max": nan,
+            "expert_util_mean": nan,
+        }
+    w = weights.detach().float()
+    if w.ndim == 2:
+        w = w.unsqueeze(1)
+    if w.ndim != 3:
+        nan = w.new_tensor(float("nan"))
+        return {
+            "route_depth_nmi_mean": nan,
+            "route_depth_nmi_max": nan,
+            "expert_util_mean": nan,
+        }
+    k_count, slot_count, expert_count = w.shape
+    if k_count < 2 or slot_count < 1 or expert_count < 1:
+        nan = w.new_tensor(float("nan"))
+        return {
+            "route_depth_nmi_mean": nan,
+            "route_depth_nmi_max": nan,
+            "expert_util_mean": nan,
+        }
+    w = w.clamp_min(0.0)
+    w = w / w.sum(dim=-1, keepdim=True).clamp_min(eps)
+    nmis: list[Tensor] = []
+    utils: list[Tensor] = []
+    log_k = math.log(float(k_count))
+    for slot_idx in range(slot_count):
+        p_ke = w[:, slot_idx, :]
+        p_e = p_ke.mean(dim=0).clamp_min(eps)
+        mi = (p_ke * (p_ke.clamp_min(eps).log() - p_e.log())).sum() / float(k_count)
+        nmis.append((mi / max(log_k, eps)).clamp(0.0, 1.0))
+        ent_e = -(p_e * p_e.log()).sum()
+        utils.append((ent_e.exp() / float(expert_count)).clamp(0.0, 1.0))
+    nmi_t = torch.stack(nmis)
+    util_t = torch.stack(utils)
+    return {
+        "route_depth_nmi_mean": nmi_t.mean(),
+        "route_depth_nmi_max": nmi_t.max(),
+        "expert_util_mean": util_t.mean(),
+    }
+
+
+def _aggregate_route_depth_metrics_from_tracks(tracks: list[Tensor | None]) -> dict[str, Tensor]:
+    vals: dict[str, list[Tensor]] = {
+        "route_depth_nmi_mean": [],
+        "route_depth_nmi_max": [],
+        "expert_util_mean": [],
+    }
+    for track in tracks:
+        if track is None:
+            continue
+        stats = _route_depth_metrics_from_weight_tracks(track)
+        for key, value in stats.items():
+            if isinstance(value, torch.Tensor) and torch.isfinite(value).all():
+                vals[key].append(value)
+    out: dict[str, Tensor] = {}
+    for key, seq in vals.items():
+        if seq:
+            stacked = torch.stack(seq)
+            out[key] = stacked.max() if key.endswith("_max") else stacked.mean()
+    return out
+
+
+def _pair_mean_expert_weight_trace(track: list[Tensor], K: int) -> Tensor | None:
+    """Convert per-call expert weights into ``(K, slots, experts)`` traces."""
+    if K <= 0 or len(track) == 0:
+        return None
+    if len(track) % (2 * K) != 0:
+        return None
+    calls_per_half_step = len(track) // (2 * K)
+    try:
+        stacked = torch.stack(track, dim=0)
+    except RuntimeError:
+        return None
+    return stacked.reshape(K, 2, calls_per_half_step, -1).mean(dim=1)
 
 
 def _diag_scalar(value) -> float | None:
@@ -368,10 +489,11 @@ class Hyperparameters:
     fast_val_k_sweep_set: tuple[int, ...] = ()
     train_log_every = 10  # log every 10 steps (~85s at 8.5s/step) for better progress visibility
     auto_plot_on_val = True
-    # Fixed-point spectral probe: rho_F = |lambda_max(J_F)| at the saved DEQ
-    # FP, via power iteration on J_F directly (NOT J_F^T J_F). rho_F < 1 is
-    # necessary AND sufficient for asymptotic local convergence per
-    # Hartman-Grobman; this is the principled gate metric. lip_ub_T/S/F
+    # Fixed-point spectral probe: rho_F = |lambda_max(J_F)| at the saved
+    # terminal state, via power iteration on J_F directly (NOT J_F^T J_F).
+    # rho_F < 1 is necessary and sufficient for asymptotic local convergence
+    # under a fixed-point fallback; in the active finite-horizon profile it is
+    # an advisory terminal-cache readiness diagnostic. lip_ub_T/S/F
     # (operator-norm proxies) were removed 2026-05-15 — over-restrictive
     # for non-symmetric J_F (iter152 has rho ≈ 0.85 yet sigma_max ≈ 17).
     fp_rho_power_iters = 8
@@ -428,7 +550,13 @@ class Hyperparameters:
     # grad_accum_multiplier docstring + H73). D-scaling deferred to 8× H100.
     model_dim = 768
     num_heads = 8
-    num_experts = 16  # iter 96 baseline (PROMOTED ★, H71): 8 → 16 paired with attn/mlp_expert_rank halving. Iter 97 (E=20) NOT PROMOTED on per-wallclock grounds; H72 documents axis saturation past E=16 / R=64 on D=768.
+    experts_per_slot = 16
+    expert_slots = 1
+    expert_slot_order = "parallel"
+    # Internal/readback total expert modules per attention bank and per MLP
+    # bank. Launches should use experts_per_slot × expert_slots so the
+    # expressiveness/throughput grid is explicit.
+    num_experts = 16
     # Shared expert disabled by default. The DeepSeek-style always-on
     # bypass-routing expert (Phase 9 iter 51) remains a code path but
     # is opt-in: every routed expert is full-D LoRA-style under the
@@ -727,24 +855,6 @@ class Hyperparameters:
     # path. Kernel bench: 2.86× dense, 7.36× at 87.5% sparse (per H101 ε ≤ ε_bf16).
     # Training (grad-enabled) and TBPTT window unaffected (eager path).
     use_unified_routed_down = False
-    # iter 103 / H77 (2026-04-30): chained 2-stage pooled routing.
-    # Default OFF (single-stage routing as in iter 117 v5 / iter 117b-1).
-    # When True, Block uses TWO sequentially-chained SoftDenseRouter
-    # instances inside T_θ. Each stage drives `num_routed/2` attn experts
-    # + `num_routed/2` mlp experts (independent params, no sharing across
-    # stages). Stage 1 output is used as input to stage 2; final block
-    # residual = T_2(T_1(z, x_0), x_0) + Parcae input injection.
-    # Skip-connection across the chain: out = stage_1_out + stage_2_out
-    # (preserves iter 100b strict-gen path when stage 2 zero-init).
-    # See experiments/docs/hypotheses.md H77 for full spec + design questions.
-    # Step 1 (this commit): Hyperparameter + CLI only — Block refactor
-    # lands in step 2.
-    use_chained_routing = False
-    # iter 103 / H77 active component switch. "none" keeps the current unified
-    # Block path with no extra registered params. Named presets are implemented
-    # in experiments/components/chained_routing.py:
-    # split_2stage, attn_first_2stage, mlp_first_2stage, split_4stage.
-    chained_stages_preset = "none"
     # iter 117 v2 (post-NaN rescue 2026-04-29): the entmax blend itself is
     # ANNEALED from pure softmax (anneal=0 → blend forced to 1.0 = softmax)
     # to learnable (anneal=1 → blend = sigmoid(blend_logit)) over training.
@@ -841,107 +951,31 @@ class Hyperparameters:
     # — re-enable via CLI --deq-bptt-k=N.  Deeper-K jitter (4,8,16,24) may
     # be re-combined with Phase 6 contraction shell in a follow-up iter once
     # the new architecture stabilizes val_bpb.
-    # 2026-04-29 user directive: K-jitter re-enabled with set {16, 24}.
-    # Rationale: iter 98b K-sweep showed val_bpb is essentially CONVERGED at
-    # K=16 (K=16: 1.5018, K=128: 1.5039, Δ=+0.0021). The FP is found at K=16.
-    # Adding K=24 to the jitter set tests whether wider FP-depth jitter
-    # provides regularization gain (analog of H12 VERIFIED at the wider
-    # {4,6,10}→{8,12,20} scale). The post-2026-04-28 K=16-fix established that
-    # RevDEQ is O(1) in K — there's no OOM concern at K=24. K=24 is also
-    # added to the K-sweep matrix for cross-K diagnostics at this depth.
     deq_k_jitter = True
     deq_k_min = 4
-    # iter 146: keep most training at the promoted K16/K24 depths, but sample
-    # K32/K64 at low probability for finite-depth robustness. Weighted sampling
-    # is required: a plain 4-value tuple would sample K64 25% of the time.
-    deq_k_max = 128  # extended 2026-05-13 to accommodate K=96 and K=128 in the K-jitter tail
+    deq_k_max = 128
     deq_k_step = 4
-    # K-jitter set extended 2026-05-13 per user directive: add K=96 and K=128
-    # at half-frequency cascading from K=64 (96 = 0.5 * w_64, 128 = 0.5 * w_96).
-    # Rationale: low-frequency deeper-K samples expose the model to fixed-point
-    # convergence at the gate-relevant K=128 evaluation depth without
-    # significantly increasing average per-step cost
-    # (E[K] = 16*0.489 + 24*0.391 + 32*0.069 + 64*0.029 + 96*0.0147 + 128*0.0073
-    #     ≈ 22.9, vs prior 21.76, ~5% step-time increase).
-    # Framework normalizes weights internally; raw values shown for clarity.
-    deq_k_jitter_set = (16, 24, 32, 64, 96, 128)
-    deq_k_jitter_weights = (0.50, 0.40, 0.07, 0.03, 0.015, 0.0075)
-    # iter173 (2026-05-17): K-jitter weight annealing curriculum. Linearly
-    # interpolates `deq_k_jitter_weights` → `deq_k_jitter_weights_final` over
-    # the training window [anneal_start_frac, anneal_end_frac] · total_steps.
-    # Empty `deq_k_jitter_weights_final` = annealing DISABLED (default OFF
-    # preserves iter172 behavior). Hypothesis: iter172 achieved rho_F=0.77
-    # at K=128 (vs iter163's 0.92) — model is "ready" for deeper K. By
-    # gradually shifting probability mass toward K∈{64,96,128} over training,
-    # the model practices the deep-K regime that K-sweep eval actually uses.
-    # Final distribution (0.125,0.125,0.125,0.125,0.25,0.25) → E[K] ≈ 51 vs
-    # the iter172 start E[K] ≈ 22.9 (~2.2× deeper). Anneal window [0.2, 1.0]
-    # leaves the first 20% of training at iter172's biased weights (so basic
-    # FP convergence is locked in before pushing depth) and spans the final
-    # 80% smoothly — no settling buffer at the end because the deeper-K
-    # regime is what the K-sweep eval measures, so the model should be at
-    # the final distribution exactly when training stops. Cost: deep-K steps
-    # are slower (K=128 ≈ 6× K=16 cost), so E[step_cost] increases ~2.2× by
-    # end-of-training — expected total wallclock ~1.5× iter172 baseline.
+    # Finite-horizon OPG main path (reports/opg_doc.tex): train at deep
+    # horizons and supervise no-degradation against shallow paired endpoints.
+    deq_k_jitter_set = (32, 64, 128)
+    deq_k_jitter_weights = (0.20, 0.40, 0.40)
+    # Legacy curriculum knob retained for parser/backward compatibility only;
+    # empty means no annealing.
     deq_k_jitter_weights_final: tuple[float, ...] = ()
     deq_k_jitter_anneal_start_frac: float = 0.2
     deq_k_jitter_anneal_end_frac: float = 1.0
     deq_k_eval = 16  # iter 30: baseline eval K (the converged FP)
-    # iter152: conditional prefix-K multi-anchor supervision. Default OFF.
-    # When enabled, a sampled K still performs one K-step solve, but the train
-    # task loss is averaged over traversed prefix endpoints from the current
-    # jitter set (e.g. K=32 supervises {16,24,32}). Router/MoS/diversity
-    # regularizers remain attached to the final endpoint only, so the iter is a
-    # pure finite-depth task-supervision change rather than another coefficient
-    # bundle.
-    deq_prefix_anchors = True  # iter152 promoted on BPB (1.4718 vs 1.4787); promotion-propagation completed 2026-05-13 after iter153/iter155 confound was diagnosed.
-    # iter172 (2026-05-17, PROMOTED at full val_bpb=1.462898 vs iter163's
-    # 1.471598 = −8.7 mBPB win, 39× iter163's margin over iter152). Explicit
-    # prefix-anchor depths, decoupled from the K-jitter set. The K=8 shallow
-    # anchor (gap=8 to next-deeper K=16) matches iter163's healthy regime
-    # while giving a non-trivial consistency-pair at K_sampled=16 (which
-    # samples ~88% of training steps). iter170's K=4 (gap=12) collapsed
-    # rho_F→0 by anchoring an unconverged shallow state to the deep target;
-    # iter172's K=8 preserves contraction (final rho_F=0.77 at K=128 vs
-    # iter163's 0.92). Default falls back to deq_k_jitter_set if set to ().
-    deq_prefix_anchor_set: tuple[int, ...] = (8, 16, 24, 32, 64, 128)
-
-    # iter172 (2026-05-17, PROMOTED at val_bpb=1.462898 vs iter163's
-    # 1.471598 = −8.7 mBPB): recursive nearest-neighbor consistency loss.
-    # Each prefix-anchor z_i is paired with its NEXT-DEEPER z_{i+1}.detach():
-    #   L_anchor = anchor_coef · mean_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²
-    # This is literally iter163's promoted recursive anchor formula.
-    #
-    # Why recursive instead of iter170's all-to-deepest:
-    # iter170 (all z_i → z_K_sampled) was REFUTED at step 200 val
-    # (val_bpb=2.067 vs baseline 2.003, +65 mBPB regression). The
-    # all-to-deepest pairing has ρ → 0 as its unique global minimum —
-    # the model satisfies all pairs simultaneously by making F nearly
-    # constant in z (flat iteration map = degenerate DEQ = experts
-    # collapse, mlp_ortho +0.40). Recursive pairs only require contraction
-    # over each LOCAL depth range, allowing ρ ≈ 0.85 (iter163's healthy
-    # regime) without degenerating to ρ → 0.
-    #
-    # Trade-offs vs prior designs (REFUTED alternatives kept for the
-    # `removal-symmetry-sweep` audit row; do NOT reintroduce as ablations
-    # without re-reading the closure note in hypotheses.md):
-    #   iter163  (recursive + Δ=K_train extension): prior champion;
-    #     ~1.6× iter152 step time due to deep no-grad extension forward.
-    #   iter163c v2 (Δ=1 no-grad iter): REFUTED at full val, +22 mBPB.
-    #   iter167 (Δ=8 no-grad iters):   subsumed (z_K_sampled free).
-    #   iter170 (all-to-deepest):      REFUTED at s200, +65 mBPB; ρ → 0
-    #     degeneracy. K=4 anchor (gap=12 to K=16) further collapsed rho_F.
-    #   iter171 (recursive, K=4 + K=256 anchors): superseded by iter172.
-    #   iter172 (this design, PROMOTED): recursive only (no extension),
-    #     anchor set (8, 16, 24, 32, 64, 128). K=8 gives non-trivial
-    #     consistency pair at K_sampled=16 without iter170's gap=12
-    #     rho_F collapse. Cost ~1.00× iter152 step time. Worst-case
-    #     backward chain count at K_sampled=128: 6 anchors × 3 bptt = 18
-    #     chains = iter163-baseline-safe memory.
-    #
-    # Architecture-agnostic per CLAUDE.md most-principled-simplest-general.
-    # Disable for ablation with `--multi-k-consistency-anchor-coef=0`.
-    multi_k_consistency_anchor_coef = 0.1
+    deq_prefix_anchors = False
+    deq_prefix_anchor_set: tuple[int, ...] = ()
+    multi_k_consistency_anchor_coef = 0.0
+    finite_horizon_pairs: tuple[tuple[int, int], ...] = ((16, 64), (16, 128), (32, 128))
+    finite_horizon_scale_coef = 0.05
+    finite_horizon_scale_margin = 0.0
+    # Reversible-safe residual-aware routing: the router receives a detached
+    # displacement-from-input feature, not true z_k-z_{k-1} motion, because
+    # true previous-state routing would make RevDEQ backward reconstruction
+    # depend on unavailable history.
+    router_residual_feature_scale = 0.10
 
     # iter161-QAT-late (2026-05-16): deterministic STE int6-SDCLIP fake-quant
     # on CastedLinear weights (matrix tensors with numel > 8192) for the last
@@ -999,15 +1033,15 @@ _CONFIG_PROFILES: dict[str, dict[str, object]] = {
     # Current source-of-truth defaults.  Kept explicit so launch logs and
     # tests can distinguish "default recipe" from hand-assembled CLI flags.
     "fast_default": {},
-    # BPB-winning reference from iter152: conditional prefix-K anchors on the
-    # iter149 coefficient base.  This is a profile, not the unconditional
-    # default, because it costs more wallclock and still carries health debt.
+    # Historical scoring profile name retained for wrappers. The prefix-anchor
+    # consistency flag formerly associated with iter152 is now rejected by
+    # `_validate_hyperparameters`; this profile keeps only compatible router
+    # coefficient overrides.
     # Note: `eval_profile=submission` runs the local Lipschitz probe ONLY at
     # K=128, so reproducing this profile produces a shorter audit trail than
     # the iter152 promotion run (which used the full diagnostic K-sweep).
     # Switch to `--eval-profile=diagnostic` to recover the original coverage.
     "score_iter152": {
-        "deq_prefix_anchors": True,
         "router_ema_balance_coef": 0.60,
         "router_ema_specialization_coef": 0.40,
         "router_pertoken_entropy_coef": 0.20,
@@ -1098,7 +1132,7 @@ _OPTIONAL_COMPONENT_CAPABILITIES: tuple[OptionalComponentCapability, ...] = (
     OptionalComponentCapability("use_grouped_artifact_compression", "grouped_artifact", "artifact_effect"),
     OptionalComponentCapability("use_caseops", "caseops", "rejected"),
     OptionalComponentCapability("use_sparse_dispatch", "sparse_dispatch", "rejected"),
-    OptionalComponentCapability("deq_prefix_anchors", "deq_prefix_anchors", "training_effect"),
+    OptionalComponentCapability("deq_prefix_anchors", "deq_prefix_anchors", "rejected"),
     OptionalComponentCapability("use_reverse_kl_balance", "reverse_kl_balance", "training_effect"),
 )
 
@@ -1118,6 +1152,7 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "max-training-seconds", "max-wallclock-seconds",  # max-wallclock-seconds is a deprecated alias
     "grad-accum-multiplier",
     "num-heads", "num-kv-heads",
+    "experts-per-slot", "expert-slots", "expert-slot-order",
     "bigram-vocab-size", "bigram-dim",
     "kv-latent-dim", "attn-expert-rank", "mlp-expert-rank",
     "swa-start-frac", "swa-every", "ema-decay", "ema-update-every",
@@ -1152,12 +1187,13 @@ _CLI_TUNABLE_KNOBS: tuple[str, ...] = (
     "eval-reservation-seconds",
     "ctp-weight",
     "multi-k-consistency-anchor-coef",
+    "finite-horizon-pairs", "finite-horizon-scale-coef", "finite-horizon-scale-margin",
+    "router-residual-feature-scale",
     "qat-late-start-step",
     "expert-diversity-kind",
     "expert-output-diversity-coef", "expert-diversity-every", "expert-diversity-max-tokens",
     "mos-output-diversity-coef",
     "regularizer-warmup-frac",
-    "chained-stages-preset",
     # iter 106 NSA — Native Sparse Attention (H86)
     "use-nsa-attention",
     "nsa-compress-block-size", "nsa-compress-block-sliding-stride",
@@ -1196,7 +1232,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "swa-enabled", "ema-enabled", "use-ctp", "use-entmax-routing",
         "use-router-sigmoid-gate",
         "use-polar-express-ns", "use-entmax-triton",
-        "use-chained-routing",
         "use-unified-routed-down",  # iter 118a Phase A3
         "use-parcae", "deq-beta-jitter",
         "final-full-validation", "resume-latest",
@@ -1225,7 +1260,6 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
         "use_entmax_routing", "use_router_sigmoid_gate",
         "use_polar_express_ns",
         "use_entmax_triton", "use_unified_routed_down",
-        "use_chained_routing",
         "use_parcae", "deq_beta_jitter",
         "final_full_validation", "resume_latest",
     }
@@ -1238,10 +1272,19 @@ def _parse_cli_overrides(argv: list[str]) -> dict[str, object]:
                 out[key] = bool(int(v))
             elif isinstance(default, tuple):
                 raw = str(v).strip()
-                if raw.startswith(("(", "[")) and raw.endswith((")", "]")):
-                    raw = raw[1:-1]
-                vals = tuple(float(part.strip()) for part in raw.split(",") if part.strip())
-                out[key] = vals
+                try:
+                    parsed = ast.literal_eval(raw)
+                except (SyntaxError, ValueError):
+                    parsed = None
+                if isinstance(parsed, (tuple, list)):
+                    if parsed and isinstance(parsed[0], (tuple, list)):
+                        out[key] = tuple(tuple(item for item in pair) for pair in parsed)
+                    else:
+                        out[key] = tuple(parsed)
+                else:
+                    if raw.startswith(("(", "[")) and raw.endswith((")", "]")):
+                        raw = raw[1:-1]
+                    out[key] = tuple(float(part.strip()) for part in raw.split(",") if part.strip())
             else:
                 out[key] = v
     return out
@@ -1577,6 +1620,95 @@ def run_validation(args, model, rank, world_size, device, grad_accum_steps,
 
 # Backwards-compatible alias used by smoke_test.py and other callers
 eval_val = run_validation
+
+
+def run_paired_depth_validation(
+    args,
+    model,
+    rank,
+    world_size,
+    device,
+    grad_accum_steps,
+    val_tokens,
+    *,
+    pairs,
+    epsilon: float = 0.0,
+) -> dict[tuple[int, int], dict[str, float]]:
+    """Evaluate paired finite-horizon gains on identical validation sequences."""
+    norm_pairs = _normalize_finite_horizon_pairs(pairs)
+    if not norm_pairs:
+        return {}
+    local_batch_tokens = args.val_batch_size // world_size
+    local_batch_seqs = max(1, local_batch_tokens // args.train_seq_len)
+    _val_cap = getattr(args, "val_micro_batch_seqs", 0)
+    if _val_cap > 0:
+        local_batch_seqs = min(local_batch_seqs, _val_cap)
+    else:
+        _train_seqs = args.train_batch_tokens // args.train_seq_len
+        _train_micro = max(1, _train_seqs // (world_size * grad_accum_steps))
+        local_batch_seqs = min(local_batch_seqs, _train_micro)
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    global_seqs = total_seqs if args.eval_batch_seqs <= 0 else min(total_seqs, int(args.eval_batch_seqs))
+    seq_start = (global_seqs * rank) // world_size
+    seq_end = (global_seqs * (rank + 1)) // world_size
+
+    was_training = bool(model.training)
+    model.train(False)
+    base_m = _unwrap_compiled_module(model)
+
+    def _seq_losses_for_k(x: Tensor, y: Tensor, k: int) -> Tensor:
+        with _temporary_deq_k_override(base_m, k):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                log_probs = base_m.forward_logits(x)
+        return F.nll_loss(
+            log_probs.reshape(-1, log_probs.size(-1)).float(),
+            y.reshape(-1),
+            reduction="none",
+        ).reshape(y.shape[0], y.shape[1]).mean(dim=1)
+
+    try:
+        accum = {
+            pair: torch.zeros(5, device=device, dtype=torch.float64)
+            for pair in norm_pairs
+        }
+        with torch.inference_mode():
+            for batch_start in range(seq_start, seq_end, local_batch_seqs):
+                batch_end = min(batch_start + local_batch_seqs, seq_end)
+                raw_start = batch_start * args.train_seq_len
+                raw_end = batch_end * args.train_seq_len + 1
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].reshape(-1, args.train_seq_len)
+                y = local[1:].reshape(-1, args.train_seq_len)
+                losses_by_k: dict[int, Tensor] = {}
+                for k in sorted({k for pair in norm_pairs for k in pair}):
+                    losses_by_k[k] = _seq_losses_for_k(x, y, k)
+                for pair in norm_pairs:
+                    lo, hi = pair
+                    shallow = losses_by_k[lo]
+                    deep = losses_by_k[hi]
+                    gain = (shallow - deep).detach().float()
+                    ndr = (deep > shallow + float(epsilon)).detach().float()
+                    hard_mask = shallow.detach().float() >= shallow.detach().float().median()
+                    hard_gain = gain[hard_mask]
+                    accum[pair][0] += gain.double().sum()
+                    accum[pair][1] += torch.tensor(float(gain.numel()), device=device, dtype=torch.float64)
+                    accum[pair][2] += ndr.double().sum()
+                    if hard_gain.numel() > 0:
+                        accum[pair][3] += hard_gain.double().sum()
+                        accum[pair][4] += torch.tensor(float(hard_gain.numel()), device=device, dtype=torch.float64)
+        results: dict[tuple[int, int], dict[str, float]] = {}
+        for pair, vec in accum.items():
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+            count = max(float(vec[1].item()), 1.0)
+            results[pair] = {
+                "G_T": float((vec[0] / count).item()),
+                "NDR_epsilon": float((vec[2] / count).item()),
+                "HardGain": float((vec[3] / max(float(vec[4].item()), 1.0)).item()),
+            }
+        return results
+    finally:
+        model.train(was_training)
 
 
 # ---------------------------------------------------------------------------
@@ -2206,6 +2338,79 @@ def _prefix_anchor_depths(sampled_k: int, values) -> tuple[int, ...]:
     if k not in anchors:
         anchors.append(k)
     return tuple(anchors)
+
+
+def _normalize_finite_horizon_pairs(pairs) -> tuple[tuple[int, int], ...]:
+    out: list[tuple[int, int]] = []
+    if pairs is None:
+        return ()
+    # CLI compatibility: a flat tuple like (16,64,16,128) means pairs.
+    if isinstance(pairs, (tuple, list)) and pairs and not isinstance(pairs[0], (tuple, list)):
+        vals = [int(v) for v in pairs]
+        if len(vals) % 2 != 0:
+            raise ValueError("finite_horizon_pairs flat form must have even length")
+        iterable = zip(vals[0::2], vals[1::2])
+    else:
+        iterable = pairs
+    for lo, hi in iterable:
+        lo_i, hi_i = int(lo), int(hi)
+        if lo_i <= 0 or hi_i <= 0 or lo_i >= hi_i:
+            raise ValueError("finite_horizon_pairs require 0 < K_lo < K_hi")
+        out.append((lo_i, hi_i))
+    if len(set(out)) != len(out):
+        raise ValueError("finite_horizon_pairs must be unique")
+    return tuple(out)
+
+
+def _finite_horizon_pair_for_depth(sampled_k: int, pairs) -> tuple[int, int]:
+    k_hi = int(sampled_k)
+    if k_hi <= 1:
+        raise ValueError(f"sampled_k must be > 1 for finite-horizon pairs, got {sampled_k}")
+    norm_pairs = _normalize_finite_horizon_pairs(pairs)
+    exact = [lo for lo, hi in norm_pairs if hi == k_hi]
+    if exact:
+        return max(exact), k_hi
+    lows = [lo for lo, hi in norm_pairs if lo < k_hi]
+    fallback = max(lows) if lows else max(1, k_hi // 2)
+    return min(fallback, k_hi - 1), k_hi
+
+
+def _finite_horizon_scale_hinge(
+    shallow_loss: Tensor,
+    deep_loss: Tensor,
+    *,
+    coef: float,
+    margin: float = 0.0,
+) -> Tensor:
+    coef_f = float(coef)
+    if coef_f <= 0.0:
+        return deep_loss.new_zeros(())
+    return coef_f * torch.relu(deep_loss - shallow_loss.detach() + float(margin))
+
+
+def _paired_depth_metrics(
+    shallow_loss: Tensor,
+    deep_loss: Tensor,
+    *,
+    epsilon: float = 0.0,
+    hard_mask: Tensor | None = None,
+) -> dict[str, Tensor]:
+    shallow = shallow_loss.detach().float()
+    deep = deep_loss.detach().float()
+    if shallow.shape != deep.shape:
+        raise ValueError("paired depth metrics require same-shaped loss tensors")
+    gain = shallow - deep
+    ndr = (deep > shallow + float(epsilon)).float().mean()
+    if hard_mask is not None:
+        mask = hard_mask.to(device=gain.device, dtype=torch.bool)
+        hard_gain = gain[mask].mean() if bool(mask.any()) else gain.new_zeros(())
+    else:
+        hard_gain = gain.mean()
+    return {
+        "gain": gain.mean(),
+        "ndr": ndr,
+        "hard_gain": hard_gain,
+    }
 
 
 class KShuffleBagSampler:
@@ -4282,6 +4487,9 @@ class Block(nn.Module):
                  rope_base: float, qk_gain_init: float, kv_latent_dim: int = 0,
                  attn_expert_rank: int = 0, mlp_expert_rank: int = 0,
                  num_experts: int = 16, num_shared_experts: int = 0,
+                 experts_per_slot: int | None = None,
+                 expert_slots: int = 1,
+                 expert_slot_order: str = "parallel",
                  # Defaults below mirror Hyperparameters (current rescue stack,
                  # 2026-05-08).
                  router_scoring: str = "dirichlet_ucb",
@@ -4305,7 +4513,7 @@ class Block(nn.Module):
                  rr_stride: int = 8,
                  rr_block_size: int = 64,
                  rr_tau: float = 0.95,
-                 chained_stages_preset: str | None = None,
+                 router_residual_feature_scale: float = 0.0,
                  **kwargs):
         super().__init__()
         # T_θ(z, x₀) = B̄ ⊙ RMSUnit(x₀) ⊙ x0_inject_norm_weight + Δ_θ(z, x₀).
@@ -4316,11 +4524,29 @@ class Block(nn.Module):
         self.x0_inject_norm_weight = nn.Parameter(torch.ones(dim))
         # Shared experts (DeepSeek-style): always-on with per-token sigmoid gate.
         # T_θ = g_s·E_shared(h) + Σ w_j E_routed_j(h)
-        self.num_experts = num_experts
+        self.experts_per_slot = int(experts_per_slot if experts_per_slot is not None else num_experts)
+        self.expert_slots = int(expert_slots)
+        self.expert_slot_order = str(expert_slot_order)
+        self.expert_layout = f"{self.experts_per_slot}x{self.expert_slots}"
+        if self.experts_per_slot <= 0:
+            raise ValueError(f"experts_per_slot must be positive, got {self.experts_per_slot}")
+        if self.expert_slots <= 0:
+            raise ValueError(f"expert_slots must be positive, got {self.expert_slots}")
+        if self.expert_slot_order not in ("parallel", "attn_mlp", "mlp_attn"):
+            raise ValueError(
+                f"expert_slot_order={self.expert_slot_order!r} must be one of "
+                "parallel,attn_mlp,mlp_attn"
+            )
+        self.num_experts = self.experts_per_slot * self.expert_slots
         self.num_shared_experts = int(num_shared_experts)
-        num_routed = num_experts - self.num_shared_experts
-        self.chained_stages_preset = chained_stages_preset
-        self.chained_stack = None
+        num_routed = self.experts_per_slot - self.num_shared_experts
+        if num_routed <= 0:
+            raise ValueError(
+                f"num_shared_experts ({self.num_shared_experts}) must be < "
+                f"experts_per_slot ({self.experts_per_slot})"
+            )
+        self.expert_stack = None
+        self.router_residual_feature_scale = float(router_residual_feature_scale)
         # Diagnostic tracking for per-DEQ-iteration gate trajectories.
         self._diag_track_enabled = False
         # Call-track lists hold 0-d GPU tensors (one per block.forward invocation
@@ -4346,17 +4572,10 @@ class Block(nn.Module):
         self._shared_gate_std: Tensor | float | None = None
         self._shared_gate_diag_step: int | None = None
 
-        if chained_stages_preset is not None and str(chained_stages_preset).strip().lower() not in ("", "none"):
-            from experiments.components.chained_routing import ChainedExpertStack, parse_stages
+        if self.expert_slots > 1 or self.expert_slot_order != "parallel":
+            from experiments.components.expert_layout import ExpertSlotStack, make_uniform_expert_layout
 
-            stages = parse_stages(
-                str(chained_stages_preset),
-                num_experts=int(num_experts),
-                num_shared_experts=int(self.num_shared_experts),
-            )
-            if stages is None:
-                raise ValueError("chained_stages_preset parsed to None after non-empty input")
-            self.chained_stack = ChainedExpertStack(
+            self.expert_stack = ExpertSlotStack(
                 dim=dim,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
@@ -4366,13 +4585,19 @@ class Block(nn.Module):
                 kv_latent_dim=kv_latent_dim,
                 attn_expert_rank=attn_expert_rank,
                 mlp_expert_rank=mlp_expert_rank,
-                stages=stages,
+                slots=make_uniform_expert_layout(
+                    experts_per_slot=self.experts_per_slot,
+                    expert_slots=self.expert_slots,
+                    num_shared_experts=self.num_shared_experts,
+                ),
+                slot_order=self.expert_slot_order,
                 router_scoring=router_scoring,
                 router_pertoken_entropy_coef=router_pertoken_entropy_coef,
                 router_dirichlet_ucb_beta=router_dirichlet_ucb_beta,
                 use_router_sigmoid_gate=use_router_sigmoid_gate,
                 use_entmax_routing=use_entmax_routing,
                 entmax_blend_init_logit=entmax_blend_init_logit,
+                use_reverse_kl_balance=use_reverse_kl_balance,
                 use_nsa_attention=use_nsa_attention,
                 nsa_compress_block_size=nsa_compress_block_size,
                 nsa_compress_block_sliding_stride=nsa_compress_block_sliding_stride,
@@ -4392,7 +4617,6 @@ class Block(nn.Module):
                 mlp_cls=MLP,
                 rms_norm_cls=RMSNorm,
             )
-            self._init_chained_stage0_aliases()
             return
 
         self.attn_post_mix_norm = RMSNorm(dim)
@@ -4428,7 +4652,7 @@ class Block(nn.Module):
         self.attn_router = self.router  # alias for backward-compat diagnostics
         self.mlp_router = self.router   # alias (same instance → dedup via id())
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                         kv_latent_dim=kv_latent_dim, num_experts=num_experts,
+                                         kv_latent_dim=kv_latent_dim, num_experts=self.experts_per_slot,
                                          expert_rank=attn_expert_rank, router=self.router,
                                          use_nsa_attention=use_nsa_attention,
                                          nsa_compress_block_size=nsa_compress_block_size,
@@ -4444,41 +4668,21 @@ class Block(nn.Module):
                                          rr_stride=rr_stride,
                                          rr_block_size=rr_block_size,
                                          rr_tau=rr_tau)
-        self.mlp = MLP(dim, mlp_mult, num_experts=num_experts, expert_rank=mlp_expert_rank, router=self.router)
-
-    def _init_chained_stage0_aliases(self) -> None:
-        """Stage-0-only compatibility aliases for legacy diagnostics and tests
-        that read `shared_block.attn` / `.mlp` / `.router`.
-
-        Under chained mode these point to stage-0 ONLY. Every consumer that
-        needs all stages MUST go through `active_routers()` /
-        `active_attn_modules()` / `active_mlp_modules()` (or iterate
-        `chained_stack.iter_*`). Forward, ortho-aux, gate tracking, and the
-        optimizer-step bias_update already use those iterators; new diagnostics
-        that touch `block.attn` / `.mlp` / `.router` directly MUST gate on
-        `chained_stack is None`.
-        """
-        stack = self.chained_stack
-        assert stack is not None
-        self.attn = stack.attns[0] if len(stack.attns) > 0 else None
-        self.mlp = stack.mlps[0] if len(stack.mlps) > 0 else None
-        self.router = stack.routers[0] if len(stack.routers) > 0 else None
-        self.attn_router = self.router
-        self.mlp_router = self.router
+        self.mlp = MLP(dim, mlp_mult, num_experts=self.experts_per_slot, expert_rank=mlp_expert_rank, router=self.router)
 
     def active_routers(self) -> list[SoftDenseRouter]:
-        if self.chained_stack is not None:
-            return list(self.chained_stack.iter_routers())
+        if self.expert_stack is not None:
+            return list(self.expert_stack.iter_routers())
         return [self.router]
 
     def active_attn_modules(self):
-        if self.chained_stack is not None:
-            return list(self.chained_stack.iter_attn_modules())
+        if self.expert_stack is not None:
+            return list(self.expert_stack.iter_attn_modules())
         return [("attn", self.attn)]
 
     def active_mlp_modules(self):
-        if self.chained_stack is not None:
-            return list(self.chained_stack.iter_mlp_modules())
+        if self.expert_stack is not None:
+            return list(self.expert_stack.iter_mlp_modules())
         return [("mlp", self.mlp)]
 
     @staticmethod
@@ -4506,7 +4710,7 @@ class Block(nn.Module):
         down_t = mlp.expert_down.to(dtype=h_mlp_per_expert.dtype).transpose(1, 2)
         return torch.einsum("ner,erd->ned", h_mlp_per_expert.float(), down_t.float())
 
-    def _ortho_aux_chained(
+    def _ortho_aux_expert_stack(
         self,
         z_sub: Tensor,
         x0_sub: Tensor,
@@ -4514,30 +4718,31 @@ class Block(nn.Module):
         compute_per_token_gram: bool,
         per_token_gram_kind: str,
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
-        assert self.chained_stack is not None
-        stack = self.chained_stack
+        assert self.expert_stack is not None
+        stack = self.expert_stack
         cumulative_state = z_sub
         attn_outputs: list[Tensor] = []
         mlp_outputs: list[Tensor] = []
         kv_flats: list[Tensor] = []
 
-        for stage_idx, spec in enumerate(stack.stages):
+        for stage_idx, spec in enumerate(stack.slots):
             h = _rms_unit(cumulative_state + x0_sub)
             w_attn, w_mlp = stack._route(stage_idx, h)
-            stage_delta = torch.zeros_like(z_sub)
 
-            attn_idx = stack._stage_attn_indices[stage_idx]
-            if attn_idx is not None:
+            def attn_delta_from(h_attn: Tensor) -> Tensor | None:
+                attn_idx = stack._slot_attn_indices[stage_idx]
+                if attn_idx is None:
+                    return None
                 attn = stack.attns[attn_idx]
-                attn_expert_out = attn.forward_experts(h)
+                attn_expert_out = attn.forward_experts(h_attn)
                 attn_outputs.append(attn_expert_out)
                 kv_flats.append(attn.expert_kv_a.float().reshape(attn.expert_kv_a.shape[0], -1))
                 g_s_attn = stack._shared_gate(
-                    h,
+                    h_attn,
                     gate_list=stack.shared_gate_attn,
                     norm_list=stack.shared_gate_norm_weight_attn,
-                    gate_idx=stack._stage_shared_attn_gate_indices[stage_idx],
-                    norm_idx=stack._stage_shared_attn_norm_indices[stage_idx],
+                    gate_idx=stack._slot_shared_attn_gate_indices[stage_idx],
+                    norm_idx=stack._slot_shared_attn_norm_indices[stage_idx],
                 )
                 parts = []
                 if spec.shared_attn > 0 and g_s_attn is not None:
@@ -4546,29 +4751,57 @@ class Block(nn.Module):
                     assert w_attn is not None
                     parts.append((attn_expert_out[:, :, spec.shared_attn:, :] * w_attn.unsqueeze(-1)).sum(dim=2))
                 attn_mix = sum(parts) if len(parts) > 1 else parts[0]
-                norm_idx = stack._stage_attn_norm_indices[stage_idx]
+                norm_idx = stack._slot_attn_norm_indices[stage_idx]
                 assert norm_idx is not None
-                stage_delta = stage_delta + stack.attn_post_norms[norm_idx](attn_mix)
+                return stack.attn_post_norms[norm_idx](attn_mix)
 
-            mlp_idx = stack._stage_mlp_indices[stage_idx]
-            if mlp_idx is not None:
+            def mlp_delta_from(h_mlp: Tensor) -> Tensor | None:
+                mlp_idx = stack._slot_mlp_indices[stage_idx]
+                if mlp_idx is None:
+                    return None
                 mlp = stack.mlps[mlp_idx]
-                mlp_outputs.append(self._mlp_expert_outputs(mlp, h))
+                mlp_outputs.append(self._mlp_expert_outputs(mlp, h_mlp))
                 g_s_mlp = stack._shared_gate(
-                    h,
+                    h_mlp,
                     gate_list=stack.shared_gate_mlp,
                     norm_list=stack.shared_gate_norm_weight_mlp,
-                    gate_idx=stack._stage_shared_mlp_gate_indices[stage_idx],
-                    norm_idx=stack._stage_shared_mlp_norm_indices[stage_idx],
+                    gate_idx=stack._slot_shared_mlp_gate_indices[stage_idx],
+                    norm_idx=stack._slot_shared_mlp_norm_indices[stage_idx],
                 )
                 if w_mlp is None:
-                    w_mlp = h.new_empty((*h.shape[:-1], 0))
-                mlp_mix = mlp.mix_experts(h, w_mlp, num_shared=spec.shared_mlp, shared_gate=g_s_mlp)
-                norm_idx = stack._stage_mlp_norm_indices[stage_idx]
+                    w_mlp_local = h_mlp.new_empty((*h_mlp.shape[:-1], 0))
+                else:
+                    w_mlp_local = w_mlp
+                mlp_mix = mlp.mix_experts(h_mlp, w_mlp_local, num_shared=spec.shared_mlp, shared_gate=g_s_mlp)
+                norm_idx = stack._slot_mlp_norm_indices[stage_idx]
                 assert norm_idx is not None
-                stage_delta = stage_delta + stack.mlp_post_norms[norm_idx](mlp_mix)
+                return stack.mlp_post_norms[norm_idx](mlp_mix)
 
-            cumulative_state = cumulative_state + stage_delta
+            if stack.slot_order == "parallel":
+                stage_delta = torch.zeros_like(z_sub)
+                attn_delta = attn_delta_from(h)
+                mlp_delta = mlp_delta_from(h)
+                if attn_delta is not None:
+                    stage_delta = stage_delta + attn_delta
+                if mlp_delta is not None:
+                    stage_delta = stage_delta + mlp_delta
+                cumulative_state = cumulative_state + stage_delta
+            elif stack.slot_order == "attn_mlp":
+                attn_delta = attn_delta_from(h)
+                if attn_delta is not None:
+                    cumulative_state = cumulative_state + attn_delta
+                h_mlp = _rms_unit(cumulative_state + x0_sub)
+                mlp_delta = mlp_delta_from(h_mlp)
+                if mlp_delta is not None:
+                    cumulative_state = cumulative_state + mlp_delta
+            else:
+                mlp_delta = mlp_delta_from(h)
+                if mlp_delta is not None:
+                    cumulative_state = cumulative_state + mlp_delta
+                h_attn = _rms_unit(cumulative_state + x0_sub)
+                attn_delta = attn_delta_from(h_attn)
+                if attn_delta is not None:
+                    cumulative_state = cumulative_state + attn_delta
 
         if not attn_outputs or not mlp_outputs:
             zero = z_sub.new_zeros(())
@@ -4626,8 +4859,8 @@ class Block(nn.Module):
             start = int(token_start or 0) % (max_start + 1)
         z_sub = z_in[:, start:start + t]
         x0_sub = x0[:, start:start + t]
-        if self.chained_stack is not None:
-            return self._ortho_aux_chained(
+        if self.expert_stack is not None:
+            return self._ortho_aux_expert_stack(
                 z_sub, x0_sub,
                 compute_per_token_gram=compute_per_token_gram,
                 per_token_gram_kind=per_token_gram_kind,
@@ -4762,13 +4995,13 @@ class Block(nn.Module):
             self._shared_gate_diag_step = None
 
     def forward(self, z_in: Tensor, x0: Tensor, b_bar: Tensor | None = None) -> Tensor:
-        if self.chained_stack is not None:
-            self.chained_stack._diag_track_enabled = bool(self._diag_track_enabled)
-            delta = self.chained_stack(z_in, x0, _rms_unit)
-            self._shared_gate_mean = self.chained_stack._shared_gate_mean
-            self._shared_gate_min = self.chained_stack._shared_gate_min
-            self._shared_gate_std = self.chained_stack._shared_gate_std
-            self._shared_gate_diag_step = self.chained_stack._shared_gate_diag_step
+        if self.expert_stack is not None:
+            self.expert_stack._diag_track_enabled = bool(self._diag_track_enabled)
+            delta = self.expert_stack(z_in, x0, _rms_unit)
+            self._shared_gate_mean = self.expert_stack._shared_gate_mean
+            self._shared_gate_min = self.expert_stack._shared_gate_min
+            self._shared_gate_std = self.expert_stack._shared_gate_std
+            self._shared_gate_diag_step = self.expert_stack._shared_gate_diag_step
             x0_rms = F.rms_norm(x0, (x0.size(-1),), eps=1e-6) * self.x0_inject_norm_weight.to(x0.dtype)
             if b_bar is not None:
                 x0_rms = b_bar.to(x0_rms.dtype) * x0_rms
@@ -4781,8 +5014,18 @@ class Block(nn.Module):
 
         E = self.num_experts
         S = self.num_shared_experts
-        # Route only the non-shared experts.
-        w_attn, w_mlp = self._route_pooled(h)
+        # Route only the non-shared experts. Finite-horizon OPG uses a
+        # reversible-safe residual feature: detached displacement from x0,
+        # not true z_k-z_{k-1} motion, so RevDEQ backward reconstruction does
+        # not depend on unavailable previous-state history.
+        route_h = h
+        residual_scale = float(getattr(self, "router_residual_feature_scale", 0.0))
+        if residual_scale != 0.0:
+            disp = (z_in - x0).detach()
+            disp_unit = _rms_unit(disp).to(dtype=h.dtype)
+            disp_norm = disp.float().pow(2).mean(dim=-1, keepdim=True).sqrt().to(dtype=h.dtype)
+            route_h = _rms_unit(h + residual_scale * disp_unit + residual_scale * disp_norm)
+        w_attn, w_mlp = self._route_pooled(route_h)
         # Eager-only per-iter expert-weight tracking — see helper docstring.
         self._maybe_track_expert_weights(w_attn, w_mlp)
 
@@ -5549,14 +5792,17 @@ class GPT(nn.Module):
                  smear_gate_bos_id: int = 1,
                  logit_softcap: float = 0.0,
                  num_experts: int = 16, num_shared_experts: int = 0,
+                 experts_per_slot: int | None = None,
+                 expert_slots: int = 1,
+                 expert_slot_order: str = "parallel",
                  lyapunov_coef: float = 0.0,
                  lyapunov_gamma: float = 0.97,
                  lyapunov_every: int = 16,
                  lyapunov_max_tokens: int = 64,
                  lyapunov_target: str = "transition_T",
                  lyapunov_estimator: str = "random_fd",
-                 deq_prefix_anchors: bool = True,
-                 deq_prefix_anchor_set: tuple[int, ...] | None = (8, 16, 24, 32, 64, 128),
+                 deq_prefix_anchors: bool = False,
+                 deq_prefix_anchor_set: tuple[int, ...] | None = (),
                  use_parcae: bool = True,
                  parcae_init_a_bar: float = 0.7,
                  parcae_init_b_bar: float | None = None,
@@ -5566,7 +5812,11 @@ class GPT(nn.Module):
                  router_ema_balance_coef: float = 0.30,
                  router_ema_specialization_coef: float = 0.20,
                  use_reverse_kl_balance: bool = True,
-                 multi_k_consistency_anchor_coef: float = 0.1,
+                 multi_k_consistency_anchor_coef: float = 0.0,
+                 finite_horizon_pairs: tuple[tuple[int, int], ...] | tuple[int, ...] | None = ((16, 64), (16, 128), (32, 128)),
+                 finite_horizon_scale_coef: float = 0.05,
+                 finite_horizon_scale_margin: float = 0.0,
+                 router_residual_feature_scale: float = 0.10,
                  expert_diversity_kind: str = "cosine",
                  expert_output_diversity_coef: float = 0.30,
                  expert_diversity_every: int = 8,
@@ -5586,8 +5836,7 @@ class GPT(nn.Module):
                  use_rr_attention: bool = False,
                  rr_stride: int = 8,
                  rr_block_size: int = 64,
-                 rr_tau: float = 0.95,
-                 chained_stages_preset: str | None = None):
+                 rr_tau: float = 0.95):
         super().__init__()
         self.use_ctp = bool(use_ctp)
         self.ctp_weight = float(ctp_weight)
@@ -5595,8 +5844,14 @@ class GPT(nn.Module):
         self.router_ema_balance_coef = float(router_ema_balance_coef)
         self.router_ema_specialization_coef = float(router_ema_specialization_coef)
         self.multi_k_consistency_anchor_coef = float(multi_k_consistency_anchor_coef)
-        # Stash for diagnostics + readback in compute_loss; populated in _run_backbone.
+        self.finite_horizon_pairs = _normalize_finite_horizon_pairs(finite_horizon_pairs)
+        self.finite_horizon_scale_coef = float(finite_horizon_scale_coef)
+        self.finite_horizon_scale_margin = float(finite_horizon_scale_margin)
+        # Stash for diagnostics + readback in compute_loss; populated in _run_backbone/forward.
         self._consistency_anchor_loss_t: Tensor | None = None
+        self._scale_hinge_loss_t: Tensor | None = None
+        self._finite_horizon_scale_hinge_raw: Tensor | None = None
+        self._finite_horizon_depths_last: tuple[int, int] | tuple[()] = ()
         self.expert_diversity_kind = str(expert_diversity_kind)
         if self.expert_diversity_kind not in ("frobenius", "cosine"):
             raise ValueError(
@@ -5662,14 +5917,20 @@ class GPT(nn.Module):
                 self.smear_gate.lam.fill_(float(smear_gate_init))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
-        # Invariant: GPT.num_experts == shared_block.{attn,mlp}.num_experts
-        # (threaded from Hyperparameters; verified by experiments/test_arch.py).
-        self.num_experts = int(num_experts)
+        self.experts_per_slot = int(experts_per_slot if experts_per_slot is not None else num_experts)
+        self.expert_slots = int(expert_slots)
+        self.expert_slot_order = str(expert_slot_order)
+        self.expert_layout = f"{self.experts_per_slot}x{self.expert_slots}"
+        # Total expert modules per attention bank and per MLP bank.
+        self.num_experts = self.experts_per_slot * self.expert_slots
         self.num_shared_experts = int(num_shared_experts)
         self.shared_block = Block(model_dim, num_heads, num_kv_heads, mlp_mult,
                                    rope_base, qk_gain_init, kv_latent_dim=kv_latent_dim,
                                    attn_expert_rank=attn_expert_rank, mlp_expert_rank=mlp_expert_rank,
                                    num_experts=self.num_experts,
+                                   experts_per_slot=self.experts_per_slot,
+                                   expert_slots=self.expert_slots,
+                                   expert_slot_order=self.expert_slot_order,
                                    num_shared_experts=self.num_shared_experts,
                                    router_scoring=router_scoring,
                                    router_pertoken_entropy_coef=router_pertoken_entropy_coef,
@@ -5692,7 +5953,7 @@ class GPT(nn.Module):
                                    rr_stride=rr_stride,
                                    rr_block_size=rr_block_size,
                                    rr_tau=rr_tau,
-                                   chained_stages_preset=chained_stages_preset,
+                                   router_residual_feature_scale=router_residual_feature_scale,
                                    )
         self.deq_beta = float(deq_beta)
         # Phase 9 iter 66b: Parcae-style per-dim diagonal damping with
@@ -5736,9 +5997,9 @@ class GPT(nn.Module):
         # S = Ā·z+(1−Ā)·T_θ (when `lyapunov_target=iteration_S`; advisory
         # only — NOT the iterated map), or the actual two-state Parcae cycle
         # F (when `lyapunov_target=iteration_F`).  Default OFF, run
-        # low-cadence from the training loop. NOT an operator-norm probe —
-        # the principled gate is `rho_F` (spectral radius via power
-        # iteration on J_F; Hartman-Grobman necessary AND sufficient).
+        # low-cadence from the training loop. NOT an operator-norm probe.
+        # rho_F is the matching spectral-radius diagnostic; it is advisory
+        # unless a fixed-point/terminal-cache fallback is active.
         self.lyapunov_coef = float(lyapunov_coef)
         self.lyapunov_gamma = float(lyapunov_gamma)
         self.lyapunov_every = int(lyapunov_every)
@@ -5920,7 +6181,7 @@ class GPT(nn.Module):
         track_diag = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
         sb = _unwrap_compiled_module(self.shared_block)
         sb._diag_track_enabled = bool(track_diag)
-        stack = getattr(sb, "chained_stack", None)
+        stack = getattr(sb, "expert_stack", None)
         if stack is not None:
             stack._diag_track_enabled = bool(track_diag)
             stack._attn_gate_call_track = []
@@ -5950,6 +6211,18 @@ class GPT(nn.Module):
             z_acc = z_init.to(acc_dtype)
             z = z_init
             z_prev = z
+            collect_effective_depth = bool(
+                (not self.training)
+                and getattr(self, "_effective_depth_probe_pending", False)
+            )
+            update_sigs: list[Tensor] = []
+            logp_sigs: list[Tensor] = []
+            if collect_effective_depth:
+                self._effective_depth_update_t = None
+                self._effective_depth_logit_t = None
+                self._expert_output_erank_mean_t = None
+                probe_b = min(int(z.shape[0]), 1)
+                probe_t = min(int(z.shape[1]), 16) if z.ndim >= 3 else 1
             for _ in range(K):
                 z_prev = z
                 f_z = f_theta(z, x0, b_bar)
@@ -5958,6 +6231,24 @@ class GPT(nn.Module):
                 f_y = f_theta(y, x0, b_bar)
                 z_acc = (1 - beta) * z_acc + beta * f_y.to(acc_dtype)
                 z = z_acc.to(dtype)
+                if collect_effective_depth:
+                    dz_probe = (z[:probe_b, :probe_t] - z_prev[:probe_b, :probe_t]).detach().float()
+                    update_sigs.append(dz_probe.reshape(-1, dz_probe.shape[-1]).mean(dim=0))
+                    prev_div = bool(getattr(self.mos_head, "_diversity_aux_enabled", False))
+                    self.mos_head._diversity_aux_enabled = False
+                    try:
+                        h_probe = self.final_norm(z[:probe_b, :probe_t])
+                        _, log_p_ntp = self.mos_head(h_probe)
+                        logp_sigs.append(log_p_ntp.detach().float().mean(dim=tuple(range(log_p_ntp.ndim - 1))))
+                    finally:
+                        self.mos_head._diversity_aux_enabled = prev_div
+            if collect_effective_depth:
+                if update_sigs:
+                    self._effective_depth_update_t = _effective_rank_from_signatures(torch.stack(update_sigs, dim=0)).detach()
+                if len(logp_sigs) >= 2:
+                    logp_t = torch.stack(logp_sigs, dim=0)
+                    self._effective_depth_logit_t = _effective_rank_from_signatures(logp_t[1:] - logp_t[:-1]).detach()
+                self._effective_depth_probe_pending = False
             return z, z_prev, y_acc, z_acc
         finally:
             _DEQ_SOLVE_ACTIVE = prev_deq_flag
@@ -5998,23 +6289,19 @@ class GPT(nn.Module):
 
             # Per-expert routing weights per iteration (2 calls per iter: y-update,
             # z-update).  The producer at Block.forward stored each entry as a
-            # detached GPU tensor of shape (E,); we stack + pair-mean here but
-            # KEEP THE RESULT ON GPU as `_attn_expert_weights_iter_t` — the .cpu()
+            # detached GPU tensor of shape (E,); we stack + pair-mean here as
+            # (K, slots, E) but KEEP THE RESULT ON GPU as
+            # `_attn_expert_weights_iter_t` — the .cpu()
             # materialization is deferred to the log-emission site
             # (`format_iter_dynamics_info`), which runs OUTSIDE the micro_step
             # hot range (CLAUDE.md §9 "Hot-path sync prohibition").
             track_owner = stack if stack is not None else sb
             attn_ew = list(getattr(track_owner, "_attn_expert_weights_per_iter", []) or [])
-            if stack is not None:
-                self._attn_expert_weights_iter_t = None
-            elif len(attn_ew) == 2 * K:
-                # (2K, E) → reshape (K, 2, E) → mean over the 2-call axis → (K, E)
-                self._attn_expert_weights_iter_t = (
-                    torch.stack(attn_ew, dim=0).reshape(K, 2, -1).mean(dim=1)
-                )
-            else:
-                self._attn_expert_weights_iter_t = None
+            mlp_ew = list(getattr(track_owner, "_mlp_expert_weights_per_iter", []) or [])
+            self._attn_expert_weights_iter_t = _pair_mean_expert_weight_trace(attn_ew, K)
+            self._mlp_expert_weights_iter_t = _pair_mean_expert_weight_trace(mlp_ew, K)
             self._attn_expert_weights_iter: list[list[float]] | None = None  # lazy materialization
+            self._mlp_expert_weights_iter: list[list[float]] | None = None
             track_owner._attn_expert_weights_per_iter = []
             track_owner._mlp_expert_weights_per_iter = []
 
@@ -6047,7 +6334,7 @@ class GPT(nn.Module):
         track_diag = _should_diag(self.training) and bool(_ROUTER_DIAGNOSTICS_ACTIVE)
         sb = _unwrap_compiled_module(self.shared_block)
         sb._diag_track_enabled = bool(track_diag)
-        stack = getattr(sb, "chained_stack", None)
+        stack = getattr(sb, "expert_stack", None)
         if stack is not None:
             stack._diag_track_enabled = bool(track_diag)
             stack._attn_gate_call_track = []
@@ -6096,15 +6383,11 @@ class GPT(nn.Module):
             self._mlp_router_gate_iter_last_solve = self._attn_router_gate_iter_last_solve
 
             attn_ew = list(getattr(track_owner, "_attn_expert_weights_per_iter", []) or [])
-            if stack is not None:
-                self._attn_expert_weights_iter_t = None
-            elif len(attn_ew) == 2 * K:
-                self._attn_expert_weights_iter_t = (
-                    torch.stack(attn_ew, dim=0).reshape(K, 2, -1).mean(dim=1)
-                )
-            else:
-                self._attn_expert_weights_iter_t = None
+            mlp_ew = list(getattr(track_owner, "_mlp_expert_weights_per_iter", []) or [])
+            self._attn_expert_weights_iter_t = _pair_mean_expert_weight_trace(attn_ew, K)
+            self._mlp_expert_weights_iter_t = _pair_mean_expert_weight_trace(mlp_ew, K)
             self._attn_expert_weights_iter = None
+            self._mlp_expert_weights_iter = None
             track_owner._attn_expert_weights_per_iter = []
             track_owner._mlp_expert_weights_per_iter = []
             if track_diag and bool(_ROUTER_DIAGNOSTICS_ACTIVE):
@@ -6131,6 +6414,18 @@ class GPT(nn.Module):
         x0_refined = x0
         self._expert_diversity_loss = None
         prefix_mode = bool(self.training and self.deq_prefix_anchors)
+        finite_horizon_mode = bool(
+            self.training
+            and not prefix_mode
+            and self.finite_horizon_scale_coef > 0.0
+            and len(self.finite_horizon_pairs) > 0
+            and int(getattr(self, "_deq_k_override", 0) or self.num_layers) > 1
+        )
+        self._finite_horizon_depths_last = ()
+        self._finite_horizon_scale_hinge_raw = None
+        self._scale_hinge_loss_t = None
+        self._consistency_anchor_loss_raw = None
+        self._consistency_anchor_loss_t = None
 
         for r in range(1 + self.num_refinements):
             if r > 0:
@@ -6145,7 +6440,14 @@ class GPT(nn.Module):
 
             self._deq_k_last = int(getattr(self, "_deq_k_override", 0) or self.num_layers)
             self._deq_z_init_last = z.detach()
-            if prefix_mode:
+            if finite_horizon_mode:
+                pair = _finite_horizon_pair_for_depth(self._deq_k_last, self.finite_horizon_pairs)
+                self._finite_horizon_depths_last = pair
+                z_stack, z_prev_stack = self._deq_solve_prefix_anchors(x0_refined, z, pair)
+                z = z_stack[-1]
+                z_prev = z_prev_stack[-1]
+                self._deq_prefix_anchor_depths_last = ()
+            elif prefix_mode:
                 anchors = _prefix_anchor_depths(self._deq_k_last, self.deq_prefix_anchor_set)
                 self._deq_prefix_anchor_depths_last = anchors
                 z_stack, z_prev_stack = self._deq_solve_prefix_anchors(x0_refined, z, anchors)
@@ -6154,38 +6456,6 @@ class GPT(nn.Module):
             else:
                 self._deq_prefix_anchor_depths_last = ()
                 z, z_prev, y_acc, z_acc = self._deq_solve(x0_refined, z)
-
-        # iter172 (2026-05-17, PROMOTED at val_bpb=1.462898 vs iter163's
-        # 1.471598 = −8.7 mBPB): recursive nearest-neighbor consistency loss.
-        # Each prefix-anchor z_i is paired with its NEXT-DEEPER z_{i+1}.detach():
-        #
-        #   L_anchor = anchor_coef · mean_i ‖z_{prefix_i} − z_{prefix_{i+1}}.detach()‖²
-        #
-        # Zero extra forward compute — target is the next z already produced
-        # by the gradient-carrying prefix-anchor forward. Default anchor set
-        # (8, 16, 24, 32, 64, 128) gives a non-trivial (z_8, z_16.det) pair at
-        # K_sampled=16 (~88 % of steps) while keeping the deepest backward
-        # chain count at 6 anchors (iter163-baseline-safe memory).
-        #
-        # Recursive (not all-to-deepest) avoids iter170's degeneracy: all-to-
-        # deepest pressures the iteration map to be FLAT in z (ρ → 0) so all
-        # pairs collapse to a pseudo-FP — REFUTED at step 200 (val_bpb=2.07
-        # vs baseline 2.00, +65 mBPB). Recursive pairs require only LOCAL
-        # contraction over each depth range, allowing ρ ≈ 0.85 (iter163's
-        # healthy regime). iter170's K=4 anchor (gap=12 to K=16) further
-        # collapsed rho_F → 0 by anchoring an unconverged shallow state to
-        # the deep target; iter172's K=8 (gap=8) preserves contraction
-        # (final rho_F=0.77 at K=128 vs iter163's 0.92).
-        #
-        # The `_*_loss_raw` field holds the with-grad tensor that crosses the
-        # `_run_backbone` → `forward` boundary; the `_*_loss_t` field is the
-        # detached log copy. Same separation as `_ntp_loss_t` / `ntp_loss`.
-        self._consistency_anchor_loss_raw = None
-        self._consistency_anchor_loss_t = None
-        if self.training and prefix_mode and self.multi_k_consistency_anchor_coef > 0.0 and z_stack.shape[0] >= 2:
-            anchor_raw = (z_stack[:-1] - z_stack[1:].detach()).pow(2).mean()
-            self._consistency_anchor_loss_raw = anchor_raw
-            self._consistency_anchor_loss_t = anchor_raw.detach()
 
         # DEQ diagnostics: keep tensor fields for low-overhead logging, but
         # also maintain legacy float/list fields for existing experiments.
@@ -6260,12 +6530,14 @@ class GPT(nn.Module):
                     per_token_gram_kind=str(self.expert_diversity_kind),
                 )
                 # Diagnostic mean-cosine readout for log time (no sync here).
-                self.shared_block.attn._out_ortho_cos_sim_t = attn_o.detach()
-                self.shared_block.mlp._out_ortho_cos_sim_t = mlp_o.detach()
+                for _, attn_mod in self.shared_block.active_attn_modules():
+                    attn_mod._out_ortho_cos_sim_t = attn_o.detach()
+                for _, mlp_mod in self.shared_block.active_mlp_modules():
+                    mlp_mod._out_ortho_cos_sim_t = mlp_o.detach()
                 if attn_gram_pt is not None and mlp_gram_pt is not None:
                     self._expert_diversity_loss = 0.5 * (attn_gram_pt + mlp_gram_pt)
 
-        return z_stack if prefix_mode else z
+        return z_stack if (prefix_mode or finite_horizon_mode) else z
 
     def _encode(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -6380,20 +6652,37 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self._encode(input_ids)
-        if self.training and self.deq_prefix_anchors:
-            # x is (A,B,T,D): task loss over all prefix anchors; auxiliary
-            # regularizers remain final-endpoint-only for attribution.
+        if self.training and x.ndim == 4:
+            # x is (A,B,T,D): finite-horizon mode uses final-depth task loss
+            # plus shallow-stopgrad no-degradation hinge. The legacy
+            # prefix-anchor branch remains parser-compatible but validator
+            # rejects it for launched training.
             A = int(x.shape[0])
             self.mos_head._diversity_aux_enabled = False
             log_p_ctp, log_p_ntp = self.mos_head(x)
             V = self.tok_emb.num_embeddings
-            target_stack = target_ids.unsqueeze(0).expand(A, *target_ids.shape)
-            ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_stack.reshape(-1))
-            if self.use_ctp:
-                input_stack = input_ids.unsqueeze(0).expand(A, *input_ids.shape)
-                ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_stack.reshape(-1))
+            if self._finite_horizon_depths_last:
+                shallow_ntp = F.nll_loss(log_p_ntp[0].reshape(-1, V), target_ids.reshape(-1))
+                ntp_loss = F.nll_loss(log_p_ntp[-1].reshape(-1, V), target_ids.reshape(-1))
+                if self.use_ctp:
+                    ctp_loss = F.nll_loss(log_p_ctp[-1].reshape(-1, V), input_ids.reshape(-1))
+                else:
+                    ctp_loss = torch.tensor(0.0, device=ntp_loss.device)
+                scale_hinge = _finite_horizon_scale_hinge(
+                    shallow_ntp,
+                    ntp_loss,
+                    coef=self.finite_horizon_scale_coef,
+                    margin=self.finite_horizon_scale_margin,
+                )
             else:
-                ctp_loss = torch.tensor(0.0, device=ntp_loss.device)
+                target_stack = target_ids.unsqueeze(0).expand(A, *target_ids.shape)
+                ntp_loss = F.nll_loss(log_p_ntp.reshape(-1, V), target_stack.reshape(-1))
+                if self.use_ctp:
+                    input_stack = input_ids.unsqueeze(0).expand(A, *input_ids.shape)
+                    ctp_loss = F.nll_loss(log_p_ctp.reshape(-1, V), input_stack.reshape(-1))
+                else:
+                    ctp_loss = torch.tensor(0.0, device=ntp_loss.device)
+                scale_hinge = ntp_loss.new_zeros(())
 
             final_x = x[-1]
             self.mos_head._diversity_aux_enabled = bool(
@@ -6430,12 +6719,12 @@ class GPT(nn.Module):
             )
             self._ntp_loss_t = ntp_loss.detach()
             self._ctp_loss_t = ctp_loss.detach()
+            self._finite_horizon_scale_hinge_raw = scale_hinge
+            self._scale_hinge_loss_t = scale_hinge.detach()
             self._ntp_loss = 0.0
             self._ctp_loss = 0.0
             ctp_weight = float(getattr(self, "ctp_weight", 0.0)) if self.use_ctp else 0.0
-            total = ntp_loss + ctp_weight * ctp_loss + router_reg_loss
-            if isinstance(self._consistency_anchor_loss_raw, torch.Tensor) and self.multi_k_consistency_anchor_coef > 0.0:
-                total = total + self.multi_k_consistency_anchor_coef * self._consistency_anchor_loss_raw
+            total = ntp_loss + ctp_weight * ctp_loss + scale_hinge + router_reg_loss
             return total
 
         self.mos_head._diversity_aux_enabled = bool(
@@ -6486,6 +6775,8 @@ class GPT(nn.Module):
         )
         self._ntp_loss_t = ntp_loss.detach()
         self._ctp_loss_t = ctp_loss.detach()
+        self._finite_horizon_scale_hinge_raw = ntp_loss.new_zeros(())
+        self._scale_hinge_loss_t = self._finite_horizon_scale_hinge_raw.detach()
         # Back-compat scalar fields used by experiments/*.
         if (not self.training) or bool(_ROUTER_DIAGNOSTICS_ACTIVE):
             try:
@@ -6706,8 +6997,11 @@ def _prescribe_failure_fix(failure: str) -> dict:
     over symptom-specific losses:
       - router_bias_update          — slow generic usage-prior controller
       - expert-bank geometry        — preferred expert-collapse fix
-      - transition parameterization — preferred contraction fix
-      - multi-K consistency loss    — principled FP-convergence mechanism
+      - transition parameterization — fallback-only cache/readiness fix
+
+    Fixed-point/contraction strings are advisory under the active Pure Finite
+    Reversible OPG profile. They must not prescribe training pressure unless a
+    future terminal-cache or fixed-point fallback profile is explicitly active.
     Router/MoS CV-as-loss was removed 2026-05-15 (EMA-anchored balance fully
     covers routed-usage balance, and MoS head balance is maintained for free
     by the routing softmax + small head count); the CV-floor fallback is no
@@ -6772,26 +7066,25 @@ def _prescribe_failure_fix(failure: str) -> dict:
     if low.startswith("k-sweep"):
         return {
             "failure": failure,
-            "category": "fp_quality_loss",
-            "hypothesis": "H12 VERIFIED (wider K jitter → better FP)",
-            "fix": "Gross FP-quality loss at deep K (Δ > 0.1).  Try widening K jitter: increase "
-                   "deq_k_max by 4.  Note: minor non-monotonicity (K=64 vs K=32 ±0.01) "
-                   "is no longer gated; it's within finite-K noise.",
-            "config_change": {"deq_k_max_delta": 4},
+            "category": "terminal_cache_quality_advisory",
+            "hypothesis": "Deep-K quality loss is a terminal-cache/extrapolation-readiness risk, not an active finite-horizon promotion failure.",
+            "fix": ("Keep the active finite-horizon loss unchanged. If constant-KV or "
+                    "terminal-cache inference becomes the active experiment, compare "
+                    "exact multi-depth cache against terminal-cache quality and only "
+                    "then introduce a cache-local stabilizer."),
+            "config_change": {},
         }
     # `first_token` is lowercased from `failure.lower()` above, so comparisons
-    # below are all lowercase.  iter155 (corrected) split the contraction
-    # metric into three:
-    # rho_F (spectral radius on the actual two-state Parcae cycle F) is
-    # the principled FP-convergence gate per Hartman-Grobman. lip_ub_T/S/F
-    # operator-norm proxies and fp_bound (Banach error bound) were removed
-    # 2026-05-15 as over-restrictive. Legacy lip_ub_* / fp_bound failure
-    # strings from pre-2026-05-15 logs are routed to advisory.
+    # below are all lowercase.  Fixed-point/contraction diagnostics are not
+    # active promotion gates under Pure Finite Reversible OPG. Legacy
+    # lip_ub_* / fp_bound failure strings from pre-2026-05-15 logs are routed
+    # to advisory, and rho_F / iter_conv_rel strings are cache-readiness
+    # advisories unless a future terminal-cache fallback profile opts in.
     if first_token in ("lip_ub_f", "lip_ub", "lip_ub_t", "lip_ub_s") or first_token.startswith("fp_bound"):
         return {
             "failure": failure,
             "category": "operator_norm_advisory",
-            "hypothesis": "Operator-norm proxy (lip_ub_*) and fp_bound were removed 2026-05-15 — over-restrictive for non-symmetric J_F. Check rho_F (spectral radius) and iter_conv_rel for the principled FP-convergence signals.",
+            "hypothesis": "Operator-norm proxy (lip_ub_*) and fp_bound were removed 2026-05-15 — over-restrictive for non-symmetric J_F. Check rho_F and iter_conv_rel only as advisory cache-readiness signals under the active profile.",
             "fix": ("Legacy operator-norm / Banach-bound prescription. The "
                     "necessary-and-sufficient condition for asymptotic local "
                     "contraction is rho(J_F) < 1 (spectral radius), NOT "
@@ -6799,52 +7092,37 @@ def _prescribe_failure_fix(failure: str) -> dict:
                     "huge (iter152 has sigma_max ~ 17 with iter_conv_rel ~ 0.02 "
                     "-- clearly converging). Check rho_F and iter_conv_rel "
                     "diagnostics; do NOT enable lyapunov_coef (refuted by iter155). "
-                    "If rho_F >= 1 or iter_conv_rel >= 0.05, follow those prescriptions."),
+                    "Under the active finite-horizon profile these remain advisory "
+                    "unless a terminal-cache fallback experiment is explicitly active."),
             "config_change": {},
         }
     if first_token == "rho_f":
         # rho_F = |lambda_max(J_F)| via straight power iteration on J_F.
-        # Necessary AND sufficient for asymptotic local FP convergence
-        # (Hartman-Grobman). Architecture-agnostic.
+        # Necessary and sufficient for asymptotic local FP convergence under an
+        # FP objective; advisory cache-readiness signal under the active finite
+        # horizon objective.
         return {
             "failure": failure,
-            "category": "fp_convergence_failed",
-            "hypothesis": "Spectral radius rho(J_F) >= 1 -- the iteration is locally non-contractive and the fixed point is not asymptotically attractive.",
-            "fix": ("rho(J_F) >= 1 means asymptotic local convergence is genuinely "
-                    "threatened (Hartman--Grobman: rho < 1 is necessary AND "
-                    "sufficient).  Soft Lyapunov penalties were refuted by iter155 "
-                    "as ineffective at constraining spectral properties.  "
-                    "Formal-tier mechanism required: spectral normalization on "
-                    "T_theta's component layers (caps sigma_max per-layer, bounds "
-                    "rho via composition), bounded-Lipschitz block parameterization, "
-                    "or learned `c*Delta` gain with hard projection.  Architecture "
-                    "constraint: any new iteration mechanism must satisfy "
-                    "rho(J) < 1 for asymptotic local contraction."),
-            "config_change": {"needs_formal_tier_contraction": True},
+            "category": "terminal_cache_convergence_advisory",
+            "hypothesis": "Spectral radius rho(J_F) >= 1 weakens terminal-cache or fixed-point fallback readiness; it is not an active finite-horizon task-utility failure.",
+            "fix": ("Do not add global FP pressure to the active profile. If a measured "
+                    "constant-KV terminal-cache experiment fails because of this signal, "
+                    "prefer cache-local stabilization or a bounded transition "
+                    "parameterization in that fallback profile."),
+            "config_change": {},
         }
     if first_token.startswith("iter_conv_rel"):
-        # Tier 1 (2026-05-13): iter_conv_rel is the EMPIRICAL FP
-        # convergence signal -- the operational evidence that
-        # rho(J_F) < 1 holds.  Promoted from advisory to gate-relevant
-        # because it is the actually-required condition for asymptotic
-        # local contraction (the architecture-agnostic principled gate).
-        # Prescription is solver-tuning rather than spectral-control:
-        # if the iteration is empirically not converging, we adjust K
-        # depth or solver knobs, NOT add Lyapunov penalties (refuted).
+        # Empirical terminal drift. Advisory for Pure Finite Reversible OPG;
+        # gate-relevant only for a future terminal-cache / fixed-point fallback.
         return {
             "failure": failure,
-            "category": "fp_convergence_empirical_failed",
-            "hypothesis": "Empirical FP convergence signal weak: ||F^K(z) - F^{K-1}(z)|| / ||F^{K-1}(z)|| does not shrink with K.  This is the actually-required condition for asymptotic local contraction (architecture-agnostic).",
-            "fix": ("iter_conv_rel large at deepest K means the solver isn't reaching "
-                    "a fixed point in practice.  First-order remediations: increase "
-                    "weight_decay 1.5x (regularize transition Jacobian), increase "
-                    "deq_k_max by 4 (more solver iterations); under Parcae the scalar "
-                    "deq_beta is fallback-only.  Do NOT enable lyapunov_coef -- "
-                    "iter155 confirmed soft penalties on operator-norm proxies are "
-                    "not principled for asymptotic convergence.  If iter_conv_rel "
-                    "remains stuck after solver tuning, escalate to formal-tier "
-                    "spectral control (see rho_F prescription)."),
-            "config_change": {"weight_decay_mult": 1.5, "deq_k_max_delta": 4},
+            "category": "terminal_cache_drift_advisory",
+            "hypothesis": "Terminal drift is high, so terminal-cache reuse may be inaccurate; finite-horizon utility can still be valid.",
+            "fix": ("Keep the active finite-horizon objective unchanged. If terminal-cache "
+                    "inference is the active experiment, measure exact-cache versus "
+                    "terminal-cache quality first, then add the weakest cache-local "
+                    "stabilizer that closes the measured gap."),
+            "config_change": {},
         }
     if first_token.startswith("deq_recon_err"):
         return {
@@ -7484,6 +7762,12 @@ def _validate_hyperparameters(args) -> None:
         raise SystemExit(f"lyapunov_every ({args.lyapunov_every}) must be positive")
     if int(getattr(args, "lyapunov_max_tokens", 1)) <= 0:
         raise SystemExit(f"lyapunov_max_tokens ({args.lyapunov_max_tokens}) must be positive")
+    lyap_coef = float(getattr(args, "lyapunov_coef", 0.0))
+    if not math.isfinite(lyap_coef) or lyap_coef != 0.0:
+        raise SystemExit(
+            "lyapunov_coef is a refuted fixed-point/contraction pressure path. "
+            "Active OPG launches track fixed-point diagnostics only, so lyapunov_coef must be 0.0."
+        )
     lyap_target = str(getattr(args, "lyapunov_target", "transition_T"))
     if lyap_target not in ("transition_T", "iteration_S", "iteration_F"):
         raise SystemExit(
@@ -7498,15 +7782,27 @@ def _validate_hyperparameters(args) -> None:
             "lip_ub_* operator-norm probes (both refuted by iter155/iter152 "
             "evidence). See CLAUDE.md for the principled rho_F gate."
         )
+    experts_per_slot = int(getattr(args, "experts_per_slot", 0))
+    expert_slots = int(getattr(args, "expert_slots", 0))
+    expert_slot_order = str(getattr(args, "expert_slot_order", "parallel"))
+    if experts_per_slot <= 0:
+        raise SystemExit(f"experts_per_slot ({experts_per_slot}) must be positive")
+    if expert_slots <= 0:
+        raise SystemExit(f"expert_slots ({expert_slots}) must be positive")
+    if expert_slot_order not in ("parallel", "attn_mlp", "mlp_attn"):
+        raise SystemExit(
+            f"expert_slot_order={expert_slot_order!r} must be one of: "
+            "parallel,attn_mlp,mlp_attn"
+        )
     nE, nS = int(args.num_experts), int(args.num_shared_experts)
     if nE <= 0:
         raise SystemExit(f"num_experts ({nE}) must be positive")
     if nS < 0:
         raise SystemExit(f"num_shared_experts ({nS}) must be non-negative")
-    if nS >= nE:
+    if nS >= experts_per_slot:
         raise SystemExit(
-            f"num_shared_experts ({nS}) must be < num_experts ({nE}) so at least "
-            f"one routed expert remains"
+            f"num_shared_experts ({nS}) must be < experts_per_slot ({experts_per_slot}) "
+            "so each expert slot keeps at least one routed expert"
         )
     if str(args.router_scoring) not in ("linear", "l2", "sips", "dirichlet_ucb"):
         raise SystemExit(f"router_scoring={args.router_scoring!r} must be one of linear,l2,sips,dirichlet_ucb")
@@ -7588,8 +7884,26 @@ def _validate_hyperparameters(args) -> None:
             "the tokenized dataset bypasses it. Disable the flag until the codec "
             "is wired into the data pipeline."
         )
-    if bool(getattr(args, "deq_prefix_anchors", False)) and int(getattr(args, "num_refinements", 0)) != 0:
-        raise SystemExit("deq_prefix_anchors currently requires num_refinements=0")
+    if bool(getattr(args, "deq_prefix_anchors", False)):
+        raise SystemExit(
+            "deq_prefix_anchors is a legacy fixed-point consistency path and is "
+            "not valid for finite-horizon OPG training; use finite_horizon_scale_coef instead"
+        )
+    if float(getattr(args, "multi_k_consistency_anchor_coef", 0.0)) > 0.0:
+        raise SystemExit(
+            "multi_k_consistency_anchor_coef is a legacy fixed-point consistency loss; "
+            "finite-horizon OPG requires consistency disabled (coef=0)"
+        )
+    fh_coef = float(getattr(args, "finite_horizon_scale_coef", 0.0))
+    if not math.isfinite(fh_coef) or fh_coef < 0.0:
+        raise SystemExit("finite_horizon_scale_coef must be finite and non-negative")
+    fh_margin = float(getattr(args, "finite_horizon_scale_margin", 0.0))
+    if not math.isfinite(fh_margin) or fh_margin < 0.0:
+        raise SystemExit("finite_horizon_scale_margin must be finite and non-negative")
+    try:
+        _normalize_finite_horizon_pairs(getattr(args, "finite_horizon_pairs", ()))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if int(args.train_seq_len) <= 0:
         raise SystemExit(f"train_seq_len ({args.train_seq_len}) must be positive")
     if int(args.train_batch_tokens) % int(args.train_seq_len) != 0:
@@ -7614,6 +7928,7 @@ def main() -> None:
         setattr(args, k, v)
     _resolve_training_seconds_alias(args, cli_overrides)
     _validate_hyperparameters(args)
+    args.num_experts = int(args.experts_per_slot) * int(args.expert_slots)
     # iter161-QAT-late (2026-05-16): configure the module-global QAT state
     # at startup so CastedLinear.forward can branch on it. set_step() is
     # called per training iteration in the main loop.
@@ -7641,16 +7956,6 @@ def main() -> None:
     )
     # iter 118a Phase A3: fused routed-down kernel toggle. Same pattern.
     _set_unified_routed_down(getattr(args, "use_unified_routed_down", False))
-    # iter 103: legacy boolean is superseded by the preset selector. Keep a
-    # fail-fast guard so old launch scripts do not silently pick a variant.
-    if getattr(args, "use_chained_routing", False):
-        raise NotImplementedError(
-            "use_chained_routing is deprecated; launch iter 103 with "
-            "--chained-stages-preset={split_2stage,attn_first_2stage,mlp_first_2stage}."
-        )
-    from experiments.components.chained_routing import set_chained_routing_enabled
-    _chained_preset = getattr(args, "chained_stages_preset", None)
-    set_chained_routing_enabled(_chained_preset is not None and str(_chained_preset).strip().lower() not in ("", "none"))
     from experiments.components.artifact_compression import set_grouped_artifact_compression_enabled
     from experiments.components.caseops_tokenizer import set_caseops_enabled
     from experiments.components.gptq_lqer import set_gptq_lqer_enabled
@@ -7956,6 +8261,9 @@ def main() -> None:
         f" deq_k_range={args.deq_k_min}-{args.deq_k_max} deq_k_eval={args.deq_k_eval}"
         f" deq_k_jitter_set={tuple(getattr(args, 'deq_k_jitter_set', ()) or ())}"
         f" deq_k_jitter_weights={tuple(getattr(args, 'deq_k_jitter_weights', ()) or ())}"
+        f" finite_horizon_pairs={tuple(getattr(args, 'finite_horizon_pairs', ()) or ())}"
+        f" finite_horizon_scale_coef={float(getattr(args, 'finite_horizon_scale_coef', 0.0)):.4g}"
+        f" finite_horizon_scale_margin={float(getattr(args, 'finite_horizon_scale_margin', 0.0)):.4g}"
         f" deq_bptt_k={args.deq_bptt_k}"
         f" batch_tokens={args.train_batch_tokens} seq_len={args.train_seq_len}"
         f" refinements={args.num_refinements} refine_ramp_frac={args.num_refinements_ramp_frac}"
@@ -7963,6 +8271,8 @@ def main() -> None:
         f" config_profile={args.config_profile}"
         f" eval_profile={args.eval_profile}"
         f" diagnostic_gate_policy={args.diagnostic_gate_policy}"
+        f" expert_layout={int(args.experts_per_slot)}x{int(args.expert_slots)}"
+        f" expert_slot_order={args.expert_slot_order}"
         f" pooled_router=True router_scoring={args.router_scoring}"
         f" router_ucb_beta={float(args.router_dirichlet_ucb_beta):.4g}"
         f" router_sigmoid_gate={int(bool(args.use_router_sigmoid_gate))}"
@@ -7990,7 +8300,11 @@ def main() -> None:
             or getattr(args, "deq_k_jitter_set", ())
             or ()
         )),
-        num_experts=args.num_experts, num_shared_experts=args.num_shared_experts,
+        num_experts=int(args.experts_per_slot) * int(args.expert_slots),
+        experts_per_slot=int(args.experts_per_slot),
+        expert_slots=int(args.expert_slots),
+        expert_slot_order=str(args.expert_slot_order),
+        num_shared_experts=args.num_shared_experts,
         router_scoring=args.router_scoring,
         router_pertoken_entropy_coef=float(args.router_pertoken_entropy_coef),
         router_dirichlet_ucb_beta=float(args.router_dirichlet_ucb_beta),
@@ -8019,6 +8333,10 @@ def main() -> None:
         router_ema_specialization_coef=float(args.router_ema_specialization_coef),
         use_reverse_kl_balance=bool(args.use_reverse_kl_balance),
         multi_k_consistency_anchor_coef=float(getattr(args, "multi_k_consistency_anchor_coef", 0.0)),
+        finite_horizon_pairs=getattr(args, "finite_horizon_pairs", ()),
+        finite_horizon_scale_coef=float(getattr(args, "finite_horizon_scale_coef", 0.0)),
+        finite_horizon_scale_margin=float(getattr(args, "finite_horizon_scale_margin", 0.0)),
+        router_residual_feature_scale=float(getattr(args, "router_residual_feature_scale", 0.0)),
         expert_diversity_kind=str(args.expert_diversity_kind),
         expert_output_diversity_coef=float(args.expert_output_diversity_coef),
         expert_diversity_every=int(args.expert_diversity_every),
@@ -8039,7 +8357,6 @@ def main() -> None:
         rr_stride=int(args.rr_stride),
         rr_block_size=int(args.rr_block_size),
         rr_tau=float(args.rr_tau),
-        chained_stages_preset=args.chained_stages_preset,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -8245,6 +8562,9 @@ def main() -> None:
         prefix_anchors = getattr(m, "_deq_prefix_anchor_depths_last", None)
         if prefix_anchors:
             parts.append(f"deq_prefix_anchors:[{','.join(str(int(k)) for k in prefix_anchors)}]")
+        fh_pair = getattr(m, "_finite_horizon_depths_last", None)
+        if fh_pair:
+            parts.append(f"finite_horizon_pair:[{int(fh_pair[0])},{int(fh_pair[1])}]")
         resid_t = getattr(m, "_deq_residual_t", None)
         if isinstance(resid_t, torch.Tensor):
             parts.append(f"deq_residual:{float(resid_t.detach().float().item()):.6f}")
@@ -8315,19 +8635,29 @@ def main() -> None:
                 ew_iter = ew_iter_t.cpu().tolist()
                 m._attn_expert_weights_iter = ew_iter
         if ew_iter is not None and len(ew_iter) > 0:
-            # Log std across iterations per expert (high std = specialist, low = uniform)
-            ew_arr = np.array(ew_iter)  # (K, E)
-            iter_std = ew_arr.std(axis=0)  # per-expert std across iters
-            iter_range = ew_arr.max(axis=0) - ew_arr.min(axis=0)  # per-expert range
+            # Log std across iterations per slot/expert (high std = specialist,
+            # low = uniform).  Flatten slot×expert so 16x1, 8x2, and 2x8 share
+            # one comparable diagnostic surface.
+            ew_arr = np.array(ew_iter, dtype=float).reshape(len(ew_iter), -1)
+            iter_std = ew_arr.std(axis=0)
+            iter_range = ew_arr.max(axis=0) - ew_arr.min(axis=0)
             parts.append(f"expert_iter_std:[{','.join(f'{v:.4f}' for v in iter_std)}]")
             parts.append(f"expert_iter_range:[{','.join(f'{v:.4f}' for v in iter_range)}]")
+        route_stats = _aggregate_route_depth_metrics_from_tracks([
+            getattr(m, "_attn_expert_weights_iter_t", None),
+            getattr(m, "_mlp_expert_weights_iter_t", None),
+        ])
+        for key in ("route_depth_nmi_mean", "route_depth_nmi_max", "expert_util_mean"):
+            value = _diag_scalar(route_stats.get(key))
+            if value is not None:
+                parts.append(f"{key}:{value:.4f}")
         return (" " + " ".join(parts)) if parts else ""
 
     def format_expert_info(m: nn.Module, *, step: int | None = None, require_step_match: bool = False) -> str:
         parts: list[str] = []
         if hasattr(m, "shared_block"):
             sb_fmt = _unwrap_compiled_module(m.shared_block)
-            if getattr(sb_fmt, "chained_stack", None) is not None:
+            if getattr(sb_fmt, "expert_stack", None) is not None:
                 cvs: list[float] = []
                 ents: list[float] = []
                 masses: list[float] = []
@@ -8610,12 +8940,12 @@ def main() -> None:
             expert_info = format_expert_info(base_model, step=step) if master_process else ""
             _window_avg = (sum(_step_dt_window) / len(_step_dt_window)) if _step_dt_window else 0.0
             _fast_val_count += 1
-            # Always-on FP spectral probe at the saved DEQ FP. rho_F is the
-            # principled gate metric (necessary AND sufficient for asymptotic
-            # local FP convergence per Hartman-Grobman). lip_ub_T/S/F and
-            # fp_bound were removed 2026-05-15 — operator-norm proxies are
-            # over-restrictive for non-symmetric J_F and add cost without
-            # changing the gate decision.
+            # Always-on FP/cache-readiness spectral probe at the saved terminal
+            # state. rho_F is necessary and sufficient for asymptotic local FP
+            # convergence only when a fixed-point fallback is active; here it
+            # is advisory. lip_ub_T/S/F and fp_bound were removed 2026-05-15
+            # because operator-norm proxies are over-restrictive for
+            # non-symmetric J_F.
             if master_process:
                 fp_residual_F = _joint_F_residual_at_saved_fp(base_model)
                 rho_F = _rho_F_at_saved_fp(
@@ -8851,8 +9181,9 @@ def main() -> None:
                             # operator norm ‖J_M‖_2. So this is a Frobenius/√D
                             # proxy on whichever Jacobian `lyapunov_target` selects
                             # (T_θ, S, or F) — soft contraction pressure, not a tight
-                            # Lipschitz cert. The principled FP-convergence gate is
-                            # `rho_F` (spectral radius via power iteration on J_F);
+                            # Lipschitz cert. The matching FP/cache-readiness
+                            # diagnostic is `rho_F` (spectral radius via power
+                            # iteration on J_F);
                             # operator-norm probes `lip_ub_T/S/F` were removed
                             # 2026-05-15 as over-restrictive proxies.
                             # RMS form (vs unit-L2) keeps per-element
@@ -8888,11 +9219,11 @@ def main() -> None:
                             #   iteration_F:  joint perturbation on (y, z) with
                             #     y* = z* = z_base; diff is the directional
                             #     derivative of the two-state cycle map F.
-                            #     ⇒ ‖J_F · (u_y, u_z)‖ — the gate-aligned object.
+                            #     ⇒ ‖J_F · (u_y, u_z)‖.
                             # Soft directional proxy for the spectral norm of
-                            # the chosen J_M; the principled gate is `rho_F`
-                            # (spectral radius). This FD penalty is a refuted
-                            # lower-bound proxy retained only as an ablation.
+                            # the chosen J_M; `rho_F` is the corresponding
+                            # spectral-radius diagnostic. This FD penalty is a
+                            # refuted lower-bound proxy retained only as an ablation.
                             lyap_target = str(getattr(base_model, "lyapunov_target", "transition_T"))
                             if lyap_target == "iteration_F" and base_model.use_parcae:
                                 # Two-state cycle: y' = Ā·y + β·T(z),
@@ -9067,7 +9398,7 @@ def main() -> None:
                 f"{ema_coef_cols} "
                 f"expert_diversity_coef_eff:{_log_tensor_attr('_expert_diversity_coef_eff_t'):.6g} "
                 f"mos_diversity_coef_eff:{_log_tensor_attr('_mos_diversity_coef_eff_t'):.6g} "
-                f"consistency_anchor_loss:{_log_tensor_attr('_consistency_anchor_loss_t'):.6f} "
+                f"scale_hinge_loss:{_log_tensor_attr('_scale_hinge_loss_t'):.6f} "
             )
             base_model._deq_x0_recon_error = getattr(base_model.shared_block, "_deq_x0_recon_error_last_bwd", None)
             base_model._deq_recon_error = getattr(base_model.shared_block, "_deq_recon_error_last_bwd", None)
@@ -9133,6 +9464,25 @@ def main() -> None:
     base_model.train(False)
     meta_path: Path | None = None
     val_bpb_q = 0.0
+    paired_depth_results = run_paired_depth_validation(
+        args,
+        base_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        pairs=getattr(args, "finite_horizon_pairs", ()),
+        epsilon=float(getattr(args, "finite_horizon_scale_margin", 0.0)),
+    )
+    if master_process:
+        for (k_lo, k_hi), metrics in paired_depth_results.items():
+            log0(
+                f"paired_depth_eval:pair={k_lo}-{k_hi} "
+                f"G_T:{metrics['G_T']:.6f} "
+                f"NDR_epsilon:{metrics['NDR_epsilon']:.6f} "
+                f"HardGain:{metrics['HardGain']:.6f}"
+            )
     # Budget-violation flag must be visible on EVERY rank so the raise below
     # executes collectively — raising only on master would leave other ranks
     # blocked forever on a later broadcast / barrier.
@@ -9288,17 +9638,17 @@ def main() -> None:
     log0(f"roundtrip_verification:done val_loss:{val_loss_q:.4f} val_bpb:{val_bpb_q:.6f}")
 
 
-    # DEQ fixed-point K-sweep: verify val_bpb improves (or plateaus) as K grows.
-    # A valid DEQ should converge to a fixed point — more solver iterations = better
-    # or equal quality, never worse.  Non-monotone behaviour indicates the model
-    # is exploiting a specific iteration count rather than a true fixed point.
+    # Finite-horizon K-sweep: measure task utility across recurrent budgets.
+    # Positive useful-depth gain is the active question; fixed-point/cache
+    # diagnostics below are advisory readiness signals, not promotion gates.
     # Runs DDP-parallel across ranks for a ~2x speedup on 2 GPUs.
     #
-    # K-sweep reports rho_F (spectral radius, principled FP-convergence
-    # gate per Hartman-Grobman) + fp_residual_F (joint two-state-cycle
-    # residual) + iter_conv_rel (z-only step residual). lip_ub_T/S/F and
-    # fp_bound were removed 2026-05-15 — operator-norm proxies are
-    # over-restrictive for non-symmetric J_F.
+    # K-sweep reports rho_F (spectral radius), sigma_max_F (operator-norm
+    # robustness proxy), fp_residual_F (joint two-state-cycle residual), and
+    # iter_conv_rel (z-only step residual) for terminal-cache/fallback
+    # readiness. lip_ub_T/S/F and fp_bound were removed 2026-05-15 as active
+    # gates because operator-norm proxies are over-restrictive for
+    # non-symmetric J_F.
     log0("k_sweep:start")
     # T-opt 15: Reset dynamo before K-sweep to prevent recompilation storm.
     # Different K values change iteration counts, triggering dynamo guards
@@ -9309,10 +9659,10 @@ def main() -> None:
     # probes without changing training behavior.
     k_sweep_values = _resolve_k_sweep_values(args)
     k_sweep_results: dict[int, float] = {}
-    # rho_F = |lambda_max(J_F)| via straight power iteration on J_F.
-    # Necessary AND sufficient for asymptotic local FP convergence
-    # (Hartman-Grobman). Architecture-agnostic: same condition applies
-    # to any iteration map.
+    # rho_F = |lambda_max(J_F)| via straight power iteration on J_F. It is
+    # necessary and sufficient for asymptotic local FP convergence under a
+    # fixed-point objective, but advisory only for the active finite-horizon
+    # profile.
     k_sweep_rho_F: dict[int, float] = {}
     # iter168 (2026-05-16): sigma_max(J_F) operator-norm DIAGNOSTIC restored
     # alongside rho_F. NOT a gate; captures per-step contraction bound,
@@ -9339,7 +9689,7 @@ def main() -> None:
             return {}
         sb = _unwrap_compiled_module(sb_raw)
         out: dict[str, float] = {}
-        if getattr(sb, "chained_stack", None) is not None:
+        if getattr(sb, "expert_stack", None) is not None:
             routers_for_conf: list[SoftDenseRouter] = []
             cvs: list[float] = []
             mins: list[float] = []
@@ -9438,10 +9788,15 @@ def main() -> None:
         ("K", 5), ("val_bpb", 9), ("attn_cv", 8), ("mlp_cv", 8), ("pool_cv", 8),
         ("attn_min", 9), ("mlp_min", 9), ("attn_ortho", 11), ("mlp_ortho", 10),
         ("pertoken_ent", 13), ("pool_ent", 9), ("shared_gate", 12),
+        ("ED_update", 10), ("ED_logit", 9),
+        ("route_depth_nmi_mean", 20), ("route_depth_nmi_max", 19),
+        ("expert_util_mean", 16), ("expert_output_erank_mean", 24),
         *_dir_cols,
-        # rho_F (principled gate per Hartman-Grobman) + fp_residual_F (joint
-        # two-state-cycle residual at the saved FP) + iter_conv_rel (z-only
-        # step residual at the K-eval forward).
+        # Fixed-point/cache-readiness diagnostics: rho_F (local spectral
+        # radius), sigma_max_F (operator-norm robustness proxy),
+        # fp_residual_F (joint two-state-cycle residual), and iter_conv_rel
+        # (z-only terminal drift). These are advisory under the finite-horizon
+        # baseline; they are not promotion gates.
         ("rho_F", 9), ("sigma_max_F", 12), ("fp_residual_F", 14), ("iter_conv_rel", 14),
     ]
     def _fmt_kdiag(value: float | None, width: int, name: str = "") -> str:
@@ -9463,6 +9818,7 @@ def main() -> None:
         # roundtrip_verification already ran full validation at the default K;
         # the sweep only needs relative comparisons across K values.
         with router_diagnostics(enabled=True, step_tag=k_eval):
+            base_m_for_roundtrip._effective_depth_probe_pending = True
             _, bpb_k = run_validation(
                 args, base_m_for_roundtrip, rank, world_size, device, grad_accum_steps,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
@@ -9497,13 +9853,33 @@ def main() -> None:
             conf_value = kdiag.get(conf_name)
             if conf_value is not None:
                 diag_parts.append(f"{conf_name}:{float(conf_value):.4f}")
+        ed_update_val = _diag_scalar(getattr(base_m_for_roundtrip, "_effective_depth_update_t", None))
+        ed_logit_val = _diag_scalar(getattr(base_m_for_roundtrip, "_effective_depth_logit_t", None))
+        expert_output_erank_val = _diag_scalar(getattr(base_m_for_roundtrip, "_expert_output_erank_mean_t", None))
+        route_depth_stats_t = _aggregate_route_depth_metrics_from_tracks([
+            getattr(base_m_for_roundtrip, "_attn_expert_weights_iter_t", None),
+            getattr(base_m_for_roundtrip, "_mlp_expert_weights_iter_t", None),
+        ])
+        route_depth_stats = {
+            key: _diag_scalar(value)
+            for key, value in route_depth_stats_t.items()
+        }
+        if ed_update_val is not None:
+            diag_parts.append(f"ED_update:{ed_update_val:.4f}")
+        if ed_logit_val is not None:
+            diag_parts.append(f"ED_logit:{ed_logit_val:.4f}")
+        for key in ("route_depth_nmi_mean", "route_depth_nmi_max", "expert_util_mean"):
+            value = route_depth_stats.get(key)
+            if value is not None:
+                diag_parts.append(f"{key}:{value:.4f}")
+        if expert_output_erank_val is not None:
+            diag_parts.append(f"expert_output_erank_mean:{expert_output_erank_val:.4f}")
         # Local FP contraction metric at the saved DEQ FP (z*).  Eval profile
-        # Per-K spectral probe at the saved FP. rho_F is the principled
-        # gate metric (necessary AND sufficient for asymptotic FP
-        # convergence per Hartman-Grobman); lip_ub_T/S/F and fp_bound
-        # were removed 2026-05-15 — operator-norm proxies are
-        # over-restrictive for non-symmetric J_F. fp_residual_F is the
-        # joint two-state-cycle residual at the saved FP.
+        # Per-K spectral probe at the saved terminal state. rho_F is a
+        # terminal-cache/fallback readiness diagnostic here; lip_ub_T/S/F and
+        # fp_bound were removed 2026-05-15 as active gates because
+        # operator-norm proxies are over-restrictive for non-symmetric J_F.
+        # fp_residual_F is the joint two-state-cycle residual.
         rho_F_val = _rho_F_at_saved_fp(
             base_m_for_roundtrip,
             n_iters=int(getattr(args, "fp_rho_power_iters", 8)),
@@ -9532,9 +9908,8 @@ def main() -> None:
             k_sweep_fp_residual_F[k_eval] = float(fp_residual_F_val)
         log0(f"k_sweep:k={k_eval} {' '.join(diag_parts)}")
         # iter 100b user directive (PERMANENT): tabular per-K row.
-        # iter_conv_rel (z-only step residual at K-eval forward) is the
-        # empirical FP-convergence diagnostic; rho_F (spectral radius)
-        # is the principled gate metric.
+        # iter_conv_rel (z-only terminal drift) and rho_F (spectral radius)
+        # are advisory terminal-cache/fallback readiness diagnostics.
         conv_rel_val = float(conv_rel_t.detach().float().item()) if isinstance(conv_rel_t, torch.Tensor) else None
         kdiag_row = {
             "K": float(k_eval),
@@ -9549,6 +9924,12 @@ def main() -> None:
             "pertoken_ent": kdiag.get("pertoken_ent"),
             "pool_ent": kdiag.get("pool_ent"),
             "shared_gate": kdiag.get("shared_gate"),
+            "ED_update": ed_update_val,
+            "ED_logit": ed_logit_val,
+            "route_depth_nmi_mean": route_depth_stats.get("route_depth_nmi_mean"),
+            "route_depth_nmi_max": route_depth_stats.get("route_depth_nmi_max"),
+            "expert_util_mean": route_depth_stats.get("expert_util_mean"),
+            "expert_output_erank_mean": expert_output_erank_val,
             **{short: kdiag.get(name) for name, _, short in ROUTER_DIRICHLET_DIAG_TERMS},
             ROUTER_DIRICHLET_BETA_TERM[2]: kdiag.get(ROUTER_DIRICHLET_BETA_TERM[0]),
             "rho_F": rho_F_val,
@@ -9570,6 +9951,7 @@ def main() -> None:
     # eval which only batched a subset), so we DDP-all-reduce them here to get
     # the global view that actually matters.
     _failures: list[str] = []
+    _fp_advisories: list[str] = []
 
     # Deadlock-safe DDP helpers.  Every rank MUST enter all_reduce regardless
     # of whether its local value is None, so a NaN/zero sentinel + presence
@@ -9692,48 +10074,53 @@ def main() -> None:
             return None
 
     # Each spec: (prefix, num_experts, usage_gpu_getter, usage_list_getter, ortho_getter).
-    # Dedup pooled router by id — attn_router and mlp_router are aliases.
-    # For pooled router (2R routed experts), split usage into halves and check
-    # each type independently with normalized per-type routed shares. Shared
-    # bypass gates are separate diagnostics, not hidden routed usage.
+    # For pooled slot routers (2R routed experts), split usage into halves and
+    # check each type independently with normalized per-type routed shares.
+    # Shared bypass gates are separate diagnostics, not hidden routed usage.
     check_specs = []
-    attn_router = getattr(shared_block.attn, "attn_router", None)
-    mlp_router = getattr(shared_block.mlp, "mlp_router", None)
-    E = shared_block.num_experts
-    R = E - int(getattr(shared_block, "num_shared_experts", 0))
-    _seen_router_ids: set[int] = set()
-    if attn_router is not None and id(attn_router) not in _seen_router_ids:
-        _seen_router_ids.add(id(attn_router))
-        is_pooled = int(attn_router.num_experts) == 2 * R
-        if is_pooled:
-            # Pooled router: check per-type normalized halves
+    shared_per_slot = int(getattr(shared_block, "num_shared_experts", 0))
+    attn_modules = list(shared_block.active_attn_modules()) if hasattr(shared_block, "active_attn_modules") else []
+    mlp_modules = list(shared_block.active_mlp_modules()) if hasattr(shared_block, "active_mlp_modules") else []
+    for idx, (name, attn_mod) in enumerate(attn_modules):
+        attn_router = getattr(attn_mod, "attn_router", None)
+        if attn_router is None:
+            continue
+        routed = max(int(getattr(attn_mod, "num_experts", 0)) - shared_per_slot, 0)
+        prefix = "attn" if len(attn_modules) == 1 else f"attn_s{idx}"
+        if routed > 0 and int(getattr(attn_router, "num_experts", 0)) == 2 * routed:
             check_specs.append((
-                "attn", R,
-                lambda: _split_pool_usage_gpu(attn_router, R, half=0),
-                lambda: _split_pool_usage_list(attn_router, R, half=0),
-                lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None),
-            ))
-            check_specs.append((
-                "mlp", R,
-                lambda: _split_pool_usage_gpu(attn_router, R, half=1),
-                lambda: _split_pool_usage_list(attn_router, R, half=1),
-                lambda: getattr(shared_block.mlp, "_out_ortho_cos_sim", None),
+                prefix, routed,
+                lambda r=attn_router, e=routed: _split_pool_usage_gpu(r, e, half=0),
+                lambda r=attn_router, e=routed: _split_pool_usage_list(r, e, half=0),
+                lambda m=attn_mod: getattr(m, "_out_ortho_cos_sim", None),
             ))
         else:
             check_specs.append((
-                "attn", int(attn_router.num_experts),
-                lambda: getattr(attn_router, "_expert_usage_gpu", None),
-                lambda: getattr(attn_router, "_expert_usage", None),
-                lambda: getattr(shared_block.attn, "_out_ortho_cos_sim", None),
+                prefix, int(getattr(attn_router, "num_experts", 0)),
+                lambda r=attn_router: getattr(r, "_expert_usage_gpu", None),
+                lambda r=attn_router: getattr(r, "_expert_usage", None),
+                lambda m=attn_mod: getattr(m, "_out_ortho_cos_sim", None),
             ))
-    if mlp_router is not None and id(mlp_router) not in _seen_router_ids:
-        _seen_router_ids.add(id(mlp_router))
-        check_specs.append((
-            "mlp", int(mlp_router.num_experts),
-            lambda: getattr(mlp_router, "_expert_usage_gpu", None),
-            lambda: getattr(mlp_router, "_expert_usage", None),
-            lambda: getattr(shared_block.mlp, "_out_ortho_cos_sim", None),
-        ))
+    for idx, (name, mlp_mod) in enumerate(mlp_modules):
+        mlp_router = getattr(mlp_mod, "mlp_router", None)
+        if mlp_router is None:
+            continue
+        routed = max(int(getattr(mlp_mod, "num_experts", 0)) - shared_per_slot, 0)
+        prefix = "mlp" if len(mlp_modules) == 1 else f"mlp_s{idx}"
+        if routed > 0 and int(getattr(mlp_router, "num_experts", 0)) == 2 * routed:
+            check_specs.append((
+                prefix, routed,
+                lambda r=mlp_router, e=routed: _split_pool_usage_gpu(r, e, half=1),
+                lambda r=mlp_router, e=routed: _split_pool_usage_list(r, e, half=1),
+                lambda m=mlp_mod: getattr(m, "_out_ortho_cos_sim", None),
+            ))
+        else:
+            check_specs.append((
+                prefix, int(getattr(mlp_router, "num_experts", 0)),
+                lambda r=mlp_router: getattr(r, "_expert_usage_gpu", None),
+                lambda r=mlp_router: getattr(r, "_expert_usage", None),
+                lambda m=mlp_mod: getattr(m, "_out_ortho_cos_sim", None),
+            ))
     if mos_head is not None:
         # NTP head is always allocated.
         n_ntp = _mos_num_experts("ntp")
@@ -9793,21 +10180,18 @@ def main() -> None:
                 f"{prefix}_ortho={ortho:.4f} > 0.5 (max pairwise |cos| — correlated experts)"
             )
 
-    # 2. FP convergence: K-sweep degradation gate.  Threshold 0.1 catches gross
-    # FP collapse (model exploits a specific K and degrades dramatically at others)
-    # without firing on finite-K noise (typical K=64 vs K=32 fluctuation is
-    # 0.005-0.010, which the prior 0.005 monotone gate flagged as failures —
-    # the current best baseline 1.705 also fails the old 0.005 gate).
-    # The per-step monotone check has been DROPPED; it was below the noise floor.
+    # 2. K-sweep degradation advisories. These catch gross deep-K quality loss
+    # that would matter for terminal-cache or extrapolated inference, without
+    # turning fixed-point monotonicity into an active finite-horizon gate.
     if len(k_sweep_results) >= 2:
         ks_sorted = sorted(k_sweep_results.items())
         best_bpb = min(v for _, v in ks_sorted)
         # Gross degradation gate: any K>=16 shouldn't be 0.1+ worse than best
         worst_high_k = max(v for k, v in ks_sorted if k >= 16) if any(k >= 16 for k, _ in ks_sorted) else None
         if worst_high_k is not None and worst_high_k - best_bpb > 0.1:
-            _failures.append(
+            _fp_advisories.append(
                 f"K-sweep degradation: best={best_bpb:.4f} worst_k>=16={worst_high_k:.4f} "
-                f"(Δ={worst_high_k - best_bpb:.4f} > 0.1 — gross FP quality loss at deep K)"
+                f"(delta={worst_high_k - best_bpb:.4f} > 0.1; terminal-cache readiness risk)"
             )
         # True-FP quality gate: K=64 and K=128 should be near the best
         # high-K value. Task loss along the solver trajectory is not a
@@ -9817,9 +10201,9 @@ def main() -> None:
             if k_check in k_sweep_results:
                 delta = k_sweep_results[k_check] - best_bpb
                 if delta > 0.02:
-                    _failures.append(
+                    _fp_advisories.append(
                         f"K={k_check}_degradation: bpb={k_sweep_results[k_check]:.4f} "
-                        f"vs best={best_bpb:.4f} (Δ={delta:.4f} > 0.02 — not a true FP)"
+                        f"vs best={best_bpb:.4f} (delta={delta:.4f} > 0.02; terminal-cache readiness risk)"
                     )
 
     conv_rel_t = getattr(base_m_for_roundtrip, "_deq_iter_convergence_rel_t", None)
@@ -9829,45 +10213,33 @@ def main() -> None:
     )
     conv_rel = _ddp_mean_scalar(conv_rel_local)
 
-    # 3. Local contraction + FP convergence: rho(J_F) < 1 is the gate
-    # (necessary AND sufficient for asymptotic local convergence per
-    # Hartman-Grobman). lip_ub_T/S/F operator-norm proxies were removed
-    # 2026-05-15 as over-restrictive.
+    # 3. Local contraction + FP/cache-readiness diagnostics.  These are advisory
+    # under Pure Finite Reversible OPG: they indicate terminal-cache readiness
+    # and extrapolation risk, not finite-horizon task-utility failure.
     deepest_k = max(k_sweep_values) if k_sweep_values else None
     if deepest_k is not None:
         deepest_rho_F = _ddp_max_scalar(k_sweep_rho_F.get(deepest_k))
         deepest_fp_resid_F = _ddp_max_scalar(k_sweep_fp_residual_F.get(deepest_k))
         if deepest_rho_F is not None and deepest_rho_F >= 1.0:
             attr_str = f", fp_residual_F={deepest_fp_resid_F:.6f}" if deepest_fp_resid_F is not None else ""
-            _failures.append(
+            _fp_advisories.append(
                 f"rho_F={deepest_rho_F:.4f} >= 1.0 at K={deepest_k}{attr_str} "
-                "(spectral-radius estimate on F; necessary-and-sufficient asymptotic "
-                "convergence condition violated -- formal-tier mechanism required)"
+                "(spectral-radius estimate on F; terminal-cache convergence readiness weak)"
             )
 
-    # 4. Iter convergence (empirical FP convergence signal).  Promoted to
-    # gate-relevant per Tier 1 redesign: this is the operational signal
-    # of asymptotic convergence (decoupled from theoretical spectral-radius
-    # estimates via `rho_F`).  Threshold 0.05 chosen because iter152
-    # (BPB-winning baseline) shows 0.019 at K=128; 0.05 leaves headroom
-    # for legitimate optimization noise while still flagging real divergence.
-    # DDP-reduce the rank-local conv_rel so the assertion sees the global
-    # mean (matches the treatment of ortho/usage above).
+    # 4. Iter convergence (empirical terminal drift).  Advisory for the active
+    # finite-horizon baseline; it becomes gate-relevant only in a future
+    # terminal-cache or fixed-point fallback experiment.
     if conv_rel is not None and conv_rel >= 0.05:
-        # Tier-graded message: the 0.05 threshold is the principled gate
-        # (iter152 baseline shows 0.019 at K=128, comfortable margin); the
-        # 0.1 threshold tags severe divergence specifically.  One failure
-        # row regardless of severity to avoid duplicate gate signals.
         if conv_rel > 0.1:
-            _failures.append(
+            _fp_advisories.append(
                 f"iter_conv_rel={conv_rel:.4f} > 0.1 (severe solver divergence at deepest K -- "
-                "asymptotic local FP convergence empirically failed)"
+                "terminal-cache readiness weak)"
             )
         else:
-            _failures.append(
-                f"iter_conv_rel={conv_rel:.4f} >= 0.05 (empirical FP convergence "
-                "signal weak at deepest K -- the actually-required condition for "
-                "asymptotic local contraction is not cleanly met)"
+            _fp_advisories.append(
+                f"iter_conv_rel={conv_rel:.4f} >= 0.05 (empirical terminal-drift "
+                "signal weak at deepest K; terminal-cache readiness weak)"
             )
 
     # 6. RevDEQ reconstruction error: end-to-end ||reverse(forward(x_0)) − x_0||,
@@ -9890,6 +10262,11 @@ def main() -> None:
             f"deq_recon_err={dist_val:.3e} > 0.1 (RevDEQ reversibility degrading — "
             f"gradients getting noisy, training efficiency drops)"
         )
+
+    if _fp_advisories:
+        log0("FP ADVISORY — finite-horizon promotion is not gated by these cache-readiness diagnostics")
+        for msg in _fp_advisories:
+            log0(f"  [fp_advisory] {msg}")
 
     # Classify each failure and prescribe a fix from the verified-hypothesis
     # troubleshooting table.  Gate failures are not metadata-invalidating by
@@ -9943,7 +10320,7 @@ def main() -> None:
                 json.dump(meta_json, f)
     _assertions_passed = not _failures
     if not _failures:
-        log0("POST-INT6 HEALTH: all diagnostic gates passed (no dead experts, expert ortho, gate trend, injection, FP convergence, reversibility)")
+        log0("POST-INT6 HEALTH: all active diagnostic gates passed (no dead experts, expert ortho, reversibility); FP/cache-readiness diagnostics are advisory")
         if master_process:
             retry_hint_path = Path("experiments/weights/current") / "retry_hint.json"
             if retry_hint_path.exists():

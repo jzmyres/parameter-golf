@@ -17,7 +17,7 @@ a focused single-purpose module that:
 | Component | Status | Integration step | Tests |
 |---|---|---|---|
 | `fused_routed_down.py` | active optional path | imported by `train_gpt.py` when `use_unified_routed_down=True` | component smoke test |
-| `chained_routing.py` | active optional path (design: [`../docs/iter103_chained_routing_plan.md`](../docs/iter103_chained_routing_plan.md)) | selected by `--chained-stages-preset=<preset>` | `experiments/test_chained_routing.py` |
+| `expert_layout.py` | active expert-slot layout path | selected by `--experts-per-slot`, `--expert-slots`, and `--expert-slot-order` | `experiments/test_expert_layout.py` |
 | `smear_gate.py` | active optional path | selected by `--use-smear-gate=1` after token embedding | `experiments/test_remaining_components.py` |
 | `sparse_attn_head_gate.py` | active optional path | selected by `--use-sparse-attn-head-gate=1` after attention SDPA | `experiments/test_remaining_components.py` |
 | `rr_attention.py` | active optional path | selected by `--use-rr-attention=1` instead of dense causal SDPA | `experiments/test_remaining_components.py` |

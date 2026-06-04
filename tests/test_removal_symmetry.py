@@ -2,7 +2,7 @@
 
 Enforces the CLAUDE.md "Removal-symmetry sweep" rule: when a Hyperparameter,
 loss term, or diagnostic is removed from `train_gpt.py`, the same commit
-must drop the corresponding equation/symbol from `opg_doc.tex` (both
+must drop the corresponding equation/symbol from `reports/opg_doc.tex` (both
 equation blocks AND parameter-table rows) and remove or annotate every
 docstring / inline comment / prescription bullet that names the field.
 
@@ -141,7 +141,7 @@ def _scan_file(path: Path, names: tuple[str, ...]) -> list[tuple[int, str, str]]
 @pytest.mark.parametrize(
     "rel_path",
     [
-        "opg_doc.tex",
+        "reports/opg_doc.tex",
         "train_gpt.py",
         "CLAUDE.md",
     ],
@@ -196,28 +196,21 @@ def test_removed_names_absent_from_active_hyperparameters() -> None:
         )
 
 
-def test_iter163_consistency_log_fields_in_parser_and_contract() -> None:
-    """Companion check for the Sibling-fanout DRY gate that the iter163
-    promotion commit (884b132) originally violated: log field
-    `consistency_anchor_loss` must appear in `experiments/plot_metrics.py`
+def test_finite_horizon_log_fields_in_parser_and_contract() -> None:
+    """Companion check for the Sibling-fanout DRY gate: log field
+    `scale_hinge_loss` must appear in `experiments/plot_metrics.py`
     (parser) and `tests/test_training_contracts.py` (required_fields). This
     failure is exactly what the Removal-symmetry sweep companion is meant
     to catch when fields are *added*, not just removed — the same
     'multi-site grep-and-paste' failure mode in reverse.
 
-    `consistency_ext_loss` was the iter163 auxiliary extension term that was
-    empirically refuted by iter163c v2 (val_bpb +22 mBPB regression for Δ=1,
-    1.6× step time for Δ=K_train) and removed from the run.log emission and
-    parser at commit `d7e410a` (iter163c OOM fix, 2026-05-16) — iter172
-    promotion (`447367c`, 2026-05-17) did not touch this field; iter172 is
-    the operative baseline only because all subsequent iters inherit
-    `d7e410a`'s removal. The field is intentionally absent from current
-    parser entries and contracts per the removal-symmetry-sweep audit row.
-    Do NOT re-add the field name here.
+    `consistency_anchor_loss` is now legacy fixed-point logging. Parsers may
+    keep it for backward compatibility with old run logs, but active training
+    contracts must require the finite-horizon hinge field.
     """
     plot_metrics_text = (REPO_ROOT / "experiments" / "plot_metrics.py").read_text(encoding="utf-8")
     contracts_text = (REPO_ROOT / "tests" / "test_training_contracts.py").read_text(encoding="utf-8")
-    for field in ("consistency_anchor_loss",):
+    for field in ("scale_hinge_loss",):
         assert field in plot_metrics_text, (
             f"`{field}` is emitted in run.log but `experiments/plot_metrics.py` "
             f"has no parser entry — Sibling-fanout DRY violation."

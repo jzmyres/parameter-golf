@@ -6,7 +6,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_GPT = ROOT / "train_gpt.py"
 UPDATE_RESULTS = ROOT / "experiments" / "update_results.sh"
-OPG_DOC = ROOT / "opg_doc.tex"
+OPG_DOC = ROOT / "reports" / "opg_doc.tex"
+P1_SYNTHETIC = ROOT / "experiments" / "p1_synthetic.py"
+P1_SYNTHETIC_PIPELINE = ROOT / "experiments" / "run_p1_synthetic_pipeline.sh"
+P1_FEEDBACK_STAGES = ROOT / "experiments" / "p1_feedback_stages.py"
+P1_FEEDBACK_PIPELINE = ROOT / "experiments" / "run_feedback_stage_pipeline.sh"
 CLAUDE = ROOT / "CLAUDE.md"
 EXPERIENCE = ROOT / "EXPERIENCE.md"
 EXPERIMENT_DOCS = ROOT / "experiments" / "docs"
@@ -76,44 +80,216 @@ class TestTrainingContracts(unittest.TestCase):
                 f"refuted IFT identifier matching {pattern!r} re-introduced",
             )
 
-    def test_opg_doc_tracks_active_entrypoint_and_rescue_defaults(self) -> None:
-        # Whitespace-tolerant: any number of spaces/tabs between `\texttt{...}`,
-        # the `&` separator, and the value. Matches the actual table column
-        # alignment without breaking on harmless reformatting (one space vs
-        # tab vs aligned-block) — only the semantic key/value pairing is
-        # enforced.
+    def test_opg_doc_tracks_final_minimal_p1_design(self) -> None:
         text = OPG_DOC.read_text()
-        self.assertIn(r"\texttt{train\_gpt\_mlx.py} script is an Apple Silicon/MLX starter path", text)
-        for pattern in (
-            r"\\texttt\{deq\\_k\\_jitter\\_set\}\s*&\s*\$\(16,24,32,64,96,128\)\$",
-            r"\\texttt\{config\\_profile\}\s*&\s*fast\\_default",
-            r"\\texttt\{eval\\_profile\}\s*&\s*diagnostic",
-            r"\\texttt\{diagnostic\\_gate\\_policy\}\s*&\s*advisory",
-            r"\\texttt\{router\\_ema\\_alive\\_coef\}\s*&\s*0\.02",
-            r"\\texttt\{expert\\_diversity\\_kind\}\s*&\s*cosine\s+max-pair",
-        ):
-            self.assertRegex(text, pattern)
-        self.assertIn("Root-cause fix policy", text)
-        self.assertIn("generic router usage controller", text)
-        self.assertIn("transition-map", text)
         for snippet in (
-            r"\paragraph{Profiles.}",
-            r"\texttt{score\_iter152}",
-            r"\texttt{eval\_profile=submission}",
-            r"\paragraph{Feature and capability defaults.}",
-            r"\texttt{use\_grouped\_artifact\_compression} & false & optional artifact-effect path",
-            r"\texttt{use\_gptq}, \texttt{use\_lqer} & false, false & rejected scaffold",
-            r"\texttt{use\_caseops} & false & rejected scaffold",
-            r"\texttt{use\_sparse\_dispatch} & false & rejected:",
-            r"\texttt{encode\_scored\_artifact}",
-            r"\texttt{diagnostic} profile evaluates",
-            r"\texttt{submission} profile evaluates",
-            r"\texttt{debug} profile evaluates only",
-            r"\texttt{score\_valid}",
-            r"\texttt{health\_valid}",
-            r"\texttt{diagnostic\_gate\_policy=hard}",
+            "Final Minimal Design",
+            "P1, primary",
+            "P2, memory",
+            "P3, secondary",
+            r"Core \(M_0\)",
+            r"\(M_{\rm clk}\)",
+            "Positive control",
+            "Halting",
+            "additive-coupling reversible recurrence",
+            "standard MHA/GQA plus SwiGLU",
+            "reversible full BPTT",
+            "Tier 1",
+            r"\(S_5\)",
+            "Barrington",
+            "experiments/p1\\_synthetic.py",
+            "Pipeline Simplification Audit",
+            "Current Simplified S+0 DDP Verification",
+            "gpu67\\_s0\\_pruned\\_i1000",
         ):
             self.assertIn(snippet, text)
+        for metric in ("G_T", r"\mathrm{NDR}_\epsilon", "Pareto"):
+            self.assertIn(metric, text)
+        for snippet in (
+            "Dirichlet--UCB router",
+            "MLA",
+            "mixture-of-softmaxes",
+            "int6 quantization",
+            "Lyapunov pressure",
+            "excluded from the P1 science path",
+        ):
+            self.assertIn(snippet, text)
+
+    def test_opg_doc_stages_kv_and_prior_dense_moe_as_future_non_p1(self) -> None:
+        text = OPG_DOC.read_text()
+        lowered = text.lower()
+        for snippet in (
+            "S+2, KV axis",
+            "exact multi-depth cache",
+            "Terminal hidden-state cache",
+            r"\alpha_{\rm kv}",
+            "Prior Diagnostic Evidence",
+            "16x1 Dense-MoE",
+            "Dirichlet--UCB routing",
+            "MoS output head",
+        ):
+            self.assertIn(snippet, text)
+        self.assertIn("prior diagnostic evidence", lowered)
+        self.assertIn("quality gap", lowered)
+        self.assertNotIn("0.9--0.99", text)
+        self.assertNotIn("0.9 to 0.99", text)
+
+    def test_opg_doc_demotes_internal_effective_depth_metrics(self) -> None:
+        text = OPG_DOC.read_text()
+        lowered = text.lower()
+        for snippet in (
+            "Recurrence-equivalence exponent",
+            r"\mathrm{WFIR}",
+            r"\mathrm{AEBR}",
+            "ED_update",
+            "ED_logit",
+            "route-depth NMI",
+        ):
+            self.assertIn(snippet, text)
+        self.assertIn("diagnostic", lowered)
+        self.assertIn("not p1 gates", lowered)
+
+    def test_operating_docs_reject_lyapunov_pressure(self) -> None:
+        for path in (
+            CLAUDE,
+            ROOT / "docs" / "adr" / "0001-finite-horizon-opg-main-path.md",
+            ROOT / "docs" / "adr" / "0002-final-minimal-p1-design.md",
+        ):
+            text = path.read_text()
+            lowered = text.lower()
+            self.assertIn("lyapunov_coef", text, str(path))
+            self.assertRegex(lowered, r"reject|exclude|pressure", str(path))
+            self.assertIn("diagnostic", lowered, str(path))
+
+    def test_adr0002_interface_matches_harness_variants(self) -> None:
+        """ADR 0002's Interface must list exactly the p1_synthetic --variant surface.
+
+        Operationalizes the 'ADR interface <-> code consistency' directive: the
+        decision record's interface cannot silently drift from the implementation.
+        """
+        import re
+
+        adr = (ROOT / "docs" / "adr" / "0002-final-minimal-p1-design.md").read_text()
+        src = (ROOT / "experiments" / "p1_synthetic.py").read_text()
+        m = re.search(r'"--variant",\s*choices=\[([^\]]*)\]', src)
+        assert m is not None, "could not locate --variant choices in p1_synthetic.py"
+        variants = re.findall(r'"([a-z0-9_]+)"', m.group(1))
+        self.assertEqual(set(variants), {"control", "m0", "mclk"})
+        for v in variants:
+            self.assertIn(v, adr, f"ADR 0002 Interface omits harness variant {v!r}")
+
+    def test_context_names_final_minimal_p1_without_reactivating_legacy_consistency(self) -> None:
+        text = (ROOT / "CONTEXT.md").read_text()
+        for term in (
+            "Final Minimal P1 Design",
+            "P1 Synthetic Harness",
+            "P1 Depth Utility",
+            "Depth-Hard Synthetic",
+            "Positive Control",
+            "Clock Diagnostic",
+            "Halting Readout",
+            "Fixed-Point Diagnostics",
+            "Terminal Hidden-State Cache",
+            "Exact Multi-Depth Cache",
+            "Expert Layout",
+            "Expert Slot Order",
+        ):
+            self.assertIn(term, text)
+        self.assertIn("Legacy fallback pressure", text)
+        self.assertIn("startup validation rejects attempts to re-enable prefix anchors", text)
+
+    def test_p1_synthetic_harness_exposes_only_core_p1_surface(self) -> None:
+        text = P1_SYNTHETIC.read_text()
+        pipeline = P1_SYNTHETIC_PIPELINE.read_text()
+        for snippet in (
+            '"control"',
+            '"m0"',
+            '"mclk"',
+            "compose_s5_sequence",
+            "reconstruction_error",
+            "G_nll",
+            "G_nll_ci_low",
+            "G_nll_ci_high",
+            "NDR_epsilon",
+        ):
+            self.assertIn(snippet, text)
+        for removed in (
+            '"moe"',
+            '"static_moe"',
+            "SoftMoEFFN",
+            "cache_diagnostics",
+            "_quantize_linear_int6_",
+            "mechanism_diagnostics",
+            "_route_depth_nmi",
+            "_effective_rank",
+            "HardGain",
+        ):
+            self.assertNotIn(removed, text)
+        for snippet in (
+            "for variant in control m0 mclk",
+            'run_variant "${variant}"',
+        ):
+            self.assertIn(snippet, pipeline)
+        for snippet in (
+            'SEQ_LEN="${SEQ_LEN:-16}"',
+            'TRAIN_DEPTHS="${TRAIN_DEPTHS:-16,32,64}"',
+            'PAIRS="${PAIRS:-16,64,8,32}"',
+            'NPROC="${NPROC:-2}"',
+        ):
+            self.assertIn(snippet, pipeline)
+        for removed in ("STAGES=", "NUM_EXPERTS", "ROUTER_TOP_R", "MOE_BALANCE_COEF", "emit-cache", "eval-int6"):
+            self.assertNotIn(removed, pipeline)
+        self.assertIn("experiments/p1_synthetic.py", pipeline)
+        self.assertIn("torchrun --standalone --nproc_per_node=2", CLAUDE.read_text())
+
+    def test_feedback_stage_diagnostics_are_separate_from_p1_core(self) -> None:
+        text = P1_FEEDBACK_STAGES.read_text()
+        pipeline = P1_FEEDBACK_PIPELINE.read_text()
+        for snippet in (
+            "SoftMoEFFN",
+            '"s1"',
+            '"s2"',
+            '"s3"',
+            '"moe"',
+            '"static_moe"',
+            "mechanism_diagnostics",
+            "_route_depth_nmi",
+            "_effective_rank",
+            "cache_diagnostics",
+            "hidden_state_proxy_not_autoregressive_kv",
+            "_quantize_linear_int6_",
+            "quality_gap_status",
+            "not_tested_requires_autoregressive_terminal_context_attention",
+        ):
+            self.assertIn(snippet, text)
+        for snippet in (
+            "experiments/p1_synthetic.py",
+            "experiments/p1_feedback_stages.py",
+            "run_stage_variant s1 m0",
+            "run_stage_variant s1 moe",
+            "run_stage_variant s1 static_moe",
+            "run_stage_variant s2 m0",
+            "run_stage_variant s3 m0",
+            'NUM_EXPERTS="${NUM_EXPERTS:-4}"',
+            'ROUTER_TOP_R="${ROUTER_TOP_R:-0}"',
+        ):
+            self.assertIn(snippet, pipeline)
+        self.assertNotIn("dirichlet_ucb", text.lower())
+        self.assertNotIn("ucb_beta", text.lower())
+
+    def test_expert_layout_docs_use_explicit_slot_api(self) -> None:
+        train = TRAIN_GPT.read_text()
+        context = (ROOT / "CONTEXT.md").read_text()
+        for snippet in (
+            "experts_per_slot",
+            "expert_slots",
+            "expert_slot_order",
+        ):
+            self.assertIn(snippet, train)
+        self.assertIn("expressiveness/throughput", context)
+        self.assertIn("P3 MoE Basis", context)
+        self.assertNotIn("use_chained_routing", train)
+        self.assertNotIn("chained_stages_preset", train)
 
     def test_experiment_docs_are_canonical(self) -> None:
         expected_docs = [
@@ -140,6 +316,14 @@ class TestTrainingContracts(unittest.TestCase):
             self.assertFalse(old_path.exists(), f"stale root-level doc remains: {old_path}")
 
         hyp = (EXPERIMENT_DOCS / "hypotheses.md").read_text()
+        for snippet in (
+            "final-minimal P1 pipeline",
+            "RUN_TAG=gpu67_s0_pruned_i1000",
+            "Legacy Dense-MoE Snapshot (Superseded)",
+            "Legacy Remaining Queue (Superseded)",
+            "Legacy Run Macros (Superseded)",
+        ):
+            self.assertIn(snippet, hyp)
         # Require "removed" to appear within a same-line "pure IFT" window
         # so an unrelated future use of the word "removed" elsewhere in the
         # doc cannot satisfy the IFT-refutation assertion. Single-line +
@@ -214,7 +398,7 @@ class TestTrainingContracts(unittest.TestCase):
             "router_pertoken_entropy_coef_eff:",
             "expert_diversity_coef_eff:",
             "mos_diversity_coef_eff:",
-            "consistency_anchor_loss:",
+            "scale_hinge_loss:",
         ]
         for field in required_fields:
             self.assertIn(field, text)

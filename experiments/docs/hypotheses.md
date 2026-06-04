@@ -32,6 +32,58 @@ baseline.
 
 | Area | Current state |
 |---|---|
+| Code source of truth | `reports/opg_doc.tex` and ADR 0002 define the active final-minimal P1 pipeline. `experiments/p1_synthetic.py` is the executable Tier-1 harness; `train_gpt.py` is legacy small-LM/deployment infrastructure until Tier 1 passes. |
+| Active goal | P1 first: show positive paired depth utility on a depth-hard task with a passing positive control. P2 activation-memory evidence is separate. P3 MoE-basis recovery is staged only after P1 holds. |
+| Active models | P1 promotion path: `control`, `m0`, and `mclk`. The active harness intentionally has no MoE, cache, or int6 switches. Separate feedback-stage diagnostics now live in `experiments/p1_feedback_stages.py` for S+1/S+2/S+3 coverage without widening P1. |
+| Active metrics | Paired `G_nll`/`G_acc` with confidence intervals, `NDR_epsilon`, K sweep loss/accuracy, peak VRAM, and structural reconstruction error for `m0`/`mclk`. Mean-only gains are not promotion evidence. |
+| Latest run | `RUN_TAG=gpu67_feedback_all_i1000`, GPUs 6/7 DDP, 1000 iterations, seq_len 16. The minimal S+0 runner plus separate S+1/S+2/S+3 diagnostics completed. P1 did not promote: positive-control `G_nll(16,64)=-0.000477` with CI `[-0.000951,-0.000002]` and `NDR_epsilon=0.5122`. `M0`/`M_clk` reconstruction stayed near `1e-5`. |
+| Next active question | Repair Tier-1 detectability before model changes. Sweeping `SEQ_LEN` and 1000 iterations was not enough, so the next move is to verify the task/target and positive-control capacity: use a simpler provable positive control, a shorter/easier compositional curriculum, or a target representation with a stronger training signal. |
+| Closed for active P1 | Nonzero `lyapunov_coef`, Lipschitz-band pressure, prefix-anchor consistency, Dirichlet-UCB, MLA, MoS, distillation, UFID, anytime/adaptive diagnostics, plain MoE, static MoE, cache proxy, and int6 eval. MoE/static-MoE, hidden-state cache proxy, and fake-int6 are available only through the separate feedback-stage diagnostic runner and do not promote P1. |
+
+## Active Run Macros
+
+```bash
+# Default S+0 DDP smoke on the requested GPU pair.
+CUDA_VISIBLE_DEVICES=6,7 ITERATIONS=300 RUN_TAG=gpu67 bash experiments/run_p1_synthetic_pipeline.sh
+
+# Positive-control detectability sweep examples. Change only task/budget knobs.
+CUDA_VISIBLE_DEVICES=6,7 SEQ_LEN=8 ITERATIONS=1000 RUN_TAG=gpu67_seq8_i1000 bash experiments/run_p1_synthetic_pipeline.sh
+CUDA_VISIBLE_DEVICES=6,7 SEQ_LEN=16 ITERATIONS=1000 RUN_TAG=gpu67_seq16_i1000 bash experiments/run_p1_synthetic_pipeline.sh
+
+# Full feedback-stage executable coverage; S+1/S+2/S+3 are diagnostics only.
+CUDA_VISIBLE_DEVICES=6,7 ITERATIONS=1000 RUN_TAG=gpu67_feedback_all_i1000 bash experiments/run_feedback_stage_pipeline.sh
+```
+
+## Current Feedback-Stage Verification (2026-06-04)
+
+`RUN_TAG=gpu67_feedback_all_i1000` completed on GPUs 6/7 with DDP and 1000 iterations per stage row.
+It verifies executable coverage of the feedback document without widening the P1 runner.
+It supersedes, but does not erase, the pruned S+0 verification
+`RUN_TAG=gpu67_s0_pruned_i1000`, which already showed the same positive-control blocker.
+
+| Row | Best K/loss | `G_nll(16,64)` 95% CI | NDR | Notes |
+|---|---:|---:|---:|---|
+| `s0_control` | 16 / 4.793021 | `-0.000477 [-0.000951, -0.000002]` | 0.5122 | Positive control fails P1. |
+| `s0_m0` | 16 / 4.793416 | `0.000071 [-0.000270, 0.000412]` | 0.4968 | Structural reconstruction `9.57e-6`. |
+| `s0_mclk` | 16 / 4.793167 | `-0.000073 [-0.000351, 0.000205]` | 0.5146 | Structural reconstruction `1.12e-5`. |
+| `s1_moe` | 16 / 4.794307 | `-0.000133 [-0.000396, 0.000130]` | 0.5159 | Route-depth NMI `8.02e-6`, AEBR `1.385`, utilization `0.9992`. |
+| `s1_static_moe` | 16 / 4.794298 | `-0.000134 [-0.000393, 0.000125]` | 0.5110 | Route-depth NMI `4.93e-6`, AEBR `1.512`, utilization `0.9995`. |
+| `s2_m0` | 16 / 4.793416 | `0.000071 [-0.000270, 0.000412]` | 0.4968 | Hidden-state proxy only: exact slope 1, terminal/shared slope 0; KV quality gap untested. |
+| `s3_m0` | 16 / 4.793416 | `0.000071 [-0.000270, 0.000412]` | 0.4968 | Fake-int6 best-loss gap `+0.000907`; int6 `G_nll(16,64)=0.000044 [-0.000295,0.000383]`. |
+
+Verdict: implementation coverage is now complete for S+0 through S+3, but the scientific blocker is
+unchanged. Do not escalate mechanisms. Repair the Tier-1 detectability target or positive-control
+capacity first.
+
+## Legacy Dense-MoE Snapshot (Superseded)
+
+Everything in this section and below is historical unless explicitly referenced
+by the final-minimal P1 protocol. It is kept as evidence, not as the active
+research queue. In particular, pure IFT remains removed, and nonzero
+`lyapunov_coef` remains rejected for active P1.
+
+| Area | Current state |
+|---|---|
 | Code source of truth | `train_gpt.py::Hyperparameters`; docs must track active defaults, not old records. |
 | Backbone | RevDEQ + Parcae, `use_parcae=True`, weighted `deq_k_jitter_set=(16,24,32,64,96,128)` with weights `(0.50,0.40,0.07,0.03,0.015,0.0075)` normalized at launch, `deq_bptt_k=3`. |
 | Routing loss stack | Root-cause rescue stack: Dirichlet-UCB routing, router CV off, EMA-anchored balance/specialization (`router_ema_balance_coef=0.30`, `router_ema_specialization_coef=0.20`), small alive hinge (`router_ema_alive_coef=0.02`), worst-pair cosine expert-output diversity (`expert_output_diversity_coef=0.30`), MoS-CV/per-token entropy unchanged, and 0.07 warmup. Legacy nested routing-gram stack is superseded. |
@@ -66,7 +118,7 @@ baseline.
 | iter 142c | Frobenius-only counterfactual at 1000 steps: `expert_output_diversity_coef=1.0` Frobenius + `router_load_cv_coef=0`, `router_pertoken_entropy_coef=0`, `mos_load_cv_coef=0`; `regularizer_warmup_frac=0`. | `NOT PROMOTED` | Full val_bpb 1.5143, post-int6 1.5245 (+0.0213 vs c94899a-era baseline; +0.0134 worse than 142b). Diagnostic gate flagged `router_collapse + expert_collapse ×2`. attn_cv ≤ 1.70 throughout (peaked at s100, settled at 0.65); MLP side worse than 142b (mlp_cv 0.20 vs 0.18). K-sweep: K=24 best at 1.5233; Δ(K=8→K=64)=−0.067, Δ(K=16→K=64)=+0.000 (well-converged at K≥16). Acyclicity prime K=113 shows +0.004 bump from K=64 (small acyclicity artifact, not seen in 142b). Step time 23.45 s (+3.2 % vs baseline). Artifact 7.61 MB. | Confirms decomposed cosine (142b) > Frobenius-only (142c) by +0.013 BPB at 1000 steps. Frobenius-alone path closed; remove from default consideration. |
 | iter 142d | Doubled-coef variant queued in pre-override defaults: `expert_output_diversity_coef=2.0`, `router_load_cv_coef=1.0`, `router_pertoken_entropy_coef=0.0025`, `mos_load_cv_coef=0.5`, `regularizer_warmup_frac=0`. | `SUPERSEDED` (2026-05-06) | Never run — 2026-05-06 user override set defaults to uniform 1.0, which is the same end-state 142d aimed at exploring. iter 143 (`deq_bptt_k=4`) runs on the uniform-1.0 baseline and supersedes the standalone 142d sweep. | Closed; do not run as a standalone iter. |
 
-## Remaining Queue
+## Legacy Remaining Queue (Superseded)
 
 | Priority | Item | Change | Principled? | Efficient to test? | Merge/test decision |
 |---|---|---|---|---|---|
@@ -132,7 +184,7 @@ baseline.
 | Closed | iter 138/140/141 legacy gram queue | Old routing-gram ablations. | Stale under current flat objective. | Would waste runs. | Closed; archived. |
 | Closed | H97/H98/H105 | Attn-gate quantization / hard sparse head gate / weak stale proposals. | Weak or mismatched to active architecture. | Not worth current queue slots. | Closed; archived. |
 
-## Run Macros
+## Legacy Run Macros (Superseded)
 
 These are experiment shapes, not mandatory commands. Iteration comparisons use
 the full 1000-step budget by default. Keep all logs under
