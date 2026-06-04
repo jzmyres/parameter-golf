@@ -51,7 +51,11 @@ try:
         sample_task_batch,
         task_num_classes,
     )
-except ModuleNotFoundError:  # pragma: no cover - script execution path
+except ModuleNotFoundError as exc:  # pragma: no cover - script execution path
+    # Only fall back for the package-resolution case; a genuinely missing
+    # dependency inside p1_synthetic must surface, not be masked as "no experiments".
+    if exc.name not in (None, "experiments", "experiments.p1_synthetic"):
+        raise
     from p1_synthetic import (  # type: ignore
         AdditiveCouplingP1Model,
         HaltingReadout,
@@ -98,6 +102,9 @@ class SoftMoEFFN(nn.Module):
         if self.static_route:
             logits = logits.mean(dim=(0, 1), keepdim=True).expand_as(logits)
         if 0 < self.top_r < self.num_experts:
+            # NOTE: hard top-k is a NON-reversible mechanism-diagnostic knob
+            # (off by default, top_r=0). It deliberately sits outside the RevDEQ
+            # soft-dense-routing contract and is used only for S+1 routing analysis.
             values, index = logits.topk(self.top_r, dim=-1)
             sparse_logits = torch.full_like(logits, float("-inf"))
             logits = sparse_logits.scatter(dim=-1, index=index, src=values)
@@ -350,6 +357,8 @@ def _quantize_linear_int6_(model: nn.Module) -> None:
         for module in model.modules():
             if isinstance(module, nn.Linear):
                 weight = module.weight.data
+                if not torch.isfinite(weight).all():
+                    raise FloatingPointError("non-finite weight before int6 quantization (S+3 gap would be meaningless)")
                 scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(1e-8) / 31.0
                 q = torch.round(weight / scale).clamp(-31, 31)
                 module.weight.data.copy_(q * scale)

@@ -883,9 +883,10 @@ class Hyperparameters:
     #      the actual Parcae cycle the solver iterates; penalizes
     #      ‖J_F·(u_y, u_z)‖ — empirical pressure toward contraction, not a
     #      formal certificate. iter155 refuted this path empirically.
-    # Kept default-off; the principled FP-convergence mechanism is now the
-    # iter163 multi-K consistency loss (which *learns* rho(J_F) < 1 naturally
-    # by anchoring each TBPTT-K to the converged-FP target).
+    # Kept default-off. (Legacy note: under the prior fixed-point framing the
+    # iter163/iter172 multi-K consistency loss was treated as the principled
+    # FP-convergence mechanism; the finite-horizon pivot REJECTS that path at
+    # launch — FP convergence is now an advisory cache-readiness signal only.)
     lyapunov_coef = 0.0        # λ_jac: weight of relu(expansion - gamma)^2
     # γ is on the Frobenius/√D proxy (Hutchinson), not ‖J‖_2: ‖J‖_2 < 1
     # implies Frobenius/√D < 1 but not the reverse, so γ=0.97 is a soft
@@ -1067,13 +1068,11 @@ _EVAL_PROFILES: dict[str, EvalProfile] = {
     "debug": EvalProfile(k_sweep_values=(16,)),
     "submission": EvalProfile(k_sweep_values=(16, 24, 64, 128)),
     "diagnostic": EvalProfile(
-        # K=192 added 2026-05-17 for extrapolation perf test: 50% deeper than
-        # max-trained K=128 in iter172/iter173, tests whether the rho_F<1
-        # contraction basin extends beyond the trained-K cap. If val_bpb at
-        # K=192 ≈ K=128, the model has wide-basin convergence (good); if
-        # K=192 degrades, the consistency loss is overfitting to trained K.
-        # For iter174 (K=256 in jitter), K=192 becomes an interpolation point
-        # between trained K=128 and K=256.
+        # K=192: extrapolation probe 50% deeper than the max-trained K=128 —
+        # tests whether the finite-horizon model holds up beyond its trained-K
+        # cap (K=192 ≈ K=128 is good; degradation means no extrapolation).
+        # (Legacy: predates the finite-horizon pivot; the prior
+        # consistency-loss-overfitting / iter174 rationale no longer applies.)
         k_sweep_values=(4, 8, 16, 17, 24, 32, 37, 64, 113, 128, 192),
     ),
 }
@@ -7178,11 +7177,11 @@ def _parcae_cycle_F(
     with ``β = 1 − Ā`` and per-dim Ā stored in ``a_bar_d`` (broadcast-
     compatible with ``y`` / ``z``, e.g. shape ``(1, 1, D)``).
 
-    This is the iteration map probed by ``rho_F`` (the principled spectral
-    gate per Hartman--Grobman), measured by ``fp_residual_F``, and used by
-    the iter163 multi-K consistency loss extension term — the single source
-    of truth for the F-cycle algebra so the probe / residual / training
-    paths cannot silently diverge. The operator-norm probes (``lip_ub_F``,
+    This is the iteration map probed by ``rho_F`` (an advisory spectral
+    diagnostic per Hartman--Grobman) and measured by ``fp_residual_F`` — the
+    single source of truth for the F-cycle algebra so the probe / residual
+    paths cannot silently diverge. (Legacy: the multi-K consistency loss that
+    once consumed this is rejected at launch under the finite-horizon pivot.) The operator-norm probes (``lip_ub_F``,
     ``lip_ub_S``, ``lip_ub_T``) and Banach error bound (``fp_bound``) were
     removed 2026-05-15 as over-restrictive.
 

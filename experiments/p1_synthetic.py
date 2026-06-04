@@ -255,6 +255,9 @@ class AdditiveCouplingP1Model(nn.Module):
     def _step(self, k: int, x0: Tensor) -> Tensor:
         if self.step_emb is None:
             return x0.new_zeros((1, 1, self.dim))
+        # Clamp to the clock table (size 512). Configured depths are << 512; a
+        # depth beyond the table reuses the last clock embedding (frozen clock)
+        # rather than erroring -- acceptable for this diagnostic-only variant.
         idx = torch.full((1,), min(int(k), self.step_emb.num_embeddings - 1), device=x0.device, dtype=torch.long)
         return self.step_emb(idx).view(1, 1, self.dim)
 
