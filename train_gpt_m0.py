@@ -11,7 +11,9 @@ Sections:
     2. Normalization (RMSNorm)
     3. Reversible recurrence core (ReversibleRecurrence)
     4. O(1)-memory reversible BPTT (RevRecurrenceFn + run_reversible)
-    5. Test-only delta block (_TinyDelta)
+    5. Rotary position embedding (Rotary + apply_rotary_emb)
+    6. Multi-head Latent Attention (MLAttention)
+    7. Test-only delta block (_TinyDelta)
 """
 
 # ---------------------------------------------------------------------------
@@ -19,6 +21,7 @@ Sections:
 # ---------------------------------------------------------------------------
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +163,149 @@ class RevRecurrenceFn(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
-# 5. Test-only delta block
+# 5. Rotary position embedding
+# ---------------------------------------------------------------------------
+class Rotary(nn.Module):
+    """Rotary position embedding with a cached cos/sin table.
+
+    Ported from ``train_gpt.py::Rotary``, stripped of the legacy
+    ``@dynamo_disable`` decorator and inference-mode cache guard (M0 builds the
+    cache lazily and recomputes when ``seq_len`` / device changes). ``dim`` is
+    the rotated sub-dimension (the rope half of each head), so the table holds
+    ``dim // 2`` frequencies and ``apply_rotary_emb`` rotates ``dim`` channels.
+    """
+
+    def __init__(self, dim, base=10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
+
+    def _refresh_cache(self, seq_len, device):
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq.to(device))
+        self._cos_cached = freqs.cos()[None, None, :, :].contiguous()
+        self._sin_cached = freqs.sin()[None, None, :, :].contiguous()
+        self._seq_len_cached = seq_len
+
+    def forward(self, seq_len, device, dtype):
+        if (self._cos_cached is None or self._sin_cached is None
+                or self._seq_len_cached != seq_len or self._cos_cached.device != device):
+            self._refresh_cache(seq_len, device)
+        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
+
+
+def apply_rotary_emb(x, cos, sin):
+    """Rotate the last dim of ``x`` (shape ``(..., 2*half)``). Ported verbatim
+    from ``train_gpt.py``: the two halves are the real/imag interleave-free
+    layout (first half / second half), so ``cos``/``sin`` have width ``half``.
+    """
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# 6. Multi-head Latent Attention (MLA)
+# ---------------------------------------------------------------------------
+class MLAttention(nn.Module):
+    """Clean single-module Multi-head Latent Attention (DeepSeek-V2 style).
+
+    Low-rank joint KV compression with decoupled RoPE, ported and stripped from
+    ``train_gpt.py::CausalSelfAttention``. Removed relative to the source:
+    per-expert weight banks, NSA / round-robin / sparse-head-gate / smear
+    branches, and the attention gate. What remains is the core MLA path:
+
+      1. Q (low-rank):   x -> q_down (dim->q_latent) -> RMS -> q_up
+                         (q_latent -> n_heads*head_dim), split into rope/nope.
+      2. KV (low-rank):  x -> kv_down (dim->kv_latent) -> RMS statistic, then
+                         separate learned K/V input scales -> k_up / v_up
+                         (kv_latent -> n_kv_heads*nope_dim / n_kv_heads*head_dim).
+      3. Decoupled RoPE: a separate k_rope projection (dim -> n_kv_heads*rope_dim)
+                         carries position; RoPE is applied to q_rope and k_rope.
+      4. Attention:      causal SDPA with GQA (enable_gqa when n_kv_heads<n_heads).
+      5. Output:         o_proj mixes heads back to ``dim``.
+
+    Each head splits into ``rope_dim`` (rotated, position-dependent) plus
+    ``nope_dim`` (content-only). bf16-friendly: only RMSNorm statistics use the
+    fused ``F.rms_norm`` kernel; no forced fp32 elsewhere.
+    """
+
+    def __init__(self, dim, n_heads, n_kv_heads, kv_latent, head_dim,
+                 q_latent=None, rope_base=10000.0):
+        super().__init__()
+        assert n_heads % n_kv_heads == 0, "n_heads must be a multiple of n_kv_heads (GQA)"
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.head_dim = head_dim
+        self.kv_latent = kv_latent
+        self.q_latent = q_latent if q_latent is not None else kv_latent
+        # Decoupled-RoPE split: half of each head carries position (rope), the
+        # remainder is content-only (nope). Mirrors the source MLA convention.
+        self.rope_dim = head_dim // 2
+        self.nope_dim = head_dim - self.rope_dim
+
+        # --- Q: low-rank dim -> q_latent -> n_heads*head_dim ---
+        self.q_down = nn.Linear(dim, self.q_latent, bias=False)
+        self.q_norm = RMSNorm(self.q_latent)
+        self.q_up = nn.Linear(self.q_latent, n_heads * head_dim, bias=False)
+
+        # --- KV: low-rank dim -> kv_latent, then up-project to K_nope / V ---
+        self.kv_down = nn.Linear(dim, kv_latent, bias=False)
+        self.kv_norm = RMSNorm(kv_latent)
+        self.k_up = nn.Linear(kv_latent, n_kv_heads * self.nope_dim, bias=False)
+        self.v_up = nn.Linear(kv_latent, n_kv_heads * head_dim, bias=False)
+
+        # --- Decoupled K_rope: dim -> n_kv_heads*rope_dim (position channel) ---
+        self.k_rope = nn.Linear(dim, n_kv_heads * self.rope_dim, bias=False)
+
+        # --- Output projection: mix heads back to dim ---
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+
+        self.rotary = Rotary(self.rope_dim, base=rope_base)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        H, H_kv, d = self.n_heads, self.n_kv_heads, self.head_dim
+
+        # --- Q (low-rank) -> (B, H, T, head_dim), split rope/nope ---
+        q = self.q_up(self.q_norm(self.q_down(x)))
+        q = q.view(B, T, H, d).transpose(1, 2)              # (B, H, T, d)
+        q_rope, q_nope = q[..., :self.rope_dim], q[..., self.rope_dim:]
+
+        # --- KV (low-rank latent) -> K_nope, V ---
+        kv = self.kv_norm(self.kv_down(x))                   # (B, T, kv_latent)
+        k_nope = self.k_up(kv).view(B, T, H_kv, self.nope_dim).transpose(1, 2)  # (B,H_kv,T,nope)
+        v = self.v_up(kv).view(B, T, H_kv, d).transpose(1, 2)                   # (B,H_kv,T,d)
+
+        # --- Decoupled K_rope ---
+        k_rope = self.k_rope(x).view(B, T, H_kv, self.rope_dim).transpose(1, 2)  # (B,H_kv,T,rope)
+
+        # --- Apply RoPE to the rope sub-dims of Q and K ---
+        cos, sin = self.rotary(T, x.device, q_rope.dtype)
+        q_rope = apply_rotary_emb(q_rope, cos, sin)
+        k_rope = apply_rotary_emb(k_rope, cos.to(k_rope.dtype), sin.to(k_rope.dtype))
+
+        # --- Assemble full Q, K (rope ++ nope) ---
+        q_full = torch.cat([q_rope, q_nope], dim=-1)          # (B, H, T, d)
+        k_full = torch.cat([k_rope, k_nope], dim=-1)          # (B, H_kv, T, d)
+
+        # --- Causal SDPA with GQA ---
+        y = F.scaled_dot_product_attention(
+            q_full, k_full, v, attn_mask=None, is_causal=True,
+            enable_gqa=(H_kv != H),
+        )                                                     # (B, H, T, d)
+
+        # --- Output projection ---
+        y = y.transpose(1, 2).reshape(B, T, H * d)
+        return self.o_proj(y)
+
+
+# ---------------------------------------------------------------------------
+# 7. Test-only delta block
 # ---------------------------------------------------------------------------
 class _TinyDelta(nn.Module):
     """Minimal delta block for reversibility tests (not a model component)."""
