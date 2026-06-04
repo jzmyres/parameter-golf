@@ -1,6 +1,6 @@
 import torch
 
-from train_gpt_m0 import MLAttention, SwiGLUMoE
+from train_gpt_m0 import MLAttention, MoSHead, SwiGLUMoE
 
 
 def test_mla_shapes_and_kv_latent():
@@ -51,3 +51,11 @@ def test_moe_routing_is_smooth_for_reversibility():
     y1 = moe(x)
     y2 = moe(x + 1e-7)
     assert (y1 - y2).abs().max() < 1e-3  # continuous (no discrete jumps)
+
+
+def test_mos_head_is_distribution_and_high_rank():
+    h = MoSHead(dim=16, vocab=32, n_mix=3)
+    z = torch.randn(4, 7, 16)
+    logp = h(z)
+    assert logp.shape == (4, 7, 32)
+    assert torch.allclose(logp.exp().sum(-1), torch.ones(4, 7), atol=1e-4)

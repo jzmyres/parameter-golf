@@ -14,7 +14,8 @@ Sections:
     5. Rotary position embedding (Rotary + apply_rotary_emb)
     6. Multi-head Latent Attention (MLAttention)
     7. SwiGLU Mixture-of-Experts (SwiGLUMoE)
-    8. Test-only delta block (_TinyDelta)
+    8. Mixture-of-Softmaxes output head (MoSHead)
+    9. Test-only delta block (_TinyDelta)
 """
 
 # ---------------------------------------------------------------------------
@@ -392,7 +393,62 @@ class SwiGLUMoE(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 8. Test-only delta block
+# 8. Mixture-of-Softmaxes output head
+# ---------------------------------------------------------------------------
+class MoSHead(nn.Module):
+    """Mixture-of-Softmaxes language-model head (Yang et al. 2018).
+
+    A single softmax over ``W @ z`` is rank-bounded by ``dim`` ("the softmax
+    bottleneck"). MoS instead mixes ``n_mix`` softmaxes, each computed from its
+    own nonlinear context vector, yielding a higher-rank log-probability matrix
+    at modest extra cost (cheap here since ``vocab`` is small). Output basis is
+    ``out_embed``: Task 6's ``M0GPT`` ties ``out_embed.weight`` to the model's
+    input token embedding, so MoSHead owns the parameter but does not assume
+    untied weights.
+
+    Forward (per mixture component ``k``)::
+
+        h_k      = tanh(ctx_k(z))                  # context, shape (B, T, dim)
+        logits_k = h_k @ out_embed.weight.T        # (B, T, vocab)
+        p_k      = softmax(logits_k, dim=-1)
+        pi       = softmax(gate(z), dim=-1)         # mixture weights (B, T, n_mix)
+        p        = sum_k pi[..., k] * p_k           # valid distribution (rows sum to 1)
+        return log(p.clamp_min(1e-12))             # log-probabilities (B, T, vocab)
+
+    The mixture is a convex combination of per-component distributions, so ``p``
+    is itself a distribution. bf16-friendly: the softmax / mixture arithmetic is
+    done in fp32 internally for numerical stability and the fp32 result is
+    returned (this casts only the head's tensors, not the whole model).
+    """
+
+    def __init__(self, dim, vocab, n_mix):
+        super().__init__()
+        self.dim = dim
+        self.vocab = vocab
+        self.n_mix = n_mix
+        # Output token basis; Task 6 ties this to the input embedding.
+        self.out_embed = nn.Embedding(vocab, dim)
+        # Per-component context projections (one (dim->dim) map per mixture).
+        self.ctx = nn.Linear(dim, n_mix * dim)
+        # Mixture gate: dim -> n_mix logits.
+        self.gate = nn.Linear(dim, n_mix)
+
+    def forward(self, z):
+        B, T, _ = z.shape
+        K = self.n_mix
+        # Context for every component, in fp32 for a stable softmax mixture.
+        h = torch.tanh(self.ctx(z)).float()                  # (B, T, K*dim)
+        h = h.view(B, T, K, self.dim)                        # (B, T, K, dim)
+        w = self.out_embed.weight.float()                    # (vocab, dim)
+        logits = torch.einsum("btkd,vd->btkv", h, w)         # (B, T, K, vocab)
+        p_k = F.softmax(logits, dim=-1)                      # (B, T, K, vocab)
+        pi = F.softmax(self.gate(z).float(), dim=-1)         # (B, T, K)
+        p = torch.einsum("btk,btkv->btv", pi, p_k)           # (B, T, vocab)
+        return p.clamp_min(1e-12).log()
+
+
+# ---------------------------------------------------------------------------
+# 9. Test-only delta block
 # ---------------------------------------------------------------------------
 class _TinyDelta(nn.Module):
     """Minimal delta block for reversibility tests (not a model component)."""
