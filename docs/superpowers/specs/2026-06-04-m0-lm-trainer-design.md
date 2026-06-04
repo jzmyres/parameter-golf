@@ -107,13 +107,13 @@ in `opg_doc.tex` Related Work.
 - **Alignment:** update `opg_doc.tex` (§Models simple readout; MLA/MoE/MoS retained, removed
   from §Goal exclusions; two-goal metrics; Related Work). Fix stale CLAUDE.md ref-impl paths.
 
-## Open decision — the 1500-line budget
+## Line budget (resolved 2026-06-04)
 
-The upstream ≤1500-line hard-stop targets the *reference* `train_gpt.py`. The OPG research
-model with the **mandated** mechanisms (MLA + MoE + MoS + reversible backward) will exceed
-1500 (est. ~2,000–2,500 lines, well-modularized). **Recommendation:** scope the 1500
-invariant to a reference baseline; the research model targets "as lean as possible, mechanisms
-in clear modules." *Flagged for review — this needs a CLAUDE.md carve-out.*
+**No hard line cap on the research `train_gpt.py`** (user directive; the CLAUDE.md ≤1500
+invariant was removed). The model carries the mandated mechanisms (MLA + MoE + MoS + reversible
+backward), so the upstream ≤1500-line note is treated as a *reference-baseline* aspiration only.
+Target: lean code with each mechanism in a clearly-bounded module (est. ~2,000–2,500 lines), not
+a line count.
 
 ## Testing strategy
 

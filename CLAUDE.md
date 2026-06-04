@@ -9,7 +9,7 @@ This file is the **single binding directive** for working in this repo, and a th
 ## Project Invariants
 
 - **Challenge constraints.** Artifact ≤ 16,000,000 bytes; submission training fits the 600 s 8xH100 budget. Details: [`EXPERIENCE.md#project-constraints`](EXPERIENCE.md#project-constraints).
-- **1500-line readability hard-stop.** `train_gpt.py` and `train_gpt_mlx.py` must never exceed 1500 lines (upstream invariant, stated in `train_gpt_mlx.py`). The legacy rich architecture currently violates this (~10.4k lines); the minimal-M0 rewrite restores compliance, at which point an enforcing `wc -l` test lands. Do not grow the file further.
+- **No hard line cap on the research `train_gpt.py`.** The upstream ≤1500-line note in `train_gpt_mlx.py` targets a newcomer *reference*; the OPG research model carries the mandated resource/expressiveness mechanisms (reversible recurrence, MLA, MoE, MoS) and is not line-capped. Keep it as lean as the design allows with mechanisms in clearly-bounded modules. User directive 2026-06-04.
 - **Scoped edits.** Default writable surface is `train_gpt.py`, focused tests, and project docs. Do not modify `data/`, tokenizer/eval harness code, `records/`, package manifests, or dependencies without explicit user approval.
 - **No new packages by default.** If approved, install with `uv pip install <pkg>` and update requirements in the same commit.
 - **DDP first.** Training code works under single GPU and `torchrun` DDP; GPU-count-specific paths use `world_size`.
