@@ -13,7 +13,8 @@ Sections:
     4. O(1)-memory reversible BPTT (RevRecurrenceFn + run_reversible)
     5. Rotary position embedding (Rotary + apply_rotary_emb)
     6. Multi-head Latent Attention (MLAttention)
-    7. Test-only delta block (_TinyDelta)
+    7. SwiGLU Mixture-of-Experts (SwiGLUMoE)
+    8. Test-only delta block (_TinyDelta)
 """
 
 # ---------------------------------------------------------------------------
@@ -305,7 +306,93 @@ class MLAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 7. Test-only delta block
+# 7. SwiGLU Mixture-of-Experts
+# ---------------------------------------------------------------------------
+class SwiGLUMoE(nn.Module):
+    """Smooth, reversibility-safe SwiGLU Mixture-of-Experts FFN.
+
+    Used as an ``F`` / ``G`` block inside :class:`ReversibleRecurrence`, so the
+    routing MUST be a *continuous* function of the input — NO top-k, argmax,
+    capacity, or hard-threshold dispatch. A discrete jump in which experts fire
+    would break the reversible backward's recomputation stability (the inverse
+    must reconstruct the identical forward argument). Every expert is therefore
+    always computed and the outputs are combined with smooth per-token weights;
+    "sparsity" comes only from the ReLU router emitting *exact zeros*, not from
+    skipping any expert.
+
+    Two router types (a planned control experiment, selected by ``router_type``):
+
+      * ``softmax`` — dense-soft baseline: ``w = softmax(router(x))``. All weights
+        strictly positive (no sparsity), always sums to 1 per token.
+      * ``relu``    — ReMoE-style smooth-sparse: ``w = relu(router(x))``. The
+        ReLU yields exact zeros (data-dependent sparsity / load shedding) while
+        staying continuous and a.e.-differentiable.
+
+    Experts are low-rank (LoRA-style) SwiGLU: each expert down-projects ``dim``
+    to ``expert_rank``, applies SwiGLU there, and up-projects back to ``dim``, so
+    the parameter count scales with ``expert_rank`` rather than a full hidden
+    width. All experts are evaluated densely as batched tensors and combined as
+    ``y = sum_e w[..., e] * expert_e(x)``.
+
+    Diagnostics set after each forward:
+      * ``self.last_route`` — detached routing weights, shape ``(B, T, n_experts)``.
+      * ``self.aux_l1``     — mean L1 of the (live) routing weights, the ReMoE
+        adaptive sparsity / load-balance aux term consumed by the train loop.
+
+    bf16-friendly: no forced fp32 except inside ``RMSNorm`` statistics.
+    """
+
+    def __init__(self, dim, n_experts, expert_rank, router_type="softmax"):
+        super().__init__()
+        assert router_type in ("softmax", "relu"), (
+            f"router_type must be 'softmax' or 'relu', got {router_type!r}"
+        )
+        self.dim = dim
+        self.n_experts = n_experts
+        self.expert_rank = expert_rank
+        self.router_type = router_type
+
+        # Router is full-rank: dim -> n_experts logits.
+        self.router = nn.Linear(dim, n_experts)
+
+        # Low-rank (LoRA-style) SwiGLU experts as batched parameter banks.
+        # gate/up share a single down-projection to expert_rank, then SwiGLU
+        # (silu(gate) * up) at rank, then up-project back to dim.
+        #   x:(B,T,dim) @ w_in:(E,dim,2*rank) -> (B,T,E,2*rank) -> SwiGLU(rank)
+        #   -> @ w_out:(E,rank,dim) -> (B,T,E,dim)
+        self.w_in = nn.Parameter(torch.empty(n_experts, dim, 2 * expert_rank))
+        self.w_out = nn.Parameter(torch.empty(n_experts, expert_rank, dim))
+        nn.init.normal_(self.w_in, std=dim ** -0.5)
+        nn.init.normal_(self.w_out, std=expert_rank ** -0.5)
+
+        self.last_route = None
+        self.aux_l1 = None
+
+    def forward(self, x):
+        # --- Smooth router over the input (continuous in x; no dispatch) ---
+        logits = self.router(x)                                  # (B, T, E)
+        if self.router_type == "softmax":
+            w = F.softmax(logits, dim=-1)
+        else:  # relu: exact zeros => sparsity, still continuous in x
+            w = F.relu(logits)
+
+        # ReMoE adaptive sparsity / load-balance aux term (keep w in graph).
+        self.aux_l1 = w.abs().mean()
+        self.last_route = w.detach()
+
+        # --- Dense low-rank SwiGLU over ALL experts (no skipping) ---
+        h = torch.einsum("btd,edr->bter", x, self.w_in)         # (B, T, E, 2*rank)
+        gate, up = h.chunk(2, dim=-1)                            # each (B, T, E, rank)
+        act = F.silu(gate) * up                                  # (B, T, E, rank)
+        expert_out = torch.einsum("bter,erd->bted", act, self.w_out)  # (B, T, E, dim)
+
+        # --- Smooth soft combine: y = sum_e w[...,e] * expert_e(x) ---
+        y = torch.einsum("bte,bted->btd", w.type_as(expert_out), expert_out)
+        return y
+
+
+# ---------------------------------------------------------------------------
+# 8. Test-only delta block
 # ---------------------------------------------------------------------------
 class _TinyDelta(nn.Module):
     """Minimal delta block for reversibility tests (not a model component)."""

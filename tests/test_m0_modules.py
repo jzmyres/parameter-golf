@@ -1,6 +1,6 @@
 import torch
 
-from train_gpt_m0 import MLAttention
+from train_gpt_m0 import MLAttention, SwiGLUMoE
 
 
 def test_mla_shapes_and_kv_latent():
@@ -33,3 +33,21 @@ def test_mla_q_latent_override():
     m = MLAttention(dim=32, n_heads=4, n_kv_heads=2, kv_latent=8, head_dim=8, q_latent=12)
     x = torch.randn(2, 5, 32)
     assert m(x).shape == x.shape
+
+
+def test_moe_routers_run_and_relu_is_sparse():
+    x = torch.randn(2, 5, 32)
+    for rt in ("softmax", "relu"):
+        moe = SwiGLUMoE(dim=32, n_experts=8, expert_rank=8, router_type=rt)
+        y = moe(x)
+        assert y.shape == x.shape
+        if rt == "relu":
+            assert (moe.last_route == 0).any()  # exact-zero sparsity
+
+
+def test_moe_routing_is_smooth_for_reversibility():
+    moe = SwiGLUMoE(dim=32, n_experts=8, expert_rank=8, router_type="relu")
+    x = torch.randn(2, 5, 32)
+    y1 = moe(x)
+    y2 = moe(x + 1e-7)
+    assert (y1 - y2).abs().max() < 1e-3  # continuous (no discrete jumps)
