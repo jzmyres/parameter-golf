@@ -71,49 +71,117 @@ class RMSNorm(nn.Module):
 class ReversibleRecurrence(nn.Module):
     """Additive-coupling reversible recurrence with an explicit, floor-free inverse.
 
-    Forward update (one depth step), conditioned on the injected input ``x0``::
+    Forward update (one depth step ``k``), conditioned on the injected input
+    ``x0`` and an OPTIONAL per-step embedding ``e_k`` (``step_conditioning``)::
 
-        a_{k+1} = a_k + F(b_k     + x0)
-        b_{k+1} = b_k + G(a_{k+1} + x0)
+        a_{k+1} = a_k + F(b_k     + x0 + e_k)
+        b_{k+1} = b_k + G(a_{k+1} + x0 + e_k)
 
-    The inverse runs the same blocks in reverse, undoing each additive coupling::
+    The inverse runs the same blocks in reverse, undoing each additive coupling
+    and RECOMPUTING the SAME ``e_k`` for each known step index ``k``::
 
-        b_k     = b_{k+1} - G(a_{k+1} + x0)
-        a_k     = a_{k+1} - F(b_k     + x0)
+        b_k     = b_{k+1} - G(a_{k+1} + x0 + e_k)
+        a_k     = a_{k+1} - F(b_k     + x0 + e_k)
 
     Reconstruction is exact (no contraction / no floor) because each step only
-    adds a quantity that is recomputable from the *other* stream plus ``x0``.
-    ``F`` / ``G`` carry their own input RMSNorm, so the inverse recomputes the
-    same normalized argument identically.
+    adds a quantity that is recomputable from the *other* stream plus ``x0`` and
+    the deterministic ``e_k = step_emb(min(k, max-1))``. ``F`` / ``G`` carry
+    their own input RMSNorm, so the inverse recomputes the same normalized
+    argument identically; ``e_k`` is a deterministic function of the step index
+    only, so the reverse pass (which walks ``k`` in reverse) reconstructs it
+    bit-identically.
+
+    ``step_emb`` is the PRINCIPLED FIX for effective-depth collapse: a tied
+    block iterated ``K`` times collapses to a fixed point (effective depth
+    ``phi`` -> 0, depth-gain ``G_T`` -> 0, the Universal-Transformer / looped
+    failure). Injecting a learned step embedding makes each step a DISTINCT
+    function (a depth-``K`` program, not a fixed-point iteration). This mirrors
+    ``experiments/p1_synthetic.py``'s ``mclk`` clock variant and the
+    ``M_clk`` model of ``reports/opg_doc.tex``. When ``step_emb is None``
+    (default) the behavior is byte-identical to the unconditioned recurrence:
+    ``_step_vec`` returns a zero scalar tensor that the additive form absorbs
+    with no graph effect, so reversibility and gradients are unchanged.
+
+    ``step_emb`` is registered as a SUBMODULE of this recurrence (not the parent
+    model) so its weight is included in ``self.parameters()`` — the same tuple
+    that :meth:`run_reversible` passes as explicit ``RevRecurrenceFn.apply``
+    inputs and that ``RevRecurrenceFn.backward`` returns gradient slots for.
+    This is what gives ``step_emb`` a correct grad edge through the custom
+    autograd Function (see ``EXPERIENCE.md#custom-autograd-input``).
     """
 
-    def __init__(self, F, G):
+    def __init__(self, F, G, step_emb=None):
         super().__init__()
         self.F, self.G = F, G
+        # Optional per-step (clock) embedding submodule. None -> unconditioned
+        # recurrence, byte-identical to the previous behavior.
+        self.step_emb = step_emb
+
+    def _step_vec(self, k, ref):
+        """Per-step embedding ``e_k`` broadcastable over ``(B, T, D)``.
+
+        Returns ``step_emb(min(k, max-1))`` shaped ``(1, 1, D)`` when
+        ``step_conditioning`` is on, else a zero scalar tensor (matching
+        ``ref``'s dtype/device) that the additive ``+ e_k`` absorbs with no
+        graph effect. The clamp ``min(k, num_embeddings-1)`` lets a depth beyond
+        the clock table reuse the last clock embedding (frozen clock) rather
+        than erroring — mirrors ``p1_synthetic.py``'s ``mclk``.
+        """
+        if self.step_emb is None:
+            return ref.new_zeros(())
+        n = self.step_emb.num_embeddings
+        idx = torch.full((1,), min(int(k), n - 1), device=ref.device, dtype=torch.long)
+        return self.step_emb(idx).view(1, 1, -1).type_as(ref)
 
     def forward_states(self, a, b, x0, depth):
         states = []
-        for _ in range(int(depth)):
-            a = a + self.F(b + x0)
-            b = b + self.G(a + x0)
+        for k in range(int(depth)):
+            e_k = self._step_vec(k, x0)
+            a = a + self.F(b + x0 + e_k)
+            b = b + self.G(a + x0 + e_k)
             states.append(0.5 * (a + b))
         return (a, b), states
 
     def invert(self, a, b, x0, depth):
-        for _ in range(int(depth)):
-            b = b - self.G(a + x0)
-            a = a - self.F(b + x0)
+        # Walk steps in REVERSE; e_k is a deterministic function of the step
+        # index k, so each reverse step recomputes the SAME e_k the forward used.
+        for k in reversed(range(int(depth))):
+            e_k = self._step_vec(k, x0)
+            b = b - self.G(a + x0 + e_k)
+            a = a - self.F(b + x0 + e_k)
         return a, b
 
-    def run_reversible(self, x0, depth):
-        """O(1)-memory reversible BPTT: seed ``a0 = b0 = x0``, return midpoint.
+    def run_reversible(self, x0, depth, a0=None, b0=None):
+        """O(1)-memory reversible BPTT from seed ``(a0, b0)``; return midpoint.
+
+        Seed selection (Huginn-style path-independent init, the Occam
+        anti-collapse fix — ``--init-state``):
+
+          * ``a0 is None and b0 is None`` (default, ``init_state="x0"``): seed
+            ``a0 = b0 = x0``. Byte-identical to the previous behavior. ``x0``
+            enters BOTH as the seed AND the per-step injection, so the seed-grad
+            term (``gx0 += ga + gb``) is kept in ``RevRecurrenceFn.backward``.
+          * explicit ``a0``/``b0`` (``init_state="random"``): seed with small
+            random NON-LEARNABLE tensors INDEPENDENT of ``x0``. ``x0`` is STILL
+            injected each step, but no longer the seed, so the seed-grad term is
+            DROPPED (the cotangents reaching the loop entry are grads w.r.t. the
+            random init, which the caller discards). A tied block iterated K
+            times from random noise must do REAL depth-K work to map noise ->
+            solution, forcing effective depth instead of fixed-point collapse
+            (cite ``huginn``).
 
         Routes through :class:`RevRecurrenceFn` so the backward reconstructs
         activations instead of storing them. Gradients are identical to
         ``forward_states`` followed by ordinary autograd (see grad-equivalence
-        test). ``x0`` and every parameter are explicit ``apply`` inputs.
+        tests for BOTH seed modes). ``x0``, the explicit seeds ``(a0, b0)``, and
+        every parameter (including ``step_emb.weight`` when ``step_conditioning``
+        is on) are explicit ``apply`` inputs (custom-autograd-input rule).
         """
-        aK, bK = RevRecurrenceFn.apply(self, x0, depth, *self.parameters())
+        seed_is_x0 = a0 is None and b0 is None
+        if seed_is_x0:
+            a0 = b0 = x0
+        aK, bK = RevRecurrenceFn.apply(self, x0, a0, b0, depth, seed_is_x0,
+                                       *self.parameters())
         return 0.5 * (aK + bK)
 
 
@@ -132,45 +200,68 @@ class RevRecurrenceFn(torch.autograd.Function):
     parameter. This yields gradients numerically identical to ordinary BPTT
     while keeping memory constant in ``depth``.
 
+    Seed handling (``--init-state``): the seed ``(a0, b0)`` is an explicit
+    ``apply`` input. When ``seed_is_x0`` is True (default ``init_state="x0"``)
+    the seed equals ``x0``, so the cotangents that reach the loop entry
+    (``ga``, ``gb``) flow into ``x0`` (the seed-grad term ``gx0 += ga + gb``) and
+    the ``a0``/``b0`` grad slots return ``None``. When ``seed_is_x0`` is False
+    (``init_state="random"``) the seed is a random NON-LEARNABLE constant
+    independent of ``x0``: the seed-grad term is DROPPED, and ``ga``/``gb`` are
+    returned in the ``a0``/``b0`` grad slots (autograd needs the slot; the caller
+    discards these grads since the random init has no learnable parent). x0 still
+    receives only its per-step injection grad. This keeps grad-equivalence EXACT
+    for BOTH modes (see the two grad-equivalence tests).
+
     Per ``EXPERIENCE.md#custom-autograd-input``: every grad-needing tensor
-    (``x0`` and every parameter) is an explicit ``apply(...)`` input with a
-    matching gradient slot in ``backward``. Reconstructed states are
-    re-instantiated as leaves with ``.clone().requires_grad_(...)`` — never
-    ``.detach().requires_grad_(...)`` — so the two coupling legs and successive
-    steps never share underlying storage.
+    (``x0``, the seeds ``a0``/``b0``, and every parameter) is an explicit
+    ``apply(...)`` input with a matching gradient slot in ``backward``.
+    Reconstructed states are re-instantiated as leaves with
+    ``.clone().requires_grad_(...)`` — never ``.detach().requires_grad_(...)`` —
+    so the two coupling legs and successive steps never share underlying storage.
     """
 
     @staticmethod
-    def forward(ctx, rec, x0, depth, *params):
+    def forward(ctx, rec, x0, a0, b0, depth, seed_is_x0, *params):
         with torch.no_grad():
-            (aK, bK), _ = rec.forward_states(x0, x0, x0, depth)
-        ctx.rec, ctx.depth = rec, depth
+            (aK, bK), _ = rec.forward_states(a0, b0, x0, depth)
+        ctx.rec, ctx.depth, ctx.seed_is_x0 = rec, depth, seed_is_x0
         ctx.save_for_backward(aK.detach(), bK.detach(), x0.detach())
         return aK, bK
 
     @staticmethod
     def backward(ctx, ga, gb):
-        rec, depth = ctx.rec, ctx.depth
+        rec, depth, seed_is_x0 = ctx.rec, ctx.depth, ctx.seed_is_x0
         a, b, x0 = ctx.saved_tensors
         params = list(rec.parameters())
         pgrads = [torch.zeros_like(p) for p in params]
         gx0 = torch.zeros_like(x0)
-        for _ in range(int(depth)):
-            # Algebraic inverse of one forward step (no_grad: reconstruction
-            # only, gradients flow through the rebuilt graph below).
+        # Walk steps in REVERSE so the recomputed per-step embedding e_k matches
+        # the forward's e_k at the corresponding step index k (deterministic
+        # function of k -> exact reconstruction; see ReversibleRecurrence).
+        for k in reversed(range(int(depth))):
+            # e_k is grad-needing through step_emb.weight (a member of params),
+            # so it MUST live on the rebuilt local graph below — never inside the
+            # no_grad reconstruction. We compute it twice: once detached (for the
+            # algebraic inverse) and once live (for the VJP). Both are the same
+            # deterministic value, so reconstruction stays exact.
             with torch.no_grad():
-                b_prev = b - rec.G(a + x0)
-                a_prev = a - rec.F(b_prev + x0)
+                e_k = rec._step_vec(k, x0)
+                # Algebraic inverse of one forward step (no_grad: reconstruction
+                # only, gradients flow through the rebuilt graph below).
+                b_prev = b - rec.G(a + x0 + e_k)
+                a_prev = a - rec.F(b_prev + x0 + e_k)
             # Rebuild the single forward step on fresh leaves. Use .clone() so
             # the y-leg/z-leg pair and successive steps do not alias storage.
             # enable_grad: a custom Function's backward runs with grad disabled
             # by default; we need a live local graph to take the per-step VJP.
+            # e_k_live keeps step_emb.weight on the graph so its grad slot fills.
             with torch.enable_grad():
                 ap = a_prev.clone().requires_grad_(True)
                 bp = b_prev.clone().requires_grad_(True)
                 x0r = x0.clone().requires_grad_(True)
-                a_new = ap + rec.F(bp + x0r)
-                b_new = bp + rec.G(a_new + x0r)
+                e_k_live = rec._step_vec(k, x0r)
+                a_new = ap + rec.F(bp + x0r + e_k_live)
+                b_new = bp + rec.G(a_new + x0r + e_k_live)
             grads = torch.autograd.grad(
                 (a_new, b_new), [ap, bp, x0r, *params],
                 grad_outputs=(ga, gb), retain_graph=False, allow_unused=True,
@@ -182,10 +273,20 @@ class RevRecurrenceFn(torch.autograd.Function):
                 if g is not None:
                     pgrads[i] = pgrads[i] + g
             a, b = a_prev, b_prev
-        # Seed: a0 = b0 = x0, so the cotangents that reached the loop entry
-        # (ga, gb) both flow into x0 in addition to the per-step injection.
-        gx0 = gx0 + ga + gb
-        return (None, gx0, None, *pgrads)
+        # Seed grad. With a0=b0=x0 (init_state="x0") the cotangents reaching the
+        # loop entry (ga, gb) ALSO flow into x0 (the seed-grad term), and the
+        # a0/b0 grad slots are None. With a random seed independent of x0
+        # (init_state="random") the seed-grad term is DROPPED — x0 keeps only its
+        # per-step injection grad — and ga/gb are returned in the a0/b0 slots
+        # (autograd requires a slot per input; the random init has no learnable
+        # parent so the caller discards these). Grad-equivalence stays EXACT for
+        # both modes. Signature: (rec, x0, a0, b0, depth, seed_is_x0, *params).
+        if seed_is_x0:
+            gx0 = gx0 + ga + gb
+            ga0 = gb0 = None
+        else:
+            ga0, gb0 = ga, gb
+        return (None, gx0, ga0, gb0, None, None, *pgrads)
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +926,31 @@ class Hyperparameters:
     #   expert_b_init: routed-expert up-proj (w_out) init. small = non-zero
     #     engagement default; zero = classic LoRA-B (needs shared experts base).
     expert_b_init: str = "small"
+    #   step_conditioning: inject a LEARNED per-step embedding e_k into each
+    #     recurrence step (the M_clk clock / UT timestep embedding). This is the
+    #     principled fix for effective-depth collapse: a tied block iterated K
+    #     times collapses to a fixed point (phi -> 0, depth-gain G_T -> 0);
+    #     e_k makes each step a DISTINCT function (a depth-K program). OFF by
+    #     default so the unconditioned path is byte-identical. Reversibility is
+    #     preserved: e_k is a deterministic function of the step index k, so the
+    #     reverse pass recomputes the same e_k (exact fp64 reconstruction).
+    step_conditioning: bool = False
+    #   max_step_emb: clock-table size (number of distinct learned step
+    #     embeddings). A depth beyond the table reuses the last entry (frozen
+    #     clock) rather than erroring. Only allocated when step_conditioning.
+    max_step_emb: int = 256
+    #   init_state: recurrence seed (a_0, b_0). "x0" (default): a_0=b_0=x_0
+    #     (current; byte-identical). "random": small random NON-LEARNABLE a_0/b_0
+    #     INDEPENDENT of x_0 (Huginn-style path-independent init), while x_0 is
+    #     STILL injected each step. The Occam-first anti-collapse fix: a tied
+    #     recurrence seeded at x_0 can collapse to a fixed point (effective depth
+    #     phi -> 0, depth-gain G_T -> 0); seeding from noise forces the K steps to
+    #     do REAL work mapping noise -> solution, so depth is used (cite huginn).
+    #     Reversibility (fp64 reconstruction) + grad-equivalence are preserved for
+    #     both modes (the seed-grad term is dropped for the random seed).
+    init_state: str = "x0"
+    #   init_state_std: std of the random a_0/b_0 when init_state="random".
+    init_state_std: float = 0.02
 
 
 class _DeltaSubBlock(nn.Module):
@@ -973,7 +1099,15 @@ class M0GPT(nn.Module):
 
         F_block = _PreNormDeltaBlock(args)
         G_block = _PreNormDeltaBlock(args)
-        self.rec = ReversibleRecurrence(F_block, G_block)
+        # Optional per-step (clock) embedding — the principled fix for
+        # effective-depth collapse. Registered as a SUBMODULE of the recurrence
+        # (not M0GPT) so its weight rides the existing self.parameters() tuple
+        # that RevRecurrenceFn passes/returns grads for (custom-autograd-input).
+        step_emb = None
+        if args.step_conditioning:
+            step_emb = nn.Embedding(args.max_step_emb, d)
+            nn.init.normal_(step_emb.weight, mean=0.0, std=0.02)
+        self.rec = ReversibleRecurrence(F_block, G_block, step_emb=step_emb)
 
         # Readout norm of the reversible midpoint, applied OUTSIDE the recurrence
         # so reconstruction stays exact (see class docstring).
@@ -1021,7 +1155,18 @@ class M0GPT(nn.Module):
     def forward(self, tokens, targets, depth):
         B, T = tokens.shape
         x0 = self.tok_emb(tokens) + self.pos_emb[:, :T]
-        z_K = self.rec.run_reversible(x0, depth)
+        # Recurrence seed (--init-state). "x0" (default): a0=b0=x0 (implicit,
+        # byte-identical). "random": small random NON-LEARNABLE a0/b0 INDEPENDENT
+        # of x0 (Huginn path-independent init); x0 is still injected each step.
+        # The seeds need NOT be regenerated in backward — the reversible inverse
+        # recovers them from the terminal state regardless of their value — they
+        # only must be the SAME tensors the forward used, which run_reversible
+        # guarantees (they are saved/reconstructed inside RevRecurrenceFn).
+        a0 = b0 = None
+        if self.args.init_state == "random":
+            a0 = self.args.init_state_std * torch.randn_like(x0)
+            b0 = self.args.init_state_std * torch.randn_like(x0)
+        z_K = self.rec.run_reversible(x0, depth, a0=a0, b0=b0)
         z = self.final_norm(z_K)  # readout norm, OUTSIDE the recurrence
         logp = self.mos_head(z)
         if not torch.isfinite(logp).all():
@@ -2163,6 +2308,32 @@ def build_arg_parser():
                    help="Routed-expert up-proj (w_out) init: small=non-zero "
                         "engagement default; zero=classic LoRA-B (only sensible "
                         "with --num-shared-experts>0 providing a base).")
+    p.add_argument("--step-conditioning", action="store_true",
+                   help="Inject a LEARNED per-step embedding e_k into each "
+                        "recurrence step (the M_clk clock / UT timestep "
+                        "embedding). Principled fix for effective-depth collapse: "
+                        "makes each tied-block step a DISTINCT function (a "
+                        "depth-K program, not a fixed-point iteration). "
+                        "Reversibility-safe (e_k is a deterministic function of "
+                        "the step index k, recomputed identically in reverse). "
+                        "Default OFF -> byte-identical unconditioned path.")
+    p.add_argument("--max-step-emb", type=int, default=256,
+                   help="Clock-table size for --step-conditioning (number of "
+                        "distinct learned step embeddings). Depth beyond the "
+                        "table reuses the last entry (frozen clock).")
+    p.add_argument("--init-state", type=str, default="x0", choices=("x0", "random"),
+                   help="Recurrence seed (a0, b0). x0 (default): a0=b0=x0 "
+                        "(current behavior, byte-identical). random: small random "
+                        "NON-LEARNABLE a0/b0 INDEPENDENT of x0 (Huginn-style "
+                        "path-independent init), while x0 is STILL injected each "
+                        "step. The Occam-first anti-collapse fix for effective- "
+                        "depth collapse (a tied recurrence seeded at x0 can "
+                        "collapse to a fixed point: phi -> 0, G_T -> 0; a random "
+                        "seed forces real depth-K work mapping noise -> solution). "
+                        "Reversibility + grad-equivalence preserved for both modes.")
+    p.add_argument("--init-state-std", type=float, default=0.02,
+                   help="Std of the random a0/b0 when --init-state random "
+                        "(default 0.02).")
     # Training schedule / batch.
     p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--seq-len", type=int, default=512)
@@ -2212,6 +2383,14 @@ def build_arg_parser():
                         "overriding --moe-target-active-frac for the controller.")
     p.add_argument("--k-eval", type=int, default=None,
                    help="Eval depth (default: max of --k-set).")
+    p.add_argument("--k-eval-sweep", type=str, default=None,
+                   help="Comma-separated eval depths for the end-of-run "
+                        "depth-gain MEASUREMENT (e.g. '8,16,32,64'). When set, "
+                        "after the final validation each K is evaluated and the "
+                        "depth-gain G_T = bpb[min K] - bpb[max K] (positive => "
+                        "depth helps) plus an eval-K phi proxy are printed. "
+                        "Rank-0 / end-of-run only (no hot-loop syncs). "
+                        "Default None disables the sweep.")
     # Optimizer.
     p.add_argument("--matrix-lr", type=float, default=0.02)
     p.add_argument("--embed-lr", type=float, default=0.1)
@@ -2299,6 +2478,8 @@ def main(argv=None):
         n_attn_experts=args.n_attn_experts,
         num_shared_experts=args.num_shared_experts,
         n_sublayers=args.n_sublayers, expert_b_init=args.expert_b_init,
+        step_conditioning=args.step_conditioning, max_step_emb=args.max_step_emb,
+        init_state=args.init_state, init_state_std=args.init_state_std,
     )
     base_model = M0GPT(model_args).to(device)
     model = base_model
@@ -2496,6 +2677,39 @@ def main(argv=None):
         grad_accum_steps=grad_accum_steps, device=device, luts=luts,
         autocast_enabled=autocast_enabled)
     print0(f"final val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
+
+    # --- depth-gain MEASUREMENT (--k-eval-sweep): end-of-run, rank-0 only ---
+    # Evaluate the trained model at each requested recurrent depth K and report
+    # the depth-gain G_T = bpb[min K] - bpb[max K] (positive => deeper recurrence
+    # helps) plus an eval-K phi proxy. This confirms whether depth buys anything
+    # (the looped/UT failure mode is G_T -> 0). It runs OUTSIDE the hot loop (no
+    # micro-loop syncs); run_validation already all-reduces across ranks.
+    if args.k_eval_sweep:
+        sweep_ks = _parse_int_set(args.k_eval_sweep)
+        if not sweep_ks:
+            raise ValueError("--k-eval-sweep must contain at least one depth")
+        sweep_loss = {}
+        sweep_bpb = {}
+        for k in sweep_ks:
+            k_loss, k_bpb = run_validation(
+                base_model, val_loader, depth=k, n_batches=args.eval_batches,
+                seq_len=args.seq_len, global_tokens=batch_tokens,
+                grad_accum_steps=grad_accum_steps, device=device, luts=luts,
+                autocast_enabled=autocast_enabled)
+            sweep_loss[k] = k_loss
+            sweep_bpb[k] = k_bpb
+            print0(f"depth_sweep: K={k} val_bpb:{k_bpb:.4f} val_loss:{k_loss:.4f}")
+        # Depth-gain over the swept budgets: bpb at the SHALLOWEST minus bpb at
+        # the DEEPEST (positive => depth helps). On the synthetic smoke (no
+        # tokenizer) bpb is NaN, so G_T is NaN there; the loss path still ran.
+        k_min, k_max = min(sweep_ks), max(sweep_ks)
+        gt = sweep_bpb[k_min] - sweep_bpb[k_max]
+        print0(f"depth_gain_GT:{gt:.4f}")
+        # Eval-K phi PROXY: the iso-depth recurrence-equivalence exponent fitted
+        # on the {K: val_loss} map. NOTE this is an EVAL-DEPTH proxy (it varies
+        # the inference budget K of one trained model), NOT the train-r phi (which
+        # would compare models trained at different recurrence budgets r).
+        print0(f"phi_eval:{fit_phi(sweep_loss):.4f}")
 
     # --- peak VRAM (RESOURCE-goal headline; memory-efficiency, no gate) ---
     # Integer MiB to match the existing ``peak_vram_mb:<int>`` log contract that

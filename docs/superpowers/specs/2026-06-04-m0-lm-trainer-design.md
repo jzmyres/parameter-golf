@@ -99,6 +99,28 @@ RevFFN's no-floor design). `F_θ`/`G_θ` are pre-norm blocks: **MLA attention + 
   Sustained displacement ⇒ the recurrence keeps doing work at depth (high effective depth); rapid
   decay to ≈0 ⇒ early saturation. Computed under `no_grad` at the log site (`recurrence_displacement`
   / `displacement_tail`), never in the grad-accum hot loop.
+- **Depth-gain MEASUREMENT (`--k-eval-sweep`).** A tied recurrence can collapse to a fixed point —
+  effective depth `φ → 0`, depth-gain `G_T → 0` — so we MEASURE whether depth buys anything before
+  trusting internal depth metrics. `--k-eval-sweep 8,16,32,64` (comma ints, default empty) evaluates
+  the trained model at each recurrent depth K **after the final validation** (rank-0, end-of-run only;
+  no hot-loop syncs) and prints one `depth_sweep: K=… val_bpb:… val_loss:…` line per K, then
+  `depth_gain_GT = val_bpb[min K] − val_bpb[max K]` (positive ⇒ deeper recurrence helps) and a
+  `phi_eval` proxy (`fit_phi` over the `{K: val_loss}` map — an **eval-depth** φ proxy that varies the
+  inference budget of ONE trained model, NOT the train-r φ that compares models trained at different
+  budgets).
+- **Anti-collapse fix #2: random state init (`--init-state ∈ {x0, random}`, default `x0`; the
+  Occam-first fix).** Per Occam we test the SIMPLEST principled anti-collapse fix first: Huginn-style
+  **random state initialization**~\cite{huginn} instead of `a_0=b_0=x_0`. `x0` (default) is the current
+  byte-identical behavior. `random` seeds the recurrence with small random **non-learnable** `a_0, b_0`
+  (`init_state_std · randn`, default 0.02) **independent of `x_0`**, while `x_0` is STILL injected each
+  step (`b_k + x_0`). With input-injection + K-sampling already present, a path-independent seed forces
+  the K steps to do REAL work mapping noise → solution, so the recurrence must USE depth rather than
+  sit at a fixed point. **Reversibility + grad-equivalence are preserved for both modes:** the algebraic
+  inverse recovers the random `(a_0, b_0)` exactly (fp64), and the custom backward DROPS the x0-init
+  seed-grad term (`gx0 += ga + gb`) for the random seed (the random init is non-learnable, so `ga/gb`
+  at the loop entry are returned in the `a_0/b_0` grad slots and discarded; `x_0` keeps only its
+  per-step injection grad) — keeping the reversible backward bit-for-bit equal to ordinary autograd
+  (max grad diff ≈ 3e-14).
 - **Low-rank everywhere it pays:** experts, MLP, MLA Q/KV, MoS components are low-rank with
   rank set per-matrix on the **erank** frontier (Roy & Vetterli 2007; ARSVD). Small matrices
   (norms, gates, **router**, the tiny vocab=1024 embedding) stay full-rank.

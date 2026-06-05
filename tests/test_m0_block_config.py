@@ -399,3 +399,120 @@ def test_cli_parser_block_config_defaults():
     assert args.num_shared_experts == 0
     assert args.n_sublayers == 1
     assert args.expert_b_init == "small"
+
+
+# ---------------------------------------------------------------------------
+# Knob 6: step-conditioning (the M_clk clock / principled fix for
+# effective-depth collapse). The HARD gate is fp64 reconstruction with the
+# per-step embedding ON across block/attn-moe combos (the reverse pass must
+# recompute e_k identically). Plus default-off byte-identity and a
+# distinguishability test (steps actually depend on e_k).
+# ---------------------------------------------------------------------------
+def test_step_conditioning_defaults_off():
+    a = _args()
+    assert a.step_conditioning is False
+    assert a.max_step_emb == 256
+    # default model has no clock submodule
+    m = M0GPT(a)
+    assert m.rec.step_emb is None
+
+
+_SC_BLOCK_ORDERS = ("attn_ffn", "parallel")
+_SC_ATTN_MOE = (False, True)
+
+
+@pytest.mark.parametrize(
+    "block_order,attn_moe",
+    list(itertools.product(_SC_BLOCK_ORDERS, _SC_ATTN_MOE)),
+)
+def test_step_conditioning_reconstructs_fp64(block_order, attn_moe):
+    """HARD reversibility gate: with step_conditioning ON the reverse pass must
+    recompute the same per-step e_k for every k and reconstruct x0 in fp64."""
+    torch.manual_seed(0)
+    args = _args(
+        block_order=block_order, attn_moe=attn_moe,
+        step_conditioning=True, max_step_emb=16, n_experts=4,
+    )
+    m = M0GPT(args).double()
+    rec = m.rec
+    assert rec.step_emb is not None
+    with torch.no_grad():
+        # Non-trivial recurrence AND a non-trivial clock (otherwise e_k is ~0
+        # and the test does not exercise the per-step injection).
+        for blk in (rec.F, rec.G):
+            for sub in blk.sublayers:
+                for mod in sub.attn_modules():
+                    mod.o_proj.weight.normal_(std=0.3)
+                for moe in sub.moe_modules():
+                    moe.w_out.normal_(std=0.3)
+        rec.step_emb.weight.normal_(std=0.5)
+    x0 = torch.randn(2, 5, 16, dtype=torch.float64)
+    (aK, bK), _ = rec.forward_states(x0, x0, x0, depth=4)
+    assert not torch.allclose(aK, x0), "recurrence is trivially identity; test vacuous"
+    a0, b0 = rec.invert(aK, bK, x0, depth=4)
+    assert torch.allclose(a0, x0, atol=1e-7) and torch.allclose(b0, x0, atol=1e-7)
+
+
+def test_step_conditioning_off_is_byte_identical_to_baseline():
+    """step_conditioning=False must produce the SAME recurrence output as a
+    model built without the knob (no silent regression of the default path)."""
+    torch.manual_seed(0)
+    base = M0GPT(_args()).double()
+    torch.manual_seed(0)
+    off = M0GPT(_args(step_conditioning=False)).double()
+    # identical params (same seed, same construction) -> identical forward
+    x0 = torch.randn(2, 5, 16, dtype=torch.float64)
+    (a_base, b_base), _ = base.rec.forward_states(x0, x0, x0, depth=4)
+    (a_off, b_off), _ = off.rec.forward_states(x0, x0, x0, depth=4)
+    assert torch.equal(a_base, a_off) and torch.equal(b_base, b_off)
+
+
+def test_step_conditioning_steps_depend_on_e_k():
+    """With step_conditioning ON, zeroing the clock embedding must CHANGE the
+    depth-K recurrence output — i.e. the steps are genuinely distinguished by
+    e_k (not a no-op injection)."""
+    torch.manual_seed(0)
+    args = _args(step_conditioning=True, max_step_emb=16)
+    m = M0GPT(args).double()
+    rec = m.rec
+    with torch.no_grad():
+        # Make F/G non-trivial so the clock can actually steer the dynamics.
+        for blk in (rec.F, rec.G):
+            for sub in blk.sublayers:
+                for mod in sub.attn_modules():
+                    mod.o_proj.weight.normal_(std=0.3)
+        rec.step_emb.weight.normal_(std=0.5)
+    x0 = torch.randn(2, 5, 16, dtype=torch.float64)
+    (aK_on, bK_on), _ = rec.forward_states(x0, x0, x0, depth=4)
+    with torch.no_grad():
+        rec.step_emb.weight.zero_()
+    (aK_off, bK_off), _ = rec.forward_states(x0, x0, x0, depth=4)
+    out_on = 0.5 * (aK_on + bK_on)
+    out_off = 0.5 * (aK_off + bK_off)
+    assert not torch.allclose(out_on, out_off, atol=1e-6)
+
+
+def test_step_conditioning_weight_in_exactly_one_optimizer_group():
+    """The clock embedding weight must be covered by exactly one optimizer
+    group (coverage contract) when step_conditioning is on."""
+    args = _args(model_dim=32, vocab_size=1024, step_conditioning=True, max_step_emb=8)
+    m = M0GPT(args)
+    optimizers = build_optimizers(m, matrix_lr=0.02, embed_lr=0.1, scalar_lr=0.02)
+    sc_id = id(m.rec.step_emb.weight)
+    count = sum(
+        1 for opt in optimizers for g in opt.param_groups
+        for p in g["params"] if id(p) == sc_id
+    )
+    assert count == 1, f"step_emb.weight is in {count} optimizer groups (want 1)"
+
+
+def test_cli_parser_exposes_step_conditioning():
+    from train_gpt import build_arg_parser
+
+    p = build_arg_parser()
+    args = p.parse_args(["--step-conditioning", "--max-step-emb", "64"])
+    assert args.step_conditioning is True
+    assert args.max_step_emb == 64
+    defaults = p.parse_args([])
+    assert defaults.step_conditioning is False
+    assert defaults.max_step_emb == 256

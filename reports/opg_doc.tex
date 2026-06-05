@@ -307,6 +307,25 @@ Use Huginn-style recurrence-count sampling for \(q_{\rm deep}\) and test-time de
 per-step input injection \cite{huginn}.  Do not borrow truncated BPTT for the core: reversibility
 affords full BPTT and is the memory advantage being tested.
 
+\paragraph{Depth-gain measurement and the Occam anti-collapse fix.}
+A tied recurrence can collapse to a fixed point---effective depth \(\varphi\to 0\), depth-gain
+\(G_T\to 0\)---so the \code{M0} trainer first \emph{measures} whether depth buys anything before
+trusting internal depth metrics.  The \code{--k-eval-sweep} flag evaluates one trained model at each
+recurrent depth \(K\) after the final validation (rank-0, end-of-run only) and emits
+\(G_T=\bpb(K_{\min})-\bpb(K_{\max})\) (positive when deeper recurrence helps) plus an eval-depth
+\(\varphi\) proxy fitted over the \(\{K:\text{loss}(K)\}\) map.  When collapse is detected, the
+simplest principled fix---tested first per Occam---is Huginn-style \emph{random state
+initialization}~\cite{huginn} (\code{--init-state random}): the recurrence is seeded with small
+random non-learnable \(a_0,b_0\) independent of the injected token state \(x_0\) (the default
+\code{x0} keeps \(a_0=b_0=x_0\), byte-identical to the prior behavior), while \(x_0\) is still
+injected at every step.  Combined with the input injection and depth sampling already present, a
+path-independent seed forces the \(K\) steps to do real work mapping noise to the solution, so the
+recurrence \emph{uses} depth rather than settling at a fixed point.  Both the exact fp64
+reconstruction and the grad-equivalence of the reversible backward to ordinary BPTT are preserved
+for both seed modes: the algebraic inverse recovers the random seed exactly, and the custom backward
+drops the \(x_0\)-seed gradient term (\(g_{x_0}\mathrel{+}=g_a+g_b\)) when the seed is the random,
+non-learnable init---returning \(g_a,g_b\) in the seed slots, which the caller discards.
+
 \paragraph{Scale and statistics.}
 Use \(d_{\rm model}\in[256,512]\), one reversible block, context length at most 1024, and multiple
 seeds.  Evaluate

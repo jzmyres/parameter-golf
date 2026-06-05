@@ -877,6 +877,145 @@ def test_m0_trainer_smoke_grad_accum_two(tmp_path):
     assert (tmp_path / "m2.bin").stat().st_size > 0
 
 
+def test_m0_trainer_k_eval_sweep_emits_depth_gain(tmp_path, capsys):
+    """--k-eval-sweep prints one depth_sweep line per K plus a depth_gain_GT
+    and a phi_eval line at the end of the run (the depth-gain MEASUREMENT)."""
+    import re
+    from train_gpt import main
+
+    main(["--iterations", "2", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
+          "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8",
+          "--head-dim", "8", "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+          "--k-set", "2,4", "--k-eval-sweep", "2,4,8",
+          "--artifact-out", str(tmp_path / "ks.bin")])
+    out = capsys.readouterr().out
+    swept = {}
+    for ln in out.splitlines():
+        m = re.match(
+            r"depth_sweep: K=(\d+) val_bpb:([-+0-9.eEnNaA]+) val_loss:([-+0-9.eEnNaA]+)",
+            ln)
+        if m:
+            swept[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+    assert set(swept) == {2, 4, 8}, f"missing depth_sweep lines: {swept}"
+    # val_loss is real (finite) even on the synthetic smoke (bpb may be NaN).
+    for k, (bpb, loss) in swept.items():
+        assert loss == loss, f"K={k} val_loss is NaN"  # noqa: PLR0124
+    m_gt = re.search(r"^depth_gain_GT:([-+0-9.eEnNaA]+)", out, re.MULTILINE)
+    m_phi = re.search(r"^phi_eval:([-+0-9.eEnNaA]+)", out, re.MULTILINE)
+    assert m_gt is not None, "no depth_gain_GT line"
+    assert m_phi is not None, "no phi_eval line"
+    # phi_eval is a finite proxy in [0, 1] (synthetic bpb is NaN but loss is real,
+    # so fit_phi over the {K: val_loss} map is well-defined and clamped).
+    phi = float(m_phi.group(1))
+    assert 0.0 <= phi <= 1.0, phi
+
+
+def test_init_state_cli_default_and_choices():
+    """--init-state defaults to x0 (current behavior); random is the Huginn fix."""
+    from train_gpt import build_arg_parser
+
+    p = build_arg_parser()
+    assert p.parse_args([]).init_state == "x0"
+    assert p.parse_args(["--init-state", "random"]).init_state == "random"
+    assert p.parse_args(["--init-state", "x0"]).init_state == "x0"
+
+
+def test_init_state_x0_is_byte_identical_default():
+    """init_state='x0' (default) reproduces the current forward/grad EXACTLY.
+
+    A no-regression guard: switching the default Hyperparameter on must not move
+    a single bit relative to a model built without the field set (the x0 seed
+    path is unchanged)."""
+    from train_gpt import Hyperparameters, M0GPT
+
+    def _build():
+        return M0GPT(Hyperparameters(
+            model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+            n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+            max_seq_len=16,
+        ))
+
+    torch.manual_seed(0)
+    m_default = _build()
+    torch.manual_seed(0)
+    m_x0 = M0GPT(Hyperparameters(
+        model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16, init_state="x0",
+    ))
+    x = torch.randint(0, 64, (2, 16))
+    y = x.clone()
+    l_default = m_default(x, y, depth=4)
+    l_x0 = m_x0(x, y, depth=4)
+    assert torch.equal(l_default.detach(), l_x0.detach())
+    l_default.backward()
+    g_default = {n: p.grad.clone() for n, p in m_default.named_parameters()}
+    l_x0.backward()
+    for n, p in m_x0.named_parameters():
+        assert torch.allclose(p.grad, g_default[n], atol=1e-12), n
+
+
+def test_init_state_random_changes_forward_and_trains():
+    """init_state='random' seeds the recurrence with small random a0/b0 (not x0),
+    which changes the forward output vs the x0 seed, and the model still trains
+    (finite gradients to every param) under the random seed."""
+    from train_gpt import Hyperparameters, M0GPT
+
+    def _build(init_state):
+        torch.manual_seed(0)
+        return M0GPT(Hyperparameters(
+            model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+            n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+            max_seq_len=16, init_state=init_state,
+        ))
+
+    x = torch.randint(0, 64, (2, 16))
+    y = x.clone()
+    m_x0 = _build("x0")
+    m_rand = _build("random")
+    # Same params (same seed); only the seed-state path differs -> different loss.
+    torch.manual_seed(123)
+    l_x0 = m_x0(x, y, depth=4)
+    torch.manual_seed(123)
+    l_rand = m_rand(x, y, depth=4)
+    assert not torch.allclose(l_x0.detach(), l_rand.detach())
+    # Trains: finite, non-zero gradients reach the params under the random seed.
+    l_rand.backward()
+    g_norm = sum(p.grad.norm().item() for p in m_rand.parameters() if p.grad is not None)
+    assert g_norm > 0.0
+    for p in m_rand.parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all()
+
+
+def test_m0_trainer_init_state_random_smoke(tmp_path):
+    """End-to-end CPU smoke with --init-state random: trains and writes an
+    artifact (the Huginn path-independent init runs through the custom backward)."""
+    from train_gpt import main
+
+    main(["--iterations", "2", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
+          "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8",
+          "--head-dim", "8", "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+          "--init-state", "random", "--k-set", "2,4",
+          "--artifact-out", str(tmp_path / "ri.bin")])
+    assert (tmp_path / "ri.bin").exists()
+    assert (tmp_path / "ri.bin").stat().st_size > 0
+
+
+def test_m0_trainer_step_conditioning_smoke(tmp_path):
+    """End-to-end CPU smoke with --step-conditioning ON: trains and writes an
+    artifact (the clock weight rides the optimizer + custom backward)."""
+    from train_gpt import main
+
+    main(["--iterations", "2", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
+          "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8",
+          "--head-dim", "8", "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+          "--step-conditioning", "--max-step-emb", "8", "--k-set", "2,4",
+          "--artifact-out", str(tmp_path / "sc.bin")])
+    assert (tmp_path / "sc.bin").exists()
+    assert (tmp_path / "sc.bin").stat().st_size > 0
+
+
 def test_format_metrics_line_emits_throughput_and_vram_util_ops_stats():
     """The metrics: line carries tok_per_s + vram_util_pct as OPS/efficiency
     diagnostics (NOT the resource-GOAL peak-VRAM / R_act numbers). On CPU
