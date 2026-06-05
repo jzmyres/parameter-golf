@@ -49,6 +49,7 @@ M0_METRICS_FIELDS: tuple[str, ...] = (
     "router_entropy", # collapse diag: mean per-token router entropy
     "expert_util",    # collapse diag: global expert-utilization entropy
     "disp_tail",      # effective-depth diag: tail-mean recurrence displacement
+    "recon_rel",      # BPTT gradient-correctness gate: reversible round-trip err
     "tok_per_s",      # ops/efficiency: tokens/wall-second (throughput)
     "vram_util_pct",  # ops/efficiency: peak VRAM as % of device memory
     "R_act",          # resource (headline): activation-memory scaling (sweep)
@@ -431,7 +432,10 @@ def parse_log(logpath: str) -> dict:
                 last_step_seen if last_step_seen is not None else len(data["metrics_steps"]) + 1
             )
             for field in M0_METRICS_FIELDS:
-                m_f = re.search(rf"\b{field}:{_FLOAT}", m.group(1))
+                # NaN/sci-notation-tolerant: recon_rel spans 1e-15..1e-2 (sci
+                # notation) and any field may legitimately log `nan` (e.g. an
+                # empty-displacement disp_tail). Absent on the line -> NaN.
+                m_f = re.search(rf"\b{field}:{_FLOAT_NAN}", m.group(1))
                 data[field].append(float(m_f.group(1)) if m_f else math.nan)
 
         # Validation steps

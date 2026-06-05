@@ -356,3 +356,91 @@ def test_displacement_tail_summary_helper():
     assert abs(displacement_tail(vals) - (0.25 + 0.125) / 2) < 1e-9
     # Empty -> NaN (no forward yet).
     assert displacement_tail([]) != displacement_tail([])
+
+
+# --- reconstruction_error (reversible round-trip / BPTT gradient-correctness gate) -
+def _small_m0_args(**overrides):
+    """Tiny CPU M0 config for the recon_rel probe tests."""
+    from train_gpt import Hyperparameters
+
+    base = dict(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=16, n_experts=4,
+        expert_rank=4, n_mix=2, kv_latent=4, head_dim=8, max_seq_len=16,
+    )
+    base.update(overrides)
+    return Hyperparameters(**base)
+
+
+def test_reconstruction_error_fp64_near_exact_depth8_and_16():
+    """The gradient-correctness gate: in fp64 the reversible inverse round-trips
+    the seed (a0, b0) to ~machine precision, so recon_rel is ~0 (< 1e-10) at both
+    a shallow and a deep budget — confirming the backward reconstructs the true
+    forward graph (and hence the true gradients)."""
+    from train_gpt import M0GPT, reconstruction_error
+
+    torch.manual_seed(0)
+    m = M0GPT(_small_m0_args()).double()  # fp64 model -> near-exact round-trip
+    tokens = torch.randint(0, 16, (2, 5))
+    for depth in (8, 16):
+        rel = reconstruction_error(m, tokens, depth)
+        assert isinstance(rel, float)
+        assert rel >= 0.0
+        assert rel < 1e-10, (depth, rel)
+
+
+def test_reconstruction_error_fp32_finite_nonneg():
+    """fp32 model: the probe returns a finite non-negative float (nonzero round-
+    trip drift is allowed; the gate only requires a measurable finite value)."""
+    from train_gpt import M0GPT, reconstruction_error
+
+    torch.manual_seed(0)
+    m = M0GPT(_small_m0_args())  # default fp32
+    tokens = torch.randint(0, 16, (2, 5))
+    rel = reconstruction_error(m, tokens, depth=8)
+    assert isinstance(rel, float)
+    assert rel == rel and rel >= 0.0  # finite (not NaN) and non-negative
+
+
+def test_reconstruction_error_random_init_finite_nonneg():
+    """random-init model: round-trip fidelity is SEED-INDEPENDENT — the SAME
+    (a0, b0) drawn for the forward are inverted from (aK, bK), so the relative
+    round-trip error is still a finite non-negative float."""
+    from train_gpt import M0GPT, reconstruction_error
+
+    torch.manual_seed(0)
+    m = M0GPT(_small_m0_args(init_state="random"))
+    tokens = torch.randint(0, 16, (2, 5))
+    rel = reconstruction_error(m, tokens, depth=8)
+    assert isinstance(rel, float)
+    assert rel == rel and rel >= 0.0
+
+
+def test_reconstruction_error_step_conditioning_fp64_near_exact():
+    """step_conditioning model: e_k is recomputed deterministically from the step
+    index inside ``invert``, so the round-trip stays near-exact in fp64 (< 1e-10).
+    """
+    from train_gpt import M0GPT, reconstruction_error
+
+    torch.manual_seed(0)
+    m = M0GPT(_small_m0_args(step_conditioning=True)).double()
+    tokens = torch.randint(0, 16, (2, 5))
+    rel = reconstruction_error(m, tokens, depth=8)
+    assert isinstance(rel, float)
+    assert rel >= 0.0
+    assert rel < 1e-10, rel
+
+
+def test_format_metrics_line_includes_recon_rel_when_present():
+    """``recon_rel`` is rendered (scientific notation) when supplied and omitted
+    when absent (mirrors the ``disp_tail`` formatter contract)."""
+    from train_gpt import format_metrics_line
+
+    base = {"erank": 1.0, "peak_vram": 0.0, "kv_bytes": 1, "params": 1}
+    with_recon = format_metrics_line({**base, "recon_rel": 5e-16})
+    assert "recon_rel:" in with_recon
+    # Absent key -> field omitted.
+    without = format_metrics_line(base)
+    assert "recon_rel:" not in without
+    # None value -> field omitted (same guard as disp_tail).
+    none_val = format_metrics_line({**base, "recon_rel": None})
+    assert "recon_rel:" not in none_val

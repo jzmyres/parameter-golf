@@ -206,6 +206,17 @@ last half of the depth steps of the per-step relative recurrence displacement
 \(\lVert z_{k+1}-z_k\rVert/\lVert z_k\rVert\) (with \(z_k=\tfrac12(a_k+b_k)\) the reversible midpoint).
 A sustained (non-decaying) displacement signals the recurrence keeps doing work at depth (high
 effective depth); a rapid decay to \(\approx0\) signals early saturation.
+The reversible round-trip error \(\code{\detokenize{recon_rel}}\) is also logged as the BPTT
+\emph{gradient-correctness gate}: the relative error of inverting the terminal state
+\((a_K,b_K)\) back to the seed \((a_0,b_0)\),
+\(\code{\detokenize{recon_rel}}=(\lVert a_0'-a_0\rVert+\lVert b_0'-b_0\rVert)/(\lVert a_0\rVert+\lVert b_0\rVert+\epsilon)\).
+The \(O(1)\)-memory reversible backward reconstructs activations from \((a_K,b_K)\) via exactly this
+inverse, so gradients equal ordinary BPTT only if the round-trip is exact: \(\approx0\) at machine
+precision in fp64 (proven by the reconstruction unit tests), a small nonzero in bf16 (additive
+non-associativity over \(K\) steps).  A large \(\code{\detokenize{recon_rel}}\) means the
+reconstructed graph --- and hence the gradient signal --- drift from the true forward pass.  It is a
+log-site-only probe (one forward sweep plus one inverse sweep), measured under the training bf16
+autocast so it reports the actual training reconstruction drift.
 The trained model can still fail; the point is that the architecture composes
 shared low-rank experts per step into high \emph{effective} depth.  Nestedness across depth is a
 property of the additive-coupling recurrence and budget selection, not of a halting gate.
@@ -372,7 +383,7 @@ replace this with a paired bootstrap over saved per-example gains.
 \midrule
 \(G_T(K_{\rm lo},K_{\rm hi})\) & \GATE\ (P1) & Paired CI, lower bound \(>0\), on a depth-hard task, with knee-straddling pairs and a passing positive control. \\
 \(\mathrm{NDR}_\epsilon\) & \GATE\ (guard) & No-degradation rate \(\le\delta_{\rm task}\). \\
-\(\vram_{\rm peak}\), \(\mathrm{slope}(\vram/\text{batch})\), \(\alpha_{\rm act}\), \(R_{\rm rec}\) & \GATE\ (P2, resource = memory-efficiency) & Peak VRAM is the primary resource number; VRAM-vs-batch scaling slope should be low/flat (\(\mathrm{slope}_{\rm MB/sample}\), OLS fit \code{\detokenize{vram_vs_batch_scaling}}); \(R_{\rm act}(K,2K)\le1.10\) (activation memory \(\approx\)constant in recurrent depth \(K\)); reconstruction error acceptable under actual training stochasticity.  Dropped as resource metrics: the artifact-16\,MB hard gate (artifact bytes logged informationally only), FLOPs/token, and wall-clock/step.  The active-expert fraction is demoted to a MoE-mechanism diagnostic (\code{\detokenize{diag:active_frac}}), not a resource gate.  Throughput (\code{\detokenize{ops:tok_per_s}}) and VRAM utilization (\code{\detokenize{ops:vram_util_pct}}\(=100\cdot\vram_{\rm peak}/\)device memory) are logged as \emph{ops/efficiency} diagnostics (under the \code{ops:} prefix) for tuning the batch / grad-accum knobs --- \code{\detokenize{--grad-accum 1}} runs the whole batch in one forward to fill VRAM, which the \(O(1)\)-in-\(K\) reversible recurrence makes affordable at deep \(K\) --- and are \emph{not} resource gates. \\
+\(\vram_{\rm peak}\), \(\mathrm{slope}(\vram/\text{batch})\), \(\alpha_{\rm act}\), \(R_{\rm rec}\) & \GATE\ (P2, resource = memory-efficiency) & Peak VRAM is the primary resource number; VRAM-vs-batch scaling slope should be low/flat (\(\mathrm{slope}_{\rm MB/sample}\), OLS fit \code{\detokenize{vram_vs_batch_scaling}}); \(R_{\rm act}(K,2K)\le1.10\) (activation memory \(\approx\)constant in recurrent depth \(K\)); the reversible round-trip error \(\code{\detokenize{recon_rel}}\) (the BPTT gradient-correctness gate) acceptable under actual training stochasticity.  Dropped as resource metrics: the artifact-16\,MB hard gate (artifact bytes logged informationally only), FLOPs/token, and wall-clock/step.  The active-expert fraction is demoted to a MoE-mechanism diagnostic (\code{\detokenize{diag:active_frac}}), not a resource gate.  Throughput (\code{\detokenize{ops:tok_per_s}}) and VRAM utilization (\code{\detokenize{ops:vram_util_pct}}\(=100\cdot\vram_{\rm peak}/\)device memory) are logged as \emph{ops/efficiency} diagnostics (under the \code{ops:} prefix) for tuning the batch / grad-accum knobs --- \code{\detokenize{--grad-accum 1}} runs the whole batch in one forward to fill VRAM, which the \(O(1)\)-in-\(K\) reversible recurrence makes affordable at deep \(K\) --- and are \emph{not} resource gates. \\
 Pareto \((S_T,\vram,\mathrm{ms/token})\) & \GATE\ (sufficiency) & On or above frontier versus a matched small dense transformer.  This, not \(G_T>0\) alone, is project success. \\
 \midrule
 Recurrence-equivalence exponent & \DIAG\ (headline) & \(K\) recurrent loops are worth how many untied layers; fit on the synthetic task where hardness is known. \\
@@ -534,7 +545,8 @@ for P3, KV, or deployment while the positive-control gate is failing.  The audit
 implementation gap: \code{experiments/p1\_synthetic.py} verifies
 structural reversibility and P1 detectability, but it does not yet implement custom reversible
 activation reconstruction for training memory.  That is intentional staging, not a P2 claim.  P2 is
-promoted only after activation-memory slope and reconstruction error are measured in the actual
+promoted only after activation-memory slope and the reversible round-trip error
+\(\code{\detokenize{recon_rel}}\) (the BPTT gradient-correctness gate) are measured in the actual
 memory-saving backward path.
 
 \subsection{Feedback-stage implementation split}

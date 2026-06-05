@@ -249,6 +249,35 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["R_act"][1], 2.5)
         self.assertEqual(d["phi"][1], 0.8)
 
+    def test_parse_m0_metrics_recon_rel(self):
+        """``recon_rel`` (reversible round-trip / BPTT gradient-correctness gate)
+        is a per-step series on the ``metrics:`` line, parsed from sci-notation
+        and NaN-tolerant (absent on a line -> NaN, like the other sparse fields)."""
+        from experiments.plot_metrics import M0_METRICS_FIELDS
+
+        self.assertIn("recon_rel", M0_METRICS_FIELDS)
+        log = "\n".join(
+            [
+                "step:10/20 k_hi:64 train_loss:3.2000",
+                # Scientific-notation value (recon_rel spans 1e-15..1e-2).
+                "metrics: erank:512.3456 peak_vram:1024.0000 kv_bytes:128 params:1234567 "
+                "disp_tail:0.3300 recon_rel:5.00e-16",
+                # Second line OMITS recon_rel -> parses to NaN.
+                "step:20/20 k_hi:64 train_loss:3.0000",
+                "metrics: erank:600.0000 peak_vram:2048.0000 kv_bytes:128 params:1234567 "
+                "disp_tail:0.4100",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        self.assertEqual(len(d["recon_rel"]), 2)
+        self.assertAlmostEqual(d["recon_rel"][0], 5.00e-16)
+        self.assertTrue(math.isnan(d["recon_rel"][1]))
+
     def test_parse_depth_gain_sweep_lines(self):
         """The end-of-run depth-gain MEASUREMENT lines (--k-eval-sweep) parse as
         standalone scalars: depth_sweep -> {K: (val_bpb, val_loss)} map,

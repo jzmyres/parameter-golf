@@ -1958,6 +1958,65 @@ def displacement_tail(disp) -> float:
     return float(sum(tail) / len(tail))
 
 
+def reconstruction_error(model, tokens, depth) -> float:
+    """``recon_rel``: relative reversible round-trip error — the BPTT GRADIENT-
+    CORRECTNESS GATE.
+
+    The O(1)-memory reversible backward (:class:`RevRecurrenceFn`) does NOT store
+    intermediate activations: it reconstructs them from the saved terminal state
+    ``(aK, bK)`` via the SAME algebraic inverse measured here
+    (:meth:`ReversibleRecurrence.invert`). Gradients equal ordinary BPTT *only if
+    that reconstruction is exact*. A large round-trip error therefore means the
+    reconstructed graph — and hence the gradients — drift from the true forward
+    pass, silently corrupting the gradient signal.
+
+    The probe seeds ``(a0, b0)`` EXACTLY as :meth:`M0GPT.forward` does for the
+    model's ``init_state`` (``"x0"``: ``a0 = b0 = x0``; ``"random"``: one
+    ``init_state_std * randn_like`` draw each), runs the forward recurrence to
+    ``depth``, inverts the terminal state back to the seed, and returns the
+    RELATIVE round-trip error::
+
+        recon_rel = (||a0r - a0|| + ||b0r - b0||)
+                    / (||a0|| + ||b0|| + eps)
+
+    Round-trip fidelity is SEED-INDEPENDENT (the same ``a0, b0`` are inverted), so
+    the random-init mode is measured against its own draw. ``e_k`` (step
+    conditioning) is a deterministic function of the step index recomputed inside
+    ``invert``, so the round-trip stays exact under it too. The value is ``~0``
+    (machine precision) in fp64 — proven by the reversibility tests — and a small
+    nonzero in bf16 (additive non-associativity over ``K`` steps).
+
+    Runs at the AMBIENT dtype / autocast of the CALLER: at the rank-0 log site
+    (under bf16 autocast) it measures REAL training reconstruction drift; the
+    fp64/fp32 unit tests measure it without autocast. Costs ~``2 * depth`` block
+    evaluations (one forward sweep + one inverse sweep), so — like ``disp_tail``
+    via :func:`recurrence_displacement` — it is a LOG-SITE-only probe and must
+    NEVER be called inside the grad-accum hot loop.
+    """
+    inner = model.module if hasattr(model, "module") else model
+    rec = inner.rec
+    was_training = inner.training
+    inner.eval()
+    try:
+        with torch.no_grad():
+            x0 = inner.tok_emb(tokens) + inner.pos_emb[:, :tokens.shape[1]]
+            # Seed EXACTLY as M0GPT.forward does for the model's init_state.
+            if inner.args.init_state == "random":
+                a0 = inner.args.init_state_std * torch.randn_like(x0)
+                b0 = inner.args.init_state_std * torch.randn_like(x0)
+            else:  # "x0": a0 = b0 = x0
+                a0 = b0 = x0
+            (aK, bK), _ = rec.forward_states(a0, b0, x0, depth)
+            a0r, b0r = rec.invert(aK, bK, x0, depth)
+            num = float((a0r - a0).norm()) + float((b0r - b0).norm())
+            den = float(a0.norm()) + float(b0.norm()) + 1e-12
+            rel = num / den
+    finally:
+        if was_training:
+            inner.train()
+    return float(rel)
+
+
 def measured_sparsity(model) -> float:
     """Mean realized routing sparsity over forward-run SwiGLUMoE blocks.
 
@@ -2464,8 +2523,9 @@ def format_metrics_line(metrics: dict) -> str:
     (control-sweep sites). The collapse-prevention diagnostics ``router_entropy``
     (mean per-token router entropy) and ``expert_util`` (global utilization
     entropy) are emitted when supplied, as is the effective-depth diagnostic
-    ``disp_tail`` (tail-mean per-step recurrence displacement). The MoE-mechanism
-    diagnostic
+    ``disp_tail`` (tail-mean per-step recurrence displacement) and the BPTT
+    gradient-correctness gate ``recon_rel`` (relative reversible round-trip error,
+    scientific notation). The MoE-mechanism diagnostic
     ``active_frac`` is emitted with a ``diag:`` prefix so it is clearly NOT framed
     as a resource metric. Field order is fixed for the parser.
     """
@@ -2483,6 +2543,11 @@ def format_metrics_line(metrics: dict) -> str:
     # (sustained => high effective depth; ~0 => early saturation).
     if "disp_tail" in metrics and metrics["disp_tail"] is not None:
         parts.append(f"disp_tail:{float(metrics['disp_tail']):.4f}")
+    # BPTT gradient-correctness gate: relative reversible round-trip error
+    # (~0 in fp64, small nonzero in bf16). Scientific notation since the value
+    # spans 1e-15..1e-2 — a fixed-decimal format would round small values to 0.
+    if "recon_rel" in metrics and metrics["recon_rel"] is not None:
+        parts.append(f"recon_rel:{float(metrics['recon_rel']):.2e}")
     # OPS/efficiency diagnostics (throughput + VRAM utilization). These are NOT
     # resource-GOAL numbers (the goal is absolute peak_vram / R_act scaling) —
     # the ``ops:`` prefix marks them clearly. tok_per_s = batch_tokens / step
@@ -2899,6 +2964,17 @@ def main(argv=None):
                 # tail mean (sustained displacement => high effective depth).
                 m["disp_tail"] = displacement_tail(
                     recurrence_displacement(base_model, x, k_hi))
+                # BPTT gradient-correctness gate: relative reversible round-trip
+                # error on the SAME last micro-batch x at the deep budget. Wrapped
+                # in the SAME bf16 autocast the training forward uses so it
+                # measures the REAL training reconstruction drift (the reversible
+                # backward reconstructs activations via this same inverse; bf16
+                # additive non-associativity over K steps is what makes it >0).
+                # The probe is no_grad internally and only rank-0 here -> the
+                # single .item() in reconstruction_error is not a hot-path sync.
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                    enabled=autocast_enabled):
+                    m["recon_rel"] = reconstruction_error(base_model, x, k_hi)
                 print0(format_metrics_line(m))
 
         if args.val_every > 0 and (step + 1) % args.val_every == 0:
