@@ -113,6 +113,47 @@ Parcae damping/floor, Lyapunov, fixed-point consistency, DEQ-implicit/IFT backwa
 probes, Dirichlet-UCB complexity (→ ReLU/softmax routing), QAT-late, rich diagnostics,
 Bigram/FSQ/CTP/NSA/smear.
 
+## Configurable recurrence-block structure (architecture-search axes)
+
+The `F_θ`/`G_θ` delta block is **fully configurable** so a controlled architecture
+search can run without touching the recurrence/reversibility core. Every axis
+**defaults to the current M0 behavior** (so existing runs are unchanged) and is
+**reversibility-preserving**: each block stays a deterministic pure function of its
+single input → exact fp64 reconstruction; routing is always smooth (no top-k /
+argmax / capacity dispatch). The axes are composable CLI knobs (each a
+`Hyperparameters` field plumbed through `M0GPT`). Swept by
+`experiments/run_m0_control_experiments.sh` (Experiments 4–8).
+
+1. **Block order** (`--block-order ∈ {attn_ffn, ffn_attn, parallel}`, default
+   `attn_ffn`). How the attention and FFN-MoE compose inside one delta sub-block:
+   - `attn_ffn` (current): `a = attn(norm(inp)); out = a + moe(norm(inp + a))`.
+   - `ffn_attn`: `m = moe(norm(inp)); out = m + attn(norm(inp + m))`.
+   - `parallel`: `out = attn(norm(inp)) + moe(norm(inp))` (both from `inp`).
+   All three read only `inp` (or a deterministic function of it) → pure → reversible.
+2. **Attention MoE** (`--attn-moe`, default off; `--n-attn-experts`, default 4).
+   When on, the attention is a **MoEUT-style** per-token MoE over `n_attn_experts`
+   independent low-rank MLA experts (each owns its own Q/KV-compression/decompression,
+   K-rope, `o_proj`), combined with the **same smooth-routing family** as the FFN MoE
+   (`softmax`/`relu`). Its router trains through the same entropy / load-balance /
+   ReMoE-L1 aux collectors. Off = the single shared MLA (current).
+3. **Shared experts** (`--num-shared-experts`, default 0). DeepSeek-style always-on,
+   **ungated** experts summed into every token in ADDITION to the routed experts:
+   `moe_out = Σ_s shared_s(x) + Σ_e route_e · routed_e(x)`. Applies to the FFN MoE
+   and (if `--attn-moe`) the attention MoE. Shared experts are always small-non-zero
+   initialized so they provide a live base.
+4. **Expert layout** (`--n-sublayers`, default 1). Each `F`/`G` delta block is a STACK
+   of `n_sublayers` **unique** attn+MoE sub-blocks applied in sequence as one clean
+   pure delta (`h = inp; for sub: h = h + sub(h); return h − inp`). Trades
+   "more experts in one sublayer" vs "fewer experts × more unique sublayers" at
+   matched param/compute (e.g. `--n-experts 16 --n-sublayers 1` vs
+   `--n-experts 8 --n-sublayers 2`). The stack is a pure function of `inp` → reversible.
+5. **Expert B-init** (`--expert-b-init ∈ {small, zero}`, default `small`). The routed-
+   expert up-projection (`w_out`) init: `small` = non-zero std (the engagement-fixed
+   default that gives the router + experts a finite task gradient from step 0); `zero`
+   = classic LoRA-B init (only sensible with `--num-shared-experts > 0` providing a
+   base, otherwise the routed MoE is inert at init). Applies to the FFN experts and
+   (if `--attn-moe`) the attention experts' `o_proj`.
+
 ## Principled metrics (the two goals)
 
 | Goal | Primary | Supporting |

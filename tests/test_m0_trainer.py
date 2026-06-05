@@ -315,6 +315,22 @@ def test_control_experiment_script_shape():
     subprocess.run(["bash", "-n", "experiments/run_m0_control_experiments.sh"], check=True)
 
 
+def test_control_experiment_script_has_architecture_search_sweeps():
+    """The runner sweeps every configurable recurrence-block axis with a `?`-safe
+    summary (so a missing metric line never aborts the run)."""
+    txt = open("experiments/run_m0_control_experiments.sh").read()
+    for s in (
+        "--block-order", "BLOCK_ORDER_SWEEP", "ffn_attn", "parallel",
+        "--attn-moe", "ATTN_MOE_SWEEP",
+        "--num-shared-experts", "SHARED_EXPERTS_SWEEP",
+        "--n-sublayers", "LAYOUT_SWEEP",
+        "--expert-b-init", "EXPERT_B_INIT_SWEEP",
+    ):
+        assert s in txt, f"missing architecture-search sweep token: {s}"
+    # `?`-fallback summary present (EXPERIENCE.md#explicit-boundary).
+    assert "${bpb:-?}" in txt
+
+
 # ---------------------------------------------------------------------------
 # ReMoE adaptive sparsity controller + load-balanced aux (anti-collapse fix)
 # ---------------------------------------------------------------------------
@@ -1091,10 +1107,15 @@ def test_moe_w_out_init_is_non_zero():
         max_seq_len=16,
     )
     m = M0GPT(args)
+    # The delta block is a stack of sub-blocks (default 1); each holds the
+    # attn + FFN-MoE. Default config: small non-zero MoE w_out, zero attn o_proj.
     for blk in (m.rec.F, m.rec.G):
-        assert blk.moe.w_out.abs().sum() > 0.0, "MoE w_out is zero-initialized (inert)"
-        # Attention o_proj remains zero (readout-stability near-identity start).
-        assert blk.attn.o_proj.weight.abs().sum() == 0.0
+        for sub in blk.sublayers:
+            for moe in sub.moe_modules():
+                assert moe.w_out.abs().sum() > 0.0, "MoE w_out is zero-initialized (inert)"
+            for mla in sub.attn_modules():
+                # Attention o_proj remains zero (readout-stability near-identity).
+                assert mla.o_proj.weight.abs().sum() == 0.0
 
 
 if __name__ == "__main__":

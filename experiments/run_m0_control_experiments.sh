@@ -21,6 +21,15 @@ set -euo pipefail
 # Experiment 3 — MLA kv_latent sweep. Ranks the KV-compression latent against
 #   val_bpb and kv_bytes/token to pick the smallest latent without quality loss.
 #
+# Architecture-search axes (configurable recurrence-block structure; all
+# reversibility-preserving). Each sweep varies ONE structural knob at matched
+# config and writes its own `metrics:`/`val_bpb:` summary rows:
+# Experiment 4 — block-order in {attn_ffn, ffn_attn, parallel}.
+# Experiment 5 — attn-MoE on/off (MoEUT-style attention experts).
+# Experiment 6 — DeepSeek shared always-on experts in {0, 1, 2}.
+# Experiment 7 — n-experts x n-sublayers layout {16x1, 8x2, 4x4} (matched-ish).
+# Experiment 8 — expert-b-init in {small, zero} (zero paired with shared base).
+#
 # GPU runs default to CUDA_VISIBLE_DEVICES=7 (overridable). Heavy training is
 # intentionally NOT run by the test suite; this script is for real runs.
 # ---------------------------------------------------------------------------
@@ -36,6 +45,14 @@ EXPERT_RANK="${EXPERT_RANK:-32}"
 KV_LATENT="${KV_LATENT:-128}"
 KV_LATENT_SWEEP="${KV_LATENT_SWEEP:-32 64 128 256}"
 K_SET="${K_SET:-32,64,128}"
+# Architecture-search axis sweeps (override via env).
+BLOCK_ORDER_SWEEP="${BLOCK_ORDER_SWEEP:-attn_ffn ffn_attn parallel}"
+ATTN_MOE_SWEEP="${ATTN_MOE_SWEEP:-off on}"
+N_ATTN_EXPERTS="${N_ATTN_EXPERTS:-4}"
+SHARED_EXPERTS_SWEEP="${SHARED_EXPERTS_SWEEP:-0 1 2}"
+# n-experts x n-sublayers layouts, encoded as "experts:sublayers" pairs.
+LAYOUT_SWEEP="${LAYOUT_SWEEP:-16:1 8:2 4:4}"
+EXPERT_B_INIT_SWEEP="${EXPERT_B_INIT_SWEEP:-small zero}"
 EVAL_BATCHES="${EVAL_BATCHES:-8}"
 LOG_EVERY="${LOG_EVERY:-50}"
 SEED="${SEED:-1337}"
@@ -150,6 +167,118 @@ for kv_latent in ${KV_LATENT_SWEEP}; do
     > "${log}" 2>&1
   echo "m0_control_kv_done: kv_latent=${kv_latent} -> ${log}"
   append_summary "kv_latent" "kv_latent=${kv_latent}" "${log}"
+done
+
+# Shared matched-config base args for the architecture-search sweeps below.
+# Each sweep appends ONLY the structural knob it varies. (DRY: one source for
+# the matched config so all axes are compared under the same model size.)
+base_args() {
+  printf '%s ' \
+    --model-dim "${MODEL_DIM}" \
+    --n-heads "${N_HEADS}" \
+    --n-kv-heads "${N_KV_HEADS}" \
+    --expert-rank "${EXPERT_RANK}" \
+    --kv-latent "${KV_LATENT}" \
+    --k-set "${K_SET}" \
+    --seq-len "${SEQ_LEN}" \
+    --iterations "${ITERATIONS}" \
+    --eval-batches "${EVAL_BATCHES}" \
+    --log-every "${LOG_EVERY}" \
+    --seed "${SEED}" \
+    --device "${DEVICE}"
+}
+
+# ---------------------------------------------------------------------------
+# Experiment 4: block-order in {attn_ffn, ffn_attn, parallel}. Picks how the
+# attention and FFN-MoE compose inside one delta sub-block (reversibility-safe).
+# ---------------------------------------------------------------------------
+for block_order in ${BLOCK_ORDER_SWEEP}; do
+  log="${OUT_DIR}/block_order_${block_order}.log"
+  echo "m0_control_block_order_start: block_order=${block_order} -> ${log}"
+  python train_gpt.py $(base_args) \
+    --n-experts "${N_EXPERTS}" \
+    --block-order "${block_order}" \
+    --artifact-out "${OUT_DIR}/block_order_${block_order}.bin" \
+    > "${log}" 2>&1
+  echo "m0_control_block_order_done: block_order=${block_order} -> ${log}"
+  append_summary "block_order" "block_order=${block_order}" "${log}"
+done
+
+# ---------------------------------------------------------------------------
+# Experiment 5: attn-MoE on/off. Off = single shared MLA; on = MoEUT-style
+# per-token MoE over N_ATTN_EXPERTS low-rank MLA experts (smooth routing).
+# ---------------------------------------------------------------------------
+for attn_moe in ${ATTN_MOE_SWEEP}; do
+  log="${OUT_DIR}/attn_moe_${attn_moe}.log"
+  echo "m0_control_attn_moe_start: attn_moe=${attn_moe} -> ${log}"
+  attn_moe_flag=""
+  if [ "${attn_moe}" = "on" ]; then
+    attn_moe_flag="--attn-moe --n-attn-experts ${N_ATTN_EXPERTS}"
+  fi
+  python train_gpt.py $(base_args) \
+    --n-experts "${N_EXPERTS}" \
+    ${attn_moe_flag} \
+    --artifact-out "${OUT_DIR}/attn_moe_${attn_moe}.bin" \
+    > "${log}" 2>&1
+  echo "m0_control_attn_moe_done: attn_moe=${attn_moe} -> ${log}"
+  append_summary "attn_moe" "attn_moe=${attn_moe}" "${log}"
+done
+
+# ---------------------------------------------------------------------------
+# Experiment 6: DeepSeek shared always-on experts in {0, 1, 2}. Adds ungated
+# base experts summed into every token in addition to the routed experts.
+# ---------------------------------------------------------------------------
+for num_shared in ${SHARED_EXPERTS_SWEEP}; do
+  log="${OUT_DIR}/num_shared_experts_${num_shared}.log"
+  echo "m0_control_num_shared_start: num_shared_experts=${num_shared} -> ${log}"
+  python train_gpt.py $(base_args) \
+    --n-experts "${N_EXPERTS}" \
+    --num-shared-experts "${num_shared}" \
+    --artifact-out "${OUT_DIR}/num_shared_experts_${num_shared}.bin" \
+    > "${log}" 2>&1
+  echo "m0_control_num_shared_done: num_shared_experts=${num_shared} -> ${log}"
+  append_summary "num_shared_experts" "num_shared_experts=${num_shared}" "${log}"
+done
+
+# ---------------------------------------------------------------------------
+# Experiment 7: n-experts x n-sublayers layout {16x1, 8x2, 4x4}. Trades more
+# experts-in-one-sublayer vs fewer-experts x more-unique-sublayers. Encoded as
+# "experts:sublayers" pairs in LAYOUT_SWEEP.
+# ---------------------------------------------------------------------------
+for layout in ${LAYOUT_SWEEP}; do
+  n_experts="${layout%%:*}"
+  n_sublayers="${layout##*:}"
+  tag="${n_experts}x${n_sublayers}"
+  log="${OUT_DIR}/layout_${tag}.log"
+  echo "m0_control_layout_start: layout=${tag} (n_experts=${n_experts} n_sublayers=${n_sublayers}) -> ${log}"
+  python train_gpt.py $(base_args) \
+    --n-experts "${n_experts}" \
+    --n-sublayers "${n_sublayers}" \
+    --artifact-out "${OUT_DIR}/layout_${tag}.bin" \
+    > "${log}" 2>&1
+  echo "m0_control_layout_done: layout=${tag} -> ${log}"
+  append_summary "layout" "n_experts=${n_experts} n_sublayers=${n_sublayers}" "${log}"
+done
+
+# ---------------------------------------------------------------------------
+# Experiment 8: expert-b-init in {small, zero}. zero (classic LoRA-B) is only
+# sensible with a shared-expert base, so it is paired with --num-shared-experts 1.
+# ---------------------------------------------------------------------------
+for b_init in ${EXPERT_B_INIT_SWEEP}; do
+  log="${OUT_DIR}/expert_b_init_${b_init}.log"
+  echo "m0_control_b_init_start: expert_b_init=${b_init} -> ${log}"
+  shared_flag=""
+  if [ "${b_init}" = "zero" ]; then
+    shared_flag="--num-shared-experts 1"
+  fi
+  python train_gpt.py $(base_args) \
+    --n-experts "${N_EXPERTS}" \
+    --expert-b-init "${b_init}" \
+    ${shared_flag} \
+    --artifact-out "${OUT_DIR}/expert_b_init_${b_init}.bin" \
+    > "${log}" 2>&1
+  echo "m0_control_b_init_done: expert_b_init=${b_init} -> ${log}"
+  append_summary "expert_b_init" "expert_b_init=${b_init}" "${log}"
 done
 
 echo "m0_control_done: summary=${SUMMARY}"

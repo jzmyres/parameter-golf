@@ -331,6 +331,118 @@ class MLAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# 6b. Attention Mixture-of-Experts (MoEUT-style)
+# ---------------------------------------------------------------------------
+class MLAMoE(nn.Module):
+    """Per-token Mixture-of-Experts over low-rank MLA attention experts.
+
+    A MoEUT-style attention MoE used as the attention sub-component of an
+    ``F``/``G`` delta block when ``attn_moe=True``. Each of the ``n_experts``
+    experts is an independent :class:`MLAttention` (owning its OWN low-rank
+    Q / KV-compression / decompression, K-rope, and ``o_proj``), so no trainable
+    parameter is shared across experts (expert-independence invariant). The
+    per-token combine uses the SAME smooth-routing family as the FFN MoE
+    (:class:`SwiGLUMoE`): ``softmax`` (dense soft) or ``relu`` (smooth-sparse,
+    exact zeros). NO top-k / argmax / capacity dispatch — every expert is
+    always evaluated and combined with continuous per-token weights, so the
+    block stays a deterministic *pure function of its input* and the reversible
+    recurrence reconstructs it exactly (reversibility-safe).
+
+    DeepSeek shared (always-on, ungated) attention experts are supported via
+    ``num_shared_experts``: their outputs are SUMMED into every token
+    unconditionally, in addition to the routed combine.
+
+    The routing diagnostics / router-aux machinery mirror :class:`SwiGLUMoE`
+    (``last_route`` / ``last_sparsity`` / ``_route_input`` and the entropy /
+    load-balance / ReMoE-L1 recompute terms) so the same collector
+    (:func:`_collect_moe_aux`) trains the attention router too.
+    """
+
+    def __init__(self, dim, n_heads, n_kv_heads, kv_latent, head_dim,
+                 n_experts, q_latent=None, rope_base=10000.0,
+                 router_type="softmax", num_shared_experts=0,
+                 expert_b_init="small"):
+        super().__init__()
+        assert router_type in ("softmax", "relu"), (
+            f"router_type must be 'softmax' or 'relu', got {router_type!r}"
+        )
+        assert num_shared_experts >= 0
+        self.dim = dim
+        self.n_experts = n_experts
+        self.num_shared_experts = num_shared_experts
+        self.router_type = router_type
+        self.expert_b_init = expert_b_init
+
+        self.router = nn.Linear(dim, n_experts)
+        # Routed experts: one independent MLA per expert (own Q/KV/o weights).
+        self.experts = nn.ModuleList([
+            MLAttention(dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
+                        kv_latent=kv_latent, head_dim=head_dim,
+                        q_latent=q_latent, rope_base=rope_base)
+            for _ in range(n_experts)
+        ])
+        # DeepSeek shared (always-on) attention experts.
+        self.shared_experts = nn.ModuleList([
+            MLAttention(dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
+                        kv_latent=kv_latent, head_dim=head_dim,
+                        q_latent=q_latent, rope_base=rope_base)
+            for _ in range(num_shared_experts)
+        ])
+        if expert_b_init == "zero":
+            for e in self.experts:
+                nn.init.zeros_(e.o_proj.weight)
+
+        self.last_route = None
+        self.last_sparsity = None
+        self._route_input = None
+
+    # -- router map / aux terms: identical contract to SwiGLUMoE -------------
+    def _router_weights(self, x):
+        logits = self.router(x)
+        if self.router_type == "softmax":
+            return F.softmax(logits, dim=-1)
+        return F.relu(logits)
+
+    def _recompute_router_w(self):
+        if self._route_input is None:
+            return None
+        return self._router_weights(self._route_input)
+
+    def router_entropy(self):
+        w = self._recompute_router_w()
+        return None if w is None else SwiGLUMoE._route_entropy(self, w)
+
+    def load_balance_term(self):
+        w = self._recompute_router_w()
+        return None if w is None else SwiGLUMoE._load_balance(self, w)
+
+    def aux_l1_loadbalanced(self):
+        w = self._recompute_router_w()
+        if w is None:
+            return None
+        active = (w > 0).type_as(w)
+        f_e = active.detach().mean(dim=(0, 1))
+        mean_mass = w.mean(dim=(0, 1))
+        return (f_e * mean_mass).mean()
+
+    def forward(self, x):
+        w = self._router_weights(x)                              # (B, T, E)
+        self._route_input = x.detach()
+        self.last_route = w.detach()
+        self.last_sparsity = (w.detach() == 0).type_as(w).mean()
+
+        # Routed: stack the per-expert attention outputs and soft-combine.
+        # Each expert is a pure function of x; the combine is continuous in w.
+        outs = torch.stack([e(x) for e in self.experts], dim=-2)  # (B, T, E, dim)
+        y = torch.einsum("bte,bted->btd", w.type_as(outs), outs)
+
+        # Shared always-on experts: summed in, ungated.
+        for e in self.shared_experts:
+            y = y + e(x).type_as(y)
+        return y
+
+
+# ---------------------------------------------------------------------------
 # 7. SwiGLU Mixture-of-Experts
 # ---------------------------------------------------------------------------
 class SwiGLUMoE(nn.Module):
@@ -395,17 +507,25 @@ class SwiGLUMoE(nn.Module):
     bf16-friendly: no forced fp32 except inside ``RMSNorm`` statistics.
     """
 
-    def __init__(self, dim, n_experts, expert_rank, router_type="softmax"):
+    def __init__(self, dim, n_experts, expert_rank, router_type="softmax",
+                 num_shared_experts=0, expert_b_init="small"):
         super().__init__()
         assert router_type in ("softmax", "relu"), (
             f"router_type must be 'softmax' or 'relu', got {router_type!r}"
         )
+        assert expert_b_init in ("small", "zero"), (
+            f"expert_b_init must be 'small' or 'zero', got {expert_b_init!r}"
+        )
+        assert num_shared_experts >= 0
         self.dim = dim
         self.n_experts = n_experts
         self.expert_rank = expert_rank
         self.router_type = router_type
+        self.num_shared_experts = num_shared_experts
+        self.expert_b_init = expert_b_init
 
-        # Router is full-rank: dim -> n_experts logits.
+        # Router is full-rank: dim -> n_experts logits. Routes ONLY the routed
+        # experts; the shared experts (below) are always-on and ungated.
         self.router = nn.Linear(dim, n_experts)
 
         # Low-rank (LoRA-style) SwiGLU experts as batched parameter banks.
@@ -416,7 +536,31 @@ class SwiGLUMoE(nn.Module):
         self.w_in = nn.Parameter(torch.empty(n_experts, dim, 2 * expert_rank))
         self.w_out = nn.Parameter(torch.empty(n_experts, expert_rank, dim))
         nn.init.normal_(self.w_in, std=dim ** -0.5)
-        nn.init.normal_(self.w_out, std=expert_rank ** -0.5)
+        # Routed-expert output-proj init (knob ``expert_b_init``): ``small`` keeps
+        # a non-zero std so the router + experts get a finite task gradient from
+        # step 0 (engagement fix); ``zero`` is the classic LoRA-B init (only
+        # sensible with shared experts providing a base). M0GPT may RE-init w_out
+        # later for the near-identity start; this is the module-local default.
+        if expert_b_init == "zero":
+            nn.init.zeros_(self.w_out)
+        else:
+            nn.init.normal_(self.w_out, std=expert_rank ** -0.5)
+
+        # DeepSeek-style shared (always-on, ungated) experts: a separate bank of
+        # ``num_shared_experts`` LoRA-SwiGLU experts whose outputs are SUMMED into
+        # every token unconditionally (not multiplied by any router weight). They
+        # are ALWAYS small-non-zero initialized so they provide a live base even
+        # when ``expert_b_init='zero'`` zeroes the routed experts.
+        if num_shared_experts > 0:
+            self.shared_w_in = nn.Parameter(
+                torch.empty(num_shared_experts, dim, 2 * expert_rank))
+            self.shared_w_out = nn.Parameter(
+                torch.empty(num_shared_experts, expert_rank, dim))
+            nn.init.normal_(self.shared_w_in, std=dim ** -0.5)
+            nn.init.normal_(self.shared_w_out, std=expert_rank ** -0.5)
+        else:
+            self.shared_w_in = None
+            self.shared_w_out = None
 
         self.last_route = None
         self.last_sparsity = None
@@ -541,14 +685,22 @@ class SwiGLUMoE(nn.Module):
         self.last_route = w.detach()
         self.last_sparsity = (w.detach() == 0).type_as(w).mean()
 
-        # --- Dense low-rank SwiGLU over ALL experts (no skipping) ---
+        # --- Dense low-rank SwiGLU over ALL routed experts (no skipping) ---
         h = torch.einsum("btd,edr->bter", x, self.w_in)         # (B, T, E, 2*rank)
         gate, up = h.chunk(2, dim=-1)                            # each (B, T, E, rank)
         act = F.silu(gate) * up                                  # (B, T, E, rank)
         expert_out = torch.einsum("bter,erd->bted", act, self.w_out)  # (B, T, E, dim)
 
-        # --- Smooth soft combine: y = sum_e w[...,e] * expert_e(x) ---
+        # --- Smooth soft combine of the ROUTED experts: sum_e w[...,e]*expert_e ---
         y = torch.einsum("bte,bted->btd", w.type_as(expert_out), expert_out)
+
+        # --- DeepSeek shared experts: always-on, ungated, SUMMED in ---
+        if self.shared_w_in is not None:
+            hs = torch.einsum("btd,sdr->btsr", x, self.shared_w_in)   # (B,T,S,2*rank)
+            sg, su = hs.chunk(2, dim=-1)
+            sa = F.silu(sg) * su                                       # (B,T,S,rank)
+            shared_out = torch.einsum("btsr,srd->btd", sa, self.shared_w_out)
+            y = y + shared_out.type_as(y)
         return y
 
 
@@ -651,45 +803,137 @@ class Hyperparameters:
     # ReMoE adaptive sparsity controller target (relu router): the active
     # fraction the controller holds routing at; sparsity target S* = 1 - this.
     moe_target_active_frac: float = 0.5
+    # --- Configurable recurrence-block structure (architecture-search axes) ---
+    # All default to the CURRENT M0 behavior so existing runs are unchanged.
+    # Each is reversibility-preserving (smooth routing, pure function of input).
+    #   block_order: how attn / FFN-MoE compose INSIDE one delta sub-block.
+    #     attn_ffn (current): a=attn(norm(inp)); out = a + moe(norm(inp+a))
+    #     ffn_attn:           m=moe(norm(inp));  out = m + attn(norm(inp+m))
+    #     parallel:           out = attn(norm(inp)) + moe(norm(inp))
+    block_order: str = "attn_ffn"
+    #   attn_moe: when True the attention is ALSO a (MoEUT-style) MoE over
+    #     n_attn_experts low-rank MLA experts; when False it is a single MLA.
+    attn_moe: bool = False
+    n_attn_experts: int = 4
+    #   num_shared_experts: DeepSeek always-on experts (per MoE), summed in
+    #     ungated, in ADDITION to the n_experts routed experts.
+    num_shared_experts: int = 0
+    #   n_sublayers: each F/G delta block is a STACK of n_sublayers UNIQUE
+    #     attn+MoE sub-blocks applied in sequence (pure delta). Trades more
+    #     experts-in-one-sublayer vs fewer-experts x more-unique-sublayers.
+    n_sublayers: int = 1
+    #   expert_b_init: routed-expert up-proj (w_out) init. small = non-zero
+    #     engagement default; zero = classic LoRA-B (needs shared experts base).
+    expert_b_init: str = "small"
 
 
-class _PreNormDeltaBlock(nn.Module):
-    """Pre-norm MLA + SwiGLU-MoE *delta* block — one ``F``/``G`` map.
+class _DeltaSubBlock(nn.Module):
+    """One pre-norm attention + MoE *delta* sub-block (a single F/G stage).
 
-    Returns the residual update the reversible recurrence adds (NOT input +
-    update); the recurrence owns the additive coupling. CRITICAL for
-    reversibility: the block is a deterministic *pure function of its single
-    input tensor* (no dropout, no batch-coupled routing, no external state), so
-    the reversible inverse recomputes the identical update and reconstruction is
-    exact in fp64.
+    Returns the residual update for ITS input (not input + update); the caller
+    (:class:`_PreNormDeltaBlock` or the recurrence) owns the additive coupling.
+    The sub-block is a deterministic *pure function of its single input tensor*
+    (no dropout / batch-coupled routing / external state) so the reversible
+    inverse recomputes the identical update and reconstruction is exact in fp64.
 
-    Delta form (post-attention-residual; verified in ``p1_synthetic``)::
+    The attention is a single :class:`MLAttention` (default) or a
+    :class:`MLAMoE` (when ``args.attn_moe``). The FFN is a :class:`SwiGLUMoE`.
+    The two compose by ``args.block_order``:
 
-        h   = attn_norm(inp)
-        a   = attn(h)
-        h2  = mlp_norm(inp + a)
-        out = a + moe(h2)
-        return out
+      * ``attn_ffn`` (current/default): ``a=attn(norm(inp)); out=a+moe(norm(inp+a))``
+      * ``ffn_attn``:                   ``m=moe(norm(inp));  out=m+attn(norm(inp+m))``
+      * ``parallel``:                   ``out=attn(norm(inp))+moe(norm(inp))``
+
+    All three are pure functions of ``inp`` (each branch reads only ``inp`` or a
+    deterministic function of it), so reversibility is preserved for every order.
     """
 
     def __init__(self, args: Hyperparameters):
         super().__init__()
         d = args.model_dim
-        self.attn_norm = RMSNorm(d)
-        self.attn = MLAttention(
-            dim=d, n_heads=args.n_heads, n_kv_heads=args.n_kv_heads,
-            kv_latent=args.kv_latent, head_dim=args.head_dim, q_latent=args.q_latent,
+        assert args.block_order in ("attn_ffn", "ffn_attn", "parallel"), (
+            f"block_order must be attn_ffn/ffn_attn/parallel, got {args.block_order!r}"
         )
+        self.block_order = args.block_order
+        self.attn_norm = RMSNorm(d)
         self.mlp_norm = RMSNorm(d)
+        if args.attn_moe:
+            self.attn = MLAMoE(
+                dim=d, n_heads=args.n_heads, n_kv_heads=args.n_kv_heads,
+                kv_latent=args.kv_latent, head_dim=args.head_dim,
+                n_experts=args.n_attn_experts, q_latent=args.q_latent,
+                router_type=args.router_type,
+                num_shared_experts=args.num_shared_experts,
+                expert_b_init=args.expert_b_init,
+            )
+        else:
+            self.attn = MLAttention(
+                dim=d, n_heads=args.n_heads, n_kv_heads=args.n_kv_heads,
+                kv_latent=args.kv_latent, head_dim=args.head_dim,
+                q_latent=args.q_latent,
+            )
         self.moe = SwiGLUMoE(
             dim=d, n_experts=args.n_experts, expert_rank=args.expert_rank,
             router_type=args.router_type,
+            num_shared_experts=args.num_shared_experts,
+            expert_b_init=args.expert_b_init,
+        )
+
+    def attn_modules(self):
+        """Yield the underlying MLA module(s) (1 for single MLA, N for MLAMoE)."""
+        if isinstance(self.attn, MLAMoE):
+            yield from self.attn.experts
+            yield from self.attn.shared_experts
+        else:
+            yield self.attn
+
+    def moe_modules(self):
+        """Yield the FFN MoE module(s) of this sub-block (one)."""
+        yield self.moe
+
+    def forward(self, inp):
+        if self.block_order == "attn_ffn":
+            a = self.attn(self.attn_norm(inp))
+            return a + self.moe(self.mlp_norm(inp + a))
+        if self.block_order == "ffn_attn":
+            m = self.moe(self.mlp_norm(inp))
+            return m + self.attn(self.attn_norm(inp + m))
+        # parallel: both branches read the SAME input (norm(inp)).
+        return self.attn(self.attn_norm(inp)) + self.moe(self.mlp_norm(inp))
+
+
+class _PreNormDeltaBlock(nn.Module):
+    """One ``F``/``G`` map: a stack of ``n_sublayers`` UNIQUE delta sub-blocks.
+
+    With ``n_sublayers=1`` (default) this is exactly the previous single
+    attention+MoE delta block. With ``n_sublayers>1`` it composes ``n_sublayers``
+    independent :class:`_DeltaSubBlock` instances (each its own attn+MoE weights)
+    into one recurrence-step delta:
+
+        h = inp
+        for sub in sublayers: h = h + sub(h)
+        return h - inp                       # clean pure delta
+
+    The recurrence owns the outer additive coupling (it adds ``F(...)`` to ``a``),
+    so this block returns the residual update for ``inp``. The composition is a
+    deterministic pure function of ``inp`` (each ``sub`` is pure and the running
+    ``h`` is a deterministic function of ``inp``), so reversibility / exact fp64
+    reconstruction is preserved for any ``n_sublayers``. The ``- inp`` makes it a
+    clean delta (``inp + F(inp) == h``), matching the recurrence's additive form.
+    """
+
+    def __init__(self, args: Hyperparameters):
+        super().__init__()
+        assert args.n_sublayers >= 1, "n_sublayers must be >= 1"
+        self.sublayers = nn.ModuleList(
+            [_DeltaSubBlock(args) for _ in range(args.n_sublayers)]
         )
 
     def forward(self, inp):
-        a = self.attn(self.attn_norm(inp))
-        out = a + self.moe(self.mlp_norm(inp + a))
-        return out
+        h = inp
+        for sub in self.sublayers:
+            h = h + sub(h)
+        return h - inp
 
 
 class M0GPT(nn.Module):
@@ -748,23 +992,31 @@ class M0GPT(nn.Module):
         nn.init.zeros_(self.mos_head.gate.bias)
         nn.init.normal_(self.mos_head.ctx.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.mos_head.ctx.bias)
-        # Start the recurrence near-identity: zero the two delta-block ATTENTION
-        # output projections so z_K starts close to x0 (no compounding before
-        # training) — this is what keeps the readout stable at init.
-        nn.init.zeros_(self.rec.F.attn.o_proj.weight)
-        nn.init.zeros_(self.rec.G.attn.o_proj.weight)
-        # Do NOT zero the MoE w_out: a zero w_out makes every expert output 0, so
-        # the router weights multiply a zero and receive ZERO task gradient (the
-        # whole MoE is inert and the router never engages — observed as
-        # bit-identical val_bpb across entropy / load-balance / no-aux variants).
-        # A small non-zero init keeps the init delta tiny (z_K stays near x0, init
-        # NLL ~ ln(vocab)) while giving each expert AND the router a meaningful
-        # gradient from step 0. Reversibility is unaffected (the reverse pass
-        # reconstructs whatever w_out holds; the recurrence inverse is exact for
-        # any deterministic F/G). std matches the small-init convention used for
-        # the embedding / MoS ctx above.
-        nn.init.normal_(self.rec.F.moe.w_out, std=0.02)
-        nn.init.normal_(self.rec.G.moe.w_out, std=0.02)
+        # Start the recurrence near-identity: zero EVERY delta sub-block's
+        # ATTENTION output projection(s) so z_K starts close to x0 (no compounding
+        # before training) — this is what keeps the readout stable at init. With
+        # attn_moe this covers each routed AND shared MLA expert's o_proj; with a
+        # single MLA it is the lone o_proj. Iterates over all sub-blocks of both
+        # F and G so the near-identity start holds for any n_sublayers.
+        for blk in (self.rec.F, self.rec.G):
+            for sub in blk.sublayers:
+                for mla in sub.attn_modules():
+                    nn.init.zeros_(mla.o_proj.weight)
+                # MoE routed-expert up-proj (w_out) init: respect expert_b_init.
+                #   small (default): a small non-zero w_out keeps the init delta
+                #     tiny (z_K stays near x0, init NLL ~ ln(vocab)) while giving
+                #     each expert AND the router a meaningful gradient from step 0.
+                #     A zero w_out would make every expert output 0, so the router
+                #     weights multiply a zero and receive ZERO task gradient (inert
+                #     MoE; bit-identical val_bpb across aux variants).
+                #   zero: classic LoRA-B init (routed w_out stays at 0); only
+                #     sensible with num_shared_experts>0 providing a live base.
+                # Reversibility is unaffected (the reverse pass reconstructs
+                # whatever w_out holds; the recurrence inverse is exact for any
+                # deterministic F/G). std matches the small-init convention above.
+                for moe in sub.moe_modules():
+                    if args.expert_b_init != "zero":
+                        nn.init.normal_(moe.w_out, std=0.02)
 
     def forward(self, tokens, targets, depth):
         B, T = tokens.shape
@@ -1242,20 +1494,29 @@ def load_int6_artifact(blob, template_state_dict):
 # ---------------------------------------------------------------------------
 # 15. Finite-horizon loss + optimizer builder
 # ---------------------------------------------------------------------------
+# Router-bearing MoE module types whose router-aux terms the collectors sum.
+# Both the FFN MoE (:class:`SwiGLUMoE`) and the optional attention MoE
+# (:class:`MLAMoE`, when ``attn_moe``) expose the same aux contract
+# (``router_entropy`` / ``load_balance_term`` / ``aux_l1_loadbalanced`` via
+# ``_recompute_router_w``), so both train their routers through these collectors.
+_ROUTER_MOE_TYPES = (SwiGLUMoE, MLAMoE)
+
+
 def _collect_moe_aux(model, method):
-    """Sum a SwiGLUMoE router-aux term (named ``method``) over the MoE blocks.
+    """Sum a router-aux term (named ``method``) over the router-bearing MoE blocks.
 
     Walks ``model.modules()`` so it works whether or not the model is DDP- or
     compile-wrapped (caller passes the inner module). Each aux is RECOMPUTED in
     the ambient grad mode from the block's saved detached router input (so the
-    term trains the router; see :meth:`SwiGLUMoE._recompute_router_w`). Skips
-    blocks that have not run a forward yet (the method returns ``None``). Returns
-    a 0.0 tensor on the model's device when no MoE produced a forward, keeping
-    loss assembly type-stable. Single helper drives every collector (DRY).
+    term trains the router; see :meth:`SwiGLUMoE._recompute_router_w`). Covers
+    both the FFN MoE and the optional attention MoE (``_ROUTER_MOE_TYPES``).
+    Skips blocks that have not run a forward yet (the method returns ``None``).
+    Returns a 0.0 tensor on the model's device when no MoE produced a forward,
+    keeping loss assembly type-stable. Single helper drives every collector (DRY).
     """
     total = None
     for m in model.modules():
-        if isinstance(m, SwiGLUMoE):
+        if isinstance(m, _ROUTER_MOE_TYPES):
             v = getattr(m, method)()
             if v is not None:
                 total = v if total is None else total + v
@@ -1876,6 +2137,32 @@ def build_arg_parser():
     p.add_argument("--q-latent", type=int, default=None)
     p.add_argument("--router-type", type=str, default="softmax", choices=("softmax", "relu"))
     p.add_argument("--mlp-mult", type=float, default=3.0)
+    # Configurable recurrence-block structure (architecture-search axes). All
+    # default to the current M0 behavior; each is reversibility-preserving.
+    p.add_argument("--block-order", type=str, default="attn_ffn",
+                   choices=("attn_ffn", "ffn_attn", "parallel"),
+                   help="How attn / FFN-MoE compose in one delta sub-block "
+                        "(attn_ffn=current; ffn_attn=FFN-first; parallel=both "
+                        "from norm(inp)). All pure functions of inp -> reversible.")
+    p.add_argument("--attn-moe", action="store_true",
+                   help="Make attention a (MoEUT-style) MoE over --n-attn-experts "
+                        "low-rank MLA experts (smooth routing). Default: single MLA.")
+    p.add_argument("--n-attn-experts", type=int, default=4,
+                   help="Number of routed attention experts when --attn-moe is set.")
+    p.add_argument("--num-shared-experts", type=int, default=0,
+                   help="DeepSeek always-on experts per MoE (FFN, and attention "
+                        "if --attn-moe): summed in ungated, in ADDITION to the "
+                        "routed experts. 0 (default) disables.")
+    p.add_argument("--n-sublayers", type=int, default=1,
+                   help="Each F/G delta block is a stack of N UNIQUE attn+MoE "
+                        "sub-blocks applied in sequence (pure delta). Trades "
+                        "experts-per-sublayer vs unique-sublayers at matched "
+                        "param/compute (e.g. 16x1 vs 8x2). Default 1 = current.")
+    p.add_argument("--expert-b-init", type=str, default="small",
+                   choices=("small", "zero"),
+                   help="Routed-expert up-proj (w_out) init: small=non-zero "
+                        "engagement default; zero=classic LoRA-B (only sensible "
+                        "with --num-shared-experts>0 providing a base).")
     # Training schedule / batch.
     p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--seq-len", type=int, default=512)
@@ -2008,6 +2295,10 @@ def main(argv=None):
         q_latent=args.q_latent, router_type=args.router_type,
         max_seq_len=args.seq_len, mlp_mult=args.mlp_mult,
         moe_target_active_frac=args.moe_target_active_frac,
+        block_order=args.block_order, attn_moe=args.attn_moe,
+        n_attn_experts=args.n_attn_experts,
+        num_shared_experts=args.num_shared_experts,
+        n_sublayers=args.n_sublayers, expert_b_init=args.expert_b_init,
     )
     base_model = M0GPT(model_args).to(device)
     model = base_model

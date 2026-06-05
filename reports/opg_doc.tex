@@ -126,6 +126,34 @@ knob, \texttt{router\_type}\(\in\{\texttt{relu},\texttt{softmax}\}\) (ReLU routi
 ReMoE~\cite{remoe} is continuous, reconstruction-stable, and reversibility-safe; cf.\
 MoEUT~\cite{moeut}).
 
+\paragraph{Configurable recurrence-block structure (architecture-search axes).}
+The \(F_\theta\)/\(G_\theta\) delta block exposes a family of composable, reversibility-preserving
+structural knobs so a controlled architecture search can run without touching the recurrence or its
+floor-free inverse.  Every axis defaults to the core \(M_0\) behavior, and each keeps the block a
+deterministic pure function of its single input (smooth routing only; no top-\(k\)/argmax/capacity
+dispatch), so exact fp64 reconstruction holds for every setting.
+(1) \emph{Block order} \(\in\{\texttt{attn\_ffn},\texttt{ffn\_attn},\texttt{parallel}\}\) selects how
+attention and the FFN-MoE compose inside one delta sub-block:
+\(\texttt{attn\_ffn}\) (default) computes \(a=\mathrm{attn}(\RMSNorm(\mathit{inp}))\) then
+\(a+\mathrm{moe}(\RMSNorm(\mathit{inp}+a))\); \(\texttt{ffn\_attn}\) reverses the two;
+\(\texttt{parallel}\) sums both branches from the same \(\RMSNorm(\mathit{inp})\).
+(2) \emph{Attention MoE} (off by default) replaces the single shared MLA with a MoEUT-style~\cite{moeut}
+per-token MoE over \(n_{\rm attn}\) independent low-rank MLA experts (each owning its Q/KV
+compression--decompression, K-rope, and output projection), combined with the same smooth-routing
+family and trained through the same router auxiliaries.
+(3) \emph{Shared experts} \(n_{\rm shared}\ge0\) add DeepSeek-style~\cite{deepseekv2} always-on,
+ungated experts summed into every token in addition to the routed experts,
+\(\mathrm{moe}(x)=\sum_s\mathrm{shared}_s(x)+\sum_e r_{t,e}\,\mathrm{routed}_e(x)\), applied to the FFN
+MoE (and the attention MoE when enabled).
+(4) \emph{Expert layout} \(n_{\rm sub}\ge1\) makes each \(F_\theta\)/\(G_\theta\) map a stack of
+\(n_{\rm sub}\) unique attn+MoE sub-blocks applied in sequence as one clean pure delta
+(\(h\leftarrow\mathit{inp}\); \(h\leftarrow h+\mathrm{sub}(h)\) per sub-block; return \(h-\mathit{inp}\)),
+trading experts-per-sublayer against unique-sublayers at matched parameter/compute
+(e.g.\ \(16\times1\) vs \(8\times2\)).
+(5) \emph{Expert B-init} \(\in\{\texttt{small},\texttt{zero}\}\) sets the routed-expert output-projection
+init: \(\texttt{small}\) is the non-zero engagement default; \(\texttt{zero}\) is the classic LoRA-B
+init, only sensible with \(n_{\rm shared}>0\) providing a live base.
+
 \paragraph{Collapse-prevention auxiliaries (control-experiment axis).}
 The active-expert fraction is no longer a resource metric (the resource goal is
 activation memory; \S\ref{sec:metrics}), so dense routing is acceptable and the only objective is to

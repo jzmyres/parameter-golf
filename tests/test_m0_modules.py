@@ -86,8 +86,11 @@ def test_m0gpt_recurrence_reconstructs_with_real_blocks():
     rec = m.rec  # the ReversibleRecurrence
     with torch.no_grad():
         for blk in (rec.F, rec.G):
-            blk.attn.o_proj.weight.normal_(std=0.3)
-            blk.moe.w_out.normal_(std=0.3)
+            for sub in blk.sublayers:
+                for mla in sub.attn_modules():
+                    mla.o_proj.weight.normal_(std=0.3)
+                for moe in sub.moe_modules():
+                    moe.w_out.normal_(std=0.3)
     x0 = torch.randn(2, 5, 16, dtype=torch.float64)
     (aK, bK), _ = rec.forward_states(x0, x0, x0, depth=4)
     assert not torch.allclose(aK, x0), "recurrence is trivially identity; test is vacuous"
