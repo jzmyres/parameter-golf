@@ -15,6 +15,7 @@ control-experiment runner (Task 9) computes ``phi`` over ``r`` and ``R_act``
 over ``K`` from these primitives. Here we lock in known-input correctness and
 deterministic behaviour for the primitives themselves.
 """
+import math
 import os
 import sys
 
@@ -24,10 +25,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from train_gpt import (  # noqa: E402
     Hyperparameters,
+    M0GPT,
     active_expert_fraction,
     effective_rank,
     fit_phi,
+    fit_phi_isodepth,
     kv_bytes_per_token,
+    recurrence_param_counts,
     _fit_slope,
     vram_vs_batch_scaling,
 )
@@ -97,6 +101,168 @@ def test_fit_phi_degenerate_single_point():
     # Fewer than two depths -> no slope to estimate -> defined as 0.0.
     assert fit_phi({4: 2.5}) == 0.0
     assert fit_phi({}) == 0.0
+
+
+# --- fit_phi_isodepth (PRINCIPLED Iso-Depth train-r scaling-law phi) -------
+# Fits L(r) = E + A * (N_once + r^phi * N_rec)^(-alpha) to a {r: trained loss}
+# sweep, recovering the recurrence-equivalence exponent phi as a FITTED law
+# parameter (arXiv:2604.21106). The synthetic-recovery tests below generate
+# L(r) from KNOWN (phi, alpha, E, A, N_once, N_rec) and assert phi is recovered.
+_ISO_R = [1, 2, 4, 8, 16]
+_ISO_N_ONCE = 2_000_000
+_ISO_N_REC = 6_000_000
+
+
+def _isodepth_law(r, phi, alpha, E, A, n_once, n_rec):
+    return E + A * (n_once + (r ** phi) * n_rec) ** (-alpha)
+
+
+def _isodepth_losses(phi, alpha=0.3, E=2.5, A=50.0,
+                     n_once=_ISO_N_ONCE, n_rec=_ISO_N_REC, rs=_ISO_R):
+    return {r: _isodepth_law(r, phi, alpha, E, A, n_once, n_rec) for r in rs}
+
+
+def test_fit_phi_isodepth_recovers_known_phi_noiseless():
+    # Noiseless recovery within +/-0.05 for representative phi in (0, 1).
+    for phi_true in (0.3, 0.6, 0.9):
+        losses = _isodepth_losses(phi_true)
+        out = fit_phi_isodepth(losses, _ISO_N_ONCE, _ISO_N_REC)
+        assert math.isfinite(out["phi"]), out
+        assert abs(out["phi"] - phi_true) < 0.05, (phi_true, out)
+        assert 0.0 <= out["phi"] <= 1.0
+        assert out["n_points"] == len(_ISO_R)
+        assert out["rmse"] < 1e-3  # near-exact fit on noiseless data
+
+
+def test_fit_phi_isodepth_recovers_known_phi_with_noise():
+    # Small additive noise -> recovery within +/-0.1 (deterministic seed).
+    #
+    # NOTE on noise scale: the 4-parameter law over only 5 r is a small-sample,
+    # weakly-identified fit (phi/alpha/A partially trade off), so its tolerance to
+    # noise is SMALL — empirically ~1e-5 absolute (≈0.05% of the inter-r loss gap)
+    # keeps every phi within +/-0.1; an order of magnitude more already pushes the
+    # shallow phi=0.3 case past 0.1. This fragility is a real property of the
+    # estimator (documented in fit_phi_isodepth and the harness header): use more
+    # r and/or seeds for tight confidence intervals on real sweeps.
+    g = torch.Generator().manual_seed(0)
+    for phi_true in (0.3, 0.6, 0.9):
+        clean = _isodepth_losses(phi_true)
+        noisy = {
+            r: v + 1e-5 * float(torch.randn((), generator=g))
+            for r, v in clean.items()
+        }
+        out = fit_phi_isodepth(noisy, _ISO_N_ONCE, _ISO_N_REC)
+        assert math.isfinite(out["phi"]), out
+        assert abs(out["phi"] - phi_true) < 0.1, (phi_true, out)
+
+
+def test_fit_phi_isodepth_edge_phi_zero_flat_loss():
+    # phi = 0 -> r^phi = 1 -> loss is FLAT in r (looping buys nothing).
+    losses = _isodepth_losses(0.0)
+    vals = list(losses.values())
+    assert max(vals) - min(vals) < 1e-9  # confirm the construction is flat
+    out = fit_phi_isodepth(losses, _ISO_N_ONCE, _ISO_N_REC)
+    assert math.isfinite(out["phi"])
+    assert out["phi"] < 0.05
+
+
+def test_fit_phi_isodepth_edge_phi_one_full_equivalence():
+    # phi = 1 -> each loop is worth a full unique block.
+    out = fit_phi_isodepth(_isodepth_losses(1.0), _ISO_N_ONCE, _ISO_N_REC)
+    assert math.isfinite(out["phi"])
+    assert abs(out["phi"] - 1.0) < 0.05
+
+
+def test_fit_phi_isodepth_too_few_points_is_nan():
+    # <3 finite points -> phi is NaN with a reason, no crash.
+    out = fit_phi_isodepth({1: 3.0, 2: 2.9}, _ISO_N_ONCE, _ISO_N_REC)
+    assert math.isnan(out["phi"])
+    assert out["n_points"] == 2
+    assert isinstance(out.get("reason"), str) and out["reason"]
+
+
+def test_fit_phi_isodepth_drops_nonfinite_points():
+    # A diverged r (NaN/inf loss) is DROPPED before fitting; the fit proceeds on
+    # the remaining finite points and stays finite + in range. (With only the 3
+    # surviving r the 4-parameter law is under-identified, so we assert the drop +
+    # a sane finite phi, not tight recovery — that needs the full sweep.)
+    losses = _isodepth_losses(0.6)
+    losses[8] = float("nan")        # diverged depth
+    losses[16] = float("inf")       # diverged depth
+    out = fit_phi_isodepth(losses, _ISO_N_ONCE, _ISO_N_REC)
+    assert out["n_points"] == 3     # r in {1, 2, 4} survive the finite filter
+    assert math.isfinite(out["phi"])
+    assert 0.0 <= out["phi"] <= 1.0
+
+
+def test_fit_phi_isodepth_returns_full_param_dict():
+    out = fit_phi_isodepth(_isodepth_losses(0.5), _ISO_N_ONCE, _ISO_N_REC)
+    for key in ("phi", "alpha", "E", "A", "rmse", "n_points"):
+        assert key in out, key
+    assert all(isinstance(out[k], float) for k in ("phi", "alpha", "E", "A", "rmse"))
+    assert isinstance(out["n_points"], int)
+
+
+# --- recurrence_param_counts (N_once / N_rec split for the Iso-Depth law) --
+def _tiny_m0gpt(step_conditioning=True):
+    args = Hyperparameters(
+        model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16, step_conditioning=step_conditioning,
+    )
+    return M0GPT(args)
+
+
+def test_recurrence_param_counts_split_matches_named_parameters():
+    model = _tiny_m0gpt()
+    n_once, n_rec = recurrence_param_counts(model)
+    # n_rec is exactly the params under model.rec (F/G blocks + step_emb).
+    expected_rec = sum(p.numel() for p in model.rec.parameters())
+    assert n_rec == expected_rec
+    assert n_rec > 0 and n_once > 0
+
+
+def test_recurrence_param_counts_sum_is_total_trainable():
+    model = _tiny_m0gpt()
+    n_once, n_rec = recurrence_param_counts(model)
+    # Tied embedding is one tensor object -> named_parameters dedupes it, so the
+    # split sums to the total trainable params (counted once).
+    seen = set()
+    total = 0
+    for p in model.parameters():
+        if id(p) in seen:
+            continue
+        seen.add(id(p))
+        total += p.numel()
+    assert n_once + n_rec == total
+
+
+def test_recurrence_param_counts_tied_embedding_counted_once():
+    model = _tiny_m0gpt()
+    assert model.tok_emb.weight is model.mos_head.out_embed.weight
+    n_once, _n_rec = recurrence_param_counts(model)
+    # The tied (vocab x dim) weight is in n_once exactly once, not twice.
+    vocab, dim = model.tok_emb.weight.shape
+    # n_once contains tok_emb + pos_emb + final_norm + mos_head (ctx/gate),
+    # and the out_embed alias must NOT double-count the embedding.
+    non_rec = sum(
+        p.numel() for n, p in model.named_parameters() if not n.startswith("rec.")
+    )
+    assert n_once == non_rec
+    # Sanity: the embedding block (vocab*dim) appears once in the non-rec sum.
+    assert non_rec >= vocab * dim
+
+
+def test_recurrence_param_counts_unwraps_ddp_module():
+    model = _tiny_m0gpt()
+
+    class _FakeDDP:
+        def __init__(self, m):
+            self.module = m
+
+    direct = recurrence_param_counts(model)
+    wrapped = recurrence_param_counts(_FakeDDP(model))
+    assert direct == wrapped
 
 
 # --- active_expert_fraction (MoE sparsity) --------------------------------

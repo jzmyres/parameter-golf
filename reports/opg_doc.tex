@@ -384,7 +384,12 @@ A tied recurrence can collapse to a fixed point---effective depth \(\varphi\to 0
 trusting internal depth metrics.  The \code{--k-eval-sweep} flag evaluates one trained model at each
 recurrent depth \(K\) after the final validation (rank-0 prints; all ranks run the loop because the
 validation all-reduces) and emits \(G_T=\bpb(K_{\min})-\bpb(K_{\max})\) (positive when deeper
-recurrence helps) plus an eval-depth \(\varphi\) proxy fitted over the \(\{K:\text{loss}(K)\}\) map.
+recurrence helps) plus the cheap eval-depth \(\varphi\) \emph{proxy} \code{phi\_eval} fitted over the
+\(\{K:\text{loss}(K)\}\) map.  \code{phi\_eval} is an OLS log-slope of one trained model's loss versus
+\emph{inference} depth \(K\) (test-time depth utilization) and is \emph{not} the principled Iso-Depth
+recurrence-equivalence exponent; the latter is the train-\(r\) \(\varphi\) (\code{phi\_isodepth}) of
+Eq.~\eqref{eq:isodepth}, fitted over models pretrained at different recurrence budgets \(r\) by
+\code{experiments/measure\_phi.py} (\S\ref{sec:related}).
 The sweep is computed from a \emph{single shared trajectory}: the recurrence is deterministic given
 the seed \((a_0,b_0,x_0)\), so depth \(K_{\max}\) is depth \(K_{\min}\) \emph{continued}.  Rather than
 re-running the recurrence from the seed for each \(K\) (cost \(\sum_K K\)), the trainer takes ONE
@@ -866,12 +871,39 @@ adaptive \(\lambda_{\rm route}\) controller (\S\ref{sec:models}) targets a spars
 holds \(\code{\detokenize{active_frac}}\) near it, paired with the per-expert load-balanced aux.
 
 \paragraph{Effective-depth and rank metrics.}
-The recurrence-equivalence exponent \(\varphi\)~\cite{isodepth} measures whether looping a block
-\(r\) times yields the capacity of \(r\) unique blocks (\(\varphi{=}1\)) or none
-(\(\varphi{=}0\)), separating true loop capacity from token-budget effects; truncated BPTT
-lowers \(\varphi\), motivating our full reversible BPTT. Effective rank (spectral entropy of
-singular values)~\cite{effrank} sets each low-rank matrix's ``sufficient rank'' on the
-resource/expressiveness frontier.
+The recurrence-equivalence exponent \(\varphi\)~\cite{isodepth} is \emph{the} recurrence-effectiveness
+metric: it measures whether looping a block \(r\) times yields the capacity of \(r\) unique blocks
+(\(\varphi{=}1\)) or none (\(\varphi{=}0\)), separating true loop capacity from token-budget effects;
+truncated BPTT lowers \(\varphi\), motivating our full reversible BPTT (paper reference
+\(\varphi\!\approx\!0.46\)).  We estimate \(\varphi\) as a \emph{fitted parameter} of the Iso-Depth
+joint scaling law from a pretraining sweep over recurrence counts \(r\) (looped models only --- the
+split below already encodes ``loops vs unique blocks'', so no untied baseline is needed).  At fixed
+data \(D\) the \(B D^{-\beta}\) term is constant and absorbed into the irreducible offset \(E\):
+\begin{equation}
+L(r) \;=\; E \;+\; A\,\bigl(N_{\mathrm{once}} + r^{\varphi}\,N_{\mathrm{rec}}\bigr)^{-\alpha},
+\label{eq:isodepth}
+\end{equation}
+where \(N_{\mathrm{once}}\) is the count of non-recurrent parameters (token/positional embeddings,
+readout norm and the MoS head --- the tied output embedding counted once) applied once per forward,
+and \(N_{\mathrm{rec}}\) is the count of recurrent (looped-block) parameters (the reversible \(F/G\)
+delta blocks plus the step embedding).  The split \(N_{\mathrm{once}} + r^{\varphi} N_{\mathrm{rec}}\)
+is what encodes the question: \(\varphi{=}1\) means looping \(r\) times buys the capacity of \(r\)
+unique blocks, \(\varphi{=}0\) means looping buys nothing (loss flat in \(r\)).  We fit
+\((\varphi,\alpha,E,A)\) with \texttt{scipy.optimize.curve\_fit} (bounds \(\varphi\!\in\![0,1]\),
+\(\alpha\!\in\!(0,3]\), \(A>0\), \(E\!\in\![0,\min_r L]\); multi-start over \((\varphi_0,\alpha_0)\) for
+robustness) to the per-\(r\) trained validation loss collected by \code{experiments/measure\_phi.py}
+(an \emph{expensive} multi-train experiment that retrains the model once per \(r\) at matched
+data/steps/seed, fixing recurrence depth via a single-element \code{--k-set} and disabling the
+no-degradation hinge so each model is a clean pure-depth-\(r\) train).  This is distinct from the
+cheap per-run \emph{eval-depth} proxy \code{phi\_eval} (\S\ref{sec:protocol}), which is only an OLS
+log-slope of \emph{one} trained model's loss versus \emph{inference} depth \(K\): \code{phi\_eval}
+gauges test-time depth utilization, whereas the train-\(r\) \(\varphi\) of Eq.~\eqref{eq:isodepth}
+(\code{phi\_isodepth}) measures train-time loop capacity and is the principled metric.  With only
+\(\sim\!5\) values of \(r\) the four-parameter fit is small-sample and weakly identified
+(\(\varphi/\alpha/A\) partially trade off), so it recovers \(\varphi\) near-exactly on clean data but
+is noise-fragile, especially at low \(\varphi\); reporting tight confidence intervals needs more \(r\)
+and/or repeated seeds.  Effective rank (spectral entropy of singular values)~\cite{effrank} sets each
+low-rank matrix's ``sufficient rank'' on the resource/expressiveness frontier.
 
 \paragraph{Attention and output expressiveness under a resource budget.}
 Multi-head Latent Attention~\cite{deepseekv2} low-rank-compresses the KV cache (to 4--14\% of

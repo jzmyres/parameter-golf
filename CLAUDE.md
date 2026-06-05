@@ -70,7 +70,8 @@ Orientation mirror only — `train_gpt.py` `Hyperparameters` + `build_arg_parser
 - **Finite-horizon recurrence:** `k_set={32,64,128}` (K_hi sampled uniformly per step), `k_lo=8`; loss = final-depth task loss + a shallow stop-gradient no-degradation hinge (`lambda_h=0.1`, `margin=0`). NOT a fixed-point objective.
 - **Anti-collapse axes (default OFF; under active study, NOT promoted):** `init_state=x0` default (`random` = Huginn path-independent init, the Occam-first autonomous fix); `step_conditioning=False` (the `M_clk` clock = ceiling diagnostic only, depth-conditioned → NOT generalizable → last resort). The intended autonomous expressiveness rung is an orthogonal/mHC strictly-invertible damping matrix (relax `A+B=I`, orthogonal `A` / free `B`; see `opg_doc.tex` §Failure Triage).
 - **Router health:** default collapse-preventer is DeepSeek-V3 auxiliary-loss-free load balancing (`router_bias_update_rate=1e-3`: detached per-expert `router_bias` buffer added to logits before softmax, sign-rule updated at the step boundary ONLY — constant within forward+backward so `recon_rel≈0`; DDP-all-reduced) + ST-MoE z-loss (`router_z_coef=1e-3`: `mean(logsumexp(logits)^2)` bounds logit magnitude, anti-over-confidence). Entropy-MAX is DEMOTED to OFF (`router_entropy_coef=0.0`; antagonistic to specialization, didn't prevent the measured per-token collapse) but stays a CLI ablation knob; load-balance off; `lambda_route` adaptive for the relu router (`moe_target_active_frac=0.5`). MoE-basis-depth diagnostics: `route_step_div` (across-step dominant-expert diversity, 1/K=degenerate) + `expert_cos_div` (expert output-cosine diversity).
-- **Two-goal metrics (all emitted; ALL must improve — gate before any full run):** expressiveness — `val_bpb`, depth-gain `G_T`/`phi_eval` (paired single-trajectory `--k-eval-sweep`), `erank`, `disp_tail`; resource — `peak_vram`, VRAM-vs-batch slope, `R_act(K)`, `kv_bytes`; correctness — `recon_rel` (reversible round-trip = gradient-correctness gate). `ops:tok_per_s`/`ops:vram_util_pct` are tuning diagnostics, not gates.
+- **Two-goal metrics (all emitted; ALL must improve — gate before any full run):** expressiveness — `val_bpb`, depth-gain `G_T`, `erank`, `disp_tail`; resource — `peak_vram`, VRAM-vs-batch slope, `R_act(K)`, `kv_bytes`; correctness — `recon_rel` (reversible round-trip = gradient-correctness gate). `ops:tok_per_s`/`ops:vram_util_pct` are tuning diagnostics, not gates.
+- **Recurrence-effectiveness φ — two metrics, do not conflate.** The PRINCIPLED metric is the Iso-Depth train-r exponent `phi_isodepth` (`fit_phi_isodepth`): the fitted φ in the scaling law `L(r)=E+A*(N_once+r^φ*N_rec)^-α` over models PRETRAINED at recurrence budgets r∈{1,2,4,8,16}, where `N_once`/`N_rec` = non-recurrent/recurrent (`model.rec`) param counts (`recurrence_param_counts`); φ=1 ⇒ a loop is worth a unique block, φ=0 ⇒ worthless (paper ref ≈0.46). Produced by `experiments/measure_phi.py` (EXPENSIVE multi-train: one model per r, `--k-set <r> --lambda-h 0`); fit is small-sample/noise-fragile with 5 r (use more r/seeds for tight CIs). `phi_eval` (per-run `--k-eval-sweep`, `fit_phi`) is only the CHEAP EVAL-DEPTH PROXY (inference-K log-slope of one trained model) — NOT the Iso-Depth φ.
 - **Optimizer / artifact:** Muon (matrix params) + AdamW groups (`build_optimizers`); int6 + zstd scored artifact (`save_int6_artifact` / `load_int6_artifact`).
 
 ## Run Commands
@@ -115,6 +116,18 @@ S+2 hidden-state cache proxy diagnostics, and S+3 fake-int6 sensitivity diagnost
 as mechanism/deployment evidence only; they do not promote P1 while the positive-control gate fails.
 
 Dated S+0 / feedback-stage run history (the `gpu67_*` verification results) lives in [`experiments/docs/hypotheses.md`](experiments/docs/hypotheses.md#current-feedback-stage-verification-2026-06-04), not here — CLAUDE.md stays policy-thin. Standing conclusion: P1 is not yet promoted (positive-control depth gain CI crosses zero); the next step is detectability repair of the Tier-1 task/positive-control capacity, not adding MoE, fixed-point pressure, cache, or quantization machinery.
+
+Principled Iso-Depth train-r φ sweep (EXPENSIVE: trains one model per r; NOT a per-run metric):
+
+```bash
+CUDA_VISIBLE_DEVICES=7 R_LIST=1,2,4,8,16 ITERATIONS=2000 SEQ_LEN=512 NPROC=1 \
+  python experiments/measure_phi.py -- --model-dim 768 --n-experts 16
+```
+
+Emits `phi_sweep: r=<r> val_loss:<L> val_bpb:<bpb>` per r and a final
+`phi_isodepth: <φ> alpha:<..> E:<..> rmse:<..> n_once:<..> n_rec:<..>` (the fitted
+recurrence-equivalence exponent). NPROC>1 uses torchrun DDP; model/config flags pass
+through after `--`.
 
 Submission-style run:
 

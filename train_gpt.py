@@ -2677,6 +2677,163 @@ def fit_phi(losses: dict) -> float:
     return float(min(max(b / b_ref, 0.0), 1.0))
 
 
+def fit_phi_isodepth(losses_by_r, n_once, n_rec) -> dict:
+    """PRINCIPLED Iso-Depth recurrence-equivalence exponent ``phi`` (arXiv:2604.21106).
+
+    Unlike :func:`fit_phi` (a cheap *eval-depth* proxy: an OLS log-slope of one
+    trained model's loss vs inference depth ``K``, divided by a unit reference),
+    this is THE recurrence-effectiveness metric. It is a FITTED parameter in the
+    joint Iso-Depth scaling law, estimated from a *pretraining sweep over
+    recurrence counts* ``r`` (separate models, each trained at a fixed recurrence
+    depth ``r``, same data / steps / seed). At fixed data ``D`` the ``B*D^-beta``
+    term is constant and absorbed into the irreducible offset ``E``::
+
+        L(r) = E + A * (N_once + r^phi * N_rec)^(-alpha)
+
+    where ``N_once`` is the count of NON-recurrent parameters (applied once:
+    embeddings, readout) and ``N_rec`` is the count of recurrent (looped-block)
+    parameters. The split ``N_once + r^phi N_rec`` is what encodes "loops vs
+    unique blocks": ``phi = 1`` means looping ``r`` times buys the capacity of
+    ``r`` unique blocks (full recurrence-equivalence); ``phi = 0`` means looping
+    buys nothing (the effective recurrent capacity is ``r``-independent, so loss
+    is flat in ``r``). Because the split itself models "loops vs unique blocks",
+    NO untied baseline is needed — looped models alone identify ``phi`` (paper
+    reference value ``phi ~ 0.46``).
+
+    Args:
+        losses_by_r: ``{r: trained_val_loss}`` mapping (one entry per recurrence
+            count ``r`` in the pretraining sweep). Non-finite losses (a diverged
+            ``r``) are dropped before fitting.
+        n_once: non-recurrent parameter count ``N_once``.
+        n_rec: recurrent (looped-block) parameter count ``N_rec``.
+
+    Returns:
+        ``{"phi", "alpha", "E", "A", "rmse", "n_points"}`` (all floats except the
+        int ``n_points``). On <3 finite points or a fit failure, ``phi`` is
+        ``NaN`` and a ``"reason"`` string is included (the function never raises).
+
+    The fit uses :func:`scipy.optimize.curve_fit` (trust-region) over the natural
+    parameters with bounds ``phi in [0, 1]``, ``alpha in (0, 3]``, ``A > 0``,
+    ``E in [0, min(L)]``, and a MULTI-START over a small ``(phi0, alpha0)`` grid
+    (``E0 = 0.9*min(L)``, ``A0`` solved from the shallowest point), keeping the
+    lowest-RMSE solution — this avoids the degenerate basin a single start can
+    fall into. It is the train-r analogue the paper estimates; with only ~5 ``r``
+    it is a small-sample, weakly-identified fit (consider more ``r`` / seeds for
+    tight confidence intervals).
+    """
+    import warnings
+
+    from scipy.optimize import OptimizeWarning, curve_fit  # local: only this path needs scipy
+
+    pts = sorted(
+        (int(r), float(v))
+        for r, v in losses_by_r.items()
+        if int(r) > 0 and math.isfinite(float(v))
+    )
+    n_points = len(pts)
+    nan_out = {
+        "phi": float("nan"), "alpha": float("nan"), "E": float("nan"),
+        "A": float("nan"), "rmse": float("nan"), "n_points": n_points,
+    }
+    # The law has 4 free parameters (phi, alpha, E, A); with <3 finite points the
+    # fit is under/ill-determined, so report NaN with a reason rather than crash.
+    if n_points < 3:
+        nan_out["reason"] = f"need>=3 finite points, got {n_points}"
+        return nan_out
+
+    rs = np.array([r for r, _ in pts], dtype=np.float64)
+    ys = np.array([v for _, v in pts], dtype=np.float64)
+    n_rec_f = float(n_rec)
+    # NUMERICAL CONDITIONING: the raw amplitude A multiplies
+    # (N_once + r^phi N_rec)^(-alpha), and with N ~ 1e7 that base is huge so A
+    # must be astronomically large (A ~ N^alpha) and the curve_fit Jacobian is
+    # badly scaled (alpha pins to its bound, A overflows). We fit the ALGEBRAICALLY
+    # IDENTICAL law with the parameter count normalized by N_rec, so the base is
+    # O(1) and the fitted amplitude A' = A * N_rec^(-alpha) is O(loss):
+    #     L(r) = E + A' * (ratio + r^phi)^(-alpha),  ratio = N_once / N_rec
+    # phi, alpha, E are invariant under this rescale; we report A = A' * N_rec^alpha
+    # so the returned A matches the un-normalized law's amplitude.
+    ratio = float(n_once) / n_rec_f if n_rec_f > 0 else 0.0
+    l_min = float(ys.min())
+
+    def _law_norm(r, phi, alpha, E, A_n):
+        return E + A_n * (ratio + (r ** phi)) ** (-alpha)
+
+    # Bounds: phi in [0,1], alpha in (0,3], A_n>0, E in [0, min(L)]. The tiny
+    # epsilons keep the lower bounds strictly inside the open intervals and below
+    # any initial guess (curve_fit requires lb <= p0 <= ub).
+    eps = 1e-9
+    lower = [0.0, eps, 0.0, eps]
+    upper = [1.0, 3.0, max(l_min, eps), np.inf]
+    E0 = min(max(0.0, 0.9 * l_min), l_min)
+    r0 = rs[0]
+
+    # MULTI-START: the 4-parameter law over only ~5 r is a small-sample fit whose
+    # (phi, alpha, A) directions partially trade off, so a single start can settle
+    # in a degenerate basin (alpha pinned to its bound). We sweep a small grid of
+    # (phi0, alpha0) starts, run curve_fit from each, and keep the lowest-RMSE
+    # FINITE solution. A0 is solved from the shallowest point so the normalized
+    # curve passes through it at each start's (phi0, alpha0, E0).
+    best = None  # (rmse, popt)
+    for phi0 in (0.1, 0.3, 0.5, 0.7, 0.9):
+        for alpha0 in (0.1, 0.3, 0.6, 1.0):
+            denom0 = (ratio + (r0 ** phi0)) ** (-alpha0)
+            A0 = max((ys[0] - E0) / denom0, 1e-12) if denom0 > 0 else 1.0
+            p0 = [phi0, alpha0, E0, A0]
+            try:
+                with warnings.catch_warnings():
+                    # Exact/near-exact fits can't estimate a covariance; we never
+                    # use pcov, so silence that expected OptimizeWarning.
+                    warnings.simplefilter("ignore", OptimizeWarning)
+                    popt, _ = curve_fit(
+                        _law_norm, rs, ys, p0=p0, bounds=(lower, upper),
+                        maxfev=20000)
+            except Exception:  # RuntimeError (no convergence), ValueError, etc.
+                continue
+            resid = ys - _law_norm(rs, *popt)
+            rmse = float(np.sqrt(np.mean(resid ** 2)))
+            if math.isfinite(rmse) and (best is None or rmse < best[0]):
+                best = (rmse, popt)
+    if best is None:
+        nan_out["reason"] = "curve_fit failed from all multi-starts"
+        return nan_out
+
+    rmse, popt = best
+    phi, alpha, E, A_n = (float(v) for v in popt)
+    # De-normalize the amplitude back to the un-normalized law A (N_rec^alpha).
+    A = A_n * (n_rec_f ** alpha) if n_rec_f > 0 else A_n
+    return {
+        "phi": phi, "alpha": alpha, "E": E, "A": A,
+        "rmse": rmse, "n_points": n_points,
+    }
+
+
+def recurrence_param_counts(model):
+    """Split trainable params into ``(n_once, n_rec)`` for the Iso-Depth law.
+
+    ``n_rec`` = sum of params under ``model.rec`` (the reversible recurrence: the
+    ``F``/``G`` delta blocks plus ``step_emb``) — the LOOPED block whose capacity
+    is reused ``r`` times. ``n_once`` = every other trainable param (``tok_emb``,
+    ``pos_emb``, ``final_norm``, ``mos_head``), applied ONCE per forward.
+
+    The tied output embedding (``mos_head.out_embed.weight`` is the SAME tensor
+    object as ``tok_emb.weight``) is counted once: ``named_parameters`` yields a
+    shared tensor a single time, so summing ``p.numel()`` over the non-``rec.``
+    named params already dedupes the tie. Unwraps a DDP/wrapper ``.module``.
+
+    Returns ``(n_once, n_rec)`` as Python ints; ``n_once + n_rec`` equals the
+    total trainable parameter count (tied weight counted once).
+    """
+    inner = model.module if hasattr(model, "module") else model
+    n_once = n_rec = 0
+    for name, p in inner.named_parameters():  # tied weight yielded once -> dedup
+        if name.startswith("rec."):
+            n_rec += p.numel()
+        else:
+            n_once += p.numel()
+    return int(n_once), int(n_rec)
+
+
 def active_expert_fraction(moe_or_last_route) -> float:
     """Mean fraction of routing weights that are strictly positive (MoE sparsity).
 
@@ -3066,6 +3223,34 @@ def _parse_int_set(spec: str):
     return tuple(int(v) for v in str(spec).split(",") if v.strip())
 
 
+def hyperparameters_from_args(args) -> "Hyperparameters":
+    """Map a parsed argparse Namespace onto a :class:`Hyperparameters` instance.
+
+    SINGLE SOURCE OF TRUTH for the args -> Hyperparameters mapping (note
+    ``seq_len`` -> ``max_seq_len``). Both the trainer ``main`` and the Iso-Depth
+    phi harness (``experiments/measure_phi.py``, which needs the model's
+    parameter split under the exact sweep config) build the model config through
+    this one function so they never drift.
+    """
+    return Hyperparameters(
+        model_dim=args.model_dim, n_heads=args.n_heads, n_kv_heads=args.n_kv_heads,
+        vocab_size=args.vocab_size, n_experts=args.n_experts, expert_rank=args.expert_rank,
+        n_mix=args.n_mix, kv_latent=args.kv_latent, head_dim=args.head_dim,
+        q_latent=args.q_latent, router_type=args.router_type,
+        max_seq_len=args.seq_len, mlp_mult=args.mlp_mult,
+        moe_target_active_frac=args.moe_target_active_frac,
+        router_bias_update_rate=args.router_bias_update_rate,
+        router_z_coef=args.router_z_coef,
+        block_order=args.block_order, attn_moe=args.attn_moe,
+        n_attn_experts=args.n_attn_experts,
+        num_shared_experts=args.num_shared_experts,
+        n_sublayers=args.n_sublayers, expert_b_init=args.expert_b_init,
+        step_conditioning=args.step_conditioning, max_step_emb=args.max_step_emb,
+        init_state=args.init_state, init_state_std=args.init_state_std,
+        recurrence_accum_dtype=args.recurrence_accum_dtype,
+    )
+
+
 def build_arg_parser():
     p = argparse.ArgumentParser(description="M0 reversible recurrent-depth GPT trainer")
     # Model shape.
@@ -3287,23 +3472,7 @@ def main(argv=None):
         batch_tokens = min_global
 
     # --- model ---
-    model_args = Hyperparameters(
-        model_dim=args.model_dim, n_heads=args.n_heads, n_kv_heads=args.n_kv_heads,
-        vocab_size=args.vocab_size, n_experts=args.n_experts, expert_rank=args.expert_rank,
-        n_mix=args.n_mix, kv_latent=args.kv_latent, head_dim=args.head_dim,
-        q_latent=args.q_latent, router_type=args.router_type,
-        max_seq_len=args.seq_len, mlp_mult=args.mlp_mult,
-        moe_target_active_frac=args.moe_target_active_frac,
-        router_bias_update_rate=args.router_bias_update_rate,
-        router_z_coef=args.router_z_coef,
-        block_order=args.block_order, attn_moe=args.attn_moe,
-        n_attn_experts=args.n_attn_experts,
-        num_shared_experts=args.num_shared_experts,
-        n_sublayers=args.n_sublayers, expert_b_init=args.expert_b_init,
-        step_conditioning=args.step_conditioning, max_step_emb=args.max_step_emb,
-        init_state=args.init_state, init_state_std=args.init_state_std,
-        recurrence_accum_dtype=args.recurrence_accum_dtype,
-    )
+    model_args = hyperparameters_from_args(args)
     base_model = M0GPT(model_args).to(device)
     model = base_model
 
@@ -3574,11 +3743,16 @@ def main(argv=None):
         k_min, k_max = sweep_ks[0], sweep_ks[-1]
         gt = sweep_bpb[k_min] - sweep_bpb[k_max]
         print0(f"depth_gain_GT:{gt:.4f}")
-        # Eval-K phi PROXY: the iso-depth recurrence-equivalence exponent fitted
-        # on the {K: val_loss} map. NOTE this is an EVAL-DEPTH proxy (it varies
-        # the inference budget K of one trained model), NOT the train-r phi (which
-        # would compare models trained at different recurrence budgets r).
-        print0(f"phi_eval:{fit_phi(sweep_loss):.4f}")
+        # phi_eval is the CHEAP EVAL-DEPTH PROXY ONLY: an OLS log-slope of ONE
+        # trained model's loss vs INFERENCE depth K (fit_phi), divided by a unit
+        # reference. It is NOT the principled Iso-Depth recurrence-equivalence
+        # exponent. THE recurrence-effectiveness metric is the train-r phi
+        # (phi_isodepth): the fitted exponent of the scaling law
+        # L(r)=E+A*(N_once+r^phi*N_rec)^-alpha over models PRETRAINED at different
+        # recurrence budgets r, produced by experiments/measure_phi.py
+        # (fit_phi_isodepth). phi_eval varies inference K of a single model and so
+        # only gauges test-time depth utilization, not train-time loop capacity.
+        print0(f"phi_eval:{fit_phi(sweep_loss):.4f}  # EVAL-K proxy (NOT phi_isodepth)")
 
     # --- peak VRAM (RESOURCE-goal headline; memory-efficiency, no gate) ---
     # Integer MiB to match the existing ``peak_vram_mb:<int>`` log contract that

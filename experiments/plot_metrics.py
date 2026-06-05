@@ -178,13 +178,23 @@ def parse_log(logpath: str) -> dict:
         # end-of-run scalar lines (NOT part of the `metrics:` line):
         #   depth_sweep: K=<int> val_bpb:<f> val_loss:<f>   (one per swept K)
         #   depth_gain_GT:<f>                               (bpb[minK]-bpb[maxK])
-        #   phi_eval:<f>                                    (eval-depth phi proxy)
+        #   phi_eval:<f>                                    (eval-depth phi PROXY)
         # `depth_sweep` is a {K: (val_bpb, val_loss)} map; GT/phi are scalars.
         # Synthetic smoke emits `nan` (no tokenizer), so the float pattern below
         # is NaN-tolerant.
         "depth_sweep": {},
         "depth_gain_GT": None,
         "phi_eval": None,
+        # PRINCIPLED Iso-Depth train-r phi (experiments/measure_phi.py — an
+        # EXPENSIVE multi-train sweep, NOT a per-run metric). It fits the scaling
+        # law L(r)=E+A*(N_once+r^phi*N_rec)^-alpha over models pretrained at
+        # different recurrence budgets r:
+        #   phi_sweep: r=<int> val_loss:<f> val_bpb:<f>     (one per r)
+        #   phi_isodepth: <phi> alpha:<f> E:<f> rmse:<f> n_once:<int> n_rec:<int> ...
+        # `phi_sweep` -> {r: (val_loss, val_bpb)} map; `phi_isodepth` -> scalar phi
+        # (the fitted exponent). val_loss is NaN-tolerant; a FAILED run is skipped.
+        "phi_sweep": {},
+        "phi_isodepth": None,
         # M0 two-goal metrics (`metrics:` log line). Resource: active_frac,
         # kv_bytes, params (+ R_act when the control sweep supplies it).
         # Expressiveness: erank (+ phi when the control sweep supplies it).
@@ -414,6 +424,20 @@ def parse_log(logpath: str) -> dict:
         m = re.search(rf"^phi_eval:{_FLOAT_NAN}", line)
         if m:
             data["phi_eval"] = float(m.group(1))
+
+        # PRINCIPLED Iso-Depth train-r phi (experiments/measure_phi.py). The
+        # per-r sweep line carries val_loss + val_bpb (a FAILED run prints the
+        # literal "FAILED", which we skip); the final line carries the fitted phi.
+        m = re.search(
+            rf"^phi_sweep:\s*r=(\d+)\s+val_loss:{_FLOAT_NAN}\s+val_bpb:{_FLOAT_NAN}",
+            line)
+        if m:
+            data["phi_sweep"][int(m.group(1))] = (
+                float(m.group(2)), float(m.group(3)))
+
+        m = re.search(rf"^phi_isodepth:\s*{_FLOAT_NAN}", line)
+        if m:
+            data["phi_isodepth"] = float(m.group(1))
 
         # M0 lightweight train-step line (`step:N/M k_hi:K train_loss:L`, no
         # train_time/step_avg, so the legacy train-step regex above does NOT

@@ -297,7 +297,9 @@ class TestPlotMetricsParse(unittest.TestCase):
                 "depth_sweep: K=16 val_bpb:1.4200 val_loss:2.5200",
                 "depth_sweep: K=64 val_bpb:1.4000 val_loss:2.5000",
                 "depth_gain_GT:0.0500",
-                "phi_eval:0.3300",
+                # phi_eval carries a trailing "# EVAL-K proxy ..." comment in the
+                # real emit; the parser must read the float and ignore the suffix.
+                "phi_eval:0.3300  # EVAL-K proxy (NOT phi_isodepth)",
             ]
         )
         with tempfile.TemporaryDirectory() as td:
@@ -311,6 +313,55 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["depth_sweep"][64], (1.40, 2.50))
         self.assertEqual(d["depth_gain_GT"], 0.05)
         self.assertEqual(d["phi_eval"], 0.33)
+
+    def test_parse_phi_isodepth_train_r_sweep_lines(self):
+        """The PRINCIPLED Iso-Depth harness (experiments/measure_phi.py) emits a
+        per-r `phi_sweep:` line and a final `phi_isodepth:` scalar. phi_sweep ->
+        {r: (val_loss, val_bpb)} map; phi_isodepth -> the fitted exponent."""
+        log = "\n".join(
+            [
+                "measure_phi: r_list=[1, 2, 4, 8, 16] n_once=2000000 n_rec=6000000",
+                "phi_sweep: r=1 val_loss:2.9200 val_bpb:1.6000",
+                "phi_sweep: r=2 val_loss:2.9000 val_bpb:1.5800",
+                "phi_sweep: r=4 val_loss:2.8800 val_bpb:1.5600",
+                "phi_sweep: r=8 val_loss:2.8600 val_bpb:1.5400",
+                "phi_sweep: r=16 val_loss:2.8400 val_bpb:1.5200",
+                ("phi_isodepth: 0.4600 alpha:0.3000 E:2.5000 rmse:1.2e-08 "
+                 "n_once:2000000 n_rec:6000000 n_points:5"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        self.assertEqual(set(d["phi_sweep"].keys()), {1, 2, 4, 8, 16})
+        self.assertEqual(d["phi_sweep"][1], (2.92, 1.60))
+        self.assertEqual(d["phi_sweep"][16], (2.84, 1.52))
+        self.assertEqual(d["phi_isodepth"], 0.46)
+
+    def test_parse_phi_isodepth_nan_and_failed_run_tolerant(self):
+        """A degenerate fit emits `phi_isodepth: nan ...` and a crashed r prints
+        `val_loss:FAILED` (skipped by the float-only phi_sweep regex)."""
+        log = "\n".join(
+            [
+                "phi_sweep: r=1 val_loss:2.9200 val_bpb:nan",
+                "phi_sweep: r=2 val_loss:FAILED val_bpb:FAILED",
+                "phi_isodepth: nan alpha:nan E:nan rmse:nan n_once:10 n_rec:20 "
+                "n_points:1 reason:need>=3 finite points, got 1",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        # Only the finite-float r=1 line is captured; the FAILED r=2 is skipped.
+        self.assertEqual(set(d["phi_sweep"].keys()), {1})
+        self.assertTrue(math.isnan(d["phi_sweep"][1][1]))  # val_bpb nan
+        self.assertTrue(math.isnan(d["phi_isodepth"]))
 
     def test_parse_depth_gain_sweep_nan_tolerant(self):
         """On the synthetic smoke (no tokenizer) bpb is `nan`; the parser must
