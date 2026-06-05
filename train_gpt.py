@@ -625,11 +625,42 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     return X.T if transposed else X
 
 
-class Muon(torch.optim.Optimizer):
-    """Muon (modded-nanogpt). Orthogonalized momentum SGD for 2D matrices.
+def zeropower_via_newtonschulz5_batched(G, steps=5, eps=1e-7):
+    """Batched Newton-Schulz: orthogonalize a stack of matrices ``(..., M, N)``.
 
-    Ported from a15093a. DDP-aware: each rank orthogonalizes a disjoint slice of
-    the params, then a single ``all_reduce(SUM)`` stitches the flattened updates.
+    Vectorized (batched matmul over the last two dims) counterpart of
+    :func:`zeropower_via_newtonschulz5`, used by :class:`Muon` for the 3-D MoE
+    expert banks (``w_in (E, dim, 2*rank)`` / ``w_out (E, rank, dim)``). Each
+    matrix is normalized independently by its own Frobenius norm over the last
+    two dims, so the iteration is scale-invariant per matrix. Same coefficients
+    and step count as the 2-D path, kept bf16-friendly and compile-free.
+    """
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    norms = X.flatten(-2).norm(dim=-1)                 # (...,)
+    X = X / (norms[..., None, None] + eps)
+    # All matrices in a homogeneous stack share the same (M, N); a single
+    # transpose decision mirrors the 2-D path's ``size(0) > size(1)`` guard.
+    transposed = X.size(-2) > X.size(-1)
+    if transposed:
+        X = X.transpose(-1, -2)
+    Xt = lambda T: T.transpose(-1, -2)
+    for _ in range(steps):
+        A = X @ Xt(X)
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    return Xt(X) if transposed else X
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon (modded-nanogpt). Orthogonalized momentum SGD for matrix params.
+
+    Ported from a15093a. Handles 2-D matrices (attn/MoS projections) via the
+    2-D Newton-Schulz and 3-D MoE expert banks ``(E, M, N)`` via the batched NS
+    (orthogonalizing each expert's matrix independently). DDP-aware: each rank
+    orthogonalizes a disjoint slice of the params, then a single
+    ``all_reduce(SUM)`` stitches the flattened updates (the per-param update has
+    the same shape as the param, so 3-D banks ride the same stitch logic).
     """
 
     def __init__(self, params, lr, momentum, backend_steps, nesterov=True):
@@ -674,8 +705,14 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g = g * (max(1, g.size(0) / g.size(1)) ** 0.5)
+                    if g.ndim == 2:
+                        g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    else:
+                        # 3-D expert banks (E, M, N): batched NS over last 2 dims.
+                        g = zeropower_via_newtonschulz5_batched(g, steps=backend_steps)
+                    # RMS-match scale: aspect-ratio factor over the matrix dims
+                    # (last two), shared across any leading batch dim.
+                    g = g * (max(1, g.size(-2) / g.size(-1)) ** 0.5)
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -888,6 +925,8 @@ def run_validation(model, loader, depth, n_batches, seq_len, global_tokens,
 # Ported from current train_gpt.py (replaces the a15093a int8 path). Single
 # supported export format: per-row SDClip int6 for >8192-elem float tensors,
 # fp16 passthrough for the tied embedding, exact passthrough for small/non-float.
+# Shared tensors (the tied tok_emb / out_embed weight) are deduped by data_ptr:
+# stored once, with the duplicate key recorded as an alias and re-tied on load.
 CONTROL_TENSOR_PATTERNS = ("norm.w", "router.bias", "gate.bias")
 FP16_KEEP_PATTERNS = ("tok_emb", "out_embed")
 SDCLIP_K_MATRIX = 12.85
@@ -930,7 +969,17 @@ def quantize_int6_sdclip(t, k=SDCLIP_K_MATRIX):
 def mixed_quantize_int6(state_dict, int6_cats):
     result = {}
     meta = {}
+    # Fix M1: dedup shared tensors (the tied tok_emb / out_embed weight is one
+    # physical Parameter). The first key to claim a ``data_ptr`` is serialized;
+    # any later key sharing it stores no payload and records an ``alias`` to the
+    # owner, resolved on dequant.
+    seen_ptrs = {}
     for name, tensor in state_dict.items():
+        ptr = tensor.data_ptr()
+        if ptr in seen_ptrs:
+            meta[name] = {"type": "alias", "to": seen_ptrs[ptr]}
+            continue
+        seen_ptrs[ptr] = name
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
         if not t.is_floating_point() or t.numel() <= 8192:
@@ -961,9 +1010,13 @@ def mixed_quantize_int6(state_dict, int6_cats):
 
 def dequantize_mixed_int6(result, meta, template_sd):
     out = {}
+    aliases = {}  # name -> owner name (Fix M1: tied/shared tensors)
     for name, orig in template_sd.items():
         info = meta[name]
         orig_dtype = orig.dtype
+        if isinstance(info, dict) and info.get("type") == "alias":
+            aliases[name] = info["to"]
+            continue
         if info in ("passthrough", "passthrough_ctrl", "passthrough_fp16"):
             t = result[name]
             if t.dtype == torch.float16 and orig_dtype in (torch.float32, torch.bfloat16):
@@ -978,6 +1031,10 @@ def dequantize_mixed_int6(result, meta, template_sd):
             out[name] = deq.view(orig_shape).to(orig_dtype)
         else:
             out[name] = (q.float() * float(s.item())).view(orig_shape).to(orig_dtype)
+    # Resolve aliases against the already-dequantized owner (re-tie shared
+    # tensors), casting to each alias's own template dtype.
+    for name, owner in aliases.items():
+        out[name] = out[owner].to(template_sd[name].dtype)
     return out
 
 
@@ -1051,7 +1108,7 @@ def finite_horizon_loss(model, x, y, k_hi, k_lo, lambda_h, margin, lambda_route)
 def build_optimizers(model, matrix_lr, embed_lr, scalar_lr,
                      beta1=0.9, beta2=0.95, adam_eps=1e-8,
                      muon_momentum=0.95, muon_backend_steps=5):
-    """Split trainable params into Muon (2D matrices) + AdamW (embed/scalars/router).
+    """Split trainable params into Muon (matrix banks) + AdamW (embed/scalars/router).
 
     Coverage contract (CLAUDE.md audit): every trainable parameter lands in
     EXACTLY one group. The tied ``tok_emb.weight`` / ``out_embed.weight`` is one
@@ -1060,7 +1117,12 @@ def build_optimizers(model, matrix_lr, embed_lr, scalar_lr,
     Group assignment:
       * embedding (``tok_emb.weight``, ``pos_emb``)            -> AdamW @ embed_lr
       * router / gate / 1D scalar params (norm scales, biases) -> AdamW @ scalar_lr
-      * remaining 2D matrices (attn/expert/MoS projections)    -> Muon  @ matrix_lr
+      * remaining matrices, ``ndim >= 2`` (attn/MoS projections AND the 3-D MoE
+        expert banks ``w_in``/``w_out`` — the effective-depth basis)
+                                                              -> Muon  @ matrix_lr
+
+    The 3-D expert banks are orthogonalized per-expert by Muon's batched
+    Newton-Schulz; routing them to Muon (not AdamW) is Fix I1.
     """
     embed_ids = set()
     embed_params = []
@@ -1076,7 +1138,7 @@ def build_optimizers(model, matrix_lr, embed_lr, scalar_lr,
             continue
         seen.add(id(p))
         is_router = ("router" in name) or ("gate" in name)
-        if p.ndim == 2 and not is_router:
+        if p.ndim >= 2 and not is_router:
             matrix_params.append(p)
         else:
             scalar_params.append(p)
@@ -1097,6 +1159,24 @@ def build_optimizers(model, matrix_lr, embed_lr, scalar_lr,
         betas=(beta1, beta2), eps=adam_eps,
     ))
     return optimizers
+
+
+def adamw_params(model, optimizers):
+    """Trainable params NOT managed by Muon (i.e. the AdamW-group params).
+
+    These are the params whose grads we all-reduce-MEAN across ranks (Muon syncs
+    its own matrix *updates*, not grads). Their synced grads have a consistent
+    global norm across ranks, so they are the only safe scope for grad clipping
+    (Fix I2): clipping over Muon params too would compute a rank-inconsistent
+    scale from unsynced per-rank grads. Muon's update is scale-invariant (NS
+    re-normalizes), so its params neither need nor should drive the clip.
+    """
+    muon_ids = {
+        id(p) for opt in optimizers if isinstance(opt, Muon)
+        for group in opt.param_groups for p in group["params"]
+    }
+    return [p for p in model.parameters()
+            if p.requires_grad and id(p) not in muon_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -1391,17 +1471,12 @@ def main(argv=None):
     # reducer bookkeeping does not support. Instead: Muon all-reduces its own
     # matrix updates internally (per-rank slice then SUM == full update), and we
     # explicitly all-reduce-MEAN the grads of every non-Muon (AdamW) param below.
-    muon_param_ids = {
-        id(p) for opt in optimizers if isinstance(opt, Muon)
-        for group in opt.param_groups for p in group["params"]
-    }
-    adamw_params = [p for p in base_model.parameters()
-                    if p.requires_grad and id(p) not in muon_param_ids]
+    adamw_param_list = adamw_params(base_model, optimizers)
 
     def sync_adamw_grads():
         if not distributed or world_size <= 1:
             return
-        for p in adamw_params:
+        for p in adamw_param_list:
             if p.grad is not None:
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
                 p.grad.div_(world_size)
@@ -1485,7 +1560,12 @@ def main(argv=None):
         # its own matrix updates internally during opt.step().
         sync_adamw_grads()
         if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip)
+            # Fix I2: clip over the AdamW group ONLY. Their grads are synced
+            # (consistent global norm across ranks), so the clip scale is
+            # identical on every rank. Muon's grads are unsynced per-rank (it
+            # syncs updates, not grads) and its update is scale-invariant, so
+            # including Muon params would give a rank-inconsistent clip.
+            torch.nn.utils.clip_grad_norm_(adamw_param_list, args.grad_clip)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
