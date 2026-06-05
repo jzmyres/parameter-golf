@@ -85,6 +85,14 @@ def test_finite_horizon_hinge_loss():
     assert not parts["l_lo_sg"].requires_grad
 
 
+def test_control_experiment_script_shape():
+    import subprocess
+    txt = open("experiments/run_m0_control_experiments.sh").read()
+    for s in ("router_type=relu", "router_type=softmax", "for r in 1 2 4 8", "kv_latent"):
+        assert s in txt
+    subprocess.run(["bash", "-n", "experiments/run_m0_control_experiments.sh"], check=True)
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
