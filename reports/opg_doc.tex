@@ -377,8 +377,9 @@ drops the \(x_0\)-seed gradient term (\(g_{x_0}\mathrel{+}=g_a+g_b\)) when the s
 non-learnable init---returning \(g_a,g_b\) in the seed slots, which the caller discards.
 
 \paragraph{Scale and statistics.}
-Use \(d_{\rm model}\in[256,512]\), one reversible block, context length at most 1024, and multiple
-seeds.  Evaluate
+Use \(d_{\rm model}\in[512,768]\) (the trainer default is \(768\): 12 query / 4 KV heads,
+head dim 64, MLA kv-latent 256, 16 experts of rank 64), one reversible block, context length at
+most 1024, and multiple seeds.  Evaluate
 \[
   K\in\{4,8,16,32,64,128\}.
 \]
