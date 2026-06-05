@@ -696,6 +696,72 @@ def test_finite_horizon_loss_adds_entropy_and_loadbalance_terms():
         assert torch.isfinite(parts1[k])
 
 
+def test_finite_horizon_loss_adds_router_z_loss_term():
+    """finite_horizon_loss composes the ST-MoE z-loss when z_coef>0:
+
+        L = base + z_coef * Z,   Z = mean(logsumexp(router_logits)^2).
+    """
+    from train_gpt import M0GPT, finite_horizon_loss
+
+    torch.manual_seed(0)
+    model = M0GPT(_tiny_args())
+    x = torch.randint(0, 1024, (2, 16))
+    y = torch.randint(0, 1024, (2, 16))
+
+    # z-loss off -> reported router_z is an in-graph 0.0; loss == base.
+    loss0, parts0 = finite_horizon_loss(
+        model, x, y, k_hi=4, k_lo=2, lambda_h=0.5, margin=0.0, lambda_route=0.0,
+        use_load_balance=False, entropy_coef=0.0, loadbalance_coef=0.0, z_coef=0.0,
+    )
+    assert "router_z" in parts0 and float(parts0["router_z"]) == 0.0
+    # z-loss on -> loss == base + z_coef * Z, and Z > 0 (the experts are live).
+    loss1, parts1 = finite_horizon_loss(
+        model, x, y, k_hi=4, k_lo=2, lambda_h=0.5, margin=0.0, lambda_route=0.0,
+        use_load_balance=False, entropy_coef=0.0, loadbalance_coef=0.0, z_coef=0.5,
+    )
+    base = parts1["l_hi"] + 0.5 * torch.relu(parts1["l_hi"] - parts1["l_lo_sg"] + 0.0)
+    expected = base + 0.5 * parts1["router_z"]
+    assert torch.allclose(loss1, expected, atol=1e-5)
+    assert torch.isfinite(parts1["router_z"]) and float(parts1["router_z"].detach()) > 0.0
+
+
+def test_router_bias_update_runs_at_step_boundary_in_trainer():
+    """The DeepSeek-V3 step-boundary bias update (update_router_biases) moves the
+    recurrence MoEs' router_bias away from zero over a few real optimizer steps,
+    and the bias stays a buffer (not a Parameter) throughout."""
+    from train_gpt import (
+        Hyperparameters, M0GPT, finite_horizon_loss, update_router_biases,
+        _RouterBiasMixin,
+    )
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=24, n_heads=2, n_kv_heads=1, vocab_size=64, n_experts=8,
+        expert_rank=8, n_mix=2, kv_latent=8, head_dim=8, max_seq_len=16,
+        router_type="softmax", router_bias_update_rate=0.05,
+    )
+    model = M0GPT(args)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    gen = torch.Generator().manual_seed(1)
+    moved = False
+    for _ in range(8):
+        x = torch.randint(0, 64, (2, 8), generator=gen)
+        y = torch.randint(0, 64, (2, 8), generator=gen)
+        opt.zero_grad(set_to_none=True)
+        loss, _ = finite_horizon_loss(
+            model, x, y, k_hi=4, k_lo=2, lambda_h=0.0, margin=0.0,
+            lambda_route=0.0, use_load_balance=False, z_coef=1e-3)
+        loss.backward()
+        opt.step()
+        update_router_biases(model)  # the step-boundary update
+    param_ids = {id(p) for p in model.parameters()}
+    for m in model._recurrence_moes():
+        assert id(m.router_bias) not in param_ids  # still a buffer
+        if float(m.router_bias.abs().sum()) > 0.0:
+            moved = True
+    assert moved, "router_bias never moved off zero — step-boundary update inert"
+
+
 def test_target_active_frac_gates_adaptive_controller():
     """--router-target-active-frac > 0 (relu) enables the controller; 0 disables.
 
@@ -711,16 +777,20 @@ def test_target_active_frac_gates_adaptive_controller():
     # Enabled.
     a1 = p.parse_args(["--router-type", "relu", "--router-target-active-frac", "0.4"])
     assert a1.router_target_active_frac == 0.4
-    # Entropy aux defaults ON at an effective coef (chosen collapse-preventer);
-    # load-balance defaults OFF (not stacked by default). Both remain CLI knobs.
-    assert a0.router_entropy_coef == 0.1
+    # The DEFAULT collapse-preventer is now DeepSeek-V3 loss-free balancing
+    # (router-bias-update-rate>0) + ST-MoE z-loss (router-z-coef>0). The
+    # entropy-MAX term is DEMOTED to OFF-by-default; load-balance stays OFF. All
+    # remain CLI knobs.
+    assert a0.router_bias_update_rate > 0.0
+    assert a0.router_z_coef > 0.0
+    assert a0.router_entropy_coef == 0.0
     assert a0.router_loadbalance_coef == 0.0
     a2 = p.parse_args(["--router-entropy-coef", "0.01", "--router-loadbalance-coef", "0.02"])
     assert a2.router_entropy_coef == 0.01
     assert a2.router_loadbalance_coef == 0.02
-    # Entropy aux is still disablable via the CLI knob.
-    a3 = p.parse_args(["--router-entropy-coef", "0.0"])
-    assert a3.router_entropy_coef == 0.0
+    # Entropy aux is still ENABLABLE via the CLI knob (ablation path).
+    a3 = p.parse_args(["--router-entropy-coef", "0.1"])
+    assert a3.router_entropy_coef == 0.1
 
 
 def test_entropy_aux_keeps_relu_moe_alive_no_collapse():
@@ -818,6 +888,25 @@ def test_format_metrics_line_emits_router_entropy_and_expert_util():
     assert "expert_util:2.5000" in line
     assert "disp_tail:0.4200" in line
     assert "diag:active_frac:0.5000" in line
+
+
+def test_format_metrics_line_emits_and_omits_moe_basis_diagnostics():
+    """The metrics: line carries route_step_div + expert_cos_div WHEN supplied and
+    OMITS them when absent (the MoE-basis-depth diagnostics)."""
+    from train_gpt import format_metrics_line
+
+    line = format_metrics_line({
+        "erank": 1.0, "peak_vram": 0.0, "kv_bytes": 8, "params": 10,
+        "route_step_div": 0.625, "expert_cos_div": 0.7777,
+    })
+    assert "route_step_div:0.6250" in line
+    assert "expert_cos_div:0.7777" in line
+    # Omitted when absent.
+    line2 = format_metrics_line({
+        "erank": 1.0, "peak_vram": 0.0, "kv_bytes": 8, "params": 10,
+    })
+    assert "route_step_div" not in line2
+    assert "expert_cos_div" not in line2
 
 
 # ---------------------------------------------------------------------------
@@ -1179,21 +1268,22 @@ def test_loadbalance_aux_changes_expert_utilization():
     )
 
 
-def test_router_default_entropy_coef_is_effective():
-    """The DEFAULT --router-entropy-coef must be a value that actually prevents
-    collapse (the bake-off's 0.01-style default was effectively zero). Assert the
-    parser default is > 0 and, run through the loss at that default, lifts router
-    entropy clearly above a no-aux baseline."""
+def test_router_default_collapse_preventer_is_loss_free_balancing():
+    """The DEFAULT collapse-preventer is now DeepSeek-V3 loss-free balancing +
+    ST-MoE z-loss (NOT the demoted entropy-max). Assert the parser defaults: the
+    bias-update-rate and z-coef are ON (>0) and the entropy-MAX coef is OFF (0.0).
+
+    The entropy-max term MAXIMIZES per-token entropy and fights useful
+    specialization; it did not prevent the measured 9.7M-scale collapse, so it is
+    no longer the default. It stays a CLI ablation knob."""
     from train_gpt import build_arg_parser
 
-    default = build_arg_parser().parse_args([]).router_entropy_coef
-    assert default > 0.0, f"default entropy coef {default} is OFF (collapse risk)"
-    h_default, _ = _train_m0_for_router(entropy_coef=default)
-    h_off, _ = _train_m0_for_router(entropy_coef=0.0)
-    assert h_default > h_off + 0.3, (
-        f"default entropy coef {default} is not effective: "
-        f"default-run entropy {h_default:.4f} vs off {h_off:.4f}"
-    )
+    a = build_arg_parser().parse_args([])
+    assert a.router_bias_update_rate > 0.0, (
+        "DeepSeek loss-free balancing is OFF by default (collapse risk)")
+    assert a.router_z_coef > 0.0, "ST-MoE z-loss is OFF by default (collapse risk)"
+    assert a.router_entropy_coef == 0.0, (
+        "entropy-MAX is still the default — it should be demoted to OFF")
 
 
 def test_moe_is_non_inert_n_experts_changes_loss():

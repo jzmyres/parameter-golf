@@ -337,3 +337,71 @@ def test_x0_init_byte_identical_to_explicit_x0_seed():
     for n, p in rec.named_parameters():
         assert torch.allclose(p.grad, g_default[n], atol=1e-12), n
     assert torch.allclose(x0b.grad, gx0_default, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V3 router_bias is a CONSTANT detached buffer within a forward+backward
+# (updated only at the step boundary), so reversibility (fp64 reconstruction,
+# recon_rel ~ 0) and grad-equivalence MUST be unaffected by a NONZERO bias.
+# ---------------------------------------------------------------------------
+def _m0_with_nonzero_router_bias(dtype=torch.float64, accum="float64"):
+    from train_gpt import Hyperparameters, M0GPT, _RouterBiasMixin
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=16, n_experts=4,
+        expert_rank=4, n_mix=2, kv_latent=4, head_dim=8, max_seq_len=16,
+        router_type="softmax", router_bias_update_rate=1e-3,
+        recurrence_accum_dtype=accum,
+    )
+    m = M0GPT(args).to(dtype)
+    # Re-randomize the (else near-identity) delta blocks so reconstruction is a
+    # NON-TRIVIAL gate, then set a NONZERO frozen router_bias on every MoE.
+    with torch.no_grad():
+        for blk in (m.rec.F, m.rec.G):
+            for sub in blk.sublayers:
+                for mla in sub.attn_modules():
+                    mla.o_proj.weight.normal_(std=0.3)
+                for moe in sub.moe_modules():
+                    moe.w_out.normal_(std=0.3)
+        for mod in m.modules():
+            if isinstance(mod, _RouterBiasMixin):
+                mod.router_bias = torch.randn_like(mod.router_bias).to(dtype) * 0.4
+    return m
+
+
+def test_recon_rel_is_zero_with_nonzero_router_bias():
+    """fp64 reversible reconstruction stays EXACT (recon_rel ~ 0) with a NONZERO
+    frozen router_bias — the bias is a constant detached buffer within the
+    forward+backward, so the inverse reconstructs the identical routing map."""
+    from train_gpt import reconstruction_error
+
+    m = _m0_with_nonzero_router_bias()
+    x = torch.randint(0, 16, (2, 8))
+    rr = reconstruction_error(m, x, depth=6)
+    assert rr < 1e-9, f"recon_rel must be ~0 with nonzero router_bias, got {rr:.2e}"
+
+
+def test_reversible_backward_matches_ordinary_autograd_with_router_bias():
+    """The O(1)-memory custom backward must match ordinary stored-activation BPTT
+    even with a NONZERO router_bias (constant within forward+backward). Compares
+    the run_reversible grads to forward_states + ordinary autograd grads."""
+    m = _m0_with_nonzero_router_bias()
+    x = torch.randint(0, 16, (2, 8))
+    x0 = m.tok_emb(x) + m.pos_emb[:, :x.shape[1]]
+    x0 = x0.detach()
+    rec = m.rec
+    # Reference: ordinary autograd through forward_states.
+    x0a = x0.clone().requires_grad_(True)
+    (aK, bK), _ = rec.forward_states(x0a, x0a, x0a, depth=4)
+    (0.5 * (aK + bK)).pow(2).sum().backward()
+    ref_g = {n: p.grad.clone() for n, p in rec.named_parameters()}
+    ref_x0 = x0a.grad.clone()
+    for p in rec.parameters():
+        p.grad = None
+    # O(1) custom-autograd path.
+    x0b = x0.clone().requires_grad_(True)
+    rec.run_reversible(x0b, depth=4).pow(2).sum().backward()
+    for n, p in rec.named_parameters():
+        assert torch.allclose(p.grad, ref_g[n], atol=1e-6), n
+    assert torch.allclose(x0b.grad, ref_x0, atol=1e-6)

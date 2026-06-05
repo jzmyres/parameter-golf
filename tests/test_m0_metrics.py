@@ -358,6 +358,61 @@ def test_displacement_tail_summary_helper():
     assert displacement_tail([]) != displacement_tail([])
 
 
+# --- route_step_div / expert_cos_div (MoE-basis-depth diagnostics) ---------
+def test_route_step_diversity_in_range_on_real_m0gpt():
+    """``route_step_div`` is a finite float in ``[1/K, 1]`` on a real M0GPT."""
+    from train_gpt import Hyperparameters, M0GPT, route_step_diversity
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=16, n_experts=4,
+        expert_rank=4, n_mix=2, kv_latent=4, head_dim=8, max_seq_len=16,
+    )
+    m = M0GPT(args)
+    tokens = torch.randint(0, 16, (2, 5))
+    K = 6
+    rsd = route_step_diversity(m, tokens, depth=K)
+    assert isinstance(rsd, float) and rsd == rsd  # finite (not NaN)
+    assert 1.0 / K - 1e-6 <= rsd <= 1.0 + 1e-6, rsd
+
+
+def test_route_step_diversity_degenerate_single_expert_is_one_over_K():
+    """A DEGENERATE router (one expert always dominant every step) gives
+    ``route_step_div`` == 1/K (the collapse mode this fix targets)."""
+    from train_gpt import Hyperparameters, M0GPT, route_step_diversity, SwiGLUMoE
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=16, n_experts=4,
+        expert_rank=4, n_mix=2, kv_latent=4, head_dim=8, max_seq_len=16,
+    )
+    m = M0GPT(args)
+    # Force the FFN MoE routers to ALWAYS pick expert 0 (huge bias on logit 0):
+    # the argmax is then expert 0 at every step -> 1 distinct expert / K.
+    with torch.no_grad():
+        for mod in m.modules():
+            if isinstance(mod, SwiGLUMoE):
+                mod.router.weight.zero_()
+                mod.router.bias.zero_()
+                mod.router.bias[0] = 1e3
+    tokens = torch.randint(0, 16, (2, 5))
+    K = 5
+    rsd = route_step_diversity(m, tokens, depth=K)
+    assert abs(rsd - 1.0 / K) < 1e-6, f"degenerate router should give 1/K, got {rsd}"
+
+
+def test_expert_output_cosine_diversity_metric():
+    """``expert_output_cosine_diversity`` is finite and >= 0; <2 experts -> NaN."""
+    from train_gpt import SwiGLUMoE, expert_output_cosine_diversity
+
+    torch.manual_seed(0)
+    moe = SwiGLUMoE(dim=16, n_experts=4, expert_rank=8, router_type="softmax")
+    d = expert_output_cosine_diversity(moe)
+    assert d == d and d >= 0.0
+    moe1 = SwiGLUMoE(dim=16, n_experts=1, expert_rank=8, router_type="softmax")
+    assert expert_output_cosine_diversity(moe1) != expert_output_cosine_diversity(moe1)
+
+
 # --- reconstruction_error (reversible round-trip / BPTT gradient-correctness gate) -
 def _small_m0_args(**overrides):
     """Tiny CPU M0 config for the recon_rel probe tests."""

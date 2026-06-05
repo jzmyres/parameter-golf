@@ -628,9 +628,129 @@ class MLAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# 6a. Auxiliary-loss-free load-balancing router bias (DeepSeek-V3) + z-loss
+# ---------------------------------------------------------------------------
+class _RouterBiasMixin:
+    """DeepSeek-V3 auxiliary-loss-free load-balancing bias + ST-MoE z-loss.
+
+    Shared router-collapse machinery for the FFN MoE (:class:`SwiGLUMoE`) and the
+    attention MoE (:class:`MLAMoE`). One mixin so the buffers, the bias-conditioned
+    routing map, the load accumulation, and the step-boundary update are defined
+    ONCE (DRY / sibling-fanout gate).
+
+    DeepSeek-V3 loss-free balancing~\\cite{deepseekv3} is the SOTA collapse
+    preventer because it equalizes per-expert load WITHOUT a gradient-interfering
+    auxiliary loss: a per-expert bias ``router_bias`` (a detached BUFFER, NOT a
+    Parameter, in NO optimizer group) is ADDED to the router logits before the
+    softmax so an under-used expert is nudged up and an over-used one down. The
+    bias is the permitted "slow bias feedback": it is updated ONLY at the optimizer
+    step boundary (between optimizer steps), so it is CONSTANT within any single
+    forward+backward. That constancy is what keeps the reversible recurrence exact
+    — the backward reconstruction reads the SAME ``router_bias`` the forward used,
+    so reconstruction (``recon_rel``) and grad-equivalence are unaffected.
+
+    Load accumulation: ``_load_accum`` sums, per expert, the detached routing
+    weight over tokens AND recurrence steps; ``_load_count`` sums the token count.
+    Accumulation happens ONLY while ``_load_accum_enabled`` is True, which the real
+    training forward turns on for the duration of the recurrence (and OFF for the
+    backward reconstruction and the eval/diagnostic forwards) so each step is
+    counted exactly once and the backward replay does not double-count.
+
+    Step-boundary update (DeepSeek-V3 sign rule)::
+
+        load      = _load_accum / _load_count            # mean weight per expert
+        mean_load = load.mean()
+        router_bias += rate * sign(mean_load - load)     # up under-used, down over
+        router_bias -= router_bias.mean()                # re-center for stability
+
+    ST-MoE z-loss~\\cite{stmoe} is the direct anti-over-confidence term computed by
+    :meth:`router_z_loss`: ``mean( logsumexp(logits)^2 )`` over routed tokens. It
+    bounds the router logit magnitude, preventing the runaway confidence that
+    collapses per-token entropy. It is an in-graph loss (recomputed on the saved
+    block input, like the other router regs) so reversibility is untouched.
+    """
+
+    def _init_router_bias(self, n_experts, router_bias_update_rate=0.0):
+        self.router_bias_update_rate = float(router_bias_update_rate)
+        # Detached buffers (NOT Parameters): no grad, never in an optimizer group.
+        # persistent=False so they are not serialized in the int6 artifact (they
+        # are training-only balancing state, regenerated as zeros on load).
+        self.register_buffer("router_bias", torch.zeros(n_experts),
+                             persistent=False)
+        self.register_buffer("_load_accum", torch.zeros(n_experts),
+                             persistent=False)
+        self.register_buffer("_load_count", torch.zeros(()), persistent=False)
+        # Accumulate load ONLY during the real training forward (see class doc).
+        self._load_accum_enabled = False
+
+    def _apply_router_bias(self, logits):
+        """Add the loss-free balancing bias to the router logits before the
+        routing activation. The bias is a detached buffer (constant within a
+        forward+backward), so reversibility/recon stay exact."""
+        return logits + self.router_bias.to(logits.dtype)
+
+    def _accumulate_router_load(self, w):
+        """Accumulate detached per-expert load (summed over tokens AND steps).
+
+        ``w`` is the (B, T, E) routing-weight tensor. Per-expert load is the SUM
+        of routing weight over the (B, T) tokens; ``_load_count`` tracks the token
+        count so the step-boundary update reads the MEAN weight per expert. No-op
+        unless ``_load_accum_enabled`` (real forward only) — the backward
+        reconstruction and eval/diagnostic forwards must NOT accumulate."""
+        if not self._load_accum_enabled:
+            return
+        wd = w.detach()
+        E = wd.shape[-1]
+        wf = wd.reshape(-1, E).float()
+        self._load_accum = self._load_accum + wf.sum(dim=0)
+        self._load_count = self._load_count + float(wf.shape[0])
+
+    @torch.no_grad()
+    def update_router_bias(self):
+        """DeepSeek-V3 step-boundary bias update from the accumulated load.
+
+        Called ONCE per optimizer step, OUTSIDE the reversible Function (so the
+        bias is constant within every forward+backward). Returns the per-expert
+        mean load (for an optional all-reduce by the caller); a no-op (returns
+        ``None``) when the rate is 0 or no load was accumulated. The caller is
+        responsible for all-reducing the load across ranks BEFORE this update so
+        every rank keeps an identical bias (reversibility/determinism)."""
+        if self.router_bias_update_rate <= 0.0:
+            return None
+        if float(self._load_count) <= 0.0:
+            return None
+        load = self._load_accum / self._load_count
+        mean_load = load.mean()
+        # Sign rule: raise the bias of UNDER-used experts (load < mean) and lower
+        # OVER-used ones (load > mean). Re-center (subtract the mean) so the bias
+        # does not drift as a whole — only the RELATIVE per-expert offsets matter.
+        self.router_bias = self.router_bias + self.router_bias_update_rate * torch.sign(
+            mean_load - load)
+        self.router_bias = self.router_bias - self.router_bias.mean()
+        # Reset the accumulators for the next optimizer step's window.
+        self._load_accum = torch.zeros_like(self._load_accum)
+        self._load_count = torch.zeros_like(self._load_count)
+        return load
+
+    def router_z_loss(self):
+        """In-graph ST-MoE router z-loss ``mean( logsumexp(logits)^2 )``.
+
+        Recomputed from the saved detached block input UNDER GRAD (like the other
+        router regs) so it trains the router. ``logsumexp(logits, dim=-1)`` is the
+        log-partition of the router; squaring and averaging over routed tokens
+        penalizes large logit magnitudes (the runaway confidence that collapses
+        per-token entropy). Returns ``None`` if no forward has run yet."""
+        if self._route_input is None:
+            return None
+        logits = self.router(self._route_input)            # (B, T, E)
+        lse = torch.logsumexp(logits, dim=-1)              # (B, T)
+        return (lse ** 2).mean()
+
+
+# ---------------------------------------------------------------------------
 # 6b. Attention Mixture-of-Experts (MoEUT-style)
 # ---------------------------------------------------------------------------
-class MLAMoE(nn.Module):
+class MLAMoE(_RouterBiasMixin, nn.Module):
     """Per-token Mixture-of-Experts over low-rank MLA attention experts.
 
     A MoEUT-style attention MoE used as the attention sub-component of an
@@ -658,7 +778,7 @@ class MLAMoE(nn.Module):
     def __init__(self, dim, n_heads, n_kv_heads, kv_latent, head_dim,
                  n_experts, q_latent=None, rope_base=10000.0,
                  router_type="softmax", num_shared_experts=0,
-                 expert_b_init="small"):
+                 expert_b_init="small", router_bias_update_rate=0.0):
         super().__init__()
         assert router_type in ("softmax", "relu"), (
             f"router_type must be 'softmax' or 'relu', got {router_type!r}"
@@ -671,6 +791,9 @@ class MLAMoE(nn.Module):
         self.expert_b_init = expert_b_init
 
         self.router = nn.Linear(dim, n_experts)
+        # DeepSeek-V3 loss-free balancing bias + load accumulators (detached
+        # buffers; updated only at the step boundary -> reversibility-safe).
+        self._init_router_bias(n_experts, router_bias_update_rate)
         # Routed experts: one independent MLA per expert (own Q/KV/o weights).
         self.experts = nn.ModuleList([
             MLAttention(dim=dim, n_heads=n_heads, n_kv_heads=n_kv_heads,
@@ -695,7 +818,9 @@ class MLAMoE(nn.Module):
 
     # -- router map / aux terms: identical contract to SwiGLUMoE -------------
     def _router_weights(self, x):
-        logits = self.router(x)
+        # Add the DeepSeek-V3 loss-free balancing bias to the logits BEFORE the
+        # softmax (constant detached buffer -> reversibility-safe).
+        logits = self._apply_router_bias(self.router(x))
         if self.router_type == "softmax":
             return F.softmax(logits, dim=-1)
         return F.relu(logits)
@@ -727,6 +852,8 @@ class MLAMoE(nn.Module):
         self._route_input = x.detach()
         self.last_route = w.detach()
         self.last_sparsity = (w.detach() == 0).type_as(w).mean()
+        # DeepSeek-V3 load accumulation (real forward only; see _RouterBiasMixin).
+        self._accumulate_router_load(w)
 
         # Routed: stack the per-expert attention outputs and soft-combine.
         # Each expert is a pure function of x; the combine is continuous in w.
@@ -742,7 +869,7 @@ class MLAMoE(nn.Module):
 # ---------------------------------------------------------------------------
 # 7. SwiGLU Mixture-of-Experts
 # ---------------------------------------------------------------------------
-class SwiGLUMoE(nn.Module):
+class SwiGLUMoE(_RouterBiasMixin, nn.Module):
     """Smooth, reversibility-safe SwiGLU Mixture-of-Experts FFN.
 
     Used as an ``F`` / ``G`` block inside :class:`ReversibleRecurrence`, so the
@@ -805,7 +932,8 @@ class SwiGLUMoE(nn.Module):
     """
 
     def __init__(self, dim, n_experts, expert_rank, router_type="softmax",
-                 num_shared_experts=0, expert_b_init="small"):
+                 num_shared_experts=0, expert_b_init="small",
+                 router_bias_update_rate=0.0):
         super().__init__()
         assert router_type in ("softmax", "relu"), (
             f"router_type must be 'softmax' or 'relu', got {router_type!r}"
@@ -824,6 +952,9 @@ class SwiGLUMoE(nn.Module):
         # Router is full-rank: dim -> n_experts logits. Routes ONLY the routed
         # experts; the shared experts (below) are always-on and ungated.
         self.router = nn.Linear(dim, n_experts)
+        # DeepSeek-V3 loss-free balancing bias + load accumulators (detached
+        # buffers; updated only at the step boundary -> reversibility-safe).
+        self._init_router_bias(n_experts, router_bias_update_rate)
 
         # Low-rank (LoRA-style) SwiGLU experts as batched parameter banks.
         # gate/up share a single down-projection to expert_rank, then SwiGLU
@@ -914,8 +1045,11 @@ class SwiGLUMoE(nn.Module):
 
         Single source for the router map, shared by :meth:`forward` and the aux
         recompute path. Continuous in ``x`` (no dispatch) so reversibility holds.
+        The DeepSeek-V3 loss-free balancing bias is added to the logits BEFORE the
+        activation (a constant detached buffer within a forward+backward, so the
+        reversible inverse recomputes the same routing map -> recon stays exact).
         """
-        logits = self.router(x)                                  # (B, T, E)
+        logits = self._apply_router_bias(self.router(x))         # (B, T, E)
         if self.router_type == "softmax":
             return F.softmax(logits, dim=-1)
         return F.relu(logits)                                    # exact zeros
@@ -981,6 +1115,8 @@ class SwiGLUMoE(nn.Module):
         # Detached diagnostics (read at log / controller sites; no hot-path cost).
         self.last_route = w.detach()
         self.last_sparsity = (w.detach() == 0).type_as(w).mean()
+        # DeepSeek-V3 load accumulation (real forward only; see _RouterBiasMixin).
+        self._accumulate_router_load(w)
 
         # --- Dense low-rank SwiGLU over ALL routed experts (no skipping) ---
         h = torch.einsum("btd,edr->bter", x, self.w_in)         # (B, T, E, 2*rank)
@@ -1100,6 +1236,16 @@ class Hyperparameters:
     # ReMoE adaptive sparsity controller target (relu router): the active
     # fraction the controller holds routing at; sparsity target S* = 1 - this.
     moe_target_active_frac: float = 0.5
+    # DeepSeek-V3 auxiliary-loss-free load-balancing bias update rate (the DEFAULT
+    # collapse-preventer). A per-expert detached buffer bias is added to the router
+    # logits before the softmax and updated once per optimizer step by the sign
+    # rule (up under-used, down over-used). 0 disables. Updated only at the step
+    # boundary -> constant within a forward+backward -> reversibility-safe.
+    router_bias_update_rate: float = 1e-3
+    # ST-MoE router z-loss coefficient (the direct anti-over-confidence term):
+    # loss += coef * mean(logsumexp(logits)^2), bounding the router logit magnitude
+    # so per-token entropy cannot collapse via runaway confidence. 0 disables.
+    router_z_coef: float = 1e-3
     # --- Configurable recurrence-block structure (architecture-search axes) ---
     # All default to the CURRENT M0 behavior so existing runs are unchanged.
     # Each is reversibility-preserving (smooth routing, pure function of input).
@@ -1214,6 +1360,7 @@ class _DeltaSubBlock(nn.Module):
                 router_type=args.router_type,
                 num_shared_experts=args.num_shared_experts,
                 expert_b_init=args.expert_b_init,
+                router_bias_update_rate=args.router_bias_update_rate,
             )
         else:
             self.attn = MLAttention(
@@ -1226,6 +1373,7 @@ class _DeltaSubBlock(nn.Module):
             router_type=args.router_type,
             num_shared_experts=args.num_shared_experts,
             expert_b_init=args.expert_b_init,
+            router_bias_update_rate=args.router_bias_update_rate,
         )
 
     def attn_modules(self):
@@ -1377,6 +1525,29 @@ class M0GPT(nn.Module):
                     if args.expert_b_init != "zero":
                         nn.init.normal_(moe.w_out, std=0.02)
 
+    def _recurrence_moes(self):
+        """Yield the router-bearing MoE modules INSIDE the reversible recurrence.
+
+        These are the only modules whose ``router_bias`` rides the reversible
+        forward+backward, so they are the scope for load accumulation and the
+        step-boundary DeepSeek-V3 bias update. Walks the F/G blocks so it covers
+        the FFN MoE and (when ``attn_moe``) the attention MoE for any n_sublayers.
+        """
+        for blk in (self.rec.F, self.rec.G):
+            for m in blk.modules():
+                if isinstance(m, _RouterBiasMixin):
+                    yield m
+
+    def set_router_load_accum(self, enabled):
+        """Enable/disable DeepSeek-V3 load accumulation on the recurrence MoEs.
+
+        The REAL training forward turns this ON for the duration of the
+        recurrence (and OFF immediately after), so each recurrence step's routing
+        is counted exactly once. The backward reconstruction and the eval /
+        diagnostic forwards run with it OFF so they never double-count."""
+        for m in self._recurrence_moes():
+            m._load_accum_enabled = bool(enabled)
+
     def forward(self, tokens, targets, depth):
         B, T = tokens.shape
         x0 = self.tok_emb(tokens) + self.pos_emb[:, :T]
@@ -1391,7 +1562,16 @@ class M0GPT(nn.Module):
         if self.args.init_state == "random":
             a0 = self.args.init_state_std * torch.randn_like(x0)
             b0 = self.args.init_state_std * torch.randn_like(x0)
-        z_K = self.rec.run_reversible(x0, depth, a0=a0, b0=b0)
+        # DeepSeek-V3 load accumulation ON only for the REAL forward recurrence
+        # (the RevRecurrenceFn.forward sweep). It is OFF for the backward
+        # reconstruction (a separate autograd call after this returns) and for the
+        # eval/diagnostic forwards, so each step is counted exactly once and the
+        # backward replay does not double-count -> reversibility-safe load stats.
+        self.set_router_load_accum(True)
+        try:
+            z_K = self.rec.run_reversible(x0, depth, a0=a0, b0=b0)
+        finally:
+            self.set_router_load_accum(False)
         # The recurrence accumulates the stream in fp64 (recurrence_accum_dtype);
         # cast the midpoint back to the model/input dtype BEFORE the readout so
         # final_norm/mos_head/loss run unchanged (no fp64 leak into the head).
@@ -2061,6 +2241,34 @@ def _collect_load_balance(model):
     return _collect_moe_aux(model, "load_balance_term")
 
 
+def _collect_router_z(model):
+    """Sum the in-graph ST-MoE router z-loss over the MoE blocks."""
+    return _collect_moe_aux(model, "router_z_loss")
+
+
+def update_router_biases(model, distributed=False, world_size=1):
+    """Apply the DeepSeek-V3 step-boundary load-free bias update to every MoE.
+
+    Called ONCE per optimizer step at the step boundary (OUTSIDE the reversible
+    Function), so the bias is constant within every forward+backward and the
+    reversible reconstruction stays exact. For DDP correctness the accumulated
+    per-expert load is all-reduced-MEAN across ranks BEFORE the sign update so
+    every rank derives an IDENTICAL bias (determinism / reversibility). A no-op
+    when the update rate is 0 (the buffer stays at its zero init). Walks the inner
+    module so it works under DDP/compile wrappers."""
+    inner = model.module if hasattr(model, "module") else model
+    for m in inner.modules():
+        if not isinstance(m, _RouterBiasMixin) or m.router_bias_update_rate <= 0.0:
+            continue
+        if distributed and world_size > 1:
+            # All-reduce-SUM the accumulators so the per-rank slices are stitched
+            # into the GLOBAL load (count is also summed); the mean inside
+            # update_router_bias then yields a rank-identical bias.
+            dist.all_reduce(m._load_accum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(m._load_count, op=dist.ReduceOp.SUM)
+        m.update_router_bias()
+
+
 def recurrence_displacement(model, tokens, depth) -> list[float]:
     """Per-step relative recurrence displacement ``||z_{k+1}-z_k|| / ||z_k||``.
 
@@ -2213,30 +2421,45 @@ def _update_lambda_route(lambda_route, s_measured, s_target, alpha=1.2,
 
 def finite_horizon_loss(model, x, y, k_hi, k_lo, lambda_h, margin, lambda_route,
                         use_load_balance=True, entropy_coef=0.0,
-                        loadbalance_coef=0.0):
+                        loadbalance_coef=0.0, z_coef=0.0):
     """Finite-horizon no-degradation loss + composable router auxiliaries.
 
         L = L_hi + lambda_h * relu(L_hi - sg(L_lo) + margin)
               + lambda_route * aux_lb                 (ReMoE adaptive L1, if on)
               - entropy_coef * H                      (entropy reg: MAXIMIZE H)
               + loadbalance_coef * LB                 (Switch load-balance)
+              + z_coef * Z                            (ST-MoE router z-loss)
+
+    The DEFAULT collapse preventer is the DeepSeek-V3 loss-free balancing bias
+    (applied inside the router forward, not as a loss term — see _RouterBiasMixin)
+    plus the ST-MoE z-loss ``Z = mean(logsumexp(logits)^2)`` here (anti-over-
+    confidence). The entropy-MAX term is demoted to OFF-by-default: it MAXIMIZES
+    per-token entropy and fights useful specialization (and did not prevent the
+    measured 9.7M-scale collapse). Both ``entropy_coef`` and ``loadbalance_coef``
+    remain CLI knobs for explicit ablation.
 
     ``L_hi = model(x, y, k_hi)`` is the deep pass that carries the task gradient.
     ``L_lo = model(x, y, k_lo)`` is a shallow pass; inside the hinge it is
     stop-gradient (``sg``) so the no-degradation pressure pushes the deep state to
     be no worse than the shallow one WITHOUT backpropping into the shallow pass.
 
-    The three collapse-prevention router auxiliaries are an EMPIRICAL bake-off
-    (each independently gated, default OFF) — every term is summed over the MoE
-    blocks from the L_hi forward (the last forward run):
+    The composable router auxiliaries (each independently gated) — every term is
+    summed over the MoE blocks from the L_hi forward (the last forward run):
+      * ``Z`` (ST-MoE router z-loss, Zoph et al. 2022) — ADDED with
+        ``z_coef >= 0`` (DEFAULT 1e-3): ``mean(logsumexp(logits)^2)`` bounds the
+        router logit magnitude, the direct fix for the measured per-token
+        over-confidence collapse. The complementary default collapse-preventer is
+        the DeepSeek-V3 loss-free balancing bias (inside the router forward, not a
+        loss term — see :class:`_RouterBiasMixin`).
       * ``aux_lb`` — ReMoE load-balanced sparsity term, scaled by the *adaptive*
         ``lambda_route`` (see :func:`_update_lambda_route`); ``use_load_balance``
         toggles it for explicit ablation (when ``False`` the term is dropped and
         ``lambda_route`` ignored).
       * ``H`` (router entropy) — SUBTRACTED with ``entropy_coef >= 0`` so the loss
-        MAXIMIZES entropy (spreads routing mass; standard entropy reg).
+        MAXIMIZES entropy. DEMOTED to OFF-by-default: it fights useful
+        specialization and did not prevent the collapse; kept as an ablation knob.
       * ``LB`` (Switch load-balance, Fedus et al. 2021) — ADDED with
-        ``loadbalance_coef >= 0`` to equalize per-expert usage.
+        ``loadbalance_coef >= 0`` to equalize per-expert usage (ablation knob).
 
     Returns ``(loss, parts)`` exposing the components for testing/logging.
 
@@ -2267,15 +2490,19 @@ def finite_horizon_loss(model, x, y, k_hi, k_lo, lambda_h, margin, lambda_route,
     aux_lb = _collect_aux_lb(model) if use_load_balance else _zero()
     router_entropy = _collect_router_entropy(model) if entropy_coef != 0.0 else _zero()
     load_balance = _collect_load_balance(model) if loadbalance_coef != 0.0 else _zero()
+    router_z = _collect_router_z(model) if z_coef != 0.0 else _zero()
     if use_load_balance:
         loss = loss + lambda_route * aux_lb
     if entropy_coef != 0.0:
-        loss = loss - entropy_coef * router_entropy   # MAXIMIZE entropy
+        loss = loss - entropy_coef * router_entropy   # MAXIMIZE entropy (ablation)
     if loadbalance_coef != 0.0:
         loss = loss + loadbalance_coef * load_balance
+    if z_coef != 0.0:
+        loss = loss + z_coef * router_z               # ST-MoE z-loss (bound logits)
     parts = {
         "l_hi": l_hi, "l_lo_sg": l_lo, "aux_lb": aux_lb, "hinge": hinge,
         "router_entropy": router_entropy, "load_balance": load_balance,
+        "router_z": router_z,
     }
     return loss, parts
 
@@ -2487,6 +2714,103 @@ def _global_util_entropy(route) -> float:
     return float(-(p[nz] * p[nz].log()).sum())
 
 
+def route_step_diversity(model, tokens, depth) -> float:
+    """``route_step_div``: the TRUE MoE-basis-depth signal — does routing VARY
+    ACROSS recurrence steps?
+
+    For the MoE-basis-depth mechanism (experts composed across recurrence steps ->
+    exponentially many depth-K expert PATHS), what matters is not per-token entropy
+    or global utilization but whether each token's DOMINANT expert CHANGES from
+    step to step. For every token we record its ``argmax`` expert at each of the
+    ``K`` recurrence steps and count the number of DISTINCT dominant experts over
+    the trajectory; ``route_step_div`` is the mean over tokens of that count
+    divided by ``K``:
+
+      * ``1.0``  => a different dominant expert every step (maximal exponential-
+        path diversity);
+      * ``1/K``  => the same expert every step (degenerate — the MoE forms NO
+        across-depth path diversity, the collapse mode this fix targets).
+
+    Computed under ``no_grad`` from a SINGLE depth-``depth`` recurrence forward,
+    reading the recurrence FFN MoE's per-step routing via a forward hook (the F
+    block's first-sublayer ``SwiGLUMoE``; one hook fire per step). A LOG-SITE read
+    (extra forward + CPU sync); never call in the grad-accum hot loop. Returns NaN
+    when the model has no recurrence FFN MoE or depth < 1.
+    """
+    moe = None
+    for sub in model.rec.F.sublayers:
+        for m in sub.moe_modules():
+            moe = m
+            break
+        if moe is not None:
+            break
+    if moe is None or int(depth) < 1:
+        return float("nan")
+    per_step_argmax = []
+
+    def _hook(_module, _inp, _out):
+        # last_route is set inside forward BEFORE this returns; read the detached
+        # per-token argmax expert for THIS step (one fire per F-block forward).
+        r = _module.last_route
+        if r is not None:
+            per_step_argmax.append(r.reshape(-1, r.shape[-1]).argmax(dim=-1))
+
+    handle = moe.register_forward_hook(_hook)
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            x0 = model.tok_emb(tokens) + model.pos_emb[:, :tokens.shape[1]]
+            model.rec.forward_states(x0, x0, x0, int(depth))
+    finally:
+        handle.remove()
+        if was_training:
+            model.train()
+    if not per_step_argmax:
+        return float("nan")
+    # (K, N) per-step dominant expert per token -> distinct-count per token / K.
+    stacked = torch.stack(per_step_argmax, dim=0)          # (K, N)
+    K = stacked.shape[0]
+    # Distinct dominant experts per token across the K steps.
+    distinct = torch.tensor(
+        [int(stacked[:, j].unique().numel()) for j in range(stacked.shape[1])],
+        dtype=torch.float32,
+    )
+    return float(distinct.mean() / K)
+
+
+def expert_output_cosine_diversity(moe) -> float:
+    """``expert_cos_div``: mean pairwise ``1 - cos`` between experts' output basis.
+
+    A DEGENERATE/duplicated expert bank (all experts compute nearly the same map)
+    gives near-zero diversity; a rich basis gives diversity near 1. We probe each
+    expert with the SAME unit-norm random batch and measure the mean pairwise
+    ``1 - cosine`` over the per-expert flattened output vectors. Higher => more
+    diverse expert basis. A LOG-SITE read (no_grad). Returns NaN with <2 experts
+    or when the MoE exposes no probeable expert bank.
+    """
+    if not isinstance(moe, SwiGLUMoE) or moe.n_experts < 2:
+        return float("nan")
+    with torch.no_grad():
+        w_in = moe.w_in                                   # (E, dim, 2*rank)
+        E, dim, _ = w_in.shape
+        # Shared probe batch (deterministic): one normalized random vector set.
+        g = torch.Generator(device="cpu").manual_seed(0)
+        x = torch.randn(8, dim, generator=g).to(w_in.device, w_in.dtype)
+        x = x / x.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        h = torch.einsum("nd,edr->ner", x, w_in)          # (n, E, 2*rank)
+        gate, up = h.chunk(2, dim=-1)
+        act = F.silu(gate) * up                            # (n, E, rank)
+        out = torch.einsum("ner,erd->ned", act, moe.w_out)  # (n, E, dim)
+        # Per-expert flattened output vector over the probe batch.
+        vec = out.permute(1, 0, 2).reshape(E, -1).float()  # (E, n*dim)
+        vec = vec / vec.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        cos = vec @ vec.t()                                # (E, E) cosine matrix
+        iu = torch.triu_indices(E, E, offset=1)
+        pairwise = 1.0 - cos[iu[0], iu[1]]
+        return float(pairwise.mean())
+
+
 def kv_bytes_per_token(args: Hyperparameters) -> int:
     """Autoregressive KV-cache footprint per token, in bytes (MLA cache).
 
@@ -2655,9 +2979,14 @@ def collect_metrics(model, args: Hyperparameters) -> dict:
                 sum(float(m.router_entropy()) for m in moes) / len(moes))
         expert_util = float(
             sum(_global_util_entropy(m.last_route) for m in moes) / len(moes))
+        # expert_cos_div: mean pairwise (1 - cos) between experts' output basis
+        # (higher => more diverse basis; low => degenerate/duplicated experts).
+        expert_cos_div = float(
+            sum(expert_output_cosine_diversity(m) for m in moes) / len(moes))
     else:
         router_entropy = float("nan")
         expert_util = float("nan")
+        expert_cos_div = float("nan")
     erank = effective_rank(inner.tok_emb.weight)
     return {
         "erank": erank,
@@ -2667,6 +2996,7 @@ def collect_metrics(model, args: Hyperparameters) -> dict:
         "active_frac": active_frac,  # MoE mechanism diagnostic (not resource goal)
         "router_entropy": router_entropy,  # mean per-token router entropy
         "expert_util": expert_util,        # global utilization entropy
+        "expert_cos_div": expert_cos_div,  # MoE-basis diversity (output cosine)
     }
 
 
@@ -2694,6 +3024,14 @@ def format_metrics_line(metrics: dict) -> str:
         parts.append(f"router_entropy:{float(metrics['router_entropy']):.4f}")
     if "expert_util" in metrics and metrics["expert_util"] is not None:
         parts.append(f"expert_util:{float(metrics['expert_util']):.4f}")
+    # MoE-basis-depth diagnostics: route_step_div (mean distinct dominant experts
+    # per token across the K recurrence steps / K — 1.0 = a different expert each
+    # step, 1/K = degenerate single expert) and expert_cos_div (mean pairwise
+    # (1 - cos) between experts' output basis — higher = more diverse basis).
+    if "route_step_div" in metrics and metrics["route_step_div"] is not None:
+        parts.append(f"route_step_div:{float(metrics['route_step_div']):.4f}")
+    if "expert_cos_div" in metrics and metrics["expert_cos_div"] is not None:
+        parts.append(f"expert_cos_div:{float(metrics['expert_cos_div']):.4f}")
     # Effective-depth diagnostic: tail-mean per-step recurrence displacement
     # (sustained => high effective depth; ~0 => early saturation).
     if "disp_tail" in metrics and metrics["disp_tail"] is not None:
@@ -2833,20 +3171,29 @@ def build_arg_parser():
     p.add_argument("--moe-target-active-frac", type=float, default=0.5,
                    help="ReMoE target active fraction for the relu router; the "
                         "adaptive controller holds sparsity at S*=1-this.")
-    # Composable router collapse-prevention auxiliaries (control-experiment
-    # bake-off). Entropy defaults ON at an EFFECTIVE coef (0.1) because it is the
-    # chosen default collapse-preventer: the bake-off's ~0.01-style coef was
-    # effectively zero against the (then-inert) MoE, leaving the softmax router
-    # collapsed to one expert. 0.1 verifiably lifts router entropy well above a
-    # no-aux baseline (see test_router_default_entropy_coef_is_effective) while
-    # staying a CLI knob (set 0 to disable). Load-balance defaults OFF so the two
-    # regularizers are not stacked by default (decouple antagonistic objectives).
-    # See SwiGLUMoE / finite_horizon_loss for the term math.
-    p.add_argument("--router-entropy-coef", type=float, default=0.1,
-                   help="Entropy reg weight (default 0.1, ON): loss += -coef*H "
-                        "(router dist), i.e. MAXIMIZE per-token router entropy "
-                        "(spreads expert mass; prevents single-expert collapse). "
-                        "Set 0 to disable.")
+    # Router collapse-prevention stack. The DEFAULT collapse-preventer is now the
+    # DeepSeek-V3 auxiliary-loss-free balancing bias (--router-bias-update-rate)
+    # plus the ST-MoE z-loss (--router-z-coef): the bias equalizes per-expert load
+    # WITHOUT a gradient-interfering aux loss, and the z-loss bounds the router
+    # logit magnitude that drove per-token entropy to ~0.06 at 9.7M scale. The
+    # entropy-MAX term is DEMOTED to OFF-by-default (it fights specialization and
+    # did not prevent the collapse); load-balance stays OFF. Both remain CLI knobs
+    # for explicit ablation. See _RouterBiasMixin / finite_horizon_loss for math.
+    p.add_argument("--router-bias-update-rate", type=float, default=1e-3,
+                   help="DeepSeek-V3 loss-free balancing bias update rate "
+                        "(default 1e-3, ON): per-expert detached-buffer bias added "
+                        "to the router logits before softmax, updated once per "
+                        "optimizer step by sign(mean_load - load). 0 disables. "
+                        "Updated only at the step boundary -> reversibility-safe.")
+    p.add_argument("--router-z-coef", type=float, default=1e-3,
+                   help="ST-MoE router z-loss weight (default 1e-3, ON): "
+                        "loss += coef*mean(logsumexp(logits)^2), bounding router "
+                        "logit magnitude (anti-over-confidence). 0 disables.")
+    p.add_argument("--router-entropy-coef", type=float, default=0.0,
+                   help="Entropy reg weight (default 0.0, OFF — DEMOTED): "
+                        "loss += -coef*H (router dist), i.e. MAXIMIZE per-token "
+                        "router entropy. Fights useful specialization and did not "
+                        "prevent collapse; kept as an ablation knob (>0 enables).")
     p.add_argument("--router-loadbalance-coef", type=float, default=0.0,
                    help="Switch-Transformer load-balance weight: "
                         "loss += coef*E*sum_e f_e*P_e (equalizes expert usage).")
@@ -2947,6 +3294,8 @@ def main(argv=None):
         q_latent=args.q_latent, router_type=args.router_type,
         max_seq_len=args.seq_len, mlp_mult=args.mlp_mult,
         moe_target_active_frac=args.moe_target_active_frac,
+        router_bias_update_rate=args.router_bias_update_rate,
+        router_z_coef=args.router_z_coef,
         block_order=args.block_order, attn_moe=args.attn_moe,
         n_attn_experts=args.n_attn_experts,
         num_shared_experts=args.num_shared_experts,
@@ -3085,7 +3434,8 @@ def main(argv=None):
                     lambda_h=args.lambda_h, margin=args.margin,
                     lambda_route=lambda_route,
                     entropy_coef=args.router_entropy_coef,
-                    loadbalance_coef=args.router_loadbalance_coef)
+                    loadbalance_coef=args.router_loadbalance_coef,
+                    z_coef=args.router_z_coef)
             step_loss = step_loss + loss.detach()
             (loss / grad_accum_steps).backward()
         step_loss = step_loss / grad_accum_steps
@@ -3103,6 +3453,14 @@ def main(argv=None):
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        # DeepSeek-V3 loss-free balancing: ONE step-boundary bias update from the
+        # load accumulated over this step's forwards. OUTSIDE the reversible
+        # Function (the bias is constant within each forward+backward, so
+        # reconstruction stays exact); DDP-all-reduced so every rank's bias is
+        # identical. A no-op when --router-bias-update-rate is 0.
+        update_router_biases(base_model, distributed=distributed,
+                             world_size=world_size)
 
         # ReMoE adaptive-lambda update (relu router): ONE reduced sparsity read
         # at the step boundary, then a python-float lambda step toward the target
@@ -3132,6 +3490,11 @@ def main(argv=None):
                 # tail mean (sustained displacement => high effective depth).
                 m["disp_tail"] = displacement_tail(
                     recurrence_displacement(base_model, x, k_hi))
+                # MoE-basis-depth signal: across-step routing diversity (mean
+                # distinct dominant experts per token across the K steps / K) on
+                # the last micro-batch at the deep budget. 1.0 = maximal
+                # exponential-path diversity; 1/K = degenerate single expert.
+                m["route_step_div"] = route_step_diversity(base_model, x, k_hi)
                 # BPTT gradient-correctness gate: relative reversible round-trip
                 # error on the SAME last micro-batch x at the deep budget. Wrapped
                 # in the SAME bf16 autocast the training forward uses so it

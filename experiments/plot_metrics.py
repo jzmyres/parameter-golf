@@ -48,6 +48,8 @@ M0_METRICS_FIELDS: tuple[str, ...] = (
     "params",         # resource: trainable parameter count
     "router_entropy", # collapse diag: mean per-token router entropy
     "expert_util",    # collapse diag: global expert-utilization entropy
+    "route_step_div", # MoE-basis-depth: across-step dominant-expert diversity
+    "expert_cos_div", # MoE-basis-depth: pairwise expert output-cosine diversity
     "disp_tail",      # effective-depth diag: tail-mean recurrence displacement
     "recon_rel",      # BPTT gradient-correctness gate: reversible round-trip err
     "tok_per_s",      # ops/efficiency: tokens/wall-second (throughput)

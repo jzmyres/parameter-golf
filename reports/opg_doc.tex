@@ -159,29 +159,55 @@ trading experts-per-sublayer against unique-sublayers at matched parameter/compu
 init: \(\texttt{small}\) is the non-zero engagement default; \(\texttt{zero}\) is the classic LoRA-B
 init, only sensible with \(n_{\rm shared}>0\) providing a live base.
 
-\paragraph{Collapse-prevention auxiliaries (control-experiment axis).}
+\paragraph{Collapse prevention: loss-free balancing + z-loss (default).}
 The active-expert fraction is no longer a resource metric (the resource goal is
 activation memory; \S\ref{sec:metrics}), so dense routing is acceptable and the only objective is to
-keep experts \emph{alive and diverse} (expressiveness / effective depth).  A \emph{fixed} \(L_1\)
-penalty on ReLU routing weights monotonically drives every weight to zero
-(\(\code{\detokenize{active_frac}}\to0\), the MoE switched off), so we compare three principled,
-\emph{composable} collapse-prevention auxiliaries, each an independent CLI knob.  Entropy
-regularization defaults \emph{on} at an effective coefficient (\(c_H=0.1\)) as the chosen
-collapse-preventer; load-balance and the ReMoE controller default off so the two regularizers are not
-stacked and the no-auxiliary run remains an explicit ablation.  All three are differentiable
-router-only regularizers (they train the router on the saved block input); the forward routing map is
-unchanged, so reversibility is unaffected.  The auxiliaries reach the router only because the experts
-are \emph{not} inert: the per-expert output projection \(W^{\rm out}_e\) is small-non-zero
+keep experts \emph{alive and diverse} (expressiveness / effective depth).  At \(\approx\)10\,M scale
+the softmax router does \emph{not} suffer global dead-expert collapse (global utilization
+\(\code{\detokenize{expert_util}}\) stays high) but instead per-token \emph{over-confidence}:
+per-token router entropy \(\code{\detokenize{router_entropy}}\) crashes (\(2.4\to0.06\), each token
+near one-hot).  The entropy-MAX regularizer (\S below) MAXIMIZES per-token entropy --- an antagonistic
+objective that fights useful specialization --- and did not prevent this collapse, so it is
+\emph{demoted to off-by-default}.  The default collapse preventers are now two related-work mechanisms
+that are gradient-interference-free and reversibility-safe:
+\begin{enumerate}
+\item \emph{DeepSeek-V3 auxiliary-loss-free load balancing}~\cite{deepseekv3} (default, the SOTA
+  balancer):  a per-expert bias \(b\in\mathbb{R}^E\) is ADDED to the router logits before the softmax,
+  \(r=\mathrm{softmax}(\code{router}(x)+b)\), and updated once per optimizer step by the sign rule
+  \(b_e\!\leftarrow\!b_e + \eta_b\,\mathrm{sign}(\bar L - L_e)\) (raise under-used, lower over-used),
+  then re-centered (\(b\!\leftarrow\!b-\bar b\)), where \(L_e\) is the mean routing weight of expert
+  \(e\) accumulated over tokens AND recurrence steps and \(\bar L\) its mean.  Crucially \(b\) is a
+  \emph{detached buffer} (no gradient, in no optimizer group), updated ONLY at the step boundary, so it
+  is CONSTANT within any single forward+backward --- the reversible inverse recomputes the identical
+  routing map, leaving reconstruction (\(\code{\detokenize{recon_rel}}\approx0\)) and grad-equivalence
+  exact.  It is the permitted ``slow bias feedback'': global usage pressure with no auxiliary-loss
+  gradient interference.  The accumulated load is all-reduced across ranks before the update so every
+  rank keeps an identical bias.  Knob \(\texttt{router\_bias\_update\_rate}\) (\(\eta_b\), default
+  \(10^{-3}\); 0 disables).
+\item \emph{ST-MoE router z-loss}~\cite{stmoe} (default; the direct anti-over-confidence term):  the
+  loss adds \(c_z\,Z\) with \(Z=\frac{1}{BT}\sum_{t}\big(\mathrm{logsumexp}_e\,\ell_{t,e}\big)^2\) over
+  routed tokens (\(\ell\) the router logits).  It bounds the router logit magnitude, preventing the
+  runaway confidence that drove per-token entropy to \(0.06\).  It is an in-graph router-only term
+  (recomputed on the saved block input), so reversibility is untouched.  Knob
+  \(\texttt{router\_z\_coef}\) (\(c_z\), default \(10^{-3}\); 0 disables).
+\end{enumerate}
+The forward routing map is otherwise unchanged.  Both default mechanisms reach the router only because
+the experts are \emph{not} inert: the per-expert output projection \(W^{\rm out}_e\) is small-non-zero
 initialized (the attention output projection alone is zero-initialized for readout stability), so each
 expert contributes a small non-zero delta from step zero and both the experts and the router receive a
 non-zero task gradient.  A zero-initialized \(W^{\rm out}_e\) would zero every expert output, so the
-router weights would multiply a zero and receive \emph{no} task gradient --- the MoE would be inert
-and the entropy / load-balance auxiliaries would be no-ops.
+router weights would multiply a zero and receive \emph{no} task gradient --- the MoE would be inert.
+
+\paragraph{Demoted / ablation auxiliaries (control-experiment axis).}
+The following remain composable CLI knobs for explicit ablation but are \emph{off by default} (a
+\emph{fixed} \(L_1\) penalty on ReLU routing weights, by contrast, monotonically drives every weight to
+zero, \(\code{\detokenize{active_frac}}\to0\)):
 \begin{enumerate}
-\item \emph{Entropy regularization} (standard; maximize): the loss \emph{subtracts}
+\item \emph{Entropy regularization} (demoted, off by default; maximize): the loss \emph{subtracts}
   \(c_H\,H(p)\) where \(H(p)=-\sum_e p_e\log p_e\) is the mean-token entropy of the router
   distribution (softmax weights, or ReLU weights renormalized to a distribution with zero-mass tokens
-  skipped).  Higher entropy \(\Rightarrow\) more uniform expert use.
+  skipped).  Higher entropy \(\Rightarrow\) more uniform expert use.  Demoted because it MAXIMIZES
+  per-token entropy --- fighting useful specialization --- and did not prevent the measured collapse.
 \item \emph{Switch-Transformer load balance}~\cite{switch} (minimize): the loss adds
   \(c_{\rm sw}\,E\sum_e f^{\rm top}_e\,P_e\), with \(P_e=\frac{1}{BT}\sum_t r_{t,e}\) the mean router
   probability mass (differentiable) and \(f^{\rm top}_e\) the fraction of tokens whose \(\arg\max\)
@@ -203,9 +229,17 @@ and the entropy / load-balance auxiliaries would be no-ops.
   across ranks for a rank-consistent \(\lambda_{\rm route}\)), never inside the gradient-accumulation
   micro loop.  Softmax routing is dense (\(S_{\rm meas}\approx0\)), so the controller is a no-op.
 \end{enumerate}
-Diagnostics logged for the bake-off: per-token router entropy
-(\(\code{\detokenize{router_entropy}}\)), global expert-utilization entropy
-(\(\code{\detokenize{expert_util}}\)), and \(\code{\detokenize{diag:active_frac}}\).
+Diagnostics logged: per-token router entropy
+(\(\code{\detokenize{router_entropy}}\), specialization), global expert-utilization entropy
+(\(\code{\detokenize{expert_util}}\), utilization), and \(\code{\detokenize{diag:active_frac}}\).
+Two diagnostics directly probe the MoE-basis-depth mechanism (experts composed across recurrence steps
+\(\Rightarrow\) exponentially many depth-\(K\) expert paths --- what matters is whether routing
+\emph{varies across steps}):  \(\code{\detokenize{route_step_div}}\) is the mean over tokens of the
+number of DISTINCT dominant (\(\arg\max\)) experts across the \(K\) recurrence steps divided by \(K\)
+(\(1.0\): a different expert every step, maximal exponential-path diversity; \(1/K\): the same expert
+every step, degenerate);  \(\code{\detokenize{expert_cos_div}}\) is the mean pairwise \(1-\cos\) between
+the experts' output vectors on a probe batch (higher: a more diverse basis; \(\approx0\):
+degenerate/duplicated experts).  Both are log-site reads (no hot-loop sync).
 An effective-depth diagnostic \(\code{\detokenize{disp_tail}}\) is also logged: the tail-mean over the
 last half of the depth steps of the per-step relative recurrence displacement
 \(\lVert z_{k+1}-z_k\rVert/\lVert z_k\rVert\) (with \(z_k=\tfrac12(a_k+b_k)\) the reversible midpoint).
@@ -933,6 +967,18 @@ W. Fedus, B. Zoph, and N. Shazeer.
 \newblock Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.
 \newblock \emph{Journal of Machine Learning Research}, 23(120):1--39, 2022.
 \newblock \url{https://arxiv.org/abs/2101.03961}.
+
+\bibitem{deepseekv3}
+DeepSeek-AI.
+\newblock DeepSeek-V3 Technical Report (auxiliary-loss-free load balancing).
+\newblock arXiv:2412.19437, 2024.
+\newblock \url{https://arxiv.org/abs/2412.19437}.
+
+\bibitem{stmoe}
+B. Zoph, I. Bello, S. Kumar, N. Du, Y. Huang, J. Dean, N. Shazeer, and W. Fedus.
+\newblock ST-MoE: Designing Stable and Transferable Sparse Expert Models (router z-loss).
+\newblock arXiv:2202.08906, 2022.
+\newblock \url{https://arxiv.org/abs/2202.08906}.
 
 \bibitem{relaxedrec}
 S. Bae, A. Fisch, H. Harutyunyan, Z. Ji, S. Kim, and T. Schuster.
