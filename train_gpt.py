@@ -358,10 +358,38 @@ class SwiGLUMoE(nn.Module):
     width. All experts are evaluated densely as batched tensors and combined as
     ``y = sum_e w[..., e] * expert_e(x)``.
 
-    Diagnostics set after each forward:
-      * ``self.last_route`` — detached routing weights, shape ``(B, T, n_experts)``.
-      * ``self.aux_l1``     — mean L1 of the (live) routing weights, the ReMoE
-        adaptive sparsity / load-balance aux term consumed by the train loop.
+    Detached diagnostics set after each forward (log / controller reads):
+      * ``self.last_route``    — detached routing weights, shape ``(B, T, E)``.
+      * ``self.last_sparsity`` — detached scalar, the realized sparsity (mean
+        fraction of route weights ``== 0``) for the ReMoE adaptive controller to
+        read ONCE per optimizer step at the step boundary (never in the hot loop).
+      * ``self._route_input``  — detached block input; the router aux terms below
+        are recomputed from it under grad (the recurrence forward runs no_grad).
+
+    Composable collapse-prevention auxiliaries (a control-experiment bake-off; all
+    OFF unless the train loop gates them with a positive coef). Each is RECOMPUTED
+    from the saved detached router input UNDER GRAD (so it trains the router) and
+    returned in-graph as a differentiable loss term:
+      * :meth:`router_entropy` — mean-token entropy ``H(p)`` of the router dist
+        (softmax weights, or relu weights renormalized to a distribution). The
+        train loop MAXIMIZES it (``loss += -coef * H``) to spread mass back across
+        experts (standard entropy regularization). Higher ``H`` => more uniform.
+      * :meth:`load_balance_term` — Switch-Transformer load balance
+        ``E * sum_e f_e * P_e`` (Fedus et al. 2021), with ``P_e`` the mean router
+        prob mass on expert ``e`` (differentiable) and ``f_e`` the fraction of
+        tokens whose argmax (top) expert is ``e`` (detached — argmax is used ONLY
+        in this loss factor, NOT in the forward dispatch, so reversibility is
+        untouched). Minimized to equalize usage.
+      * :meth:`aux_l1_loadbalanced` — ReMoE load-balanced sparsity L1
+        ``mean_e( f_e * mean_t route_{t,e} )``, scaled by the adaptive
+        ``lambda_route`` (ReMoE arXiv 2412.14711).
+
+    The ReMoE controller is what prevents router collapse for the relu router: a
+    *fixed* L1 penalty monotonically drives every routing weight to zero
+    (``active_frac -> 0``, MoE off). ReMoE instead adapts ``lambda_route`` to HOLD
+    ``last_sparsity`` at a target ``S* = 1 - moe_target_active_frac`` (see
+    :func:`_update_lambda_route`). Entropy / load-balance are independent,
+    composable alternatives evaluated against this controller in the bake-off.
 
     bf16-friendly: no forced fp32 except inside ``RMSNorm`` statistics.
     """
@@ -390,19 +418,127 @@ class SwiGLUMoE(nn.Module):
         nn.init.normal_(self.w_out, std=expert_rank ** -0.5)
 
         self.last_route = None
-        self.aux_l1 = None
+        self.last_sparsity = None
+        # Detached router input saved each forward; the router aux terms (entropy,
+        # Switch load-balance, ReMoE-L1) are recomputed from it UNDER GRAD so they
+        # train the router even though the recurrence forward runs under no_grad.
+        self._route_input = None
+
+    def _route_entropy(self, w, eps=1e-9):
+        """Mean-token entropy ``H(p)`` of the router distribution.
+
+        ``w`` is the (B, T, E) routing weight tensor. For softmax routing ``w`` is
+        already a per-token distribution; for relu routing we renormalize each
+        token's weights to a distribution ``p = w / w.sum(-1)`` before the entropy
+        (tokens whose route sums to ``0`` carry no mass and are skipped so they
+        contribute ``0`` rather than ``NaN``). ``H(p) = -sum_e p_e log p_e`` per
+        token; returns the mean over the live tokens (kept in-graph so the train
+        loop can MAXIMIZE it). ``0`` if no token has any mass.
+        """
+        total = w.sum(dim=-1, keepdim=True)                     # (B, T, 1)
+        live = (total.squeeze(-1) > 0).type_as(w)              # (B, T) has-mass
+        p = w / total.clamp_min(eps)                            # (B, T, E) dist
+        # 0*log(0) := 0 — mask exact zeros so they contribute nothing.
+        logp = torch.where(p > 0, p.clamp_min(eps).log(),
+                           torch.zeros_like(p))
+        h_tok = -(p * logp).sum(dim=-1)                         # (B, T) per-token H
+        # Mean over the LIVE tokens (those with mass); all-zero rows contribute 0.
+        # Pure-tensor (clamp_min the count) so there is no hot-path CPU sync.
+        n_live = live.sum().clamp_min(1.0)
+        return (h_tok * live).sum() / n_live
+
+    def _load_balance(self, w):
+        """Switch-Transformer load-balance term ``E * sum_e f_e * P_e``.
+
+        ``P_e`` = mean over tokens of the router weight for expert ``e``
+        (differentiable). ``f_e`` = fraction of tokens whose argmax (top) expert
+        is ``e`` (DETACHED — argmax is non-differentiable and is used ONLY in this
+        loss factor, never in the forward dispatch, so reversibility is intact).
+        Minimal (``== 1``) for a perfectly uniform load over ``E`` experts,
+        maximal (``== E``) when one expert carries everything. Kept in-graph
+        through ``P_e``.
+        """
+        E = w.shape[-1]
+        wf = w.reshape(-1, E)                                   # (N, E) per token
+        p_e = wf.mean(dim=0)                                    # (E,) mean mass
+        top = wf.argmax(dim=-1)                                 # (N,) top expert
+        f_e = torch.zeros(E, device=w.device, dtype=p_e.dtype)
+        f_e.scatter_add_(0, top, torch.ones_like(top, dtype=p_e.dtype))
+        f_e = (f_e / wf.shape[0]).detach()                     # (E,) top-frac
+        return E * (f_e * p_e).sum()
+
+    def _router_weights(self, x):
+        """Routing weights ``w`` from input ``x`` (softmax dist, or relu sparse).
+
+        Single source for the router map, shared by :meth:`forward` and the aux
+        recompute path. Continuous in ``x`` (no dispatch) so reversibility holds.
+        """
+        logits = self.router(x)                                  # (B, T, E)
+        if self.router_type == "softmax":
+            return F.softmax(logits, dim=-1)
+        return F.relu(logits)                                    # exact zeros
+
+    def _recompute_router_w(self):
+        """Recompute routing weights from the saved (detached) router input.
+
+        The reversible recurrence runs every block forward under ``no_grad`` (it
+        recomputes activations in backward for O(1) memory), so the routing
+        weights computed during the cached forward are DETACHED — a router aux
+        read from them would add NO gradient to the router. To make the router
+        regularizers actually train the router, we re-run the (cheap) router map
+        on the saved detached block input under the ambient grad mode; the
+        gradient then flows to the ROUTER parameters (which is exactly what
+        entropy / Switch load-balance / ReMoE-L1 regularizers target — the
+        router, not the upstream block). Returns ``None`` if no forward has run.
+        """
+        if self._route_input is None:
+            return None
+        return self._router_weights(self._route_input)
+
+    def router_entropy(self):
+        """In-graph mean-token router entropy (recomputed -> trains the router)."""
+        w = self._recompute_router_w()
+        if w is None:
+            return None
+        return self._route_entropy(w)
+
+    def load_balance_term(self):
+        """In-graph Switch load-balance term (recomputed -> trains the router)."""
+        w = self._recompute_router_w()
+        if w is None:
+            return None
+        return self._load_balance(w)
+
+    def aux_l1_loadbalanced(self):
+        """In-graph ReMoE load-balanced sparsity aux (recomputed -> trains router).
+
+        ``mean_e( f_e * mean_t route_{t,e} )`` with ``f_e`` the detached per-expert
+        usage fraction (fraction of tokens with nonzero weight on ``e``) and the
+        per-expert mean mass kept live, so the penalty shrinks the actual routing
+        weights of over-used experts (prevents a single expert dominating). The
+        train loop scales this by the adaptive ``lambda_route``.
+        """
+        w = self._recompute_router_w()
+        if w is None:
+            return None
+        active = (w > 0).type_as(w)                              # (B, T, E)
+        f_e = active.detach().mean(dim=(0, 1))                   # (E,) usage frac
+        mean_mass = w.mean(dim=(0, 1))                           # (E,) mean mass
+        return (f_e * mean_mass).mean()
 
     def forward(self, x):
         # --- Smooth router over the input (continuous in x; no dispatch) ---
-        logits = self.router(x)                                  # (B, T, E)
-        if self.router_type == "softmax":
-            w = F.softmax(logits, dim=-1)
-        else:  # relu: exact zeros => sparsity, still continuous in x
-            w = F.relu(logits)
+        w = self._router_weights(x)                             # (B, T, E)
 
-        # ReMoE adaptive sparsity / load-balance aux term (keep w in graph).
-        self.aux_l1 = w.abs().mean()
+        # Save the (detached) router input so the router aux terms can be
+        # recomputed UNDER GRAD by the loss assembly. The recurrence runs this
+        # forward under no_grad (O(1)-memory reversibility), so the in-forward
+        # routing weights carry no gradient; the recompute path is what makes the
+        # entropy / load-balance / ReMoE-L1 regularizers actually train the router.
+        self._route_input = x.detach()
+        # Detached diagnostics (read at log / controller sites; no hot-path cost).
         self.last_route = w.detach()
+        self.last_sparsity = (w.detach() == 0).type_as(w).mean()
 
         # --- Dense low-rank SwiGLU over ALL experts (no skipping) ---
         h = torch.einsum("btd,edr->bter", x, self.w_in)         # (B, T, E, 2*rank)
@@ -511,6 +647,9 @@ class Hyperparameters:
     router_type: str = "softmax"
     max_seq_len: int = 2048
     mlp_mult: float = 3.0  # spec-parity (expert hidden-width); unused for now
+    # ReMoE adaptive sparsity controller target (relu router): the active
+    # fraction the controller holds routing at; sparsity target S* = 1 - this.
+    moe_target_active_frac: float = 0.5
 
 
 class _PreNormDeltaBlock(nn.Module):
@@ -1091,44 +1230,135 @@ def load_int6_artifact(blob, template_state_dict):
 # ---------------------------------------------------------------------------
 # 15. Finite-horizon loss + optimizer builder
 # ---------------------------------------------------------------------------
-def _collect_aux_l1(model):
-    """Sum ``aux_l1`` over every SwiGLUMoE block that has produced a forward.
+def _collect_moe_aux(model, method):
+    """Sum a SwiGLUMoE router-aux term (named ``method``) over the MoE blocks.
 
     Walks ``model.modules()`` so it works whether or not the model is DDP- or
-    compile-wrapped (caller passes the inner module). Skips blocks that have not
-    run a forward yet (``aux_l1 is None``).
+    compile-wrapped (caller passes the inner module). Each aux is RECOMPUTED in
+    the ambient grad mode from the block's saved detached router input (so the
+    term trains the router; see :meth:`SwiGLUMoE._recompute_router_w`). Skips
+    blocks that have not run a forward yet (the method returns ``None``). Returns
+    a 0.0 tensor on the model's device when no MoE produced a forward, keeping
+    loss assembly type-stable. Single helper drives every collector (DRY).
     """
     total = None
     for m in model.modules():
-        if isinstance(m, SwiGLUMoE) and m.aux_l1 is not None:
-            total = m.aux_l1 if total is None else total + m.aux_l1
+        if isinstance(m, SwiGLUMoE):
+            v = getattr(m, method)()
+            if v is not None:
+                total = v if total is None else total + v
     if total is None:
-        # No MoE produced a forward (should not happen on the train path); a 0.0
-        # tensor on the right device keeps the loss assembly type-stable.
         p = next(model.parameters())
         return torch.zeros((), device=p.device, dtype=torch.float32)
     return total
 
 
-def finite_horizon_loss(model, x, y, k_hi, k_lo, lambda_h, margin, lambda_route):
-    """Finite-horizon no-degradation loss.
+def _collect_aux_lb(model):
+    """Sum the in-graph ReMoE load-balanced L1 aux over the MoE blocks."""
+    return _collect_moe_aux(model, "aux_l1_loadbalanced")
 
-        L = L_hi + lambda_h * relu(L_hi - sg(L_lo) + margin) + lambda_route * aux_l1
+
+def _collect_router_entropy(model):
+    """Sum the in-graph router entropy over forward-run SwiGLUMoE blocks."""
+    return _collect_moe_aux(model, "router_entropy")
+
+
+def _collect_load_balance(model):
+    """Sum the in-graph Switch load-balance term over the MoE blocks."""
+    return _collect_moe_aux(model, "load_balance_term")
+
+
+def measured_sparsity(model) -> float:
+    """Mean realized routing sparsity over forward-run SwiGLUMoE blocks.
+
+    Sparsity is the mean fraction of route weights ``== 0`` (so dense softmax
+    routing reads ~0, ReLU routing reads its realized load-shedding). Reads each
+    block's detached ``last_sparsity`` scalar, so this is ONE CPU sync at the
+    step boundary — never call it inside the grad-accum micro loop. Returns
+    ``0.0`` when no MoE has produced a forward yet (controller no-op).
+    """
+    vals = [m.last_sparsity for m in model.modules()
+            if isinstance(m, SwiGLUMoE) and m.last_sparsity is not None]
+    if not vals:
+        return 0.0
+    return float(torch.stack([v.float() for v in vals]).mean())
+
+
+def _update_lambda_route(lambda_route, s_measured, s_target, alpha=1.2,
+                         lo=1e-8, hi=1e3):
+    """ReMoE adaptive sparsity controller (arXiv 2412.14711, Eq. for lambda).
+
+        lambda <- clamp( lambda * alpha ** sign(S_measured - S_target), lo, hi )
+
+    A *fixed* L1 penalty drives every routing weight to zero (router collapse).
+    ReMoE instead targets a sparsity level ``S* = 1 - moe_target_active_frac``:
+    when routing is TOO sparse (``S_measured > S_target``) it LOWERS lambda so
+    experts re-activate; when TOO dense (``S_measured < S_target``) it RAISES
+    lambda. The scalar is a plain Python float updated once per optimizer step
+    from a single reduced sparsity measurement, and clamped to ``[lo, hi]`` so it
+    never runs away or vanishes. Returns the new float.
+    """
+    if s_measured > s_target:
+        lam = lambda_route / alpha
+    elif s_measured < s_target:
+        lam = lambda_route * alpha
+    else:
+        lam = lambda_route
+    return float(min(max(lam, lo), hi))
+
+
+def finite_horizon_loss(model, x, y, k_hi, k_lo, lambda_h, margin, lambda_route,
+                        use_load_balance=True, entropy_coef=0.0,
+                        loadbalance_coef=0.0):
+    """Finite-horizon no-degradation loss + composable router auxiliaries.
+
+        L = L_hi + lambda_h * relu(L_hi - sg(L_lo) + margin)
+              + lambda_route * aux_lb                 (ReMoE adaptive L1, if on)
+              - entropy_coef * H                      (entropy reg: MAXIMIZE H)
+              + loadbalance_coef * LB                 (Switch load-balance)
 
     ``L_hi = model(x, y, k_hi)`` is the deep pass that carries the task gradient.
     ``L_lo = model(x, y, k_lo)`` is a shallow pass; inside the hinge it is
     stop-gradient (``sg``) so the no-degradation pressure pushes the deep state to
     be no worse than the shallow one WITHOUT backpropping into the shallow pass.
-    ``aux_l1`` is the summed ReMoE routing-mass L1 over the MoE blocks (computed
-    from the L_hi forward, which is the last forward run). Returns
-    ``(loss, parts)`` where ``parts`` exposes the components for testing/logging.
+
+    The three collapse-prevention router auxiliaries are an EMPIRICAL bake-off
+    (each independently gated, default OFF) — every term is summed over the MoE
+    blocks from the L_hi forward (the last forward run):
+      * ``aux_lb`` — ReMoE load-balanced sparsity term, scaled by the *adaptive*
+        ``lambda_route`` (see :func:`_update_lambda_route`); ``use_load_balance``
+        toggles it for explicit ablation (when ``False`` the term is dropped and
+        ``lambda_route`` ignored).
+      * ``H`` (router entropy) — SUBTRACTED with ``entropy_coef >= 0`` so the loss
+        MAXIMIZES entropy (spreads routing mass; standard entropy reg).
+      * ``LB`` (Switch load-balance, Fedus et al. 2021) — ADDED with
+        ``loadbalance_coef >= 0`` to equalize per-expert usage.
+
+    Returns ``(loss, parts)`` exposing the components for testing/logging.
     """
     l_lo = model(x, y, k_lo).detach()  # stop-grad shallow pass
-    l_hi = model(x, y, k_hi)           # deep pass: runs last so aux_l1 reflects it
-    aux_l1 = _collect_aux_l1(model)
+    l_hi = model(x, y, k_hi)           # deep pass: runs last so aux reflects it
     hinge = torch.relu(l_hi - l_lo + margin)
-    loss = l_hi + lambda_h * hinge + lambda_route * aux_l1
-    parts = {"l_hi": l_hi, "l_lo_sg": l_lo, "aux_l1": aux_l1, "hinge": hinge}
+    loss = l_hi + lambda_h * hinge
+
+    # Each router aux RECOMPUTES the router map (see SwiGLUMoE), so collect a term
+    # only when it actually enters the loss; an inactive term reports an in-graph
+    # 0.0 in ``parts`` (for logging/tests) without the redundant router matmul.
+    def _zero():
+        return torch.zeros((), device=l_hi.device, dtype=l_hi.dtype)
+    aux_lb = _collect_aux_lb(model) if use_load_balance else _zero()
+    router_entropy = _collect_router_entropy(model) if entropy_coef != 0.0 else _zero()
+    load_balance = _collect_load_balance(model) if loadbalance_coef != 0.0 else _zero()
+    if use_load_balance:
+        loss = loss + lambda_route * aux_lb
+    if entropy_coef != 0.0:
+        loss = loss - entropy_coef * router_entropy   # MAXIMIZE entropy
+    if loadbalance_coef != 0.0:
+        loss = loss + loadbalance_coef * load_balance
+    parts = {
+        "l_hi": l_hi, "l_lo_sg": l_lo, "aux_lb": aux_lb, "hinge": hinge,
+        "router_entropy": router_entropy, "load_balance": load_balance,
+    }
     return loss, parts
 
 
@@ -1311,6 +1541,27 @@ def active_expert_fraction(moe_or_last_route) -> float:
     return float((route.detach() > 0).float().mean())
 
 
+def _global_util_entropy(route) -> float:
+    """Global expert-utilization entropy ``H(P)`` of the mean routing dist.
+
+    ``P_e = mean_t route_{t,e}`` normalized to a distribution over experts; the
+    Shannon entropy ``H = -sum_e P_e log P_e`` (0*log0 := 0) measures how many
+    experts carry mass GLOBALLY (utilization), distinct from the per-token router
+    entropy (specialization). Returns a Python ``float`` (log/eval-site only);
+    ``0.0`` if every weight is zero (collapsed). Diagnostic only — not in-graph.
+    """
+    if route is None:
+        return float("nan")
+    r = route.detach().float()
+    p = r.reshape(-1, r.shape[-1]).mean(dim=0)        # (E,) mean mass
+    total = p.sum()
+    if float(total) <= 0.0:
+        return 0.0
+    p = p / total
+    nz = p > 0
+    return float(-(p[nz] * p[nz].log()).sum())
+
+
 def kv_bytes_per_token(args: Hyperparameters) -> int:
     """Autoregressive KV-cache footprint per token, in bytes (MLA cache).
 
@@ -1424,9 +1675,25 @@ def collect_metrics(model, args: Hyperparameters) -> dict:
     ``dict[str, float|int]`` (CPU scalars; do not call in the hot loop).
     """
     inner = model.module if hasattr(model, "module") else model
-    routes = [active_expert_fraction(m) for m in inner.modules()
-              if isinstance(m, SwiGLUMoE) and m.last_route is not None]
+    moes = [m for m in inner.modules()
+            if isinstance(m, SwiGLUMoE) and m.last_route is not None]
+    routes = [active_expert_fraction(m) for m in moes]
     active_frac = float(sum(routes) / len(routes)) if routes else float("nan")
+    # Collapse-prevention diagnostics: router_entropy is the mean per-token router
+    # entropy (specialization-vs-uniformity of the routing dist); expert_util is
+    # the GLOBAL utilization entropy (entropy of the mean routing dist over all
+    # tokens) — how many experts are used at all. Both averaged over MoE blocks.
+    # no_grad: this is a log-site read, not a loss term (router_entropy() is
+    # otherwise in-graph for the loss path).
+    if moes:
+        with torch.no_grad():
+            router_entropy = float(
+                sum(float(m.router_entropy()) for m in moes) / len(moes))
+        expert_util = float(
+            sum(_global_util_entropy(m.last_route) for m in moes) / len(moes))
+    else:
+        router_entropy = float("nan")
+        expert_util = float("nan")
     erank = effective_rank(inner.tok_emb.weight)
     return {
         "erank": erank,
@@ -1434,6 +1701,8 @@ def collect_metrics(model, args: Hyperparameters) -> dict:
         "kv_bytes": kv_bytes_per_token(args),
         "params": int(sum(p.numel() for p in inner.parameters())),
         "active_frac": active_frac,  # MoE mechanism diagnostic (not resource goal)
+        "router_entropy": router_entropy,  # mean per-token router entropy
+        "expert_util": expert_util,        # global utilization entropy
     }
 
 
@@ -1442,9 +1711,11 @@ def format_metrics_line(metrics: dict) -> str:
 
     RESOURCE-goal fields (``erank`` / ``peak_vram`` / ``kv_bytes`` / ``params``)
     are always emitted; ``R_act`` / ``phi`` only when the caller supplies them
-    (control-sweep sites). The MoE-mechanism diagnostic ``active_frac`` is
-    emitted with a ``diag:`` prefix so it is clearly NOT framed as a resource
-    metric. Field order is fixed for the parser.
+    (control-sweep sites). The collapse-prevention diagnostics ``router_entropy``
+    (mean per-token router entropy) and ``expert_util`` (global utilization
+    entropy) are emitted when supplied. The MoE-mechanism diagnostic
+    ``active_frac`` is emitted with a ``diag:`` prefix so it is clearly NOT framed
+    as a resource metric. Field order is fixed for the parser.
     """
     parts = [
         f"erank:{metrics['erank']:.4f}",
@@ -1452,6 +1723,10 @@ def format_metrics_line(metrics: dict) -> str:
         f"kv_bytes:{int(metrics['kv_bytes'])}",
         f"params:{int(metrics['params'])}",
     ]
+    if "router_entropy" in metrics and metrics["router_entropy"] is not None:
+        parts.append(f"router_entropy:{float(metrics['router_entropy']):.4f}")
+    if "expert_util" in metrics and metrics["expert_util"] is not None:
+        parts.append(f"expert_util:{float(metrics['expert_util']):.4f}")
     if "R_act" in metrics and metrics["R_act"] is not None:
         parts.append(f"R_act:{float(metrics['R_act']):.4f}")
     if "phi" in metrics and metrics["phi"] is not None:
@@ -1497,7 +1772,25 @@ def build_arg_parser():
     p.add_argument("--k-lo", type=int, default=8, help="Shallow budget for the hinge.")
     p.add_argument("--lambda-h", type=float, default=0.1, help="No-degradation hinge weight.")
     p.add_argument("--margin", type=float, default=0.0, help="Hinge margin (nats).")
-    p.add_argument("--lambda-route", type=float, default=0.001, help="ReMoE aux-L1 weight.")
+    p.add_argument("--lambda-route", type=float, default=0.001,
+                   help="ReMoE adaptive-sparsity aux weight (initial value; the "
+                        "relu-router controller adapts it toward the target).")
+    p.add_argument("--moe-target-active-frac", type=float, default=0.5,
+                   help="ReMoE target active fraction for the relu router; the "
+                        "adaptive controller holds sparsity at S*=1-this.")
+    # Composable router collapse-prevention auxiliaries (control-experiment
+    # bake-off). All default OFF / 0 so the trainer's behavior is unchanged unless
+    # a knob is set. See SwiGLUMoE / finite_horizon_loss for the term math.
+    p.add_argument("--router-entropy-coef", type=float, default=0.0,
+                   help="Entropy reg weight: loss += -coef*H(router dist), i.e. "
+                        "MAXIMIZE per-token router entropy (spreads expert mass).")
+    p.add_argument("--router-loadbalance-coef", type=float, default=0.0,
+                   help="Switch-Transformer load-balance weight: "
+                        "loss += coef*E*sum_e f_e*P_e (equalizes expert usage).")
+    p.add_argument("--router-target-active-frac", type=float, default=0.0,
+                   help="ReMoE adaptive-lambda controller (relu router only): "
+                        "0 disables; >0 enables and targets sparsity S*=1-this, "
+                        "overriding --moe-target-active-frac for the controller.")
     p.add_argument("--k-eval", type=int, default=None,
                    help="Eval depth (default: max of --k-set).")
     # Optimizer.
@@ -1580,6 +1873,7 @@ def main(argv=None):
         n_mix=args.n_mix, kv_latent=args.kv_latent, head_dim=args.head_dim,
         q_latent=args.q_latent, router_type=args.router_type,
         max_seq_len=args.seq_len, mlp_mult=args.mlp_mult,
+        moe_target_active_frac=args.moe_target_active_frac,
     )
     base_model = M0GPT(model_args).to(device)
     model = base_model
@@ -1655,6 +1949,33 @@ def main(argv=None):
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+    # --- ReMoE adaptive sparsity controller state (relu router only) ---
+    # A fixed L1 penalty collapses the router (active_frac -> 0); the controller
+    # adapts a scalar lambda_route per optimizer step to HOLD realized sparsity at
+    # the target S* = 1 - target_active_frac. The controller is ON only when
+    # BOTH the router is relu AND --router-target-active-frac > 0 (the bake-off
+    # gate); >0 overrides --moe-target-active-frac for the controller's target.
+    # When OFF (default), lambda_route keeps its fixed initial value and the L1
+    # aux is the static "no-fix control" — the entropy / load-balance auxiliaries
+    # are the composable alternatives, each gated by its own coef below.
+    target_active_frac = (args.router_target_active_frac
+                          if args.router_target_active_frac > 0.0
+                          else args.moe_target_active_frac)
+    adaptive_route = args.router_type == "relu" and args.router_target_active_frac > 0.0
+    lambda_route = float(args.lambda_route)
+    s_target = 1.0 - target_active_frac
+
+    def reduced_sparsity():
+        """Mean realized routing sparsity, all-reduced-MEAN across ranks so the
+        controller's lambda update is identical on every rank. One sync at the
+        step boundary (mirrors the logging .item() site, not the hot loop)."""
+        s = measured_sparsity(base_model)
+        if distributed and world_size > 1:
+            t = torch.tensor(s, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            s = float(t) / world_size
+        return s
+
     # --- training loop (DDP grad-accum, finite-horizon hinge) ---
     # Reset the CUDA peak-memory counter so the end-of-run ``peak_vram_mb`` (the
     # RESOURCE-goal headline) reflects the training high-water mark, not setup.
@@ -1678,7 +1999,9 @@ def main(argv=None):
                 loss, _ = finite_horizon_loss(
                     base_model, x, y, k_hi=k_hi, k_lo=args.k_lo,
                     lambda_h=args.lambda_h, margin=args.margin,
-                    lambda_route=args.lambda_route)
+                    lambda_route=lambda_route,
+                    entropy_coef=args.router_entropy_coef,
+                    loadbalance_coef=args.router_loadbalance_coef)
             step_loss = step_loss + loss.detach()
             (loss / grad_accum_steps).backward()
         step_loss = step_loss / grad_accum_steps
@@ -1697,11 +2020,18 @@ def main(argv=None):
             opt.step()
         zero_grad_all()
 
+        # ReMoE adaptive-lambda update (relu router): ONE reduced sparsity read
+        # at the step boundary, then a python-float lambda step toward the target
+        # sparsity. Keeps active_frac near (1 - S*) instead of collapsing to 0.
+        if adaptive_route:
+            lambda_route = _update_lambda_route(
+                lambda_route, s_measured=reduced_sparsity(), s_target=s_target)
+
         do_log = args.log_every > 0 and (step < 3 or (step + 1) % args.log_every == 0)
         if do_log:
             # Single rank-0 .item() sync at the log site (no hot-path sync).
             print0(f"step:{step + 1}/{args.iterations} k_hi:{k_hi} "
-                   f"train_loss:{step_loss.item():.4f}")
+                   f"train_loss:{step_loss.item():.4f} lambda_route:{lambda_route:.3e}")
             # Two-goal metrics from the just-finished forward (rank-0 log site
             # only; collect_metrics does CPU syncs, never call in the hot loop).
             if master:

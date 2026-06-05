@@ -54,6 +54,36 @@ RevFFN's no-floor design). `F_θ`/`G_θ` are pre-norm blocks: **MLA attention + 
   diversity weight-tying loses (MoEUT, Sparse-Looped-MoE, Relaxed-Recursive). **Router is a
   control-experiment knob `router_type ∈ {relu, softmax}`** (see Experiments). MoE is
   **hard-on** (mandated for G2). Routing is **smooth** (no hard top-k) → reversibility-safe.
+- **Composable router collapse-prevention auxiliaries (control-experiment axis).** `active_frac`
+  is no longer a resource metric (resource goal = activation memory), so dense routing is fine;
+  the only objective is keeping experts **alive + diverse** (expressiveness / effective depth).
+  A *fixed* L1 penalty on ReLU routing weights monotonically drives every weight to zero
+  (`active_frac → 0`, MoE switched OFF — the collapse bug a 100-step GPU smoke surfaced), so we
+  EMPIRICALLY compare three principled, **composable** fixes — each an independent CLI knob,
+  **default OFF / 0** (so the no-fix fixed-L1 run is the control). All three are differentiable
+  **router-only** regularizers (they recompute the routing map on the saved block input and train
+  the router); the forward routing is unchanged → reversibility unaffected.
+  1. **Entropy regularization** (`--router-entropy-coef`, standard; MAXIMIZE): loss `+= −coef·H(p)`,
+     `H(p) = −Σ_e p_e log p_e` mean-token entropy of the router dist (softmax weights, or relu
+     weights renormalized to a distribution; zero-mass tokens skipped). Higher H ⇒ more uniform use.
+  2. **Switch-Transformer load balance** (`--router-loadbalance-coef`, Fedus et al. 2021; MINIMIZE):
+     loss `+= coef·E·Σ_e f_e·P_e`, `P_e` = mean router prob mass on e (differentiable), `f_e` =
+     fraction of tokens whose argmax top expert is e (**detached**; argmax is in the LOSS factor
+     only, NOT the forward dispatch, so reversibility holds). Minimal (=1) at uniform load, max (=E)
+     when one expert carries everything.
+  3. **ReMoE adaptive-λ controller** (`--router-target-active-frac`, ReMoE arXiv 2412.14711; ReLU
+     only). **`0` (default) disables; `>0` enables** and targets sparsity `S* = 1 − target_active_frac`
+     (overriding `--moe-target-active-frac` for the controller). A scalar `lambda_route` is updated
+     once per optimizer step by `lambda_route *= α^sign(S_measured − S*)` (α = 1.2, clamp `[1e-8, 1e3]`,
+     init `1e-3`), RAISING λ when too dense and LOWERING when too sparse, holding `active_frac` near
+     the target instead of collapsing. Its aux is the **load-balanced** L1
+     `aux_lb = mean_e( f_e · mean_t route_{t,e} )` (`f_e` = per-expert usage fraction). `S_measured`
+     is read ONCE per optimizer step at the controller boundary (all-reduced across ranks for a
+     rank-consistent λ), never inside the grad-accum micro loop. Softmax routing is dense (`S ≈ 0`),
+     so the controller is a no-op.
+
+  Bake-off diagnostics logged on the `metrics:` line: `router_entropy` (mean per-token router
+  entropy), `expert_util` (global expert-utilization entropy), and `diag:active_frac`.
 - **Low-rank everywhere it pays:** experts, MLP, MLA Q/KV, MoS components are low-rank with
   rank set per-matrix on the **erank** frontier (Roy & Vetterli 2007; ARSVD). Small matrices
   (norms, gates, **router**, the tiny vocab=1024 embedding) stay full-rank.

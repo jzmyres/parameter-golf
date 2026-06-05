@@ -208,10 +208,11 @@ class TestPlotMetricsParse(unittest.TestCase):
                 # peak_vram is the PRIMARY resource field; active_frac is now the
                 # MoE-mechanism diagnostic (emitted with a diag: prefix).
                 "metrics: erank:512.3456 peak_vram:1024.0000 kv_bytes:128 params:1234567 "
-                "diag:active_frac:0.7500",
+                "router_entropy:2.0794 expert_util:1.9000 diag:active_frac:0.7500",
                 # Control-sweep line carrying the sparse R_act / phi fields too.
                 "step:20/20 k_hi:64 train_loss:3.0000",
                 "metrics: erank:600.0000 peak_vram:2048.0000 kv_bytes:128 params:1234567 "
+                "router_entropy:1.5000 expert_util:2.5000 "
                 "R_act:2.5000 phi:0.8000 diag:active_frac:1.0000",
             ]
         )
@@ -230,6 +231,8 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["erank"], [512.3456, 600.0])
         self.assertEqual(d["peak_vram"], [1024.0, 2048.0])
         self.assertEqual(d["active_frac"], [0.75, 1.0])
+        self.assertEqual(d["router_entropy"], [2.0794, 1.5])
+        self.assertEqual(d["expert_util"], [1.9, 2.5])
         self.assertEqual(d["kv_bytes"], [128.0, 128.0])
         self.assertEqual(d["params"], [1234567.0, 1234567.0])
         # R_act / phi absent on the first line -> NaN; present on the second.

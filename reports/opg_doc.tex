@@ -124,7 +124,48 @@ SwiGLU MoE, trained with full reversible BPTT~\cite{revffn,revnet} (\(O(1)\) act
 \(K\), \S\ref{sec:related}) so deeper inference is not penalized by activation storage.  The MoE router is a control-experiment
 knob, \texttt{router\_type}\(\in\{\texttt{relu},\texttt{softmax}\}\) (ReLU routing per
 ReMoE~\cite{remoe} is continuous, reconstruction-stable, and reversibility-safe; cf.\
-MoEUT~\cite{moeut}).  The trained model can still fail; the point is that the architecture composes
+MoEUT~\cite{moeut}).
+
+\paragraph{Collapse-prevention auxiliaries (control-experiment axis).}
+The active-expert fraction is no longer a resource metric (the resource goal is
+activation memory; \S\ref{sec:metrics}), so dense routing is acceptable and the only objective is to
+keep experts \emph{alive and diverse} (expressiveness / effective depth).  A \emph{fixed} \(L_1\)
+penalty on ReLU routing weights monotonically drives every weight to zero
+(\(\code{\detokenize{active_frac}}\to0\), the MoE switched off), so we compare three principled,
+\emph{composable} collapse-prevention auxiliaries, each an independent CLI knob defaulting to off so
+the no-auxiliary fixed-\(L_1\) run is the control.  All three are differentiable router-only
+regularizers (they train the router on the saved block input); the forward routing map is unchanged,
+so reversibility is unaffected.
+\begin{enumerate}
+\item \emph{Entropy regularization} (standard; maximize): the loss \emph{subtracts}
+  \(c_H\,H(p)\) where \(H(p)=-\sum_e p_e\log p_e\) is the mean-token entropy of the router
+  distribution (softmax weights, or ReLU weights renormalized to a distribution with zero-mass tokens
+  skipped).  Higher entropy \(\Rightarrow\) more uniform expert use.
+\item \emph{Switch-Transformer load balance}~\cite{switch} (minimize): the loss adds
+  \(c_{\rm sw}\,E\sum_e f^{\rm top}_e\,P_e\), with \(P_e=\frac{1}{BT}\sum_t r_{t,e}\) the mean router
+  probability mass (differentiable) and \(f^{\rm top}_e\) the fraction of tokens whose \(\arg\max\)
+  (top) expert is \(e\) (detached; the \(\arg\max\) is used \emph{only} in this loss factor, never in
+  the forward dispatch, so reversibility holds).  Minimal (\(=1\)) at a uniform load, maximal (\(=E\))
+  when one expert carries everything.
+\item \emph{ReMoE adaptive-\(\lambda\) controller}~\cite{remoe} (ReLU router, enabled by
+  \(\texttt{router\_target\_active\_frac}>0\)): a scalar \(\lambda_{\rm route}\) is updated once per
+  optimizer step toward a target sparsity \(S^\star=1-\texttt{router\_target\_active\_frac}\),
+\[
+  \lambda_{\rm route}\ \leftarrow\ \mathrm{clamp}\!\Big(\lambda_{\rm route}\cdot\alpha^{\,\mathrm{sign}(S_{\rm meas}-S^\star)},\ 10^{-8},\ 10^{3}\Big),\qquad \alpha=1.2,
+\]
+  raising \(\lambda_{\rm route}\) when routing is too dense and lowering it when too sparse, which
+  holds \(\code{\detokenize{active_frac}}\) near the target rather than collapsing.  Its aux penalty is the
+  load-balanced \(L_1\) form \(\mathcal{L}_{\rm lb}=\frac{1}{E}\sum_e f_e\,\bar r_e\) with per-expert usage
+  fraction \(f_e=\frac{1}{BT}\sum_{t}\mathbf{1}[r_{t,e}>0]\) and mean mass \(\bar r_e=\frac{1}{BT}\sum_t r_{t,e}\),
+  so over-used experts are penalized more.  The realized sparsity
+  \(S_{\rm meas}\) is measured once per optimizer step at the controller boundary (all-reduced
+  across ranks for a rank-consistent \(\lambda_{\rm route}\)), never inside the gradient-accumulation
+  micro loop.  Softmax routing is dense (\(S_{\rm meas}\approx0\)), so the controller is a no-op.
+\end{enumerate}
+Diagnostics logged for the bake-off: per-token router entropy
+(\(\code{\detokenize{router_entropy}}\)), global expert-utilization entropy
+(\(\code{\detokenize{expert_util}}\)), and \(\code{\detokenize{diag:active_frac}}\).
+The trained model can still fail; the point is that the architecture composes
 shared low-rank experts per step into high \emph{effective} depth.  Nestedness across depth is a
 property of the additive-coupling recurrence and budget selection, not of a halting gate.
 
@@ -652,7 +693,10 @@ ReLU routing~\cite{remoe} is continuous and fully differentiable yet yields exac
 gates, with adaptive-\(L_1\) sparsity control and load balancing; it matches top-\(k\) FLOPs,
 exceeds top-\(k\) accuracy, and shows 2--3\(\times\) lower activation flip-rate (hence more
 reconstruction-stable). We expose \texttt{router\_type}\(\in\{\texttt{relu},\texttt{softmax}\}\)
-as a control experiment.
+as a control experiment and, crucially, port ReMoE's \emph{adaptive} mechanism, not merely the
+penalty: a fixed \(L_1\) penalty collapses the router (every weight \(\to0\)), whereas the
+adaptive \(\lambda_{\rm route}\) controller (\S\ref{sec:models}) targets a sparsity level and
+holds \(\code{\detokenize{active_frac}}\) near it, paired with the per-expert load-balanced aux.
 
 \paragraph{Effective-depth and rank metrics.}
 The recurrence-equivalence exponent \(\varphi\)~\cite{isodepth} measures whether looping a block
@@ -731,6 +775,12 @@ Z. Wang, J. Chen, and J. Zhu.
 \newblock ReMoE: Fully Differentiable Mixture-of-Experts with ReLU Routing.
 \newblock \emph{International Conference on Learning Representations}, 2025.
 \newblock \url{https://arxiv.org/abs/2412.14711}.
+
+\bibitem{switch}
+W. Fedus, B. Zoph, and N. Shazeer.
+\newblock Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity.
+\newblock \emph{Journal of Machine Learning Research}, 23(120):1--39, 2022.
+\newblock \url{https://arxiv.org/abs/2101.03961}.
 
 \bibitem{relaxedrec}
 S. Bae, A. Fisch, H. Harutyunyan, Z. Ji, S. Kim, and T. Schuster.

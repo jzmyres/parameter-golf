@@ -231,10 +231,11 @@ def test_batched_newtonschulz_orthogonalizes_each_slice():
 
 
 def test_finite_horizon_hinge_loss():
-    """Loss = L_hi + lambda_h*relu(L_hi - sg(L_lo) + margin) + lambda_route*aux_l1.
+    """Loss = L_hi + lambda_h*relu(L_hi - sg(L_lo) + margin) + lambda_route*aux_lb.
 
     sg(L_lo): the hinge must not backprop into the shallow pass; only L_hi and
-    aux carry gradients into the params besides the hinge's L_hi term.
+    aux carry gradients into the params besides the hinge's L_hi term. ``aux_lb``
+    is the ReMoE load-balanced sparsity term (not a plain mean|route| L1).
     """
     from train_gpt import M0GPT, finite_horizon_loss
 
@@ -251,11 +252,22 @@ def test_finite_horizon_hinge_loss():
     expected = (
         parts["l_hi"]
         + 0.5 * torch.relu(parts["l_hi"] - parts["l_lo_sg"] + 0.0)
-        + 0.01 * parts["aux_l1"]
+        + 0.01 * parts["aux_lb"]
     )
     assert torch.allclose(loss, expected, atol=1e-5)
     # L_lo inside the hinge must be stop-gradient: parts["l_lo_sg"] is detached.
     assert not parts["l_lo_sg"].requires_grad
+
+    # use_load_balance=False drops the aux term entirely (explicit ablation).
+    loss_no_lb, parts_no_lb = finite_horizon_loss(
+        model, x, y, k_hi=4, k_lo=2, lambda_h=0.5, margin=0.0, lambda_route=0.01,
+        use_load_balance=False,
+    )
+    expected_no_lb = (
+        parts_no_lb["l_hi"]
+        + 0.5 * torch.relu(parts_no_lb["l_hi"] - parts_no_lb["l_lo_sg"] + 0.0)
+    )
+    assert torch.allclose(loss_no_lb, expected_no_lb, atol=1e-5)
 
 
 def test_int6_artifact_dedups_tied_embedding():
@@ -301,6 +313,489 @@ def test_control_experiment_script_shape():
     for s in ("router_type=relu", "router_type=softmax", "for r in 1 2 4 8", "kv_latent"):
         assert s in txt
     subprocess.run(["bash", "-n", "experiments/run_m0_control_experiments.sh"], check=True)
+
+
+# ---------------------------------------------------------------------------
+# ReMoE adaptive sparsity controller + load-balanced aux (anti-collapse fix)
+# ---------------------------------------------------------------------------
+def test_update_lambda_route_rule_and_clamp():
+    """Unit-test the ReMoE adaptive-lambda update rule.
+
+        lambda *= alpha ** sign(S_measured - S_target)
+
+    So MORE sparse than target (S_measured > S_target) => lambda DECREASES
+    (relax the penalty so experts re-activate); LESS sparse than target
+    (S_measured < S_target) => lambda INCREASES (push toward target sparsity).
+    The scalar is clamped to a sane range so it never runs away or vanishes.
+    """
+    from train_gpt import _update_lambda_route
+
+    lam0 = 1e-3
+    alpha = 1.2
+    # Too sparse (S=0.9 > target 0.5) -> lambda decreases.
+    dn = _update_lambda_route(lam0, s_measured=0.9, s_target=0.5, alpha=alpha)
+    assert dn < lam0
+    assert abs(dn - lam0 / alpha) < 1e-12
+    # Too dense (S=0.1 < target 0.5) -> lambda increases.
+    up = _update_lambda_route(lam0, s_measured=0.1, s_target=0.5, alpha=alpha)
+    assert up > lam0
+    assert abs(up - lam0 * alpha) < 1e-12
+    # On target (sign 0) -> unchanged.
+    same = _update_lambda_route(lam0, s_measured=0.5, s_target=0.5, alpha=alpha)
+    assert abs(same - lam0) < 1e-12
+    # Clamp high: repeated increases saturate at hi.
+    lam = 1.0
+    for _ in range(200):
+        lam = _update_lambda_route(lam, s_measured=0.0, s_target=0.5, alpha=alpha,
+                                   lo=1e-8, hi=1e3)
+    assert lam <= 1e3 + 1e-9
+    # Clamp low: repeated decreases saturate at lo.
+    lam = 1.0
+    for _ in range(400):
+        lam = _update_lambda_route(lam, s_measured=1.0, s_target=0.5, alpha=alpha,
+                                   lo=1e-8, hi=1e3)
+    assert lam >= 1e-8 - 1e-12
+
+
+def test_moe_aux_lb_is_load_balanced_form():
+    """SwiGLUMoE exposes aux_lb = mean_e( f_e * mean_t route_{t,e} ).
+
+    f_e is per-expert relative usage (fraction of tokens with nonzero weight
+    on expert e). An expert that is ALWAYS used (high f_e) AND carries large
+    mass is penalized more than one used rarely, unlike a plain mean|route|.
+    """
+    from train_gpt import SwiGLUMoE
+
+    torch.manual_seed(0)
+    moe = SwiGLUMoE(dim=16, n_experts=4, expert_rank=8, router_type="relu")
+    x = torch.randn(2, 8, 16)
+    moe(x)
+    aux_lb = moe.aux_l1_loadbalanced()  # in-graph, recomputed from saved input
+    assert aux_lb is not None
+    assert torch.isfinite(aux_lb)
+    # last_sparsity is set for the controller: fraction of route weights == 0.
+    assert moe.last_sparsity is not None
+    s = float(moe.last_sparsity)
+    assert 0.0 <= s <= 1.0
+
+    # Recompute the load-balanced form from last_route and check agreement.
+    route = moe.last_route  # (B, T, E), detached
+    f_e = (route > 0).float().mean(dim=(0, 1))      # per-expert usage fraction
+    mean_mass = route.mean(dim=(0, 1))              # per-expert mean mass
+    expected = (f_e * mean_mass).mean()
+    assert torch.allclose(aux_lb.detach(), expected, atol=1e-5)
+
+
+def test_controller_drives_sparsity_to_target_and_prevents_collapse():
+    """The ReMoE controller is a NEGATIVE-feedback loop that holds sparsity at
+    the target and never lets it run away to total collapse (sparsity -> 1).
+
+    Models the controller against a monotone "router responds to lambda" plant:
+    higher lambda => more sparsity (the L1 pressure the real router feels). This
+    is the dynamical core of the fix — a FIXED lambda (the bug) has NO feedback,
+    so any positive pressure ratchets sparsity to 1.0 (active_frac -> 0); the
+    adaptive lambda pulls sparsity back toward S* from BOTH sides. We assert the
+    closed loop converges near S* and stays bounded away from full collapse.
+    """
+    from train_gpt import _update_lambda_route
+
+    def plant_sparsity(lam):
+        # Monotone increasing in lambda, saturating in [0, 1): a faithful sign
+        # for the controller (more penalty -> more zeros). Exact form is
+        # irrelevant; only monotonicity + range matter for the feedback proof.
+        return 1.0 - 1.0 / (1.0 + lam)
+
+    s_target = 0.5            # target sparsity (active_frac target 0.5)
+    # (a) Fixed lambda well above the equilibrium -> NO feedback -> over-sparse,
+    #     i.e. the collapse regime the bug lives in.
+    s_fixed = plant_sparsity(lam=50.0)
+    assert s_fixed > 0.9, "sanity: a large fixed lambda over-sparsifies (collapse)"
+
+    # (b) Adaptive lambda: closed loop converges to the target sparsity and the
+    #     realized active_frac is held near 0.5 (NOT collapsed to ~0).
+    lam = 1e-3
+    sparsity = plant_sparsity(lam)
+    for _ in range(200):
+        lam = _update_lambda_route(lam, s_measured=sparsity, s_target=s_target,
+                                   alpha=1.2)
+        sparsity = plant_sparsity(lam)
+    assert abs(sparsity - s_target) < 0.1, (
+        f"closed loop did not reach target sparsity: {sparsity:.4f}"
+    )
+    active_frac = 1.0 - sparsity
+    assert active_frac > 0.05, f"controller let the MoE collapse: af={active_frac:.4f}"
+    assert 0.25 <= active_frac <= 0.75
+    assert 1e-8 <= lam <= 1e3
+
+
+def test_adaptive_controller_keeps_relu_moe_alive():
+    """End-to-end on a real tiny ReLU-router M0GPT: training under the adaptive
+    controller keeps the MoE alive (active_frac well above 0) and holds it near
+    the configured target, while the load-balanced aux is finite throughout.
+
+    This exercises the exact train-loop wiring (finite_horizon_loss with the
+    load-balanced aux + per-step measured_sparsity + _update_lambda_route) end to
+    end, so a regression that re-collapses the router (or wires the controller in
+    backwards) fails here, not just in the synthetic feedback test above.
+    """
+    from train_gpt import (
+        Hyperparameters, M0GPT, finite_horizon_loss,
+        active_expert_fraction, measured_sparsity, _update_lambda_route,
+        SwiGLUMoE,
+    )
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+        n_experts=8, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16, router_type="relu", moe_target_active_frac=0.5,
+    )
+    model = M0GPT(args)
+
+    gen = torch.Generator().manual_seed(1)
+    x = torch.randint(0, 64, (4, 16), generator=gen)
+    y = x.clone()
+
+    def _active_frac():
+        fr = [active_expert_fraction(m) for m in model.modules()
+              if isinstance(m, SwiGLUMoE) and m.last_route is not None]
+        return sum(fr) / len(fr)
+
+    target = args.moe_target_active_frac
+    s_target = 1.0 - target
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
+    lambda_route = 1e-3
+    traj = []
+    for _ in range(70):
+        opt.zero_grad(set_to_none=True)
+        loss, parts = finite_horizon_loss(
+            model, x, y, k_hi=4, k_lo=2, lambda_h=0.1, margin=0.0,
+            lambda_route=lambda_route, use_load_balance=True)
+        assert torch.isfinite(parts["aux_lb"])
+        loss.backward()
+        opt.step()
+        s_meas = measured_sparsity(model)
+        lambda_route = _update_lambda_route(
+            lambda_route, s_measured=s_meas, s_target=s_target, alpha=1.2)
+        traj.append(_active_frac())
+
+    final = traj[-1]
+    # Crucially: NOT dead (the collapse bug drove this to ~0).
+    assert final > 0.05, f"controller failed to keep MoE alive: active_frac={final:.4f}"
+    # And it stays near the configured target active fraction.
+    assert target - 0.25 <= final <= target + 0.25, (
+        f"active_frac {final:.4f} not within [{target-0.25:.2f}, {target+0.25:.2f}]"
+    )
+    # lambda stayed in the sane clamp range throughout.
+    assert 1e-8 <= lambda_route <= 1e3
+
+
+# ---------------------------------------------------------------------------
+# Composable router auxiliaries (entropy / Switch load-balance / ReMoE-adaptive)
+# collapse-prevention bake-off. All default OFF / 0 so existing behavior holds.
+# ---------------------------------------------------------------------------
+def test_router_entropy_uniform_vs_onehot_softmax():
+    """SwiGLUMoE.router_entropy() is the mean-token entropy of the router dist.
+
+    A uniform router dist over E experts has entropy ~ ln(E); a one-hot dist has
+    entropy ~ 0. We force the two regimes by saturating the softmax logits with
+    very large weights into a constant pattern.
+    """
+    from train_gpt import SwiGLUMoE
+
+    torch.manual_seed(0)
+    E = 4
+    moe = SwiGLUMoE(dim=16, n_experts=E, expert_rank=8, router_type="softmax")
+    x = torch.randn(2, 8, 16)
+
+    # Uniform: zero the router so every logit is the bias (equal) -> softmax uniform.
+    with torch.no_grad():
+        moe.router.weight.zero_()
+        moe.router.bias.zero_()
+    moe(x)
+    h_uniform = moe.router_entropy().detach()
+    assert torch.isfinite(h_uniform)
+    assert abs(float(h_uniform) - math.log(E)) < 1e-4, float(h_uniform)
+
+    # One-hot: a huge bias on expert 0 saturates softmax onto it -> entropy ~ 0.
+    with torch.no_grad():
+        moe.router.weight.zero_()
+        moe.router.bias.zero_()
+        moe.router.bias[0] = 1e4
+    moe(x)
+    h_onehot = moe.router_entropy().detach()
+    assert float(h_onehot) < 1e-3, float(h_onehot)
+    assert float(h_uniform) > float(h_onehot)
+
+
+def test_router_entropy_relu_normalized_uniform_vs_onehot():
+    """For the relu router the entropy is over the route renormalized to a dist.
+
+    Tokens whose route sums to 0 contribute 0 (skipped), so an all-zero route is
+    handled gracefully. Uniform positive route -> ln(E); one expert only -> ~0.
+    """
+    from train_gpt import SwiGLUMoE
+
+    E = 4
+    moe = SwiGLUMoE(dim=8, n_experts=E, expert_rank=4, router_type="relu")
+
+    # Uniform positive route: inject a constant positive route directly.
+    route_uniform = torch.ones(2, 8, E)
+    h_uniform = moe._route_entropy(route_uniform)
+    assert abs(float(h_uniform) - math.log(E)) < 1e-5, float(h_uniform)
+
+    # One-hot route: all mass on expert 0.
+    route_onehot = torch.zeros(2, 8, E)
+    route_onehot[..., 0] = 1.0
+    h_onehot = moe._route_entropy(route_onehot)
+    assert float(h_onehot) < 1e-5, float(h_onehot)
+
+    # All-zero route rows are skipped (no NaN), entropy over the (empty) live set
+    # is 0 rather than NaN.
+    route_zero = torch.zeros(2, 8, E)
+    h_zero = moe._route_entropy(route_zero)
+    assert torch.isfinite(h_zero)
+    assert float(h_zero) == 0.0
+
+
+def test_load_balance_term_balanced_lower_than_imbalanced():
+    """Switch load-balance term: coef*E*sum_e f_e*P_e.
+
+    Balanced usage (every expert equally likely top + equal prob mass) gives the
+    minimal value (== 1 before the E scaling for a perfectly uniform dist over E
+    experts); a fully imbalanced dist (all tokens to one expert) gives the max
+    (== E for one expert carrying everything). We assert the ORDERING.
+    """
+    from train_gpt import SwiGLUMoE
+
+    E = 4
+    moe = SwiGLUMoE(dim=8, n_experts=E, expert_rank=4, router_type="softmax")
+
+    balanced = torch.full((2, 8, E), 1.0 / E)            # uniform dist per token
+    lb_balanced = moe._load_balance(balanced)
+    # Perfectly balanced: f_e = 1/E (argmax ties broken to index 0 -> all on 0;
+    # so use a slightly perturbed near-uniform that spreads argmax). Use a
+    # rotation so each token's argmax lands on a different expert.
+    rot = torch.zeros(2, 8, E)
+    for t in range(8):
+        probs = torch.full((E,), (1.0 - 0.4) / (E - 1))
+        probs[t % E] = 0.4
+        rot[:, t, :] = probs
+    lb_spread = moe._load_balance(rot)
+
+    imbalanced = torch.zeros(2, 8, E)
+    imbalanced[..., 0] = 1.0                              # all tokens to expert 0
+    lb_imbalanced = moe._load_balance(imbalanced)
+
+    assert torch.isfinite(lb_balanced) and torch.isfinite(lb_imbalanced)
+    # Fully imbalanced is the maximum (== E); spread/balanced are below it.
+    assert float(lb_imbalanced) > float(lb_spread)
+    assert abs(float(lb_imbalanced) - E) < 1e-4
+    # The Switch term is differentiable through P_e (the prob mass factor).
+    w = torch.full((2, 8, E), 1.0 / E, requires_grad=True)
+    lb = moe._load_balance(w)
+    lb.backward()
+    assert w.grad is not None and torch.isfinite(w.grad).all()
+
+
+def test_moe_exposes_entropy_and_loadbalance_after_forward():
+    """After a forward, the MoE exposes in-graph entropy + load-balance terms.
+
+    router_entropy() and load_balance_term() must be differentiable (in the
+    autograd graph) so the train loop can add them as loss terms. They train the
+    ROUTER (the regularizers' target): the gradient reaches the router weights.
+    """
+    from train_gpt import SwiGLUMoE
+
+    torch.manual_seed(0)
+    moe = SwiGLUMoE(dim=16, n_experts=4, expert_rank=8, router_type="relu")
+    x = torch.randn(2, 8, 16)
+    moe(x)
+    h = moe.router_entropy()
+    lb = moe.load_balance_term()
+    assert h.requires_grad and lb.requires_grad
+    (h + lb).backward()
+    # The router aux trains the router parameters (recomputed from the saved
+    # detached block input), so the router weight receives a finite gradient.
+    assert moe.router.weight.grad is not None
+    assert torch.isfinite(moe.router.weight.grad).all()
+
+
+def test_collect_router_aux_sums_over_blocks():
+    """The collectors sum router entropy / load-balance over MoE blocks."""
+    from train_gpt import (
+        Hyperparameters, M0GPT, _collect_router_entropy, _collect_load_balance,
+        SwiGLUMoE,
+    )
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16, router_type="relu",
+    )
+    model = M0GPT(args)
+    x = torch.randint(0, 64, (2, 16))
+    y = x.clone()
+    model(x, y, 4)
+    n_moe = sum(1 for m in model.modules() if isinstance(m, SwiGLUMoE))
+    assert n_moe >= 1
+    ent = _collect_router_entropy(model)
+    lb = _collect_load_balance(model)
+    assert ent.requires_grad and lb.requires_grad
+    assert torch.isfinite(ent) and torch.isfinite(lb)
+
+
+def test_finite_horizon_loss_adds_entropy_and_loadbalance_terms():
+    """finite_horizon_loss composes the entropy + Switch load-balance auxiliaries.
+
+        L = base + (-entropy_coef * H) + loadbalance_coef * LB
+    with H maximized (so we SUBTRACT it) and LB minimized.
+    """
+    from train_gpt import M0GPT, finite_horizon_loss
+
+    torch.manual_seed(0)
+    model = M0GPT(_tiny_args())
+    x = torch.randint(0, 1024, (2, 16))
+    y = torch.randint(0, 1024, (2, 16))
+
+    # Baseline (all aux off).
+    loss0, parts0 = finite_horizon_loss(
+        model, x, y, k_hi=4, k_lo=2, lambda_h=0.5, margin=0.0, lambda_route=0.0,
+        use_load_balance=False, entropy_coef=0.0, loadbalance_coef=0.0,
+    )
+    # With entropy + load-balance.
+    loss1, parts1 = finite_horizon_loss(
+        model, x, y, k_hi=4, k_lo=2, lambda_h=0.5, margin=0.0, lambda_route=0.0,
+        use_load_balance=False, entropy_coef=0.3, loadbalance_coef=0.2,
+    )
+    assert torch.isfinite(loss1)
+    # Reconstruct the documented form from the reported parts.
+    base = parts1["l_hi"] + 0.5 * torch.relu(parts1["l_hi"] - parts1["l_lo_sg"] + 0.0)
+    expected = base - 0.3 * parts1["router_entropy"] + 0.2 * parts1["load_balance"]
+    assert torch.allclose(loss1, expected, atol=1e-5)
+    # parts expose the aux quantities for logging.
+    for k in ("router_entropy", "load_balance"):
+        assert k in parts0 and k in parts1
+        assert torch.isfinite(parts1[k])
+
+
+def test_target_active_frac_gates_adaptive_controller():
+    """--router-target-active-frac > 0 (relu) enables the controller; 0 disables.
+
+    Exercised through the CLI builder + the small main() loop semantics: with the
+    knob at 0 the adaptive controller is OFF; with it > 0 and relu it is ON.
+    """
+    from train_gpt import build_arg_parser
+
+    p = build_arg_parser()
+    # Default: disabled.
+    a0 = p.parse_args(["--router-type", "relu"])
+    assert a0.router_target_active_frac == 0.0
+    # Enabled.
+    a1 = p.parse_args(["--router-type", "relu", "--router-target-active-frac", "0.4"])
+    assert a1.router_target_active_frac == 0.4
+    # New aux coef knobs default OFF.
+    assert a0.router_entropy_coef == 0.0
+    assert a0.router_loadbalance_coef == 0.0
+    a2 = p.parse_args(["--router-entropy-coef", "0.01", "--router-loadbalance-coef", "0.02"])
+    assert a2.router_entropy_coef == 0.01
+    assert a2.router_loadbalance_coef == 0.02
+
+
+def test_entropy_aux_keeps_relu_moe_alive_no_collapse():
+    """A short relu-router training run with ONLY the entropy auxiliary (no ReMoE
+    controller, fixed lambda_route=0) keeps active_frac well above 0 over ~60
+    steps. The entropy MAX pressure spreads routing mass back across experts, so
+    the ReLU router does not collapse to all-zero (active_frac -> 0).
+    """
+    from train_gpt import (
+        Hyperparameters, M0GPT, finite_horizon_loss,
+        active_expert_fraction, SwiGLUMoE,
+    )
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+        n_experts=8, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16, router_type="relu",
+    )
+    model = M0GPT(args)
+    gen = torch.Generator().manual_seed(1)
+    x = torch.randint(0, 64, (4, 16), generator=gen)
+    y = x.clone()
+
+    def _active_frac():
+        fr = [active_expert_fraction(m) for m in model.modules()
+              if isinstance(m, SwiGLUMoE) and m.last_route is not None]
+        return sum(fr) / len(fr)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
+    traj = []
+    for _ in range(60):
+        opt.zero_grad(set_to_none=True)
+        # NO ReMoE controller (lambda_route=0, use_load_balance=False); entropy only.
+        loss, _ = finite_horizon_loss(
+            model, x, y, k_hi=4, k_lo=2, lambda_h=0.1, margin=0.0,
+            lambda_route=0.0, use_load_balance=False,
+            entropy_coef=0.05, loadbalance_coef=0.0)
+        loss.backward()
+        opt.step()
+        traj.append(_active_frac())
+    final = traj[-1]
+    assert final > 0.05, f"entropy aux failed to keep MoE alive: active_frac={final:.4f}"
+
+
+def test_softmax_entropy_aux_keeps_router_from_collapsing():
+    """With softmax routing + the entropy auxiliary, the router entropy stays
+    high (the dist does not collapse onto a single expert). We compare against a
+    run with a strong ANTI-entropy pressure (negative coef) which DOES sharpen.
+    """
+    from train_gpt import (
+        Hyperparameters, M0GPT, finite_horizon_loss, SwiGLUMoE,
+    )
+
+    def _run(entropy_coef):
+        torch.manual_seed(0)
+        args = Hyperparameters(
+            model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+            n_experts=8, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+            max_seq_len=16, router_type="softmax",
+        )
+        model = M0GPT(args)
+        gen = torch.Generator().manual_seed(1)
+        x = torch.randint(0, 64, (4, 16), generator=gen)
+        y = x.clone()
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+        for _ in range(60):
+            opt.zero_grad(set_to_none=True)
+            loss, _ = finite_horizon_loss(
+                model, x, y, k_hi=4, k_lo=2, lambda_h=0.1, margin=0.0,
+                lambda_route=0.0, use_load_balance=False,
+                entropy_coef=entropy_coef, loadbalance_coef=0.0)
+            loss.backward()
+            opt.step()
+        ents = [float(m.router_entropy().detach()) for m in model.modules()
+                if isinstance(m, SwiGLUMoE) and m.last_route is not None]
+        return sum(ents) / len(ents)
+
+    h_with_entropy = _run(entropy_coef=0.1)
+    h_anti_entropy = _run(entropy_coef=-0.1)
+    # Maximizing entropy keeps the dist broad; the anti-entropy run sharpens it.
+    assert h_with_entropy > h_anti_entropy, (h_with_entropy, h_anti_entropy)
+
+
+def test_format_metrics_line_emits_router_entropy_and_expert_util():
+    """The metrics: line carries router_entropy + expert_util when supplied."""
+    from train_gpt import format_metrics_line
+
+    line = format_metrics_line({
+        "erank": 1.0, "peak_vram": 0.0, "kv_bytes": 8, "params": 10,
+        "active_frac": 0.5, "router_entropy": 1.234, "expert_util": 2.5,
+    })
+    assert "router_entropy:1.2340" in line
+    assert "expert_util:2.5000" in line
+    assert "diag:active_frac:0.5000" in line
 
 
 if __name__ == "__main__":

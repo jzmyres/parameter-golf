@@ -46,6 +46,8 @@ M0_METRICS_FIELDS: tuple[str, ...] = (
     "peak_vram",      # resource (PRIMARY): peak VRAM MiB (memory-efficiency)
     "kv_bytes",       # resource: MLA KV-cache bytes per token
     "params",         # resource: trainable parameter count
+    "router_entropy", # collapse diag: mean per-token router entropy
+    "expert_util",    # collapse diag: global expert-utilization entropy
     "R_act",          # resource (headline): activation-memory scaling (sweep)
     "phi",            # expressiveness: recurrence-equivalence exponent (sweep)
     "active_frac",    # MoE MECHANISM diagnostic (emitted as diag:active_frac)
