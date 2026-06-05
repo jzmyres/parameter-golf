@@ -38,6 +38,18 @@ AUX_LOSS_FIELDS: tuple[str, ...] = (
     "consistency_anchor_loss",
 )
 
+# M0 two-goal `metrics:` log-line fields (single registry drives the field
+# fanout). Mirror of `train_gpt_m0.format_metrics_line` field names. R_act/phi
+# are sparse (control-sweep only) and parse to NaN on a plain per-step line.
+M0_METRICS_FIELDS: tuple[str, ...] = (
+    "erank",          # expressiveness: effective rank (spectral entropy)
+    "active_frac",    # resource: mean active-expert fraction (MoE sparsity)
+    "kv_bytes",       # resource: MLA KV-cache bytes per token
+    "params",         # resource: trainable parameter count
+    "R_act",          # resource: activation-memory scaling (control sweep)
+    "phi",            # expressiveness: recurrence-equivalence exponent (sweep)
+)
+
 # Consistent colors: blue for Baseline, orange for Current
 COLOR_BASELINE = "#1f77b4"  # matplotlib default blue
 COLOR_CURRENT = "#ff7f0e"   # matplotlib default orange
@@ -149,6 +161,11 @@ def parse_log(logpath: str) -> dict:
         "final_status": {},
         "k_sweep": [],
         "k_sweep_table": [],
+        # M0 two-goal metrics (`metrics:` log line). Resource: active_frac,
+        # kv_bytes, params (+ R_act when the control sweep supplies it).
+        # Expressiveness: erank (+ phi when the control sweep supplies it).
+        "metrics_steps": [],
+        **{f: [] for f in M0_METRICS_FIELDS},
         }
 
     # NOTE: logs may accidentally contain multiple runs concatenated together (e.g. reused run_id).
@@ -354,6 +371,28 @@ def parse_log(logpath: str) -> dict:
                     k, v = tok.split(":", 1)
                     kvs[k.strip()] = v.strip()
             data["final_status"] = kvs
+
+        # M0 lightweight train-step line (`step:N/M k_hi:K train_loss:L`, no
+        # train_time/step_avg, so the legacy train-step regex above does NOT
+        # match it). Track its step index so the following `metrics:` line can
+        # share it; this does not append to train series (the legacy plots key
+        # off train_time-bearing lines).
+        m = re.search(rf"^step:(\d+)/\d+ k_hi:\d+ train_loss:{_FLOAT}\s*$", line)
+        if m:
+            last_step_seen = int(m.group(1))
+
+        # M0 two-goal `metrics:` line (emitted right after a train step line, so
+        # it shares that step index). Each registered field parses to its float
+        # value or NaN when absent (R_act/phi are control-sweep-only). kv_bytes
+        # and params are integer counts but stored as floats for plotting parity.
+        m = re.search(r"^metrics:\s*(.*)$", line)
+        if m:
+            data["metrics_steps"].append(
+                last_step_seen if last_step_seen is not None else len(data["metrics_steps"]) + 1
+            )
+            for field in M0_METRICS_FIELDS:
+                m_f = re.search(rf"\b{field}:{_FLOAT}", m.group(1))
+                data[field].append(float(m_f.group(1)) if m_f else math.nan)
 
         # Validation steps
         m = re.search(rf"^step:(\d+)/\d+ val_loss:{_FLOAT} val_bpb:{_FLOAT}", line)

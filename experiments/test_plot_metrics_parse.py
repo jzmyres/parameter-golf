@@ -199,6 +199,41 @@ class TestPlotMetricsParse(unittest.TestCase):
 
         self.assertEqual(d["expert_ortho"], [0.33])
 
+    def test_parse_m0_two_goal_metrics_line(self):
+        from experiments.plot_metrics import M0_METRICS_FIELDS
+
+        log = "\n".join(
+            [
+                "step:10/20 k_hi:64 train_loss:3.2000",
+                "metrics: erank:512.3456 active_frac:0.7500 kv_bytes:128 params:1234567",
+                # Control-sweep line carrying the sparse R_act / phi fields too.
+                "step:20/20 k_hi:64 train_loss:3.0000",
+                "metrics: erank:600.0000 active_frac:1.0000 kv_bytes:128 params:1234567 "
+                "R_act:2.5000 phi:0.8000",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        # Every registered M0 metric field is present in the parsed dict.
+        for field in M0_METRICS_FIELDS:
+            self.assertIn(field, d)
+            self.assertEqual(len(d[field]), 2)
+
+        self.assertEqual(d["metrics_steps"], [10, 20])
+        self.assertEqual(d["erank"], [512.3456, 600.0])
+        self.assertEqual(d["active_frac"], [0.75, 1.0])
+        self.assertEqual(d["kv_bytes"], [128.0, 128.0])
+        self.assertEqual(d["params"], [1234567.0, 1234567.0])
+        # R_act / phi absent on the first line -> NaN; present on the second.
+        self.assertTrue(math.isnan(d["R_act"][0]))
+        self.assertTrue(math.isnan(d["phi"][0]))
+        self.assertEqual(d["R_act"][1], 2.5)
+        self.assertEqual(d["phi"][1], 0.8)
+
     def test_plot_comparison_smoke_with_auxiliary_terms(self):
         train_line = (
             "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "

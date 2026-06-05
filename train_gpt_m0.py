@@ -1100,6 +1100,167 @@ def build_optimizers(model, matrix_lr, embed_lr, scalar_lr,
 
 
 # ---------------------------------------------------------------------------
+# 15b. Two-goal metrics (Resource + Expressiveness)
+# ---------------------------------------------------------------------------
+# The project tracks two goals with principled, named metrics. These are PURE
+# functions (no model state mutation, no hot-path .item()/CPU syncs — call them
+# only at log/eval sites). They are the primitives the control-experiment runner
+# (Task 9) composes into the recurrence-equivalence exponent ``phi`` over the
+# loop count ``r`` and the activation-memory scaling ``R_act`` over the recurrent
+# budget ``K``; here we also log the cheap per-step subset (``erank`` /
+# ``active_frac`` / ``kv_bytes`` / ``params``).
+def effective_rank(matrix_or_singular_values) -> float:
+    """Effective (numerical) rank via spectral entropy — Roy & Vetterli (2007).
+
+    Given a 2D matrix we take its singular values ``s = svdvals(M)``; given a 1D
+    tensor we treat it directly as a singular-value spectrum. Normalize to a
+    distribution ``p = s / sum(s)`` (the singular values are non-negative), take
+    its Shannon entropy ``H = -sum(p log p)`` (zeros contribute 0), and return
+    ``erank = exp(H)``. This is the exponential of the spectral entropy:
+
+      * an isotropic spectrum (all ``s`` equal) has the maximal-entropy uniform
+        ``p`` over ``n`` atoms, so ``erank == n`` (e.g. ``eye(4)`` -> 4);
+      * a rank-1 spectrum concentrates all mass on one atom, so ``H == 0`` and
+        ``erank == 1``.
+
+    erank is a smooth, basis-free proxy for "how many directions the matrix
+    actually uses", which we read as an expressiveness signal on expert / MoS /
+    recurrent-state output spaces. Returns a Python ``float`` (single CPU sync;
+    do not call inside the grad-accum hot loop).
+    """
+    t = matrix_or_singular_values.detach()
+    if t.ndim >= 2:
+        s = torch.linalg.svdvals(t.float())
+    else:
+        s = t.float().abs()
+    total = s.sum()
+    if float(total) <= 0.0:
+        return 0.0
+    p = s / total
+    # Mask exact zeros so 0*log(0) := 0 (the entropy convention).
+    nz = p > 0
+    h = -(p[nz] * p[nz].log()).sum()
+    return float(torch.exp(h))
+
+
+def fit_phi(losses: dict) -> float:
+    """Iso-Depth recurrence-equivalence exponent ``phi`` in ``[0, 1]``.
+
+    Question: looping one shared block ``r`` times — does it buy the capacity of
+    ``r`` *unique* blocks? We model the depth scaling law in log-loop space::
+
+        loss(r) ≈ a - b * log(r),     b >= 0  (improvement per log-loop)
+
+    and compare the fitted slope ``b`` against the "one unique block per loop"
+    reference slope ``b_ref``. The exponent is the capped ratio::
+
+        phi = clamp(b / b_ref, 0, 1)
+
+    Interpretation: ``phi == 1`` means each extra loop is worth a full unique
+    block (perfect recurrence-equivalence); ``phi == 0`` means looping buys
+    nothing (loss flat in ``r``); intermediate values quantify partial
+    equivalence. We take ``b_ref = 1.0`` so a unit log-loop improvement maps to
+    ``phi = 1`` (the test's full-equivalence construction uses unit slope), and
+    negative slopes (loss *worsening* with depth) clamp to 0.
+
+    The fit is an ordinary least-squares slope of ``loss`` against ``log(r)``,
+    which is deterministic and closed-form (no optimizer, no randomness). With
+    fewer than two distinct depths there is no slope to estimate, so ``phi`` is
+    defined as ``0.0``.
+    """
+    pts = sorted((int(r), float(v)) for r, v in losses.items() if int(r) > 0)
+    if len(pts) < 2:
+        return 0.0
+    xs = [math.log(r) for r, _ in pts]
+    ys = [v for _, v in pts]
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0.0:  # all log(r) identical (cannot happen for distinct r>0, guard anyway)
+        return 0.0
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    slope = sxy / sxx          # dloss/dlog(r); negative when loss improves with depth
+    b = -slope                 # improvement per log-loop (>=0 when looping helps)
+    b_ref = 1.0                # one unique block per log-loop reference slope
+    return float(min(max(b / b_ref, 0.0), 1.0))
+
+
+def active_expert_fraction(moe_or_last_route) -> float:
+    """Mean fraction of routing weights that are strictly positive (MoE sparsity).
+
+    Accepts either a :class:`SwiGLUMoE` (reads its detached ``last_route``) or a
+    routing-weight tensor directly. ``softmax`` routing emits strictly positive
+    weights everywhere, so the fraction is ~1.0 (dense); ``relu`` routing emits
+    exact zeros (load shedding), so the fraction reports the realized sparsity in
+    ``[0, 1]``. Returns a Python ``float`` (single CPU sync; log/eval-site only).
+    """
+    route = moe_or_last_route.last_route if isinstance(moe_or_last_route, SwiGLUMoE) \
+        else moe_or_last_route
+    if route is None:
+        return float("nan")
+    return float((route.detach() > 0).float().mean())
+
+
+def kv_bytes_per_token(args: Hyperparameters) -> int:
+    """Autoregressive KV-cache footprint per token, in bytes (MLA cache).
+
+    MLA caches the *compressed* KV latent (``kv_latent`` floats) plus the
+    decoupled per-KV-head RoPE key channel (``n_kv_heads * rope_dim`` floats),
+    which is what the attention recomputes K/V from at decode time — that is the
+    whole point of latent KV compression versus caching full per-head K and V.
+    ``rope_dim = head_dim // 2`` mirrors :class:`MLAttention`'s decoupled-RoPE
+    split. We bill bf16 (2 bytes/float), the training/inference activation dtype.
+    """
+    rope_dim = args.head_dim // 2
+    floats = args.kv_latent + args.n_kv_heads * rope_dim
+    return int(floats * 2)  # bf16 = 2 bytes/element
+
+
+def collect_metrics(model, args: Hyperparameters) -> dict:
+    """Assemble the cheap per-step two-goal metrics for the ``metrics:`` log line.
+
+    Reads ``active_frac`` / ``erank`` from the LAST forward's routing weights and
+    output-embedding spectrum (so call after a forward), ``kv_bytes`` from the
+    static head config, and ``params`` from the model. ``R_act`` and ``phi`` are
+    NOT computed here — they require the multi-K / multi-r control sweep (Task 9)
+    — but the log emitter accepts them when a caller supplies them. Returns a
+    plain ``dict[str, float|int]`` (CPU scalars; do not call in the hot loop).
+    """
+    inner = model.module if hasattr(model, "module") else model
+    routes = [active_expert_fraction(m) for m in inner.modules()
+              if isinstance(m, SwiGLUMoE) and m.last_route is not None]
+    active_frac = float(sum(routes) / len(routes)) if routes else float("nan")
+    erank = effective_rank(inner.tok_emb.weight)
+    return {
+        "active_frac": active_frac,
+        "erank": erank,
+        "kv_bytes": kv_bytes_per_token(args),
+        "params": int(sum(p.numel() for p in inner.parameters())),
+    }
+
+
+def format_metrics_line(metrics: dict) -> str:
+    """Render the ``metrics:`` log line consumed by ``plot_metrics.parse_log``.
+
+    Emits ``erank`` / ``active_frac`` / ``kv_bytes`` / ``params`` always, and
+    ``R_act`` / ``phi`` only when the caller provides them (control-sweep sites),
+    so a plain per-step call stays compact. Field order is fixed for the parser.
+    """
+    parts = [
+        f"erank:{metrics['erank']:.4f}",
+        f"active_frac:{metrics['active_frac']:.4f}",
+        f"kv_bytes:{int(metrics['kv_bytes'])}",
+        f"params:{int(metrics['params'])}",
+    ]
+    if "R_act" in metrics and metrics["R_act"] is not None:
+        parts.append(f"R_act:{float(metrics['R_act']):.4f}")
+    if "phi" in metrics and metrics["phi"] is not None:
+        parts.append(f"phi:{float(metrics['phi']):.4f}")
+    return "metrics: " + " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # 16. CLI trainer
 # ---------------------------------------------------------------------------
 def _parse_int_set(spec: str):
@@ -1334,6 +1495,10 @@ def main(argv=None):
             # Single rank-0 .item() sync at the log site (no hot-path sync).
             print0(f"step:{step + 1}/{args.iterations} k_hi:{k_hi} "
                    f"train_loss:{step_loss.item():.4f}")
+            # Two-goal metrics from the just-finished forward (rank-0 log site
+            # only; collect_metrics does CPU syncs, never call in the hot loop).
+            if master:
+                print0(format_metrics_line(collect_metrics(base_model, model_args)))
 
         if args.val_every > 0 and (step + 1) % args.val_every == 0:
             v_loss, v_bpb = run_validation(
