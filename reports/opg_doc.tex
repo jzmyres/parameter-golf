@@ -106,7 +106,12 @@ The inverse is structural and floor-free:
   a_{k+1}-F_\theta\!\left(\RMSNorm(b_k+x_0)\right).
 \end{align}
 Invertibility is therefore an algebraic property of the additive coupling, not a consequence of
-contraction.  The core does not require a fixed point.
+contraction.  The core does not require a fixed point.  Under mixed-precision (bf16 autocast) training
+the coupling streams \((a,b)\) are accumulated in fp64 (the additive \(\pm\) uses fp64 add/sub) while
+\(F_\theta,G_\theta\) keep their matmuls under the ambient bf16 autocast; the backward replays that
+autocast so reconstruction recomputes the identical bf16 \(F_\theta,G_\theta\).  This makes the inverse
+bit-exact (\(\code{\detokenize{recon_rel}}\approx0\)) and the \(O(1)\)-memory reversible BPTT gradients
+correct under bf16 (\S\ref{sec:metrics}, the \code{\detokenize{recurrence_accum_dtype}} knob).
 
 The readout is simple: for a recurrent budget \(K\), the final recurrent state
 \[
@@ -211,10 +216,22 @@ The reversible round-trip error \(\code{\detokenize{recon_rel}}\) is also logged
 \((a_K,b_K)\) back to the seed \((a_0,b_0)\),
 \(\code{\detokenize{recon_rel}}=(\lVert a_0'-a_0\rVert+\lVert b_0'-b_0\rVert)/(\lVert a_0\rVert+\lVert b_0\rVert+\epsilon)\).
 The \(O(1)\)-memory reversible backward reconstructs activations from \((a_K,b_K)\) via exactly this
-inverse, so gradients equal ordinary BPTT only if the round-trip is exact: \(\approx0\) at machine
-precision in fp64 (proven by the reconstruction unit tests), a small nonzero in bf16 (additive
-non-associativity over \(K\) steps).  A large \(\code{\detokenize{recon_rel}}\) means the
-reconstructed graph --- and hence the gradient signal --- drift from the true forward pass.  It is a
+inverse, so gradients equal ordinary BPTT only if the round-trip is exact.  Mixed-precision
+correctness rests on two design choices.  \emph{(i) fp64 stream accumulation.}  The recurrence carries
+the coupling streams \((a,b)\) in fp64 (the \code{\detokenize{recurrence_accum_dtype}} knob, default
+\code{float64}; \code{float32} is a cheaper option), so the additive coupling \(\pm\) is exact while
+the \(F_\theta,G_\theta\) matmuls still run at the ambient autocast precision (bf16); their output is
+cast to the stream dtype before each \(\pm\).  This keeps the algebraic inverse bit-exact and removes
+the catastrophic low-precision \(\pm\) drift that otherwise amplifies over \(K\) steps in
+ill-conditioned (random-init) regimes.  \emph{(ii) Autocast replay in the backward.}  The forward runs
+\(F_\theta,G_\theta\) under the caller's bf16 autocast; the backward \emph{captures and replays} that
+autocast so the reconstruction and the rebuilt-step VJP recompute \(F_\theta,G_\theta\) identically
+(same bf16 matmuls) --- otherwise an fp32 backward would invert a \emph{different} function than the
+bf16 forward and corrupt the gradient.  With both, \(\code{\detokenize{recon_rel}}\approx0\) (machine
+precision) under bf16 autocast, so the reconstructed graph --- and the gradient signal --- match the
+true forward; the readout (\code{\detokenize{final_norm}}/\code{\detokenize{mos_head}}/loss) is cast
+back to the model dtype so only the recurrence stream is fp64.  A large
+\(\code{\detokenize{recon_rel}}\) means the reconstructed graph drifts from the true forward.  It is a
 log-site-only probe (one forward sweep plus one inverse sweep), measured under the training bf16
 autocast so it reports the actual training reconstruction drift.
 The trained model can still fail; the point is that the architecture composes

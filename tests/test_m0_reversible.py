@@ -194,6 +194,126 @@ def test_step_conditioning_and_random_init_compose_backward():
     assert torch.allclose(x0b.grad, ref_x0, atol=1e-6), f"x0 grad max_diff={max_diff}"
 
 
+def test_bf16_autocast_backward_matches_ordinary_autograd():
+    """bf16 GRAD-EQUIVALENCE: under CPU bf16 autocast the O(1) reversible backward
+    must reproduce ordinary stored-activation BPTT grads to a bf16-appropriate
+    tolerance. This is the real correctness target: not just small recon, but
+    that the autocast-matched, fp64-accumulating backward yields correct
+    gradients. The reference unrolls forward_states under the SAME autocast.
+
+    Before the fix the backward recomputed F/G in fp32 (no autocast replayed),
+    so forward-F (bf16) != backward-F (fp32) and the algebraic inverse used the
+    wrong function -> wrong grads. fp32-param leaves keep all grads fp32.
+    """
+    torch.manual_seed(0)
+    d = 16
+    F, G = _TinyDelta(d).float(), _TinyDelta(d).float()  # fp32 params
+    rec = ReversibleRecurrence(F, G)
+    x0 = torch.randn(2, 4, d, requires_grad=True)  # fp32 seed
+    # Reference: ordinary autograd through forward_states under bf16 autocast.
+    # backward() is called OUTSIDE the autocast region to MATCH the trainer
+    # (finite_horizon_loss runs under autocast; backward runs after it closes).
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        (aK, bK), _ = rec.forward_states(x0, x0, x0, depth=8)
+        ref_loss = (0.5 * (aK + bK)).float().pow(2).sum()
+    ref_loss.backward()
+    ref_g = {n: p.grad.clone() for n, p in rec.named_parameters()}
+    ref_x0 = x0.grad.clone()
+    for p in rec.parameters():
+        p.grad = None
+    # O(1) custom-autograd path under the SAME bf16 autocast (backward outside).
+    x0b = x0.detach().clone().requires_grad_(True)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        zK = rec.run_reversible(x0b, depth=8)
+        loss = zK.float().pow(2).sum()
+    loss.backward()
+
+    def relerr(g, ref):
+        return float((g - ref).norm() / (ref.norm() + 1e-12))
+
+    for n, p in rec.named_parameters():
+        assert p.grad.dtype == p.dtype, (n, p.grad.dtype)  # grads stay fp32
+        # bf16 matmuls -> compare with a bf16-appropriate RELATIVE-NORM tolerance
+        # (the meaningful BPTT-correctness measure; per-element atol is dominated
+        # by bf16 noise on near-zero grad components). < 2% confirms the
+        # autocast-matched backward reproduces the true grads.
+        assert relerr(p.grad, ref_g[n]) < 2e-2, (n, relerr(p.grad, ref_g[n]))
+    assert x0b.grad.dtype == x0.dtype
+    assert relerr(x0b.grad, ref_x0) < 2e-2, relerr(x0b.grad, ref_x0)
+
+
+def test_bf16_backward_under_outer_autocast_keeps_matmul_grads():
+    """cache_enabled gate: when ``backward()`` runs WITH an outer autocast still
+    active, the backward's no_grad reconstruction would otherwise poison the
+    OUTER autocast weight-cast cache with a DETACHED bf16 weight; the enable_grad
+    rebuilt step then reuses it and the matmul (Linear.weight) grads come back
+    None -> ZERO. The fix enters the backward's autocast with cache_enabled=False
+    so each rebuilt step gets a fresh grad-tracked weight cast. Here the Linear
+    weight grads MUST be nonzero and match the reference."""
+    torch.manual_seed(0)
+    d = 16
+    F, G = _TinyDelta(d).float(), _TinyDelta(d).float()
+    rec = ReversibleRecurrence(F, G)
+    x0 = torch.randn(2, 4, d, requires_grad=True)
+    # Reference (backward outside autocast — always correct).
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        (aK, bK), _ = rec.forward_states(x0, x0, x0, depth=8)
+        (0.5 * (aK + bK)).float().pow(2).sum().backward()
+    ref_g = {n: p.grad.clone() for n, p in rec.named_parameters()}
+    for p in rec.parameters():
+        p.grad = None
+    # Custom path with backward INSIDE the outer autocast (poisoning condition).
+    x0b = x0.detach().clone().requires_grad_(True)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        zK = rec.run_reversible(x0b, depth=8)
+        zK.float().pow(2).sum().backward()  # backward UNDER outer autocast
+    # The Linear (matmul) weights MUST carry nonzero grads matching the reference.
+    for n in ("F.l.weight", "G.l.weight"):
+        g = dict(rec.named_parameters())[n].grad
+        assert g.norm() > 0, f"{n} grad is zero (autocast cache poisoned)"
+        rel = float((g - ref_g[n]).norm() / (ref_g[n].norm() + 1e-12))
+        assert rel < 2e-2, (n, rel)
+
+
+def test_revrecurrence_backward_captures_and_replays_autocast():
+    """Part A structural gate: RevRecurrenceFn.forward must CAPTURE the caller's
+    autocast (enabled flag, device_type, dtype) onto ctx so backward can REPLAY
+    it. We intercept the ctx via a custom Function subclass hook to assert the
+    captured metadata matches the active bf16 autocast — a regression that drops
+    the capture (reverting Part A, so backward F/G run fp32 != forward bf16)
+    fails here."""
+    import train_gpt
+
+    captured = {}
+    orig_forward = train_gpt.RevRecurrenceFn.forward
+
+    class _SpyFn(train_gpt.RevRecurrenceFn):
+        @staticmethod
+        def forward(ctx, *a):
+            out = orig_forward(ctx, *a)
+            captured["enabled"] = ctx.autocast_enabled
+            captured["device_type"] = ctx.device_type
+            captured["dtype"] = ctx.autocast_dtype
+            return out
+
+    torch.manual_seed(0)
+    d = 16
+    F, G = _TinyDelta(d).float(), _TinyDelta(d).float()
+    rec = ReversibleRecurrence(F, G)
+    x0 = torch.randn(2, 4, d, requires_grad=True)
+    a0 = b0 = x0
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        aK, bK = _SpyFn.apply(rec, x0, a0, b0, 4, True, *rec.parameters())
+    assert captured["enabled"] is True
+    assert captured["device_type"] == "cpu"
+    assert captured["dtype"] == torch.bfloat16
+    # And with NO autocast the capture records enabled=False (backward stays fp32).
+    captured.clear()
+    x0b = x0.detach().clone().requires_grad_(True)
+    _SpyFn.apply(rec, x0b, x0b, x0b, 4, True, *rec.parameters())
+    assert captured["enabled"] is False
+
+
 def test_x0_init_byte_identical_to_explicit_x0_seed():
     """Default run_reversible(x0) (a0=b0 implicit x0) is byte-identical to passing
     a0=b0=x0 explicitly — proves the new explicit-seed path keeps the x0 seed

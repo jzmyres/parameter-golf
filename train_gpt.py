@@ -52,6 +52,43 @@ except ImportError:  # pragma: no cover - zstd is the prod path
     _COMPRESSOR = "zlib"
 
 
+def _dtype_rank(dt):
+    """Precision rank for float dtypes (higher = more precise). Used to pick the
+    F/G block's native compute dtype as its highest-precision parameter."""
+    return {torch.float16: 0, torch.bfloat16: 0, torch.float32: 1,
+            torch.float64: 2}.get(dt, 1)
+
+
+def _autocast_enabled(device_type):
+    """Whether autocast is active for ``device_type``, across torch versions.
+
+    ``torch.is_autocast_enabled()`` with NO argument queries the CUDA device, so
+    under CPU bf16 autocast it returns False — the device-type-aware call is
+    required. Falls back to the deprecated device-specific getter on old builds.
+    """
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:  # pragma: no cover - very old torch (no device arg)
+        if device_type == "cuda":
+            return torch.is_autocast_enabled()
+        return torch.is_autocast_cpu_enabled()
+
+
+def _autocast_dtype(device_type):
+    """Current autocast dtype for ``device_type``, across torch versions.
+
+    Prefers the modern ``torch.get_autocast_dtype(device_type)`` (torch>=2.4)
+    and falls back to the device-specific getters on older builds. Only called
+    inside ``RevRecurrenceFn.forward`` to capture the forward's autocast dtype so
+    the backward can REPLAY it (F/G recompute identically to the forward).
+    """
+    if hasattr(torch, "get_autocast_dtype"):
+        return torch.get_autocast_dtype(device_type)
+    if device_type == "cuda":
+        return torch.get_autocast_gpu_dtype()
+    return torch.get_autocast_cpu_dtype()
+
+
 @contextlib.contextmanager
 def paired_rng(device):
     """Snapshot the CPU (+ CUDA, when ``device`` is CUDA) RNG and yield a
@@ -138,12 +175,51 @@ class ReversibleRecurrence(nn.Module):
     autograd Function (see ``EXPERIENCE.md#custom-autograd-input``).
     """
 
-    def __init__(self, F, G, step_emb=None):
+    def __init__(self, F, G, step_emb=None, accum_dtype=torch.float64):
         super().__init__()
         self.F, self.G = F, G
         # Optional per-step (clock) embedding submodule. None -> unconditioned
         # recurrence, byte-identical to the previous behavior.
         self.step_emb = step_emb
+        # Dtype the coupling STREAM (a, b) is carried in for the additive +/-.
+        # fp64 (default, CLAUDE.md mandate) keeps the +/- exact so the reversible
+        # inverse reconstructs the true forward under bf16 autocast (F/G matmuls
+        # still run at the ambient autocast precision). See Hyperparameters
+        # ``recurrence_accum_dtype``.
+        self.accum_dtype = accum_dtype
+
+    def _fn_in_dtype(self, fn):
+        """Native compute dtype of an F/G block: its highest-precision float param.
+
+        The stream is carried in ``accum_dtype`` (e.g. fp64) but F/G's matmul
+        weights are the model dtype (fp32, or fp64 in the fp64 unit tests). A
+        matmul requires its activation and weight to share a dtype, so the
+        stream is cast to this before F/G and the F/G output is cast back to
+        ``accum_dtype`` after. We pick the HIGHEST-precision float param so:
+
+          * fp64 model / fp64 ``_TinyDelta`` (whose Linear is ``.double()``, norm
+            scale fp32) -> fp64: the block stays exact, fp64 tests unchanged.
+          * fp32 model -> fp32: under autocast the fp32 activation is what lets
+            autocast intercept and run the matmul in bf16 (autocast does NOT
+            downcast an fp64 activation, so feeding fp64 in would error).
+
+        Falls back to ``accum_dtype`` when the block is parameter-free.
+        """
+        best = None
+        for p in fn.parameters():
+            if p.is_floating_point() and (best is None or _dtype_rank(p.dtype) > _dtype_rank(best)):
+                best = p.dtype
+        return best if best is not None else self.accum_dtype
+
+    def _stream_setup(self, a, b, x0):
+        """Upcast the coupling stream to ``accum_dtype`` and resolve the F/G input
+        dtypes. The single shared preamble for :meth:`forward_states`,
+        :meth:`forward_states_at`, and :meth:`invert` so the fp64-stream /
+        block-dtype-input convention is defined in one place. Returns
+        ``(ad, fd, gd, a, b, x0)`` with ``a, b, x0`` upcast to ``ad``."""
+        ad = self.accum_dtype
+        fd, gd = self._fn_in_dtype(self.F), self._fn_in_dtype(self.G)
+        return ad, fd, gd, a.to(ad), b.to(ad), x0.to(ad)
 
     def _step_vec(self, k, ref):
         """Per-step embedding ``e_k`` broadcastable over ``(B, T, D)``.
@@ -162,11 +238,16 @@ class ReversibleRecurrence(nn.Module):
         return self.step_emb(idx).view(1, 1, -1).type_as(ref)
 
     def forward_states(self, a, b, x0, depth):
+        # Carry the coupling stream (a, b) in ``accum_dtype`` (fp64 by default)
+        # so the additive +/- is exact under bf16 autocast. F/G receive their
+        # input cast to the block's native dtype (so autocast can run the matmul
+        # in bf16) and their output is cast back to the stream dtype before +.
+        ad, fd, gd, a, b, x0 = self._stream_setup(a, b, x0)
         states = []
         for k in range(int(depth)):
             e_k = self._step_vec(k, x0)
-            a = a + self.F(b + x0 + e_k)
-            b = b + self.G(a + x0 + e_k)
+            a = a + self.F((b + x0 + e_k).to(fd)).to(ad)
+            b = b + self.G((a + x0 + e_k).to(gd)).to(ad)
             states.append(0.5 * (a + b))
         return (a, b), states
 
@@ -191,11 +272,13 @@ class ReversibleRecurrence(nn.Module):
         if not want or want[0] < 1:
             raise ValueError("forward_states_at requires positive depths")
         want_set = set(want)
+        # fp64 stream + block-dtype F/G inputs, identical to forward_states.
+        ad, fd, gd, a, b, x0 = self._stream_setup(a, b, x0)
         out = {}
         for k in range(want[-1]):
             e_k = self._step_vec(k, x0)
-            a = a + self.F(b + x0 + e_k)
-            b = b + self.G(a + x0 + e_k)
+            a = a + self.F((b + x0 + e_k).to(fd)).to(ad)
+            b = b + self.G((a + x0 + e_k).to(gd)).to(ad)
             d = k + 1  # midpoint after (k+1) full steps
             if d in want_set:
                 out[d] = 0.5 * (a + b)
@@ -204,10 +287,13 @@ class ReversibleRecurrence(nn.Module):
     def invert(self, a, b, x0, depth):
         # Walk steps in REVERSE; e_k is a deterministic function of the step
         # index k, so each reverse step recomputes the SAME e_k the forward used.
+        # fp64 stream + block-dtype F/G inputs, identical to forward_states, so
+        # the algebraic +/- inverse is exact bit-for-bit.
+        ad, fd, gd, a, b, x0 = self._stream_setup(a, b, x0)
         for k in reversed(range(int(depth))):
             e_k = self._step_vec(k, x0)
-            b = b - self.G(a + x0 + e_k)
-            a = a - self.F(b + x0 + e_k)
+            b = b - self.G((a + x0 + e_k).to(gd)).to(ad)
+            a = a - self.F((b + x0 + e_k).to(fd)).to(ad)
         return a, b
 
     def run_reversible(self, x0, depth, a0=None, b0=None):
@@ -288,19 +374,52 @@ class RevRecurrenceFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, rec, x0, a0, b0, depth, seed_is_x0, *params):
+        # CAPTURE the caller's autocast so backward can REPLAY it: forward_states
+        # runs F/G under the caller's autocast (e.g. bf16), so the backward must
+        # recompute F/G under the SAME autocast or forward-F (bf16) != backward-F
+        # (fp32) and the algebraic inverse uses the wrong function -> wrong grads.
+        device_type = x0.device.type
+        ctx.autocast_enabled = _autocast_enabled(device_type)
+        ctx.device_type = device_type
+        ctx.autocast_dtype = _autocast_dtype(device_type)
         with torch.no_grad():
+            # forward_states carries the stream in rec.accum_dtype (fp64 default)
+            # and returns fp64 terminal states; F/G matmuls ran under the caller's
+            # autocast. The fp64 stream keeps the coupling +/- exact.
             (aK, bK), _ = rec.forward_states(a0, b0, x0, depth)
         ctx.rec, ctx.depth, ctx.seed_is_x0 = rec, depth, seed_is_x0
-        ctx.save_for_backward(aK.detach(), bK.detach(), x0.detach())
+        ctx.x0_dtype = x0.dtype
+        # Save the fp64 terminal state + the fp64-upcast x0 (the reconstruction
+        # and rebuilt-step VJP both run in the stream dtype).
+        ctx.save_for_backward(aK.detach(), bK.detach(),
+                              x0.detach().to(rec.accum_dtype))
         return aK, bK
 
     @staticmethod
     def backward(ctx, ga, gb):
         rec, depth, seed_is_x0 = ctx.rec, ctx.depth, ctx.seed_is_x0
-        a, b, x0 = ctx.saved_tensors
+        a, b, x0 = ctx.saved_tensors  # all in rec.accum_dtype (fp64 default)
+        ad = rec.accum_dtype
+        fd, gd = rec._fn_in_dtype(rec.F), rec._fn_in_dtype(rec.G)
         params = list(rec.parameters())
         pgrads = [torch.zeros_like(p) for p in params]
+        # The incoming cotangents (ga, gb) are grads of fp64 outputs (aK, bK), so
+        # they are fp64; carry all VJP accumulation in the stream dtype.
+        ga, gb = ga.to(ad), gb.to(ad)
         gx0 = torch.zeros_like(x0)
+        # REPLAY the forward's autocast so F/G recompute identically (bf16 matmuls
+        # match the forward) — this is what makes the reconstructed graph, and
+        # hence the gradients, equal ordinary autocast BPTT. A FRESH autocast is
+        # entered per block with cache_enabled=False: a bf16 weight first cast
+        # under the no_grad reconstruction is cached DETACHED, which would poison
+        # the subsequent enable_grad rebuilt step (its weight grad would come back
+        # None -> zero F.l.weight/G.l.weight grads). Disabling the cache forces a
+        # fresh, grad-tracked weight cast in the enable_grad block.
+        def autocast_ctx():
+            return torch.autocast(device_type=ctx.device_type,
+                                  dtype=ctx.autocast_dtype,
+                                  enabled=ctx.autocast_enabled,
+                                  cache_enabled=False)
         # Walk steps in REVERSE so the recomputed per-step embedding e_k matches
         # the forward's e_k at the corresponding step index k (deterministic
         # function of k -> exact reconstruction; see ReversibleRecurrence).
@@ -310,24 +429,25 @@ class RevRecurrenceFn(torch.autograd.Function):
             # no_grad reconstruction. We compute it twice: once detached (for the
             # algebraic inverse) and once live (for the VJP). Both are the same
             # deterministic value, so reconstruction stays exact.
-            with torch.no_grad():
-                e_k = rec._step_vec(k, x0)
-                # Algebraic inverse of one forward step (no_grad: reconstruction
-                # only, gradients flow through the rebuilt graph below).
-                b_prev = b - rec.G(a + x0 + e_k)
-                a_prev = a - rec.F(b_prev + x0 + e_k)
-            # Rebuild the single forward step on fresh leaves. Use .clone() so
-            # the y-leg/z-leg pair and successive steps do not alias storage.
+            with torch.no_grad(), autocast_ctx():
+                e_k = rec._step_vec(k, x0)  # fp64 (x0 is fp64) -> stream dtype
+                # Algebraic inverse of one forward step IN THE STREAM DTYPE (fp64
+                # +/-, exact); F/G run under the replayed autocast (bf16 matmuls)
+                # and their output is cast back to the stream dtype before the -.
+                b_prev = b - rec.G((a + x0 + e_k).to(gd)).to(ad)
+                a_prev = a - rec.F((b_prev + x0 + e_k).to(fd)).to(ad)
+            # Rebuild the single forward step on fresh fp64 leaves. Use .clone()
+            # so the y-leg/z-leg pair and successive steps do not alias storage.
             # enable_grad: a custom Function's backward runs with grad disabled
             # by default; we need a live local graph to take the per-step VJP.
-            # e_k_live keeps step_emb.weight on the graph so its grad slot fills.
-            with torch.enable_grad():
+            # autocast is replayed so F/G match the forward (bf16 matmuls).
+            with torch.enable_grad(), autocast_ctx():
                 ap = a_prev.clone().requires_grad_(True)
                 bp = b_prev.clone().requires_grad_(True)
                 x0r = x0.clone().requires_grad_(True)
                 e_k_live = rec._step_vec(k, x0r)
-                a_new = ap + rec.F(bp + x0r + e_k_live)
-                b_new = bp + rec.G(a_new + x0r + e_k_live)
+                a_new = ap + rec.F((bp + x0r + e_k_live).to(fd)).to(ad)
+                b_new = bp + rec.G((a_new + x0r + e_k_live).to(gd)).to(ad)
             grads = torch.autograd.grad(
                 (a_new, b_new), [ap, bp, x0r, *params],
                 grad_outputs=(ga, gb), retain_graph=False, allow_unused=True,
@@ -337,7 +457,9 @@ class RevRecurrenceFn(torch.autograd.Function):
                 gx0 = gx0 + gx0_step
             for i, g in enumerate(grads[3:]):
                 if g is not None:
-                    pgrads[i] = pgrads[i] + g
+                    # param grads come back in the param dtype (fp32) — accumulate
+                    # in-place keeps pgrads fp32 for the optimizer.
+                    pgrads[i] = pgrads[i] + g.to(pgrads[i].dtype)
             a, b = a_prev, b_prev
         # Seed grad. With a0=b0=x0 (init_state="x0") the cotangents reaching the
         # loop entry (ga, gb) ALSO flow into x0 (the seed-grad term), and the
@@ -352,6 +474,14 @@ class RevRecurrenceFn(torch.autograd.Function):
             ga0 = gb0 = None
         else:
             ga0, gb0 = ga, gb
+        # Cast grads back to their CONSUMERS' dtype: x0's grad goes to the input's
+        # original dtype (fp32 embedding), the seed slots match x0 too. pgrads are
+        # already fp32. This keeps the optimizer / embedding grad path fp32.
+        gx0 = gx0.to(ctx.x0_dtype)
+        if ga0 is not None:
+            ga0 = ga0.to(ctx.x0_dtype)
+        if gb0 is not None:
+            gb0 = gb0.to(ctx.x0_dtype)
         return (None, gx0, ga0, gb0, None, None, *pgrads)
 
 
@@ -1017,6 +1147,17 @@ class Hyperparameters:
     init_state: str = "x0"
     #   init_state_std: std of the random a_0/b_0 when init_state="random".
     init_state_std: float = 0.02
+    #   recurrence_accum_dtype: dtype the reversible recurrence carries the
+    #     coupling STREAM (a, b) in for the additive +/- (the F/G matmuls still
+    #     run under the caller's autocast, e.g. bf16). "float64" (default, the
+    #     CLAUDE.md "reconstruction uses fp64 add/sub" mandate): the +/- never
+    #     drifts, so the O(1) reversible backward reconstructs the true forward
+    #     graph and the BPTT gradients are CORRECT under bf16 autocast (recon_rel
+    #     ~ 0). "float32": cheaper accumulation that removes the catastrophic
+    #     random-init blow-up but is NOT bit-exact. The READOUT (final_norm /
+    #     mos_head / loss) is cast back to the model dtype, so this is internal
+    #     to the recurrence only. Must be "float64" or "float32".
+    recurrence_accum_dtype: str = "float64"
 
     def __post_init__(self):
         # Validate the recurrence-seed mode OUTSIDE the CLI (the CLI also
@@ -1027,6 +1168,11 @@ class Hyperparameters:
         if self.init_state not in ("x0", "random"):
             raise ValueError(
                 f"init_state must be 'x0' or 'random', got {self.init_state!r}"
+            )
+        if self.recurrence_accum_dtype not in ("float64", "float32"):
+            raise ValueError(
+                "recurrence_accum_dtype must be 'float64' or 'float32', got "
+                f"{self.recurrence_accum_dtype!r}"
             )
 
 
@@ -1184,7 +1330,9 @@ class M0GPT(nn.Module):
         if args.step_conditioning:
             step_emb = nn.Embedding(args.max_step_emb, d)
             nn.init.normal_(step_emb.weight, mean=0.0, std=0.02)
-        self.rec = ReversibleRecurrence(F_block, G_block, step_emb=step_emb)
+        accum_dtype = getattr(torch, args.recurrence_accum_dtype)
+        self.rec = ReversibleRecurrence(F_block, G_block, step_emb=step_emb,
+                                        accum_dtype=accum_dtype)
 
         # Readout norm of the reversible midpoint, applied OUTSIDE the recurrence
         # so reconstruction stays exact (see class docstring).
@@ -1244,6 +1392,10 @@ class M0GPT(nn.Module):
             a0 = self.args.init_state_std * torch.randn_like(x0)
             b0 = self.args.init_state_std * torch.randn_like(x0)
         z_K = self.rec.run_reversible(x0, depth, a0=a0, b0=b0)
+        # The recurrence accumulates the stream in fp64 (recurrence_accum_dtype);
+        # cast the midpoint back to the model/input dtype BEFORE the readout so
+        # final_norm/mos_head/loss run unchanged (no fp64 leak into the head).
+        z_K = z_K.to(x0.dtype)
         z = self.final_norm(z_K)  # readout norm, OUTSIDE the recurrence
         logp = self.mos_head(z)
         if not torch.isfinite(logp).all():
@@ -1285,6 +1437,9 @@ class M0GPT(nn.Module):
         mids = self.rec.forward_states_at(a0, b0, x0, depths)
         losses = {}
         for d, mid in mids.items():
+            # mids are fp64 (recurrence_accum_dtype); cast back to the model dtype
+            # before the readout so final_norm/mos_head/loss run unchanged.
+            mid = mid.to(x0.dtype)
             z = self.final_norm(mid)  # readout norm, OUTSIDE the recurrence
             logp = self.mos_head(z)
             if not torch.isfinite(logp).all():
@@ -2640,6 +2795,18 @@ def build_arg_parser():
     p.add_argument("--init-state-std", type=float, default=0.02,
                    help="Std of the random a0/b0 when --init-state random "
                         "(default 0.02).")
+    p.add_argument("--recurrence-accum-dtype", type=str, default="float64",
+                   choices=("float64", "float32"),
+                   help="Dtype the reversible recurrence carries the coupling "
+                        "STREAM (a, b) in for the additive +/- (F/G matmuls still "
+                        "run under the caller's autocast, e.g. bf16). float64 "
+                        "(default, CLAUDE.md 'reconstruction uses fp64 add/sub' "
+                        "mandate) keeps the +/- exact so the O(1) reversible "
+                        "backward reconstructs the true forward and the BPTT "
+                        "gradients are CORRECT under bf16 autocast (recon_rel ~ 0). "
+                        "float32: cheaper, removes the random-init blow-up but is "
+                        "NOT bit-exact. Readout (final_norm/mos_head) is cast back "
+                        "to the model dtype either way.")
     # Training schedule / batch.
     p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--seq-len", type=int, default=512)
@@ -2786,6 +2953,7 @@ def main(argv=None):
         n_sublayers=args.n_sublayers, expert_b_init=args.expert_b_init,
         step_conditioning=args.step_conditioning, max_step_emb=args.max_step_emb,
         init_state=args.init_state, init_state_std=args.init_state_std,
+        recurrence_accum_dtype=args.recurrence_accum_dtype,
     )
     base_model = M0GPT(model_args).to(device)
     model = base_model

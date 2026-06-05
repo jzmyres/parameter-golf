@@ -430,6 +430,68 @@ def test_reconstruction_error_step_conditioning_fp64_near_exact():
     assert rel < 1e-10, rel
 
 
+def test_m0gpt_forward_readout_dtype_fp32_under_bf16_autocast():
+    """The recurrence now accumulates the stream in fp64 internally, but the
+    READOUT path (final_norm/mos_head/loss) must stay at the model dtype (fp32):
+    the midpoint z_K is cast back BEFORE final_norm. Under bf16 autocast the loss
+    must be finite and the model parameters/output path remain fp32 (no fp64
+    leak into the head)."""
+    from train_gpt import M0GPT
+
+    torch.manual_seed(0)
+    m = M0GPT(_small_m0_args())  # fp32 params
+    tokens = torch.randint(0, 16, (2, 5))
+    targets = torch.randint(0, 16, (2, 5))
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss = m(tokens, targets, depth=8)
+    assert torch.isfinite(loss)
+    # final_norm/mos_head weights are fp32 — the fp64 accumulation is internal.
+    assert m.final_norm.w.dtype == torch.float32
+    assert m.tok_emb.weight.dtype == torch.float32
+
+
+def test_reconstruction_error_bf16_autocast_near_exact_x0_and_random():
+    """REPRODUCE-THEN-FIX gate: under CPU bf16 autocast the reversible round-trip
+    must stay near-exact (recon_rel < 1e-6) for BOTH init modes at BOTH a shallow
+    and a deep budget.
+
+    Before the fp64-stream-accumulation + autocast-replay fix this FAILS: bf16
+    coupling ± drifts (random-init grew > 1.0, x0-init ~1e-2..4e-2), meaning the
+    O(1) reversible backward reconstructs activations that diverge from the true
+    forward — i.e. the BPTT gradients are wrong. The fp64 stream accumulation
+    keeps the ± exact while F/G still run their matmuls under bf16 autocast.
+    """
+    from train_gpt import M0GPT, reconstruction_error
+
+    for init_state in ("x0", "random"):
+        torch.manual_seed(0)
+        m = M0GPT(_small_m0_args(init_state=init_state))  # fp32 params
+        tokens = torch.randint(0, 16, (2, 5))
+        for depth in (16, 32):
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                rel = reconstruction_error(m, tokens, depth)
+            assert isinstance(rel, float)
+            assert rel >= 0.0
+            assert rel < 1e-6, (init_state, depth, rel)
+
+
+def test_reconstruction_error_bf16_float32_accum_is_finite():
+    """``recurrence_accum_dtype='float32'`` option: under bf16 autocast the
+    round-trip is still a finite non-negative float. fp32 accumulation is far
+    better than ambient bf16 ± (it removes the catastrophic random-init blow-up)
+    but is NOT exact like fp64, so we only assert finiteness + a loose bound."""
+    from train_gpt import M0GPT, reconstruction_error
+
+    torch.manual_seed(0)
+    m = M0GPT(_small_m0_args(recurrence_accum_dtype="float32"))
+    tokens = torch.randint(0, 16, (2, 5))
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        rel = reconstruction_error(m, tokens, depth=16)
+    assert isinstance(rel, float)
+    assert rel == rel and rel >= 0.0
+    assert rel < 1e-1, rel  # fp32 ± is well-behaved (no random-init blow-up)
+
+
 def test_format_metrics_line_includes_recon_rel_when_present():
     """``recon_rel`` is rendered (scientific notation) when supplied and omitted
     when absent (mirrors the ``disp_tail`` formatter contract)."""
