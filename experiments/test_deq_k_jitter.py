@@ -7,7 +7,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-from train_gpt import Hyperparameters, KShuffleBagSampler, _parse_cli_overrides, _prefix_anchor_depths
+from legacy.train_gpt_rich import Hyperparameters, KShuffleBagSampler, _parse_cli_overrides, _prefix_anchor_depths
 
 
 class TestDeqKJitterDefaults(unittest.TestCase):

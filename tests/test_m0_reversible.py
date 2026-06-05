@@ -1,5 +1,5 @@
 import torch
-from train_gpt_m0 import ReversibleRecurrence, _TinyDelta
+from train_gpt import ReversibleRecurrence, _TinyDelta
 
 
 def test_additive_coupling_reconstructs_initial_state():

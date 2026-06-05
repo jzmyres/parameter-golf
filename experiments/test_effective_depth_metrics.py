@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def test_effective_rank_from_signatures_detects_identical_vs_orthogonal_steps():
-    from train_gpt import _effective_rank_from_signatures
+    from legacy.train_gpt_rich import _effective_rank_from_signatures
 
     identical = torch.ones(4, 8)
     orthogonal = torch.eye(4)
@@ -21,7 +21,7 @@ def test_effective_rank_from_signatures_detects_identical_vs_orthogonal_steps():
 
 
 def test_route_depth_metrics_accept_single_and_multi_slot_layouts():
-    from train_gpt import _route_depth_metrics_from_weight_tracks
+    from legacy.train_gpt_rich import _route_depth_metrics_from_weight_tracks
 
     single_slot = torch.tensor(
         [
@@ -53,7 +53,7 @@ def test_route_depth_metrics_accept_single_and_multi_slot_layouts():
 
 def test_k_sweep_table_includes_layout_agnostic_effective_depth_columns():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = open(os.path.join(repo_root, "train_gpt.py"), "r", encoding="utf-8").read()
+    src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r", encoding="utf-8").read()
 
     for column in (
         "ED_update",
@@ -67,7 +67,7 @@ def test_k_sweep_table_includes_layout_agnostic_effective_depth_columns():
 
 
 def test_eval_forward_populates_effective_depth_probe_on_tiny_model():
-    from train_gpt import GPT, router_diagnostics
+    from legacy.train_gpt_rich import GPT, router_diagnostics
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GPT(
@@ -108,7 +108,7 @@ def test_eval_forward_populates_effective_depth_probe_on_tiny_model():
 
 def test_fp_metrics_are_advisory_not_finite_horizon_failures():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = open(os.path.join(repo_root, "train_gpt.py"), "r", encoding="utf-8").read()
+    src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r", encoding="utf-8").read()
 
     assert "FP ADVISORY" in src
     assert "rho_F=" not in _failure_append_block(src)

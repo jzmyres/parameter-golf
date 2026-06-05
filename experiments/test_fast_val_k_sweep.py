@@ -14,7 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt import Hyperparameters, _CLI_TUNABLE_KNOBS
+from legacy.train_gpt_rich import Hyperparameters, _CLI_TUNABLE_KNOBS
 
 
 class TestFastValKSweep(unittest.TestCase):
@@ -34,7 +34,7 @@ class TestFastValKSweep(unittest.TestCase):
         `fast_k_sweep:` log field. Without this the feature would be
         silently disabled even when the CLI flag is set."""
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+        src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
         # The loop body
         self.assertIn(
             'extra_ks = tuple(int(k) for k in (getattr(args, "fast_val_k_sweep_set", ()) or ()))',
@@ -58,7 +58,7 @@ class TestFastValKSweep(unittest.TestCase):
         must be SKIPPED (already computed by the main fast-val call). The
         skip condition is `k_extra == default_k or k_extra <= 0`."""
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+        src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
         self.assertIn("if k_extra == default_k or k_extra <= 0:", src,
             "fast-val K-sweep must skip default_k and non-positive K values"
         )
@@ -68,7 +68,7 @@ class TestFastValKSweep(unittest.TestCase):
         so an exception during run_validation does not leave the model in a
         wrong-K state for the next training step."""
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+        src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
         # The try block setting the override
         self.assertIn(
             "base_model._deq_k_override = k_extra\n                try:",

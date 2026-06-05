@@ -22,7 +22,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt_m0 import (  # noqa: E402
+from train_gpt import (  # noqa: E402
     Hyperparameters,
     active_expert_fraction,
     effective_rank,
@@ -100,7 +100,7 @@ def test_fit_phi_degenerate_single_point():
 # --- active_expert_fraction (MoE sparsity) --------------------------------
 def test_active_expert_fraction_softmax_is_full():
     # softmax weights are strictly positive -> ~all experts active.
-    from train_gpt_m0 import SwiGLUMoE
+    from train_gpt import SwiGLUMoE
 
     moe = SwiGLUMoE(dim=8, n_experts=4, expert_rank=4, router_type="softmax")
     moe(torch.randn(2, 5, 8))
@@ -114,7 +114,7 @@ def test_active_expert_fraction_route_tensor():
 
 
 def test_active_expert_fraction_relu_in_unit_interval():
-    from train_gpt_m0 import SwiGLUMoE
+    from train_gpt import SwiGLUMoE
 
     moe = SwiGLUMoE(dim=8, n_experts=4, expert_rank=4, router_type="relu")
     moe(torch.randn(2, 5, 8))

@@ -142,7 +142,7 @@ def _scan_file(path: Path, names: tuple[str, ...]) -> list[tuple[int, str, str]]
     "rel_path",
     [
         "reports/opg_doc.tex",
-        "train_gpt.py",
+        "legacy/train_gpt_rich.py",
         "CLAUDE.md",
     ],
 )
@@ -169,11 +169,11 @@ def test_removed_names_absent_from_active_hyperparameters() -> None:
     test handles annotated context), but a `removed_name = ...` line is
     a removal-symmetry P0.
     """
-    src = (REPO_ROOT / "train_gpt.py").read_text(encoding="utf-8")
+    src = (REPO_ROOT / "legacy" / "train_gpt_rich.py").read_text(encoding="utf-8")
     # Find the Hyperparameters class body (heuristic: from `class
     # Hyperparameters` to the next top-level `class ` or `def `).
     m = re.search(r"^class Hyperparameters\b.*?$", src, re.MULTILINE)
-    assert m is not None, "Hyperparameters class not found in train_gpt.py"
+    assert m is not None, "Hyperparameters class not found in legacy/train_gpt_rich.py"
     start = m.end()
     end_m = re.search(r"^(class |def )", src[start:], re.MULTILINE)
     body = src[start: start + (end_m.start() if end_m else len(src) - start)]

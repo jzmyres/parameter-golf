@@ -17,7 +17,7 @@ def _make_model(**overrides):
     # Keep this helper on the base RevDEQ solver. Finite-horizon OPG tests
     # explicitly override `finite_horizon_scale_coef` when they need the new
     # two-endpoint stack.
-    from train_gpt import GPT
+    from legacy.train_gpt_rich import GPT
     defaults = dict(
         vocab_size=1024, num_layers=5, model_dim=640, num_heads=10,
         num_kv_heads=5, mlp_mult=2.5, tie_embeddings=True,
@@ -39,7 +39,7 @@ def _make_model(**overrides):
 
 def test_gpt_constructor_defaults_track_hyperparameters():
     """Production defaults must not drift between Hyperparameters and GPT()."""
-    from train_gpt import GPT, Hyperparameters
+    from legacy.train_gpt_rich import GPT, Hyperparameters
 
     model = GPT(
         vocab_size=64, num_layers=2, model_dim=32, num_heads=4,
@@ -76,7 +76,7 @@ def test_router_state_dict_optional_param_load():
     """Loading a legacy (l2 + sigmoid-gate) checkpoint into a default
     (Dirichlet-UCB + gate-off) router must silently drop the optional keys
     and must not mutate the caller's state_dict."""
-    from train_gpt import SoftDenseRouter
+    from legacy.train_gpt_rich import SoftDenseRouter
 
     dim, E = 32, 4
     legacy = SoftDenseRouter(dim=dim, num_experts=E,
@@ -238,7 +238,7 @@ def test_shared_bypass_gate_diagnostics_are_separate():
     x0 = torch.randn(1, 8, model.tok_emb.embedding_dim, device=dev, dtype=dtype)
     z = torch.randn_like(x0)
 
-    from train_gpt import router_diagnostics
+    from legacy.train_gpt_rich import router_diagnostics
     with torch.no_grad(), router_diagnostics(True, step_tag=17):
         _ = model.shared_block(z, x0)
 
@@ -391,7 +391,7 @@ def test_revdeq_reversibility():
 
     # Reconstruction diagnostic is produced during the RevDEQ backward path and
     # is gated behind router_diagnostics(...) for speed in normal training.
-    from train_gpt import router_diagnostics
+    from legacy.train_gpt_rich import router_diagnostics
     with router_diagnostics(True, step_tag=0):
         if dev.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -431,7 +431,7 @@ def test_revdeq_reconstruction_at_a_bar_floor():
     x = torch.randint(0, 1024, (1, 16), device=dev)
     y = torch.randint(0, 1024, (1, 16), device=dev)
 
-    from train_gpt import router_diagnostics
+    from legacy.train_gpt_rich import router_diagnostics
     with router_diagnostics(True, step_tag=0):
         if dev.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -517,7 +517,7 @@ def test_prescriptions_route_to_invariant_mechanisms_not_per_symptom_losses():
     removed in the rework (e.g. `router_ema_alive_coef_mult`, `weight_decay_mult`
     for routing collapse).
     """
-    from train_gpt import _prescribe_failure_fix
+    from legacy.train_gpt_rich import _prescribe_failure_fix
 
     invariant_keys = {
         "router_bias_update",
@@ -617,7 +617,7 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
     coefficient-first values. This locks Hyperparameters defaults and verifies
     they propagate to a constructed model so signature-default drift is loud.
     """
-    from train_gpt import Hyperparameters
+    from legacy.train_gpt_rich import Hyperparameters
     # Required fields exist.
     for name in (
         "router_ema_balance_coef",
@@ -672,7 +672,7 @@ def test_routing_regularizer_coefficients_match_promoted_defaults():
     for r in model.shared_block.active_routers():
         assert bool(r.use_router_sigmoid_gate) is False
 
-    from train_gpt import _prescribe_failure_fix
+    from legacy.train_gpt_rich import _prescribe_failure_fix
     # Active finite-horizon profile: lip_ub_F is a legacy advisory diagnostic.
     p_lip = _prescribe_failure_fix("lip_ub_F=45.0 >= 1.0")
     assert p_lip["category"] == "operator_norm_advisory"
@@ -697,7 +697,7 @@ def test_eval_microbatch_and_mos_expert_settings_are_dry_but_independent():
     """Validation chunking is configurable, and MoS follows shared expert
     principles without silently copying main DEQ expert counts/ranks.
     """
-    from train_gpt import Hyperparameters
+    from legacy.train_gpt_rich import Hyperparameters
 
     assert int(Hyperparameters.val_micro_batch_seqs) == 48
 
@@ -710,7 +710,7 @@ def test_eval_microbatch_and_mos_expert_settings_are_dry_but_independent():
 
 
 def test_dirichlet_router_confidence_diagnostics_are_populated():
-    from train_gpt import (
+    from legacy.train_gpt_rich import (
         SoftDenseRouter,
         _format_router_confidence_parts,
         _router_confidence_stats,
@@ -755,7 +755,7 @@ def test_dirichlet_router_confidence_diagnostics_are_populated():
 def test_fp_probe_uses_eager_forward_when_instance_forward_is_wrapped():
     """Fast-val Lipschitz probes must bypass the compiled training forward."""
     import torch
-    from train_gpt import _prepare_saved_fp_probe
+    from legacy.train_gpt_rich import _prepare_saved_fp_probe
 
     class DummyBlock(torch.nn.Module):
         def forward(self, z, x0, b_bar):

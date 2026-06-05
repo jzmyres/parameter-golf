@@ -29,7 +29,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from experiments.test_arch import _make_model
-from train_gpt import _rho_F_at_saved_fp, _sigma_max_F_at_saved_fp
+from legacy.train_gpt_rich import _rho_F_at_saved_fp, _sigma_max_F_at_saved_fp
 
 
 def _populate_saved_fp(model):
@@ -119,12 +119,12 @@ def test_rho_F_is_emitted_in_fast_val_alongside_residual():
     advisory terminal-cache/fallback-readiness diagnostic. The lip_ub_*
     operator-norm proxies were removed 2026-05-15 as active gates.
 
-    Static text-search test on train_gpt.py because the fast-val site lives
+    Static text-search test on legacy/train_gpt_rich.py because the fast-val site lives
     deep inside the train loop; we assert the structural invariant rather
     than spinning up a full training run.
     """
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+    src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
 
     # The rho_F probe call must appear in the fast-val block.
     assert "rho_F = _rho_F_at_saved_fp(\n                    base_model," in src, (
@@ -160,7 +160,7 @@ def test_sigma_max_F_is_emitted_in_fast_val_as_diagnostic():
     the robustness/basin-size info rho_F alone does not provide, but NOT
     used as a gate or penalty."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+    src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
     assert "sigma_max_F = _sigma_max_F_at_saved_fp(" in src, (
         "fast-val: sigma_max_F probe call missing — iter168 must restore "
         "the operator-norm diagnostic alongside rho_F."
@@ -175,7 +175,7 @@ def test_sigma_max_F_is_emitted_in_k_sweep_table():
     """iter168 (2026-05-16): K-sweep table must include sigma_max_F as a
     per-K diagnostic column alongside rho_F, fp_residual_F, iter_conv_rel."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+    src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
     assert "(\"sigma_max_F\", 12)" in src, (
         "K-sweep table missing sigma_max_F column — iter168 must include "
         "it in `_kdiag_cols` alongside rho_F."
@@ -193,7 +193,7 @@ def test_sigma_max_F_is_not_used_as_prescription_or_gate():
     Lyapunov-on-F branch was refuted), and must not trigger any post-int
     gate failure prescription."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+    src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
     # Find the _prescribe_failure_fix function body and assert sigma_max_F
     # is not referenced as a triggering metric there.
     import re

@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TRAIN_GPT = ROOT / "train_gpt.py"
+TRAIN_GPT = ROOT / "legacy" / "train_gpt_rich.py"
 UPDATE_RESULTS = ROOT / "experiments" / "update_results.sh"
 OPG_DOC = ROOT / "reports" / "opg_doc.tex"
 P1_SYNTHETIC = ROOT / "experiments" / "p1_synthetic.py"
@@ -396,7 +396,7 @@ class TestTrainingContracts(unittest.TestCase):
         """
         import sys
         sys.path.insert(0, str(ROOT))
-        from train_gpt import (
+        from legacy.train_gpt_rich import (
             ROUTER_DIRICHLET_BETA_TERM,
             ROUTER_DIRICHLET_DIAG_TERMS,
         )

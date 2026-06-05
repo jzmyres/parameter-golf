@@ -37,7 +37,7 @@ SUMMARY_TOP_N = int(os.environ.get("PROFILE_TOP_N", "30"))
 
 import torch
 from torch.profiler import profile, ProfilerActivity, schedule
-import train_gpt  # type: ignore
+import legacy.train_gpt_rich as train_gpt  # type: ignore
 
 # Patch train_gpt.main — wrap its training step with a profiler step boundary.
 # Strategy: use a global profiler handle and call .step() at every train log

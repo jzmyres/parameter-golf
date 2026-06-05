@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt import (
+from legacy.train_gpt_rich import (
     CastedLinear,
     Hyperparameters,
     SDCLIP_K_MATRIX,
@@ -191,12 +191,12 @@ class TestHyperparameterValidator(unittest.TestCase):
 
 class TestQATPropagationToTrainGpt(unittest.TestCase):
     """Negative assertion: ensure the iter20 anti-pattern (stochastic
-    quant-noise injection) does NOT reappear in train_gpt.py — iter161-QAT
+    quant-noise injection) does NOT reappear in legacy/train_gpt_rich.py — iter161-QAT
     is deterministic by design (forward depends only on weight values)."""
 
     def test_no_random_quant_noise_in_train_gpt(self):
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+        src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
         # iter20 used `torch.randn_like(weight) * noise_rate`. The deterministic
         # iter161-QAT must not introduce per-step randomness on weights.
         # Allow the phrase in comments (e.g., docstring referencing iter20).
@@ -211,7 +211,7 @@ class TestQATPropagationToTrainGpt(unittest.TestCase):
 
     def test_fake_quant_ste_is_registered_in_casted_linear(self):
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        src = open(os.path.join(repo_root, "train_gpt.py"), "r").read()
+        src = open(os.path.join(repo_root, "legacy", "train_gpt_rich.py"), "r").read()
         self.assertIn("_FakeQuantInt6SDClipSTE.apply(w", src,
             "CastedLinear.forward must call _FakeQuantInt6SDClipSTE.apply "
             "for the QAT-late training-time effect to fire.")

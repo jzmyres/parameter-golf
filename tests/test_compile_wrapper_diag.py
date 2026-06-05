@@ -15,7 +15,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt import _temporary_deq_k_override, _unwrap_compiled_module  # noqa: E402
+from legacy.train_gpt_rich import _temporary_deq_k_override, _unwrap_compiled_module  # noqa: E402
 
 
 class _TinyModule(nn.Module):

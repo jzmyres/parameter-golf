@@ -13,7 +13,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt import Block  # noqa: E402
+from legacy.train_gpt_rich import Block  # noqa: E402
 
 
 def _fresh_block(dim: int = 32) -> Block:
@@ -124,7 +124,7 @@ class TestLyapunovArchDefaults(unittest.TestCase):
 
     def test_revdeq_default_trains_parcae_parameters(self) -> None:
         """Default RevDEQ path must expose Ā/B̄/Δ parameters to autograd."""
-        from train_gpt import GPT
+        from legacy.train_gpt_rich import GPT
 
         torch.manual_seed(0)
         model = GPT(

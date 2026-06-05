@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _classes():
-    from train_gpt import CausalSelfAttention, MLP, RMSNorm, SoftDenseRouter
+    from legacy.train_gpt_rich import CausalSelfAttention, MLP, RMSNorm, SoftDenseRouter
 
     return SoftDenseRouter, CausalSelfAttention, MLP, RMSNorm
 
@@ -175,7 +175,7 @@ def test_expert_slot_stack_forward_backward_for_4x4_layout():
 
 
 def test_gpt_exposes_explicit_expert_layout_without_stage0_alias_for_multislot():
-    from train_gpt import GPT
+    from legacy.train_gpt_rich import GPT
 
     model = GPT(
         vocab_size=64,

@@ -7,7 +7,7 @@ import torch
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from train_gpt import SoftDenseRouter, router_diagnostics
+from legacy.train_gpt_rich import SoftDenseRouter, router_diagnostics
 
 
 class TestRouterHealthLoss(unittest.TestCase):

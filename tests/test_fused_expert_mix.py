@@ -12,7 +12,7 @@ import torch.nn.functional as F
 class TestIndependentExpertAttention(unittest.TestCase):
     def test_forward_experts_output_shape(self) -> None:
         """forward_experts returns (B, T, E, D) per-expert attention outputs."""
-        from train_gpt import CausalSelfAttention
+        from legacy.train_gpt_rich import CausalSelfAttention
 
         torch.manual_seed(0)
         B, T, D = 2, 5, 16
@@ -37,7 +37,7 @@ class TestIndependentExpertAttention(unittest.TestCase):
 
     def test_forward_experts_gradient_flow(self) -> None:
         """Gradients flow through forward_experts to all expert params."""
-        from train_gpt import CausalSelfAttention
+        from legacy.train_gpt_rich import CausalSelfAttention
 
         torch.manual_seed(0)
         B, T, D = 1, 4, 16
@@ -69,7 +69,7 @@ class TestIndependentExpertAttention(unittest.TestCase):
 
     def test_experts_produce_different_outputs(self) -> None:
         """Different experts should produce different attention outputs."""
-        from train_gpt import CausalSelfAttention
+        from legacy.train_gpt_rich import CausalSelfAttention
 
         torch.manual_seed(42)
         B, T, D = 1, 8, 16
@@ -104,7 +104,7 @@ class TestIndependentExpertAttention(unittest.TestCase):
 
 class TestMLPFusedExpertMix(unittest.TestCase):
     def test_mlp_fused_mix_matches_explicit(self) -> None:
-        from train_gpt import MLP
+        from legacy.train_gpt_rich import MLP
 
         torch.manual_seed(0)
         B, T, D = 2, 7, 16

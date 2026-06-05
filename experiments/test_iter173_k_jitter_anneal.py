@@ -14,7 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt import (
+from legacy.train_gpt_rich import (
     Hyperparameters,
     KShuffleBagSampler,
     _compute_annealed_k_jitter_weights,

@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 class TestLossComponentLogging(unittest.TestCase):
     def test_router_cv_uses_combined_allocation_and_gate_mass(self) -> None:
-        from train_gpt import SoftDenseRouter
+        from legacy.train_gpt_rich import SoftDenseRouter
 
         # `use_router_sigmoid_gate` is default-OFF in the iter146 rescue
         # stack — without it the sigmoid gate is forced to 1.0 and the
@@ -39,7 +39,7 @@ class TestLossComponentLogging(unittest.TestCase):
         self.assertGreater(gated_imbalance, 1e-3)
 
     def test_gpt_exposes_detached_loss_component_tensors(self) -> None:
-        from train_gpt import GPT
+        from legacy.train_gpt_rich import GPT
 
         torch.manual_seed(0)
         # Pass-through test: every coef is passed explicitly so the
@@ -108,7 +108,7 @@ class TestLossComponentLogging(unittest.TestCase):
         self.assertAlmostEqual(float(model._router_reg_loss_t.item()), expected_router_reg, places=4)
 
     def test_deterministic_token_window_start_is_stable_and_bounded(self) -> None:
-        from train_gpt import _deterministic_token_window_start
+        from legacy.train_gpt_rich import _deterministic_token_window_start
 
         first = _deterministic_token_window_start(seed=42, step=8, seqlen=128, max_tokens=64)
         second = _deterministic_token_window_start(seed=42, step=8, seqlen=128, max_tokens=64)

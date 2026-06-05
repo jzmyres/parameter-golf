@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from tests._helpers import mutate_hyperparameters as _mut  # noqa: E402
-from train_gpt import (  # noqa: E402
+from legacy.train_gpt_rich import (  # noqa: E402
     Hyperparameters,
     _OPTIONAL_COMPONENT_CAPABILITIES,
     _OPTIONAL_COMPONENT_FLAGS,

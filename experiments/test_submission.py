@@ -37,7 +37,7 @@ def _build_model():
     than the one actually scored. Iter 96 baseline: full-D LoRA experts
     (no bottleneck rewrite), revdeq backward only.
     """
-    from train_gpt import GPT, Hyperparameters
+    from legacy.train_gpt_rich import GPT, Hyperparameters
     args = Hyperparameters()
     model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
@@ -84,7 +84,7 @@ def _build_model():
 
 def _train_few_steps(model, num_steps=20):
     """Train a few steps so weights are non-trivial."""
-    from train_gpt import Hyperparameters
+    from legacy.train_gpt_rich import Hyperparameters
     args = Hyperparameters()
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     model.train()
@@ -119,7 +119,7 @@ def _quantize_and_compress(model):
     Returns `(blob, sd_cpu)` — `sd_cpu` is the un-quantized template needed
     by the symmetric loader for shape/dtype reconstruction.
     """
-    from train_gpt import encode_scored_artifact
+    from legacy.train_gpt_rich import encode_scored_artifact
     sd_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     result = encode_scored_artifact(sd_cpu)
     return result.compressed, sd_cpu
@@ -132,7 +132,7 @@ def test_encode_scored_artifact_default_path_is_byte_identical_to_save_int6():
     Without this assertion a future codec change could silently desync the
     contract-mirror path from production.
     """
-    from train_gpt import _COMPRESSOR, encode_scored_artifact, save_int6_artifact
+    from legacy.train_gpt_rich import _COMPRESSOR, encode_scored_artifact, save_int6_artifact
     torch.manual_seed(0)
     sd = {
         f"layer{i}.weight": torch.randn(8, 16, dtype=torch.float32)
@@ -154,7 +154,7 @@ def test_encode_scored_artifact_default_path_is_byte_identical_to_save_int6():
 
 def _decompress_and_load(model, quant_blob, sd_cpu):
     """Inverse of _quantize_and_compress; uses the production load helper."""
-    from train_gpt import load_int6_artifact
+    from legacy.train_gpt_rich import load_int6_artifact
     deq_state = load_int6_artifact(quant_blob, sd_cpu)
     model.load_state_dict(deq_state, strict=True)
     return model
@@ -172,7 +172,7 @@ def test_artifact_size():
     quant_bytes = len(quant_blob)
 
     # Code size: read train_gpt.py
-    code_path = os.path.join(os.path.dirname(__file__), "..", "train_gpt.py")
+    code_path = os.path.join(os.path.dirname(__file__), "..", "legacy", "train_gpt_rich.py")
     with open(code_path) as f:
         code_bytes = len(f.read().encode("utf-8"))
 

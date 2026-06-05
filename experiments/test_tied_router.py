@@ -13,7 +13,7 @@ class TestTiedAttnMlpRouter(unittest.TestCase):
         """Constructs GPT against the post-iter146 NTP-only default (`use_ctp=False`).
         The test inspects router fields only — CTP coverage is exercised by
         `experiments/test_arch.py::_make_model` which pins `use_ctp=True`."""
-        from train_gpt import GPT, router_diagnostics
+        from legacy.train_gpt_rich import GPT, router_diagnostics
 
         if not torch.cuda.is_available():
             self.skipTest("CUDA required for this test")

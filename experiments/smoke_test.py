@@ -1,4 +1,4 @@
-"""Smoke test wrapper around `train_gpt.py main()`.
+"""Smoke test wrapper around `legacy/train_gpt_rich.py main()`.
 
 Runs the actual training script with a short-budget config and parses the
 emitted train log for diagnostic trends. The DRY win: any change to the
@@ -38,7 +38,7 @@ def _build_cmd(steps: int, kbwd: int | None, k_fwd: int | None) -> list[str]:
     needs the train-time recon + descent signals."""
     parts = [
         "torchrun", "--standalone", "--nproc_per_node=gpu",
-        "train_gpt.py",
+        "legacy/train_gpt_rich.py",
         f"--iterations={steps}",
         "--val-loss-every=1000000",
     ]
@@ -168,7 +168,7 @@ def smoke_test():
         proc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
 
     if proc.returncode != 0:
-        print(f"FAIL: train_gpt.py exited with code {proc.returncode}")
+        print(f"FAIL: legacy/train_gpt_rich.py exited with code {proc.returncode}")
         # Surface the last few log lines for debugging.
         with open(log_path, "r", encoding="utf-8") as f:
             tail = f.readlines()[-30:]

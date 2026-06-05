@@ -10,7 +10,7 @@ import torch
 
 class TestMoSProjectionLayout(unittest.TestCase):
     def test_project_a_matches_index_explicit_einsum(self) -> None:
-        from train_gpt import MoSHead
+        from legacy.train_gpt_rich import MoSHead
 
         torch.manual_seed(0)
         head = MoSHead(d_model=5, vocab_size=7, rank=3,
@@ -27,7 +27,7 @@ class TestMoSProjectionLayout(unittest.TestCase):
 
 class TestOptimizerCoverage(unittest.TestCase):
     def test_all_trainable_parameters_are_grouped_once(self) -> None:
-        from train_gpt import GPT, _build_optimizer_param_lists, _flatten_param_groups
+        from legacy.train_gpt_rich import GPT, _build_optimizer_param_lists, _flatten_param_groups
 
         model = GPT(
             vocab_size=1024,

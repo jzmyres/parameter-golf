@@ -1,6 +1,6 @@
 import torch
 
-from train_gpt_m0 import Hyperparameters, M0GPT, MLAttention, MoSHead, SwiGLUMoE
+from train_gpt import Hyperparameters, M0GPT, MLAttention, MoSHead, SwiGLUMoE
 
 
 def test_mla_shapes_and_kv_latent():

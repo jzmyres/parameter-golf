@@ -1,6 +1,6 @@
 """Task 7 — M0 LM-scaffold trainer smoke + unit tests.
 
-The smoke test runs ``train_gpt_m0.main`` end-to-end on CPU with tiny dims and a
+The smoke test runs ``train_gpt.main`` end-to-end on CPU with tiny dims and a
 synthetic in-memory shard (no big dataset required) and asserts an int6 artifact
 is written. The unit tests cover the pieces the smoke can't isolate cheaply:
 optimizer param coverage (every trainable param in exactly one group) and the
@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def test_m0_trainer_smoke(tmp_path):
-    from train_gpt_m0 import main
+    from train_gpt import main
 
     main(["--iterations", "3", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
           "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8", "--head-dim", "8",
@@ -26,7 +26,7 @@ def test_m0_trainer_smoke(tmp_path):
 
 
 def _tiny_args():
-    from train_gpt_m0 import Hyperparameters
+    from train_gpt import Hyperparameters
     return Hyperparameters(
         model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=1024,
         n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
@@ -36,7 +36,7 @@ def _tiny_args():
 
 def test_optimizer_param_coverage():
     """Every trainable parameter lands in exactly one optimizer group."""
-    from train_gpt_m0 import M0GPT, build_optimizers
+    from train_gpt import M0GPT, build_optimizers
 
     model = M0GPT(_tiny_args())
     optimizers = build_optimizers(model, matrix_lr=0.02, embed_lr=0.1, scalar_lr=0.02)
@@ -63,7 +63,7 @@ def test_finite_horizon_hinge_loss():
     sg(L_lo): the hinge must not backprop into the shallow pass; only L_hi and
     aux carry gradients into the params besides the hinge's L_hi term.
     """
-    from train_gpt_m0 import M0GPT, finite_horizon_loss
+    from train_gpt import M0GPT, finite_horizon_loss
 
     torch.manual_seed(0)
     model = M0GPT(_tiny_args())

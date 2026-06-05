@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _tiny_gpt(**overrides):
-    from train_gpt import GPT
+    from legacy.train_gpt_rich import GPT
 
     kwargs = dict(
         vocab_size=64,
@@ -101,7 +101,7 @@ def test_gpt_train_time_components_forward_backward():
 def test_gpt_deq_prefix_anchors_are_legacy_rejected():
     # Prefix-anchor consistency is archived as a fixed-point legacy path.
     # Startup validation must reject attempts to re-enable it.
-    from train_gpt import Hyperparameters, _validate_hyperparameters
+    from legacy.train_gpt_rich import Hyperparameters, _validate_hyperparameters
 
     cfg = Hyperparameters()
     cfg.deq_prefix_anchors = True
@@ -115,7 +115,7 @@ def test_use_reverse_kl_balance_output_differs():
     non-uniform EMA state. The reverse-KL path is the iter153 default; the
     forward path remains recoverable via `--use-reverse-kl-balance=0`.
     """
-    from train_gpt import SoftDenseRouter
+    from legacy.train_gpt_rich import SoftDenseRouter
 
     torch.manual_seed(0)
     fwd = SoftDenseRouter(dim=8, num_experts=4, use_reverse_kl_balance=False)
@@ -187,7 +187,7 @@ def test_grouped_artifact_compression_flag_changes_payload_layout():
     # baseline, otherwise the flag is a no-op and the banner misrepresents.
     # The Hyperparameters construction here is the witness the contract test
     # looks for; the codec call below proves the path actually differs.
-    from train_gpt import Hyperparameters, _validate_hyperparameters
+    from legacy.train_gpt_rich import Hyperparameters, _validate_hyperparameters
     from experiments.components.artifact_compression import grouped_compress_int6_payload
 
     cfg = Hyperparameters()

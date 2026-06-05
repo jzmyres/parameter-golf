@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from train_gpt import SoftDenseRouter  # noqa: E402
+from legacy.train_gpt_rich import SoftDenseRouter  # noqa: E402
 
 
 def _broadcast_l2_logits(x_n: torch.Tensor, c: torch.Tensor, gamma: float) -> torch.Tensor:

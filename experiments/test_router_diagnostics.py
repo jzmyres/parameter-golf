@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 class TestRouterDiagnostics(unittest.TestCase):
     def test_soft_dense_router_collects_diagnostics_in_train_when_enabled(self):
-        from train_gpt import SoftDenseRouter, router_diagnostics
+        from legacy.train_gpt_rich import SoftDenseRouter, router_diagnostics
 
         router = SoftDenseRouter(dim=8, num_experts=3)
         router.train(True)
@@ -44,7 +44,7 @@ class TestRouterDiagnostics(unittest.TestCase):
         Constructs GPT against the post-iter146 NTP-only default (`use_ctp=False`);
         CTP coverage is exercised by `experiments/test_arch.py::_make_model`.
         """
-        from train_gpt import GPT, router_diagnostics
+        from legacy.train_gpt_rich import GPT, router_diagnostics
 
         if not torch.cuda.is_available():
             self.skipTest("CUDA required for this test")

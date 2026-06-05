@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 class TestSoftDenseRouterForwardNoSync(unittest.TestCase):
     def test_forward_has_no_item_or_cpu_calls(self) -> None:
-        src = (REPO_ROOT / "train_gpt.py").read_text(encoding="utf-8")
+        src = (REPO_ROOT / "legacy" / "train_gpt_rich.py").read_text(encoding="utf-8")
         tree = ast.parse(src)
 
         forward_fn: ast.FunctionDef | None = None

@@ -22,7 +22,7 @@ class TestDistributedTokenLoader(unittest.TestCase):
         shard_path = os.path.join(tmpdir, "test_train_000000.bin")
         _create_test_shard(shard_path, num_tokens=num_tokens)
         pattern = os.path.join(tmpdir, "test_train_*.bin")
-        from train_gpt import DistributedTokenLoader
+        from legacy.train_gpt_rich import DistributedTokenLoader
         loaders = [
             DistributedTokenLoader(pattern, rank=r, world_size=world_size,
                                    device=torch.device("cpu"))
@@ -75,7 +75,7 @@ class TestDistributedTokenLoader(unittest.TestCase):
             shard_path = os.path.join(tmpdir, "test_warn_000000.bin")
             _create_test_shard(shard_path, num_tokens=4096)
             from pathlib import Path
-            from train_gpt import load_data_shard
+            from legacy.train_gpt_rich import load_data_shard
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 tokens = load_data_shard(Path(shard_path))

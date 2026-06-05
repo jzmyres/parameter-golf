@@ -17,7 +17,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from train_gpt import Hyperparameters, _validate_hyperparameters
+from legacy.train_gpt_rich import Hyperparameters, _validate_hyperparameters
 
 
 class TestFiniteHorizonOPG(unittest.TestCase):
@@ -51,7 +51,7 @@ class TestFiniteHorizonOPG(unittest.TestCase):
             self.assertIn("consistency", msg)
 
     def test_scale_hinge_is_one_sided_and_stops_shallow_gradient(self):
-        from train_gpt import _finite_horizon_scale_hinge
+        from legacy.train_gpt_rich import _finite_horizon_scale_hinge
 
         shallow = torch.tensor(2.0, requires_grad=True)
         deep = torch.tensor(2.3, requires_grad=True)
@@ -69,7 +69,7 @@ class TestFiniteHorizonOPG(unittest.TestCase):
         self.assertEqual(float(improved), 0.0)
 
     def test_paired_depth_metrics_use_same_sequence_losses(self):
-        from train_gpt import _paired_depth_metrics
+        from legacy.train_gpt_rich import _paired_depth_metrics
 
         shallow = torch.tensor([2.0, 1.0, 3.0])
         deep = torch.tensor([1.5, 1.1, 2.0])

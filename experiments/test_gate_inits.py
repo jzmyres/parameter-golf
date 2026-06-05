@@ -7,7 +7,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-from train_gpt import Block
+from legacy.train_gpt_rich import Block
 
 
 class TestGateInits(unittest.TestCase):

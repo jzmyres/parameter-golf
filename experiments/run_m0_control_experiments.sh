@@ -72,7 +72,7 @@ append_summary() {
 for router_type in relu softmax; do
   log="${OUT_DIR}/router_${router_type}.log"
   echo "m0_control_router_start: router_type=${router_type} (matched config) -> ${log}"
-  python train_gpt_m0.py \
+  python train_gpt.py \
     --router-type "${router_type}" \
     --model-dim "${MODEL_DIM}" \
     --n-heads "${N_HEADS}" \
@@ -102,7 +102,7 @@ done
 for r in 1 2 4 8; do
   log="${OUT_DIR}/phi_r${r}.log"
   echo "m0_control_phi_start: r=${r} -> ${log}"
-  python train_gpt_m0.py \
+  python train_gpt.py \
     --k-set "${r}" \
     --k-eval "${r}" \
     --model-dim "${MODEL_DIM}" \
@@ -123,7 +123,7 @@ for r in 1 2 4 8; do
   append_summary "phi" "r=${r}" "${log}"
 done
 # fit_phi consumes the per-r val losses logged above (phi_r{1,2,4,8}.log) to
-# fit the effective-depth exponent phi; see train_gpt_m0 metrics emitters.
+# fit the effective-depth exponent phi; see train_gpt.py metrics emitters.
 
 # ---------------------------------------------------------------------------
 # Experiment 3: MLA kv_latent sweep. Ranks KV-compression latent against
@@ -132,7 +132,7 @@ done
 for kv_latent in ${KV_LATENT_SWEEP}; do
   log="${OUT_DIR}/kv_latent_${kv_latent}.log"
   echo "m0_control_kv_start: kv_latent=${kv_latent} -> ${log}"
-  python train_gpt_m0.py \
+  python train_gpt.py \
     --kv-latent "${kv_latent}" \
     --model-dim "${MODEL_DIM}" \
     --n-heads "${N_HEADS}" \

@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from experiments.plot_metrics import parse_log
-from train_gpt import (
+from legacy.train_gpt_rich import (
     Hyperparameters,
     KShuffleBagSampler,
     _CLI_TUNABLE_KNOBS,
@@ -156,7 +156,7 @@ class TestCliParser(unittest.TestCase):
             })
 
     def test_normalize_k_jitter_weights_validates_explicitly(self):
-        from train_gpt import _normalize_k_jitter_weights
+        from legacy.train_gpt_rich import _normalize_k_jitter_weights
         # values=None
         with self.assertRaises(ValueError):
             _normalize_k_jitter_weights(None, [1.0])
@@ -178,7 +178,7 @@ class TestCliParser(unittest.TestCase):
 
     def test_validate_hyperparameters_rejects_dirichlet_with_entmax(self):
         from types import SimpleNamespace
-        from train_gpt import _validate_hyperparameters
+        from legacy.train_gpt_rich import _validate_hyperparameters
         args = SimpleNamespace(
             model_dim=768, num_heads=8, num_kv_heads=4, num_layers=12,
             num_experts=16, num_shared_experts=1,
@@ -190,7 +190,7 @@ class TestCliParser(unittest.TestCase):
 
     def test_validate_hyperparameters_rejects_nonpositive_lyapunov_knobs(self):
         from types import SimpleNamespace
-        from train_gpt import _validate_hyperparameters
+        from legacy.train_gpt_rich import _validate_hyperparameters
         base = dict(
             model_dim=768, num_heads=8, num_kv_heads=4, num_layers=12,
             num_experts=16, num_shared_experts=1,

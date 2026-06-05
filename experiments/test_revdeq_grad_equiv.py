@@ -7,7 +7,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-from train_gpt import RevDEQFunction  # noqa: E402
+from legacy.train_gpt_rich import RevDEQFunction  # noqa: E402
 
 
 class _FTiny(torch.nn.Module):
