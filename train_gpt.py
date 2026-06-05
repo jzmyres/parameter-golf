@@ -748,12 +748,23 @@ class M0GPT(nn.Module):
         nn.init.zeros_(self.mos_head.gate.bias)
         nn.init.normal_(self.mos_head.ctx.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.mos_head.ctx.bias)
-        # Start the recurrence near-identity: zero the two delta-block output
-        # projections so z_K starts close to x0 (no compounding before training).
+        # Start the recurrence near-identity: zero the two delta-block ATTENTION
+        # output projections so z_K starts close to x0 (no compounding before
+        # training) — this is what keeps the readout stable at init.
         nn.init.zeros_(self.rec.F.attn.o_proj.weight)
         nn.init.zeros_(self.rec.G.attn.o_proj.weight)
-        nn.init.zeros_(self.rec.F.moe.w_out)
-        nn.init.zeros_(self.rec.G.moe.w_out)
+        # Do NOT zero the MoE w_out: a zero w_out makes every expert output 0, so
+        # the router weights multiply a zero and receive ZERO task gradient (the
+        # whole MoE is inert and the router never engages — observed as
+        # bit-identical val_bpb across entropy / load-balance / no-aux variants).
+        # A small non-zero init keeps the init delta tiny (z_K stays near x0, init
+        # NLL ~ ln(vocab)) while giving each expert AND the router a meaningful
+        # gradient from step 0. Reversibility is unaffected (the reverse pass
+        # reconstructs whatever w_out holds; the recurrence inverse is exact for
+        # any deterministic F/G). std matches the small-init convention used for
+        # the embedding / MoS ctx above.
+        nn.init.normal_(self.rec.F.moe.w_out, std=0.02)
+        nn.init.normal_(self.rec.G.moe.w_out, std=0.02)
 
     def forward(self, tokens, targets, depth):
         B, T = tokens.shape
@@ -1269,6 +1280,58 @@ def _collect_load_balance(model):
     return _collect_moe_aux(model, "load_balance_term")
 
 
+def recurrence_displacement(model, tokens, depth) -> list[float]:
+    """Per-step relative recurrence displacement ``||z_{k+1}-z_k|| / ||z_k||``.
+
+    An EFFECTIVE-DEPTH diagnostic: it measures how much the reversible-recurrence
+    midpoint ``z_k = 0.5*(a_k + b_k)`` (already produced by
+    :meth:`ReversibleRecurrence.forward_states`) moves at each depth step.
+
+      * A SUSTAINED (non-decaying) displacement => the recurrence keeps doing
+        work at depth, i.e. high effective depth.
+      * A rapid DECAY to ~0 => the state saturates early and extra depth buys
+        nothing (low effective depth).
+
+    Computed under ``no_grad`` from a single forward over the recurrence's
+    midpoint sequence, seeded as the model does (``a0 = b0 = x0``), so ``z_0`` is
+    the injected input ``x0`` and the returned list has length ``depth`` (one
+    relative displacement per step). The Frobenius norm is taken over the full
+    ``(B, T, D)`` state. ``||z_k||`` is floored by a tiny epsilon so an all-zero
+    state yields ``0.0`` rather than a divide-by-zero. This is a LOG-SITE read
+    (it runs an extra forward and CPU-syncs); never call it in the grad-accum
+    hot loop.
+    """
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            x0 = model.tok_emb(tokens) + model.pos_emb[:, :tokens.shape[1]]
+            # Midpoint sequence: z_0 = x0 (the seed), then one z per depth step.
+            _, states = model.rec.forward_states(x0, x0, x0, depth)
+            seq = [x0, *states]
+            disp = []
+            for k in range(len(seq) - 1):
+                num = float((seq[k + 1] - seq[k]).norm())
+                den = float(seq[k].norm())
+                disp.append(num / max(den, 1e-12))
+    finally:
+        if was_training:
+            model.train()
+    return disp
+
+
+def displacement_tail(disp) -> float:
+    """``disp_tail`` headline: mean per-step displacement over the LAST HALF of
+    the steps. A high tail => the recurrence is still moving deep in the budget
+    (high effective depth); a near-zero tail => early saturation. Returns NaN for
+    an empty list (no forward yet)."""
+    if not disp:
+        return float("nan")
+    half = len(disp) // 2
+    tail = disp[half:]
+    return float(sum(tail) / len(tail))
+
+
 def measured_sparsity(model) -> float:
     """Mean realized routing sparsity over forward-run SwiGLUMoE blocks.
 
@@ -1753,7 +1816,9 @@ def format_metrics_line(metrics: dict) -> str:
     are always emitted; ``R_act`` / ``phi`` only when the caller supplies them
     (control-sweep sites). The collapse-prevention diagnostics ``router_entropy``
     (mean per-token router entropy) and ``expert_util`` (global utilization
-    entropy) are emitted when supplied. The MoE-mechanism diagnostic
+    entropy) are emitted when supplied, as is the effective-depth diagnostic
+    ``disp_tail`` (tail-mean per-step recurrence displacement). The MoE-mechanism
+    diagnostic
     ``active_frac`` is emitted with a ``diag:`` prefix so it is clearly NOT framed
     as a resource metric. Field order is fixed for the parser.
     """
@@ -1767,6 +1832,10 @@ def format_metrics_line(metrics: dict) -> str:
         parts.append(f"router_entropy:{float(metrics['router_entropy']):.4f}")
     if "expert_util" in metrics and metrics["expert_util"] is not None:
         parts.append(f"expert_util:{float(metrics['expert_util']):.4f}")
+    # Effective-depth diagnostic: tail-mean per-step recurrence displacement
+    # (sustained => high effective depth; ~0 => early saturation).
+    if "disp_tail" in metrics and metrics["disp_tail"] is not None:
+        parts.append(f"disp_tail:{float(metrics['disp_tail']):.4f}")
     # OPS/efficiency diagnostics (throughput + VRAM utilization). These are NOT
     # resource-GOAL numbers (the goal is absolute peak_vram / R_act scaling) —
     # the ``ops:`` prefix marks them clearly. tok_per_s = batch_tokens / step
@@ -1834,11 +1903,19 @@ def build_arg_parser():
                    help="ReMoE target active fraction for the relu router; the "
                         "adaptive controller holds sparsity at S*=1-this.")
     # Composable router collapse-prevention auxiliaries (control-experiment
-    # bake-off). All default OFF / 0 so the trainer's behavior is unchanged unless
-    # a knob is set. See SwiGLUMoE / finite_horizon_loss for the term math.
-    p.add_argument("--router-entropy-coef", type=float, default=0.0,
-                   help="Entropy reg weight: loss += -coef*H(router dist), i.e. "
-                        "MAXIMIZE per-token router entropy (spreads expert mass).")
+    # bake-off). Entropy defaults ON at an EFFECTIVE coef (0.1) because it is the
+    # chosen default collapse-preventer: the bake-off's ~0.01-style coef was
+    # effectively zero against the (then-inert) MoE, leaving the softmax router
+    # collapsed to one expert. 0.1 verifiably lifts router entropy well above a
+    # no-aux baseline (see test_router_default_entropy_coef_is_effective) while
+    # staying a CLI knob (set 0 to disable). Load-balance defaults OFF so the two
+    # regularizers are not stacked by default (decouple antagonistic objectives).
+    # See SwiGLUMoE / finite_horizon_loss for the term math.
+    p.add_argument("--router-entropy-coef", type=float, default=0.1,
+                   help="Entropy reg weight (default 0.1, ON): loss += -coef*H "
+                        "(router dist), i.e. MAXIMIZE per-token router entropy "
+                        "(spreads expert mass; prevents single-expert collapse). "
+                        "Set 0 to disable.")
     p.add_argument("--router-loadbalance-coef", type=float, default=0.0,
                    help="Switch-Transformer load-balance weight: "
                         "loss += coef*E*sum_e f_e*P_e (equalizes expert usage).")
@@ -2104,6 +2181,11 @@ def main(argv=None):
                 m = collect_metrics(base_model, model_args)
                 m["tok_per_s"] = float(batch_tokens) / step_wall
                 m["vram_util_pct"] = vram_util_pct(device)
+                # Effective-depth diagnostic: per-step recurrence displacement
+                # over the last micro-batch at the deep budget; headline is the
+                # tail mean (sustained displacement => high effective depth).
+                m["disp_tail"] = displacement_tail(
+                    recurrence_displacement(base_model, x, k_hi))
                 print0(format_metrics_line(m))
 
         if args.val_every > 0 and (step + 1) % args.val_every == 0:

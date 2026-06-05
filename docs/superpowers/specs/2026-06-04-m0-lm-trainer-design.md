@@ -59,10 +59,19 @@ RevFFN's no-floor design). `F_θ`/`G_θ` are pre-norm blocks: **MLA attention + 
   the only objective is keeping experts **alive + diverse** (expressiveness / effective depth).
   A *fixed* L1 penalty on ReLU routing weights monotonically drives every weight to zero
   (`active_frac → 0`, MoE switched OFF — the collapse bug a 100-step GPU smoke surfaced), so we
-  EMPIRICALLY compare three principled, **composable** fixes — each an independent CLI knob,
-  **default OFF / 0** (so the no-fix fixed-L1 run is the control). All three are differentiable
+  EMPIRICALLY compare three principled, **composable** fixes — each an independent CLI knob.
+  **Entropy defaults ON at an effective coef (`--router-entropy-coef=0.1`)** as the chosen
+  collapse-preventer; load-balance and the ReMoE controller **default OFF** (not stacked by default;
+  the no-aux run remains an explicit ablation). All three are differentiable
   **router-only** regularizers (they recompute the routing map on the saved block input and train
   the router); the forward routing is unchanged → reversibility unaffected.
+  **Non-inert MoE init (root cause of the router no-op).** The per-expert output projection
+  `moe.w_out` is **small-non-zero initialized** (std 0.02); only the attention `o_proj` is
+  zero-initialized (readout-stability near-identity start). A zero `w_out` makes every expert output
+  0, so the router weights multiply a zero and receive **zero task gradient** AND the aux gradient is
+  starved — the MoE is inert and the entropy / load-balance auxiliaries become no-ops (observed as
+  *bit-identical* val_bpb across entropy / load-balance / no-aux variants). With the non-inert init,
+  the router and `w_in` receive a finite task gradient from step 0.
   1. **Entropy regularization** (`--router-entropy-coef`, standard; MAXIMIZE): loss `+= −coef·H(p)`,
      `H(p) = −Σ_e p_e log p_e` mean-token entropy of the router dist (softmax weights, or relu
      weights renormalized to a distribution; zero-mass tokens skipped). Higher H ⇒ more uniform use.
@@ -84,6 +93,12 @@ RevFFN's no-floor design). `F_θ`/`G_θ` are pre-norm blocks: **MLA attention + 
 
   Bake-off diagnostics logged on the `metrics:` line: `router_entropy` (mean per-token router
   entropy), `expert_util` (global expert-utilization entropy), and `diag:active_frac`.
+- **Effective-depth diagnostic (`disp_tail`).** The `metrics:` line also logs `disp_tail`, the
+  tail-mean (over the last half of the depth steps) of the per-step relative recurrence displacement
+  `‖z_{k+1}−z_k‖ / ‖z_k‖` (`z_k = 0.5·(a_k+b_k)` is the reversible midpoint from `forward_states`).
+  Sustained displacement ⇒ the recurrence keeps doing work at depth (high effective depth); rapid
+  decay to ≈0 ⇒ early saturation. Computed under `no_grad` at the log site (`recurrence_displacement`
+  / `displacement_tail`), never in the grad-accum hot loop.
 - **Low-rank everywhere it pays:** experts, MLP, MLA Q/KV, MoS components are low-rank with
   rank set per-matrix on the **erank** frontier (Roy & Vetterli 2007; ARSVD). Small matrices
   (norms, gates, **router**, the tiny vocab=1024 embedding) stay full-rank.

@@ -241,3 +241,118 @@ def test_save_int6_artifact_has_no_budget_gate():
     compressed, _qsd, _meta = save_int6_artifact(model.state_dict())
     assert isinstance(compressed, (bytes, bytearray))
     assert len(compressed) > 0
+
+
+# --- recurrence_displacement (effective-depth signal) ---------------------
+class _ConstUpdateRec(torch.nn.Module):
+    """Toy recurrence whose per-step midpoint moves by a CONSTANT vector.
+
+    ``forward_states`` is the only surface ``recurrence_displacement`` uses. Here
+    each step adds a fixed ``delta`` to both streams, so ``z_k = x0 + k*delta``
+    grows linearly; the absolute step is constant but the RELATIVE displacement
+    ``||z_{k+1}-z_k|| / ||z_k||`` DECAYS as ``z`` grows. To get a *constant*
+    relative displacement we instead scale the update by the current state.
+    """
+
+    def __init__(self, d):
+        super().__init__()
+        self.d = d
+
+    def forward_states(self, a, b, x0, depth):
+        states = []
+        for _ in range(int(depth)):
+            # Multiplicative (geometric) growth -> constant RELATIVE displacement.
+            a = a + 0.5 * a
+            b = b + 0.5 * b
+            states.append(0.5 * (a + b))
+        return (a, b), states
+
+
+class _ContractRec(torch.nn.Module):
+    """Toy recurrence that saturates: each step adds a geometrically SHRINKING
+    update, so the midpoint converges and the relative displacement DECAYS."""
+
+    def __init__(self, d):
+        super().__init__()
+        self.d = d
+
+    def forward_states(self, a, b, x0, depth):
+        states = []
+        step = torch.ones_like(a)
+        for _ in range(int(depth)):
+            step = 0.3 * step           # geometrically shrinking update
+            a = a + step
+            b = b + step
+            states.append(0.5 * (a + b))
+        return (a, b), states
+
+
+class _ToyModel(torch.nn.Module):
+    """Minimal model exposing the (tok_emb, pos_emb, rec) surface that
+    ``recurrence_displacement`` reads, wrapping a toy recurrence."""
+
+    def __init__(self, rec, vocab=8, d=4, max_seq_len=16):
+        super().__init__()
+        self.tok_emb = torch.nn.Embedding(vocab, d)
+        self.pos_emb = torch.nn.Parameter(torch.zeros(1, max_seq_len, d))
+        self.rec = rec
+        torch.nn.init.ones_(self.tok_emb.weight)  # nonzero x0 so ||z_0|| > 0
+
+
+def test_recurrence_displacement_constant_update_is_flat():
+    """A geometric (constant-relative-step) recurrence yields a flat per-step
+    relative displacement: ``||z_{k+1}-z_k|| / ||z_k||`` is constant across k."""
+    from train_gpt import recurrence_displacement
+
+    m = _ToyModel(_ConstUpdateRec(4))
+    tokens = torch.zeros(2, 5, dtype=torch.long)
+    disp = recurrence_displacement(m, tokens, depth=6)
+    assert len(disp) == 6
+    # All steps share (nearly) the same relative displacement (= 0.5 here).
+    assert max(disp) - min(disp) < 1e-4, disp
+    assert abs(disp[0] - 0.5) < 1e-4, disp
+
+
+def test_recurrence_displacement_contracting_decays():
+    """A saturating recurrence (shrinking updates) yields a DECAYING per-step
+    relative displacement — the recurrence stops doing work (low effective depth)."""
+    from train_gpt import recurrence_displacement
+
+    m = _ToyModel(_ContractRec(4))
+    tokens = torch.zeros(2, 5, dtype=torch.long)
+    disp = recurrence_displacement(m, tokens, depth=6)
+    assert len(disp) == 6
+    # Strictly decaying displacement (each step moves less than the previous).
+    for k in range(1, len(disp)):
+        assert disp[k] < disp[k - 1], disp
+    assert disp[-1] < disp[0] * 0.5, disp
+
+
+def test_recurrence_displacement_runs_on_real_m0gpt():
+    """Smoke on a real M0GPT: returns ``depth`` finite non-negative floats."""
+    from train_gpt import Hyperparameters, M0GPT, recurrence_displacement
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=16, n_experts=4,
+        expert_rank=4, n_mix=2, kv_latent=4, head_dim=8, max_seq_len=16,
+    )
+    m = M0GPT(args)
+    tokens = torch.randint(0, 16, (2, 5))
+    disp = recurrence_displacement(m, tokens, depth=4)
+    assert len(disp) == 4
+    assert all(isinstance(v, float) and v == v and v >= 0.0 for v in disp)
+
+
+def test_displacement_tail_summary_helper():
+    """``displacement_tail`` summarizes the per-step displacement as the mean over
+    the last half of the steps (the ``disp_tail`` effective-depth headline)."""
+    from train_gpt import displacement_tail
+
+    # Flat list -> tail mean equals the flat value.
+    assert abs(displacement_tail([0.5, 0.5, 0.5, 0.5]) - 0.5) < 1e-9
+    # Decaying list -> tail mean is the mean of the LAST half.
+    vals = [1.0, 0.5, 0.25, 0.125]
+    assert abs(displacement_tail(vals) - (0.25 + 0.125) / 2) < 1e-9
+    # Empty -> NaN (no forward yet).
+    assert displacement_tail([]) != displacement_tail([])

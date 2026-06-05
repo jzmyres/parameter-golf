@@ -695,12 +695,16 @@ def test_target_active_frac_gates_adaptive_controller():
     # Enabled.
     a1 = p.parse_args(["--router-type", "relu", "--router-target-active-frac", "0.4"])
     assert a1.router_target_active_frac == 0.4
-    # New aux coef knobs default OFF.
-    assert a0.router_entropy_coef == 0.0
+    # Entropy aux defaults ON at an effective coef (chosen collapse-preventer);
+    # load-balance defaults OFF (not stacked by default). Both remain CLI knobs.
+    assert a0.router_entropy_coef == 0.1
     assert a0.router_loadbalance_coef == 0.0
     a2 = p.parse_args(["--router-entropy-coef", "0.01", "--router-loadbalance-coef", "0.02"])
     assert a2.router_entropy_coef == 0.01
     assert a2.router_loadbalance_coef == 0.02
+    # Entropy aux is still disablable via the CLI knob.
+    a3 = p.parse_args(["--router-entropy-coef", "0.0"])
+    assert a3.router_entropy_coef == 0.0
 
 
 def test_entropy_aux_keeps_relu_moe_alive_no_collapse():
@@ -792,9 +796,11 @@ def test_format_metrics_line_emits_router_entropy_and_expert_util():
     line = format_metrics_line({
         "erank": 1.0, "peak_vram": 0.0, "kv_bytes": 8, "params": 10,
         "active_frac": 0.5, "router_entropy": 1.234, "expert_util": 2.5,
+        "disp_tail": 0.42,
     })
     assert "router_entropy:1.2340" in line
     assert "expert_util:2.5000" in line
+    assert "disp_tail:0.4200" in line
     assert "diag:active_frac:0.5000" in line
 
 
@@ -906,6 +912,189 @@ def test_m0_trainer_smoke_emits_throughput_and_util(tmp_path, capsys):
     d = parse_log(str(log_path))
     assert any(v > 0.0 for v in d["tok_per_s"] if v == v), d["tok_per_s"]
     assert all((v == 0.0 or v != v) for v in d["vram_util_pct"]), d["vram_util_pct"]
+
+
+# ---------------------------------------------------------------------------
+# Bug fixes: router auxes must TRAIN the router (was a no-op) + non-inert MoE
+# ---------------------------------------------------------------------------
+def _train_m0_for_router(entropy_coef=0.0, loadbalance_coef=0.0, steps=60,
+                         seed=0, vocab=64, n_experts=8):
+    """Train a tiny softmax-router M0GPT and return (mean_router_entropy,
+    mean_util_entropy) at the end. Shared driver so the entropy / load-balance
+    regression tests differ only in the single coef under test."""
+    from train_gpt import (
+        Hyperparameters, M0GPT, finite_horizon_loss, SwiGLUMoE,
+        _global_util_entropy,
+    )
+
+    torch.manual_seed(seed)
+    args = Hyperparameters(
+        model_dim=24, n_heads=2, n_kv_heads=1, vocab_size=vocab,
+        n_experts=n_experts, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16, router_type="softmax",
+    )
+    model = M0GPT(args)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    gen = torch.Generator().manual_seed(seed + 1)
+    for _ in range(steps):
+        x = torch.randint(0, vocab, (2, 8), generator=gen)
+        y = torch.randint(0, vocab, (2, 8), generator=gen)
+        opt.zero_grad(set_to_none=True)
+        loss, _ = finite_horizon_loss(
+            model, x, y, k_hi=4, k_lo=2, lambda_h=0.0, margin=0.0,
+            lambda_route=0.0, use_load_balance=False,
+            entropy_coef=entropy_coef, loadbalance_coef=loadbalance_coef)
+        loss.backward()
+        opt.step()
+    moes = [m for m in model.modules()
+            if isinstance(m, SwiGLUMoE) and m.last_route is not None]
+    h = sum(float(m.router_entropy().detach()) for m in moes) / len(moes)
+    util = sum(_global_util_entropy(m.last_route) for m in moes) / len(moes)
+    return h, util
+
+
+def test_router_and_w_in_receive_task_gradient_at_init():
+    """DECISIVE root-cause guard. With ``w_out`` zero-initialized the MoE output
+    is identically 0, so the task loss gradient to the router weights AND to
+    ``w_in`` is EXACTLY zero at init: the router never engages and the bake-off's
+    variants were bit-identical. After the non-inert init, both must receive a
+    finite, non-zero task gradient from step 0 (no aux term involved).
+    """
+    from train_gpt import (
+        Hyperparameters, M0GPT, finite_horizon_loss, SwiGLUMoE,
+    )
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=24, n_heads=2, n_kv_heads=1, vocab_size=64, n_experts=8,
+        expert_rank=8, n_mix=2, kv_latent=8, head_dim=8, max_seq_len=16,
+        router_type="softmax",
+    )
+    m = M0GPT(args)
+    x = torch.randint(0, 64, (2, 8))
+    y = torch.randint(0, 64, (2, 8))
+    m.zero_grad(set_to_none=True)
+    # Pure task loss — NO router aux (entropy/load-balance/L1 all off).
+    loss, _ = finite_horizon_loss(
+        m, x, y, k_hi=4, k_lo=2, lambda_h=0.0, margin=0.0, lambda_route=0.0,
+        use_load_balance=False, entropy_coef=0.0, loadbalance_coef=0.0)
+    loss.backward()
+    for mod in m.modules():
+        if isinstance(mod, SwiGLUMoE):
+            assert mod.router.weight.grad is not None
+            assert float(mod.router.weight.grad.norm()) > 0.0, (
+                "router gets ZERO task gradient at init — MoE output is dead "
+                "(zero-w_out regression)")
+            assert float(mod.w_in.grad.norm()) > 0.0, (
+                "w_in gets ZERO task gradient at init — experts are dead "
+                "(zero-w_out regression)")
+
+
+def test_entropy_aux_is_not_a_no_op_decisive_end_to_end():
+    """DECISIVE regression guard the bake-off lacked: a real M0GPT trained WITH a
+    large entropy coef must end with MEASURABLY HIGHER router entropy than the
+    SAME-SEED run WITHOUT it.
+
+    Root cause this guards: the MoE ``w_out`` was zero-initialized, so every
+    expert output was 0; the router weights multiplied a zero, so the router
+    received ZERO task gradient AND the tiny entropy-aux gradient rounded away in
+    practice. Three router variants (entropy / load-balance / no-aux) were then
+    BIT-IDENTICAL because the router never moved. With the non-inert init the
+    entropy aux actually spreads routing mass — assert the gap is real.
+    """
+    h_with, _ = _train_m0_for_router(entropy_coef=0.1)
+    h_without, _ = _train_m0_for_router(entropy_coef=0.0)
+    margin = 0.3
+    assert h_with > h_without + margin, (
+        f"entropy aux is a NO-OP: with={h_with:.4f} without={h_without:.4f} "
+        f"(gap {h_with - h_without:.4f} <= margin {margin}); the aux gradient is "
+        "not reaching the router weights (regression of the zero-w_out / detach bug)"
+    )
+
+
+def test_loadbalance_aux_changes_expert_utilization():
+    """A load-balance run must change realized expert utilization vs no-aux
+    (same seed). The Switch term equalizes per-expert mass, so global utilization
+    entropy rises measurably — proof the load-balance aux trains the router."""
+    _, util_with = _train_m0_for_router(loadbalance_coef=1.0)
+    _, util_without = _train_m0_for_router(loadbalance_coef=0.0)
+    assert util_with > util_without + 0.15, (
+        f"load-balance aux did not change utilization: with={util_with:.4f} "
+        f"without={util_without:.4f}"
+    )
+
+
+def test_router_default_entropy_coef_is_effective():
+    """The DEFAULT --router-entropy-coef must be a value that actually prevents
+    collapse (the bake-off's 0.01-style default was effectively zero). Assert the
+    parser default is > 0 and, run through the loss at that default, lifts router
+    entropy clearly above a no-aux baseline."""
+    from train_gpt import build_arg_parser
+
+    default = build_arg_parser().parse_args([]).router_entropy_coef
+    assert default > 0.0, f"default entropy coef {default} is OFF (collapse risk)"
+    h_default, _ = _train_m0_for_router(entropy_coef=default)
+    h_off, _ = _train_m0_for_router(entropy_coef=0.0)
+    assert h_default > h_off + 0.3, (
+        f"default entropy coef {default} is not effective: "
+        f"default-run entropy {h_default:.4f} vs off {h_off:.4f}"
+    )
+
+
+def test_moe_is_non_inert_n_experts_changes_loss():
+    """The MoE must DO WORK: two models differing ONLY in ``n_experts`` (with the
+    SAME seed) must reach DIFFERENT losses after a few steps. If ``w_out`` were
+    zero-initialized the MoE output is identically 0 and ``n_experts`` is inert —
+    both models would track the same attention-only trajectory and collide.
+    """
+    from train_gpt import Hyperparameters, M0GPT
+
+    def _final_loss(n_experts):
+        torch.manual_seed(0)
+        args = Hyperparameters(
+            model_dim=32, n_heads=2, n_kv_heads=1, vocab_size=64,
+            n_experts=n_experts, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+            max_seq_len=16, router_type="softmax",
+        )
+        model = M0GPT(args)
+        opt = torch.optim.Adam(model.parameters(), lr=5e-3)
+        gen = torch.Generator().manual_seed(1)
+        x = torch.randint(0, 64, (4, 16), generator=gen)
+        y = x.clone()
+        for _ in range(20):
+            opt.zero_grad(set_to_none=True)
+            loss = model(x, y, depth=4)
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            return float(model(x, y, depth=4))
+
+    l2 = _final_loss(n_experts=2)
+    l8 = _final_loss(n_experts=8)
+    assert abs(l2 - l8) > 1e-3, (
+        f"MoE is INERT: n_experts=2 -> {l2:.5f}, n_experts=8 -> {l8:.5f} "
+        f"(|diff|={abs(l2 - l8):.2e}); experts are not contributing to the output "
+        "(regression of the zero-w_out init)"
+    )
+
+
+def test_moe_w_out_init_is_non_zero():
+    """Unit guard: ``M0GPT`` must NOT zero-init the MoE ``w_out`` (that made each
+    expert output 0 and the whole MoE inert). The attention ``o_proj`` stays
+    near-zero for readout stability, but the experts must start with a small
+    non-zero contribution so they receive meaningful gradient from step 0."""
+    from train_gpt import Hyperparameters, M0GPT
+
+    args = Hyperparameters(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=32,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16,
+    )
+    m = M0GPT(args)
+    for blk in (m.rec.F, m.rec.G):
+        assert blk.moe.w_out.abs().sum() > 0.0, "MoE w_out is zero-initialized (inert)"
+        # Attention o_proj remains zero (readout-stability near-identity start).
+        assert blk.attn.o_proj.weight.abs().sum() == 0.0
 
 
 if __name__ == "__main__":

@@ -132,10 +132,18 @@ activation memory; \S\ref{sec:metrics}), so dense routing is acceptable and the 
 keep experts \emph{alive and diverse} (expressiveness / effective depth).  A \emph{fixed} \(L_1\)
 penalty on ReLU routing weights monotonically drives every weight to zero
 (\(\code{\detokenize{active_frac}}\to0\), the MoE switched off), so we compare three principled,
-\emph{composable} collapse-prevention auxiliaries, each an independent CLI knob defaulting to off so
-the no-auxiliary fixed-\(L_1\) run is the control.  All three are differentiable router-only
-regularizers (they train the router on the saved block input); the forward routing map is unchanged,
-so reversibility is unaffected.
+\emph{composable} collapse-prevention auxiliaries, each an independent CLI knob.  Entropy
+regularization defaults \emph{on} at an effective coefficient (\(c_H=0.1\)) as the chosen
+collapse-preventer; load-balance and the ReMoE controller default off so the two regularizers are not
+stacked and the no-auxiliary run remains an explicit ablation.  All three are differentiable
+router-only regularizers (they train the router on the saved block input); the forward routing map is
+unchanged, so reversibility is unaffected.  The auxiliaries reach the router only because the experts
+are \emph{not} inert: the per-expert output projection \(W^{\rm out}_e\) is small-non-zero
+initialized (the attention output projection alone is zero-initialized for readout stability), so each
+expert contributes a small non-zero delta from step zero and both the experts and the router receive a
+non-zero task gradient.  A zero-initialized \(W^{\rm out}_e\) would zero every expert output, so the
+router weights would multiply a zero and receive \emph{no} task gradient --- the MoE would be inert
+and the entropy / load-balance auxiliaries would be no-ops.
 \begin{enumerate}
 \item \emph{Entropy regularization} (standard; maximize): the loss \emph{subtracts}
   \(c_H\,H(p)\) where \(H(p)=-\sum_e p_e\log p_e\) is the mean-token entropy of the router
@@ -165,6 +173,11 @@ so reversibility is unaffected.
 Diagnostics logged for the bake-off: per-token router entropy
 (\(\code{\detokenize{router_entropy}}\)), global expert-utilization entropy
 (\(\code{\detokenize{expert_util}}\)), and \(\code{\detokenize{diag:active_frac}}\).
+An effective-depth diagnostic \(\code{\detokenize{disp_tail}}\) is also logged: the tail-mean over the
+last half of the depth steps of the per-step relative recurrence displacement
+\(\lVert z_{k+1}-z_k\rVert/\lVert z_k\rVert\) (with \(z_k=\tfrac12(a_k+b_k)\) the reversible midpoint).
+A sustained (non-decaying) displacement signals the recurrence keeps doing work at depth (high
+effective depth); a rapid decay to \(\approx0\) signals early saturation.
 The trained model can still fail; the point is that the architecture composes
 shared low-rank experts per step into high \emph{effective} depth.  Nestedness across depth is a
 property of the additive-coupling recurrence and budget selection, not of a halting gate.
