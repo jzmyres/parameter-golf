@@ -29,6 +29,7 @@ Sections:
 # 1. Imports
 # ---------------------------------------------------------------------------
 import argparse
+import contextlib
 import glob
 import io
 import math
@@ -49,6 +50,33 @@ try:
     _COMPRESSOR = "zstd"
 except ImportError:  # pragma: no cover - zstd is the prod path
     _COMPRESSOR = "zlib"
+
+
+@contextlib.contextmanager
+def paired_rng(device):
+    """Snapshot the CPU (+ CUDA, when ``device`` is CUDA) RNG and yield a
+    ``reset()`` that re-applies the snapshot; restore it on exit.
+
+    Used to hold the recurrence-init noise CONSTANT across repeated
+    ``M0GPT.forward`` calls when ``--init-state random`` (which draws fresh
+    ``torch.randn_like`` per call): the finite-horizon shallow/deep passes and
+    each depth K of the ``--k-eval-sweep`` reset to the same snapshot so noise
+    is shared and the comparison is paired. The save/restore is a host-side
+    generator copy (no device sync); a no-op effect for ``--init-state x0``,
+    which draws no noise.
+    """
+    cpu_rng = torch.random.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+
+    def reset():
+        torch.random.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state(cuda_rng, device)
+
+    try:
+        yield reset
+    finally:
+        reset()
 
 # ---------------------------------------------------------------------------
 # 2. Normalization
@@ -177,6 +205,13 @@ class ReversibleRecurrence(nn.Module):
         every parameter (including ``step_emb.weight`` when ``step_conditioning``
         is on) are explicit ``apply`` inputs (custom-autograd-input rule).
         """
+        # Guard half-specified seeds: a0/b0 select the seed mode together
+        # (both None => x0 seed; both given => explicit/random seed). A single
+        # one given is ambiguous (which mode? what is the missing leg?), so it
+        # is rejected rather than silently filled — see grad-equivalence: the
+        # seed-grad term is kept iff seed_is_x0, and seed_is_x0 reads BOTH legs.
+        if (a0 is None) != (b0 is None):
+            raise ValueError("a0 and b0 must both be provided or both be None")
         seed_is_x0 = a0 is None and b0 is None
         if seed_is_x0:
             a0 = b0 = x0
@@ -952,6 +987,17 @@ class Hyperparameters:
     #   init_state_std: std of the random a_0/b_0 when init_state="random".
     init_state_std: float = 0.02
 
+    def __post_init__(self):
+        # Validate the recurrence-seed mode OUTSIDE the CLI (the CLI also
+        # constrains --init-state via choices, but the config is the single
+        # source of truth and is constructed directly in tests / p1_synthetic).
+        # M0GPT.forward branches on this exact string, so an unknown value would
+        # silently fall through to the x0 seed; reject it with a clear error.
+        if self.init_state not in ("x0", "random"):
+            raise ValueError(
+                f"init_state must be 'x0' or 'random', got {self.init_state!r}"
+            )
+
 
 class _DeltaSubBlock(nn.Module):
     """One pre-norm attention + MoE *delta* sub-block (a single F/G stage).
@@ -1412,6 +1458,38 @@ class DistributedTokenLoader:
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 
+class _ReplayLoader:
+    """Replays a FIXED list of ``(x, y)`` batches for a PAIRED eval sweep.
+
+    The real :class:`DistributedTokenLoader` consumes a STATEFUL stream
+    (``stream.take``), so each ``next_batch`` call advances the data position.
+    For the ``--k-eval-sweep`` depth-gain MEASUREMENT we must hold the
+    evaluation data CONSTANT across depths K (otherwise ``G_T = bpb[Kmin] -
+    bpb[Kmax]`` conflates depth with sample variance). This loader caches the
+    batches once and replays them in order for each K, so depth is the only
+    variable. It exposes the SAME ``next_batch(global_tokens, seq_len,
+    grad_accum_steps)`` signature as :class:`DistributedTokenLoader` so
+    :func:`run_validation` consumes it unchanged (DRY — no signature change).
+
+    ``run_validation`` calls ``next_batch`` exactly ``n_batches`` times per
+    sweep entry; build a fresh instance per K so each K starts from batch 0.
+    The cached tensors already live on the eval device.
+    """
+
+    def __init__(self, batches):
+        self.batches = list(batches)
+        self.i = 0
+
+    def next_batch(self, global_tokens, seq_len, grad_accum_steps):
+        # Signature parity with DistributedTokenLoader (args ignored: the cached
+        # batches were materialized with the SAME shape at cache time).
+        if not self.batches:
+            raise RuntimeError("_ReplayLoader has no cached batches to replay")
+        x, y = self.batches[self.i % len(self.batches)]
+        self.i += 1
+        return x, y
+
+
 # ---------------------------------------------------------------------------
 # 13. BPB evaluation (tokenizer-agnostic bits-per-byte)
 # ---------------------------------------------------------------------------
@@ -1805,9 +1883,23 @@ def finite_horizon_loss(model, x, y, k_hi, k_lo, lambda_h, margin, lambda_route,
         ``loadbalance_coef >= 0`` to equalize per-expert usage.
 
     Returns ``(loss, parts)`` exposing the components for testing/logging.
+
+    Same-start depth comparison (``--init-state random``): ``M0GPT.forward``
+    draws fresh ``torch.randn_like`` recurrence-init noise per call, so the two
+    passes would otherwise start from DIFFERENT noise and the no-degradation
+    hinge would compare different starts. We capture the RNG state once and
+    RESET it before each pass so both draw the SAME init noise -> the hinge
+    compares depth budgets ``k_lo`` vs ``k_hi`` from an IDENTICAL start (a clean
+    no-signature-change fix; a no-op for ``--init-state x0``, which draws none).
     """
-    l_lo = model(x, y, k_lo).detach()  # stop-grad shallow pass
-    l_hi = model(x, y, k_hi)           # deep pass: runs last so aux reflects it
+    # Share the random init noise across the shallow/deep passes: reset the RNG
+    # before each so both draw the SAME torch.randn_like seed (paired_rng is a
+    # host-side generator copy, no device sync; a no-op for --init-state x0).
+    with paired_rng(next(model.parameters()).device) as reset_rng:
+        reset_rng()
+        l_lo = model(x, y, k_lo).detach()  # stop-grad shallow pass
+        reset_rng()
+        l_hi = model(x, y, k_hi)           # deep pass: runs last so aux reflects it
     hinge = torch.relu(l_hi - l_lo + margin)
     loss = l_hi + lambda_h * hinge
 
@@ -1977,7 +2069,14 @@ def fit_phi(losses: dict) -> float:
     fewer than two distinct depths there is no slope to estimate, so ``phi`` is
     defined as ``0.0``.
     """
-    pts = sorted((int(r), float(v)) for r, v in losses.items() if int(r) > 0)
+    # Drop non-finite points (a single diverged depth K -> NaN loss would
+    # otherwise NaN-poison the whole OLS slope and silently break phi_eval).
+    # With <2 finite distinct depths there is no slope to estimate -> phi = 0.0.
+    pts = sorted(
+        (int(r), float(v))
+        for r, v in losses.items()
+        if int(r) > 0 and math.isfinite(float(v))
+    )
     if len(pts) < 2:
         return 0.0
     xs = [math.log(r) for r, _ in pts]
@@ -2678,27 +2777,50 @@ def main(argv=None):
         autocast_enabled=autocast_enabled)
     print0(f"final val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
 
-    # --- depth-gain MEASUREMENT (--k-eval-sweep): end-of-run, rank-0 only ---
+    # --- depth-gain MEASUREMENT (--k-eval-sweep): end-of-run, PAIRED across K ---
     # Evaluate the trained model at each requested recurrent depth K and report
     # the depth-gain G_T = bpb[min K] - bpb[max K] (positive => deeper recurrence
     # helps) plus an eval-K phi proxy. This confirms whether depth buys anything
-    # (the looped/UT failure mode is G_T -> 0). It runs OUTSIDE the hot loop (no
-    # micro-loop syncs); run_validation already all-reduces across ranks.
+    # (the looped/UT failure mode is G_T -> 0).
+    #
+    # The sweep is PAIRED so depth K is the ONLY variable: (a) the eval batches
+    # are materialized ONCE and replayed for every K (run_validation otherwise
+    # consumes a STATEFUL stream, scoring each K on DIFFERENT samples), and
+    # (b) the RNG state is captured once and RESET before each K, so under
+    # --init-state random every K draws the SAME recurrence-init noise (forward
+    # otherwise draws fresh torch.randn_like per call). Without both, G_T / phi
+    # conflate depth with sample + seed variance and the instrument is biased.
+    #
+    # All ranks run this symmetrically (run_validation all-reduces); each rank
+    # caches its OWN shard and resets its OWN RNG. The loop is OUTSIDE any
+    # `if master:` guard (only print0 is rank-0) so the collectives never hang.
     if args.k_eval_sweep:
-        sweep_ks = _parse_int_set(args.k_eval_sweep)
+        # Dedup K preserving order so a repeated K is not scored twice.
+        sweep_ks = tuple(dict.fromkeys(_parse_int_set(args.k_eval_sweep)))
         if not sweep_ks:
             raise ValueError("--k-eval-sweep must contain at least one depth")
+        # (a) Materialize this rank's eval batches once (the SAME data for all K).
+        cached = [
+            val_loader.next_batch(batch_tokens, args.seq_len, grad_accum_steps)
+            for _ in range(args.eval_batches)
+        ]
+        # (b) Reset the RNG before each K so the random init noise (if any) is
+        # identical across depths -> a clean paired pass; paired_rng restores
+        # the snapshot on exit so the downstream artifact-save is unaffected.
         sweep_loss = {}
         sweep_bpb = {}
-        for k in sweep_ks:
-            k_loss, k_bpb = run_validation(
-                base_model, val_loader, depth=k, n_batches=args.eval_batches,
-                seq_len=args.seq_len, global_tokens=batch_tokens,
-                grad_accum_steps=grad_accum_steps, device=device, luts=luts,
-                autocast_enabled=autocast_enabled)
-            sweep_loss[k] = k_loss
-            sweep_bpb[k] = k_bpb
-            print0(f"depth_sweep: K={k} val_bpb:{k_bpb:.4f} val_loss:{k_loss:.4f}")
+        with paired_rng(device) as reset_rng:
+            for k in sweep_ks:
+                reset_rng()
+                replay = _ReplayLoader(cached)  # fresh -> starts from batch 0
+                k_loss, k_bpb = run_validation(
+                    base_model, replay, depth=k, n_batches=args.eval_batches,
+                    seq_len=args.seq_len, global_tokens=batch_tokens,
+                    grad_accum_steps=grad_accum_steps, device=device, luts=luts,
+                    autocast_enabled=autocast_enabled)
+                sweep_loss[k] = k_loss
+                sweep_bpb[k] = k_bpb
+                print0(f"depth_sweep: K={k} val_bpb:{k_bpb:.4f} val_loss:{k_loss:.4f}")
         # Depth-gain over the swept budgets: bpb at the SHALLOWEST minus bpb at
         # the DEEPEST (positive => depth helps). On the synthetic smoke (no
         # tokenizer) bpb is NaN, so G_T is NaN there; the loss path still ran.

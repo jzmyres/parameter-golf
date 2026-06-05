@@ -155,6 +155,45 @@ def test_random_init_changes_trajectory_vs_x0():
     assert not torch.allclose(z_x0, z_rand)
 
 
+def test_step_conditioning_and_random_init_compose_backward():
+    """HARD COMBINED GATE: step_conditioning=True AND random (a0, b0) != x0 must
+    compose cleanly through the custom backward.
+
+    The two features touch different parts of the backward: random init DROPS the
+    x0 seed-grad term (gx0 += ga + gb), while step_conditioning ADDS the
+    step_emb.weight gradient via the live e_k on each rebuilt step. Both must
+    hold at once: reversible backward == ordinary autograd (atol 1e-6), and
+    step_emb.weight.grad is nonzero. This is the M0GPT(init_state="random",
+    step_conditioning=True) backward path."""
+    torch.manual_seed(0)
+    d = 16
+    rec = _clock_rec(d, max_step=8)  # has a step_emb clock
+    x0 = torch.randn(2, 4, d, dtype=torch.float64, requires_grad=True)
+    a0 = 0.02 * torch.randn(2, 4, d, dtype=torch.float64)  # non-learnable seed
+    b0 = 0.02 * torch.randn(2, 4, d, dtype=torch.float64)
+    assert not torch.allclose(a0, x0) and not torch.allclose(b0, x0)
+    # Reference: ordinary autograd through forward_states with the random seed +
+    # the clock (forward_states applies e_k internally).
+    (aK, bK), _ = rec.forward_states(a0, b0, x0, depth=4)
+    (0.5 * (aK + bK)).pow(2).sum().backward()
+    ref_g = {n: p.grad.clone() for n, p in rec.named_parameters()}
+    ref_x0 = x0.grad.clone()
+    assert "step_emb.weight" in ref_g and ref_g["step_emb.weight"].abs().sum() > 0
+    for p in rec.parameters():
+        p.grad = None
+    # O(1) custom-autograd path with the SAME random seed + clock.
+    x0b = x0.detach().clone().requires_grad_(True)
+    rec.run_reversible(x0b, depth=4, a0=a0, b0=b0).pow(2).sum().backward()
+    max_diff = 0.0
+    for n, p in rec.named_parameters():
+        max_diff = max(max_diff, (p.grad - ref_g[n]).abs().max().item())
+        assert torch.allclose(p.grad, ref_g[n], atol=1e-6), n
+    # step_emb.weight MUST carry a real (nonzero) gradient through the combined path.
+    assert rec.step_emb.weight.grad.abs().sum() > 0
+    max_diff = max(max_diff, (x0b.grad - ref_x0).abs().max().item())
+    assert torch.allclose(x0b.grad, ref_x0, atol=1e-6), f"x0 grad max_diff={max_diff}"
+
+
 def test_x0_init_byte_identical_to_explicit_x0_seed():
     """Default run_reversible(x0) (a0=b0 implicit x0) is byte-identical to passing
     a0=b0=x0 explicitly — proves the new explicit-seed path keeps the x0 seed

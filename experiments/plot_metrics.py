@@ -90,6 +90,10 @@ COMP_LINESTYLES = {
 COMP_SCATTER_SIZE = 72
 
 _FLOAT = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+# NaN-tolerant float: the depth-gain sweep emits `nan` on the synthetic smoke
+# (no tokenizer -> bpb is NaN). Matches a normal float OR a [+-]nan/inf token,
+# which `float()` parses directly.
+_FLOAT_NAN = r"([-+]?(?:\d*\.?\d+(?:[eE][-+]?\d+)?|nan|inf))"
 
 
 def parse_log(logpath: str) -> dict:
@@ -167,6 +171,17 @@ def parse_log(logpath: str) -> dict:
         "final_status": {},
         "k_sweep": [],
         "k_sweep_table": [],
+        # M0 depth-gain MEASUREMENT (--k-eval-sweep), emitted as standalone
+        # end-of-run scalar lines (NOT part of the `metrics:` line):
+        #   depth_sweep: K=<int> val_bpb:<f> val_loss:<f>   (one per swept K)
+        #   depth_gain_GT:<f>                               (bpb[minK]-bpb[maxK])
+        #   phi_eval:<f>                                    (eval-depth phi proxy)
+        # `depth_sweep` is a {K: (val_bpb, val_loss)} map; GT/phi are scalars.
+        # Synthetic smoke emits `nan` (no tokenizer), so the float pattern below
+        # is NaN-tolerant.
+        "depth_sweep": {},
+        "depth_gain_GT": None,
+        "phi_eval": None,
         # M0 two-goal metrics (`metrics:` log line). Resource: active_frac,
         # kv_bytes, params (+ R_act when the control sweep supplies it).
         # Expressiveness: erank (+ phi when the control sweep supplies it).
@@ -377,6 +392,25 @@ def parse_log(logpath: str) -> dict:
                     k, v = tok.split(":", 1)
                     kvs[k.strip()] = v.strip()
             data["final_status"] = kvs
+
+        # M0 depth-gain MEASUREMENT (--k-eval-sweep): standalone end-of-run
+        # scalar lines (NOT part of the `metrics:` line). NaN-tolerant floats
+        # (synthetic smoke emits `nan`). depth_sweep -> {K: (val_bpb, val_loss)};
+        # depth_gain_GT / phi_eval -> run-level scalars.
+        m = re.search(
+            rf"^depth_sweep:\s*K=(\d+)\s+val_bpb:{_FLOAT_NAN}\s+val_loss:{_FLOAT_NAN}",
+            line)
+        if m:
+            data["depth_sweep"][int(m.group(1))] = (
+                float(m.group(2)), float(m.group(3)))
+
+        m = re.search(rf"^depth_gain_GT:{_FLOAT_NAN}", line)
+        if m:
+            data["depth_gain_GT"] = float(m.group(1))
+
+        m = re.search(rf"^phi_eval:{_FLOAT_NAN}", line)
+        if m:
+            data["phi_eval"] = float(m.group(1))
 
         # M0 lightweight train-step line (`step:N/M k_hi:K train_loss:L`, no
         # train_time/step_avg, so the legacy train-step regex above does NOT

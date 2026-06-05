@@ -249,6 +249,59 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["R_act"][1], 2.5)
         self.assertEqual(d["phi"][1], 0.8)
 
+    def test_parse_depth_gain_sweep_lines(self):
+        """The end-of-run depth-gain MEASUREMENT lines (--k-eval-sweep) parse as
+        standalone scalars: depth_sweep -> {K: (val_bpb, val_loss)} map,
+        depth_gain_GT / phi_eval -> run-level scalars. NaN-tolerant (synthetic
+        smoke emits `nan` for bpb)."""
+        log = "\n".join(
+            [
+                "train_batch_tokens:8 train_seq_len:16 iterations:2 warmup_steps:0 max_wallclock_seconds:0.000",
+                "final val_loss:2.5000 val_bpb:1.4000",
+                "depth_sweep: K=8 val_bpb:1.4500 val_loss:2.5500",
+                "depth_sweep: K=16 val_bpb:1.4200 val_loss:2.5200",
+                "depth_sweep: K=64 val_bpb:1.4000 val_loss:2.5000",
+                "depth_gain_GT:0.0500",
+                "phi_eval:0.3300",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        self.assertEqual(set(d["depth_sweep"].keys()), {8, 16, 64})
+        self.assertEqual(d["depth_sweep"][8], (1.45, 2.55))
+        self.assertEqual(d["depth_sweep"][64], (1.40, 2.50))
+        self.assertEqual(d["depth_gain_GT"], 0.05)
+        self.assertEqual(d["phi_eval"], 0.33)
+
+    def test_parse_depth_gain_sweep_nan_tolerant(self):
+        """On the synthetic smoke (no tokenizer) bpb is `nan`; the parser must
+        not choke and must store NaN for bpb / depth_gain_GT while keeping the
+        finite val_loss column."""
+        log = "\n".join(
+            [
+                "train_batch_tokens:8 train_seq_len:16 iterations:2 warmup_steps:0 max_wallclock_seconds:0.000",
+                "depth_sweep: K=2 val_bpb:nan val_loss:3.4500",
+                "depth_sweep: K=4 val_bpb:nan val_loss:3.4000",
+                "depth_gain_GT:nan",
+                "phi_eval:0.0000",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        self.assertEqual(set(d["depth_sweep"].keys()), {2, 4})
+        self.assertTrue(math.isnan(d["depth_sweep"][2][0]))
+        self.assertEqual(d["depth_sweep"][2][1], 3.45)
+        self.assertTrue(math.isnan(d["depth_gain_GT"]))
+        self.assertEqual(d["phi_eval"], 0.0)
+
     def test_plot_comparison_smoke_with_auxiliary_terms(self):
         train_line = (
             "step:10/20 train_loss:3.2 ntp_loss:2.1 ctp_loss:1.1 grad_norm:0.9 "

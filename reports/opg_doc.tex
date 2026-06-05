@@ -234,6 +234,15 @@ Hard \(\mathrm{NaN}/\mathrm{Inf}\) guards and a light boundedness penalty,
 \]
 are stability guards, not fixed-point losses.
 
+\emph{Implementation note (same-start hinge under random init).}  When
+\code{--init-state random} is active, \code{M0GPT.forward} draws a fresh random
+recurrence seed \((a_0,b_0)\) per call.  The \code{train\_gpt.py} finite-horizon
+path therefore captures and \emph{resets} the RNG before each of the two passes
+\(L_T(K_{\rm lo})\) and \(L_T(K_{\rm hi})\), so both start from the \emph{same}
+seed noise and the no-degradation hinge compares depth budgets \(K_{\rm lo}\) vs
+\(K_{\rm hi}\) from an identical start (a controlled same-start depth comparison;
+a no-op for \code{--init-state x0}, which draws no noise).
+
 \emph{Implementation note (Tier-1 harness).}  The executable Tier-1 harness
 (\code{experiments/p1\_synthetic.py}) currently optimizes only the
 \(L_T(K_{\rm hi})\) cross-entropy term; it does \emph{not} yet apply the
@@ -311,9 +320,17 @@ affords full BPTT and is the memory advantage being tested.
 A tied recurrence can collapse to a fixed point---effective depth \(\varphi\to 0\), depth-gain
 \(G_T\to 0\)---so the \code{M0} trainer first \emph{measures} whether depth buys anything before
 trusting internal depth metrics.  The \code{--k-eval-sweep} flag evaluates one trained model at each
-recurrent depth \(K\) after the final validation (rank-0, end-of-run only) and emits
-\(G_T=\bpb(K_{\min})-\bpb(K_{\max})\) (positive when deeper recurrence helps) plus an eval-depth
-\(\varphi\) proxy fitted over the \(\{K:\text{loss}(K)\}\) map.  When collapse is detected, the
+recurrent depth \(K\) after the final validation (rank-0 prints; all ranks run the loop because the
+validation all-reduces) and emits \(G_T=\bpb(K_{\min})-\bpb(K_{\max})\) (positive when deeper
+recurrence helps) plus an eval-depth \(\varphi\) proxy fitted over the \(\{K:\text{loss}(K)\}\) map.
+The sweep is \emph{paired so depth \(K\) is the only variable}: the evaluation batches are
+materialized once and replayed for every \(K\) (the streaming loader would otherwise score each \(K\)
+on different samples), and the RNG state is captured once and reset before each \(K\) so that under
+\code{--init-state random} every \(K\) draws the same recurrence-seed noise.  Without both, \(G_T\)
+and the \(\varphi\) proxy conflate depth with sample and seed variance; with both, the depth-gain is
+a reproducible controlled measurement on fixed weights, and the captured RNG is restored afterward so
+the artifact-save path is unaffected.  The \(\varphi\) fit drops non-finite depths so a single
+diverged \(K\) cannot \(\mathrm{NaN}\)-poison the proxy.  When collapse is detected, the
 simplest principled fix---tested first per Occam---is Huginn-style \emph{random state
 initialization}~\cite{huginn} (\code{--init-state random}): the recurrence is seeded with small
 random non-learnable \(a_0,b_0\) independent of the injected token state \(x_0\) (the default
