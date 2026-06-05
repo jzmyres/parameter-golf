@@ -43,11 +43,12 @@ AUX_LOSS_FIELDS: tuple[str, ...] = (
 # are sparse (control-sweep only) and parse to NaN on a plain per-step line.
 M0_METRICS_FIELDS: tuple[str, ...] = (
     "erank",          # expressiveness: effective rank (spectral entropy)
-    "active_frac",    # resource: mean active-expert fraction (MoE sparsity)
+    "peak_vram",      # resource (PRIMARY): peak VRAM MiB (memory-efficiency)
     "kv_bytes",       # resource: MLA KV-cache bytes per token
     "params",         # resource: trainable parameter count
-    "R_act",          # resource: activation-memory scaling (control sweep)
+    "R_act",          # resource (headline): activation-memory scaling (sweep)
     "phi",            # expressiveness: recurrence-equivalence exponent (sweep)
+    "active_frac",    # MoE MECHANISM diagnostic (emitted as diag:active_frac)
 )
 
 # Consistent colors: blue for Baseline, orange for Current

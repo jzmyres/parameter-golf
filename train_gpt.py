@@ -49,10 +49,6 @@ try:
 except ImportError:  # pragma: no cover - zstd is the prod path
     _COMPRESSOR = "zlib"
 
-# 16 MB hard artifact budget (Parameter Golf challenge constraint).
-MAX_ARTIFACT_BYTES = 16_000_000
-
-
 # ---------------------------------------------------------------------------
 # 2. Normalization
 # ---------------------------------------------------------------------------
@@ -1187,8 +1183,10 @@ def adamw_params(model, optimizers):
 # only at log/eval sites). They are the primitives the control-experiment runner
 # (Task 9) composes into the recurrence-equivalence exponent ``phi`` over the
 # loop count ``r`` and the activation-memory scaling ``R_act`` over the recurrent
-# budget ``K``; here we also log the cheap per-step subset (``erank`` /
-# ``active_frac`` / ``kv_bytes`` / ``params``).
+# budget ``K``; here we also log the cheap per-step subset — the RESOURCE goal
+# (memory-efficiency: ``peak_vram`` primary, plus ``kv_bytes`` / ``params``) and
+# the expressiveness ``erank``. ``active_frac`` stays as a MoE-mechanism
+# diagnostic (``diag:active_frac``), no longer framed as a resource-goal metric.
 def effective_rank(matrix_or_singular_values) -> float:
     """Effective (numerical) rank via spectral entropy — Roy & Vetterli (2007).
 
@@ -1297,15 +1295,102 @@ def kv_bytes_per_token(args: Hyperparameters) -> int:
     return int(floats * 2)  # bf16 = 2 bytes/element
 
 
-def collect_metrics(model, args: Hyperparameters) -> dict:
-    """Assemble the cheap per-step two-goal metrics for the ``metrics:`` log line.
+def _fit_slope(xs, ys):
+    """Ordinary-least-squares ``(slope, intercept)`` for ``ys = slope*xs + b``.
 
-    Reads ``active_frac`` / ``erank`` from the LAST forward's routing weights and
-    output-embedding spectrum (so call after a forward), ``kv_bytes`` from the
-    static head config, and ``params`` from the model. ``R_act`` and ``phi`` are
-    NOT computed here — they require the multi-K / multi-r control sweep (Task 9)
-    — but the log emitter accepts them when a caller supplies them. Returns a
-    plain ``dict[str, float|int]`` (CPU scalars; do not call in the hot loop).
+    Pure, deterministic, CPU-only (closed-form normal equations) so the slope
+    math for :func:`vram_vs_batch_scaling` is unit-testable without a GPU. With
+    fewer than two *distinct* ``xs`` the slope is undetermined, so we return
+    ``(0.0, mean(ys))`` (a flat fit through the data centroid). Returns Python
+    ``float``\\ s.
+    """
+    xs = [float(x) for x in xs]
+    ys = [float(y) for y in ys]
+    n = len(xs)
+    if n == 0:
+        return 0.0, 0.0
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0.0:  # all xs identical -> no slope; flat fit at the y-centroid
+        return 0.0, float(my)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    slope = sxy / sxx
+    intercept = my - slope * mx
+    return float(slope), float(intercept)
+
+
+def peak_vram_mb(device=None) -> float:
+    """Peak CUDA memory allocated since the last reset, in MiB.
+
+    Reads ``torch.cuda.max_memory_allocated`` (the activation+weights high-water
+    mark) and converts to MiB. Returns ``0.0`` when CUDA is unavailable so CPU
+    log/test sites stay crash-free. This is the headline RESOURCE-goal number
+    (memory-efficiency); a flat curve in recurrent depth K and batch size is the
+    reversibility win we are after.
+    """
+    if not torch.cuda.is_available():
+        return 0.0
+    return float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0)
+
+
+def vram_vs_batch_scaling(model, args: Hyperparameters, batch_sizes, device) -> dict:
+    """Peak-VRAM-vs-batch-size scaling for the RESOURCE goal (flat == good).
+
+    For each batch size, resets the CUDA peak-memory counter, runs ONE
+    train-style forward+backward step (so activation memory is exercised), and
+    records ``torch.cuda.max_memory_allocated``. The returned dict carries the
+    raw curve plus an OLS fit::
+
+        {available, batch_sizes, peak_vram_mb, slope_mb_per_sample, intercept_mb}
+
+    A LOW/FLAT ``slope_mb_per_sample`` is the memory-efficiency goal: reversible
+    recurrence makes activation memory ~constant in K, and ideally sub-linear in
+    batch. When CUDA is unavailable the helper returns ``{available: False}`` (no
+    crash) — the pure slope math lives in :func:`_fit_slope`, which the CPU tests
+    exercise on injected synthetic ``(batch, vram)`` points.
+    """
+    if not torch.cuda.is_available() or device is None or torch.device(device).type != "cuda":
+        return {"available": False}
+    model = model.to(device)
+    sizes, peaks = [], []
+    max_T = getattr(args, "max_seq_len", None) or getattr(args, "seq_len", 16)
+    T = min(getattr(args, "seq_len", max_T), max_T)
+    k_set = getattr(args, "k_set", None)
+    depth = int(k_set[0]) if k_set else 1
+    for bs in batch_sizes:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+        tokens = torch.randint(0, args.vocab_size, (bs, T), device=device)
+        targets = torch.randint(0, args.vocab_size, (bs, T), device=device)
+        model.zero_grad(set_to_none=True)
+        loss = model(tokens, targets, depth)
+        loss.backward()
+        sizes.append(int(bs))
+        peaks.append(peak_vram_mb(device))
+    slope, intercept = _fit_slope(sizes, peaks)
+    return {
+        "available": True,
+        "batch_sizes": sizes,
+        "peak_vram_mb": peaks,
+        "slope_mb_per_sample": slope,
+        "intercept_mb": intercept,
+    }
+
+
+def collect_metrics(model, args: Hyperparameters) -> dict:
+    """Assemble the cheap per-step metrics for the ``metrics:`` log line.
+
+    RESOURCE goal (memory-efficiency): ``peak_vram`` is the headline number, with
+    ``R_act`` (activation-memory ~constant in recurrent depth K) supplied by the
+    control sweep; ``kv_bytes`` (MLA KV-cache footprint) and ``params`` round out
+    the static footprint. ``active_frac`` is kept as a MoE *mechanism* diagnostic
+    (logged under the ``diag:`` prefix), NOT a resource-goal metric. ``erank`` is
+    the expressiveness signal. Reads ``active_frac`` / ``erank`` from the LAST
+    forward's routing weights and embedding spectrum (so call after a forward).
+    ``R_act`` and ``phi`` come from the multi-K / multi-r control sweep (Task 9);
+    the log emitter accepts them when a caller supplies them. Returns a plain
+    ``dict[str, float|int]`` (CPU scalars; do not call in the hot loop).
     """
     inner = model.module if hasattr(model, "module") else model
     routes = [active_expert_fraction(m) for m in inner.modules()
@@ -1313,23 +1398,26 @@ def collect_metrics(model, args: Hyperparameters) -> dict:
     active_frac = float(sum(routes) / len(routes)) if routes else float("nan")
     erank = effective_rank(inner.tok_emb.weight)
     return {
-        "active_frac": active_frac,
         "erank": erank,
+        "peak_vram": peak_vram_mb(),
         "kv_bytes": kv_bytes_per_token(args),
         "params": int(sum(p.numel() for p in inner.parameters())),
+        "active_frac": active_frac,  # MoE mechanism diagnostic (not resource goal)
     }
 
 
 def format_metrics_line(metrics: dict) -> str:
     """Render the ``metrics:`` log line consumed by ``plot_metrics.parse_log``.
 
-    Emits ``erank`` / ``active_frac`` / ``kv_bytes`` / ``params`` always, and
-    ``R_act`` / ``phi`` only when the caller provides them (control-sweep sites),
-    so a plain per-step call stays compact. Field order is fixed for the parser.
+    RESOURCE-goal fields (``erank`` / ``peak_vram`` / ``kv_bytes`` / ``params``)
+    are always emitted; ``R_act`` / ``phi`` only when the caller supplies them
+    (control-sweep sites). The MoE-mechanism diagnostic ``active_frac`` is
+    emitted with a ``diag:`` prefix so it is clearly NOT framed as a resource
+    metric. Field order is fixed for the parser.
     """
     parts = [
         f"erank:{metrics['erank']:.4f}",
-        f"active_frac:{metrics['active_frac']:.4f}",
+        f"peak_vram:{float(metrics.get('peak_vram', 0.0)):.4f}",
         f"kv_bytes:{int(metrics['kv_bytes'])}",
         f"params:{int(metrics['params'])}",
     ]
@@ -1337,6 +1425,8 @@ def format_metrics_line(metrics: dict) -> str:
         parts.append(f"R_act:{float(metrics['R_act']):.4f}")
     if "phi" in metrics and metrics["phi"] is not None:
         parts.append(f"phi:{float(metrics['phi']):.4f}")
+    if "active_frac" in metrics and metrics["active_frac"] is not None:
+        parts.append(f"diag:active_frac:{float(metrics['active_frac']):.4f}")
     return "metrics: " + " ".join(parts)
 
 
@@ -1408,7 +1498,9 @@ def main(argv=None):
     DDP-aware (reads ``RANK``/``WORLD_SIZE``/``LOCAL_RANK`` from the env under
     ``torchrun``; single-process otherwise). Returns the rank-0 ``val_bpb`` (or
     ``nan`` for the synthetic smoke). The int6 artifact is written by rank 0 to
-    ``--artifact-out``, with the 16 MB budget enforced.
+    ``--artifact-out`` and its size is logged as ``artifact_bytes`` for
+    information only (no size gate — the RESOURCE goal is memory-efficiency,
+    tracked by ``peak_vram_mb``).
     """
     args = build_arg_parser().parse_args(argv)
 
@@ -1533,6 +1625,10 @@ def main(argv=None):
             opt.zero_grad(set_to_none=True)
 
     # --- training loop (DDP grad-accum, finite-horizon hinge) ---
+    # Reset the CUDA peak-memory counter so the end-of-run ``peak_vram_mb`` (the
+    # RESOURCE-goal headline) reflects the training high-water mark, not setup.
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
     model.train()
     for step in range(args.iterations):
         # Sample one deep budget per step (shared across ranks for sync grads).
@@ -1598,32 +1694,28 @@ def main(argv=None):
         autocast_enabled=autocast_enabled)
     print0(f"final val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
 
-    # --- int6 artifact (rank 0), with 16 MB budget check ---
-    # Budget violation is broadcast from rank 0 so EVERY rank raises collectively
-    # (avoids the deadlock where master raises but workers block on the barrier).
-    violated = torch.zeros((), device=device)
-    artifact_bytes = 0
+    # --- peak VRAM (RESOURCE-goal headline; memory-efficiency, no gate) ---
+    # Integer MiB to match the existing ``peak_vram_mb:<int>`` log contract that
+    # baselines/train_gpt_comparable_sweep.py and the legacy emitter use.
+    if torch.cuda.is_available():
+        print0(f"peak_vram_mb:{int(peak_vram_mb(device))}")
+
+    # --- int6 artifact (rank 0) ---
+    # No 16 MB gate: the RESOURCE goal is memory-efficiency, so artifact bytes is
+    # logged as an INFORMATIONAL number only (no raise, no all-rank broadcast).
     if master:
         state_dict = base_model.state_dict()
         compressed, _, _ = save_int6_artifact(state_dict)
         artifact_bytes = len(compressed)
-        print0(f"artifact_bytes:{artifact_bytes} compressor:{_COMPRESSOR} "
-               f"budget:{MAX_ARTIFACT_BYTES}")
-        if artifact_bytes > MAX_ARTIFACT_BYTES:
-            violated.fill_(1.0)
-        else:
-            out_path = Path(args.artifact_out)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(out_path, "wb") as f:
-                f.write(compressed)
-            print0(f"artifact_written:{out_path}")
+        print0(f"artifact_bytes:{artifact_bytes} compressor:{_COMPRESSOR}")
+        out_path = Path(args.artifact_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(compressed)
+        print0(f"artifact_written:{out_path}")
     if distributed:
-        dist.broadcast(violated, src=0)
         dist.barrier()
         dist.destroy_process_group()
-    if float(violated.item()) > 0.5:
-        raise RuntimeError(
-            f"int6 artifact {artifact_bytes} bytes exceeds {MAX_ARTIFACT_BYTES} budget")
     return val_bpb
 
 

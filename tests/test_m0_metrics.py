@@ -28,6 +28,8 @@ from train_gpt import (  # noqa: E402
     effective_rank,
     fit_phi,
     kv_bytes_per_token,
+    _fit_slope,
+    vram_vs_batch_scaling,
 )
 
 
@@ -146,3 +148,96 @@ def test_kv_bytes_per_token_scales_with_latent():
         max_seq_len=16,
     )
     assert kv_bytes_per_token(big) > kv_bytes_per_token(base)
+
+
+# --- _fit_slope (OLS slope/intercept for VRAM-vs-batch scaling) ------------
+def test_fit_slope_proportional():
+    # ys = 10 * xs (zero intercept) -> slope == 10, intercept == 0.
+    slope, intercept = _fit_slope([1, 2, 4, 8], [10, 20, 40, 80])
+    assert abs(slope - 10.0) < 1e-9
+    assert abs(intercept - 0.0) < 1e-9
+
+
+def test_fit_slope_flat_is_zero_slope():
+    # Constant ys (memory-efficiency / flat scaling goal) -> slope == 0.
+    slope, intercept = _fit_slope([1, 2, 4, 8], [10, 10, 10, 10])
+    assert abs(slope - 0.0) < 1e-9
+    assert abs(intercept - 10.0) < 1e-9
+
+
+def test_fit_slope_affine_with_intercept():
+    # ys = 3 * xs + 5 -> slope == 3, intercept == 5.
+    slope, intercept = _fit_slope([0, 1, 2, 3], [5, 8, 11, 14])
+    assert abs(slope - 3.0) < 1e-9
+    assert abs(intercept - 5.0) < 1e-9
+
+
+def test_fit_slope_degenerate_single_point():
+    # Fewer than two distinct xs -> no slope -> (0.0, mean(ys)).
+    slope, intercept = _fit_slope([4], [7])
+    assert slope == 0.0
+    assert abs(intercept - 7.0) < 1e-9
+    slope, intercept = _fit_slope([2, 2, 2], [3, 5, 7])
+    assert slope == 0.0
+    assert abs(intercept - 5.0) < 1e-9
+
+
+def test_fit_slope_returns_floats():
+    slope, intercept = _fit_slope([1, 2], [1, 2])
+    assert isinstance(slope, float)
+    assert isinstance(intercept, float)
+
+
+# --- vram_vs_batch_scaling (CPU: available=False, slope-fit exercisable) ----
+def test_vram_vs_batch_scaling_cpu_unavailable():
+    # On CPU (no CUDA) the helper must NOT crash; it reports unavailability so
+    # the caller can still exercise the pure slope-fit on injected points.
+    import torch
+
+    args = Hyperparameters(
+        model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=1024,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16,
+    )
+    out = vram_vs_batch_scaling(model=None, args=args, batch_sizes=[1, 2],
+                                device=torch.device("cpu"))
+    assert out["available"] is False
+
+
+def test_vram_vs_batch_scaling_slope_fit_on_synthetic_points():
+    # The slope math used by vram_vs_batch_scaling is _fit_slope; verify it on
+    # known (batch, vram) points so the CPU test covers the fit logic a real GPU
+    # run would feed it. Flat VRAM across batch -> slope ~ 0 (reversibility win).
+    slope_flat, _ = _fit_slope([1, 2, 4, 8], [4000.0, 4000.0, 4000.0, 4000.0])
+    assert abs(slope_flat) < 1e-6
+    # Linear growth -> positive slope == per-sample MB.
+    slope_lin, intercept_lin = _fit_slope([1, 2, 4, 8], [100.0, 200.0, 400.0, 800.0])
+    assert abs(slope_lin - 100.0) < 1e-6
+    assert abs(intercept_lin) < 1e-6
+
+
+# --- artifact save no longer hard-gates on 16 MB --------------------------
+def test_save_int6_artifact_has_no_budget_gate():
+    """The resource goal is memory-efficiency, not an artifact-size gate.
+
+    ``save_int6_artifact`` must just quantize+serialize+compress and return the
+    bytes; there is no ``MAX_ARTIFACT_BYTES`` raise in the M0 save path. We
+    assert (a) the symbol is gone from the module and (b) saving a model never
+    raises regardless of size.
+    """
+    import train_gpt
+    from train_gpt import M0GPT, save_int6_artifact
+
+    assert not hasattr(train_gpt, "MAX_ARTIFACT_BYTES"), (
+        "M0 trainer should not carry a 16 MB artifact budget constant"
+    )
+
+    args = Hyperparameters(
+        model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=1024,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16,
+    )
+    model = M0GPT(args)
+    compressed, _qsd, _meta = save_int6_artifact(model.state_dict())
+    assert isinstance(compressed, (bytes, bytearray))
+    assert len(compressed) > 0

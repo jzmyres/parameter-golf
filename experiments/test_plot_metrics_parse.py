@@ -205,11 +205,14 @@ class TestPlotMetricsParse(unittest.TestCase):
         log = "\n".join(
             [
                 "step:10/20 k_hi:64 train_loss:3.2000",
-                "metrics: erank:512.3456 active_frac:0.7500 kv_bytes:128 params:1234567",
+                # peak_vram is the PRIMARY resource field; active_frac is now the
+                # MoE-mechanism diagnostic (emitted with a diag: prefix).
+                "metrics: erank:512.3456 peak_vram:1024.0000 kv_bytes:128 params:1234567 "
+                "diag:active_frac:0.7500",
                 # Control-sweep line carrying the sparse R_act / phi fields too.
                 "step:20/20 k_hi:64 train_loss:3.0000",
-                "metrics: erank:600.0000 active_frac:1.0000 kv_bytes:128 params:1234567 "
-                "R_act:2.5000 phi:0.8000",
+                "metrics: erank:600.0000 peak_vram:2048.0000 kv_bytes:128 params:1234567 "
+                "R_act:2.5000 phi:0.8000 diag:active_frac:1.0000",
             ]
         )
         with tempfile.TemporaryDirectory() as td:
@@ -225,6 +228,7 @@ class TestPlotMetricsParse(unittest.TestCase):
 
         self.assertEqual(d["metrics_steps"], [10, 20])
         self.assertEqual(d["erank"], [512.3456, 600.0])
+        self.assertEqual(d["peak_vram"], [1024.0, 2048.0])
         self.assertEqual(d["active_frac"], [0.75, 1.0])
         self.assertEqual(d["kv_bytes"], [128.0, 128.0])
         self.assertEqual(d["params"], [1234567.0, 1234567.0])

@@ -11,7 +11,10 @@ hard-stop) with an **organized** implementation that **preserves and optimizes t
 improvement** of `opg_doc.tex`: *recurrent depth buys task utility under a fixed memory
 budget*. Two explicit goals drive every decision:
 
-- **G1 — minimize resource** (training memory, params, artifact ≤16 MB, FLOPs/600 s, KV).
+- **G1 — minimize resource** = **memory-efficiency** (peak VRAM primary; flat VRAM-vs-batch
+  scaling; activation memory ~constant in recurrent depth K). Params + KV bytes/token are
+  static-footprint supports. *(The artifact-16 MB gate, FLOPs/token, and wall-clock/step are
+  no longer resource-goal metrics — 2026-06-04 directive.)*
 - **G2 — maximize expressiveness** (val_bpb, effective depth, representational rank).
 
 These form a **Pareto frontier** (you cannot independently max both); each mechanism is
@@ -55,7 +58,9 @@ RevFFN's no-floor design). `F_θ`/`G_θ` are pre-norm blocks: **MLA attention + 
   rank set per-matrix on the **erank** frontier (Roy & Vetterli 2007; ARSVD). Small matrices
   (norms, gates, **router**, the tiny vocab=1024 embedding) stay full-rank.
 - **Tied embeddings** (input↔output basis the MoS mixes over) — small win at vocab 1024, kept.
-- **int6 + zstd ≤16 MB artifact** (G1, required); post-hoc (QAT-late dropped).
+- **int6 + zstd artifact** (kept for compact storage); post-hoc (QAT-late dropped). Artifact
+  bytes is logged informationally — **no 16 MB hard gate** (2026-06-04 directive; the resource
+  goal is memory-efficiency, not artifact size).
 - **Optimizer:** Muon (matrices) + AdamW (embeddings/scalars/router), PE-NS, warmdown LR.
 
 **Dropped** (don't serve G1/G2; were P1-obscuring or FP/diagnostic cruft): halting readout,
@@ -67,14 +72,15 @@ Bigram/FSQ/CTP/NSA/smear.
 
 | Goal | Primary | Supporting |
 |---|---|---|
-| **G1 resource** | `R_act(K)` = peak act-mem(K)/mem(K₀) → must be ≈1 (reversibility) | params + **artifact bytes (≤16 MB gate)**; KV bytes/token + MLA ratio; **FLOPs/token + active-expert fraction** (MoE compute); peak VRAM; wall-clock/step (600 s) |
+| **G1 resource** (memory-efficiency) | **peak VRAM** (primary) + **VRAM-vs-batch scaling slope** (flat = good, `vram_vs_batch_scaling`) + `R_act(K)` = peak act-mem(K)/mem(K₀) → ≈1 (reversibility, flat in K) | params + KV bytes/token + MLA ratio (static footprint). *Removed as resource metrics: artifact-16 MB gate, FLOPs/token, wall-clock/step.* `active_frac` is **demoted to a MoE-mechanism diagnostic** (`diag:active_frac`), not a resource metric. |
 | **G2 expressiveness** | `val_bpb` (FineWeb SP1024) | **φ recurrence-equivalence exponent** (effective depth; fit over r∈{1,2,4,8}); **erank** (representation + per-matrix rank sufficiency); MoS output rank; MoE route-depth diversity; paired depth-gain `G_T` (synthetic) |
 | **Joint (Pareto)** | bpb/param · bpb/KV-byte · bpb at constant act-mem · **Δφ per FLOP** | — |
 
 ## Control experiments (the empirical gates)
 
 1. **Router: ReLU vs softmax** — matched everything else; measure val_bpb, φ, erank
-   (G2) and FLOPs / active-expert fraction, reconstruction error (G1/correctness). ReLU
+   (G2) and active-expert fraction (`diag:active_frac`, a MoE-mechanism diagnostic — not a
+   resource-goal metric), reconstruction error (G1/correctness). ReLU
    (ReMoE-style, adaptive-L1 sparsity + load-balance) wins only if it cuts active-fraction
    without losing val_bpb/φ at equal reconstruction fidelity.
 2. **Effective depth φ** over r∈{1,2,4,8}; target φ→1; verify MoE raises φ vs no-MoE.
@@ -85,10 +91,13 @@ Bigram/FSQ/CTP/NSA/smear.
 
 ## Evaluation
 
-- **FineWeb10B SP1024 → val_bpb** (primary; the 600 s / 16 MB resource benchmark — keep).
+- **FineWeb10B SP1024 → val_bpb** (primary expressiveness benchmark — keep). Resource is
+  judged by peak VRAM + VRAM-vs-batch scaling (memory-efficiency), not a 600 s / 16 MB gate.
 - **Synthetic depth-hard (S5/parity, `p1_synthetic`)** for effective-depth/φ/paired-gain
   (the comparator class the recurrent-depth literature uses).
-- Promotion: post-int6 val_bpb improves ∧ artifact ≤16 MB; φ and erank reported; reversibility gate green.
+- Promotion: post-int6 val_bpb improves ∧ peak VRAM / VRAM-vs-batch slope not regressed
+  (memory-efficiency); φ and erank reported; reversibility gate green. (Artifact bytes logged,
+  not gated.)
 
 ## Hyperparameters (grounded starting points)
 
@@ -139,5 +148,6 @@ roundtrip; DDP shape smoke; BPB smoke; ReLU/softmax router parity smoke; updated
 
 - ReLU-router sparsity may not hold expressiveness at small scale → control experiment #1 gates it.
 - Reversible backward correctness is the critical risk → grad-equivalence test is a hard gate.
-- MoE compute (even smooth-sparse) may strain 600 s → FLOPs/active-fraction metric gates it.
+- MoE compute (even smooth-sparse) is watched via the `diag:active_frac` MoE-mechanism
+  diagnostic (sparsity sanity), but FLOPs/token is no longer a resource-goal gate.
 - 1500-line budget vs mandated mechanisms → flagged open decision above.
