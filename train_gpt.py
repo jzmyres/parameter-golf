@@ -170,6 +170,37 @@ class ReversibleRecurrence(nn.Module):
             states.append(0.5 * (a + b))
         return (a, b), states
 
+    def forward_states_at(self, a, b, x0, depths):
+        """Midpoints ``0.5*(a+b)`` at each requested depth from ONE trajectory.
+
+        The recurrence is deterministic given ``(a, b, x0)``: depth ``K_big`` is
+        depth ``K_small`` CONTINUED. So a SINGLE depth-``max(depths)`` pass can
+        read off the midpoint at every requested ``K`` — exactly what each
+        independent depth-``K`` run would have produced — at cost ``~max(K)``
+        instead of ``sum(K)``. The per-step ``e_k`` clock is applied identically
+        to :meth:`forward_states` so step-conditioning stays consistent; we
+        SNAPSHOT the midpoint only at the requested depths (sorted unique) to
+        bound memory to ``O(len(depths))`` rather than ``O(max K)``.
+
+        ``depths`` is any iterable of positive ints; returns ``{d: midpoint}``
+        keyed by the distinct requested depths. The midpoint at depth ``d`` is
+        the state AFTER ``d`` full coupling steps, matching ``forward_states``'
+        ``states[d-1]`` and :meth:`run_reversible`'s output at ``depth=d``.
+        """
+        want = sorted({int(d) for d in depths})
+        if not want or want[0] < 1:
+            raise ValueError("forward_states_at requires positive depths")
+        want_set = set(want)
+        out = {}
+        for k in range(want[-1]):
+            e_k = self._step_vec(k, x0)
+            a = a + self.F(b + x0 + e_k)
+            b = b + self.G(a + x0 + e_k)
+            d = k + 1  # midpoint after (k+1) full steps
+            if d in want_set:
+                out[d] = 0.5 * (a + b)
+        return out
+
     def invert(self, a, b, x0, depth):
         # Walk steps in REVERSE; e_k is a deterministic function of the step
         # index k, so each reverse step recomputes the SAME e_k the forward used.
@@ -1222,6 +1253,49 @@ class M0GPT(nn.Module):
             raise FloatingPointError("non-finite loss")
         return loss
 
+    def eval_losses_multi_depth(self, tokens, targets, depths):
+        """Per-token NLL (nats) at each requested depth from ONE shared trajectory.
+
+        The recurrence is deterministic given ``(a0, b0, x0)``, so running to a
+        deep budget is exactly running to a shallow one CONTINUED. This computes
+        the loss at every requested depth from a SINGLE depth-``max(depths)``
+        forward (cost ``~max(K)`` vs ``sum(K)`` for independent runs), reading
+        the reversible midpoint ``0.5*(a+b)`` off the trajectory at each ``K``.
+        Because all depths share ONE trajectory they share ONE recurrence-init
+        noise draw — the comparison is inherently paired (``K_big`` IS ``K_small``
+        continued), which is both faster and the cleanest paired depth measurement.
+
+        Equivalent to calling :meth:`forward` at each depth independently (see the
+        equivalence tests). This is the EVAL path: the caller wraps it in
+        ``torch.inference_mode()`` so it is NO-GRAD and does NOT touch the
+        reversible custom Function / backward — the training path is unchanged.
+
+        ``init_state`` is honored identically to :meth:`forward`: ``"x0"`` seeds
+        ``a0=b0=x0`` (no draw); ``"random"`` seeds with ONE ``randn_like`` draw
+        for ``a0`` and one for ``b0`` — that single draw is SHARED by all depths.
+        Returns ``{d: batch_loss_nats}`` keyed by the distinct requested depths.
+        """
+        B, T = tokens.shape
+        x0 = self.tok_emb(tokens) + self.pos_emb[:, :T]
+        # Seed ONCE (shared across all depths). Mirrors forward()'s --init-state.
+        a0 = b0 = x0
+        if self.args.init_state == "random":
+            a0 = self.args.init_state_std * torch.randn_like(x0)
+            b0 = self.args.init_state_std * torch.randn_like(x0)
+        mids = self.rec.forward_states_at(a0, b0, x0, depths)
+        losses = {}
+        for d, mid in mids.items():
+            z = self.final_norm(mid)  # readout norm, OUTSIDE the recurrence
+            logp = self.mos_head(z)
+            if not torch.isfinite(logp).all():
+                raise FloatingPointError("non-finite MoS log-probabilities")
+            loss = F.nll_loss(logp.reshape(-1, self.args.vocab_size),
+                              targets.reshape(-1))
+            if not torch.isfinite(loss):
+                raise FloatingPointError("non-finite loss")
+            losses[d] = loss
+        return losses
+
 
 # ---------------------------------------------------------------------------
 # 11. Muon optimizer (ported verbatim from the a15093a clean scaffold)
@@ -1519,6 +1593,35 @@ def build_sentencepiece_luts(sp, vocab_size, device):
     )
 
 
+def _batch_byte_count(x, y, luts):
+    """Per-batch target byte total for the BPB metric (SentencePiece LUTs).
+
+    Shared by :func:`run_validation` and :func:`run_validation_multi_depth` so
+    the byte math (and the leading-space-after-non-boundary correction) lives in
+    ONE place. Returns ``0.0`` when ``luts is None`` (synthetic, no tokenizer)."""
+    if luts is None:
+        return 0.0
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = luts
+    tgt_ids = y.reshape(-1)
+    prev_ids = x.reshape(-1)
+    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+    token_bytes = token_bytes + (
+        has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+    ).to(dtype=torch.int16)
+    return token_bytes.to(torch.float64).sum()
+
+
+def _loss_to_bpb(val_loss, tok_count, byte_count, luts):
+    """BPB = (loss / ln2) * tokens_per_byte; ``nan`` when bytes are unavailable.
+
+    The single BPB formula shared by both eval drivers (DRY). ``tok_count`` /
+    ``byte_count`` are the post-all-reduce Python-float totals."""
+    bits_per_token = val_loss / math.log(2.0)
+    if luts is not None and byte_count > 0:
+        return bits_per_token * (tok_count / byte_count)
+    return float("nan")
+
+
 def run_validation(model, loader, depth, n_batches, seq_len, global_tokens,
                    grad_accum_steps, device, luts, autocast_enabled):
     """Compute ``(val_loss_nats, val_bpb)`` over ``n_batches`` batches at ``depth``.
@@ -1528,9 +1631,6 @@ def run_validation(model, loader, depth, n_batches, seq_len, global_tokens,
     SentencePiece LUTs. When ``luts is None`` (synthetic smoke, no tokenizer)
     BPB is reported as ``nan`` but the loss path is still exercised.
     """
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = (
-        luts if luts is not None else (None, None, None)
-    )
     was_training = model.training
     model.eval()
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -1546,14 +1646,7 @@ def run_validation(model, loader, depth, n_batches, seq_len, global_tokens,
             n_tok = float(y.numel())
             loss_sum += batch_loss.to(torch.float64) * n_tok
             tok_count += n_tok
-            if base_bytes_lut is not None:
-                tgt_ids = y.reshape(-1)
-                prev_ids = x.reshape(-1)
-                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-                token_bytes = token_bytes + (
-                    has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
-                ).to(dtype=torch.int16)
-                byte_count += token_bytes.to(torch.float64).sum()
+            byte_count += _batch_byte_count(x, y, luts)
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -1563,13 +1656,62 @@ def run_validation(model, loader, depth, n_batches, seq_len, global_tokens,
     if was_training:
         model.train()
     val_loss = (loss_sum / tok_count).item()
-    bits_per_token = val_loss / math.log(2.0)
-    if base_bytes_lut is not None and byte_count.item() > 0:
-        tokens_per_byte = tok_count.item() / byte_count.item()
-        val_bpb = bits_per_token * tokens_per_byte
-    else:
-        val_bpb = float("nan")
+    val_bpb = _loss_to_bpb(val_loss, tok_count.item(), byte_count.item(), luts)
     return float(val_loss), float(val_bpb)
+
+
+def run_validation_multi_depth(model, loader, depths, n_batches, seq_len,
+                               global_tokens, grad_accum_steps, device, luts,
+                               autocast_enabled):
+    """Per-depth ``{d: (val_loss_nats, val_bpb)}`` from ONE shared trajectory.
+
+    The depth-gain sweep counterpart of :func:`run_validation`: instead of
+    re-running the recurrence FROM the seed for each K (cost ``sum(K)``), it calls
+    :meth:`M0GPT.eval_losses_multi_depth` once per batch — a SINGLE depth-max(K)
+    forward whose midpoint is read off at every requested K (cost ``~max(K)``).
+    All depths share ONE trajectory (hence one recurrence-init noise draw), so
+    the depth comparison is inherently paired (``K_big`` IS ``K_small`` continued).
+
+    Accumulation mirrors :func:`run_validation` exactly: a PER-DEPTH
+    ``loss_sum``/``tok_count`` and a SHARED, depth-independent ``byte_count``
+    (the bytes depend only on the targets, not on K). Each per-depth loss_sum +
+    tok_count and the shared byte_count are all-reduced under DDP, then the SAME
+    ``_loss_to_bpb`` formula yields BPB per depth. Build a fresh ``loader`` so it
+    starts from batch 0 (the caller passes a ``_ReplayLoader`` for paired data).
+    """
+    want = sorted({int(d) for d in depths})
+    was_training = model.training
+    model.eval()
+    loss_sum = {d: torch.zeros((), device=device, dtype=torch.float64) for d in want}
+    tok_count = {d: torch.zeros((), device=device, dtype=torch.float64) for d in want}
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    autocast_dtype = torch.bfloat16
+    with torch.inference_mode():
+        for _ in range(n_batches):
+            x, y = loader.next_batch(global_tokens, seq_len, grad_accum_steps)
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype,
+                                enabled=autocast_enabled):
+                batch_losses = model.eval_losses_multi_depth(x, y, want)
+            n_tok = float(y.numel())
+            for d in want:
+                loss_sum[d] += batch_losses[d].detach().to(torch.float64) * n_tok
+                tok_count[d] += n_tok
+            byte_count += _batch_byte_count(x, y, luts)  # depth-independent
+
+    if dist.is_available() and dist.is_initialized():
+        for d in want:
+            dist.all_reduce(loss_sum[d], op=dist.ReduceOp.SUM)
+            dist.all_reduce(tok_count[d], op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    if was_training:
+        model.train()
+    out = {}
+    for d in want:
+        val_loss = (loss_sum[d] / tok_count[d]).item()
+        val_bpb = _loss_to_bpb(val_loss, tok_count[d].item(), byte_count.item(), luts)
+        out[d] = (float(val_loss), float(val_bpb))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2777,54 +2919,52 @@ def main(argv=None):
         autocast_enabled=autocast_enabled)
     print0(f"final val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f}")
 
-    # --- depth-gain MEASUREMENT (--k-eval-sweep): end-of-run, PAIRED across K ---
+    # --- depth-gain MEASUREMENT (--k-eval-sweep): end-of-run, SHARED trajectory ---
     # Evaluate the trained model at each requested recurrent depth K and report
     # the depth-gain G_T = bpb[min K] - bpb[max K] (positive => deeper recurrence
     # helps) plus an eval-K phi proxy. This confirms whether depth buys anything
     # (the looped/UT failure mode is G_T -> 0).
     #
-    # The sweep is PAIRED so depth K is the ONLY variable: (a) the eval batches
-    # are materialized ONCE and replayed for every K (run_validation otherwise
-    # consumes a STATEFUL stream, scoring each K on DIFFERENT samples), and
-    # (b) the RNG state is captured once and RESET before each K, so under
-    # --init-state random every K draws the SAME recurrence-init noise (forward
-    # otherwise draws fresh torch.randn_like per call). Without both, G_T / phi
-    # conflate depth with sample + seed variance and the instrument is biased.
+    # The recurrence is deterministic given (a0, b0, x0): depth K_big IS depth
+    # K_small CONTINUED. So the whole sweep is ONE depth-max(K) pass whose
+    # midpoint 0.5*(a+b) is read off at each requested K (run_validation_multi_depth
+    # -> eval_losses_multi_depth). This is ~half the compute of re-running from the
+    # seed per K (max(K) vs sum(K)) AND the cleanest paired depth comparison:
+    # every K shares ONE trajectory -> ONE recurrence-init noise draw, so depth is
+    # inherently the only variable. Because of that single shared trajectory, the
+    # former per-K RNG reset is no longer needed in the sweep (the per-pass reset
+    # in finite_horizon_loss's hinge is unchanged). The eval batches are still
+    # materialized ONCE and replayed (run_validation otherwise consumes a STATEFUL
+    # stream, scoring each K on DIFFERENT samples).
     #
-    # All ranks run this symmetrically (run_validation all-reduces); each rank
-    # caches its OWN shard and resets its OWN RNG. The loop is OUTSIDE any
-    # `if master:` guard (only print0 is rank-0) so the collectives never hang.
+    # All ranks run this symmetrically (run_validation_multi_depth all-reduces);
+    # each rank caches its OWN shard. The block is OUTSIDE any `if master:` guard
+    # (only print0 is rank-0) so the collectives never hang.
     if args.k_eval_sweep:
-        # Dedup K preserving order so a repeated K is not scored twice.
-        sweep_ks = tuple(dict.fromkeys(_parse_int_set(args.k_eval_sweep)))
+        # Dedup + sort K so a repeated K is scored once and lines emit ascending.
+        sweep_ks = sorted(set(_parse_int_set(args.k_eval_sweep)))
         if not sweep_ks:
             raise ValueError("--k-eval-sweep must contain at least one depth")
-        # (a) Materialize this rank's eval batches once (the SAME data for all K).
+        # Materialize this rank's eval batches once (the SAME data for all K).
         cached = [
             val_loader.next_batch(batch_tokens, args.seq_len, grad_accum_steps)
             for _ in range(args.eval_batches)
         ]
-        # (b) Reset the RNG before each K so the random init noise (if any) is
-        # identical across depths -> a clean paired pass; paired_rng restores
-        # the snapshot on exit so the downstream artifact-save is unaffected.
-        sweep_loss = {}
-        sweep_bpb = {}
-        with paired_rng(device) as reset_rng:
-            for k in sweep_ks:
-                reset_rng()
-                replay = _ReplayLoader(cached)  # fresh -> starts from batch 0
-                k_loss, k_bpb = run_validation(
-                    base_model, replay, depth=k, n_batches=args.eval_batches,
-                    seq_len=args.seq_len, global_tokens=batch_tokens,
-                    grad_accum_steps=grad_accum_steps, device=device, luts=luts,
-                    autocast_enabled=autocast_enabled)
-                sweep_loss[k] = k_loss
-                sweep_bpb[k] = k_bpb
-                print0(f"depth_sweep: K={k} val_bpb:{k_bpb:.4f} val_loss:{k_loss:.4f}")
+        # ONE shared depth-max(K) pass; midpoint read off at each K.
+        sweep = run_validation_multi_depth(
+            base_model, _ReplayLoader(cached), depths=sweep_ks,
+            n_batches=args.eval_batches, seq_len=args.seq_len,
+            global_tokens=batch_tokens, grad_accum_steps=grad_accum_steps,
+            device=device, luts=luts, autocast_enabled=autocast_enabled)
+        sweep_loss = {k: sweep[k][0] for k in sweep_ks}
+        sweep_bpb = {k: sweep[k][1] for k in sweep_ks}
+        for k in sweep_ks:  # ascending-K order
+            print0(f"depth_sweep: K={k} val_bpb:{sweep_bpb[k]:.4f} "
+                   f"val_loss:{sweep_loss[k]:.4f}")
         # Depth-gain over the swept budgets: bpb at the SHALLOWEST minus bpb at
         # the DEEPEST (positive => depth helps). On the synthetic smoke (no
         # tokenizer) bpb is NaN, so G_T is NaN there; the loss path still ran.
-        k_min, k_max = min(sweep_ks), max(sweep_ks)
+        k_min, k_max = sweep_ks[0], sweep_ks[-1]
         gt = sweep_bpb[k_min] - sweep_bpb[k_max]
         print0(f"depth_gain_GT:{gt:.4f}")
         # Eval-K phi PROXY: the iso-depth recurrence-equivalence exponent fitted

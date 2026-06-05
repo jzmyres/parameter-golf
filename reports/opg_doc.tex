@@ -323,13 +323,18 @@ trusting internal depth metrics.  The \code{--k-eval-sweep} flag evaluates one t
 recurrent depth \(K\) after the final validation (rank-0 prints; all ranks run the loop because the
 validation all-reduces) and emits \(G_T=\bpb(K_{\min})-\bpb(K_{\max})\) (positive when deeper
 recurrence helps) plus an eval-depth \(\varphi\) proxy fitted over the \(\{K:\text{loss}(K)\}\) map.
-The sweep is \emph{paired so depth \(K\) is the only variable}: the evaluation batches are
-materialized once and replayed for every \(K\) (the streaming loader would otherwise score each \(K\)
-on different samples), and the RNG state is captured once and reset before each \(K\) so that under
-\code{--init-state random} every \(K\) draws the same recurrence-seed noise.  Without both, \(G_T\)
-and the \(\varphi\) proxy conflate depth with sample and seed variance; with both, the depth-gain is
-a reproducible controlled measurement on fixed weights, and the captured RNG is restored afterward so
-the artifact-save path is unaffected.  The \(\varphi\) fit drops non-finite depths so a single
+The sweep is computed from a \emph{single shared trajectory}: the recurrence is deterministic given
+the seed \((a_0,b_0,x_0)\), so depth \(K_{\max}\) is depth \(K_{\min}\) \emph{continued}.  Rather than
+re-running the recurrence from the seed for each \(K\) (cost \(\sum_K K\)), the trainer takes ONE
+depth-\(K_{\max}\) pass and reads the reversible midpoint \(\tfrac12(a+b)\) off that trajectory at each
+requested \(K\) (cost \(\approx K_{\max}\), roughly half for a geometric ladder such as
+\(\{8,16,32,64\}\)).  This is also the \emph{cleanest paired depth comparison}: every \(K\) shares one
+trajectory and therefore one recurrence-seed noise draw, so depth is inherently the only variable
+(\(K_{\max}=K_{\min}\) continued) with no per-\(K\) RNG reset needed in the sweep.  The evaluation
+batches are still materialized once and replayed (the streaming loader would otherwise score each
+\(K\) on different samples).  The depth-gain is thus a reproducible controlled measurement on fixed
+weights, and the per-pass RNG reset is retained only inside the finite-horizon shallow/deep hinge.
+The \(\varphi\) fit drops non-finite depths so a single
 diverged \(K\) cannot \(\mathrm{NaN}\)-poison the proxy.  When collapse is detected, the
 simplest principled fix---tested first per Occam---is Huginn-style \emph{random state
 initialization}~\cite{huginn} (\code{--init-state random}): the recurrence is seeded with small

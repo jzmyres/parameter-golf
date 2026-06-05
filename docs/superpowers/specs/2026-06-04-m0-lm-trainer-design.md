@@ -99,25 +99,30 @@ RevFFN's no-floor design). `F_θ`/`G_θ` are pre-norm blocks: **MLA attention + 
   Sustained displacement ⇒ the recurrence keeps doing work at depth (high effective depth); rapid
   decay to ≈0 ⇒ early saturation. Computed under `no_grad` at the log site (`recurrence_displacement`
   / `displacement_tail`), never in the grad-accum hot loop.
-- **Depth-gain MEASUREMENT (`--k-eval-sweep`), PAIRED across K.** A tied recurrence can collapse to a
-  fixed point — effective depth `φ → 0`, depth-gain `G_T → 0` — so we MEASURE whether depth buys
-  anything before trusting internal depth metrics. `--k-eval-sweep 8,16,32,64` (comma ints, deduped
-  preserving order, default empty) evaluates the trained model at each recurrent depth K **after the
-  final validation** (rank-0 prints, but ALL ranks run the loop symmetrically since `run_validation`
-  all-reduces; outside any `if master:` guard so the collectives never hang) and prints one
-  `depth_sweep: K=… val_bpb:… val_loss:…` line per K, then `depth_gain_GT = val_bpb[min K] − val_bpb[max K]`
-  (positive ⇒ deeper recurrence helps) and a `phi_eval` proxy (`fit_phi` over the `{K: val_loss}` map —
-  an **eval-depth** φ proxy that varies the inference budget of ONE trained model, NOT the train-r φ
-  that compares models trained at different budgets). The sweep is **PAIRED so depth K is the only
-  variable**: (a) the eval batches are **materialized once and replayed** for every K (a `_ReplayLoader`
-  with the same `next_batch` signature; the real loader otherwise consumes a STATEFUL stream and would
-  score each K on DIFFERENT samples), and (b) the **RNG state is captured once and RESET before each K**,
-  so under `--init-state random` every K draws the SAME recurrence-init noise (`M0GPT.forward` otherwise
-  draws fresh `torch.randn_like` per call). Without both, `G_T`/`phi_eval` conflate depth with
-  sample + seed variance and the instrument is biased; with both, the depth-gain is REPRODUCIBLE on
-  fixed weights. The captured RNG is restored after the sweep so the artifact-save path is unaffected.
-  `fit_phi` drops non-finite points before the OLS fit, so one diverged depth does not NaN-poison
-  `phi_eval`.
+- **Depth-gain MEASUREMENT (`--k-eval-sweep`), SHARED single trajectory.** A tied recurrence can
+  collapse to a fixed point — effective depth `φ → 0`, depth-gain `G_T → 0` — so we MEASURE whether
+  depth buys anything before trusting internal depth metrics. `--k-eval-sweep 8,16,32,64` (comma ints,
+  deduped + sorted, default empty) evaluates the trained model at each recurrent depth K **after the
+  final validation** (rank-0 prints, but ALL ranks run the block symmetrically since
+  `run_validation_multi_depth` all-reduces; outside any `if master:` guard so the collectives never
+  hang) and prints one `depth_sweep: K=… val_bpb:… val_loss:…` line per K (ascending K), then
+  `depth_gain_GT = val_bpb[min K] − val_bpb[max K]` (positive ⇒ deeper recurrence helps) and a
+  `phi_eval` proxy (`fit_phi` over the `{K: val_loss}` map — an **eval-depth** φ proxy that varies the
+  inference budget of ONE trained model, NOT the train-r φ that compares models trained at different
+  budgets). The sweep is computed from a **single shared trajectory**: the recurrence is deterministic
+  given the seed `(a0,b0,x0)`, so depth `K_big` IS depth `K_small` **continued**. Instead of re-running
+  the recurrence from the seed for each K (cost `Σ K`), `M0GPT.eval_losses_multi_depth` takes ONE
+  depth-`max(K)` pass and reads the reversible midpoint `0.5*(a+b)` off that trajectory at each
+  requested K (cost `≈ max(K)`, ≈half for a geometric ladder like `{8,16,32,64}`: 64 vs 120 steps;
+  `ReversibleRecurrence.forward_states_at` snapshots only at the requested depths to bound memory to
+  `O(len(depths))`). This is also the **cleanest paired depth comparison**: every K shares one
+  trajectory ⇒ one recurrence-init noise draw ⇒ depth is inherently the only variable (`K_big` =
+  `K_small` continued), so NO per-K RNG reset is needed in the sweep. The eval batches are still
+  **materialized once and replayed** (a `_ReplayLoader` with the same `next_batch` signature; the real
+  loader otherwise consumes a STATEFUL stream and would score each K on DIFFERENT samples), so the
+  depth-gain is REPRODUCIBLE on fixed weights. The per-pass RNG reset is retained only inside the
+  finite-horizon shallow/deep hinge (`finite_horizon_loss`). `fit_phi` drops non-finite points before
+  the OLS fit, so one diverged depth does not NaN-poison `phi_eval`.
 - **Anti-collapse fix #2: random state init (`--init-state ∈ {x0, random}`, default `x0`; the
   Occam-first fix).** Per Occam we test the SIMPLEST principled anti-collapse fix first: Huginn-style
   **random state initialization**~\cite{huginn} instead of `a_0=b_0=x_0`. `x0` (default) is the current

@@ -1495,6 +1495,126 @@ def test_fit_phi_all_nan_returns_zero():
     assert fit_phi({2: 1.0, 4: float("nan")}) == 0.0
 
 
+# ---------------------------------------------------------------------------
+# Shared-trajectory k-eval-sweep — one max-K pass read off at each K.
+#
+# The recurrence is deterministic given (a0, b0, x0): running to depth K is
+# EXACTLY running to a smaller depth and CONTINUING. So evaluating losses at a
+# set of depths can read the midpoint 0.5*(a+b) off ONE depth-max(K) trajectory
+# at each requested K. The KEY correctness gate: that single-trajectory readoff
+# must be IDENTICAL to independent single-depth model(x, y, K) runs.
+# ---------------------------------------------------------------------------
+def _build_equiv_model(step_conditioning=False):
+    """A tiny deterministic M0 (x0 init, fp32/CPU) for the equivalence gate."""
+    from train_gpt import Hyperparameters, M0GPT
+    torch.manual_seed(0)
+    return M0GPT(Hyperparameters(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=32,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=8, init_state="x0", step_conditioning=step_conditioning,
+        max_step_emb=16,
+    ))
+
+
+def test_eval_losses_multi_depth_matches_single_depth_x0():
+    """Reading the midpoint off ONE shared trajectory at each K is bit-for-bit
+    equal (to tight tolerance) to independent single-depth forwards. This proves
+    K_big = K_small CONTINUED (one noise draw, one trajectory)."""
+    model = _build_equiv_model(step_conditioning=False)
+    model.eval()
+    x = torch.randint(0, 32, (2, 8))
+    y = torch.randint(0, 32, (2, 8))
+    depths = [3, 5, 8]
+    with torch.inference_mode():
+        multi = model.eval_losses_multi_depth(x, y, depths)
+        for d in depths:
+            single = model(x, y, d)
+            assert torch.allclose(multi[d], single, atol=1e-5), (
+                f"depth {d}: multi {multi[d].item()} != single {single.item()}")
+
+
+def test_eval_losses_multi_depth_matches_single_depth_step_conditioning():
+    """Same equivalence with step_conditioning on: the per-step clock e_k must be
+    applied identically along the shared trajectory."""
+    model = _build_equiv_model(step_conditioning=True)
+    model.eval()
+    x = torch.randint(0, 32, (2, 8))
+    y = torch.randint(0, 32, (2, 8))
+    depths = [3, 5, 8]
+    with torch.inference_mode():
+        multi = model.eval_losses_multi_depth(x, y, depths)
+        for d in depths:
+            single = model(x, y, d)
+            assert torch.allclose(multi[d], single, atol=1e-5), (
+                f"depth {d}: multi {multi[d].item()} != single {single.item()}")
+
+
+def test_eval_losses_multi_depth_dedups_and_sorts_depths():
+    """Requesting a repeated/unsorted depth set still returns one entry per
+    distinct depth, each equal to the single-depth forward."""
+    model = _build_equiv_model(step_conditioning=False)
+    model.eval()
+    x = torch.randint(0, 32, (2, 8))
+    y = torch.randint(0, 32, (2, 8))
+    with torch.inference_mode():
+        multi = model.eval_losses_multi_depth(x, y, [5, 3, 5, 3])
+        assert set(multi.keys()) == {3, 5}
+        for d in (3, 5):
+            assert torch.allclose(multi[d], model(x, y, d), atol=1e-5)
+
+
+def test_eval_losses_multi_depth_shares_one_random_draw():
+    """Under init_state='random' the single shared draw is the WHOLE point: every
+    depth reads off ONE trajectory (one noise draw). The deepest depth's
+    multi-depth loss equals an independent single-depth forward taken under the
+    SAME RNG state (so the same draw)."""
+    from train_gpt import Hyperparameters, M0GPT, paired_rng
+    torch.manual_seed(0)
+    model = M0GPT(Hyperparameters(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=32,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=8, init_state="random", init_state_std=0.1,
+    ))
+    model.eval()
+    x = torch.randint(0, 32, (2, 8))
+    y = torch.randint(0, 32, (2, 8))
+    depths = [3, 5, 8]
+    device = next(model.parameters()).device
+    with torch.inference_mode():
+        with paired_rng(device) as reset_rng:
+            reset_rng()
+            multi = model.eval_losses_multi_depth(x, y, depths)
+            # The shared trajectory's max depth == a single-depth forward from
+            # the SAME draw (reset RNG so randn_like draws the identical seed).
+            reset_rng()
+            single_max = model(x, y, max(depths))
+    assert torch.allclose(multi[max(depths)], single_max, atol=1e-5)
+
+
+def test_run_validation_multi_depth_matches_per_depth_run_validation():
+    """The per-depth eval driver must reproduce run_validation's loss/BPB for
+    each depth (same accumulation, same byte math) — only sharing one trajectory."""
+    from train_gpt import run_validation, run_validation_multi_depth, _ReplayLoader
+    model = _build_equiv_model(step_conditioning=False)
+    device = torch.device("cpu")
+    cache = [(torch.randint(0, 32, (2, 8)), torch.randint(0, 32, (2, 8)))
+             for _ in range(2)]
+    depths = [3, 5, 8]
+    multi = run_validation_multi_depth(
+        model, _ReplayLoader(cache), depths=depths, n_batches=len(cache),
+        seq_len=8, global_tokens=16, grad_accum_steps=1, device=device,
+        luts=None, autocast_enabled=False)
+    assert set(multi.keys()) == set(depths)
+    for d in depths:
+        loss, bpb = run_validation(
+            model, _ReplayLoader(cache), depth=d, n_batches=len(cache),
+            seq_len=8, global_tokens=16, grad_accum_steps=1, device=device,
+            luts=None, autocast_enabled=False)
+        m_loss, m_bpb = multi[d]
+        assert abs(m_loss - loss) < 1e-5, f"depth {d} loss {m_loss} != {loss}"
+        # BPB is NaN without LUTs; only assert finite-loss parity above.
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

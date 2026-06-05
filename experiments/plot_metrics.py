@@ -1407,7 +1407,7 @@ def plot_comparison(baseline_log: str, current_log: str, outdir: str) -> bool:
     axes[7, 1].set_in_layout(False)
 
     # Reserve top margin for suptitle/legend without squeezing columns.
-    fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.93])
+    fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.93))
     plt.savefig(str(Path(outdir) / "metrics_comparison.png"), dpi=150)
     plt.close()
     print(f"Saved metrics_comparison.png")
