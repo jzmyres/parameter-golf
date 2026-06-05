@@ -423,6 +423,27 @@ Control scales; neither \(M_0\) nor \(M_{\rm clk}\) scales & Bottleneck is block
 The clock is a diagnostic ceiling, not a design commitment.  It answers whether depth-conditioned
 computation is useful on the data before investing in autonomous routing.
 
+\paragraph{Autonomous substitute: a strictly-invertible damping (hyper-connection) matrix.}
+When the clock \(M_{\rm clk}\) scales but \(M_0\) does not (autonomous-depth-signal bottleneck), the
+principled escalation is \emph{not} to ship the clock---which a learned per-step embedding
+\(e_k\) makes depth-conditioned and therefore poorly-extrapolating, the very property Huginn's
+depth-unconditioned design avoids \cite{huginn}---but to give the recurrence \emph{autonomous}
+sustained dynamics via a strictly-invertible mixing/``damping'' matrix on the coupling streams.
+This is the reversible specialization of Hyper-Connections \cite{hyperconnections}, whose
+unconstrained mixing matrix is highly expressive (parallel residual streams \(\to\) high effective
+depth) but unstable (signal blow-up).  The stable form constrains the matrix to a manifold:
+manifold-constrained Hyper-Connections \cite{mhc} use a doubly-stochastic (Birkhoff) matrix, and
+the \emph{orthogonal} variant \cite{jpmhc} gives dynamical isometry.  For our reversible core the
+orthogonal choice is canonical: with \(Q\) orthogonal the coupling
+\(a_{k+1}=Q\,a_k+F(b_k{+}x_0),\; b_{k+1}=Q\,b_k+G(a_{k+1}{+}x_0)\) inverts \emph{exactly} as
+\(Q^{\top}\) (no Parcae reverse-reconstruction floor), is norm-preserving (so per-step displacement
+cannot decay to a fixed point and the dynamics stay well-scaled \emph{beyond} the trained depth,
+unlike the clock), and the cross-stream/cross-depth mixing supplies expressiveness.  It thus
+supersedes both the UT-style clock and the diagonal Parcae damping-with-floor in one mechanism.
+Per Occam it is the \emph{second} rung---tested only if Huginn-style random init
+(\code{--init-state random}, \S\ref{sec:metrics}) does not by itself close the \(M_0\)/\(M_{\rm clk}\)
+gap.
+
 %==============================================================================
 \section{Assumptions and Checks}
 \label{sec:assumptions}
@@ -821,6 +842,25 @@ K. Schwethelm, D. Rueckert, and G. Kaissis.
 \newblock How Much Is One Recurrence Worth? Iso-Depth Scaling Laws for Looped Language Models.
 \newblock arXiv:2604.21106, 2026.
 \newblock \url{https://arxiv.org/abs/2604.21106}.
+
+\bibitem{hyperconnections}
+D. Zhu, H. Huang, Z. Huang, Y. Zeng, Y. Mao, B. Wu, Q. Min, and X. Zhou.
+\newblock Hyper-Connections.
+\newblock arXiv:2409.19606, 2024.
+\newblock \url{https://arxiv.org/abs/2409.19606}.
+
+\bibitem{mhc}
+DeepSeek-AI.
+\newblock mHC: Manifold-Constrained Hyper-Connections (doubly-stochastic / Birkhoff-polytope mixing
+via Sinkhorn--Knopp for stable, signal-conserving residual mixing).
+\newblock arXiv:2512.24880, 2025.
+\newblock \url{https://arxiv.org/abs/2512.24880}.
+
+\bibitem{jpmhc}
+\newblock Dynamical Isometry via Orthogonal Hyper-Connections (strictly-invertible orthogonal mixing
+matrix; the reversibility-native variant).
+\newblock arXiv:2602.18308, 2026.
+\newblock \url{https://arxiv.org/abs/2602.18308}.
 
 \bibitem{melt}
 V. C. Vendrell, A. P. Masdemont, N. Grillo, J. Ros-Giralt, A. Behboodi, and
