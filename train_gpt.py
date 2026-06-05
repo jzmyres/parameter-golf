@@ -559,7 +559,8 @@ class M0GPT(nn.Module):
 
         x0  = tok_emb(tokens) + pos_emb[:, :T]
         z_K = run_reversible(x0, depth=K)        # midpoint of the reversible pair
-        log p = mos_head(z_K)                    # LOG-probabilities (MoS)
+        z   = final_norm(z_K)                    # readout norm (OUTSIDE recurrence)
+        log p = mos_head(z)                      # LOG-probabilities (MoS)
         loss  = nll_loss(log p, targets)         # MoS emits log-probs -> NLL
 
     The two recurrence maps ``F``/``G`` are pre-norm MLA+MoE delta blocks
@@ -567,6 +568,15 @@ class M0GPT(nn.Module):
     input, which is what makes the additive-coupling recurrence exactly
     invertible (reconstruction gate, fp64). The MoS output basis is *tied* to
     the input token embedding (shared ``nn.Parameter``).
+
+    ``final_norm`` is applied to the OUTPUT of ``run_reversible`` — strictly
+    OUTSIDE the reversible recurrence (``RevRecurrenceFn``/``ReversibleRecurrence``)
+    — so reversibility / exact fp64 reconstruction is UNAFFECTED. It is required
+    because ``z_K = 0.5*(a_K + b_K)`` accumulates ``depth`` additive updates from
+    ``x0`` and so grows with depth; feeding it unnormalized into the MoS head's
+    ``tanh(ctx(z_K))`` saturates the tanh, zeroing its gradient and blocking
+    learning everywhere upstream. NEVER add a norm INSIDE the recurrence loop —
+    that would break the algebraic inverse.
     """
 
     def __init__(self, args: Hyperparameters):
@@ -581,15 +591,36 @@ class M0GPT(nn.Module):
         G_block = _PreNormDeltaBlock(args)
         self.rec = ReversibleRecurrence(F_block, G_block)
 
+        # Readout norm of the reversible midpoint, applied OUTSIDE the recurrence
+        # so reconstruction stays exact (see class docstring).
+        self.final_norm = RMSNorm(d)
         self.mos_head = MoSHead(d, V, args.n_mix)
         # Tie the MoS output basis to the input token embedding (shared Param).
         self.mos_head.out_embed.weight = self.tok_emb.weight
+
+        # Small, conservative init so the model starts near-uniform (initial NLL
+        # ~ ln(vocab)), not ~4x worse. Defaults (~N(0,1) embedding, default Linear
+        # init) gave huge logits AND a large z_K that saturated the head's tanh.
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)  # also sets tied out_embed
+        # MoS gate zero-init -> mixture weights start uniform; ctx small-std ->
+        # tanh(ctx(z)) starts near 0 so per-component logits start near-uniform.
+        nn.init.zeros_(self.mos_head.gate.weight)
+        nn.init.zeros_(self.mos_head.gate.bias)
+        nn.init.normal_(self.mos_head.ctx.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.mos_head.ctx.bias)
+        # Start the recurrence near-identity: zero the two delta-block output
+        # projections so z_K starts close to x0 (no compounding before training).
+        nn.init.zeros_(self.rec.F.attn.o_proj.weight)
+        nn.init.zeros_(self.rec.G.attn.o_proj.weight)
+        nn.init.zeros_(self.rec.F.moe.w_out)
+        nn.init.zeros_(self.rec.G.moe.w_out)
 
     def forward(self, tokens, targets, depth):
         B, T = tokens.shape
         x0 = self.tok_emb(tokens) + self.pos_emb[:, :T]
         z_K = self.rec.run_reversible(x0, depth)
-        logp = self.mos_head(z_K)
+        z = self.final_norm(z_K)  # readout norm, OUTSIDE the recurrence
+        logp = self.mos_head(z)
         if not torch.isfinite(logp).all():
             raise FloatingPointError("non-finite MoS log-probabilities")
         loss = F.nll_loss(logp.reshape(-1, self.args.vocab_size), targets.reshape(-1))
@@ -1627,7 +1658,7 @@ def main(argv=None):
     # --- training loop (DDP grad-accum, finite-horizon hinge) ---
     # Reset the CUDA peak-memory counter so the end-of-run ``peak_vram_mb`` (the
     # RESOURCE-goal headline) reflects the training high-water mark, not setup.
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     model.train()
     for step in range(args.iterations):
@@ -1697,7 +1728,7 @@ def main(argv=None):
     # --- peak VRAM (RESOURCE-goal headline; memory-efficiency, no gate) ---
     # Integer MiB to match the existing ``peak_vram_mb:<int>`` log contract that
     # baselines/train_gpt_comparable_sweep.py and the legacy emitter use.
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         print0(f"peak_vram_mb:{int(peak_vram_mb(device))}")
 
     # --- int6 artifact (rank 0) ---

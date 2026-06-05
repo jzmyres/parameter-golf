@@ -112,9 +112,13 @@ The readout is simple: for a recurrent budget \(K\), the final recurrent state
 \[
   z_K=\tfrac12\!\left(a_K+b_K\right)
 \]
-is fed to a mixture-of-softmaxes (MoS) output head~\cite{mos}, which mixes a small number of softmax
+is normalized by a single readout RMSNorm, \(z=\RMSNorm(z_K)\), and \(z\) is fed to a
+mixture-of-softmaxes (MoS) output head~\cite{mos}, which mixes a small number of softmax
 components over the tied embedding basis to break the softmax-rank bottleneck on the output
-distribution.  There is no halting gate: depth is selected by the sampled/evaluated recurrent budget
+distribution.  The readout norm is applied strictly \emph{outside} the reversible recurrence, so
+exact (floor-free) reconstruction is unaffected; it is required because \(z_K\) accumulates \(K\)
+additive updates from \(x_0\) and grows with depth, and an unnormalized \(z_K\) saturates the
+MoS head's \(\tanh\) context map, zeroing its gradient.  There is no halting gate: depth is selected by the sampled/evaluated recurrent budget
 \(K\), and the recurrence's \(F_\theta\)/\(G_\theta\) blocks use MLA attention and smooth-sparse
 SwiGLU MoE, trained with full reversible BPTT~\cite{revffn,revnet} (\(O(1)\) activation memory in
 \(K\), \S\ref{sec:related}) so deeper inference is not penalized by activation storage.  The MoE router is a control-experiment

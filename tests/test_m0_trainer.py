@@ -6,6 +6,7 @@ is written. The unit tests cover the pieces the smoke can't isolate cheaply:
 optimizer param coverage (every trainable param in exactly one group) and the
 finite-horizon hinge loss form.
 """
+import math
 import os
 import sys
 
@@ -23,6 +24,71 @@ def test_m0_trainer_smoke(tmp_path):
           "--artifact-out", str(tmp_path / "m.bin")])
     assert (tmp_path / "m.bin").exists()
     assert (tmp_path / "m.bin").stat().st_size > 0
+
+
+def test_m0_learns_and_init_is_sane():
+    """Regression: the model must (a) START near-uniform and (b) LEARN.
+
+    Guards two coupled bugs that made a 100-step GPU smoke stall at ~27 nats
+    (~4x WORSE than uniform ``ln(vocab)=6.9``) and never descend:
+
+      1. ``z_K`` (the additive-coupling reversible midpoint) grows with depth and
+         was fed UNNORMALIZED into the MoS ``tanh(ctx(z_K))`` head, saturating it
+         so its gradient -> 0 and blocking learning everywhere upstream. Fixed by
+         an RMSNorm of ``z_K`` at readout (OUTSIDE the recurrence, so
+         reversibility is untouched).
+      2. The tied token embedding used default ``nn.Embedding`` init (~N(0,1)),
+         giving huge initial logits and loss ~27 at init. Fixed by small-std init.
+
+    Task: deterministic copy (``targets == tokens``) on a small vocab — learnable
+    in a few dozen steps with tied embeddings, so a healthy model drives the loss
+    down sharply. CPU, seeded, fast. ``model_dim`` is kept large enough (128) that
+    the bad init's oversized ``ctx(z_K)`` actually saturates the head's tanh — the
+    failure mode the tiny ``model_dim=32`` config is too small to surface.
+    """
+    from train_gpt import Hyperparameters, M0GPT
+
+    torch.manual_seed(0)
+    vocab = 64
+    args = Hyperparameters(
+        model_dim=128, n_heads=4, n_kv_heads=2, vocab_size=vocab,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16,
+    )
+    model = M0GPT(args)
+
+    # Deterministic learnable next-token task: copy the input token.
+    gen = torch.Generator().manual_seed(1)
+    x = torch.randint(0, vocab, (4, 16), generator=gen)
+    y = x.clone()
+    depth = 4
+
+    log_vocab = math.log(vocab)
+    with torch.no_grad():
+        initial_loss = model(x, y, depth).item()
+
+    # (b-init) Init must be sane: near-uniform, NOT ~4x worse than uniform.
+    assert initial_loss < 2 * log_vocab, (
+        f"initial loss {initial_loss:.3f} >= 2*ln(vocab)={2*log_vocab:.3f}; "
+        "embedding/head init is too large (regression in init)"
+    )
+
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-3)
+    for _ in range(80):
+        opt.zero_grad(set_to_none=True)
+        loss = model(x, y, depth)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        final_loss = model(x, y, depth).item()
+
+    # (a) The model must actually learn: a clear margin of descent.
+    assert final_loss < 0.6 * initial_loss, (
+        f"loss did not descend: initial={initial_loss:.3f} final={final_loss:.3f} "
+        "(gradient is being blocked — likely tanh saturation from unnormalized z_K)"
+    )
+    # And the start point is sane in absolute terms (near or below ~ln(vocab)).
+    assert initial_loss < 3 * log_vocab
 
 
 def _tiny_args():

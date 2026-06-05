@@ -76,11 +76,20 @@ def test_m0gpt_forward_backward_and_depth():
 
 def test_m0gpt_recurrence_reconstructs_with_real_blocks():
     """Reversibility integration gate with the REAL MLA+MoE delta blocks (fp64)."""
+    torch.manual_seed(0)
     args = Hyperparameters(model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=16,
                            n_experts=4, expert_rank=4, n_mix=2, kv_latent=4, head_dim=8)
     m = M0GPT(args).double()
-    x0 = torch.randn(2, 5, 16, dtype=torch.float64)
+    # M0GPT zero-inits the delta-block output projections (near-identity start),
+    # which would make the recurrence a trivial identity here. Re-randomize them
+    # so reconstruction is tested against NON-TRIVIAL F/G updates.
     rec = m.rec  # the ReversibleRecurrence
+    with torch.no_grad():
+        for blk in (rec.F, rec.G):
+            blk.attn.o_proj.weight.normal_(std=0.3)
+            blk.moe.w_out.normal_(std=0.3)
+    x0 = torch.randn(2, 5, 16, dtype=torch.float64)
     (aK, bK), _ = rec.forward_states(x0, x0, x0, depth=4)
+    assert not torch.allclose(aK, x0), "recurrence is trivially identity; test is vacuous"
     a0, b0 = rec.invert(aK, bK, x0, depth=4)
     assert torch.allclose(a0, x0, atol=1e-7) and torch.allclose(b0, x0, atol=1e-7)
