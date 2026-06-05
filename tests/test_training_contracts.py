@@ -90,9 +90,7 @@ class TestTrainingContracts(unittest.TestCase):
             r"Core \(M_0\)",
             r"\(M_{\rm clk}\)",
             "Positive control",
-            "Halting",
             "additive-coupling reversible recurrence",
-            "standard MHA/GQA plus SwiGLU",
             "reversible full BPTT",
             "Tier 1",
             r"\(S_5\)",
@@ -105,19 +103,49 @@ class TestTrainingContracts(unittest.TestCase):
             self.assertIn(snippet, text)
         for metric in ("G_T", r"\mathrm{NDR}_\epsilon", "Pareto"):
             self.assertIn(metric, text)
+        # Mechanisms that stay EXCLUDED from the P1 science path even under the
+        # retained-M0 design (FP/diagnostic/complexity cruft).
         for snippet in (
             "Dirichlet--UCB router",
-            "MLA",
-            "mixture-of-softmaxes",
             "int6 quantization",
             "Lyapunov pressure",
             "excluded from the P1 science path",
         ):
             self.assertIn(snippet, text)
 
-    def test_opg_doc_stages_kv_and_prior_dense_moe_as_future_non_p1(self) -> None:
+    def test_opg_doc_retains_mla_moe_mos_mechanisms(self) -> None:
+        r"""opg_doc.tex must describe MLA, MoE (smooth routing), and MoS as
+        RETAINED resource/expressiveness mechanisms — not future/excluded.
+
+        The M0 design retains MLA (low-rank KV resource), smooth-sparse MoE
+        (effective-depth basis), and MoS (output-rank expressiveness). The
+        \S{}Goal exclusion list and \S{}Models readout were realigned to this.
+        Dirichlet--UCB, DEQ/implicit backward, fixed-point consistency, and
+        spectral/Lyapunov pressure stay EXCLUDED.
+        """
         text = OPG_DOC.read_text()
         lowered = text.lower()
+        # MLA / MoE / MoS are now retained mechanisms with the resource and
+        # expressiveness justification language.
+        self.assertIn("retained for the resource", lowered)
+        self.assertIn("expressiveness", lowered)
+        for retained in (
+            "MLA",
+            "mixture-of-softmaxes",
+            "MoS",
+        ):
+            self.assertIn(retained, text)
+        # Smooth / non-top-k MoE routing (the reversibility-safe form).
+        self.assertRegex(lowered, r"smooth[- ]sparse|smooth.{0,40}moe|relu.{0,20}softmax")
+        # Excluded complexity/FP/diagnostic mechanisms stay excluded.
+        for excluded in (
+            "Dirichlet--UCB",
+            "fixed-point consistency",
+        ):
+            self.assertIn(excluded, text)
+        self.assertRegex(lowered, r"implicit/deq|deq.{0,20}backward|implicit backward")
+        self.assertIn("lyapunov pressure", lowered)
+        # Prior-evidence / KV-axis staging framing remains coherent.
         for snippet in (
             "S+2, KV axis",
             "exact multi-depth cache",
@@ -125,14 +153,35 @@ class TestTrainingContracts(unittest.TestCase):
             r"\alpha_{\rm kv}",
             "Prior Diagnostic Evidence",
             "16x1 Dense-MoE",
-            "Dirichlet--UCB routing",
-            "MoS output head",
         ):
             self.assertIn(snippet, text)
-        self.assertIn("prior diagnostic evidence", lowered)
         self.assertIn("quality gap", lowered)
         self.assertNotIn("0.9--0.99", text)
         self.assertNotIn("0.9 to 0.99", text)
+
+    def test_opg_doc_models_readout_is_zk_to_mos_not_halting(self) -> None:
+        r"""\S{}Models readout describes z_K -> MoS, with no halting readout.
+
+        The halting-gate readout (eq:halting-readout) was P1 measurement
+        machinery; the retained M0 readout feeds the final recurrent state
+        z_K = 0.5(a_K + b_K) into a Mixture-of-Softmaxes head.
+        """
+        text = OPG_DOC.read_text()
+        lowered = text.lower()
+        # No halting readout in the core model description.
+        self.assertNotIn("halting readout", lowered)
+        self.assertNotIn("eq:halting-readout", text)
+        self.assertNotIn(r"g_k=\sigma(w^\top z_k)", text)
+        # z_K -> MoS readout is described: z_K = 0.5(a_K + b_K) fed to a MoS head.
+        self.assertIn("z_K", text)
+        self.assertRegex(text, r"(?:0\.5|\\tfrac12|\\frac12)\s*\\?!?\s*\\?left?\(?a_K\+b_K")
+        self.assertIn("mixture-of-softmaxes", lowered)
+
+    def test_opg_doc_has_related_work(self) -> None:
+        text = OPG_DOC.read_text()
+        self.assertIn(r"\section{Related Work}", text)
+        for cite in ("revffn", "remoe", "isodepth", "deepseekv2", "mos"):
+            self.assertIn(r"\bibitem{" + cite + "}", text)
 
     def test_opg_doc_demotes_internal_effective_depth_metrics(self) -> None:
         text = OPG_DOC.read_text()

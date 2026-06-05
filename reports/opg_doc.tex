@@ -65,10 +65,13 @@ that later mechanisms cannot substitute for a failed primary result:
 \end{itemize}
 
 The design serves P1.  P2 verifies the training-memory niche.  P3 is optional capacity recovery, not
-the premise of the first experiment.  Therefore the final minimal core deliberately removes feature
-stacks that obscure P1 failure attribution: dense MoE, Dirichlet--UCB routing, MLA, MoS,
-quantization, implicit/DEQ-style backward, fixed-point consistency, spectral or Lyapunov pressure,
-UFID, distillation, and anytime losses are excluded from the P1 science path.  The executable
+the premise of the first experiment.  The core \emph{retains} the mechanisms that directly advance
+the two design goals: MLA (low-rank joint KV compression), smooth-sparse MoE (no hard top-\(k\)), and
+a mixture-of-softmaxes (MoS) output head are retained for the resource (MLA low-rank KV; smooth-sparse
+MoE compute) and expressiveness (MoE effective-depth basis, MoS output-rank) goals.  What it removes
+are feature stacks that obscure P1 failure attribution rather than advancing the goals: Dirichlet--UCB
+routing, implicit/DEQ-style backward, fixed-point consistency, spectral or Lyapunov pressure, UFID,
+distillation, and anytime losses are excluded from the P1 science path.  The executable
 pipeline is only the positive-control, \(M_0\), and \(M_{\rm clk}\) triage.  MoE, cache, and
 deployment axes are executable only through a separate staged diagnostic harness.  This preserves
 the causal split: S+0 promotes or fails P1, while S+1/S+2/S+3 report mechanism and deployment
@@ -79,7 +82,9 @@ diagnostics without becoming explanations for a failed P1 gate.
 \label{sec:models}
 
 \paragraph{Core \(M_0\).}
-The core model is a tied, token-injected, additive-coupling reversible recurrence with standard MHA/GQA plus SwiGLU and a halting readout.  The recurrent state is
+The core model is a tied, token-injected, additive-coupling reversible recurrence whose \(F_\theta\)
+and \(G_\theta\) blocks are pre-norm MLA attention~\cite{deepseekv2} plus a smooth-sparse SwiGLU
+mixture-of-experts (MoE).  The recurrent state is
 \(s_k=(a_k,b_k)\), with input embedding state \(x_0\):
 \begin{align}
   a_{k+1}
@@ -103,25 +108,21 @@ The inverse is structural and floor-free:
 Invertibility is therefore an algebraic property of the additive coupling, not a consequence of
 contraction.  The core does not require a fixed point.
 
-The readout uses a halting gate \(g_k=\sigma(w^\top z_k)\), where \(z_k\) denotes the readable
-state derived from \(s_k\).  For a recurrent budget \(K\):
-\begin{equation}
-  o_K
-  =
-  \sum_{k=1}^{K}
-  \left(
-    g_k\prod_{j<k}(1-g_j)
-  \right)z_k .
-  \label{eq:halting-readout}
-\end{equation}
-If \(g_{K_{\rm lo}}=1\), the depth-\(K_{\rm lo}\) output is reproducible inside the
-depth-\(K_{\rm hi}\) hypothesis class for \(K_{\rm hi}>K_{\rm lo}\).  This gives the desired
-nestedness:
+The readout is simple: for a recurrent budget \(K\), the final recurrent state
 \[
-  \mathcal F_{K_{\rm lo}}\subseteq\mathcal F_{K_{\rm hi}},
+  z_K=\tfrac12\!\left(a_K+b_K\right)
 \]
-and hence achievable risk monotonicity.  The trained model can still fail; the point is that the
-architecture no longer makes deeper inference intrinsically non-nested.
+is fed to a mixture-of-softmaxes (MoS) output head~\cite{mos}, which mixes a small number of softmax
+components over the tied embedding basis to break the softmax-rank bottleneck on the output
+distribution.  There is no halting gate: depth is selected by the sampled/evaluated recurrent budget
+\(K\), and the recurrence's \(F_\theta\)/\(G_\theta\) blocks use MLA attention and smooth-sparse
+SwiGLU MoE, trained with full reversible BPTT~\cite{revffn,revnet} (\(O(1)\) activation memory in
+\(K\), \S\ref{sec:related}) so deeper inference is not penalized by activation storage.  The MoE router is a control-experiment
+knob, \texttt{router\_type}\(\in\{\texttt{relu},\texttt{softmax}\}\) (ReLU routing per
+ReMoE~\cite{remoe} is continuous, reconstruction-stable, and reversibility-safe; cf.\
+MoEUT~\cite{moeut}).  The trained model can still fail; the point is that the architecture composes
+shared low-rank experts per step into high \emph{effective} depth.  Nestedness across depth is a
+property of the additive-coupling recurrence and budget selection, not of a halting gate.
 
 The memory-critical target implementation uses reversible full BPTT through \(K_{\rm hi}\).
 Truncation is only a calibrated fallback, because full reversible BPTT is the core advantage for
@@ -179,10 +180,13 @@ part of the current P1 executable interface.  Their code path lives in
 make depth utility detectable.
 
 \paragraph{Explicit exclusions from P1.}
-The following are not part of the core science path: Dirichlet--UCB router, MLA, mixture-of-softmaxes
-head, int6 quantization, DEQ or implicit backward, prefix-anchor consistency, spectral or Lyapunov
-pressure, UFID, distillation, and anytime losses.  They may remain in the repository as legacy,
-deployment, or later-stage axes, but they should not be used to establish P1.
+The following are not part of the core science path: Dirichlet--UCB router, int6 quantization, DEQ or
+implicit backward, fixed-point consistency, prefix-anchor consistency, spectral or Lyapunov pressure,
+UFID, distillation, and anytime losses.  They may remain in the repository as legacy, deployment, or
+later-stage axes, but they should not be used to establish P1.  MLA, smooth-sparse MoE, and the MoS
+output head are \emph{retained} in \(M_0\) for the resource and expressiveness goals
+(\S\ref{sec:goal}, \S\ref{sec:related}); the MoE router type is a control-experiment knob, not an
+excluded mechanism.
 
 %==============================================================================
 \section{Experimental Protocol}
@@ -306,7 +310,7 @@ computation is useful on the data before investing in autonomous routing.
 A1 & The task requires depth & Provable depth-hard synthetic task plus positive control.  If neither control nor clock scales, the harness or block is the issue. \\
 A2 & Reversibility holds numerically & \(R_{\rm rec}\) measured with real stochasticity; replay RNG state for stochastic operations in the recurrent path. \\
 A3 & Memory is binding and latency tolerable & Pareto gate versus a small dense model.  If a small dense model wins, the memory-bound niche is absent. \\
-A4 & Halting gate can saturate & Verify \(g_k\to1\) is reachable; otherwise nestedness is only approximate. \\
+A4 & Nestedness holds without a halting gate & Depth is selected by the recurrent budget \(K\); verify the depth-\(K_{\rm lo}\) function is reachable inside the depth-\(K_{\rm hi}\) class, otherwise nestedness is only approximate. \\
 A5 & Additive coupling stays bounded over \(K\) & Boundedness penalty plus hard guards; monitor norm growth as a stability and throughput cost. \\
 A6 & Optional P3 capacity recovery is needed & Tested only after P1 holds; otherwise capacity mechanisms are premature. \\
 \bottomrule
