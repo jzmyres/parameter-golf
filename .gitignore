@@ -41,3 +41,6 @@ experiments/profile_chrome_trace.json
 baselines/worktrees/
 baselines/runs/
 baselines/.envs/
+
+# Generated from reports/opg_doc.tex (do not track; no pdflatex needed)
+reports/opg_doc.pdf
