@@ -415,6 +415,64 @@ for both seed modes: the algebraic inverse recovers the random seed exactly, and
 drops the \(x_0\)-seed gradient term (\(g_{x_0}\mathrel{+}=g_a+g_b\)) when the seed is the random,
 non-learnable init---returning \(g_a,g_b\) in the seed slots, which the caller discards.
 
+\paragraph{The principled expressiveness metric: depth-resolved \texorpdfstring{$\mathcal{V}$}{V}-usable predictive information.}
+\label{par:vinfo}
+The headline measure of the \emph{expressiveness} a model \emph{gains from recurrence depth} \(K\) is
+the depth-resolved \(\mathcal{V}\)-usable predictive information~\cite{vinfo,vusable}.  Let \(Y\) be
+the next token and \(z_K\) the depth-\(K\) representation read by the model's own readout family
+\(\mathcal{V}\) (the MoS head).  Define the predictive \(\mathcal{V}\)-information
+\begin{equation}
+\label{eq:vinfo}
+  I_{\mathcal{V}}(z_K\!\to\!Y)
+  \;=\; H_{\mathcal{V}}(Y)\;-\;H_{\mathcal{V}}(Y\mid z_K)
+  \;=\; H_{\mathcal{V}}(Y)\;-\;\mathrm{loss}(K),
+\end{equation}
+where \(H_{\mathcal{V}}(Y)=-\sum_y p(y)\log p(y)\) is the best \emph{marginal} predictor loss
+(the empirical next-token marginal cross-entropy over the eval set, a constant in \(K\); reported in
+nats and, dividing by \(\ln 2\), in bits), and \(\mathrm{loss}(K)\) is the depth-\(K\) conditional
+cross-entropy already produced by the \code{--k-eval-sweep}.  The objective is
+\begin{equation}
+\label{eq:vinfo-obj}
+  \mathrm{corr}\bigl(I_{\mathcal{V}}(K),\,K\bigr)\;\to\;+1
+  \qquad\Longleftrightarrow\qquad \mathrm{loss}(K)\ \text{monotonically decreasing in }K,
+\end{equation}
+which the trainer logs as the rank correlation \code{expressiveness\_rho}
+\(=\mathrm{spearman}\bigl(K,\,I_{\mathcal{V}}(K)\bigr)\) (equivalently of \(-\mathrm{loss}\) vs.\ \(K\)),
+together with the per-\(K\) \code{usable\_info} line (\(I_{\mathcal{V}}(K)\) in bits) and the total
+usable information gained across the swept range \code{iv\_total\_bits}
+\(=I_{\mathcal{V}}(K_{\max})-I_{\mathcal{V}}(K_{\min})\) (in bits).  On real data \(I_{\mathcal{V}}(K)\)
+is \emph{realized} expressiveness; on the depth-hard positive control it measures \emph{capability}.
+
+This is THE principled expressiveness measure for three reasons.  (i) \(\mathcal{V}\)-information is
+the \emph{unique} information measure that can be \emph{created by computation}: Shannon mutual
+information cannot grow with depth (the data-processing inequality forbids
+\(I(z_K;Y)>I(z_0;Y)\) for any deterministic map), but \(I_{\mathcal{V}}\) can, because it is defined
+relative to the bounded readout family \(\mathcal{V}\)~\cite{vinfo}.  (ii) It is
+\emph{sufficient-and-necessary} for usable predictive expressiveness w.r.t.\ \(\mathcal{V}\): it equals
+the codelength (MDL) reduction a \(\mathcal{V}\)-decoder achieves from \(z_K\), and captures the
+combinatorial MoE path family (a parameter-count surrogate \(\varphi N\) cannot).  (iii) It
+\emph{subsumes} the previous depth summaries: the depth-gain \(G_T=\bpb(K_{\min})-\bpb(K_{\max})\) is a
+two-point bits-per-byte version of \code{iv\_total\_bits}, and \code{phi\_eval} is an OLS log-slope of
+the same \(\{K:\mathrm{loss}(K)\}\) curve --- both are now read as summaries/proxies of
+Eq.~\eqref{eq:vinfo}.  The marginal entropy \(H_{\mathcal{V}}(Y)\) is accumulated once as token counts
+over the same cached eval batches and all-reduced across DDP ranks so the constant is identical on
+every rank; the sweep drops non-finite depths, and \code{expressiveness\_rho} is \(\mathrm{NaN}\) with
+fewer than three finite \(K\) (no rank correlation estimable).
+
+\paragraph{Expressiveness versus efficiency: orthogonal goals on the two-goal frontier.}
+The recurrence param-\emph{efficiency} exponent \(\varphi_{\rm isodepth}\) (Eq.~\eqref{eq:isodepth}) and
+\(\mathcal{V}\)-information \(I_{\mathcal{V}}\) (Eq.~\eqref{eq:vinfo}) measure \emph{orthogonal} things.
+\(\varphi_{\rm isodepth}\) is a \emph{resource-axis} quantity --- how many \emph{unique parameters} one
+recurrent loop is worth (\(\varphi=1\): a loop equals a unique block; \(\varphi>1\):
+\emph{super}-param-equivalent recurrence, e.g.\ via MoE combinatorial path reuse, so the fit bound is
+relaxed to \(\varphi\in[0,3]\) and no longer censored at unity).  \(I_{\mathcal{V}}\) is a
+\emph{quality-axis} quantity --- how much \emph{usable predictive information} depth actually adds,
+independent of parameter accounting.  A model can be param-efficient yet low-expressiveness (high
+\(\varphi\), flat \(I_{\mathcal{V}}\)) or expressive yet param-inefficient.  Both are gated by the same
+reversibility correctness condition \(\code{\detokenize{recon_rel}}\approx0\): the depth-\(K\)
+representation \(z_K\) and the loop param count are only meaningful when the reversible round-trip is
+bit-exact.
+
 \paragraph{Scale and statistics.}
 Use \(d_{\rm model}\in[512,768]\) (the trainer default is \(768\): 12 query / 4 KV heads,
 head dim 64, MLA kv-latent 256, 16 experts of rank 64), one reversible block, context length at
@@ -443,7 +501,8 @@ replace this with a paired bootstrap over saved per-example gains.
 \(\vram_{\rm peak}\), \(\mathrm{slope}(\vram/\text{batch})\), \(\alpha_{\rm act}\), \(R_{\rm rec}\) & \GATE\ (P2, resource = memory-efficiency) & Peak VRAM is the primary resource number; VRAM-vs-batch scaling slope should be low/flat (\(\mathrm{slope}_{\rm MB/sample}\), OLS fit \code{\detokenize{vram_vs_batch_scaling}}); \(R_{\rm act}(K,2K)\le1.10\) (activation memory \(\approx\)constant in recurrent depth \(K\)); the reversible round-trip error \(\code{\detokenize{recon_rel}}\) (the BPTT gradient-correctness gate) acceptable under actual training stochasticity.  Dropped as resource metrics: the artifact-16\,MB hard gate (artifact bytes logged informationally only), FLOPs/token, and wall-clock/step.  The active-expert fraction is demoted to a MoE-mechanism diagnostic (\code{\detokenize{diag:active_frac}}), not a resource gate.  Throughput (\code{\detokenize{ops:tok_per_s}}) and VRAM utilization (\code{\detokenize{ops:vram_util_pct}}\(=100\cdot\vram_{\rm peak}/\)device memory) are logged as \emph{ops/efficiency} diagnostics (under the \code{ops:} prefix) for tuning the batch / grad-accum knobs --- \code{\detokenize{--grad-accum 1}} runs the whole batch in one forward to fill VRAM, which the \(O(1)\)-in-\(K\) reversible recurrence makes affordable at deep \(K\) --- and are \emph{not} resource gates. \\
 Pareto \((S_T,\vram,\mathrm{ms/token})\) & \GATE\ (sufficiency) & On or above frontier versus a matched small dense transformer.  This, not \(G_T>0\) alone, is project success. \\
 \midrule
-Recurrence-equivalence exponent & \DIAG\ (headline) & \(K\) recurrent loops are worth how many untied layers; fit on the synthetic task where hardness is known. \\
+\(I_{\mathcal{V}}(z_K\!\to\!Y)\), \code{\detokenize{expressiveness_rho}} & \DIAG\ (expressiveness headline) & Depth-resolved \(\mathcal{V}\)-usable predictive information \(I_{\mathcal{V}}=H_{\mathcal{V}}(Y)-\mathrm{loss}(K)\) (Eq.~\eqref{eq:vinfo}); objective \(\mathrm{corr}(I_{\mathcal{V}},K)\to+1\).  The principled expressiveness measure (quality axis); subsumes \code{\detokenize{depth_gain_GT}}/\code{\detokenize{phi_eval}}. \\
+\(\varphi_{\rm isodepth}\) (Recurrence-equivalence exponent, param-efficiency) & \DIAG\ (efficiency, orthogonal) & \(K\) recurrent loops are worth how many \emph{unique-parameter} blocks; fit on the synthetic task where hardness is known.  Resource axis, \(\varphi\in[0,3]\) (\(>1\): super-param-equivalent), \emph{not} expressiveness. \\
 Convergence-depth \(k^\star(x)\) vs. hardness & \DIAG & Correlate with \(\ell\) or graph diameter.  Flat and small \(k^\star\) is the plateau signature. \\
 \(\mathrm{WFIR}\) & \DIAG & Use task-aligned readout, such as correct-token log-probability or NLL contribution; do not use random projections as the headline.  Report \(\mathrm{WFIR}_{\rm real}-\mathrm{WFIR}_{\rm shuffled}\). \\
 \(\Delta_{\rm MoE}\), \(\mathrm{AEBR}\), route-depth NMI & \DIAG\ (future P3) & Use only after P1 passes and only in a separate MoE ablation.  They are not emitted by the P1 harness. \\
@@ -1044,6 +1103,18 @@ Z. Yang, Z. Dai, R. Salakhutdinov, and W. W. Cohen.
 O. Roy and M. Vetterli.
 \newblock The Effective Rank: A Measure of Effective Dimensionality.
 \newblock \emph{European Signal Processing Conference (EUSIPCO)}, 2007.
+
+\bibitem{vinfo}
+Y. Xu, S. Zhao, J. Song, R. Stewart, and S. Ermon.
+\newblock A Theory of Usable Information Under Computational Constraints.
+\newblock \emph{International Conference on Learning Representations}, 2020.
+\newblock \url{https://arxiv.org/abs/2002.10689}.
+
+\bibitem{vusable}
+K. Ethayarajh, Y. Choi, and S. Swayamdipta.
+\newblock Understanding Dataset Difficulty with \(\mathcal{V}\)-Usable Information.
+\newblock \emph{International Conference on Machine Learning}, 2022.
+\newblock \url{https://arxiv.org/abs/2110.08420}.
 
 \end{thebibliography}
 

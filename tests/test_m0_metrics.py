@@ -31,7 +31,10 @@ from train_gpt import (  # noqa: E402
     fit_phi,
     fit_phi_isodepth,
     kv_bytes_per_token,
+    marginal_token_entropy,
     recurrence_param_counts,
+    spearman_rho,
+    usable_information,
     _fit_slope,
     vram_vs_batch_scaling,
 )
@@ -201,6 +204,158 @@ def test_fit_phi_isodepth_returns_full_param_dict():
         assert key in out, key
     assert all(isinstance(out[k], float) for k in ("phi", "alpha", "E", "A", "rmse"))
     assert isinstance(out["n_points"], int)
+
+
+# --- marginal_token_entropy (H_V(Y): empirical next-token marginal CE) -----
+# H_V(Y) is the best MARGINAL predictor loss (the constant baseline against
+# which depth-K usable predictive information I_V(K) = H_V(Y) - loss(K) is
+# measured). It is the Shannon entropy of the empirical next-token frequencies,
+# -sum_y p(y) log p(y) in NATS.
+def test_marginal_token_entropy_uniform_is_log_V():
+    # Uniform over V distinct tokens -> H = ln(V) (maximal marginal entropy).
+    import torch
+    for V in (4, 16, 64):
+        targets = torch.arange(V)  # each token exactly once -> uniform
+        h = marginal_token_entropy(targets)
+        assert abs(h - math.log(V)) < 1e-6, (V, h)
+
+
+def test_marginal_token_entropy_skewed_below_log_V():
+    # A skewed distribution has LESS marginal entropy than the uniform ceiling.
+    import torch
+    # 4 distinct tokens but heavily skewed toward token 0.
+    targets = torch.tensor([0, 0, 0, 0, 0, 0, 0, 1, 2, 3])
+    h = marginal_token_entropy(targets)
+    assert 0.0 < h < math.log(4)
+
+
+def test_marginal_token_entropy_hand_example():
+    # p = [1/2, 1/4, 1/4] -> H = -1/2 ln(1/2) - 2*(1/4 ln 1/4)
+    #   = 1/2 ln2 + 1/2 ln4 = 1/2 ln2 + ln2 = 1.5 ln2 nats.
+    import torch
+    targets = torch.tensor([0, 0, 1, 2])  # counts 2,1,1 over 4 -> 1/2,1/4,1/4
+    h = marginal_token_entropy(targets)
+    assert abs(h - 1.5 * math.log(2)) < 1e-9, h
+
+
+def test_marginal_token_entropy_accepts_count_mapping():
+    # Accepts a precomputed {token_id: count} mapping (the accumulated form the
+    # sweep all-reduces across ranks), not just a raw target iterable.
+    h_counts = marginal_token_entropy({0: 2, 1: 1, 2: 1})
+    h_iter = marginal_token_entropy([0, 0, 1, 2])
+    assert abs(h_counts - h_iter) < 1e-12
+    assert abs(h_counts - 1.5 * math.log(2)) < 1e-9
+
+
+def test_marginal_token_entropy_single_token_is_zero():
+    # A degenerate single-token target stream has zero marginal entropy.
+    assert abs(marginal_token_entropy([7, 7, 7, 7])) < 1e-12
+
+
+def test_marginal_token_entropy_returns_float():
+    h = marginal_token_entropy([0, 1, 2, 3])
+    assert isinstance(h, float)
+
+
+# --- spearman_rho (rank correlation for the I_V(K)-vs-K objective) ----------
+def test_spearman_rho_perfect_monotone_is_one():
+    assert abs(spearman_rho([1, 2, 4, 8], [10, 20, 30, 40]) - 1.0) < 1e-9
+
+
+def test_spearman_rho_reverse_is_minus_one():
+    assert abs(spearman_rho([1, 2, 4, 8], [40, 30, 20, 10]) + 1.0) < 1e-9
+
+
+def test_spearman_rho_nonlinear_monotone_is_one():
+    # Spearman is rank-based: any strictly increasing map still gives rho = 1.
+    assert abs(spearman_rho([1, 2, 3, 4], [1, 4, 9, 16]) - 1.0) < 1e-9
+
+
+def test_spearman_rho_too_few_points_is_nan():
+    assert math.isnan(spearman_rho([1, 2], [3, 4]))
+    assert math.isnan(spearman_rho([], []))
+    assert math.isnan(spearman_rho([5], [5]))
+
+
+def test_spearman_rho_returns_float():
+    assert isinstance(spearman_rho([1, 2, 3], [3, 2, 1]), float)
+
+
+# --- usable_information (depth-resolved V-usable predictive information) -----
+# THE principled expressiveness metric: I_V(z_K -> Y) = H_V(Y) - val_loss(K),
+# the usable predictive information the depth-K representation exposes to the
+# readout family V. Objective: corr(I_V(K), K) -> +1 (loss decreasing in depth).
+def test_usable_information_iv_is_h_minus_loss():
+    h = 4.0
+    losses = {2: 3.0, 4: 2.5, 8: 2.0}
+    out = usable_information(losses, h)
+    for k, loss in losses.items():
+        assert abs(out["iv_nats"][k] - (h - loss)) < 1e-12
+        assert abs(out["iv_bits"][k] - (h - loss) / math.log(2)) < 1e-12
+
+
+def test_usable_information_monotone_decreasing_loss_rho_one():
+    # loss(K) strictly decreasing -> I_V(K) strictly increasing -> rho = +1,
+    # and total usable info gained over the swept range is positive.
+    h = 5.0
+    losses = {2: 3.0, 4: 2.5, 8: 2.0, 16: 1.5}
+    out = usable_information(losses, h)
+    assert abs(out["rho"] - 1.0) < 1e-9
+    assert out["iv_total_bits"] > 0.0
+    # iv_total_bits == iv_bits[maxK] - iv_bits[minK] == (loss[minK]-loss[maxK])/ln2.
+    expected = (losses[2] - losses[16]) / math.log(2)
+    assert abs(out["iv_total_bits"] - expected) < 1e-9
+
+
+def test_usable_information_flat_loss_rho_zero_total_zero():
+    h = 5.0
+    losses = {2: 2.5, 4: 2.5, 8: 2.5}
+    out = usable_information(losses, h)
+    # Flat loss -> tied ranks -> spearman is 0 (or NaN under zero variance); the
+    # construction here yields rho == 0 with scipy's tie handling.
+    assert abs(out["rho"]) < 1e-9 or math.isnan(out["rho"])
+    assert abs(out["iv_total_bits"]) < 1e-12
+
+
+def test_usable_information_increasing_loss_is_anti_expressive():
+    # loss(K) INCREASING with depth (anti-expressive) -> rho < 0, total < 0.
+    h = 5.0
+    losses = {2: 2.0, 4: 2.5, 8: 3.0}
+    out = usable_information(losses, h)
+    assert out["rho"] < 0.0
+    assert out["iv_total_bits"] < 0.0
+
+
+def test_usable_information_drops_nonfinite_and_handles_too_few():
+    h = 4.0
+    # A diverged K (NaN/inf loss) is dropped before fitting.
+    losses = {2: 3.0, 4: float("nan"), 8: 2.0, 16: float("inf")}
+    out = usable_information(losses, h)
+    assert 4 not in out["iv_nats"] and 16 not in out["iv_nats"]
+    assert set(out["iv_nats"].keys()) == {2, 8}
+    # <2 finite points -> rho NaN (no rank correlation estimable).
+    out1 = usable_information({2: 3.0, 4: float("nan")}, h)
+    assert math.isnan(out1["rho"])
+
+
+def test_usable_information_returns_expected_keys():
+    out = usable_information({2: 3.0, 4: 2.0}, 4.0)
+    for key in ("iv_nats", "iv_bits", "rho", "iv_total_bits"):
+        assert key in out, key
+    assert isinstance(out["iv_nats"], dict)
+    assert isinstance(out["iv_bits"], dict)
+
+
+# --- fit_phi_isodepth super-param-equivalent (phi > 1) recovery -------------
+def test_fit_phi_isodepth_recovers_super_equivalent_phi():
+    # With the cap relaxed to [0, 3], a super-param-equivalent recurrence
+    # (phi_true = 1.5: each loop buys MORE than a unique block, e.g. via MoE
+    # combinatorial path reuse) is now RECOVERABLE instead of clamped at 1.
+    losses = _isodepth_losses(1.5)
+    out = fit_phi_isodepth(losses, _ISO_N_ONCE, _ISO_N_REC)
+    assert math.isfinite(out["phi"]), out
+    assert out["phi"] > 1.0, out          # not censored at the old cap
+    assert abs(out["phi"] - 1.5) < 0.05, out
 
 
 # --- recurrence_param_counts (N_once / N_rec split for the Iso-Depth law) --

@@ -185,6 +185,17 @@ def parse_log(logpath: str) -> dict:
         "depth_sweep": {},
         "depth_gain_GT": None,
         "phi_eval": None,
+        # PRINCIPLED EXPRESSIVENESS METRIC (--k-eval-sweep): depth-resolved
+        # V-usable predictive information I_V(z_K -> Y) = H_V(Y) - val_loss(K)
+        # (Xu 2020 / Ethayarajh 2022). Standalone end-of-run lines:
+        #   usable_info: K=<int> iv_bits:<f> val_loss:<f>   (one per swept K)
+        #   expressiveness_rho:<f>   (spearman(K, I_V) -> +1 = depth adds info)
+        #   iv_total_bits:<f>        (iv_bits[maxK] - iv_bits[minK])
+        # `usable_info` -> {K: iv_bits} map; rho/total are run-level scalars.
+        # NaN-tolerant (rho is NaN with <3 finite K; iv_bits real on smoke).
+        "usable_info": {},
+        "expressiveness_rho": None,
+        "iv_total_bits": None,
         # PRINCIPLED Iso-Depth train-r phi (experiments/measure_phi.py — an
         # EXPENSIVE multi-train sweep, NOT a per-run metric). It fits the scaling
         # law L(r)=E+A*(N_once+r^phi*N_rec)^-alpha over models pretrained at
@@ -424,6 +435,24 @@ def parse_log(logpath: str) -> dict:
         m = re.search(rf"^phi_eval:{_FLOAT_NAN}", line)
         if m:
             data["phi_eval"] = float(m.group(1))
+
+        # PRINCIPLED EXPRESSIVENESS METRIC (--k-eval-sweep): per-K usable_info
+        # (I_V in bits) map plus run-level expressiveness_rho / iv_total_bits.
+        # NaN-tolerant: iv_bits is real on the synthetic smoke (val_loss real),
+        # but rho is NaN with <3 finite K.
+        m = re.search(
+            rf"^usable_info:\s*K=(\d+)\s+iv_bits:{_FLOAT_NAN}\s+val_loss:{_FLOAT_NAN}",
+            line)
+        if m:
+            data["usable_info"][int(m.group(1))] = float(m.group(2))
+
+        m = re.search(rf"^expressiveness_rho:{_FLOAT_NAN}", line)
+        if m:
+            data["expressiveness_rho"] = float(m.group(1))
+
+        m = re.search(rf"^iv_total_bits:{_FLOAT_NAN}", line)
+        if m:
+            data["iv_total_bits"] = float(m.group(1))
 
         # PRINCIPLED Iso-Depth train-r phi (experiments/measure_phi.py). The
         # per-r sweep line carries val_loss + val_bpb (a FAILED run prints the

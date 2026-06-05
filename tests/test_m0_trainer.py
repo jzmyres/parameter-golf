@@ -998,6 +998,28 @@ def test_m0_trainer_k_eval_sweep_emits_depth_gain(tmp_path, capsys):
     phi = float(m_phi.group(1))
     assert 0.0 <= phi <= 1.0, phi
 
+    # PRINCIPLED EXPRESSIVENESS: the sweep also emits per-K usable_info lines
+    # (I_V(K) in bits, finite even on the synthetic smoke since val_loss is real),
+    # plus end-of-run expressiveness_rho and iv_total_bits scalars.
+    iv_lines = {}
+    for ln in out.splitlines():
+        m = re.match(
+            r"usable_info: K=(\d+) iv_bits:([-+0-9.eEnNaA]+) val_loss:([-+0-9.eEnNaA]+)",
+            ln)
+        if m:
+            iv_lines[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+    assert set(iv_lines) == {2, 4, 8}, f"missing usable_info lines: {iv_lines}"
+    for k, (iv_bits, loss) in iv_lines.items():
+        assert iv_bits == iv_bits, f"K={k} iv_bits is NaN"  # noqa: PLR0124
+        assert loss == loss, f"K={k} val_loss is NaN"        # noqa: PLR0124
+    m_rho = re.search(r"^expressiveness_rho:([-+0-9.eEnNaA]+)", out, re.MULTILINE)
+    m_tot = re.search(r"^iv_total_bits:([-+0-9.eEnNaA]+)", out, re.MULTILINE)
+    assert m_rho is not None, "no expressiveness_rho line"
+    assert m_tot is not None, "no iv_total_bits line"
+    # rho is a spearman correlation in [-1, 1] (3 finite K -> estimable), or NaN.
+    rho = float(m_rho.group(1))
+    assert math.isnan(rho) or -1.0 <= rho <= 1.0, rho
+
 
 def test_init_state_cli_default_and_choices():
     """--init-state defaults to x0 (current behavior); random is the Huginn fix."""

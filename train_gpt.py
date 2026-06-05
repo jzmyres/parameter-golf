@@ -2677,27 +2677,167 @@ def fit_phi(losses: dict) -> float:
     return float(min(max(b / b_ref, 0.0), 1.0))
 
 
-def fit_phi_isodepth(losses_by_r, n_once, n_rec) -> dict:
-    """PRINCIPLED Iso-Depth recurrence-equivalence exponent ``phi`` (arXiv:2604.21106).
+def marginal_token_entropy(targets_or_counts) -> float:
+    """Empirical next-token MARGINAL cross-entropy ``H_V(Y)`` in NATS.
 
-    Unlike :func:`fit_phi` (a cheap *eval-depth* proxy: an OLS log-slope of one
-    trained model's loss vs inference depth ``K``, divided by a unit reference),
-    this is THE recurrence-effectiveness metric. It is a FITTED parameter in the
-    joint Iso-Depth scaling law, estimated from a *pretraining sweep over
-    recurrence counts* ``r`` (separate models, each trained at a fixed recurrence
-    depth ``r``, same data / steps / seed). At fixed data ``D`` the ``B*D^-beta``
-    term is constant and absorbed into the irreducible offset ``E``::
+    ``H_V(Y) = -sum_y p(y) log p(y)`` over the eval targets, where ``p`` is the
+    empirical next-token frequency distribution. This is the best MARGINAL
+    predictor loss — the constant baseline the depth-resolved V-usable predictive
+    information is measured against::
+
+        I_V(z_K -> Y) = H_V(Y) - H_V(Y | z_K) = H_V(Y) - val_loss(K)
+
+    (Xu et al. 2020, arXiv:2002.10689; Ethayarajh et al. 2022, arXiv:2110.08420.)
+    It is a CONSTANT w.r.t. depth K, so the sweep computes it ONCE over the cached
+    eval batches' targets (counts all-reduced across DDP ranks so ``H_V`` is
+    identical on every rank).
+
+    Args:
+        targets_or_counts: either an iterable of target token ids (a tensor, a
+            list, or anything iterable of ints — flattened) OR a precomputed
+            ``{token_id: count}`` mapping (the accumulated form the sweep
+            all-reduces). The two forms yield the same entropy.
+
+    Returns:
+        ``H_V(Y)`` in nats as a Python ``float`` (``0.0`` for an empty/degenerate
+        single-token stream; ``0 * log 0 := 0`` for unseen tokens).
+    """
+    if isinstance(targets_or_counts, dict):
+        counts = {int(k): float(v) for k, v in targets_or_counts.items() if v > 0}
+    else:
+        t = targets_or_counts
+        if isinstance(t, torch.Tensor):
+            ids = t.detach().reshape(-1).tolist()
+        else:
+            ids = [int(x) for x in t]
+        counts = {}
+        for tid in ids:
+            counts[int(tid)] = counts.get(int(tid), 0.0) + 1.0
+    total = sum(counts.values())
+    if total <= 0.0:
+        return 0.0
+    # H = -sum_y p(y) log p(y); unseen tokens (count 0) contribute 0 (0 log 0 := 0).
+    h = 0.0
+    for c in counts.values():
+        if c > 0.0:
+            p = c / total
+            h -= p * math.log(p)
+    return float(h)
+
+
+def spearman_rho(xs, ys) -> float:
+    """Spearman rank correlation between ``xs`` and ``ys`` (NaN for <3 points).
+
+    The headline expressiveness objective is ``corr(I_V(K), K) -> +1``: depth
+    monotonically adds usable predictive information. Spearman (rank) correlation
+    captures that monotone relationship without assuming linearity. Uses
+    :func:`scipy.stats.spearmanr`; returns ``NaN`` for fewer than 3 points (no
+    rank correlation is estimable) and for a degenerate zero-variance input.
+
+    Args:
+        xs, ys: equal-length sequences of floats.
+
+    Returns:
+        Spearman ``rho`` in ``[-1, 1]`` as a Python ``float``, or ``NaN``.
+    """
+    import warnings
+
+    from scipy.stats import ConstantInputWarning, spearmanr  # local: diagnostic path only
+
+    xs = list(xs)
+    ys = list(ys)
+    if len(xs) < 3 or len(xs) != len(ys):
+        return float("nan")
+    with warnings.catch_warnings():
+        # A constant input (e.g. flat loss across depths) has undefined rank
+        # correlation; scipy returns NaN, which we surface as-is (not an error).
+        warnings.simplefilter("ignore", ConstantInputWarning)
+        rho = spearmanr(xs, ys).correlation
+    return float(rho)
+
+
+def usable_information(val_losses_by_k: dict, h_marginal: float) -> dict:
+    """Depth-resolved V-usable predictive information ``I_V(z_K -> Y)``.
+
+    THE principled model-expressiveness metric (Xu et al. 2020, arXiv:2002.10689;
+    Ethayarajh et al. 2022, arXiv:2110.08420). For each recurrence depth ``K``::
+
+        I_V(z_K -> Y) = H_V(Y) - val_loss(K)     [nats]
+
+    the usable predictive information the depth-``K`` representation ``z_K``
+    exposes to the readout family ``V`` (the model's own readout). It is THE
+    expressiveness measure because V-information is the UNIQUE information measure
+    that can be CREATED by computation: Shannon MI cannot grow with depth (data
+    processing), but ``I_V`` can, so it is sufficient-and-necessary for usable
+    predictive expressiveness w.r.t. ``V`` and equals the MDL codelength
+    reduction. It subsumes ``depth_gain_GT`` / ``phi_eval`` (those are summaries
+    / proxies of the same loss-vs-depth curve).
+
+    The objective is ``corr(I_V(K), K) -> +1`` (equivalently spearman of
+    ``-val_loss`` vs ``K``): depth monotonically adds usable predictive info.
+
+    Args:
+        val_losses_by_k: ``{K: val_loss_nats}`` from the eval-K sweep. Non-finite
+            losses (a diverged K) are dropped before the correlation fit.
+        h_marginal: the marginal entropy ``H_V(Y)`` in nats
+            (:func:`marginal_token_entropy`), a depth-independent constant.
+
+    Returns:
+        ``{"iv_nats": {K: H_V - loss(K)}, "iv_bits": {K: (...) / ln2},
+        "rho": spearman(K, I_V), "iv_total_bits": iv_bits[maxK] - iv_bits[minK]}``.
+        ``rho`` is ``NaN`` with <2 finite points; ``iv_total_bits`` is ``0.0``
+        with <2 finite points (no depth range to span).
+    """
+    ln2 = math.log(2.0)
+    pts = sorted(
+        (int(k), float(v))
+        for k, v in val_losses_by_k.items()
+        if math.isfinite(float(v))
+    )
+    iv_nats = {k: h_marginal - v for k, v in pts}
+    iv_bits = {k: (h_marginal - v) / ln2 for k, v in pts}
+    ks = [k for k, _ in pts]
+    ivs = [iv_nats[k] for k in ks]
+    rho = spearman_rho(ks, ivs)  # NaN for <3 points (spearman_rho contract)
+    if len(pts) >= 2:
+        iv_total_bits = iv_bits[ks[-1]] - iv_bits[ks[0]]
+    else:
+        iv_total_bits = 0.0
+    return {
+        "iv_nats": iv_nats,
+        "iv_bits": iv_bits,
+        "rho": rho,
+        "iv_total_bits": float(iv_total_bits),
+    }
+
+
+def fit_phi_isodepth(losses_by_r, n_once, n_rec) -> dict:
+    """PRINCIPLED Iso-Depth recurrence param-EFFICIENCY exponent ``phi`` (arXiv:2604.21106).
+
+    This is the recurrence param-EFFICIENCY exponent — a RESOURCE-axis
+    diagnostic, NOT an expressiveness measure (expressiveness is the V-usable
+    predictive information ``I_V(z_K -> Y) = H_V(Y) - loss(K)``;
+    :func:`usable_information`). Unlike :func:`fit_phi` (a cheap *eval-depth*
+    proxy: an OLS log-slope of one trained model's loss vs inference depth ``K``,
+    divided by a unit reference), this is THE param-efficiency metric. It is a
+    FITTED parameter in the joint Iso-Depth scaling law, estimated from a
+    *pretraining sweep over recurrence counts* ``r`` (separate models, each
+    trained at a fixed recurrence depth ``r``, same data / steps / seed). At fixed
+    data ``D`` the ``B*D^-beta`` term is constant and absorbed into the
+    irreducible offset ``E``::
 
         L(r) = E + A * (N_once + r^phi * N_rec)^(-alpha)
 
     where ``N_once`` is the count of NON-recurrent parameters (applied once:
     embeddings, readout) and ``N_rec`` is the count of recurrent (looped-block)
     parameters. The split ``N_once + r^phi N_rec`` is what encodes "loops vs
-    unique blocks": ``phi = 1`` means looping ``r`` times buys the capacity of
-    ``r`` unique blocks (full recurrence-equivalence); ``phi = 0`` means looping
-    buys nothing (the effective recurrent capacity is ``r``-independent, so loss
-    is flat in ``r``). Because the split itself models "loops vs unique blocks",
-    NO untied baseline is needed — looped models alone identify ``phi`` (paper
+    unique parameters": ``phi = 1`` means looping ``r`` times buys the capacity of
+    ``r`` unique parameter blocks (full param-equivalence); ``phi = 0`` means
+    looping buys nothing (the effective recurrent capacity is ``r``-independent,
+    so loss is flat in ``r``); ``phi > 1`` means SUPER-param-equivalent recurrence
+    — a loop buys MORE than a unique block (e.g. via MoE combinatorial path
+    reuse). Because the split itself models "loops vs unique parameters", NO
+    untied baseline is needed — looped models alone identify ``phi`` (paper
     reference value ``phi ~ 0.46``).
 
     Args:
@@ -2713,8 +2853,9 @@ def fit_phi_isodepth(losses_by_r, n_once, n_rec) -> dict:
         ``NaN`` and a ``"reason"`` string is included (the function never raises).
 
     The fit uses :func:`scipy.optimize.curve_fit` (trust-region) over the natural
-    parameters with bounds ``phi in [0, 1]``, ``alpha in (0, 3]``, ``A > 0``,
-    ``E in [0, min(L)]``, and a MULTI-START over a small ``(phi0, alpha0)`` grid
+    parameters with bounds ``phi in [0, 3.0]`` (uncapped past 1 so
+    super-param-equivalent recurrence is not censored), ``alpha in (0, 3]``,
+    ``A > 0``, ``E in [0, min(L)]``, and a MULTI-START over a small ``(phi0, alpha0)`` grid
     (``E0 = 0.9*min(L)``, ``A0`` solved from the shallowest point), keeping the
     lowest-RMSE solution — this avoids the degenerate basin a single start can
     fall into. It is the train-r analogue the paper estimates; with only ~5 ``r``
@@ -2759,12 +2900,15 @@ def fit_phi_isodepth(losses_by_r, n_once, n_rec) -> dict:
     def _law_norm(r, phi, alpha, E, A_n):
         return E + A_n * (ratio + (r ** phi)) ** (-alpha)
 
-    # Bounds: phi in [0,1], alpha in (0,3], A_n>0, E in [0, min(L)]. The tiny
-    # epsilons keep the lower bounds strictly inside the open intervals and below
-    # any initial guess (curve_fit requires lb <= p0 <= ub).
+    # Bounds: phi in [0, 3.0] (EFFICIENCY exponent, NOT capped at 1 — with MoE
+    # the loop-vs-unique-param exchange can in principle exceed unity, and
+    # censoring at 1 would HIDE super-param-equivalent recurrence), alpha in
+    # (0,3], A_n>0, E in [0, min(L)]. The tiny epsilons keep the lower bounds
+    # strictly inside the open intervals and below any initial guess (curve_fit
+    # requires lb <= p0 <= ub).
     eps = 1e-9
     lower = [0.0, eps, 0.0, eps]
-    upper = [1.0, 3.0, max(l_min, eps), np.inf]
+    upper = [3.0, 3.0, max(l_min, eps), np.inf]
     E0 = min(max(0.0, 0.9 * l_min), l_min)
     r0 = rs[0]
 
@@ -2775,7 +2919,9 @@ def fit_phi_isodepth(losses_by_r, n_once, n_rec) -> dict:
     # FINITE solution. A0 is solved from the shallowest point so the normalized
     # curve passes through it at each start's (phi0, alpha0, E0).
     best = None  # (rmse, popt)
-    for phi0 in (0.1, 0.3, 0.5, 0.7, 0.9):
+    # phi0 grid spans the relaxed [0, 3] bound so a super-param-equivalent
+    # recurrence (phi > 1) has a nearby start and is not missed by the optimizer.
+    for phi0 in (0.1, 0.3, 0.5, 0.7, 0.9, 1.2, 1.5, 2.0):
         for alpha0 in (0.1, 0.3, 0.6, 1.0):
             denom0 = (ratio + (r0 ** phi0)) ** (-alpha0)
             A0 = max((ys[0] - E0) / denom0, 1e-12) if denom0 > 0 else 1.0
@@ -3753,6 +3899,31 @@ def main(argv=None):
         # (fit_phi_isodepth). phi_eval varies inference K of a single model and so
         # only gauges test-time depth utilization, not train-time loop capacity.
         print0(f"phi_eval:{fit_phi(sweep_loss):.4f}  # EVAL-K proxy (NOT phi_isodepth)")
+
+        # PRINCIPLED EXPRESSIVENESS METRIC: depth-resolved V-usable predictive
+        # information I_V(z_K -> Y) = H_V(Y) - val_loss(K) (Xu 2020 / Ethayarajh
+        # 2022). H_V(Y) is the marginal next-token entropy over the SAME cached
+        # eval targets, accumulated as token counts and all-reduced so every rank
+        # sees the same constant. expressiveness_rho = spearman(K, I_V(K)) is the
+        # headline objective (-> +1 means depth monotonically adds usable info).
+        # Counts on a long-lived 1D buffer of length vocab_size (no per-token
+        # .item()/sync in the loop): one all_reduce + one .tolist() at the end.
+        marginal_counts = torch.zeros(
+            args.vocab_size, device=device, dtype=torch.float64)
+        for _, y in cached:
+            marginal_counts += torch.bincount(
+                y.reshape(-1), minlength=args.vocab_size).to(torch.float64)
+        if distributed:
+            dist.all_reduce(marginal_counts, op=dist.ReduceOp.SUM)
+        h_marginal = marginal_token_entropy(
+            {i: c for i, c in enumerate(marginal_counts.tolist()) if c > 0})
+        iv = usable_information(sweep_loss, h_marginal)
+        for k in sweep_ks:  # ascending-K order; iv keys drop diverged (non-finite) K
+            if k in iv["iv_bits"]:
+                print0(f"usable_info: K={k} iv_bits:{iv['iv_bits'][k]:.4f} "
+                       f"val_loss:{sweep_loss[k]:.4f}")
+        print0(f"expressiveness_rho:{iv['rho']:.4f}")
+        print0(f"iv_total_bits:{iv['iv_total_bits']:.4f}")
 
     # --- peak VRAM (RESOURCE-goal headline; memory-efficiency, no gate) ---
     # Integer MiB to match the existing ``peak_vram_mb:<int>`` log contract that

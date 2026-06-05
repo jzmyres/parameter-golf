@@ -300,6 +300,14 @@ class TestPlotMetricsParse(unittest.TestCase):
                 # phi_eval carries a trailing "# EVAL-K proxy ..." comment in the
                 # real emit; the parser must read the float and ignore the suffix.
                 "phi_eval:0.3300  # EVAL-K proxy (NOT phi_isodepth)",
+                # PRINCIPLED EXPRESSIVENESS: per-K usable_info (I_V in bits) plus
+                # run-level expressiveness_rho / iv_total_bits. Here loss DECREASES
+                # with K -> I_V INCREASES -> rho = +1, iv_total_bits > 0.
+                "usable_info: K=8 iv_bits:2.0000 val_loss:2.5500",
+                "usable_info: K=16 iv_bits:2.0500 val_loss:2.5200",
+                "usable_info: K=64 iv_bits:2.1000 val_loss:2.5000",
+                "expressiveness_rho:1.0000",
+                "iv_total_bits:0.1000",
             ]
         )
         with tempfile.TemporaryDirectory() as td:
@@ -313,6 +321,12 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["depth_sweep"][64], (1.40, 2.50))
         self.assertEqual(d["depth_gain_GT"], 0.05)
         self.assertEqual(d["phi_eval"], 0.33)
+        # usable_info -> {K: iv_bits} map; rho / iv_total_bits -> run scalars.
+        self.assertEqual(set(d["usable_info"].keys()), {8, 16, 64})
+        self.assertEqual(d["usable_info"][8], 2.0)
+        self.assertEqual(d["usable_info"][64], 2.1)
+        self.assertEqual(d["expressiveness_rho"], 1.0)
+        self.assertEqual(d["iv_total_bits"], 0.1)
 
     def test_parse_phi_isodepth_train_r_sweep_lines(self):
         """The PRINCIPLED Iso-Depth harness (experiments/measure_phi.py) emits a
@@ -387,6 +401,31 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["depth_sweep"][2][1], 3.45)
         self.assertTrue(math.isnan(d["depth_gain_GT"]))
         self.assertEqual(d["phi_eval"], 0.0)
+
+    def test_parse_usable_info_nan_and_negative_rho_tolerant(self):
+        """expressiveness_rho is NaN with <3 finite K; an anti-expressive run
+        (loss increasing with K -> I_V decreasing) emits a negative rho and a
+        negative iv_total_bits. The parser must capture both faithfully."""
+        log = "\n".join(
+            [
+                "train_batch_tokens:8 train_seq_len:16 iterations:2 warmup_steps:0 max_wallclock_seconds:0.000",
+                # Anti-expressive: I_V DECREASES as K grows.
+                "usable_info: K=2 iv_bits:2.1000 val_loss:3.4000",
+                "usable_info: K=4 iv_bits:2.0000 val_loss:3.5000",
+                "expressiveness_rho:nan",
+                "iv_total_bits:-0.1000",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        self.assertEqual(set(d["usable_info"].keys()), {2, 4})
+        self.assertEqual(d["usable_info"][2], 2.1)
+        self.assertTrue(math.isnan(d["expressiveness_rho"]))
+        self.assertEqual(d["iv_total_bits"], -0.1)
 
     def test_plot_comparison_smoke_with_auxiliary_terms(self):
         train_line = (
