@@ -33,6 +33,7 @@ import glob
 import io
 import math
 import os
+import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -1616,6 +1617,45 @@ def peak_vram_mb(device=None) -> float:
     return float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0)
 
 
+def vram_util_pct(device=None) -> float:
+    """Peak VRAM as a percentage of total device memory (OPS/efficiency stat).
+
+    ``100 * peak_vram_mb / total_device_mem_mb``, where the total comes from
+    ``torch.cuda.get_device_properties(device).total_memory``. This is an
+    ops/efficiency diagnostic (how full the GPU was), NOT a resource-GOAL number
+    — the resource goal is the absolute ``peak_vram`` / ``R_act`` scaling. Returns
+    ``0.0`` when CUDA is unavailable (CPU log/test sites) so callers stay
+    crash-free. A high utilization at grad_accum=1 (whole batch in one forward)
+    is the throughput target: reversibility makes a large micro-batch affordable
+    even at deep recurrent depth K.
+    """
+    if not torch.cuda.is_available() or (device is not None
+                                         and torch.device(device).type != "cuda"):
+        return 0.0
+    props = torch.cuda.get_device_properties(device)
+    total_mb = float(props.total_memory) / (1024.0 * 1024.0)
+    if total_mb <= 0.0:
+        return 0.0
+    return 100.0 * peak_vram_mb(device) / total_mb
+
+
+def resolve_grad_accum_steps(grad_accum: int, world_size: int) -> int:
+    """Resolve the grad-accum micro-step count from the CLI knob.
+
+    ``grad_accum == 0`` (default) keeps the historical auto value
+    ``max(8 // max(world_size, 1), 1)`` (8 global micro-batches per step,
+    matching the original scaffold). ``grad_accum > 0`` overrides it verbatim,
+    independent of ``world_size`` — ``grad_accum=1`` runs the whole
+    ``batch_tokens`` in ONE forward per step (largest micro-batch / best VRAM
+    utilization). Correctness is unaffected: only the number of accumulating
+    micro-steps changes; the all-reduce + optimizer step still happen once per
+    optimizer step.
+    """
+    if grad_accum > 0:
+        return int(grad_accum)
+    return max(8 // max(world_size, 1), 1)
+
+
 def vram_vs_batch_scaling(model, args: Hyperparameters, batch_sizes, device) -> dict:
     """Peak-VRAM-vs-batch-size scaling for the RESOURCE goal (flat == good).
 
@@ -1727,6 +1767,14 @@ def format_metrics_line(metrics: dict) -> str:
         parts.append(f"router_entropy:{float(metrics['router_entropy']):.4f}")
     if "expert_util" in metrics and metrics["expert_util"] is not None:
         parts.append(f"expert_util:{float(metrics['expert_util']):.4f}")
+    # OPS/efficiency diagnostics (throughput + VRAM utilization). These are NOT
+    # resource-GOAL numbers (the goal is absolute peak_vram / R_act scaling) —
+    # the ``ops:`` prefix marks them clearly. tok_per_s = batch_tokens / step
+    # wall-time; vram_util_pct = 100 * peak_vram / total device memory.
+    if "tok_per_s" in metrics and metrics["tok_per_s"] is not None:
+        parts.append(f"ops:tok_per_s:{float(metrics['tok_per_s']):.4f}")
+    if "vram_util_pct" in metrics and metrics["vram_util_pct"] is not None:
+        parts.append(f"ops:vram_util_pct:{float(metrics['vram_util_pct']):.4f}")
     if "R_act" in metrics and metrics["R_act"] is not None:
         parts.append(f"R_act:{float(metrics['R_act']):.4f}")
     if "phi" in metrics and metrics["phi"] is not None:
@@ -1764,6 +1812,13 @@ def build_arg_parser():
     p.add_argument("--seq-len", type=int, default=512)
     p.add_argument("--batch-tokens", type=int, default=None,
                    help="Global tokens per optimizer step (default: 8 * world * seq_len).")
+    p.add_argument("--grad-accum", type=int, default=0,
+                   help="Grad-accum micro-steps per optimizer step. 0 (default) "
+                        "keeps the auto value max(8//world,1). >0 overrides it; "
+                        "grad_accum=1 processes the WHOLE batch_tokens in ONE "
+                        "forward (largest micro-batch, best VRAM utilization / "
+                        "throughput). Reversibility makes large batch x deep K "
+                        "affordable (activation memory ~constant in K).")
     p.add_argument("--warmdown-iters", type=int, default=0,
                    help="Linear LR warmdown over the final N iters (0 disables).")
     # Finite-horizon K-set + loss coefficients.
@@ -1856,8 +1911,10 @@ def main(argv=None):
     torch.manual_seed(args.seed + rank)
     np.random.seed(args.seed + rank)
 
-    # --- grad-accum: keep 8 "global" micro-batches per step (matches scaffold) ---
-    grad_accum_steps = max(8 // max(world_size, 1), 1)
+    # --- grad-accum: 0 keeps the 8-global-micro-batch scaffold value; >0
+    # overrides it (grad_accum=1 == whole batch_tokens in ONE forward, the
+    # largest micro-batch / best VRAM utilization). See resolve_grad_accum_steps.
+    grad_accum_steps = resolve_grad_accum_steps(args.grad_accum, world_size)
     batch_tokens = args.batch_tokens
     if batch_tokens is None:
         batch_tokens = grad_accum_steps * world_size * args.seq_len
@@ -1983,6 +2040,10 @@ def main(argv=None):
         torch.cuda.reset_peak_memory_stats(device)
     model.train()
     for step in range(args.iterations):
+        # Per-step wall-clock timer for the throughput (tok_per_s) ops metric.
+        # Started at the STEP BOUNDARY (not inside the grad-accum micro-loop) so
+        # the measured window is exactly one optimizer step.
+        step_t0 = time.perf_counter()
         # Sample one deep budget per step (shared across ranks for sync grads).
         k_hi = int(k_set[int(torch.randint(0, len(k_set), (1,), generator=k_gen).item())])
         scale = lr_scale(step)
@@ -2035,7 +2096,15 @@ def main(argv=None):
             # Two-goal metrics from the just-finished forward (rank-0 log site
             # only; collect_metrics does CPU syncs, never call in the hot loop).
             if master:
-                print0(format_metrics_line(collect_metrics(base_model, model_args)))
+                # Ops/efficiency stats measured at the STEP BOUNDARY (not in the
+                # micro-loop): throughput = global batch_tokens / step wall-time,
+                # and VRAM utilization = peak VRAM / total device mem. One
+                # max_memory_allocated read (via vram_util_pct), at the log site.
+                step_wall = max(time.perf_counter() - step_t0, 1e-9)
+                m = collect_metrics(base_model, model_args)
+                m["tok_per_s"] = float(batch_tokens) / step_wall
+                m["vram_util_pct"] = vram_util_pct(device)
+                print0(format_metrics_line(m))
 
         if args.val_every > 0 and (step + 1) % args.val_every == 0:
             v_loss, v_bpb = run_validation(

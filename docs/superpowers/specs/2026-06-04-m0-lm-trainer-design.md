@@ -106,6 +106,31 @@ Bigram/FSQ/CTP/NSA/smear.
 | **G2 expressiveness** | `val_bpb` (FineWeb SP1024) | **φ recurrence-equivalence exponent** (effective depth; fit over r∈{1,2,4,8}); **erank** (representation + per-matrix rank sufficiency); MoS output rank; MoE route-depth diversity; paired depth-gain `G_T` (synthetic) |
 | **Joint (Pareto)** | bpb/param · bpb/KV-byte · bpb at constant act-mem · **Δφ per FLOP** | — |
 
+### Throughput / VRAM utilization (ops/efficiency, NOT resource-goal metrics)
+
+The trainer underutilizes the GPU by default: `grad_accum_steps` auto-resolves to
+`max(8//world,1)` (=8 on 1 GPU), so the per-forward micro-batch is tiny
+(`batch_tokens / (grad_accum·seq)` → ~1 seq/forward → ~142 MB on an 80 GB GPU).
+The `--grad-accum` knob (0 = keep auto; `>0` = use that value) lets us fill VRAM:
+**`grad_accum=1` processes the whole `batch_tokens` in ONE forward per step** —
+the largest micro-batch and the best throughput at a given VRAM ceiling. Because
+the reversible recurrence is **O(1) activation memory in depth K**, a large
+micro-batch is affordable even at deep K (large batch × deep K is cheap).
+Correctness is unaffected: only the number of accumulating micro-steps changes;
+the custom DDP all-reduce + the optimizer step still happen once per optimizer
+step, and the finite-horizon two-forward + reversibility are per-micro-step.
+
+Two **ops/efficiency diagnostics** are logged on the `metrics:` line under an
+`ops:` prefix, measured at the **step boundary** (not in the grad-accum
+micro-loop, to avoid hot-path GPU→host syncs):
+- `ops:tok_per_s` = global `batch_tokens` / step wall-time (throughput).
+- `ops:vram_util_pct` = `100 · peak_vram_mb / total_device_mem_mb` (how full the
+  GPU was; `0.0` on CPU).
+
+These are **ops stats for tuning the batch/grad-accum knobs**, explicitly **not**
+the two resource-GOAL numbers (absolute peak VRAM / `R_act` activation-memory
+scaling), which remain the headline memory-efficiency metrics above.
+
 ## Control experiments (the empirical gates)
 
 1. **Router: ReLU vs softmax** — matched everything else; measure val_bpb, φ, erank

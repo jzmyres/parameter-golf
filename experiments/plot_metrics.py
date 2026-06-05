@@ -48,6 +48,8 @@ M0_METRICS_FIELDS: tuple[str, ...] = (
     "params",         # resource: trainable parameter count
     "router_entropy", # collapse diag: mean per-token router entropy
     "expert_util",    # collapse diag: global expert-utilization entropy
+    "tok_per_s",      # ops/efficiency: tokens/wall-second (throughput)
+    "vram_util_pct",  # ops/efficiency: peak VRAM as % of device memory
     "R_act",          # resource (headline): activation-memory scaling (sweep)
     "phi",            # expressiveness: recurrence-equivalence exponent (sweep)
     "active_frac",    # MoE MECHANISM diagnostic (emitted as diag:active_frac)

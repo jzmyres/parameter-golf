@@ -798,6 +798,116 @@ def test_format_metrics_line_emits_router_entropy_and_expert_util():
     assert "diag:active_frac:0.5000" in line
 
 
+# ---------------------------------------------------------------------------
+# --grad-accum control + throughput (tok/s) & VRAM-utilization ops logging
+# ---------------------------------------------------------------------------
+def test_grad_accum_cli_default_and_override():
+    """--grad-accum default 0 (auto); >0 overrides the per-step micro-count.
+
+    The trainer underutilizes the GPU because the hardcoded auto value
+    (max(8//world,1)=8 on 1 GPU) shrinks the per-forward micro-batch. The knob
+    lets us set grad_accum=1 (whole batch_tokens in ONE forward) to fill VRAM.
+    """
+    from train_gpt import build_arg_parser
+
+    p = build_arg_parser()
+    assert p.parse_args([]).grad_accum == 0          # default: keep auto
+    assert p.parse_args(["--grad-accum", "1"]).grad_accum == 1
+    assert p.parse_args(["--grad-accum", "4"]).grad_accum == 4
+
+
+def test_resolve_grad_accum_steps_auto_vs_override():
+    """The resolver honors >0 override and falls back to max(8//world,1)."""
+    from train_gpt import resolve_grad_accum_steps
+
+    # Auto (knob == 0): keep the historical scaffold value.
+    assert resolve_grad_accum_steps(0, world_size=1) == 8
+    assert resolve_grad_accum_steps(0, world_size=2) == 4
+    assert resolve_grad_accum_steps(0, world_size=16) == 1
+    # Override (knob > 0): use it verbatim, independent of world_size.
+    assert resolve_grad_accum_steps(1, world_size=1) == 1
+    assert resolve_grad_accum_steps(2, world_size=1) == 2
+    assert resolve_grad_accum_steps(3, world_size=8) == 3
+
+
+def test_m0_trainer_smoke_grad_accum_one(tmp_path):
+    """grad_accum=1: the whole batch_tokens is ONE forward per step (largest
+    micro-batch / best throughput at a given VRAM). End-to-end CPU smoke."""
+    from train_gpt import main
+
+    main(["--iterations", "2", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
+          "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8",
+          "--head-dim", "8", "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+          "--grad-accum", "1", "--artifact-out", str(tmp_path / "m1.bin")])
+    assert (tmp_path / "m1.bin").exists()
+    assert (tmp_path / "m1.bin").stat().st_size > 0
+
+
+def test_m0_trainer_smoke_grad_accum_two(tmp_path):
+    """grad_accum=2: two micro-steps accumulate per optimizer step. CPU smoke."""
+    from train_gpt import main
+
+    main(["--iterations", "2", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
+          "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8",
+          "--head-dim", "8", "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+          "--grad-accum", "2", "--artifact-out", str(tmp_path / "m2.bin")])
+    assert (tmp_path / "m2.bin").exists()
+    assert (tmp_path / "m2.bin").stat().st_size > 0
+
+
+def test_format_metrics_line_emits_throughput_and_vram_util_ops_stats():
+    """The metrics: line carries tok_per_s + vram_util_pct as OPS/efficiency
+    diagnostics (NOT the resource-GOAL peak-VRAM / R_act numbers). On CPU
+    vram_util_pct is 0.0; tok_per_s is the per-step throughput."""
+    from train_gpt import format_metrics_line
+
+    line = format_metrics_line({
+        "erank": 1.0, "peak_vram": 0.0, "kv_bytes": 8, "params": 10,
+        "tok_per_s": 12345.0, "vram_util_pct": 0.0,
+    })
+    assert "ops:tok_per_s:12345.0000" in line
+    assert "ops:vram_util_pct:0.0000" in line
+
+
+def test_vram_util_pct_cpu_is_zero():
+    """vram_util_pct is 0.0 when CUDA is unavailable (CPU log/test sites)."""
+    from train_gpt import vram_util_pct
+
+    # No device / CPU device -> 0.0, no crash.
+    assert vram_util_pct(None) == 0.0
+    assert vram_util_pct("cpu") == 0.0
+
+
+def test_m0_trainer_smoke_emits_throughput_and_util(tmp_path, capsys):
+    """A CPU run emits a metrics: line carrying tok_per_s (>0) and
+    vram_util_pct (0.0 on CPU); the plot_metrics parser round-trips both."""
+    import re
+    from train_gpt import main
+    from experiments.plot_metrics import parse_log
+
+    main(["--iterations", "2", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
+          "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8",
+          "--head-dim", "8", "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+          "--log-every", "1", "--artifact-out", str(tmp_path / "m.bin")])
+    out = capsys.readouterr().out
+    metrics_lines = [ln for ln in out.splitlines() if ln.startswith("metrics:")]
+    assert metrics_lines, "no metrics: line emitted"
+    last = metrics_lines[-1]
+    m_tps = re.search(r"\btok_per_s:([-+0-9.eE]+)", last)
+    m_util = re.search(r"\bvram_util_pct:([-+0-9.eE]+)", last)
+    assert m_tps is not None, last
+    assert m_util is not None, last
+    assert float(m_tps.group(1)) > 0.0          # tokens/s is positive
+    assert float(m_util.group(1)) == 0.0        # CPU -> 0% utilization
+
+    # Parser round-trip.
+    log_path = tmp_path / "run.log"
+    log_path.write_text(out, encoding="utf-8")
+    d = parse_log(str(log_path))
+    assert any(v > 0.0 for v in d["tok_per_s"] if v == v), d["tok_per_s"]
+    assert all((v == 0.0 or v != v) for v in d["vram_util_pct"]), d["vram_util_pct"]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
