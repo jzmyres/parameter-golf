@@ -1,6 +1,6 @@
 import torch
 
-from train_gpt_m0 import MLAttention, MoSHead, SwiGLUMoE
+from train_gpt_m0 import Hyperparameters, M0GPT, MLAttention, MoSHead, SwiGLUMoE
 
 
 def test_mla_shapes_and_kv_latent():
@@ -59,3 +59,28 @@ def test_mos_head_is_distribution_and_high_rank():
     logp = h(z)
     assert logp.shape == (4, 7, 32)
     assert torch.allclose(logp.exp().sum(-1), torch.ones(4, 7), atol=1e-4)
+
+
+def test_m0gpt_forward_backward_and_depth():
+    args = Hyperparameters(model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=32,
+                           n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8)
+    m = M0GPT(args)
+    x = torch.randint(0, 32, (2, 8))
+    y = torch.randint(0, 32, (2, 8))
+    loss = m(x, y, depth=4)
+    loss.backward()
+    assert torch.isfinite(loss)
+    # tied embedding: out_embed shares the input embedding Parameter
+    assert m.tok_emb.weight.data_ptr() == m.mos_head.out_embed.weight.data_ptr()
+
+
+def test_m0gpt_recurrence_reconstructs_with_real_blocks():
+    """Reversibility integration gate with the REAL MLA+MoE delta blocks (fp64)."""
+    args = Hyperparameters(model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=16,
+                           n_experts=4, expert_rank=4, n_mix=2, kv_latent=4, head_dim=8)
+    m = M0GPT(args).double()
+    x0 = torch.randn(2, 5, 16, dtype=torch.float64)
+    rec = m.rec  # the ReversibleRecurrence
+    (aK, bK), _ = rec.forward_states(x0, x0, x0, depth=4)
+    a0, b0 = rec.invert(aK, bK, x0, depth=4)
+    assert torch.allclose(a0, x0, atol=1e-7) and torch.allclose(b0, x0, atol=1e-7)

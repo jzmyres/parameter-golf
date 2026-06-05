@@ -16,11 +16,14 @@ Sections:
     7. SwiGLU Mixture-of-Experts (SwiGLUMoE)
     8. Mixture-of-Softmaxes output head (MoSHead)
     9. Test-only delta block (_TinyDelta)
+   10. LM scaffold (Hyperparameters + M0GPT)
 """
 
 # ---------------------------------------------------------------------------
 # 1. Imports
 # ---------------------------------------------------------------------------
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -460,3 +463,116 @@ class _TinyDelta(nn.Module):
 
     def forward(self, x):
         return self.l(self.n(x))
+
+
+# ---------------------------------------------------------------------------
+# 10. LM scaffold
+# ---------------------------------------------------------------------------
+@dataclass
+class Hyperparameters:
+    """M0 model configuration (single source of truth for module shapes).
+
+    Only model-architecture fields live here for Task 6; optimizer / data /
+    schedule knobs are added by later tasks. ``mlp_mult`` is carried for spec
+    parity (expert hidden-width scaling) but is unused while experts are
+    parameterized purely by ``expert_rank``.
+    """
+
+    model_dim: int
+    n_heads: int
+    n_kv_heads: int
+    vocab_size: int
+    n_experts: int
+    expert_rank: int
+    n_mix: int
+    kv_latent: int
+    head_dim: int
+    q_latent: int | None = None
+    router_type: str = "softmax"
+    max_seq_len: int = 2048
+    mlp_mult: float = 3.0  # spec-parity (expert hidden-width); unused for now
+
+
+class _PreNormDeltaBlock(nn.Module):
+    """Pre-norm MLA + SwiGLU-MoE *delta* block — one ``F``/``G`` map.
+
+    Returns the residual update the reversible recurrence adds (NOT input +
+    update); the recurrence owns the additive coupling. CRITICAL for
+    reversibility: the block is a deterministic *pure function of its single
+    input tensor* (no dropout, no batch-coupled routing, no external state), so
+    the reversible inverse recomputes the identical update and reconstruction is
+    exact in fp64.
+
+    Delta form (post-attention-residual; verified in ``p1_synthetic``)::
+
+        h   = attn_norm(inp)
+        a   = attn(h)
+        h2  = mlp_norm(inp + a)
+        out = a + moe(h2)
+        return out
+    """
+
+    def __init__(self, args: Hyperparameters):
+        super().__init__()
+        d = args.model_dim
+        self.attn_norm = RMSNorm(d)
+        self.attn = MLAttention(
+            dim=d, n_heads=args.n_heads, n_kv_heads=args.n_kv_heads,
+            kv_latent=args.kv_latent, head_dim=args.head_dim, q_latent=args.q_latent,
+        )
+        self.mlp_norm = RMSNorm(d)
+        self.moe = SwiGLUMoE(
+            dim=d, n_experts=args.n_experts, expert_rank=args.expert_rank,
+            router_type=args.router_type,
+        )
+
+    def forward(self, inp):
+        a = self.attn(self.attn_norm(inp))
+        out = a + self.moe(self.mlp_norm(inp + a))
+        return out
+
+
+class M0GPT(nn.Module):
+    """M0 reversible recurrent-depth GPT.
+
+    Pipeline::
+
+        x0  = tok_emb(tokens) + pos_emb[:, :T]
+        z_K = run_reversible(x0, depth=K)        # midpoint of the reversible pair
+        log p = mos_head(z_K)                    # LOG-probabilities (MoS)
+        loss  = nll_loss(log p, targets)         # MoS emits log-probs -> NLL
+
+    The two recurrence maps ``F``/``G`` are pre-norm MLA+MoE delta blocks
+    (:class:`_PreNormDeltaBlock`); each is a deterministic pure function of its
+    input, which is what makes the additive-coupling recurrence exactly
+    invertible (reconstruction gate, fp64). The MoS output basis is *tied* to
+    the input token embedding (shared ``nn.Parameter``).
+    """
+
+    def __init__(self, args: Hyperparameters):
+        super().__init__()
+        self.args = args
+        d, V = args.model_dim, args.vocab_size
+
+        self.tok_emb = nn.Embedding(V, d)
+        self.pos_emb = nn.Parameter(torch.zeros(1, args.max_seq_len, d))
+
+        F_block = _PreNormDeltaBlock(args)
+        G_block = _PreNormDeltaBlock(args)
+        self.rec = ReversibleRecurrence(F_block, G_block)
+
+        self.mos_head = MoSHead(d, V, args.n_mix)
+        # Tie the MoS output basis to the input token embedding (shared Param).
+        self.mos_head.out_embed.weight = self.tok_emb.weight
+
+    def forward(self, tokens, targets, depth):
+        B, T = tokens.shape
+        x0 = self.tok_emb(tokens) + self.pos_emb[:, :T]
+        z_K = self.rec.run_reversible(x0, depth)
+        logp = self.mos_head(z_K)
+        if not torch.isfinite(logp).all():
+            raise FloatingPointError("non-finite MoS log-probabilities")
+        loss = F.nll_loss(logp.reshape(-1, self.args.vocab_size), targets.reshape(-1))
+        if not torch.isfinite(loss):
+            raise FloatingPointError("non-finite loss")
+        return loss
