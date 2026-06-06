@@ -486,6 +486,26 @@ over the same cached eval batches and all-reduced across DDP ranks so the consta
 every rank; the sweep drops non-finite depths, and \code{expressiveness\_rho} is \(\mathrm{NaN}\) with
 fewer than three finite \(K\) (no rank correlation estimable).
 
+\paragraph{Monotonicity guarantee and its trainable surrogate.}
+Optimizing \(I_{\mathcal V}\) provably yields a more task-predictive model --- it \emph{is} the achievable
+readout-loss reduction --- and reversibility guarantees no input information is \emph{destroyed} across
+depth (\(z_K\) is a bijection of \((z_0,x_0)\); \code{recon\_rel}\(\approx0\)).  A \emph{monotone}
+guarantee, \(I_{\mathcal V}(K)\ge I_{\mathcal V}(K{-}1)\) (i.e.\ \code{expressiveness\_rho}\(=+1\) by
+construction), additionally requires a \emph{nested} achievable class
+\(\mathcal F_{K-1}\subseteq\mathcal F_{K}\) so that depth \(K\) can always reproduce depth \(K{-}1\).
+Three structures supply this: an \emph{anytime} (depth-selecting / nested) readout supplies it directly;
+a \emph{convergent} contraction (a Huginn fixed point) supplies it asymptotically; \emph{untied} layers
+supply it by class inclusion.  The current \emph{tied}, finite-horizon readout \(z_K\to\textsc{MoS}\)
+does \emph{not} nest by construction --- with weights tied across steps one cannot make the \(K\)-th step
+the identity without making \emph{all} steps the identity --- so deep \(K\) can over-think (degrade)
+beyond the trained horizon.  We therefore enforce monotonicity \emph{softly}, via the stop-gradient
+no-degradation hinge \(\lambda_h\,[\,L_T(K_{\rm hi})-\sg\,L_T(K_{\rm lo})+m\,]_+\) plus Huginn-style depth
+sampling, and \emph{verify} it empirically through \code{expressiveness\_rho}; on a depth-hard positive
+control the circuit-complexity equivalence (a bounded model solves a depth-\(d\) serial task iff it
+realizes serial computation depth \(\ge d\))~\cite{cot} makes the increase \emph{strict}.  A hard
+guarantee remains an available design lever (anytime readout, convergence, or untying), each trading
+against the finite-horizon / weight-tying resource win.
+
 \paragraph{Expressiveness versus efficiency: orthogonal goals on the two-goal frontier.}
 The recurrence param-\emph{efficiency} exponent \(\varphi_{\rm isodepth}\) (Eq.~\eqref{eq:isodepth}) and
 \(\mathcal{V}\)-information \(I_{\mathcal{V}}\) (Eq.~\eqref{eq:vinfo}) measure \emph{orthogonal} things.
@@ -1293,6 +1313,12 @@ via Sinkhorn--Knopp for stable, signal-conserving residual mixing).
 matrix; the reversibility-native variant).
 \newblock arXiv:2602.18308, 2026.
 \newblock \url{https://arxiv.org/abs/2602.18308}.
+
+\bibitem{cot}
+Z. Li, H. Liu, D. Zhou, and T. Ma.
+\newblock Chain of Thought Empowers Transformers to Solve Inherently Serial Problems.
+\newblock \emph{International Conference on Learning Representations}, 2024.
+\newblock \url{https://arxiv.org/abs/2402.12875}.
 
 \bibitem{melt}
 V. C. Vendrell, A. P. Masdemont, N. Grillo, J. Ros-Giralt, A. Behboodi, and
