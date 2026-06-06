@@ -34,7 +34,7 @@ from legacy.train_gpt_rich import (
     _validate_hyperparameters,
     quantize_int6_sdclip,
 )
-from tests._helpers import mutate_hyperparameters as _mut
+from legacy.tests._helpers import mutate_hyperparameters as _mut
 
 
 class TestFakeQuantSTE(unittest.TestCase):

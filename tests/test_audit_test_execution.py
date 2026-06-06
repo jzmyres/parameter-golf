@@ -212,8 +212,9 @@ class TestAuditTestExecution(unittest.TestCase):
             len(entries), 4,
             "AUDIT_TESTS appears to have been truncated or emptied — "
             f"got {entries}. The gate must enforce at least the four "
-            "core contracts: optional-component-flag, removal-symmetry, "
-            "enforcement-config-staged, audit-test-execution-self-check.",
+            "core contracts: m0-contracts (doc-code/removal-symmetry/"
+            "optimizer/int6), m0-hot-path-sync, enforcement-config-staged, "
+            "audit-test-execution-self-check.",
         )
 
     def test_marker_string_constants_match_claude_md_literals(self) -> None:

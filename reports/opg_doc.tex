@@ -578,6 +578,48 @@ LR to prevent exactly this recurrent hidden-state collapse \cite{huginn}: in a t
 weights are applied \(K\) times per forward, so an LR that is fine for a single-application block is
 effectively \(K\)\(\times\) too aggressive on the recurrent state.
 
+\paragraph{Consolidated configuration (source of truth: \code{train\_gpt.py}).}
+Table~1 collects the active \(M_0\) architecture and training defaults in one place;
+the binding source is \code{Hyperparameters} plus \code{build\_arg\_parser} in \code{train\_gpt.py}
+(this table mirrors but does not own them).  At these defaults the model is \(9{,}666{,}338\)
+parameters.  The architecture (left) and the optimization/finite-horizon recipe (right) map directly
+onto the two design goals: the resource-side knobs (MLA \code{\detokenize{kv_latent}}, low-rank
+experts, the fp64 reversible stream) hold activation memory and the KV footprint small, while the
+expressiveness-side knobs (recurrent depth \code{\detokenize{k_set}}, the MoE basis, the MoS head)
+supply usable predictive information.
+
+\begin{center}
+\footnotesize
+\renewcommand{\arraystretch}{1.12}
+\setlength{\tabcolsep}{4pt}
+\begin{tabularx}{\textwidth}{@{}L{0.27\textwidth} l @{\hskip 1.2em} L{0.27\textwidth} l@{}}
+\toprule
+\multicolumn{2}{@{}l}{\textbf{Architecture}} & \multicolumn{2}{l}{\textbf{Training / finite-horizon recipe}} \\
+\midrule
+\(d_{\rm model}\) (\code{\detokenize{model_dim}})        & 768   & Optimizer (matrix banks)   & Muon \\
+Query heads (\code{\detokenize{n_heads}})                & 12    & Optimizer (embed/router/1-D) & AdamW \\
+KV heads (\code{\detokenize{n_kv_heads}}, GQA)           & 4     & \code{\detokenize{matrix_lr}} & \(0.01\) \\
+Head dim (\code{\detokenize{head_dim}})                  & 64    & \code{\detokenize{embed_lr}}  & \(0.05\) \\
+MLA KV-latent (\code{\detokenize{kv_latent}})            & 256   & \code{\detokenize{scalar_lr}} & \(0.01\) \\
+Vocab (\code{\detokenize{vocab_size}})                   & 1024  & \(\beta_2\) / grad-clip       & \(0.95\) / \(1.0\) \\
+Routed experts (\code{\detokenize{n_experts}})           & 16    & Deep set \code{\detokenize{k_set}} (\(K_{\rm hi}\)) & \(\{32,64,128\}\) \\
+Expert rank (\code{\detokenize{expert_rank}})            & 64    & Shallow \(k_{\rm lo}\)        & \(8\) \\
+Shared experts (\code{\detokenize{num_shared_experts}})  & 0     & Hinge weight \(\lambda_h\)    & \(0.1\) \\
+Sublayers (\code{\detokenize{n_sublayers}})              & 1     & Hinge margin \(m\)            & \(0\) \\
+Block order (\code{\detokenize{block_order}})            & \code{attn\_ffn} & Train context (\code{\detokenize{seq_len}}) & \(512\) \\
+Router (\code{\detokenize{router_type}})                 & \code{softmax}   & Recurrence stream (\code{\detokenize{recurrence_accum_dtype}}) & \code{float64} \\
+MoS components (\code{\detokenize{n_mix}})               & 2     & Init state (\code{\detokenize{init_state}}) & \code{x0} \\
+Reversible blocks                                        & 1 (tied over \(K\)) & Damping (\code{--damping})   & \code{none} (\(Q{=}I\)) \\
+\bottomrule
+\end{tabularx}
+
+\smallskip
+\emph{Table~1: active \(M_0\) configuration (\code{train\_gpt.py} defaults; \(9{,}666{,}338\)
+parameters).  Router health defaults: DeepSeek loss-free balancing
+\code{\detokenize{router_bias_update_rate}}\(=10^{-3}\) and ST-MoE
+\code{\detokenize{router_z_coef}}\(=10^{-3}\); entropy-max and load-balance off.}
+\end{center}
+
 %==============================================================================
 \section{Metrics: Gates Versus Diagnostics}
 \label{sec:metrics}
@@ -1166,6 +1208,116 @@ S+3 deployment & Fake-int6 linear-weight sensitivity reported best-loss gap \(+0
 The outcome is the desired implementation split.  All feedback stages execute under DDP on the
 requested GPU pair, but the S+0 positive-control gate still fails.  Therefore the next scientific
 move remains detectability repair, not mechanism escalation.
+
+%==============================================================================
+\section{\texorpdfstring{$M_0$}{M0} Empirical Results: Depth-Monotone Expressiveness Under Flat Resource (2026-06-06)}
+\label{sec:m0-results}
+
+This section reports a controlled run of the \emph{active} \(M_0\) language model (\code{train\_gpt.py},
+the architecture of \S\ref{sec:models} at the Table~1 defaults), distinct from the synthetic S+0 P1
+triage above.  Its purpose is twofold: (i) verify that \emph{every} two-goal eval metric improves as
+training progresses, and (ii) characterize how each metric responds to recurrence depth \(K\) at the
+final checkpoint, \emph{including} the test-time extrapolation regime beyond the trained horizon.
+The run is the half-LR DDP smoke that verified the promoted (halved) LR defaults (\S Training recipe);
+the frozen evidence is \code{results/2026-06-06\_m0\_halflr\_extrapolation/} (\code{summary.md} and
+\code{run\_metrics.txt}).
+
+\paragraph{Setup.}
+Two GPUs under \code{torchrun} DDP (\code{\detokenize{nproc_per_node=2}}), \(600\) optimizer steps,
+\(d_{\rm model}=768\) and the Table~1 architecture, \(9{,}666{,}338\) parameters.  Finite-horizon
+training used \code{\detokenize{k_set}}\(=\{32,64\}\) (\(K_{\rm hi}\) sampled per step) with shallow
+\(k_{\rm lo}=8\); the promoted LRs (matrix \(0.01\), embed \(0.05\), scalar \(0.01\)); \code{--damping
+none} (\(Q{=}I\)); \code{\detokenize{init_state}}\(=\)\code{x0}; and the fp64 reversible stream
+(\code{\detokenize{recurrence_accum_dtype}}\(=\)\code{float64}).  The end-of-training depth sweep
+\code{--k-eval-sweep 4,8,16,32,64,128,256} deliberately includes \(K\in\{128,256\}\), which lie
+\emph{beyond} the trained maximum \(K{=}64\), so \(I_{\mathcal V}(K)\) and \(\bpb(K)\) are measured in
+the extrapolation regime (\S\ref{sec:protocol}); \code{--depth-sweep-every 200} additionally tracked the
+expressiveness battery as a training trend.
+
+\paragraph{(i) All two-goal eval metrics improve over training.}
+Table~2 reports the expressiveness, correctness, and resource metrics at the first tracked sweep
+(step 200) versus the final checkpoint (step 600 / end-of-run).  Every expressiveness metric rises and
+\(\bpb\) falls monotonically, while the correctness gate stays exact (\code{\detokenize{recon_rel}}\(=0\))
+and the resource number stays flat --- the conjunction the 30-iter smoke gate (\S\ref{sec:protocol})
+demands.
+
+\begin{center}
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{6pt}
+\begin{tabularx}{\textwidth}{@{}L{0.40\textwidth} r r L{0.18\textwidth}@{}}
+\toprule
+\textbf{Metric (axis)} & \textbf{step 200} & \textbf{final} & \textbf{Trend} \\
+\midrule
+\(\bpb\) (expressiveness, \(\downarrow\))                                 & \(2.131\)  & \(\mathbf{1.828}\) & monotone \(\downarrow\) \\
+\(I_{\mathcal V}(K{=}64)\) bits (expressiveness, \(\uparrow\))            & \(3.494\)  & \(\mathbf{4.178}\) & rising \\
+\code{\detokenize{iv_total_bits}} (\(K{=}4{\to}256\)) (expressiveness, \(\uparrow\)) & \(0.619\) & \(\mathbf{0.797}\) & rising \\
+\code{\detokenize{depth_gain_GT}} (expressiveness, \(\uparrow\))          & \(0.258\)  & \(\mathbf{0.324}\) & rising \\
+\code{\detokenize{phi_eval}} (efficiency proxy, \(\uparrow\))             & \(0.095\)  & \(\mathbf{0.116}\) & rising \\
+\code{\detokenize{recon_rel}} (correctness gate, \(\to0\))               & \(0\)      & \(\mathbf{0}\)     & exact throughout \\
+\code{\detokenize{peak_vram}} MB (resource, flat in \(K\))               & \(\approx30{,}468\) & \(\approx30{,}468\) & flat \\
+\code{\detokenize{expert_util}} (MoE health)                             & \(\approx2.70\) & \(\approx2.70\) & healthy \\
+\code{\detokenize{erank}} (representation diag.)                         & \(636\)    & \(550\)            & healthy (non-degenerate) \\
+\bottomrule
+\end{tabularx}
+
+\smallskip
+\emph{Table~2: two-goal metrics over training (step 200 \(\to\) final), 2026-06-06 \(M_0\) half-LR
+run.  \code{\detokenize{erank}} is an explicitly non-monotone diagnostic (\S\ref{ssec:expressiveness}),
+so its mild decline is not a regression.}
+\end{center}
+
+\paragraph{(ii) Depth strictly helps within the trained horizon; the finite-horizon cap shows beyond it.}
+Table~3 is the final unprefixed \code{--k-eval-sweep}.  Within the trained horizon \(K\le64\) the
+recurrence is \emph{strictly depth-monotone}: \(\bpb(K)\) decreases and \(I_{\mathcal V}(K)\) increases
+at every step from \(K{=}4\) to the trained maximum \(K{=}64\), where both peak.  Beyond the horizon
+(\(K\in\{128,256\}\), extrapolation) both metrics \emph{gently reverse}.  This is the expected
+finite-horizon signature of a tied, non-nested readout (\S\ref{par:vinfo}: deep \(K\) can over-think
+past the trained budget), \emph{not} a training regression --- the model was never trained to use depth
+beyond \(64\).
+
+\begin{center}
+\footnotesize
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{6pt}
+\begin{tabular}{@{}l r r r r r r r@{}}
+\toprule
+\(K\) & \(4\) & \(8\) & \(16\) & \(32\) & \(\mathbf{64}\) & \(128\) & \(256\) \\
+\midrule
+\(\bpb(K)\)              & \(2.2129\) & \(1.9842\) & \(1.8721\) & \(1.8269\) & \(\mathbf{1.8186}\) & \(1.8379\) & \(1.8885\) \\
+\(I_{\mathcal V}(K)\) bits & \(3.20\)   & \(3.76\)   & \(4.04\)   & \(4.15\)   & \(\mathbf{4.17}\)   & \(4.12\)   & \(4.00\) \\
+regime                  & \multicolumn{5}{c}{\hrulefill\ trained \(K\le64\) (strictly monotone)\ \hrulefill} & \multicolumn{2}{c}{extrapolation \(\downarrow\)} \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+\emph{Table~3: final per-depth validation (bold = trained maximum \(K{=}64\), the best depth).
+\(\bpb\) strictly decreases and \(I_{\mathcal V}\) strictly increases for \(K{=}4{\to}64\); both reverse
+beyond the trained horizon.}
+\end{center}
+
+\paragraph{Reading \code{\detokenize{expressiveness_rho}} honestly under finite-horizon design.}
+The full-range Spearman correlation over the swept \(K\) is
+\(\code{\detokenize{expressiveness_rho}}=0.5357\), \emph{not} \(+1\).  This is by design, not a failure:
+the headline gate (Eq.~\eqref{eq:expr-rho}) is \(\rho_{\rm Spearman}(K,I_{\mathcal V}(K))\) over the
+\emph{entire} sweep, which here includes the post-\(K{=}64\) extrapolation dip, so a finite-horizon model
+\emph{cannot} reach \(\rho=+1\) on a range that extends past its trained depth.  Restricted to the
+in-range depths \(K\le64\) the curve is monotone and \(\rho\approx1.0\).  The single ``flat'' headline
+number is therefore the finite-horizon extrapolation cap (\S\ref{par:vinfo}), and consuming deeper \(K\)
+at test time would require either training deeper (extend \code{\detokenize{k_set}}) or an anytime /
+convergent readout (\S\ref{par:vinfo}), a separate design axis.
+
+\paragraph{Two-goal reading.}
+This run substantiates the two-goal frame (\S\ref{ssec:two-goal}) on the active model.  \emph{Resource:}
+the reversible \(O(1)\)-in-\(K\) backward holds \code{\detokenize{peak_vram}} flat across the depth sweep
+and the fp64 stream keeps \(\code{\detokenize{recon_rel}}=0\) (gradient correctness), so deeper inference
+costs no activation memory and the loop param count is meaningful.  \emph{Expressiveness:} within the
+trained horizon, each added recurrence step buys \(\mathcal V\)-usable predictive information
+(\(I_{\mathcal V}\,\uparrow\), \(\bpb\,\downarrow\)).  The two goals hold \emph{simultaneously}:
+depth-monotone usable information at flat, bit-exact resource is exactly the Pareto behavior the design
+targets.  The modest absolute depth-contribution (\code{\detokenize{iv_total_bits}}\(\approx0.8\) bits)
+is the data-determined easy-LM regime (\S\ref{par:vinfo}); the depth-hard \code{p1\_synthetic} protocol
+remains the venue for large \(\varphi\) / depth-utility.
 
 %==============================================================================
 \section{Superseded All-Stage DDP Run}

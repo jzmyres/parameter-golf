@@ -31,8 +31,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # CLAUDE.md "Audit-test execution" row in sync (enforced by
 # tests/test_audit_test_execution.py::test_audit_tests_registry_matches_claude_md).
 AUDIT_TESTS=(
-    "tests/test_optional_component_flag_contract.py"   # flag-to-effect contract
-    "tests/test_removal_symmetry.py"                   # removal-symmetry sweep
+    "tests/test_m0_contracts.py"                       # M0 doc-code + removal-symmetry + optimizer + int6 contracts
+    "tests/test_m0_hot_path_sync.py"                   # no host-sync in the M0 micro-loop
     "tests/test_enforcement_config_staged.py"          # enforcement-config staging
     "tests/test_audit_test_execution.py"               # this rule's self-enforcement
 )
