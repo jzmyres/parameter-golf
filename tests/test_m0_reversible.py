@@ -3,6 +3,206 @@ import torch.nn as nn
 from train_gpt import ReversibleRecurrence, _TinyDelta
 
 
+# ---------------------------------------------------------------------------
+# Orthogonal (mHC-style) strictly-invertible damping on the reversible
+# recurrence: a_{k+1} = Q·a_k + F(...); b_{k+1} = Q·b_k + G(...), with Q a
+# low-rank skew-Cayley orthogonal matrix (Qᵀ exact inverse, no Parcae floor).
+# The recurrence must stay fp64-exactly reversible + grad-equivalent with
+# damping ON, and be BYTE-IDENTICAL to additive coupling with damping="none".
+# ---------------------------------------------------------------------------
+def _damp_rec(d, rank=8, std=0.05, step_emb=None, seed=0):
+    """A ReversibleRecurrence with orthogonal damping and a NON-TRIVIAL Q.
+
+    ``std`` is the U,V init scale; the default 0.05 (not the 1e-3 production
+    near-identity init) makes Q meaningfully != I so the reversibility/grad
+    gates are non-vacuous. F,G are fresh _TinyDelta blocks."""
+    torch.manual_seed(seed)
+    F, G = _TinyDelta(d), _TinyDelta(d)
+    rec = ReversibleRecurrence(F, G, step_emb=step_emb, model_dim=d,
+                               damping="orthogonal", damping_rank=rank)
+    with torch.no_grad():
+        rec.damp_U.normal_(std=std)
+        rec.damp_V.normal_(std=std)
+    return rec
+
+
+def test_damping_orthogonal_reconstructs_initial_state_fp64():
+    """HARD GATE: fp64 exact reconstruction with damping=orthogonal and a
+    non-identity Q (atol 1e-7), random seed (a0,b0)!=x0."""
+    rec = _damp_rec(16)
+    x0 = torch.randn(2, 4, 16, dtype=torch.float64)
+    a0 = 0.3 * torch.randn(2, 4, 16, dtype=torch.float64)
+    b0 = 0.3 * torch.randn(2, 4, 16, dtype=torch.float64)
+    (aK, bK), _ = rec.forward_states(a0, b0, x0, depth=6)
+    assert not torch.allclose(aK, a0), "Q is identity / recurrence trivial"
+    a_rec, b_rec = rec.invert(aK, bK, x0, depth=6)
+    assert torch.allclose(a_rec, a0, atol=1e-7)
+    assert torch.allclose(b_rec, b0, atol=1e-7)
+
+
+def test_damping_orthogonal_reconstructs_with_step_conditioning_fp64():
+    """fp64 exact reconstruction with damping=orthogonal AND step_conditioning
+    (the two features compose: Q application + per-step e_k both in the inverse)."""
+    d = 16
+    step_emb = nn.Embedding(8, d).double()
+    nn.init.normal_(step_emb.weight, std=0.5)
+    rec = _damp_rec(d, step_emb=step_emb)
+    x0 = torch.randn(2, 4, d, dtype=torch.float64)
+    (aK, bK), _ = rec.forward_states(x0, x0, x0, depth=5)
+    assert not torch.allclose(aK, x0)
+    a_rec, b_rec = rec.invert(aK, bK, x0, depth=5)
+    assert torch.allclose(a_rec, x0, atol=1e-7)
+    assert torch.allclose(b_rec, x0, atol=1e-7)
+
+
+def test_damping_orthogonal_backward_matches_ordinary_autograd():
+    """HARD GATE: O(1) reversible backward grads == ordinary forward_states +
+    autograd (atol 1e-6) with damping ON; U,V grads nonzero; x0 path unaffected."""
+    rec = _damp_rec(16)
+    x0 = torch.randn(2, 4, 16, dtype=torch.float64, requires_grad=True)
+    (aK, bK), _ = rec.forward_states(x0, x0, x0, depth=4)
+    (0.5 * (aK + bK)).pow(2).sum().backward()
+    ref_g = {n: p.grad.clone() for n, p in rec.named_parameters()}
+    ref_x0 = x0.grad.clone()
+    assert "damp_U" in ref_g and "damp_V" in ref_g
+    assert ref_g["damp_U"].abs().sum() > 0 and ref_g["damp_V"].abs().sum() > 0
+    for p in rec.parameters():
+        p.grad = None
+    x0b = x0.detach().clone().requires_grad_(True)
+    rec.run_reversible(x0b, depth=4).pow(2).sum().backward()
+    for n, p in rec.named_parameters():
+        assert torch.allclose(p.grad, ref_g[n], atol=1e-6), n
+    assert torch.allclose(x0b.grad, ref_x0, atol=1e-6)
+    # U,V carry real (nonzero) grads through the custom backward.
+    assert rec.damp_U.grad.abs().sum() > 0 and rec.damp_V.grad.abs().sum() > 0
+
+
+def test_damping_orthogonal_backward_with_step_conditioning_and_random_init():
+    """HARD COMBINED GATE: damping=orthogonal + step_conditioning + random
+    (a0,b0)!=x0 all compose through the custom backward (atol 1e-6); U,V AND
+    step_emb.weight grads nonzero; x0 keeps only its per-step injection grad."""
+    d = 16
+    step_emb = nn.Embedding(8, d).double()
+    nn.init.normal_(step_emb.weight, std=0.5)
+    rec = _damp_rec(d, step_emb=step_emb)
+    x0 = torch.randn(2, 4, d, dtype=torch.float64, requires_grad=True)
+    a0 = 0.02 * torch.randn(2, 4, d, dtype=torch.float64)
+    b0 = 0.02 * torch.randn(2, 4, d, dtype=torch.float64)
+    (aK, bK), _ = rec.forward_states(a0, b0, x0, depth=4)
+    (0.5 * (aK + bK)).pow(2).sum().backward()
+    ref_g = {n: p.grad.clone() for n, p in rec.named_parameters()}
+    ref_x0 = x0.grad.clone()
+    for p in rec.parameters():
+        p.grad = None
+    x0b = x0.detach().clone().requires_grad_(True)
+    rec.run_reversible(x0b, depth=4, a0=a0, b0=b0).pow(2).sum().backward()
+    for n, p in rec.named_parameters():
+        assert torch.allclose(p.grad, ref_g[n], atol=1e-6), n
+    assert rec.damp_U.grad.abs().sum() > 0 and rec.damp_V.grad.abs().sum() > 0
+    assert rec.step_emb.weight.grad.abs().sum() > 0
+    assert torch.allclose(x0b.grad, ref_x0, atol=1e-6)
+
+
+def test_damping_none_is_byte_identical_to_additive_coupling():
+    """damping="none" (default) reproduces the additive-coupling outputs AND
+    grads EXACTLY (no Q path; byte-identical)."""
+    torch.manual_seed(0)
+    d = 16
+    F, G = _TinyDelta(d), _TinyDelta(d)
+    rec_base = ReversibleRecurrence(F, G)  # legacy signature, no damping
+    torch.manual_seed(0)
+    F2, G2 = _TinyDelta(d), _TinyDelta(d)
+    rec_none = ReversibleRecurrence(F2, G2, model_dim=d, damping="none")
+    # No damping params exist when off.
+    assert not hasattr(rec_none, "damp_U") or rec_none.damp_U is None
+    x0 = torch.randn(2, 4, d, dtype=torch.float64, requires_grad=True)
+    z_base = rec_base.run_reversible(x0, depth=5)
+    z_base.pow(2).sum().backward()
+    g_base = {n: p.grad.clone() for n, p in rec_base.named_parameters()}
+    gx0_base = x0.grad.clone()
+    x0b = x0.detach().clone().requires_grad_(True)
+    z_none = rec_none.run_reversible(x0b, depth=5)
+    z_none.pow(2).sum().backward()
+    assert torch.equal(z_base.detach(), z_none.detach())
+    for n, p in rec_none.named_parameters():
+        assert torch.allclose(p.grad, g_base[n], atol=1e-12), n
+    assert torch.allclose(x0b.grad, gx0_base, atol=1e-12)
+
+
+def test_damping_orthogonal_recon_rel_zero_bf16_deep_K():
+    """HARD load-bearing gate: under CPU bf16 autocast + random init + damping ON,
+    the reversible round-trip error recon_rel ≈ 0 (< 1e-6) at depth 16 AND 32.
+
+    Q is applied in the fp64 recurrence-accum stream so Qᵀ(Q·x)=x to ~1e-15 and
+    the reconstruction stays exact even though F/G matmuls run in bf16."""
+    from train_gpt import reconstruction_error, Hyperparameters, M0GPT, _RouterBiasMixin
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=16, n_heads=2, n_kv_heads=1, vocab_size=16, n_experts=4,
+        expert_rank=4, n_mix=2, kv_latent=4, head_dim=8, max_seq_len=32,
+        router_type="softmax", init_state="random",
+        damping="orthogonal", damping_rank=8,
+    )
+    m = M0GPT(args)
+    # Make Q + the delta blocks non-trivial so the recon gate is not vacuous.
+    with torch.no_grad():
+        m.rec.damp_U.normal_(std=0.05)
+        m.rec.damp_V.normal_(std=0.05)
+        for blk in (m.rec.F, m.rec.G):
+            for sub in blk.sublayers:
+                for mla in sub.attn_modules():
+                    mla.o_proj.weight.normal_(std=0.3)
+                for moe in sub.moe_modules():
+                    moe.w_out.normal_(std=0.3)
+    x = torch.randint(0, 16, (2, 16))
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        for K in (16, 32):
+            rr = reconstruction_error(m, x, depth=K)
+            assert rr < 1e-6, f"recon_rel must be ~0 with damping on @K={K} bf16, got {rr:.2e}"
+
+
+def test_damping_orthogonal_preserves_norm_and_rotates_state():
+    """BEHAVIORAL gate (the mechanism): with a fixed nonzero orthogonal Q the
+    HOMOGENEOUS part of the recurrence (set F=G=0) preserves state NORM across
+    steps (orthogonal ⇒ no decay/blowup) AND rotates the DIRECTION (cos(a_k,
+    a_{k+1}) < 1) — the state TRAVERSES rather than converging. damping="none"
+    leaves the homogeneous part stationary (cos == 1)."""
+    d = 24
+    # Zero F,G so we isolate the homogeneous Q dynamics a_{k+1}=Q·a_k.
+    F, G = _TinyDelta(d), _TinyDelta(d)
+    with torch.no_grad():
+        F.l.weight.zero_(); G.l.weight.zero_()
+    torch.manual_seed(7)
+    rec = ReversibleRecurrence(F, G, model_dim=d, damping="orthogonal", damping_rank=8)
+    with torch.no_grad():
+        rec.damp_U.normal_(std=0.3)
+        rec.damp_V.normal_(std=0.3)
+    x0 = torch.zeros(1, 1, d, dtype=torch.float64)  # no injection
+    a0 = torch.randn(1, 1, d, dtype=torch.float64)
+    b0 = torch.randn(1, 1, d, dtype=torch.float64)
+    with torch.no_grad():
+        (_, _), states = rec.forward_states(a0, b0, x0, depth=8)
+    # midpoints 0.5*(a+b); with F=G=0 each is Q applied to the prior midpoint.
+    norms = [float(s.norm()) for s in states]
+    n0 = float((0.5 * (a0 + b0)).norm())
+    alln = [n0] + norms
+    # Norm is preserved across steps (orthogonal homogeneous map).
+    assert max(alln) / min(alln) < 1.0 + 1e-6, f"norm not preserved: {alln}"
+    # Direction rotates: consecutive midpoints are NOT parallel.
+    vecs = [(0.5 * (a0 + b0)).flatten()] + [s.flatten() for s in states]
+    coss = [float(torch.nn.functional.cosine_similarity(vecs[i], vecs[i + 1], dim=0))
+            for i in range(len(vecs) - 1)]
+    assert max(coss) < 0.9999, f"state did not rotate (near-stationary): {coss}"
+    # Contrast: damping="none" homogeneous part is stationary (cos == 1).
+    rec_none = ReversibleRecurrence(F, G, model_dim=d, damping="none")
+    with torch.no_grad():
+        (_, _), st_none = rec_none.forward_states(a0, b0, x0, depth=4)
+    v_none = [(0.5 * (a0 + b0)).flatten()] + [s.flatten() for s in st_none]
+    cos_none = float(torch.nn.functional.cosine_similarity(v_none[0], v_none[1], dim=0))
+    assert cos_none > 0.9999, f"damping=none should be stationary, cos={cos_none}"
+
+
 def test_additive_coupling_reconstructs_initial_state():
     torch.manual_seed(0)
     d = 16

@@ -123,6 +123,127 @@ def test_optimizer_param_coverage():
     )
 
 
+def test_damping_cli_default_and_choices():
+    """--damping defaults to none (byte-identical); orthogonal opts into Q.
+    --damping-rank defaults to 16."""
+    from train_gpt import build_arg_parser
+
+    p = build_arg_parser()
+    assert p.parse_args([]).damping == "none"
+    assert p.parse_args([]).damping_rank == 16
+    assert p.parse_args(["--damping", "orthogonal"]).damping == "orthogonal"
+    assert p.parse_args(["--damping-rank", "32"]).damping_rank == 32
+
+
+def test_damping_orthogonal_optimizer_param_coverage():
+    """With --damping orthogonal the Q params (damp_U, damp_V) land in EXACTLY
+    one optimizer group (they are 2-D matrices -> Muon group)."""
+    from train_gpt import Hyperparameters, M0GPT, build_optimizers
+
+    args = Hyperparameters(
+        model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=1024,
+        n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+        max_seq_len=16, damping="orthogonal", damping_rank=8,
+    )
+    model = M0GPT(args)
+    # The Q params exist and are trainable.
+    pnames = dict(model.named_parameters())
+    assert "rec.damp_U" in pnames and "rec.damp_V" in pnames
+    optimizers = build_optimizers(model, matrix_lr=0.02, embed_lr=0.1, scalar_lr=0.02)
+    seen = {}
+    for opt in optimizers:
+        for group in opt.param_groups:
+            for p in group["params"]:
+                assert id(p) not in seen, "param in more than one optimizer group"
+                seen[id(p)] = True
+    trainable_ids = {id(p) for p in model.parameters() if p.requires_grad}
+    assert trainable_ids == set(seen.keys())
+    # damp_U / damp_V specifically are covered.
+    assert id(model.rec.damp_U) in seen and id(model.rec.damp_V) in seen
+
+
+def test_damping_none_model_is_byte_identical_default():
+    """damping='none' (default) reproduces the current model forward/grad EXACTLY
+    vs a model built without the field set (no Q path -> not a single bit moves)."""
+    from train_gpt import Hyperparameters, M0GPT
+
+    def _cfg(**extra):
+        return Hyperparameters(
+            model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+            n_experts=4, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+            max_seq_len=16, **extra)
+
+    torch.manual_seed(0)
+    m_default = M0GPT(_cfg())
+    torch.manual_seed(0)
+    m_none = M0GPT(_cfg(damping="none"))
+    x = torch.randint(0, 64, (2, 16)); y = x.clone()
+    l_default = m_default(x, y, depth=4)
+    l_none = m_none(x, y, depth=4)
+    assert torch.equal(l_default.detach(), l_none.detach())
+    l_default.backward(); l_none.backward()
+    g_default = {n: p.grad.clone() for n, p in m_default.named_parameters()}
+    for n, p in m_none.named_parameters():
+        assert torch.allclose(p.grad, g_default[n], atol=1e-12), n
+
+
+def test_damping_orthogonal_raises_route_step_div():
+    """BEHAVIORAL (mechanism): a non-trivial orthogonal Q makes the MoE routing
+    INPUT traverse representation space, so the per-step dominant expert changes
+    more across recurrence steps -> route_step_div RISES vs damping=none.
+
+    Averaged over several Q draws so the assertion is on the mean signal, not a
+    single noisy argmax trajectory."""
+    from train_gpt import Hyperparameters, M0GPT, route_step_diversity
+
+    def _build(damping):
+        torch.manual_seed(0)
+        args = Hyperparameters(
+            model_dim=32, n_heads=4, n_kv_heads=2, vocab_size=64,
+            n_experts=8, expert_rank=8, n_mix=2, kv_latent=8, head_dim=8,
+            max_seq_len=16, damping=damping, damping_rank=8)
+        m = M0GPT(args)
+        # Non-trivial F/G so routing actually depends on the evolving state.
+        with torch.no_grad():
+            for blk in (m.rec.F, m.rec.G):
+                for sub in blk.sublayers:
+                    for mla in sub.attn_modules():
+                        mla.o_proj.weight.normal_(std=0.3)
+                    for moe in sub.moe_modules():
+                        moe.w_out.normal_(std=0.3)
+        return m
+
+    x = torch.randint(0, 64, (2, 16))
+    base = route_step_diversity(_build("none"), x, depth=8)
+    # Average route_step_div over several non-trivial Q draws.
+    divs = []
+    for s in range(5):
+        m = _build("orthogonal")
+        torch.manual_seed(100 + s)
+        with torch.no_grad():
+            m.rec.damp_U.normal_(std=0.4)
+            m.rec.damp_V.normal_(std=0.4)
+        divs.append(route_step_diversity(m, x, depth=8))
+    mean_div = sum(divs) / len(divs)
+    assert mean_div > base, (
+        f"orthogonal damping did not raise route_step_div: none={base:.4f} "
+        f"orthogonal_mean={mean_div:.4f} draws={divs}")
+
+
+def test_m0_trainer_damping_orthogonal_smoke(tmp_path):
+    """End-to-end CPU smoke with --damping orthogonal: trains and writes an
+    artifact (the Q params ride the optimizer + custom backward)."""
+    from train_gpt import main
+
+    main(["--iterations", "2", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
+          "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8",
+          "--head-dim", "8", "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+          "--damping", "orthogonal", "--damping-rank", "8", "--k-set", "2,4",
+          "--artifact-out", str(tmp_path / "dp.bin")])
+    assert (tmp_path / "dp.bin").exists()
+    assert (tmp_path / "dp.bin").stat().st_size > 0
+
+
 def test_moe_expert_banks_routed_to_muon():
     """The 3-D MoE expert banks (w_in/w_out) belong to Muon, not AdamW.
 

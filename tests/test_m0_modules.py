@@ -3,6 +3,78 @@ import torch
 from train_gpt import Hyperparameters, M0GPT, MLAttention, MoSHead, SwiGLUMoE
 
 
+# ---------------------------------------------------------------------------
+# Orthogonal (mHC-style) strictly-invertible damping: low-rank skew-Cayley Q.
+# ``cayley_apply`` computes Q·x / Qᵀ·x via Woodbury (NO d×d matrix is formed),
+# where Q = (I − S)(I + S)^{-1} with S = U Vᵀ − V Uᵀ (skew ⇒ Q orthogonal).
+# These are the fp64 helper-level gates (orthogonality + Qᵀ∘Q == I).
+# ---------------------------------------------------------------------------
+def test_cayley_apply_matches_dense_Q_and_QT():
+    """``cayley_apply`` (Woodbury, no d×d matrix) equals the dense Cayley
+    Q·x and Qᵀ·x to fp64 precision."""
+    from train_gpt import cayley_apply
+
+    torch.manual_seed(0)
+    d, r = 12, 4
+    U = torch.randn(d, r, dtype=torch.float64)
+    V = torch.randn(d, r, dtype=torch.float64)
+    S = U @ V.T - V @ U.T
+    I = torch.eye(d, dtype=torch.float64)
+    Q = (I - S) @ torch.linalg.inv(I + S)
+    x = torch.randn(3, 5, d, dtype=torch.float64)
+    # Row-vector convention: applying Q to each d-vector is x @ Qᵀ.
+    assert torch.allclose(cayley_apply(x, U, V), x @ Q.T, atol=1e-10)
+    assert torch.allclose(cayley_apply(x, U, V, transpose=True), x @ Q, atol=1e-10)
+
+
+def test_cayley_Q_is_orthogonal():
+    """The Cayley Q from a random skew S is orthogonal: ‖QᵀQ − I‖ < 1e-10 (fp64).
+    Probed columnwise through ``cayley_apply`` on the identity (no dense Q)."""
+    from train_gpt import cayley_apply
+
+    torch.manual_seed(1)
+    d, r = 16, 5
+    U = torch.randn(d, r, dtype=torch.float64)
+    V = torch.randn(d, r, dtype=torch.float64)
+    I = torch.eye(d, dtype=torch.float64)
+    Q = cayley_apply(I, U, V)          # rows are Q applied to e_i -> Q matrix rows
+    # Q here is the matrix whose i-th ROW is Q·e_i, i.e. Qᵀ. QᵀQ = I either way.
+    assert (Q @ Q.T - I).abs().max() < 1e-10
+    assert (Q.T @ Q - I).abs().max() < 1e-10
+    # det > 0 (Cayley of a skew matrix is a proper rotation).
+    assert torch.linalg.det(Q) > 0
+
+
+def test_cayley_apply_roundtrip_is_identity():
+    """Qᵀ(Q·x) == x to ~1e-12 in fp64 — the load-bearing reversibility primitive."""
+    from train_gpt import cayley_apply
+
+    torch.manual_seed(2)
+    d, r = 24, 8
+    U = torch.randn(d, r, dtype=torch.float64)
+    V = torch.randn(d, r, dtype=torch.float64)
+    x = torch.randn(4, 7, d, dtype=torch.float64)
+    rt = cayley_apply(cayley_apply(x, U, V), U, V, transpose=True)
+    assert (rt - x).abs().max() < 1e-12
+    # Also the other order Q(Qᵀ·x) == x.
+    rt2 = cayley_apply(cayley_apply(x, U, V, transpose=True), U, V)
+    assert (rt2 - x).abs().max() < 1e-12
+
+
+def test_cayley_apply_near_identity_at_small_UV():
+    """Small U,V (1e-3 init scale) ⇒ S≈0 ⇒ Q≈I: the recurrence starts ≈ the
+    additive coupling (stability + the near-identity readout start)."""
+    from train_gpt import cayley_apply
+
+    torch.manual_seed(3)
+    d, r = 16, 4
+    U = 1e-3 * torch.randn(d, r, dtype=torch.float64)
+    V = 1e-3 * torch.randn(d, r, dtype=torch.float64)
+    x = torch.randn(2, 3, d, dtype=torch.float64)
+    y = cayley_apply(x, U, V)
+    assert (y - x).abs().max() < 1e-4  # Q ≈ I at the 1e-3 init scale
+
+
 def test_mla_shapes_and_kv_latent():
     m = MLAttention(dim=32, n_heads=4, n_kv_heads=2, kv_latent=8, head_dim=8)
     x = torch.randn(2, 6, 32)

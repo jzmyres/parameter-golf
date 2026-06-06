@@ -566,10 +566,30 @@ orthogonal choice is canonical: with \(Q\) orthogonal the coupling
 \(Q^{\top}\) (no Parcae reverse-reconstruction floor), is norm-preserving (so per-step displacement
 cannot decay to a fixed point and the dynamics stay well-scaled \emph{beyond} the trained depth,
 unlike the clock), and the cross-stream/cross-depth mixing supplies expressiveness.  It thus
-supersedes both the UT-style clock and the diagonal Parcae damping-with-floor in one mechanism.
+supersedes both the UT-style clock and the diagonal Parcae damping-with-floor in one mechanism,
+relaxing the \(A{+}B{=}I\) convex tie of Parcae damping to an orthogonal \(A=Q\) with free
+\(B\) (the residual updates \(F,G\)).
 Per Occam it is the \emph{second} rung---tested only if Huginn-style random init
 (\code{--init-state random}, \S\ref{sec:metrics}) does not by itself close the \(M_0\)/\(M_{\rm clk}\)
 gap.
+
+\emph{Implemented.}  This is now available behind the \code{--damping} knob (\code{none}, the
+default, is \(Q{=}I\) and byte-identical to the additive coupling; \code{orthogonal} enables the
+mechanism) with rank knob \code{\detokenize{--damping-rank}} (default \(r{=}16\)).  \(Q\) is
+parameterized as the \emph{low-rank skew-Cayley} \(Q=(I-S)(I+S)^{-1}\) of a skew-symmetric
+\(S=UV^{\top}-VU^{\top}\) with learnable \(U,V\in\mathbb{R}^{d\times r}\); \(S^{\top}{=}{-}S\)
+guarantees \(Q^{\top}Q{=}I\) and \(\det Q{>}0\) (a proper rotation), and the inverse is exactly
+\(Q^{\top}=(I+S)(I-S)^{-1}\) --- no floor.  \(Q\,x\) and \(Q^{\top}x\) are applied via the
+Woodbury identity, \(Q\) shared across steps and between the \(a/b\) streams, so the \(d{\times}d\)
+matrix is \emph{never} formed and no \(d{\times}d\) system is solved: cost is \(O(B\,T\,d\,r)\) (an
+\(r{\times}r\) solve plus \(d{\times}r\) matmuls).  \(U,V\) are initialized at \(10^{-3}\!\cdot\!
+\mathcal{N}\) so \(S{\approx}0,\ Q{\approx}I\) at start (near-identity readout); rotation is learned.
+\(Q\) is a fixed matrix \emph{within} a forward+backward (a function of \(U,V\) only, not of the
+evolving states), so each reverse undo needs one already-available state (no leapfrog circularity);
+applying \(Q\) in the fp64 accumulation stream keeps \(Q^{\top}(Q\,x){=}x\) to \(\sim\!10^{-15}\),
+so the reversible round-trip \code{\detokenize{recon_rel}}\(\approx0\) even under bf16 autocast at
+deep \(K\).  The custom \(O(1)\)-memory backward applies \(Q^{\top}\) in its reconstruction and
+\(Q\) in the rebuilt step, so \(U,V\) receive gradients identical to ordinary BPTT.
 
 %==============================================================================
 \section{Assumptions and Checks}

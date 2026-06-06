@@ -133,28 +133,87 @@ class RMSNorm(nn.Module):
 # ---------------------------------------------------------------------------
 # 3. Reversible recurrence core
 # ---------------------------------------------------------------------------
+def cayley_apply(x, U, V, transpose=False):
+    """Apply the low-rank skew-Cayley ORTHOGONAL matrix ``Q`` (or ``Qᵀ``) to ``x``.
+
+    The orthogonal (mHC-style) damping matrix is the Cayley transform of a
+    low-rank SKEW-symmetric ``S``::
+
+        S = U Vᵀ − V Uᵀ      (Sᵀ = −S, so S is skew)      U, V ∈ R^{d×r}
+        Q = (I − S)(I + S)^{-1}        (orthogonal: QᵀQ = I, det Q > 0)
+        Qᵀ = (I + S)(I − S)^{-1}       (= Q^{-1}, since Sᵀ = −S)
+
+    ``Q`` is applied via the Woodbury / Sherman-Morrison identity so the dense
+    ``d×d`` matrix is NEVER formed and no ``d×d`` system is solved — only an
+    ``2r×2r`` solve plus ``d×2r`` matmuls (cost ``O(B·T·d·r)``). Writing
+    ``S = M Nᵀ`` with ``M = [U | V]`` and ``N = [V | −U]`` (both ``d×2r``), and
+    for the chosen branch ``(I + sgn·S)`` with ``sgn = +1`` for ``Q`` (inner
+    inverse is ``(I+S)^{-1}``) or ``sgn = −1`` for ``Qᵀ`` (inner inverse is
+    ``(I−S)^{-1}``)::
+
+        w = (I + sgn·S)^{-1} x = x − (sgn·M) (I_{2r} + Nᵀ(sgn·M))^{-1} (Nᵀ x)
+        y = (I − sgn·S) w      = w − sgn · M (Nᵀ w)
+
+    ``x`` has shape ``(..., d)`` (row-vector convention: each trailing-``d`` slice
+    is multiplied by ``Q`` on the left, i.e. ``y = x @ Qᵀ`` for ``Q``). ``U``/``V``
+    are cast to ``x``'s dtype, so calling this with an fp64 stream keeps
+    ``Qᵀ(Q·x) = x`` exact to ~1e-15 — the load-bearing reversibility primitive
+    (the reconstruction inverse divides by NOTHING, so there is no Parcae floor).
+
+    When ``r == 0`` (no damping rank) ``Q = I`` and ``x`` is returned unchanged.
+    """
+    if U is None or U.shape[-1] == 0:
+        return x
+    dt = x.dtype
+    U = U.to(dt)
+    V = V.to(dt)
+    M = torch.cat([U, V], dim=-1)        # (d, 2r),  S = M Nᵀ
+    N = torch.cat([V, -U], dim=-1)       # (d, 2r)
+    sgn = -1.0 if transpose else 1.0
+    Mh = sgn * M                         # (I + sgn·S) = I + Mh Nᵀ
+    twor = M.shape[-1]
+    eye = torch.eye(twor, dtype=dt, device=x.device)
+    Nx = x @ N                           # (..., 2r) = Nᵀ x  (row-vector)
+    cap = eye + (N.transpose(-1, -2) @ Mh)   # (2r, 2r) = I + Nᵀ(sgn·M)
+    # w = x − Mh (cap^{-1} (Nᵀ x)); solve cap · sol = Nx  (sol shape (..., 2r)).
+    sol = torch.linalg.solve(cap, Nx.unsqueeze(-1)).squeeze(-1)   # (..., 2r)
+    w = x - sol @ Mh.transpose(-1, -2)   # (..., d)
+    # y = (I − sgn·S) w = w − sgn·M (Nᵀ w).
+    Nw = w @ N                           # (..., 2r) = Nᵀ w
+    y = w - sgn * (Nw @ M.transpose(-1, -2))
+    return y
+
+
 class ReversibleRecurrence(nn.Module):
     """Additive-coupling reversible recurrence with an explicit, floor-free inverse.
 
     Forward update (one depth step ``k``), conditioned on the injected input
-    ``x0`` and an OPTIONAL per-step embedding ``e_k`` (``step_conditioning``)::
+    ``x0`` and an OPTIONAL per-step embedding ``e_k`` (``step_conditioning``),
+    with an OPTIONAL strictly-invertible orthogonal ``damping`` matrix ``Q``::
 
-        a_{k+1} = a_k + F(b_k     + x0 + e_k)
-        b_{k+1} = b_k + G(a_{k+1} + x0 + e_k)
+        a_{k+1} = Q·a_k + F(b_k     + x0 + e_k)
+        b_{k+1} = Q·b_k + G(a_{k+1} + x0 + e_k)
 
-    The inverse runs the same blocks in reverse, undoing each additive coupling
-    and RECOMPUTING the SAME ``e_k`` for each known step index ``k``::
+    The inverse runs the same blocks in reverse, undoing each coupling with
+    ``Qᵀ`` (``= Q^{-1}``, no floor) and RECOMPUTING the SAME ``e_k`` for each
+    known step index ``k``::
 
-        b_k     = b_{k+1} - G(a_{k+1} + x0 + e_k)
-        a_k     = a_{k+1} - F(b_k     + x0 + e_k)
+        b_k     = Qᵀ·(b_{k+1} - G(a_{k+1} + x0 + e_k))
+        a_k     = Qᵀ·(a_{k+1} - F(b_k     + x0 + e_k))
+
+    With ``damping="none"`` (default) ``Q = I`` and this is BYTE-IDENTICAL to the
+    plain additive coupling ``a_{k+1}=a_k+F(...)``.
 
     Reconstruction is exact (no contraction / no floor) because each step only
-    adds a quantity that is recomputable from the *other* stream plus ``x0`` and
-    the deterministic ``e_k = step_emb(min(k, max-1))``. ``F`` / ``G`` carry
-    their own input RMSNorm, so the inverse recomputes the same normalized
-    argument identically; ``e_k`` is a deterministic function of the step index
-    only, so the reverse pass (which walks ``k`` in reverse) reconstructs it
-    bit-identically.
+    (i) adds a quantity recomputable from the *other* stream plus ``x0`` and the
+    deterministic ``e_k = step_emb(min(k, max-1))``, and (ii) mixes by ``Q``,
+    whose exact inverse is ``Qᵀ`` (orthogonal — see :func:`cayley_apply`).
+    ``F`` / ``G`` carry their own input RMSNorm so the inverse recomputes the
+    same normalized argument identically; ``e_k`` is a deterministic function of
+    the step index only; ``Q`` is a fixed matrix WITHIN a forward+backward
+    (function of ``damp_U``/``damp_V`` only, NOT of the evolving states), so the
+    reverse pass reconstructs everything bit-identically. ``Q`` is applied in the
+    fp64 accum-stream dtype so ``Qᵀ(Q·x)=x`` to ~1e-15 -> ``recon_rel`` ~ 0.
 
     ``step_emb`` is the PRINCIPLED FIX for effective-depth collapse: a tied
     block iterated ``K`` times collapses to a fixed point (effective depth
@@ -167,15 +226,27 @@ class ReversibleRecurrence(nn.Module):
     ``_step_vec`` returns a zero scalar tensor that the additive form absorbs
     with no graph effect, so reversibility and gradients are unchanged.
 
-    ``step_emb`` is registered as a SUBMODULE of this recurrence (not the parent
-    model) so its weight is included in ``self.parameters()`` — the same tuple
-    that :meth:`run_reversible` passes as explicit ``RevRecurrenceFn.apply``
-    inputs and that ``RevRecurrenceFn.backward`` returns gradient slots for.
-    This is what gives ``step_emb`` a correct grad edge through the custom
-    autograd Function (see ``EXPERIENCE.md#custom-autograd-input``).
+    ``damping="orthogonal"`` is the AUTONOMOUS substitute for the clock (the
+    rung-2 anti-collapse fix): an orthogonal ``Q`` shared across steps and
+    between the a/b streams makes the recurrence state TRAVERSE representation
+    space (norm-preserving rotation, no fixed-point collapse), so it extrapolates
+    beyond the trained depth AND the MoE routing input changes across steps —
+    unlike the depth-CONDITIONED clock. ``Q`` is the low-rank skew-Cayley of
+    learnable ``damp_U``/``damp_V`` (init ``1e-3·randn`` so ``Q≈I`` at start,
+    keeping the near-identity readout). See ``reports/opg_doc.tex`` "Autonomous
+    substitute" and the ``--damping`` / ``--damping-rank`` knobs.
+
+    ``step_emb`` (when present) and ``damp_U``/``damp_V`` (when damping is on) are
+    registered as members of this recurrence (not the parent model) so their
+    weights are included in ``self.parameters()`` — the same tuple that
+    :meth:`run_reversible` passes as explicit ``RevRecurrenceFn.apply`` inputs
+    and that ``RevRecurrenceFn.backward`` returns gradient slots for. This is
+    what gives them a correct grad edge through the custom autograd Function (see
+    ``EXPERIENCE.md#custom-autograd-input``).
     """
 
-    def __init__(self, F, G, step_emb=None, accum_dtype=torch.float64):
+    def __init__(self, F, G, step_emb=None, accum_dtype=torch.float64,
+                 damping="none", damping_rank=16, model_dim=None):
         super().__init__()
         self.F, self.G = F, G
         # Optional per-step (clock) embedding submodule. None -> unconditioned
@@ -187,6 +258,33 @@ class ReversibleRecurrence(nn.Module):
         # still run at the ambient autocast precision). See Hyperparameters
         # ``recurrence_accum_dtype``.
         self.accum_dtype = accum_dtype
+        # Optional orthogonal (mHC-style) strictly-invertible damping Q. "none"
+        # (default) -> Q=I, byte-identical to additive coupling (NO Q params, NO
+        # Q application). "orthogonal" -> low-rank skew-Cayley Q = (I-S)(I+S)^-1,
+        # S = damp_U damp_Vᵀ - damp_V damp_Uᵀ, applied via :func:`cayley_apply`.
+        if damping not in ("none", "orthogonal"):
+            raise ValueError(f"damping must be 'none' or 'orthogonal', got {damping!r}")
+        self.damping = damping
+        self.damp_U = self.damp_V = None
+        if damping == "orthogonal":
+            if model_dim is None:
+                raise ValueError("damping='orthogonal' requires model_dim")
+            if damping_rank < 1:
+                raise ValueError(f"damping_rank must be >= 1, got {damping_rank}")
+            # Init U,V small (1e-3) so S≈0 -> Q≈I at init: the recurrence starts
+            # ≈ the additive coupling (stability + near-identity readout start).
+            self.damp_U = nn.Parameter(1e-3 * torch.randn(model_dim, damping_rank))
+            self.damp_V = nn.Parameter(1e-3 * torch.randn(model_dim, damping_rank))
+
+    def _apply_q(self, x, transpose=False):
+        """``Q·x`` (or ``Qᵀ·x``) when damping is on, else ``x`` unchanged.
+
+        Q is applied in ``x``'s dtype (the accum stream, fp64) so the orthogonal
+        round-trip is exact. A no-op (returns ``x``) when ``damping="none"``, so
+        the additive-coupling path is byte-identical."""
+        if self.damping == "none":
+            return x
+        return cayley_apply(x, self.damp_U, self.damp_V, transpose=transpose)
 
     def _fn_in_dtype(self, fn):
         """Native compute dtype of an F/G block: its highest-precision float param.
@@ -246,8 +344,9 @@ class ReversibleRecurrence(nn.Module):
         states = []
         for k in range(int(depth)):
             e_k = self._step_vec(k, x0)
-            a = a + self.F((b + x0 + e_k).to(fd)).to(ad)
-            b = b + self.G((a + x0 + e_k).to(gd)).to(ad)
+            # Q·a_k + F(...); Q is I (no-op) when damping is off (byte-identical).
+            a = self._apply_q(a) + self.F((b + x0 + e_k).to(fd)).to(ad)
+            b = self._apply_q(b) + self.G((a + x0 + e_k).to(gd)).to(ad)
             states.append(0.5 * (a + b))
         return (a, b), states
 
@@ -277,8 +376,8 @@ class ReversibleRecurrence(nn.Module):
         out = {}
         for k in range(want[-1]):
             e_k = self._step_vec(k, x0)
-            a = a + self.F((b + x0 + e_k).to(fd)).to(ad)
-            b = b + self.G((a + x0 + e_k).to(gd)).to(ad)
+            a = self._apply_q(a) + self.F((b + x0 + e_k).to(fd)).to(ad)
+            b = self._apply_q(b) + self.G((a + x0 + e_k).to(gd)).to(ad)
             d = k + 1  # midpoint after (k+1) full steps
             if d in want_set:
                 out[d] = 0.5 * (a + b)
@@ -288,12 +387,14 @@ class ReversibleRecurrence(nn.Module):
         # Walk steps in REVERSE; e_k is a deterministic function of the step
         # index k, so each reverse step recomputes the SAME e_k the forward used.
         # fp64 stream + block-dtype F/G inputs, identical to forward_states, so
-        # the algebraic +/- inverse is exact bit-for-bit.
+        # the algebraic inverse is exact bit-for-bit. With damping ON the forward
+        # mixes a_k by Q (a_{k+1}=Q·a_k+F(...)), so the inverse first undoes the
+        # additive coupling THEN applies Qᵀ (=Q^-1): a_k = Qᵀ·(a_{k+1}-F(...)).
         ad, fd, gd, a, b, x0 = self._stream_setup(a, b, x0)
         for k in reversed(range(int(depth))):
             e_k = self._step_vec(k, x0)
-            b = b - self.G((a + x0 + e_k).to(gd)).to(ad)
-            a = a - self.F((b + x0 + e_k).to(fd)).to(ad)
+            b = self._apply_q(b - self.G((a + x0 + e_k).to(gd)).to(ad), transpose=True)
+            a = self._apply_q(a - self.F((b + x0 + e_k).to(fd)).to(ad), transpose=True)
         return a, b
 
     def run_reversible(self, x0, depth, a0=None, b0=None):
@@ -434,20 +535,26 @@ class RevRecurrenceFn(torch.autograd.Function):
                 # Algebraic inverse of one forward step IN THE STREAM DTYPE (fp64
                 # +/-, exact); F/G run under the replayed autocast (bf16 matmuls)
                 # and their output is cast back to the stream dtype before the -.
-                b_prev = b - rec.G((a + x0 + e_k).to(gd)).to(ad)
-                a_prev = a - rec.F((b_prev + x0 + e_k).to(fd)).to(ad)
+                # With damping ON undo the additive coupling THEN apply Qᵀ (=Q^-1,
+                # no floor): b_k = Qᵀ·(b_{k+1}-G(...)); a_k = Qᵀ·(a_{k+1}-F(...)).
+                # Q is applied in the fp64 stream so Qᵀ(Q·x)=x exactly -> the
+                # reconstruction stays exact (no-op when damping is off).
+                b_prev = rec._apply_q(b - rec.G((a + x0 + e_k).to(gd)).to(ad), transpose=True)
+                a_prev = rec._apply_q(a - rec.F((b_prev + x0 + e_k).to(fd)).to(ad), transpose=True)
             # Rebuild the single forward step on fresh fp64 leaves. Use .clone()
             # so the y-leg/z-leg pair and successive steps do not alias storage.
             # enable_grad: a custom Function's backward runs with grad disabled
             # by default; we need a live local graph to take the per-step VJP.
-            # autocast is replayed so F/G match the forward (bf16 matmuls).
+            # autocast is replayed so F/G match the forward (bf16 matmuls). The Q
+            # application (rec._apply_q reads the live damp_U/damp_V, members of
+            # params) is part of the rebuilt step so U,V receive their VJP grads.
             with torch.enable_grad(), autocast_ctx():
                 ap = a_prev.clone().requires_grad_(True)
                 bp = b_prev.clone().requires_grad_(True)
                 x0r = x0.clone().requires_grad_(True)
                 e_k_live = rec._step_vec(k, x0r)
-                a_new = ap + rec.F((bp + x0r + e_k_live).to(fd)).to(ad)
-                b_new = bp + rec.G((a_new + x0r + e_k_live).to(gd)).to(ad)
+                a_new = rec._apply_q(ap) + rec.F((bp + x0r + e_k_live).to(fd)).to(ad)
+                b_new = rec._apply_q(bp) + rec.G((a_new + x0r + e_k_live).to(gd)).to(ad)
             grads = torch.autograd.grad(
                 (a_new, b_new), [ap, bp, x0r, *params],
                 grad_outputs=(ga, gb), retain_graph=False, allow_unused=True,
@@ -1304,6 +1411,23 @@ class Hyperparameters:
     #     mos_head / loss) is cast back to the model dtype, so this is internal
     #     to the recurrence only. Must be "float64" or "float32".
     recurrence_accum_dtype: str = "float64"
+    #   damping: strictly-invertible orthogonal (mHC-style) "damping" matrix Q on
+    #     the coupling streams — the AUTONOMOUS substitute for the clock (rung-2
+    #     anti-collapse). "none" (default): Q=I, BYTE-IDENTICAL to additive
+    #     coupling. "orthogonal": a_{k+1}=Q·a_k+F(...), b_{k+1}=Q·b_k+G(...) with
+    #     Q the low-rank skew-Cayley of damp_U/damp_V, SHARED across steps and
+    #     between the a/b streams. Q is norm-preserving so the state TRAVERSES
+    #     representation space (no fixed-point collapse) and extrapolates beyond
+    #     the trained depth — and the MoE routing input changes across steps
+    #     (raising route_step_div) — unlike the depth-CONDITIONED clock. The exact
+    #     inverse is Qᵀ (no Parcae floor); Q is applied in the fp64 accum stream
+    #     so recon_rel ~ 0. Relaxes the A+B=I convex tie (orthogonal A, free
+    #     B=F/G). See reports/opg_doc.tex "Autonomous substitute".
+    damping: str = "none"
+    #   damping_rank: rank r of the skew factors damp_U, damp_V (d x r). Q = Cayley
+    #     of S = U Vᵀ - V Uᵀ (rank <= 2r). Cost O(B·T·d·r) via Woodbury (no d×d
+    #     matrix / no d×d solve). Only allocated when damping="orthogonal".
+    damping_rank: int = 16
 
     def __post_init__(self):
         # Validate the recurrence-seed mode OUTSIDE the CLI (the CLI also
@@ -1319,6 +1443,18 @@ class Hyperparameters:
             raise ValueError(
                 "recurrence_accum_dtype must be 'float64' or 'float32', got "
                 f"{self.recurrence_accum_dtype!r}"
+            )
+        # ReversibleRecurrence.__init__ branches on this exact string; reject an
+        # unknown value loudly (the CLI also constrains it via choices, but the
+        # config is the single source of truth and is built directly in tests).
+        if self.damping not in ("none", "orthogonal"):
+            raise ValueError(
+                f"damping must be 'none' or 'orthogonal', got {self.damping!r}"
+            )
+        if self.damping == "orthogonal" and self.damping_rank < 1:
+            raise ValueError(
+                f"damping_rank must be >= 1 when damping='orthogonal', got "
+                f"{self.damping_rank}"
             )
 
 
@@ -1479,8 +1615,16 @@ class M0GPT(nn.Module):
             step_emb = nn.Embedding(args.max_step_emb, d)
             nn.init.normal_(step_emb.weight, mean=0.0, std=0.02)
         accum_dtype = getattr(torch, args.recurrence_accum_dtype)
+        # Optional orthogonal (mHC-style) strictly-invertible damping Q (the
+        # autonomous substitute for the clock; --damping). damp_U/damp_V are
+        # members of the recurrence so they ride self.parameters() through the
+        # custom autograd Function (same mechanism as step_emb). "none" (default)
+        # -> Q=I, byte-identical to additive coupling.
         self.rec = ReversibleRecurrence(F_block, G_block, step_emb=step_emb,
-                                        accum_dtype=accum_dtype)
+                                        accum_dtype=accum_dtype,
+                                        damping=args.damping,
+                                        damping_rank=args.damping_rank,
+                                        model_dim=d)
 
         # Readout norm of the reversible midpoint, applied OUTSIDE the recurrence
         # so reconstruction stays exact (see class docstring).
@@ -3394,6 +3538,7 @@ def hyperparameters_from_args(args) -> "Hyperparameters":
         step_conditioning=args.step_conditioning, max_step_emb=args.max_step_emb,
         init_state=args.init_state, init_state_std=args.init_state_std,
         recurrence_accum_dtype=args.recurrence_accum_dtype,
+        damping=args.damping, damping_rank=args.damping_rank,
     )
 
 
@@ -3476,6 +3621,24 @@ def build_arg_parser():
                         "float32: cheaper, removes the random-init blow-up but is "
                         "NOT bit-exact. Readout (final_norm/mos_head) is cast back "
                         "to the model dtype either way.")
+    p.add_argument("--damping", type=str, default="none",
+                   choices=("none", "orthogonal"),
+                   help="Strictly-invertible orthogonal (mHC-style) DAMPING matrix "
+                        "Q on the coupling streams — the AUTONOMOUS substitute for "
+                        "the clock (rung-2 anti-collapse). none (default): Q=I, "
+                        "byte-identical to additive coupling. orthogonal: "
+                        "a_{k+1}=Q·a_k+F(...), b_{k+1}=Q·b_k+G(...) with Q the "
+                        "low-rank skew-Cayley of damp_U/damp_V (shared across steps "
+                        "and streams). Norm-preserving so the state TRAVERSES rep "
+                        "space (no fixed-point collapse) and extrapolates beyond the "
+                        "trained depth, raising route_step_div — unlike the depth- "
+                        "conditioned clock. Exact inverse Qᵀ (no Parcae floor), "
+                        "applied in the fp64 accum stream so recon_rel ~ 0.")
+    p.add_argument("--damping-rank", type=int, default=16,
+                   help="Rank r of the skew factors damp_U, damp_V (d x r) for "
+                        "--damping orthogonal. Q = Cayley(U Vᵀ - V Uᵀ). Cost "
+                        "O(B·T·d·r) via Woodbury (no d×d matrix / no d×d solve). "
+                        "Default 16.")
     # Training schedule / batch.
     p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--seq-len", type=int, default=512)
