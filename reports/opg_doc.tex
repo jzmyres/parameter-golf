@@ -427,6 +427,15 @@ By default the sweep runs \emph{once} after the final validation, but the opt-in
 end-of-run value---the smoke-gate ``all eval metrics improving'' needs the \(\varphi\)/\(I_{\mathcal V}\)
 trends, not just the per-step \code{metrics:} line. Default \(N=0\) preserves the byte-identical
 end-of-run-only behavior; the final unprefixed sweep is always emitted.
+
+\emph{Test-time depth extrapolation.}  The \code{--k-eval-sweep} should include depths \emph{beyond}
+the trained maximum \(K\) (e.g.\ train on \(K\in\{32,64\}\), sweep \(\{4,8,16,32,64,128,256\}\)) so that
+\(I_{\mathcal V}(K)\) and \(\bpb(K)\) are measured in the extrapolation regime.  The reading is
+diagnostic: if \(I_{\mathcal V}\) keeps rising / \(\bpb\) keeps falling past the trained horizon, the
+recurrence exhibits Huginn-style test-time depth scaling \cite{huginn}; if it degrades (the tied,
+finite-horizon, non-nested readout \emph{over-thinks} beyond the trained \(K\), \S\ref{par:vinfo}), the
+extrapolation cliff is itself the signal and bounds the usable inference depth.  Either way the
+extrapolation tail is tracked at validation, never assumed.
 The sweep is computed from a \emph{single shared trajectory}: the recurrence is deterministic given
 the seed \((a_0,b_0,x_0)\), so depth \(K_{\max}\) is depth \(K_{\min}\) \emph{continued}.  Rather than
 re-running the recurrence from the seed for each \(K\) (cost \(\sum_K K\)), the trainer takes ONE
@@ -479,6 +488,20 @@ together with the per-\(K\) \code{usable\_info} line (\(I_{\mathcal{V}}(K)\) in 
 usable information gained across the swept range \code{iv\_total\_bits}
 \(=I_{\mathcal{V}}(K_{\max})-I_{\mathcal{V}}(K_{\min})\) (in bits).  On real data \(I_{\mathcal{V}}(K)\)
 is \emph{realized} expressiveness; on the depth-hard positive control it measures \emph{capability}.
+
+\emph{Depth-utility is data-determined; ``shallow vs.\ deep'' is read from the curve, not a point.}
+A single \(I_{\mathcal V}(K)\) value cannot say whether a model solves a task shallowly or deeply --- only
+the \emph{curve} \(K\mapsto I_{\mathcal V}(K)\) can, and \code{iv\_total\_bits}
+\(=I_{\mathcal V}(K_{\max})-I_{\mathcal V}(K_{\min})\) \emph{is} the depth-contribution (the slice of usable
+information that depth, not the shallow pass, supplies).  On easy LM next-token prediction the model gets
+most of its predictive information \emph{shallowly}: measured on fineweb, \(\approx79\%\) of the depth-32
+usable information is already realized at \(K{=}4\), and the remaining depth adds only \(\approx0.79\)
+bits.  Consequently \(\varphi\) / depth-utility is intrinsically \emph{modest on easy LM} and is large only
+on depth-demanding data --- the provably depth-hard \code{experiments/p1\_synthetic.py} protocol
+(\S\ref{sec:protocol}).  The \emph{magnitude} of \(\varphi\) and \code{iv\_total\_bits} is
+therefore data-determined, not a model failure: a flat \(I_{\mathcal V}\) curve on easy text is expected and
+is not evidence of recurrence collapse (which is diagnosed against the positive control, not against the
+easy-LM curve).
 
 This is THE principled expressiveness measure for three reasons.  (i) \(\mathcal{V}\)-information is
 the \emph{unique} information measure that can be \emph{created by computation}: Shannon mutual
@@ -541,6 +564,19 @@ Report the convergence knee first, then choose \((K_{\rm lo},K_{\rm hi})\) to st
 headline \(G_T\) uses paired confidence intervals.  The executable DDP harness emits a streaming
 paired normal-approximation interval from all-reduced sums and squared sums; offline reports may
 replace this with a paired bootstrap over saved per-example gains.
+
+\paragraph{Training recipe (LR is a stability constraint, not a free knob).}
+The optimizer is Muon (matrix banks, including the 3-D MoE expert weights) plus AdamW (embeddings,
+routers/gates, 1-D scalars), with \(\beta_2{=}0.95\) and gradient clipping at \(1.0\) --- both matching
+Huginn \cite{huginn}.  Deep-horizon recurrent-depth training is \emph{LR-sensitive}: the previous peak
+LRs (matrix \(0.02\), embed \(0.1\), scalar \(0.02\)) \emph{diverge} (train loss \(6.9{\to}16.5\),
+hidden-state collapse).  The promoted defaults \emph{halve} them (matrix \(0.01\), embed \(0.05\),
+scalar \(0.01\)), which restores a monotone-decreasing train loss, drops \(\bpb\) \(3.68{\to}2.03\),
+moves \(I_{\mathcal V}\) from \(-0.2\) to \(+3.7\) bits, and keeps routing healthy
+(\(\code{\detokenize{expert_util}}\approx2.7\)).  This mirrors Huginn, which explicitly reduced its peak
+LR to prevent exactly this recurrent hidden-state collapse \cite{huginn}: in a tied recurrence the same
+weights are applied \(K\) times per forward, so an LR that is fine for a single-application block is
+effectively \(K\)\(\times\) too aggressive on the recurrent state.
 
 %==============================================================================
 \section{Metrics: Gates Versus Diagnostics}
@@ -903,6 +939,18 @@ leapfrog circularity); applying \(Q\) in the fp64 accumulation stream keeps \(Q^
 bf16 autocast at deep \(K\).  The custom \(O(1)\)-memory backward applies \(Q^{\top}\) in its
 reconstruction and \(Q\) in the rebuilt step (and \(\expm\) / QR are differentiable), so \(U,V\)
 receive gradients identical to ordinary BPTT.
+
+\emph{Empirically shelved (negative result, 2026-06).}  Orthogonal / mHC damping
+(\code{--damping orthogonal}, \(Q=\expm(S)\)) is implemented but stays \emph{default off and is not
+promoted}.  Across two clean attempts it did \emph{not} raise across-step path diversity
+\(\code{\detokenize{route_step_div}}\) (the MoE basis stayed unengaged at \(\approx0.04\)) \emph{and} it
+destabilized the bf16 reconstruction (\(\code{\detokenize{recon_rel}}\to0.85\), driven by the \(F/G\)
+state dynamic range, which would require explicit state-norm control to tame).  The conclusion is that
+depth-utility arises from the recurrence \emph{dynamics} --- the additive coupling with correct fp64
+gradients --- not from MoE-basis exponential mixing paths; \code{\detokenize{route_step_div}},
+velocity-state routing, and damping were all explored and none drove the across-step diversity.  The MoE
+is therefore retained as the parameter-\emph{efficiency} basis (\(\varphi_{\rm isodepth}\),
+\S\ref{ssec:efficiency}), not as the depth-utility mechanism.
 
 %==============================================================================
 \section{Assumptions and Checks}

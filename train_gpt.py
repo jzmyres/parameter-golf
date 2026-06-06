@@ -3814,9 +3814,16 @@ def build_arg_parser():
                         "Rank-0 / end-of-run only (no hot-loop syncs). "
                         "Default None disables the sweep.")
     # Optimizer.
-    p.add_argument("--matrix-lr", type=float, default=0.02)
-    p.add_argument("--embed-lr", type=float, default=0.1)
-    p.add_argument("--scalar-lr", type=float, default=0.02)
+    # LR defaults HALVED (matrix 0.02->0.01, embed 0.1->0.05, scalar 0.02->0.01)
+    # 2026-06-06: the old peak LRs DIVERGE on deep-horizon recurrent-depth
+    # training (train_loss 6.9->16.5, hidden-state collapse). Halving fixes it
+    # (monotone train_loss, val_bpb 3.68->2.03, I_V -0.2->+3.7 bits, router
+    # healthy). Grounded in Huginn (arXiv:2502.05171): it likewise REDUCED peak
+    # LR to prevent the same hidden-state collapse. (We already match Huginn's
+    # beta2=0.95 and grad-clip 1.0.)
+    p.add_argument("--matrix-lr", type=float, default=0.01)
+    p.add_argument("--embed-lr", type=float, default=0.05)
+    p.add_argument("--scalar-lr", type=float, default=0.01)
     p.add_argument("--grad-clip", type=float, default=1.0)
     # Eval / IO.
     p.add_argument("--eval-batches", type=int, default=8)
