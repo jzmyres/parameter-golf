@@ -328,6 +328,67 @@ class TestPlotMetricsParse(unittest.TestCase):
         self.assertEqual(d["expressiveness_rho"], 1.0)
         self.assertEqual(d["iv_total_bits"], 0.1)
 
+    def test_parse_periodic_step_prefixed_depth_sweep_series(self):
+        """The PERIODIC depth-sweep (--depth-sweep-every) emits the SAME battery
+        lines but step-prefixed (``step:<s> depth_gain_GT:..`` etc.). The parser
+        collects these as per-step SERIES (so phi_eval / I_V / expressiveness_rho
+        / G_T have a trackable TREND over training) IN ADDITION to the end-of-run
+        scalar parse, which is untouched."""
+        log = "\n".join(
+            [
+                "train_batch_tokens:8 train_seq_len:16 iterations:4 warmup_steps:0 max_wallclock_seconds:0.000",
+                # --- periodic emission at step 2 ---
+                "step:2 depth_sweep: K=2 val_bpb:1.5000 val_loss:2.6000",
+                "step:2 depth_sweep: K=8 val_bpb:1.4800 val_loss:2.5800",
+                "step:2 depth_gain_GT:0.0200",
+                "step:2 phi_eval:0.3000  # EVAL-K proxy (NOT phi_isodepth)",
+                "step:2 usable_info: K=2 iv_bits:1.9000 val_loss:2.6000",
+                "step:2 usable_info: K=8 iv_bits:1.9500 val_loss:2.5800",
+                "step:2 expressiveness_rho:1.0000",
+                "step:2 iv_total_bits:0.0500",
+                # --- periodic emission at step 4 ---
+                "step:4 depth_sweep: K=2 val_bpb:1.4500 val_loss:2.5500",
+                "step:4 depth_sweep: K=8 val_bpb:1.4000 val_loss:2.5000",
+                "step:4 depth_gain_GT:0.0500",
+                "step:4 phi_eval:0.3300  # EVAL-K proxy (NOT phi_isodepth)",
+                "step:4 usable_info: K=2 iv_bits:2.0000 val_loss:2.5500",
+                "step:4 usable_info: K=8 iv_bits:2.1000 val_loss:2.5000",
+                "step:4 expressiveness_rho:1.0000",
+                "step:4 iv_total_bits:0.1000",
+                # --- end-of-run (unprefixed) scalar parse still works ---
+                "final val_loss:2.5000 val_bpb:1.4000",
+                "depth_gain_GT:0.0500",
+                "expressiveness_rho:1.0000",
+                "iv_total_bits:0.1000",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "log.txt")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(log)
+            d = parse_log(p)
+
+        # Per-step scalar SERIES (step -> value).
+        self.assertEqual(d["depth_gain_GT_steps"], [2, 4])
+        self.assertEqual(d["depth_gain_GT_series"], [0.02, 0.05])
+        self.assertEqual(d["phi_eval_steps"], [2, 4])
+        self.assertEqual(d["phi_eval_series"], [0.30, 0.33])
+        self.assertEqual(d["expressiveness_rho_steps"], [2, 4])
+        self.assertEqual(d["expressiveness_rho_series"], [1.0, 1.0])
+        self.assertEqual(d["iv_total_bits_steps"], [2, 4])
+        self.assertEqual(d["iv_total_bits_series"], [0.05, 0.10])
+        # Per-step depth_sweep / usable_info MAPS: {step: {K: ...}}.
+        self.assertEqual(set(d["depth_sweep_series"].keys()), {2, 4})
+        self.assertEqual(d["depth_sweep_series"][2][2], (1.50, 2.60))
+        self.assertEqual(d["depth_sweep_series"][4][8], (1.40, 2.50))
+        self.assertEqual(set(d["usable_info_series"].keys()), {2, 4})
+        self.assertEqual(d["usable_info_series"][2][8], 1.95)
+        self.assertEqual(d["usable_info_series"][4][2], 2.00)
+        # End-of-run (unprefixed) scalars are unaffected by the periodic series.
+        self.assertEqual(d["depth_gain_GT"], 0.05)
+        self.assertEqual(d["expressiveness_rho"], 1.0)
+        self.assertEqual(d["iv_total_bits"], 0.10)
+
     def test_parse_phi_isodepth_train_r_sweep_lines(self):
         """The PRINCIPLED Iso-Depth harness (experiments/measure_phi.py) emits a
         per-r `phi_sweep:` line and a final `phi_isodepth:` scalar. phi_sweep ->

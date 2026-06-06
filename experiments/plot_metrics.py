@@ -185,6 +185,18 @@ def parse_log(logpath: str) -> dict:
         "depth_sweep": {},
         "depth_gain_GT": None,
         "phi_eval": None,
+        # PERIODIC depth-sweep (--depth-sweep-every): the SAME battery lines
+        # emitted step-PREFIXED during training (`step:<s> depth_gain_GT:..`),
+        # collected as per-step SERIES so phi_eval / I_V / expressiveness_rho /
+        # G_T have a trackable TREND (in ADDITION to the end-of-run scalars
+        # above). Scalars -> parallel {tag}_steps / {tag}_series lists; the per-K
+        # maps -> {step: {K: ...}} (depth_sweep_series / usable_info_series).
+        "depth_sweep_series": {},
+        "usable_info_series": {},
+        "depth_gain_GT_steps": [], "depth_gain_GT_series": [],
+        "phi_eval_steps": [], "phi_eval_series": [],
+        "expressiveness_rho_steps": [], "expressiveness_rho_series": [],
+        "iv_total_bits_steps": [], "iv_total_bits_series": [],
         # PRINCIPLED EXPRESSIVENESS METRIC (--k-eval-sweep): depth-resolved
         # V-usable predictive information I_V(z_K -> Y) = H_V(Y) - val_loss(K)
         # (Xu 2020 / Ethayarajh 2022). Standalone end-of-run lines:
@@ -416,6 +428,48 @@ def parse_log(logpath: str) -> dict:
                     k, v = tok.split(":", 1)
                     kvs[k.strip()] = v.strip()
             data["final_status"] = kvs
+
+        # PERIODIC depth-sweep (--depth-sweep-every): the SAME battery lines
+        # emitted step-PREFIXED during training (`step:<s> depth_gain_GT:..`).
+        # Parsed FIRST (and the end-of-run `^`-anchored blocks below skip these
+        # because of the `step:` prefix) into per-step SERIES so phi_eval / I_V /
+        # expressiveness_rho / G_T have a trackable TREND. The `step:<s> ` prefix
+        # is distinct from the val/train step lines (those carry `step:N/M `), so
+        # there is no cross-match. NaN-tolerant (synthetic smoke emits `nan`).
+        m = re.search(
+            rf"^step:(\d+) depth_sweep:\s*K=(\d+)\s+val_bpb:{_FLOAT_NAN}\s+val_loss:{_FLOAT_NAN}",
+            line)
+        if m:
+            data["depth_sweep_series"].setdefault(int(m.group(1)), {})[
+                int(m.group(2))] = (float(m.group(3)), float(m.group(4)))
+            continue
+        m = re.search(rf"^step:(\d+) depth_gain_GT:{_FLOAT_NAN}", line)
+        if m:
+            data["depth_gain_GT_steps"].append(int(m.group(1)))
+            data["depth_gain_GT_series"].append(float(m.group(2)))
+            continue
+        m = re.search(rf"^step:(\d+) phi_eval:{_FLOAT_NAN}", line)
+        if m:
+            data["phi_eval_steps"].append(int(m.group(1)))
+            data["phi_eval_series"].append(float(m.group(2)))
+            continue
+        m = re.search(
+            rf"^step:(\d+) usable_info:\s*K=(\d+)\s+iv_bits:{_FLOAT_NAN}\s+val_loss:{_FLOAT_NAN}",
+            line)
+        if m:
+            data["usable_info_series"].setdefault(int(m.group(1)), {})[
+                int(m.group(2))] = float(m.group(3))
+            continue
+        m = re.search(rf"^step:(\d+) expressiveness_rho:{_FLOAT_NAN}", line)
+        if m:
+            data["expressiveness_rho_steps"].append(int(m.group(1)))
+            data["expressiveness_rho_series"].append(float(m.group(2)))
+            continue
+        m = re.search(rf"^step:(\d+) iv_total_bits:{_FLOAT_NAN}", line)
+        if m:
+            data["iv_total_bits_steps"].append(int(m.group(1)))
+            data["iv_total_bits_series"].append(float(m.group(2)))
+            continue
 
         # M0 depth-gain MEASUREMENT (--k-eval-sweep): standalone end-of-run
         # scalar lines (NOT part of the `metrics:` line). NaN-tolerant floats

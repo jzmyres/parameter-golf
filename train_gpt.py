@@ -2969,6 +2969,97 @@ def usable_information(val_losses_by_k: dict, h_marginal: float) -> dict:
     }
 
 
+def run_depth_sweep(model, cached, sweep_ks, vocab_size, *, n_batches, seq_len,
+                    global_tokens, grad_accum_steps, device, luts,
+                    autocast_enabled, print0, distributed, step=None):
+    """Depth-gain + expressiveness battery over a SHARED eval trajectory.
+
+    Evaluate ``model`` at each requested recurrent depth ``K`` and emit the
+    depth/expressiveness battery (``depth_sweep`` per K, ``depth_gain_GT``,
+    ``phi_eval``, ``usable_info`` per K, ``expressiveness_rho``,
+    ``iv_total_bits``). Factored out of :func:`main` so the SAME battery can run
+    BOTH periodically during training (``--depth-sweep-every``, ``step`` set) AND
+    once at end-of-run (``step is None``): a TREND, not just an end value, so the
+    smoke-gate "all eval metrics improving" can read phi / I_V / rho / G_T over
+    training, not only the others on the per-step ``metrics:`` line.
+
+    The recurrence is deterministic given (a0, b0, x0): depth ``K_big`` IS depth
+    ``K_small`` CONTINUED, so the whole sweep is ONE depth-max(K) pass whose
+    midpoint is read off at each requested K (``run_validation_multi_depth`` ->
+    ``eval_losses_multi_depth``). That single shared trajectory means depth is
+    inherently the only variable (ONE recurrence-init noise draw), so the former
+    per-K RNG reset is unneeded. The caller materializes ``cached`` eval batches
+    ONCE (replaying a STATEFUL stream would score each K on DIFFERENT samples).
+
+    DDP-safe: all ranks call this symmetrically (``run_validation_multi_depth``
+    all-reduces; each rank caches its OWN shard); only ``print0`` (rank-0)
+    prints. The block is OUTSIDE any ``if master:`` guard so the collectives
+    never hang.
+
+    Args:
+        model: the base (unwrapped) M0 model.
+        cached: list of (x, y) eval batches, materialized ONCE by the caller and
+            replayed for every K (so depth is the only variable across the sweep).
+        sweep_ks: sorted, deduped recurrent depths to score.
+        vocab_size: vocabulary size for the marginal-entropy bincount buffer.
+        step: ``None`` for the end-of-run sweep (lines emit UNPREFIXED, the
+            byte-identical historical contract); a 1-based step index ``s`` to
+            PREFIX every emitted line with ``step:<s> `` (the periodic trend).
+    """
+    prefix = "" if step is None else f"step:{step} "
+    # ONE shared depth-max(K) pass; midpoint read off at each K.
+    sweep = run_validation_multi_depth(
+        model, _ReplayLoader(cached), depths=sweep_ks,
+        n_batches=n_batches, seq_len=seq_len,
+        global_tokens=global_tokens, grad_accum_steps=grad_accum_steps,
+        device=device, luts=luts, autocast_enabled=autocast_enabled)
+    sweep_loss = {k: sweep[k][0] for k in sweep_ks}
+    sweep_bpb = {k: sweep[k][1] for k in sweep_ks}
+    for k in sweep_ks:  # ascending-K order
+        print0(f"{prefix}depth_sweep: K={k} val_bpb:{sweep_bpb[k]:.4f} "
+               f"val_loss:{sweep_loss[k]:.4f}")
+    # Depth-gain over the swept budgets: bpb at the SHALLOWEST minus bpb at
+    # the DEEPEST (positive => depth helps). On the synthetic smoke (no
+    # tokenizer) bpb is NaN, so G_T is NaN there; the loss path still ran.
+    k_min, k_max = sweep_ks[0], sweep_ks[-1]
+    gt = sweep_bpb[k_min] - sweep_bpb[k_max]
+    print0(f"{prefix}depth_gain_GT:{gt:.4f}")
+    # phi_eval is the CHEAP EVAL-DEPTH PROXY ONLY: an OLS log-slope of ONE
+    # trained model's loss vs INFERENCE depth K (fit_phi), divided by a unit
+    # reference. It is NOT the principled Iso-Depth recurrence-equivalence
+    # exponent. THE recurrence-effectiveness metric is the train-r phi
+    # (phi_isodepth): the fitted exponent of the scaling law
+    # L(r)=E+A*(N_once+r^phi*N_rec)^-alpha over models PRETRAINED at different
+    # recurrence budgets r, produced by experiments/measure_phi.py
+    # (fit_phi_isodepth). phi_eval varies inference K of a single model and so
+    # only gauges test-time depth utilization, not train-time loop capacity.
+    print0(f"{prefix}phi_eval:{fit_phi(sweep_loss):.4f}  # EVAL-K proxy (NOT phi_isodepth)")
+
+    # PRINCIPLED EXPRESSIVENESS METRIC: depth-resolved V-usable predictive
+    # information I_V(z_K -> Y) = H_V(Y) - val_loss(K) (Xu 2020 / Ethayarajh
+    # 2022). H_V(Y) is the marginal next-token entropy over the SAME cached
+    # eval targets, accumulated as token counts and all-reduced so every rank
+    # sees the same constant. expressiveness_rho = spearman(K, I_V(K)) is the
+    # headline objective (-> +1 means depth monotonically adds usable info).
+    # Counts on a long-lived 1D buffer of length vocab_size (no per-token
+    # .item()/sync in the loop): one all_reduce + one .tolist() at the end.
+    marginal_counts = torch.zeros(vocab_size, device=device, dtype=torch.float64)
+    for _, y in cached:
+        marginal_counts += torch.bincount(
+            y.reshape(-1), minlength=vocab_size).to(torch.float64)
+    if distributed:
+        dist.all_reduce(marginal_counts, op=dist.ReduceOp.SUM)
+    h_marginal = marginal_token_entropy(
+        {i: c for i, c in enumerate(marginal_counts.tolist()) if c > 0})
+    iv = usable_information(sweep_loss, h_marginal)
+    for k in sweep_ks:  # ascending-K order; iv keys drop diverged (non-finite) K
+        if k in iv["iv_bits"]:
+            print0(f"{prefix}usable_info: K={k} iv_bits:{iv['iv_bits'][k]:.4f} "
+                   f"val_loss:{sweep_loss[k]:.4f}")
+    print0(f"{prefix}expressiveness_rho:{iv['rho']:.4f}")
+    print0(f"{prefix}iv_total_bits:{iv['iv_total_bits']:.4f}")
+
+
 def fit_phi_isodepth(losses_by_r, n_once, n_rec) -> dict:
     """PRINCIPLED Iso-Depth recurrence param-EFFICIENCY exponent ``phi`` (arXiv:2604.21106).
 
@@ -3731,6 +3822,16 @@ def build_arg_parser():
     p.add_argument("--eval-batches", type=int, default=8)
     p.add_argument("--val-every", type=int, default=0,
                    help="Validate every N steps (0: only at the end).")
+    p.add_argument("--depth-sweep-every", type=int, default=0,
+                   help="Run the --k-eval-sweep depth/expressiveness battery "
+                        "(depth_sweep / depth_gain_GT / phi_eval / usable_info / "
+                        "expressiveness_rho / iv_total_bits) every N validation-"
+                        "aligned steps, step-PREFIXED (e.g. 'step:200 "
+                        "depth_gain_GT:..'), so phi_eval / I_V / G_T have a "
+                        "trackable TREND over training (not only at end-of-run). "
+                        "Fires at steps that are BOTH a multiple of this and a "
+                        "validation step (needs --val-every and --k-eval-sweep set). "
+                        "Default 0 = end-of-run sweep only (byte-identical).")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--seed", type=int, default=1337)
@@ -3855,6 +3956,24 @@ def main(argv=None):
         raise ValueError("--k-set must contain at least one budget")
     k_eval = args.k_eval if args.k_eval is not None else max(k_set)
     k_gen = torch.Generator().manual_seed(args.seed)
+
+    # Depth-sweep (--k-eval-sweep) shared setup: dedup + sort K once (a repeated K
+    # is scored once and lines emit ascending), validated here so both the
+    # periodic (--depth-sweep-every) and end-of-run sweeps reuse it. The batch
+    # materializer caches THIS rank's eval batches once (the SAME data for all K,
+    # so depth is the only variable); each periodic call pulls a fresh window from
+    # the stateful val stream.
+    run_sweep_ks = []
+    if args.k_eval_sweep:
+        run_sweep_ks = sorted(set(_parse_int_set(args.k_eval_sweep)))
+        if not run_sweep_ks:
+            raise ValueError("--k-eval-sweep must contain at least one depth")
+
+    def run_sweep_cached_batches():
+        return [
+            val_loader.next_batch(batch_tokens, args.seq_len, grad_accum_steps)
+            for _ in range(args.eval_batches)
+        ]
 
     print0(f"m0_trainer:start device={device} world_size={world_size} "
            f"grad_accum={grad_accum_steps} batch_tokens={batch_tokens} "
@@ -4011,6 +4130,24 @@ def main(argv=None):
                 autocast_enabled=autocast_enabled)
             print0(f"step:{step + 1}/{args.iterations} val_loss:{v_loss:.4f} "
                    f"val_bpb:{v_bpb:.4f}")
+            # PERIODIC depth/expressiveness battery (opt-in via --depth-sweep-every):
+            # run the SAME shared-trajectory sweep as end-of-run but step-prefixed,
+            # so phi_eval / I_V / expressiveness_rho / G_T have a trackable TREND
+            # over training (the smoke-gate "all eval metrics improving" needs the
+            # depth-sweep battery, not just the per-step `metrics:` line). All ranks
+            # run it symmetrically (run_validation_multi_depth all-reduces); only
+            # print0 emits. Default 0 = end-of-run only (byte-identical historical
+            # behavior). The cheap single shared-trajectory pass costs ~one extra
+            # max(K) eval at the existing val cadence.
+            if args.k_eval_sweep and args.depth_sweep_every > 0 \
+                    and (step + 1) % args.depth_sweep_every == 0:
+                cached = run_sweep_cached_batches()
+                run_depth_sweep(
+                    base_model, cached, run_sweep_ks, args.vocab_size,
+                    n_batches=args.eval_batches, seq_len=args.seq_len,
+                    global_tokens=batch_tokens, grad_accum_steps=grad_accum_steps,
+                    device=device, luts=luts, autocast_enabled=autocast_enabled,
+                    print0=print0, distributed=distributed, step=step + 1)
             model.train()
 
     # --- final validation ---
@@ -4024,86 +4161,24 @@ def main(argv=None):
     # --- depth-gain MEASUREMENT (--k-eval-sweep): end-of-run, SHARED trajectory ---
     # Evaluate the trained model at each requested recurrent depth K and report
     # the depth-gain G_T = bpb[min K] - bpb[max K] (positive => deeper recurrence
-    # helps) plus an eval-K phi proxy. This confirms whether depth buys anything
-    # (the looped/UT failure mode is G_T -> 0).
-    #
-    # The recurrence is deterministic given (a0, b0, x0): depth K_big IS depth
-    # K_small CONTINUED. So the whole sweep is ONE depth-max(K) pass whose
-    # midpoint 0.5*(a+b) is read off at each requested K (run_validation_multi_depth
-    # -> eval_losses_multi_depth). This is ~half the compute of re-running from the
-    # seed per K (max(K) vs sum(K)) AND the cleanest paired depth comparison:
-    # every K shares ONE trajectory -> ONE recurrence-init noise draw, so depth is
-    # inherently the only variable. Because of that single shared trajectory, the
-    # former per-K RNG reset is no longer needed in the sweep (the per-pass reset
-    # in finite_horizon_loss's hinge is unchanged). The eval batches are still
-    # materialized ONCE and replayed (run_validation otherwise consumes a STATEFUL
-    # stream, scoring each K on DIFFERENT samples).
+    # helps) plus an eval-K phi proxy and the V-usable-information battery. This
+    # confirms whether depth buys anything (the looped/UT failure mode is
+    # G_T -> 0). The body is factored into run_depth_sweep so the SAME battery can
+    # also run periodically during training (--depth-sweep-every, step-prefixed),
+    # giving phi / I_V / expressiveness_rho / G_T a trackable TREND, not just an
+    # end value. step=None here -> the historical UNPREFIXED end-of-run lines.
     #
     # All ranks run this symmetrically (run_validation_multi_depth all-reduces);
     # each rank caches its OWN shard. The block is OUTSIDE any `if master:` guard
     # (only print0 is rank-0) so the collectives never hang.
     if args.k_eval_sweep:
-        # Dedup + sort K so a repeated K is scored once and lines emit ascending.
-        sweep_ks = sorted(set(_parse_int_set(args.k_eval_sweep)))
-        if not sweep_ks:
-            raise ValueError("--k-eval-sweep must contain at least one depth")
-        # Materialize this rank's eval batches once (the SAME data for all K).
-        cached = [
-            val_loader.next_batch(batch_tokens, args.seq_len, grad_accum_steps)
-            for _ in range(args.eval_batches)
-        ]
-        # ONE shared depth-max(K) pass; midpoint read off at each K.
-        sweep = run_validation_multi_depth(
-            base_model, _ReplayLoader(cached), depths=sweep_ks,
+        cached = run_sweep_cached_batches()
+        run_depth_sweep(
+            base_model, cached, run_sweep_ks, args.vocab_size,
             n_batches=args.eval_batches, seq_len=args.seq_len,
             global_tokens=batch_tokens, grad_accum_steps=grad_accum_steps,
-            device=device, luts=luts, autocast_enabled=autocast_enabled)
-        sweep_loss = {k: sweep[k][0] for k in sweep_ks}
-        sweep_bpb = {k: sweep[k][1] for k in sweep_ks}
-        for k in sweep_ks:  # ascending-K order
-            print0(f"depth_sweep: K={k} val_bpb:{sweep_bpb[k]:.4f} "
-                   f"val_loss:{sweep_loss[k]:.4f}")
-        # Depth-gain over the swept budgets: bpb at the SHALLOWEST minus bpb at
-        # the DEEPEST (positive => depth helps). On the synthetic smoke (no
-        # tokenizer) bpb is NaN, so G_T is NaN there; the loss path still ran.
-        k_min, k_max = sweep_ks[0], sweep_ks[-1]
-        gt = sweep_bpb[k_min] - sweep_bpb[k_max]
-        print0(f"depth_gain_GT:{gt:.4f}")
-        # phi_eval is the CHEAP EVAL-DEPTH PROXY ONLY: an OLS log-slope of ONE
-        # trained model's loss vs INFERENCE depth K (fit_phi), divided by a unit
-        # reference. It is NOT the principled Iso-Depth recurrence-equivalence
-        # exponent. THE recurrence-effectiveness metric is the train-r phi
-        # (phi_isodepth): the fitted exponent of the scaling law
-        # L(r)=E+A*(N_once+r^phi*N_rec)^-alpha over models PRETRAINED at different
-        # recurrence budgets r, produced by experiments/measure_phi.py
-        # (fit_phi_isodepth). phi_eval varies inference K of a single model and so
-        # only gauges test-time depth utilization, not train-time loop capacity.
-        print0(f"phi_eval:{fit_phi(sweep_loss):.4f}  # EVAL-K proxy (NOT phi_isodepth)")
-
-        # PRINCIPLED EXPRESSIVENESS METRIC: depth-resolved V-usable predictive
-        # information I_V(z_K -> Y) = H_V(Y) - val_loss(K) (Xu 2020 / Ethayarajh
-        # 2022). H_V(Y) is the marginal next-token entropy over the SAME cached
-        # eval targets, accumulated as token counts and all-reduced so every rank
-        # sees the same constant. expressiveness_rho = spearman(K, I_V(K)) is the
-        # headline objective (-> +1 means depth monotonically adds usable info).
-        # Counts on a long-lived 1D buffer of length vocab_size (no per-token
-        # .item()/sync in the loop): one all_reduce + one .tolist() at the end.
-        marginal_counts = torch.zeros(
-            args.vocab_size, device=device, dtype=torch.float64)
-        for _, y in cached:
-            marginal_counts += torch.bincount(
-                y.reshape(-1), minlength=args.vocab_size).to(torch.float64)
-        if distributed:
-            dist.all_reduce(marginal_counts, op=dist.ReduceOp.SUM)
-        h_marginal = marginal_token_entropy(
-            {i: c for i, c in enumerate(marginal_counts.tolist()) if c > 0})
-        iv = usable_information(sweep_loss, h_marginal)
-        for k in sweep_ks:  # ascending-K order; iv keys drop diverged (non-finite) K
-            if k in iv["iv_bits"]:
-                print0(f"usable_info: K={k} iv_bits:{iv['iv_bits'][k]:.4f} "
-                       f"val_loss:{sweep_loss[k]:.4f}")
-        print0(f"expressiveness_rho:{iv['rho']:.4f}")
-        print0(f"iv_total_bits:{iv['iv_total_bits']:.4f}")
+            device=device, luts=luts, autocast_enabled=autocast_enabled,
+            print0=print0, distributed=distributed, step=None)
 
     # --- peak VRAM (RESOURCE-goal headline; memory-efficiency, no gate) ---
     # Integer MiB to match the existing ``peak_vram_mb:<int>`` log contract that

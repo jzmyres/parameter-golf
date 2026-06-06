@@ -1142,6 +1142,106 @@ def test_m0_trainer_k_eval_sweep_emits_depth_gain(tmp_path, capsys):
     assert math.isnan(rho) or -1.0 <= rho <= 1.0, rho
 
 
+def test_depth_sweep_every_cli_default_and_override():
+    """--depth-sweep-every defaults to 0 (end-of-run only) and accepts a positive
+    cadence (the periodic depth/expressiveness battery)."""
+    from train_gpt import build_arg_parser
+
+    p = build_arg_parser()
+    assert p.parse_args([]).depth_sweep_every == 0
+    assert p.parse_args(["--depth-sweep-every", "2"]).depth_sweep_every == 2
+
+
+def _depth_sweep_step_prefixed_lines(out):
+    """Collect {tag: set(steps)} for the step-prefixed periodic depth-sweep lines
+    (``step:<s> depth_gain_GT:..`` etc.). Used by the periodic-cadence test."""
+    import re
+
+    series = {tag: set() for tag in (
+        "depth_sweep", "depth_gain_GT", "phi_eval",
+        "usable_info", "expressiveness_rho", "iv_total_bits")}
+    for ln in out.splitlines():
+        m = re.match(r"step:(\d+) (\w+)", ln)
+        if m and m.group(2) in series:
+            series[m.group(2)].add(int(m.group(1)))
+    return series
+
+
+def test_m0_trainer_depth_sweep_every_emits_periodic_and_final(tmp_path, capsys):
+    """--depth-sweep-every N runs the FULL depth/expressiveness battery every N
+    steps (step-prefixed) so phi_eval / I_V / expressiveness_rho / G_T have a
+    trackable TREND, AND keeps the unprefixed end-of-run sweep."""
+    import re
+    from train_gpt import main
+
+    main(["--iterations", "4", "--model-dim", "32", "--n-heads", "4", "--n-kv-heads", "2",
+          "--n-experts", "4", "--expert-rank", "8", "--n-mix", "2", "--kv-latent", "8",
+          "--head-dim", "8", "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+          "--k-set", "2,4", "--k-eval-sweep", "2,4,8",
+          "--val-every", "2", "--depth-sweep-every", "2",
+          "--artifact-out", str(tmp_path / "dse.bin")])
+    out = capsys.readouterr().out
+
+    # Periodic (step-prefixed) lines fire at steps 2 and 4 for EVERY battery tag.
+    series = _depth_sweep_step_prefixed_lines(out)
+    for tag, steps in series.items():
+        assert steps == {2, 4}, f"{tag}: expected step-prefixed at {{2,4}}, got {steps}"
+
+    # Each periodic emission is a COMPLETE battery: all swept K appear per step.
+    per_step_sweep_ks = {}
+    for ln in out.splitlines():
+        m = re.match(
+            r"step:(\d+) depth_sweep: K=(\d+) val_bpb:\S+ val_loss:\S+", ln)
+        if m:
+            per_step_sweep_ks.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    assert per_step_sweep_ks == {2: {2, 4, 8}, 4: {2, 4, 8}}, per_step_sweep_ks
+
+    # The unprefixed END-OF-RUN sweep is still emitted (byte-identical contract).
+    final_gt = re.search(r"^depth_gain_GT:[-+0-9.eEnNaA]+", out, re.MULTILINE)
+    final_rho = re.search(r"^expressiveness_rho:[-+0-9.eEnNaA]+", out, re.MULTILINE)
+    assert final_gt is not None, "missing unprefixed end-of-run depth_gain_GT"
+    assert final_rho is not None, "missing unprefixed end-of-run expressiveness_rho"
+
+
+def test_m0_trainer_depth_sweep_every_default_is_end_only_byte_identical(tmp_path):
+    """--depth-sweep-every 0 (default) emits ZERO step-prefixed depth-sweep lines
+    and the SAME end-of-run line set as a run without the flag at all: the
+    periodic feature is strictly opt-in (default-off byte-identity)."""
+    from train_gpt import main
+
+    def _run(extra):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            main(["--iterations", "4", "--model-dim", "32", "--n-heads", "4",
+                  "--n-kv-heads", "2", "--n-experts", "4", "--expert-rank", "8",
+                  "--n-mix", "2", "--kv-latent", "8", "--head-dim", "8",
+                  "--seq-len", "16", "--eval-batches", "2", "--device", "cpu",
+                  "--k-set", "2,4", "--k-eval-sweep", "2,4,8", "--val-every", "2",
+                  "--seed", "1234",
+                  "--artifact-out", str(tmp_path / "dse_def.bin"), *extra])
+        return buf.getvalue()
+
+    # The depth-sweep-relevant lines: keep only the sweep/battery lines so the
+    # comparison is over the emitted set, not the (timing/loss-varying) rest.
+    def _sweep_lines(out):
+        keep = ("depth_sweep:", "depth_gain_GT:", "phi_eval:",
+                "usable_info:", "expressiveness_rho:", "iv_total_bits:")
+        return [ln for ln in out.splitlines() if ln.startswith(keep)]
+
+    no_flag = _sweep_lines(_run([]))
+    explicit_zero = _sweep_lines(_run(["--depth-sweep-every", "0"]))
+
+    # No step-prefixed lines in either (the periodic path is off).
+    assert all(not ln.startswith("step:") for ln in no_flag)
+    # Default-off (no flag) == explicit 0: byte-identical sweep-line SET.
+    assert no_flag == explicit_zero, (no_flag, explicit_zero)
+    # And the end-of-run battery IS present (the existing end-only contract).
+    assert any(ln.startswith("depth_gain_GT:") for ln in no_flag)
+    assert any(ln.startswith("expressiveness_rho:") for ln in no_flag)
+
+
 def test_init_state_cli_default_and_choices():
     """--init-state defaults to x0 (current behavior); random is the Huginn fix."""
     from train_gpt import build_arg_parser
