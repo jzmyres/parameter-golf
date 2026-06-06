@@ -81,6 +81,33 @@ diagnostics without becoming explanations for a failed P1 gate.
 \section{Models: The Necessary Set}
 \label{sec:models}
 
+\paragraph{End-to-end \(M_0\) flow (forward + backward).}
+The implemented pipeline (\code{train\_gpt.py}) is, in order:
+\begin{enumerate}[leftmargin=1.6em,itemsep=1pt]
+  \item \textbf{Embed.}  \(x_0=\code{\detokenize{tok_emb}}(\mathit{tokens})+\code{\detokenize{pos_emb}}\);
+  the embedding is tied and reused as the MoS output basis.
+  \item \textbf{Reversible recurrence over a sampled depth \(K\)} (additive coupling, two streams):
+  \(a_{k+1}=Q\,a_k+F_\theta(\RMSNorm(b_k+x_0+e_k))\),
+  \(b_{k+1}=Q\,b_k+G_\theta(\RMSNorm(a_{k+1}+x_0+e_k))\), where \(F_\theta,G_\theta\) are pre-norm delta
+  blocks (MLA attention + SwiGLU MoE), \(e_k\) is the optional step-clock (\(M_{\rm clk}\),
+  \code{step\_conditioning}, off by default), and \(Q\) is the optional orthogonal (low-rank
+  skew-Cayley) damping (\code{--damping}, default \code{none}\(\Rightarrow Q{=}I\)): strictly invertible
+  (\(Q^{\top}\)), norm-preserving (no fixed-point collapse, extrapolates beyond the trained depth), and
+  relaxing the \(A{+}B{=}I\) convex tie.
+  \item \textbf{Reversible \(O(1)\)-in-\(K\) backward} (\code{RevRecurrenceFn}): reconstructs activations
+  from the terminal state via the exact inverse, with fp64 stream accumulation
+  (\code{\detokenize{recurrence_accum_dtype}}) and replayed bf16 autocast keeping
+  \(\code{\detokenize{recon_rel}}\approx0\) so the BPTT gradients are correct under bf16.
+  \item \textbf{Readout, outside the recurrence.}  \(z_K=\tfrac12(a_K+b_K)\to\code{\detokenize{final_norm}}\)
+  (RMSNorm) \(\to\) MoS head (\(\code{\detokenize{n_mix}}\) mixture-of-softmaxes, log-probs) \(\to\) nll.
+  \item \textbf{MoE health.}  Default-on DeepSeek loss-free bias balancing + ST-MoE z-loss; per-token
+  entropy-max demoted to off; optional architecture-search routing knobs.
+  \item \textbf{Finite-horizon training.}  \(K_{\rm hi}\sim\code{\detokenize{k_set}}\), shallow
+  \(k_{\rm lo}\); loss \(=\) final-depth nll \(+\) a stop-grad no-degradation hinge (Eq.~\eqref{eq:p1-loss}),
+  \emph{not} a fixed-point objective.
+\end{enumerate}
+The subsections below give the precise forms.
+
 \paragraph{Core \(M_0\).}
 The core model is a tied, token-injected, additive-coupling reversible recurrence whose \(F_\theta\)
 and \(G_\theta\) blocks are pre-norm MLA attention~\cite{deepseekv2} plus a smooth-sparse SwiGLU
@@ -489,43 +516,273 @@ replace this with a paired bootstrap over saved per-example gains.
 \section{Metrics: Gates Versus Diagnostics}
 \label{sec:metrics}
 
+This section is the authoritative reference for every quantity the trainer emits.  Each metric is
+classified along two axes.  \emph{Role}: a \GATE\ decides promotion (a hard pass/fail), whereas a
+\DIAG{} explains \emph{why} a gate passed or failed but never promotes on its own.  \emph{Goal axis}:
+the project optimizes two \emph{orthogonal} objectives --- \textbf{expressiveness} (how much usable
+predictive information depth adds, maximize) and \textbf{resource} (activation memory, minimize / hold
+flat in \(K\)) --- bridged by an \textbf{efficiency-vs-dense} axis (the Iso-Depth exponent \(\varphi\))
+and underwritten by a single \textbf{correctness} gate (\code{\detokenize{recon_rel}}) that makes
+every other number trustworthy.  The reader should read each metric's mathematical definition before
+its logged value (the meta-principle: definition first, value second).
+
+\subsection{Summary: which metrics gate, which diagnose}
 \renewcommand{\arraystretch}{1.2}
 \begin{center}
 \footnotesize
 \begin{tabularx}{\textwidth}{@{}L{0.27\textwidth} c L{0.50\textwidth}@{}}
 \toprule
-\textbf{Metric} & \textbf{Role} & \textbf{Rule / mechanics} \\
+\textbf{Metric} & \textbf{Role} & \textbf{Axis / one-line rule} \\
 \midrule
-\(G_T(K_{\rm lo},K_{\rm hi})\) & \GATE\ (P1) & Paired CI, lower bound \(>0\), on a depth-hard task, with knee-straddling pairs and a passing positive control. \\
-\(\mathrm{NDR}_\epsilon\) & \GATE\ (guard) & No-degradation rate \(\le\delta_{\rm task}\). \\
-\(\vram_{\rm peak}\), \(\mathrm{slope}(\vram/\text{batch})\), \(\alpha_{\rm act}\), \(R_{\rm rec}\) & \GATE\ (P2, resource = memory-efficiency) & Peak VRAM is the primary resource number; VRAM-vs-batch scaling slope should be low/flat (\(\mathrm{slope}_{\rm MB/sample}\), OLS fit \code{\detokenize{vram_vs_batch_scaling}}); \(R_{\rm act}(K,2K)\le1.10\) (activation memory \(\approx\)constant in recurrent depth \(K\)); the reversible round-trip error \(\code{\detokenize{recon_rel}}\) (the BPTT gradient-correctness gate) acceptable under actual training stochasticity.  Dropped as resource metrics: the artifact-16\,MB hard gate (artifact bytes logged informationally only), FLOPs/token, and wall-clock/step.  The active-expert fraction is demoted to a MoE-mechanism diagnostic (\code{\detokenize{diag:active_frac}}), not a resource gate.  Throughput (\code{\detokenize{ops:tok_per_s}}) and VRAM utilization (\code{\detokenize{ops:vram_util_pct}}\(=100\cdot\vram_{\rm peak}/\)device memory) are logged as \emph{ops/efficiency} diagnostics (under the \code{ops:} prefix) for tuning the batch / grad-accum knobs --- \code{\detokenize{--grad-accum 1}} runs the whole batch in one forward to fill VRAM, which the \(O(1)\)-in-\(K\) reversible recurrence makes affordable at deep \(K\) --- and are \emph{not} resource gates. \\
+\(\code{\detokenize{recon_rel}}\) & \GATE\ (correctness) & Reversible round-trip error \(<10^{-6}\); makes all other metrics trustworthy (\S\ref{ssec:correctness}). \\
+\(G_T(K_{\rm lo},K_{\rm hi})\), \(I_{\mathcal V}\), \(\code{\detokenize{expressiveness_rho}}\) & \GATE\ (P1, expressiveness) & Paired CI lower bound \(>0\) on a depth-hard task, with knee-straddling pairs and a passing positive control; \(I_{\mathcal V}\) is the principled form, \(G_T\) its two-point bpb summary (\S\ref{ssec:expressiveness}). \\
+\(\mathrm{NDR}_\epsilon\) & \GATE\ (guard) & No-degradation rate \(\le\delta_{\rm task}\) (depth must not \emph{hurt}). \\
+\(\vram_{\rm peak}\), \(\mathrm{slope}(\vram/\text{batch})\), \(R_{\rm act}(K)\) & \GATE\ (P2, resource = memory) & Peak VRAM low \emph{and flat in \(K\)}; \(R_{\rm act}(K)\le1.10\) (\S\ref{ssec:resource}). \\
 Pareto \((S_T,\vram,\mathrm{ms/token})\) & \GATE\ (sufficiency) & On or above frontier versus a matched small dense transformer.  This, not \(G_T>0\) alone, is project success. \\
 \midrule
-\(I_{\mathcal{V}}(z_K\!\to\!Y)\), \code{\detokenize{expressiveness_rho}} & \DIAG\ (expressiveness headline) & Depth-resolved \(\mathcal{V}\)-usable predictive information \(I_{\mathcal{V}}=H_{\mathcal{V}}(Y)-\mathrm{loss}(K)\) (Eq.~\eqref{eq:vinfo}); objective \(\mathrm{corr}(I_{\mathcal{V}},K)\to+1\).  The principled expressiveness measure (quality axis); subsumes \code{\detokenize{depth_gain_GT}}/\code{\detokenize{phi_eval}}. \\
-\(\varphi_{\rm isodepth}\) (Recurrence-equivalence exponent, param-efficiency) & \DIAG\ (efficiency, orthogonal) & \(K\) recurrent loops are worth how many \emph{unique-parameter} blocks; fit on the synthetic task where hardness is known.  Resource axis, \(\varphi\in[0,3]\) (\(>1\): super-param-equivalent), \emph{not} expressiveness. \\
-Convergence-depth \(k^\star(x)\) vs. hardness & \DIAG & Correlate with \(\ell\) or graph diameter.  Flat and small \(k^\star\) is the plateau signature. \\
-\(\mathrm{WFIR}\) & \DIAG & Use task-aligned readout, such as correct-token log-probability or NLL contribution; do not use random projections as the headline.  Report \(\mathrm{WFIR}_{\rm real}-\mathrm{WFIR}_{\rm shuffled}\). \\
-\(\Delta_{\rm MoE}\), \(\mathrm{AEBR}\), route-depth NMI & \DIAG\ (future P3) & Use only after P1 passes and only in a separate MoE ablation.  They are not emitted by the P1 harness. \\
-\(\rho_F\), residual, \(\sigma_{\max}(J_F)\) & \DIAG & Convergence diagnostics only; feed \(k^\star\) and fallback decisions. \\
-\(\mathrm{Gap}_{\rm dense}\), \(\mathrm{KL}_{\rm teacher}\) & \DIAG & Dense simulation is the weakest claim and never a gate. \\
+\(\varphi_{\rm isodepth}\) (Recurrence-equivalence exponent) & \DIAG\ (efficiency-vs-dense, orthogonal) & How many \emph{unique-parameter} blocks \(r\) loops are worth; \(\varphi\in[0,3]\) (\(>1\): super-param-equivalent).  Resource/efficiency axis, \emph{not} expressiveness (\S\ref{ssec:efficiency}). \\
+\(\code{\detokenize{phi_eval}}\) & \DIAG\ (efficiency proxy) & Cheap single-model eval-depth log-slope proxy; \emph{not} \(\varphi_{\rm isodepth}\) (\S\ref{ssec:efficiency}). \\
+\(\code{\detokenize{erank}}\), \(\code{\detokenize{disp_tail}}\) & \DIAG\ (expressiveness) & Representation dimensionality (non-monotone) and sustained-dynamics / effective-depth signals (\S\ref{ssec:expressiveness}). \\
+\(\code{\detokenize{route_step_div}}\), \(\code{\detokenize{expert_cos_div}}\), \(\code{\detokenize{router_entropy}}\), \(\code{\detokenize{expert_util}}\) & \DIAG\ (MoE-basis engagement) & Across-step path diversity, basis non-degeneracy, specialization, utilization (\S\ref{ssec:moe}). \\
+\(\code{\detokenize{kv_bytes}}\), \(\code{\detokenize{ops:vram_util_pct}}\), \(\code{\detokenize{ops:tok_per_s}}\) & \DIAG\ (resource / ops) & MLA KV footprint; VRAM-util and throughput tuning knobs --- explicitly \emph{not} gates (\S\ref{ssec:resource}). \\
+Convergence-depth \(k^\star(x)\), \(\mathrm{WFIR}\), \(\Delta_{\rm MoE}\), \(\mathrm{AEBR}\), route-depth NMI, \(\rho_F\)/\(\sigma_{\max}(J_F)\), \(\mathrm{Gap}_{\rm dense}\) & \DIAG\ (legacy / future P3) & Failure-analysis traces; not emitted by the P1 harness and not P1 gates (\S\ref{ssec:demoted}). \\
 \bottomrule
 \end{tabularx}
 \end{center}
 
-\paragraph{Useful function-space depth.}
-For a fixed probe set \(X\), let \(f_k(X)\) be a task-aligned readout at recurrent depth \(k\).
-Define increments:
-\[
-  \Delta_k(X)=f_{k+1}(X)-f_k(X).
-\]
-\(\mathrm{WFIR}\) is the effective rank of centered, regularized functional increments, reported
-against a shuffled-depth baseline.  It is diagnostic because diversity alone can be noise; it
-becomes meaningful only when paired with positive \(G_T\) and controlled \(\mathrm{NDR}_\epsilon\).
-Legacy internal metrics such as \code{\detokenize{ED_update}},
-\code{\detokenize{ED_logit}}, \code{\detokenize{route_depth_nmi_mean}},
-\code{\detokenize{route_depth_nmi_max}}, and \code{\detokenize{expert_util_mean}}
-map to older ED\(_u\), ED\(_\ell\), route-depth NMI, and expert-utilization traces.  They are useful
-for failure analysis, but they are not P1 gates.
+\subsection{Correctness gate}
+\label{ssec:correctness}
+\paragraph{\(\code{\detokenize{recon_rel}}\) --- reversible round-trip error (\GATE).}
+Let \(\mathrm{forward}(\cdot)\) run the depth-\(K\) recurrence from a seed \((a_0,b_0)\) to the terminal
+\((a_K,b_K)\) and \(\mathrm{invert}(\cdot)\) apply the algebraic inverse of
+\S\ref{sec:models}, producing \((a_0',b_0')=\mathrm{invert}(\mathrm{forward}(a_0,b_0))\).  Then
+\begin{equation}
+\label{eq:recon-rel}
+  \code{\detokenize{recon_rel}}
+  \;=\;
+  \frac{\lVert a_0'-a_0\rVert+\lVert b_0'-b_0\rVert}{\lVert a_0\rVert+\lVert b_0\rVert+\epsilon}.
+\end{equation}
+\emph{Interpretation.}  The \(O(1)\)-in-\(K\) reversible backward (\code{RevRecurrenceFn}) does not
+store intermediate activations; it \emph{reconstructs} them from \((a_K,b_K)\) via exactly this inverse,
+so the reconstructed graph --- and hence the BPTT gradients --- equal ordinary stored-activation BPTT
+\emph{iff} the round-trip is exact.  A large \(\code{\detokenize{recon_rel}}\) means the reconstructed
+graph (and the gradient signal) has drifted from the true forward.  It is the gate that makes every
+other metric trustworthy: \(z_K\), the loss-vs-\(K\) curve, and the parameter count are only meaningful
+when the gradients that produced them were correct.  Measured at the rank-0 log site \emph{under the
+training bf16 autocast} (one forward + one inverse sweep), so it reports actual training reconstruction
+drift; fp64 stream accumulation (\S\ref{sec:models}, \code{\detokenize{recurrence_accum_dtype}}) and
+autocast replay drive it to \(\approx0\).  \emph{Goal:} \(<10^{-6}\) (machine precision in fp64).
+\GATE\ (correctness; also a P2 sub-gate).
+
+\subsection{Expressiveness axis (maximize)}
+\label{ssec:expressiveness}
+The headline goal is that recurrent depth \(K\) adds \emph{usable} predictive information.
+
+\paragraph{\(I_{\mathcal V}(z_K\!\to\!Y)\) --- \(\mathcal V\)-usable predictive information (\GATE\ basis).}
+With \(Y\) the next token and \(z_K\) the depth-\(K\) representation read by the model's own readout
+family \(\mathcal V\) (the MoS head; \S\ref{sec:models}),
+\begin{equation}
+\label{eq:iv-metric}
+  I_{\mathcal V}(z_K\!\to\!Y)
+  \;=\;
+  H_{\mathcal V}(Y)-H_{\mathcal V}(Y\mid z_K)
+  \;=\;
+  H_{\mathcal V}(Y)-\mathrm{nll}(z_K),
+  \qquad
+  H_{\mathcal V}(Y)=-\sum_y\hat p(y)\log\hat p(y),
+\end{equation}
+where \(H_{\mathcal V}(Y)\) is the empirical next-token \emph{marginal} cross-entropy (the best
+marginal predictor's loss, a constant in \(K\), accumulated once over the cached eval targets and
+all-reduced across DDP ranks; \(\hat p\) the empirical token frequency) and \(\mathrm{nll}(z_K)\) is the
+depth-\(K\) conditional cross-entropy from the \code{--k-eval-sweep}.  Emitted in bits as
+\(\code{\detokenize{iv_bits}}=I_{\mathcal V}/\ln 2\) per \(K\) (the \code{\detokenize{usable_info}}
+line).  \emph{Why it is the principled depth-expressiveness measure} (\cite{vinfo,vusable}): \(\mathcal
+V\)-information can be \emph{created by computation} and so can \emph{grow with} \(K\), unlike Shannon
+mutual information, which the data-processing inequality forbids from increasing under the deterministic
+map \(z_0\!\to\!z_K\) (\(I(z_K;Y)\le I(z_0;Y)\)); it is defined relative to the bounded readout family
+\(\mathcal V\), making it sufficient-and-necessary for usable predictive expressiveness w.r.t.\ \(\mathcal
+V\), and it equals the MDL codelength reduction a \(\mathcal V\)-decoder achieves from \(z_K\).
+\emph{Goal:} \(I_{\mathcal V}(K)\) increasing in \(K\).
+
+\paragraph{\(\code{\detokenize{expressiveness_rho}}\) --- headline expressiveness gate-direction (\GATE).}
+\begin{equation}
+\label{eq:expr-rho}
+  \code{\detokenize{expressiveness_rho}}
+  \;=\;
+  \rho_{\rm Spearman}\bigl(K,\,I_{\mathcal V}(K)\bigr)
+  \;=\;
+  \rho_{\rm Spearman}\bigl(K,\,-\mathrm{nll}(K)\bigr)\in[-1,1].
+\end{equation}
+\(=+1\) iff depth monotonically adds usable information (the objective); \(\mathrm{NaN}\) with fewer than
+three finite \(K\) (no rank correlation estimable).  This is the headline expressiveness reading;
+gate-direction \(\to+1\).
+
+\paragraph{\(\code{\detokenize{iv_total_bits}}\) --- total depth-added usable information (\DIAG).}
+\(\code{\detokenize{iv_total_bits}}=I_{\mathcal V}(K_{\max})-I_{\mathcal V}(K_{\min})\) bits: the net
+usable information depth buys across the swept range.
+
+\paragraph{\(G_T\) --- depth-gain (\GATE\ summary).}
+\(G_T(K_{\rm lo},K_{\rm hi})=\bpb(K_{\min})-\bpb(K_{\max})\) (bits-per-byte units), the two-point bpb
+summary of \(I_{\mathcal V}\) and the operational P1 statistic.  \emph{Gate rule:} paired-CI lower
+bound \(>0\) on a depth-hard task with knee-straddling \((K_{\rm lo},K_{\rm hi})\) and a passing
+positive control; the executable harness emits a streaming paired normal-approximation interval from
+all-reduced sums and squared sums.  \GATE\ (P1).
+
+\paragraph{\(\mathrm{NDR}_\epsilon\) --- no-degradation rate (\GATE\ guard).}
+The fraction of paired examples on which deeper recurrence \emph{degrades} the score by more than a
+task tolerance \(\epsilon\); a guard that depth must not hurt, with rule \(\mathrm{NDR}_\epsilon\le
+\delta_{\rm task}\).
+
+\paragraph{\(\code{\detokenize{erank}}\) --- effective (numerical) rank (\DIAG).}
+For singular values \(\sigma_i\) of a probed matrix (e.g.\ the tied embedding / expert output space),
+with \(\hat\sigma_i=\sigma_i/\sum_j\sigma_j\),
+\begin{equation}
+\label{eq:erank}
+  \code{\detokenize{erank}}
+  \;=\;
+  \exp\!\Bigl(-\textstyle\sum_i\hat\sigma_i\log\hat\sigma_i\Bigr)
+\end{equation}
+(Roy--Vetterli~\cite{effrank}; the exponential of the spectral entropy, \(=n\) for an isotropic
+spectrum, \(=1\) for rank-1).  A representation-dimensionality \emph{diagnostic}.  It is \emph{explicitly
+non-monotone} and \emph{not} a maximize-target: compression of the representation often aids
+generalization (the intrinsic-dimensionality caveat), so a falling \code{\detokenize{erank}} is not by
+itself a regression.
+
+\paragraph{\(\code{\detokenize{disp_tail}}\) --- sustained-dynamics / effective-depth (\DIAG).}
+With \(z_k=\tfrac12(a_k+b_k)\), the normalized per-step displacement is \(\lVert z_{k+1}-z_k\rVert/\lVert
+z_k\rVert\); \code{\detokenize{disp_tail}} is its tail mean over the last half of the budget,
+\begin{equation}
+\label{eq:disp-tail}
+  \code{\detokenize{disp_tail}}
+  \;=\;
+  \frac{2}{K}\!\!\sum_{k>K/2}\frac{\lVert z_{k+1}-z_k\rVert}{\lVert z_k\rVert}.
+\end{equation}
+A sustained (non-decaying) tail signals the recurrence is still doing work deep in the budget (high
+effective depth); a decay to \(\approx0\) signals fixed-point saturation (the collapse mode the
+\code{--init-state random} and \code{--damping orthogonal} fixes target).
+
+\subsection{Efficiency-vs-dense axis (the \texorpdfstring{$\varphi$}{phi} bridge)}
+\label{ssec:efficiency}
+This axis is \emph{complementary} to \(I_{\mathcal V}\): it measures how \emph{parameter-efficient} the
+recurrence is relative to a dense deep model, independent of absolute usable information.
+
+\paragraph{\(\varphi_{\rm isodepth}\) --- the Iso-Depth recurrence-equivalence exponent (\DIAG, the principled \(\varphi\)).}
+This is \emph{the} \(\varphi\), fitted directly from the Iso-Depth joint scaling law~\cite{isodepth}
+(\S\ref{sec:related}, Eq.~\eqref{eq:isodepth}):
+\(L(r)=E+A\,(N_{\rm once}+r^{\varphi}N_{\rm rec})^{-\alpha}\), over a recurrence-count sweep
+\(r\in\{1,2,4,8,16\}\) of \emph{looped models} (\(N_{\rm once}\): non-recurrent params; \(N_{\rm
+rec}\): recurrent/looped-block params), with \(\{E,A,\alpha,\varphi\}\) fitted by nonlinear least
+squares (\(\varphi\in[0,3]\)).  \emph{Interpretation:} \(r\) tied loops \(\equiv r^{\varphi}\) unique
+blocks --- \(\varphi=1\) full equivalence (tying is free), \(\varphi<1\) tying costs capacity (the paper
+measured \(\varphi\approx0.46\)), \(\varphi>1\) \emph{super}-param-equivalent (the MoE-basis
+``exponential paths'' beating dense depth).  This is the efficiency-vs-dense axis (a resource-axis
+quantity), \emph{not} expressiveness.  Measured by \code{experiments/measure\_phi.py} as a multi-\(r\)
+\emph{training} sweep (an experiment-level estimate, not a per-run log line); the five-point fit is
+small-sample and noise-fragile, so a trustworthy estimate needs more \(r\) and/or repeated seeds.
+
+\paragraph{\(\code{\detokenize{phi_eval}}\) --- cheap single-model eval-depth proxy (\DIAG, \emph{not} \(\varphi_{\rm isodepth}\)).}
+A per-run proxy fitted from \emph{one} trained model's \code{--k-eval-sweep}: model
+\(\mathrm{nll}(K)\approx a-b\log K\) and set \(\varphi_{\rm eval}=\mathrm{clamp}(b/b_{\rm ref},0,1)\)
+(\(b_{\rm ref}=1\)).  It is an OLS log-slope of loss versus \emph{inference} depth \(K\) (test-time depth
+utilization) with \emph{no} train-\(r\) sweep and \emph{no} \((N_{\rm once},N_{\rm rec})\) split, so it
+is explicitly a \emph{proxy} --- useful for a quick per-run read, but distinct from and not a substitute
+for the principled \(\varphi_{\rm isodepth}\) of Eq.~\eqref{eq:isodepth}.
+
+\subsection{MoE-basis engagement (diagnostics)}
+\label{ssec:moe}
+These probe whether the smooth-sparse MoE forms a diverse depth-\(K\) path family (the P3 mechanism);
+all are log-site reads (no hot-loop sync).
+
+\paragraph{\(\code{\detokenize{route_step_div}}\) --- across-step expert diversity.}
+For each token, count the distinct dominant experts \(\arg\max_e p^{(k)}_e\) across the \(K\) recurrence
+steps, divided by \(K\), then mean over tokens:
+\begin{equation}
+\label{eq:route-step-div}
+  \code{\detokenize{route_step_div}}
+  \;=\;
+  \E_t\!\left[\frac{\#\{\,\arg\max_e p^{(k)}_{t,e}\;:\;k=1,\dots,K\,\}}{K}\right]\in[1/K,\,1].
+\end{equation}
+\(=1\): a different expert each step (the exponential-path basis is engaged); \(=1/K\): the same expert
+every step (MoE-basis unused, the across-depth collapse mode).
+
+\paragraph{\(\code{\detokenize{expert_cos_div}}\) --- basis non-degeneracy.}
+Mean pairwise \(1-\cos\) of the experts' output vectors on a shared probe batch, \(\in[0,1]\); high
+\(\Rightarrow\) diverse expert functions, \(\approx0\Rightarrow\) duplicated/degenerate experts.
+
+\paragraph{\(\code{\detokenize{router_entropy}}\) --- specialization.}
+Mean per-token router entropy \(H(p)=-\sum_e p_e\log p_e\); \emph{low} \(\Rightarrow\) peaked/specialized
+routing.  This is specialization, \emph{not} utilization.
+
+\paragraph{\(\code{\detokenize{expert_util}}\) --- utilization.}
+Global entropy \(H(\bar p)\) of the batch-mean routing \(\bar p=\E_t\,p_t\), \(\in[0,\ln E]\); near
+\(\ln E\) \(\Rightarrow\) all experts used, low \(\Rightarrow\) dead experts.  \(\code{\detokenize{diag:active_frac}}\)
+(mean routed-weight active fraction) is a related MoE-mechanism diagnostic, \emph{not} a resource gate.
+
+\subsection{Resource axis (minimize / hold flat in \texorpdfstring{$K$}{K})}
+\label{ssec:resource}
+The resource goal is \emph{activation memory}, which the reversible \(O(1)\)-in-\(K\) backward holds
+flat in recurrent depth.  Dropped as resource metrics: the artifact-16\,MB hard gate (artifact bytes
+logged informationally only), FLOPs/token, and wall-clock/step.
+
+\paragraph{\(\code{\detokenize{peak_vram}}\) --- primary resource number (\GATE).}
+Peak allocated VRAM in MiB (\(\max\) over the step).  \emph{Goal:} low \emph{and flat in \(K\)} --- the
+reversible recurrence's defining property.  \GATE\ (P2).
+
+\paragraph{\(R_{\rm act}(K)=\mathrm{mem}(2K)/\mathrm{mem}(K)\) --- activation-memory ratio (\GATE).}
+The ratio of activation memory at doubled depth; \(R_{\rm act}(K)\le1.10\) certifies activations are
+\(\approx\)constant in recurrent depth, the P2 claim.  Supplied by the control sweep.  \GATE\ (P2).
+
+\paragraph{VRAM-vs-batch slope --- \(\mathrm{slope}(\vram/\text{batch})\) (\GATE).}
+The OLS slope (MB/sample) of peak VRAM versus batch size (\code{\detokenize{vram_vs_batch_scaling}});
+goal low/flat.  \code{\detokenize{--grad-accum 1}} runs the whole batch in one forward to fill VRAM,
+which the \(O(1)\)-in-\(K\) reversible recurrence makes affordable at deep \(K\).
+
+\paragraph{\(\code{\detokenize{kv_bytes}}\) --- MLA KV-cache footprint (\DIAG).}
+Bytes per token of the MLA-compressed KV cache (the latent plus decoupled RoPE channel, billed bf16);
+the static deployment footprint.  The autoregressive constant-KV claim (\(\alpha_{\rm kv}\approx0\)) is
+an S+2 axis (\S\ref{sec:staging}), not a current gate.
+
+\paragraph{\(\code{\detokenize{ops:vram_util_pct}}\), \(\code{\detokenize{ops:tok_per_s}}\) --- ops/efficiency tuning (\DIAG, \emph{not} gates).}
+VRAM utilization \(\code{\detokenize{ops:vram_util_pct}}=100\cdot\vram_{\rm peak}/\)device memory and
+throughput \(\code{\detokenize{ops:tok_per_s}}=\text{batch tokens}/\text{step wall-time}\), logged under
+the \code{ops:} prefix for tuning the batch / grad-accum knobs.  They are \emph{explicitly not}
+resource gates.
+
+\subsection{Two-goal frame}
+\label{ssec:two-goal}
+Expressiveness (\(I_{\mathcal V}\) / \code{\detokenize{expressiveness_rho}}, \S\ref{ssec:expressiveness})
+and resource (\(\code{\detokenize{peak_vram}}\) / \(R_{\rm act}\), \S\ref{ssec:resource}) are
+\emph{orthogonal} goals on the Pareto frontier: a model can be expressive yet memory-hungry, or
+memory-flat yet flat in usable information.  \(\varphi_{\rm isodepth}\) (\S\ref{ssec:efficiency}) is the
+efficiency-vs-dense bridge between them (how few unique parameters one loop is worth), and the
+correctness gate \(\code{\detokenize{recon_rel}}\approx0\) (\S\ref{ssec:correctness}) underwrites
+\emph{both} axes --- \(z_K\) and the loop param count are only meaningful when the reversible round-trip
+is bit-exact.  Project success is the Pareto gate, not \(G_T>0\) alone.
+
+\subsection{Demoted / legacy internal metrics (diagnostics, not P1 gates)}
+\label{ssec:demoted}
+The following are failure-analysis traces, not P1 gates, and are not emitted by the P1 harness.
+
+\paragraph{Useful function-space depth (\(\mathrm{WFIR}\)).}
+For a fixed probe set \(X\), let \(f_k(X)\) be a task-aligned readout at recurrent depth \(k\), with
+increments \(\Delta_k(X)=f_{k+1}(X)-f_k(X)\).  \(\mathrm{WFIR}\) is the effective rank of centered,
+regularized functional increments, reported against a shuffled-depth baseline
+(\(\mathrm{WFIR}_{\rm real}-\mathrm{WFIR}_{\rm shuffled}\)); use a task-aligned readout (correct-token
+log-probability or NLL contribution), never random projections, as the headline.  It is diagnostic
+because diversity alone can be noise; it becomes meaningful only when paired with positive \(G_T\) and
+controlled \(\mathrm{NDR}_\epsilon\).
+
+\paragraph{Other legacy traces.}
+Convergence-depth \(k^\star(x)\) versus task hardness (flat-and-small \(k^\star\) is the plateau
+signature); the P3 MoE-ablation metrics \(\Delta_{\rm MoE}\), \(\mathrm{AEBR}\), and route-depth NMI
+(used only after P1 passes, in a separate MoE ablation, never emitted by the P1 harness); the
+fixed-point convergence diagnostics \(\rho_F\), residual, and \(\sigma_{\max}(J_F)\) (advisory, feeding
+\(k^\star\) and fallback decisions); and the dense-simulation diagnostics \(\mathrm{Gap}_{\rm dense}\),
+\(\mathrm{KL}_{\rm teacher}\) (the weakest claim, never a gate).  The older internal effective-depth
+traces \code{\detokenize{ED_update}}, \code{\detokenize{ED_logit}},
+\code{\detokenize{route_depth_nmi_mean}}, \code{\detokenize{route_depth_nmi_max}}, and
+\code{\detokenize{expert_util_mean}} map to ED\(_u\), ED\(_\ell\), route-depth NMI, and
+expert-utilization traces.  They are useful for failure analysis, but they are \emph{not P1 gates}.
 
 %==============================================================================
 \section{Clock Diagnostic and Failure Triage}
