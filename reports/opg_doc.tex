@@ -21,6 +21,7 @@
 \newcommand{\E}{\mathbb{E}}
 \newcommand{\sg}{\operatorname{sg}}
 \newcommand{\RMSNorm}{\operatorname{RMSNorm}}
+\newcommand{\expm}{\operatorname{expm}}
 \newcommand{\bpb}{\textsc{bpb}}
 \newcommand{\code}[1]{\texttt{#1}}
 \newcommand{\vram}{\mathrm{VRAM}}
@@ -90,10 +91,10 @@ The implemented pipeline (\code{train\_gpt.py}) is, in order:
   \(a_{k+1}=Q\,a_k+F_\theta(\RMSNorm(b_k+x_0+e_k))\),
   \(b_{k+1}=Q\,b_k+G_\theta(\RMSNorm(a_{k+1}+x_0+e_k))\), where \(F_\theta,G_\theta\) are pre-norm delta
   blocks (MLA attention + SwiGLU MoE), \(e_k\) is the optional step-clock (\(M_{\rm clk}\),
-  \code{step\_conditioning}, off by default), and \(Q\) is the optional orthogonal (low-rank
-  skew-Cayley) damping (\code{--damping}, default \code{none}\(\Rightarrow Q{=}I\)): strictly invertible
-  (\(Q^{\top}\)), norm-preserving (no fixed-point collapse, extrapolates beyond the trained depth), and
-  relaxing the \(A{+}B{=}I\) convex tie.
+  \code{step\_conditioning}, off by default), and \(Q\) is the optional orthogonal (matrix-exponential
+  of a low-rank skew) damping (\code{--damping}, default \code{none}\(\Rightarrow Q{=}I\)): strictly
+  invertible (\(Q^{\top}\)), norm-preserving (no fixed-point collapse, extrapolates beyond the trained
+  depth), and relaxing the \(A{+}B{=}I\) convex tie.
   \item \textbf{Reversible \(O(1)\)-in-\(K\) backward} (\code{RevRecurrenceFn}): reconstructs activations
   from the terminal state via the exact inverse, with fp64 stream accumulation
   (\code{\detokenize{recurrence_accum_dtype}}) and replayed bf16 autocast keeping
@@ -853,20 +854,32 @@ gap.
 \emph{Implemented.}  This is now available behind the \code{--damping} knob (\code{none}, the
 default, is \(Q{=}I\) and byte-identical to the additive coupling; \code{orthogonal} enables the
 mechanism) with rank knob \code{\detokenize{--damping-rank}} (default \(r{=}16\)).  \(Q\) is
-parameterized as the \emph{low-rank skew-Cayley} \(Q=(I-S)(I+S)^{-1}\) of a skew-symmetric
-\(S=UV^{\top}-VU^{\top}\) with learnable \(U,V\in\mathbb{R}^{d\times r}\); \(S^{\top}{=}{-}S\)
-guarantees \(Q^{\top}Q{=}I\) and \(\det Q{>}0\) (a proper rotation), and the inverse is exactly
-\(Q^{\top}=(I+S)(I-S)^{-1}\) --- no floor.  \(Q\,x\) and \(Q^{\top}x\) are applied via the
-Woodbury identity, \(Q\) shared across steps and between the \(a/b\) streams, so the \(d{\times}d\)
-matrix is \emph{never} formed and no \(d{\times}d\) system is solved: cost is \(O(B\,T\,d\,r)\) (an
-\(r{\times}r\) solve plus \(d{\times}r\) matmuls).  \(U,V\) are initialized at \(10^{-3}\!\cdot\!
-\mathcal{N}\) so \(S{\approx}0,\ Q{\approx}I\) at start (near-identity readout); rotation is learned.
-\(Q\) is a fixed matrix \emph{within} a forward+backward (a function of \(U,V\) only, not of the
-evolving states), so each reverse undo needs one already-available state (no leapfrog circularity);
-applying \(Q\) in the fp64 accumulation stream keeps \(Q^{\top}(Q\,x){=}x\) to \(\sim\!10^{-15}\),
-so the reversible round-trip \code{\detokenize{recon_rel}}\(\approx0\) even under bf16 autocast at
-deep \(K\).  The custom \(O(1)\)-memory backward applies \(Q^{\top}\) in its reconstruction and
-\(Q\) in the rebuilt step, so \(U,V\) receive gradients identical to ordinary BPTT.
+parameterized as the \emph{matrix exponential of a low-rank skew}, \(Q=\expm(S)\), of a
+skew-symmetric \(S=UV^{\top}-VU^{\top}\) with learnable \(U,V\in\mathbb{R}^{d\times r}\);
+\(S^{\top}{=}{-}S\) guarantees \(\expm(S)\) is \emph{exactly} orthogonal for \emph{any} \(\|S\|\)
+(\(Q^{\top}Q{=}I\), \(\det Q{>}0\), a proper rotation), and the inverse is exactly
+\(Q^{\top}=\expm(-S)\) --- no floor and, crucially, \emph{no} \((I+S)^{-1}\) solve.  This replaces
+the earlier low-rank skew-Cayley form \(Q=(I-S)(I+S)^{-1}\): the Cayley form is fp64-exact only
+while \(\|S\|\) is small, but as the learnable \(U,V\) grow its low-rank Woodbury capacitance matrix
+becomes ill-conditioned, the solve loses precision, \(Q\) drifts off the orthogonal manifold, and
+\(Q^{\top}(Q\,x)\neq x\) --- so \code{\detokenize{recon_rel}} explodes mid-training and corrupts the
+reconstructed gradients.  \(\expm(S)\) has no solve and is exactly orthogonal regardless of \(\|S\|\),
+so \code{\detokenize{recon_rel}}\(\approx0\) is stable across training.  It is computed on the
+low-rank active subspace to stay \(O(B\,T\,d\,r)\): with \(W=[U\,|\,V]\) and an orthonormal basis
+\(B\) of \(\operatorname{span}(W)\) (a thin QR, \(k{\le}2r\) columns), the projected skew
+\(S_{\rm sub}=B^{\top}SB\in\mathbb{R}^{k\times k}\) is exponentiated by a small \(k{\times}k\)
+\code{\detokenize{matrix_exp}} (\(R=\expm(S_{\rm sub})\), \(R^{\top}=\expm(-S_{\rm sub})\)), and
+\(Q\,x=x+B\big((R-I)(B^{\top}x)\big)\) (identity off \(\operatorname{span}(B)\), where \(S{=}0\), so
+this is exactly the full-space \(\expm(S)\)); the \(d{\times}d\) matrix is \emph{never} formed.  \(Q\)
+is shared across steps and between the \(a/b\) streams.  \(U,V\) are initialized at
+\(10^{-3}\!\cdot\!\mathcal{N}\) so \(S{\approx}0,\ Q{\approx}I\) at start (near-identity readout);
+rotation is learned.  \(Q\) is a fixed matrix \emph{within} a forward+backward (a function of \(U,V\)
+only, not of the evolving states), so each reverse undo needs one already-available state (no
+leapfrog circularity); applying \(Q\) in the fp64 accumulation stream keeps \(Q^{\top}(Q\,x){=}x\) to
+\(\sim\!10^{-15}\), so the reversible round-trip \code{\detokenize{recon_rel}}\(\approx0\) even under
+bf16 autocast at deep \(K\).  The custom \(O(1)\)-memory backward applies \(Q^{\top}\) in its
+reconstruction and \(Q\) in the rebuilt step (and \(\expm\) / QR are differentiable), so \(U,V\)
+receive gradients identical to ordinary BPTT.
 
 %==============================================================================
 \section{Assumptions and Checks}

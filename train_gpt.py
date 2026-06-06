@@ -134,31 +134,41 @@ class RMSNorm(nn.Module):
 # 3. Reversible recurrence core
 # ---------------------------------------------------------------------------
 def cayley_apply(x, U, V, transpose=False):
-    """Apply the low-rank skew-Cayley ORTHOGONAL matrix ``Q`` (or ``Qᵀ``) to ``x``.
+    """Apply the low-rank-skew ORTHOGONAL matrix ``Q`` (or ``Qᵀ``) to ``x``.
 
-    The orthogonal (mHC-style) damping matrix is the Cayley transform of a
-    low-rank SKEW-symmetric ``S``::
+    ``Q`` is the MATRIX EXPONENTIAL of a low-rank SKEW-symmetric ``S``::
 
         S = U Vᵀ − V Uᵀ      (Sᵀ = −S, so S is skew)      U, V ∈ R^{d×r}
-        Q = (I − S)(I + S)^{-1}        (orthogonal: QᵀQ = I, det Q > 0)
-        Qᵀ = (I + S)(I − S)^{-1}       (= Q^{-1}, since Sᵀ = −S)
+        Q  = expm(S)                  (orthogonal for ANY ‖S‖: QᵀQ = I, det Q > 0)
+        Qᵀ = expm(Sᵀ) = expm(−S)      (= Q^{-1}, since Sᵀ = −S)
 
-    ``Q`` is applied via the Woodbury / Sherman-Morrison identity so the dense
-    ``d×d`` matrix is NEVER formed and no ``d×d`` system is solved — only an
-    ``2r×2r`` solve plus ``d×2r`` matmuls (cost ``O(B·T·d·r)``). Writing
-    ``S = M Nᵀ`` with ``M = [U | V]`` and ``N = [V | −U]`` (both ``d×2r``), and
-    for the chosen branch ``(I + sgn·S)`` with ``sgn = +1`` for ``Q`` (inner
-    inverse is ``(I+S)^{-1}``) or ``sgn = −1`` for ``Qᵀ`` (inner inverse is
-    ``(I−S)^{-1}``)::
+    ``expm`` of a skew matrix is EXACTLY orthogonal regardless of ``‖S‖`` — no
+    ``(I+S)^{-1}`` solve, so no ill-conditioning as the learnable ``U,V`` grow
+    (the Cayley form ``(I−S)(I+S)^{-1}`` was fp64-exact only while ``‖S‖`` was
+    small; its low-rank Woodbury capacitance matrix became ill-conditioned as
+    ``U,V`` grew, the solve lost precision, ``Q`` drifted off the orthogonal
+    manifold, and ``Qᵀ(Q·x) ≠ x`` broke the O(1) reversible reconstruction).
 
-        w = (I + sgn·S)^{-1} x = x − (sgn·M) (I_{2r} + Nᵀ(sgn·M))^{-1} (Nᵀ x)
-        y = (I − sgn·S) w      = w − sgn · M (Nᵀ w)
+    Computed on the low-rank ACTIVE subspace so it stays ``O(B·T·d·r)`` and
+    fp64-exact: ``S`` is zero off ``span([U|V])`` (so ``expm(S)`` is the identity
+    there), and on that ``k``-dim span (``k ≤ 2r``) ``expm`` reduces to a small
+    ``k×k`` ``matrix_exp``::
 
-    ``x`` has shape ``(..., d)`` (row-vector convention: each trailing-``d`` slice
-    is multiplied by ``Q`` on the left, i.e. ``y = x @ Qᵀ`` for ``Q``). ``U``/``V``
-    are cast to ``x``'s dtype, so calling this with an fp64 stream keeps
-    ``Qᵀ(Q·x) = x`` exact to ~1e-15 — the load-bearing reversibility primitive
-    (the reconstruction inverse divides by NOTHING, so there is no Parcae floor).
+        W = [U | V]                          # (d, 2r); its column span carries S
+        B, _ = qr(W)                         # (d, k) orthonormal basis of span(W)
+        S_sub = Bᵀ S B = (Bᵀ U)(Bᵀ V)ᵀ − (Bᵀ V)(Bᵀ U)ᵀ   # (k, k), enforce skew
+        R  = matrix_exp(S_sub)               # (k, k), exactly orthogonal
+        Q·x  = x + B @ ((R  − I) @ (Bᵀ x))   # (Rᵀ = matrix_exp(−S_sub) for Qᵀ)
+
+    Outside ``span(B)`` ``S = 0`` so this is the exact full-space ``expm(S)``.
+    ``B`` may have ``k < 2r`` columns when ``W`` is rank-deficient (``U,V`` share
+    directions); ``qr`` keeps the actual span so the result stays exactly
+    orthogonal. ``x`` has shape ``(..., d)`` (row-vector convention: each
+    trailing-``d`` slice is multiplied by ``Q`` on the left, i.e. ``y = x @ Qᵀ``
+    for ``Q``). ``U``/``V`` and the whole computation run in ``x``'s dtype, so
+    with an fp64 stream ``Qᵀ(Q·x) = x`` is exact to ~1e-15 for ANY ‖S‖ — the
+    load-bearing reversibility primitive (the reconstruction inverse divides by
+    NOTHING, so there is no Parcae floor).
 
     When ``r == 0`` (no damping rank) ``Q = I`` and ``x`` is returned unchanged.
     """
@@ -167,20 +177,23 @@ def cayley_apply(x, U, V, transpose=False):
     dt = x.dtype
     U = U.to(dt)
     V = V.to(dt)
-    M = torch.cat([U, V], dim=-1)        # (d, 2r),  S = M Nᵀ
-    N = torch.cat([V, -U], dim=-1)       # (d, 2r)
-    sgn = -1.0 if transpose else 1.0
-    Mh = sgn * M                         # (I + sgn·S) = I + Mh Nᵀ
-    twor = M.shape[-1]
-    eye = torch.eye(twor, dtype=dt, device=x.device)
-    Nx = x @ N                           # (..., 2r) = Nᵀ x  (row-vector)
-    cap = eye + (N.transpose(-1, -2) @ Mh)   # (2r, 2r) = I + Nᵀ(sgn·M)
-    # w = x − Mh (cap^{-1} (Nᵀ x)); solve cap · sol = Nx  (sol shape (..., 2r)).
-    sol = torch.linalg.solve(cap, Nx.unsqueeze(-1)).squeeze(-1)   # (..., 2r)
-    w = x - sol @ Mh.transpose(-1, -2)   # (..., d)
-    # y = (I − sgn·S) w = w − sgn·M (Nᵀ w).
-    Nw = w @ N                           # (..., 2r) = Nᵀ w
-    y = w - sgn * (Nw @ M.transpose(-1, -2))
+    W = torch.cat([U, V], dim=-1)            # (d, 2r): span(W) carries S
+    # Orthonormal basis B of span(W); qr keeps the actual (possibly < 2r) span.
+    B, _ = torch.linalg.qr(W)                # (d, k), k = min(d, 2r) columns
+    # Project the skew into the subspace, then enforce EXACT skew-symmetry:
+    # S = U Vᵀ − V Uᵀ  ⇒  Bᵀ S B = (BᵀU)(BᵀV)ᵀ − (BᵀV)(BᵀU)ᵀ.
+    BU = B.transpose(-1, -2) @ U             # (k, r)
+    BV = B.transpose(-1, -2) @ V             # (k, r)
+    S_sub = BU @ BV.transpose(-1, -2) - BV @ BU.transpose(-1, -2)   # (k, k)
+    S_sub = 0.5 * (S_sub - S_sub.transpose(-1, -2))   # numerically exact skew
+    if transpose:                            # Qᵀ = expm(−S_sub) = matrix_exp(Sᵀ)
+        S_sub = -S_sub
+    k = S_sub.shape[-1]
+    R = torch.matrix_exp(S_sub)              # (k, k), exactly orthogonal
+    eye = torch.eye(k, dtype=dt, device=x.device)
+    Bx = x @ B                               # (..., k) = Bᵀ x  (row-vector)
+    # y = x + B @ ((R − I) @ (Bᵀ x)); row-vector form: x + ((Bᵀx)(R−I)ᵀ) @ Bᵀ.
+    y = x + (Bx @ (R - eye).transpose(-1, -2)) @ B.transpose(-1, -2)
     return y
 
 
@@ -231,8 +244,8 @@ class ReversibleRecurrence(nn.Module):
     between the a/b streams makes the recurrence state TRAVERSE representation
     space (norm-preserving rotation, no fixed-point collapse), so it extrapolates
     beyond the trained depth AND the MoE routing input changes across steps —
-    unlike the depth-CONDITIONED clock. ``Q`` is the low-rank skew-Cayley of
-    learnable ``damp_U``/``damp_V`` (init ``1e-3·randn`` so ``Q≈I`` at start,
+    unlike the depth-CONDITIONED clock. ``Q`` is the matrix-exponential of the
+    low-rank skew of learnable ``damp_U``/``damp_V`` (init ``1e-3·randn`` so ``Q≈I`` at start,
     keeping the near-identity readout). See ``reports/opg_doc.tex`` "Autonomous
     substitute" and the ``--damping`` / ``--damping-rank`` knobs.
 
@@ -260,7 +273,7 @@ class ReversibleRecurrence(nn.Module):
         self.accum_dtype = accum_dtype
         # Optional orthogonal (mHC-style) strictly-invertible damping Q. "none"
         # (default) -> Q=I, byte-identical to additive coupling (NO Q params, NO
-        # Q application). "orthogonal" -> low-rank skew-Cayley Q = (I-S)(I+S)^-1,
+        # Q application). "orthogonal" -> low-rank-skew Q = expm(S),
         # S = damp_U damp_Vᵀ - damp_V damp_Uᵀ, applied via :func:`cayley_apply`.
         if damping not in ("none", "orthogonal"):
             raise ValueError(f"damping must be 'none' or 'orthogonal', got {damping!r}")
@@ -1415,18 +1428,19 @@ class Hyperparameters:
     #     the coupling streams — the AUTONOMOUS substitute for the clock (rung-2
     #     anti-collapse). "none" (default): Q=I, BYTE-IDENTICAL to additive
     #     coupling. "orthogonal": a_{k+1}=Q·a_k+F(...), b_{k+1}=Q·b_k+G(...) with
-    #     Q the low-rank skew-Cayley of damp_U/damp_V, SHARED across steps and
+    #     Q = expm(S) of the low-rank skew of damp_U/damp_V, SHARED across steps and
     #     between the a/b streams. Q is norm-preserving so the state TRAVERSES
     #     representation space (no fixed-point collapse) and extrapolates beyond
     #     the trained depth — and the MoE routing input changes across steps
     #     (raising route_step_div) — unlike the depth-CONDITIONED clock. The exact
-    #     inverse is Qᵀ (no Parcae floor); Q is applied in the fp64 accum stream
-    #     so recon_rel ~ 0. Relaxes the A+B=I convex tie (orthogonal A, free
-    #     B=F/G). See reports/opg_doc.tex "Autonomous substitute".
+    #     inverse is Qᵀ=expm(-S) (no Parcae floor, no (I+S)^-1 solve); Q is applied
+    #     in the fp64 accum stream so recon_rel ~ 0. Relaxes the A+B=I convex tie
+    #     (orthogonal A, free B=F/G). See reports/opg_doc.tex "Autonomous substitute".
     damping: str = "none"
-    #   damping_rank: rank r of the skew factors damp_U, damp_V (d x r). Q = Cayley
-    #     of S = U Vᵀ - V Uᵀ (rank <= 2r). Cost O(B·T·d·r) via Woodbury (no d×d
-    #     matrix / no d×d solve). Only allocated when damping="orthogonal".
+    #   damping_rank: rank r of the skew factors damp_U, damp_V (d x r). Q = expm(S)
+    #     of S = U Vᵀ - V Uᵀ (rank <= 2r), computed on the <=2r-dim active subspace
+    #     (thin QR + small k×k matrix_exp). Cost O(B·T·d·r), no d×d matrix / no
+    #     (I+S)^-1 solve. Only allocated when damping="orthogonal".
     damping_rank: int = 16
 
     def __post_init__(self):
@@ -3628,17 +3642,20 @@ def build_arg_parser():
                         "the clock (rung-2 anti-collapse). none (default): Q=I, "
                         "byte-identical to additive coupling. orthogonal: "
                         "a_{k+1}=Q·a_k+F(...), b_{k+1}=Q·b_k+G(...) with Q the "
-                        "low-rank skew-Cayley of damp_U/damp_V (shared across steps "
-                        "and streams). Norm-preserving so the state TRAVERSES rep "
-                        "space (no fixed-point collapse) and extrapolates beyond the "
-                        "trained depth, raising route_step_div — unlike the depth- "
-                        "conditioned clock. Exact inverse Qᵀ (no Parcae floor), "
-                        "applied in the fp64 accum stream so recon_rel ~ 0.")
+                        "matrix-exponential expm(S) of the low-rank skew of "
+                        "damp_U/damp_V (shared across steps and streams). Norm-"
+                        "preserving so the state TRAVERSES rep space (no fixed-point "
+                        "collapse) and extrapolates beyond the trained depth, raising "
+                        "route_step_div — unlike the depth-conditioned clock. Exact "
+                        "inverse Qᵀ=expm(-S) (no Parcae floor, no (I+S)^-1 solve, so "
+                        "exactly orthogonal for any ‖S‖), applied in the fp64 accum "
+                        "stream so recon_rel ~ 0 stably across training.")
     p.add_argument("--damping-rank", type=int, default=16,
                    help="Rank r of the skew factors damp_U, damp_V (d x r) for "
-                        "--damping orthogonal. Q = Cayley(U Vᵀ - V Uᵀ). Cost "
-                        "O(B·T·d·r) via Woodbury (no d×d matrix / no d×d solve). "
-                        "Default 16.")
+                        "--damping orthogonal. Q = expm(U Vᵀ - V Uᵀ), computed on "
+                        "the <=2r-dim active subspace (thin QR + small k×k "
+                        "matrix_exp). Cost O(B·T·d·r), no d×d matrix / no (I+S)^-1 "
+                        "solve. Default 16.")
     # Training schedule / batch.
     p.add_argument("--iterations", type=int, default=1000)
     p.add_argument("--seq-len", type=int, default=512)

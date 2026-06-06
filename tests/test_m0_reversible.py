@@ -162,6 +162,78 @@ def test_damping_orthogonal_recon_rel_zero_bf16_deep_K():
             assert rr < 1e-6, f"recon_rel must be ~0 with damping on @K={K} bf16, got {rr:.2e}"
 
 
+def test_damping_orthogonal_grown_Q_recon_rel_stays_zero_bf16_deep_K():
+    """HARD LOAD-BEARING GATE (the late-training regime that broke the Cayley
+    solve): with U,V GROWN well beyond the 1e-3 init so ‖S‖ is O(10) (mimicking
+    mid/late training), the reversible round-trip recon_rel must STAY ≈0 (< 1e-6)
+    at depth 16 AND 32 under CPU bf16 autocast.
+
+    On the Cayley form Q=(I−S)(I+S)^{-1} the low-rank Woodbury capacitance matrix
+    becomes ill-conditioned as ‖S‖ grows, the solve loses precision, Q drifts off
+    the orthogonal manifold, and recon explodes (observed 3.3e-2 → 1.13 on GPU).
+    Q=expm(S) (projected low-rank skew, no (I+S)^{-1} solve) is EXACTLY orthogonal
+    for ANY ‖S‖ — proven here by (a)+(b) below — so recon_rel ≈ 0 is stable across
+    training. The deterministic Cayley-vs-expm divergence at the apply level lives
+    in ``test_orthogonal_apply_beats_cayley_solve_at_large_S`` /
+    ``test_orthogonal_apply_matches_true_expm_at_large_S``; this gate verifies the
+    full-model reversibility round-trip stays exact with a grown Q.
+
+    Asserts (a) the grown Q is orthogonal (‖QᵀQ−I‖<1e-9, here ~1e-14), (b) the
+    reversibility primitive Qᵀ(Q·x)=x to <1e-9 (here ~1e-14) at the grown ‖S‖,
+    isolating manifold exactness from bf16 accumulation; and (c) the full-model
+    bf16 recon_rel < 1e-6 at depth 16 AND 32."""
+    from train_gpt import (reconstruction_error, Hyperparameters, M0GPT,
+                           cayley_apply)
+
+    torch.manual_seed(0)
+    args = Hyperparameters(
+        model_dim=64, n_heads=2, n_kv_heads=1, vocab_size=16, n_experts=4,
+        expert_rank=4, n_mix=2, kv_latent=4, head_dim=8, max_seq_len=32,
+        router_type="softmax", init_state="random",
+        damping="orthogonal", damping_rank=16,
+    )
+    m = M0GPT(args)
+    # GROWN U,V: std 0.5 (×500 the 1e-3 init) ⇒ ‖S‖ ≈ 26 (O(10)), the late-
+    # training regime. expm(S) keeps Q exactly orthogonal here; the Cayley solve's
+    # accuracy degrades as ‖S‖ grows (see the apply-level gates above).
+    with torch.no_grad():
+        m.rec.damp_U.normal_(std=0.5)
+        m.rec.damp_V.normal_(std=0.5)
+        for blk in (m.rec.F, m.rec.G):
+            for sub in blk.sublayers:
+                for mla in sub.attn_modules():
+                    mla.o_proj.weight.normal_(std=0.3)
+                for moe in sub.moe_modules():
+                    moe.w_out.normal_(std=0.3)
+
+    # (a)+(b): orthogonality + round-trip at the grown ‖S‖, in fp64 (no autocast).
+    U = m.rec.damp_U.detach().double()
+    V = m.rec.damp_V.detach().double()
+    d = U.shape[0]
+    S = U @ V.T - V @ U.T
+    s_norm = float(torch.linalg.matrix_norm(S, ord=2))
+    assert s_norm > 10.0, f"grown ‖S‖ should be O(10) to exercise the regime, got {s_norm:.2f}"
+    I = torch.eye(d, dtype=torch.float64)
+    Q = cayley_apply(I, U, V).transpose(-1, -2)     # dense Q (columns = Q·e_i)
+    assert (Q.T @ Q - I).abs().max() < 1e-9, (
+        f"grown Q not orthogonal at ‖S‖≈{s_norm:.2f}: "
+        f"‖QᵀQ−I‖={float((Q.T @ Q - I).abs().max()):.2e}")
+    xv = torch.randn(5, d, dtype=torch.float64)
+    rt = cayley_apply(cayley_apply(xv, U, V), U, V, transpose=True)
+    assert (rt - xv).abs().max() < 1e-9, (
+        f"grown-Q round-trip Qᵀ(Q·x)≠x at ‖S‖≈{s_norm:.2f}: "
+        f"err={float((rt - xv).abs().max()):.2e}")
+
+    # (c): full-model recon_rel under bf16 autocast at depth 16 AND 32.
+    x = torch.randint(0, 16, (2, 16))
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        for K in (16, 32):
+            rr = reconstruction_error(m, x, depth=K)
+            assert rr < 1e-6, (
+                f"recon_rel must STAY ~0 with grown Q (‖S‖≈{s_norm:.2f}) @K={K} "
+                f"bf16, got {rr:.2e}")
+
+
 def test_damping_orthogonal_preserves_norm_and_rotates_state():
     """BEHAVIORAL gate (the mechanism): with a fixed nonzero orthogonal Q the
     HOMOGENEOUS part of the recurrence (set F=G=0) preserves state NORM across

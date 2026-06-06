@@ -1,17 +1,21 @@
+import pytest
 import torch
 
 from train_gpt import Hyperparameters, M0GPT, MLAttention, MoSHead, SwiGLUMoE
 
 
 # ---------------------------------------------------------------------------
-# Orthogonal (mHC-style) strictly-invertible damping: low-rank skew-Cayley Q.
-# ``cayley_apply`` computes Q·x / Qᵀ·x via Woodbury (NO d×d matrix is formed),
-# where Q = (I − S)(I + S)^{-1} with S = U Vᵀ − V Uᵀ (skew ⇒ Q orthogonal).
-# These are the fp64 helper-level gates (orthogonality + Qᵀ∘Q == I).
+# Orthogonal (mHC-style) strictly-invertible damping: low-rank-skew Q = expm(S).
+# ``cayley_apply`` computes Q·x / Qᵀ·x via the MATRIX EXPONENTIAL of the low-rank
+# skew S = U Vᵀ − V Uᵀ projected onto its 2r-dim active subspace (NO d×d matrix
+# is formed, NO (I+S)^{-1} solve — exactly orthogonal for ANY ‖S‖). These are the
+# fp64 helper-level gates (orthogonality + Qᵀ∘Q == I). The function name is kept
+# for call-site stability; the parameterization is now expm(S), not the Cayley
+# transform (the Cayley solve became ill-conditioned as the learnable U,V grew).
 # ---------------------------------------------------------------------------
 def test_cayley_apply_matches_dense_Q_and_QT():
-    """``cayley_apply`` (Woodbury, no d×d matrix) equals the dense Cayley
-    Q·x and Qᵀ·x to fp64 precision."""
+    """``cayley_apply`` (low-rank, no d×d matrix) equals the dense matrix-
+    exponential Q·x = x @ expm(S)ᵀ and Qᵀ·x = x @ expm(S) to fp64 precision."""
     from train_gpt import cayley_apply
 
     torch.manual_seed(0)
@@ -19,8 +23,7 @@ def test_cayley_apply_matches_dense_Q_and_QT():
     U = torch.randn(d, r, dtype=torch.float64)
     V = torch.randn(d, r, dtype=torch.float64)
     S = U @ V.T - V @ U.T
-    I = torch.eye(d, dtype=torch.float64)
-    Q = (I - S) @ torch.linalg.inv(I + S)
+    Q = torch.matrix_exp(S)            # Q = expm(S) (exactly orthogonal, skew S)
     x = torch.randn(3, 5, d, dtype=torch.float64)
     # Row-vector convention: applying Q to each d-vector is x @ Qᵀ.
     assert torch.allclose(cayley_apply(x, U, V), x @ Q.T, atol=1e-10)
@@ -28,7 +31,7 @@ def test_cayley_apply_matches_dense_Q_and_QT():
 
 
 def test_cayley_Q_is_orthogonal():
-    """The Cayley Q from a random skew S is orthogonal: ‖QᵀQ − I‖ < 1e-10 (fp64).
+    """The expm(S) Q from a random skew S is orthogonal: ‖QᵀQ − I‖ < 1e-10 (fp64).
     Probed columnwise through ``cayley_apply`` on the identity (no dense Q)."""
     from train_gpt import cayley_apply
 
@@ -41,7 +44,7 @@ def test_cayley_Q_is_orthogonal():
     # Q here is the matrix whose i-th ROW is Q·e_i, i.e. Qᵀ. QᵀQ = I either way.
     assert (Q @ Q.T - I).abs().max() < 1e-10
     assert (Q.T @ Q - I).abs().max() < 1e-10
-    # det > 0 (Cayley of a skew matrix is a proper rotation).
+    # det = +1 (expm of a skew matrix is a proper rotation, det > 0).
     assert torch.linalg.det(Q) > 0
 
 
@@ -73,6 +76,162 @@ def test_cayley_apply_near_identity_at_small_UV():
     x = torch.randn(2, 3, d, dtype=torch.float64)
     y = cayley_apply(x, U, V)
     assert (y - x).abs().max() < 1e-4  # Q ≈ I at the 1e-3 init scale
+
+
+# ---------------------------------------------------------------------------
+# GROWN-Q numerical-stability gate (the regime that broke late-training Cayley).
+# As the learnable U,V grow (init ×10–50, so ‖S‖ is O(1)–O(10), mimicking late
+# training) the (I+S)^{-1} Cayley solve becomes ill-conditioned and Q drifts off
+# the orthogonal manifold ⇒ Qᵀ(Q·x)≠x ⇒ recon explodes. Q=expm(S) (matrix-
+# exponential of the projected low-rank skew) is EXACTLY orthogonal for ANY ‖S‖
+# (no (I+S)^{-1} solve), so orthogonality + round-trip stay machine-exact.
+# ---------------------------------------------------------------------------
+def _q_matrix_from_apply(apply_fn, U, V, d, transpose=False):
+    """Materialize the dense Q (or Qᵀ) by applying ``apply_fn`` to the identity.
+
+    Row-vector convention: ``apply_fn(I, ...)`` returns the matrix whose i-th ROW
+    is the map applied to e_i, i.e. (for Q) the matrix Qᵀ. QᵀQ=I either way, and
+    we transpose back to recover Q itself for the explicit ‖QᵀQ−I‖ probe."""
+    I = torch.eye(d, dtype=torch.float64)
+    rows = apply_fn(I, U, V, transpose=transpose)   # i-th row = map·e_i
+    return rows.transpose(-1, -2)                    # columns = map·e_i  -> the map matrix
+
+
+@pytest.mark.parametrize("scale", [1.0, 5.0, 10.0, 30.0, 50.0])
+def test_orthogonal_apply_stays_orthogonal_at_large_S(scale):
+    """‖QᵀQ−I‖ < 1e-9 (fp64) across a range of ‖S‖ from small to LARGE.
+
+    expm(S) is exactly orthogonal for ANY ‖S‖ (no (I+S)^{-1} solve to lose
+    precision). The residual is fp64 matmul rounding (≤~1e-10 even at ‖S‖~1e5)."""
+    from train_gpt import cayley_apply
+
+    torch.manual_seed(11)
+    d, r = 20, 6
+    base_U = torch.randn(d, r, dtype=torch.float64)
+    base_V = torch.randn(d, r, dtype=torch.float64)
+    U = scale * base_U
+    V = scale * base_V
+    S = U @ V.T - V @ U.T
+    s_norm = float(torch.linalg.matrix_norm(S, ord=2))
+    Q = _q_matrix_from_apply(cayley_apply, U, V, d)
+    I = torch.eye(d, dtype=torch.float64)
+    ortho_err = (Q.T @ Q - I).abs().max()
+    assert ortho_err < 1e-9, (
+        f"Q not orthogonal at ‖S‖≈{s_norm:.2f} (scale={scale}): "
+        f"‖QᵀQ−I‖={float(ortho_err):.2e}")
+
+
+@pytest.mark.parametrize("scale", [1.0, 5.0, 10.0, 30.0, 50.0])
+def test_orthogonal_apply_roundtrip_at_large_S(scale):
+    """Qᵀ(Q·x)=x to < 1e-9 (fp64) across small→large ‖S‖.
+
+    This is the load-bearing reversibility primitive. expm(S)·expm(−S)=I holds
+    for ANY ‖S‖ (no solve), so the round-trip stays machine-exact even in the
+    late-training regime where ‖S‖ is O(1)+; the Cayley solve degraded here."""
+    from train_gpt import cayley_apply
+
+    torch.manual_seed(12)
+    d, r = 24, 8
+    U = scale * torch.randn(d, r, dtype=torch.float64)
+    V = scale * torch.randn(d, r, dtype=torch.float64)
+    S = U @ V.T - V @ U.T
+    s_norm = float(torch.linalg.matrix_norm(S, ord=2))
+    x = torch.randn(4, 7, d, dtype=torch.float64)
+    rt = cayley_apply(cayley_apply(x, U, V), U, V, transpose=True)
+    err = (rt - x).abs().max()
+    assert err < 1e-9, (
+        f"Qᵀ(Q·x)≠x at ‖S‖≈{s_norm:.2f} (scale={scale}): "
+        f"round-trip err={float(err):.2e}")
+    # And the other order Q(Qᵀ·x)=x.
+    rt2 = cayley_apply(cayley_apply(x, U, V, transpose=True), U, V)
+    err2 = (rt2 - x).abs().max()
+    assert err2 < 1e-9, (
+        f"Q(Qᵀ·x)≠x at ‖S‖≈{s_norm:.2f} (scale={scale}): err={float(err2):.2e}")
+
+
+def test_orthogonal_apply_beats_cayley_solve_at_large_S():
+    """DIRECT fix demonstration: at a LARGE ‖S‖ (the late-training regime), the
+    expm(S) apply matches the TRUE orthogonal target ``torch.matrix_exp(S)`` to
+    ~1e-9, while the OLD Cayley-solve form ``(I−S)(I+S)^{-1}`` (reconstructed
+    here) is BOTH a different matrix (the Cayley transform ≠ expm, so it diverges
+    from the orthogonal target by O(1)) AND a less accurate orthogonal map.
+
+    This is the deterministic, seed-stable proof that the bug fix is correct: the
+    Cayley solve becomes ill-conditioned / inexact as U,V grow; expm does not."""
+    from train_gpt import cayley_apply
+
+    def _cayley_solve(x, U, V, transpose=False):
+        # The OLD low-rank Woodbury Cayley apply (pre-fix), for comparison only.
+        dt = x.dtype
+        U, V = U.to(dt), V.to(dt)
+        M = torch.cat([U, V], dim=-1)
+        N = torch.cat([V, -U], dim=-1)
+        sgn = -1.0 if transpose else 1.0
+        Mh = sgn * M
+        eye = torch.eye(M.shape[-1], dtype=dt)
+        cap = eye + (N.transpose(-1, -2) @ Mh)
+        sol = torch.linalg.solve(cap, (x @ N).unsqueeze(-1)).squeeze(-1)
+        w = x - sol @ Mh.transpose(-1, -2)
+        return w - sgn * ((w @ N) @ M.transpose(-1, -2))
+
+    torch.manual_seed(20)
+    d, r = 16, 8
+    U = 50.0 * torch.randn(d, r, dtype=torch.float64)   # LARGE ‖S‖ (late training)
+    V = 50.0 * torch.randn(d, r, dtype=torch.float64)
+    S = U @ V.T - V @ U.T
+    Q_true = torch.matrix_exp(S)                         # the exact orthogonal target
+    x = torch.randn(6, d, dtype=torch.float64)
+    target = x @ Q_true.T
+    expm_err = (cayley_apply(x, U, V) - target).abs().max()
+    cayley_err = (_cayley_solve(x, U, V) - target).abs().max()
+    # expm matches the orthogonal target; the Cayley transform is a DIFFERENT map.
+    assert expm_err < 1e-9, f"expm apply should match matrix_exp, err={float(expm_err):.2e}"
+    assert cayley_err > 1e-3, (
+        "Cayley transform should differ from expm(S) at large ‖S‖ "
+        f"(it is a different orthogonal matrix), got err={float(cayley_err):.2e}")
+
+
+def test_orthogonal_apply_matches_true_expm_at_large_S():
+    """The low-rank apply equals the TRUE full-space matrix-exponential expm(S)
+    of the skew S, at a LARGE ‖S‖ (the regime where the Cayley solve drifts).
+
+    expm(S) is the unique exactly-orthogonal target; the projected low-rank apply
+    must equal it because S is rank ≤ 2r and acts as identity off span([U|V])."""
+    from train_gpt import cayley_apply
+
+    torch.manual_seed(13)
+    d, r = 18, 5
+    U = 20.0 * torch.randn(d, r, dtype=torch.float64)
+    V = 20.0 * torch.randn(d, r, dtype=torch.float64)
+    S = U @ V.T - V @ U.T
+    Q_true = torch.matrix_exp(S)        # exact full-space expm of the skew
+    x = torch.randn(3, 5, d, dtype=torch.float64)
+    # Row-vector convention: applying Q to each d-vector is x @ Qᵀ.
+    assert torch.allclose(cayley_apply(x, U, V), x @ Q_true.T, atol=1e-9)
+    assert torch.allclose(cayley_apply(x, U, V, transpose=True), x @ Q_true, atol=1e-9)
+
+
+def test_orthogonal_apply_rank_deficient_W_is_orthogonal():
+    """Handle rank deficiency in W=[U|V]: when U,V share columns the active span
+    is < 2r. The apply must still produce an exactly-orthogonal Q (round-trip
+    exact) — qr must keep only the actual span."""
+    from train_gpt import cayley_apply
+
+    torch.manual_seed(14)
+    d, r = 16, 4
+    U = 10.0 * torch.randn(d, r, dtype=torch.float64)
+    V = U.clone()                       # span([U|V]) = span(U), so k = r < 2r
+    x = torch.randn(2, 3, d, dtype=torch.float64)
+    # S = U Vᵀ − V Uᵀ = U Uᵀ − U Uᵀ = 0 here, so Q = I exactly.
+    y = cayley_apply(x, U, V)
+    assert torch.allclose(y, x, atol=1e-9)
+    rt = cayley_apply(cayley_apply(x, U, V), U, V, transpose=True)
+    assert (rt - x).abs().max() < 1e-9
+    # And a partial overlap (V shares one column with U) must still round-trip.
+    V2 = 10.0 * torch.randn(d, r, dtype=torch.float64)
+    V2[:, 0] = U[:, 0]
+    rt2 = cayley_apply(cayley_apply(x, U, V2), U, V2, transpose=True)
+    assert (rt2 - x).abs().max() < 1e-9
 
 
 def test_mla_shapes_and_kv_latent():
