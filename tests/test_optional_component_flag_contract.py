@@ -105,12 +105,18 @@ def _ast_has_field_true(tree: ast.AST, field: str) -> bool:
 
 
 def _collect_test_sources() -> list[tuple[str, ast.AST]]:
-    """Parse every `test_*.py` under tests/ and experiments/ exactly once and
-    return (source, ast) pairs. Cached at module scope so the contract test
-    over N registry entries is O(files) rather than O(N · files)."""
+    """Parse every `test_*.py` under tests/, experiments/, and legacy/tests/
+    exactly once and return (source, ast) pairs. Cached at module scope so the
+    contract test over N registry entries is O(files) rather than O(N · files).
+
+    legacy/tests/ is included because `_OPTIONAL_COMPONENT_FLAGS` is sourced
+    from the rich model (legacy/train_gpt_rich.py) and its flag-effect witness
+    tests were archived to legacy/tests/ in the 2026-06-06 reorg (ADR 0003).
+    The Phase-B contract port will re-point both the registry and this scan at
+    the active M0 model + tests/."""
     pairs: list[tuple[str, ast.AST]] = []
     self_name = Path(__file__).name
-    for d in (REPO_ROOT / "tests", REPO_ROOT / "experiments"):
+    for d in (REPO_ROOT / "tests", REPO_ROOT / "experiments", REPO_ROOT / "legacy" / "tests"):
         if not d.exists():
             continue
         for path in d.rglob("test_*.py"):

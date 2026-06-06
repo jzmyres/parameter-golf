@@ -2,8 +2,9 @@
 
 Concise working ledger for active research decisions. Detailed historical
 entries and raw evidence are preserved in
-[`experiments/docs/hypotheses_archive.md`](./hypotheses_archive.md). Operational
-protocol and failure-mode details live in [`EXPERIENCE.md`](../../EXPERIENCE.md).
+[`legacy/docs/hypotheses_archive.md`](../../legacy/docs/hypotheses_archive.md)
+(archived in the 2026-06-06 reorg; ADR 0003). Operational protocol and
+failure-mode details live in [`EXPERIENCE.md`](../../EXPERIENCE.md).
 
 Use this file for:
 - what was tested,
@@ -53,6 +54,31 @@ CUDA_VISIBLE_DEVICES=6,7 SEQ_LEN=16 ITERATIONS=1000 RUN_TAG=gpu67_seq16_i1000 ba
 # Full feedback-stage executable coverage; S+1/S+2/S+3 are diagnostics only.
 CUDA_VISIBLE_DEVICES=6,7 ITERATIONS=1000 RUN_TAG=gpu67_feedback_all_i1000 bash experiments/run_feedback_stage_pipeline.sh
 ```
+
+## M0 Recurrent-Depth Optimization + Repo Reorg (2026-06-06)
+
+**M0 half-LR LR-promotion verification (VERIFIED).** GPUs 6/7 DDP, 600 steps,
+`k_set={32,64}`, `--k-eval-sweep 4..256`, `--depth-sweep-every 200`. The halved
+LR defaults (`matrix 0.01 / embed 0.05 / scalar 0.01`) restore monotone training
+and **all two-goal eval metrics improve over training**: `val_bpb` 2.13→**1.83**,
+`I_V`(K=64) 3.49→**4.18 bits**, `phi_eval` 0.095→**0.116**, `depth_gain_GT`
+0.258→**0.324**, `iv_total_bits` 0.62→**0.80**, `recon_rel`=**0** throughout,
+`peak_vram` flat (~30.5 GB), `expert_util`≈2.7. **Depth extrapolation:** `I_V(K)`
+peaks at the trained max K=64 (4.18) and *declines* at K=128/256 (4.12/4.00) — the
+finite-horizon signature (no test-time extrapolation by design); full-range
+`expressiveness_rho=0.5357` reflects this dip, in-range (K≤64) ρ≈1.0. Frozen
+evidence: [`results/2026-06-06_m0_halflr_extrapolation/`](../../results/2026-06-06_m0_halflr_extrapolation/summary.md).
+
+**Repo reorg (ADR 0003).** Single `legacy/` archive established; `experiments/`
+made test-free (active tests → `tests/`, rich tests → `legacy/tests/`);
+`experiments/components/` → `legacy/components/`; `train_gpt_mlx.py`,
+`results.tsv`, `RUN_RESULTS.md`, `hypotheses_archive.md`,
+`iter103_chained_routing_plan.md`, `docs/superpowers/`, `advisor_progress_*` →
+`legacy/`. Active suite **470 passed**, audit gate **19 passed**.
+**Phase-B follow-up (open):** the test/contract/audit layer still validates the
+rich model — 17 of 26 `tests/` files (incl. 2 mandated audit-registry tests)
+import `legacy.train_gpt_rich`, and M0 has only ~5 unit tests. Port the
+contracts + audit registry to `train_gpt.py` (M0) and archive the rich versions.
 
 ## Current Feedback-Stage Verification (2026-06-04)
 

@@ -14,6 +14,7 @@ P1_FEEDBACK_PIPELINE = ROOT / "experiments" / "run_feedback_stage_pipeline.sh"
 CLAUDE = ROOT / "CLAUDE.md"
 EXPERIENCE = ROOT / "EXPERIENCE.md"
 EXPERIMENT_DOCS = ROOT / "experiments" / "docs"
+LEGACY_DOCS = ROOT / "legacy" / "docs"
 
 
 def _hot_path_body(text: str) -> str:
@@ -341,11 +342,13 @@ class TestTrainingContracts(unittest.TestCase):
         self.assertNotIn("chained_stages_preset", train)
 
     def test_experiment_docs_are_canonical(self) -> None:
+        # Canonical ACTIVE experiment docs. The superseded research history
+        # (hypotheses_archive.md, iter103_chained_routing_plan.md) was archived
+        # to legacy/docs/ in the 2026-06-06 repo reorg; see ADR 0003.
         expected_docs = [
             "README.md",
             "hypotheses.md",
-            "hypotheses_archive.md",
-            "iter103_chained_routing_plan.md",
+            "recurrent_depth_baselines.md",
         ]
         for name in expected_docs:
             doc_path = EXPERIMENT_DOCS / name
@@ -356,6 +359,17 @@ class TestTrainingContracts(unittest.TestCase):
             self.assertGreaterEqual(
                 len(body), 200,
                 f"{name} too short ({len(body)} chars) — likely truncated",
+            )
+        # The archived research history must live under legacy/docs/, not the
+        # active experiments/docs/ tree.
+        for name in ["hypotheses_archive.md", "iter103_chained_routing_plan.md"]:
+            self.assertTrue(
+                (LEGACY_DOCS / name).exists(),
+                f"archived doc missing from legacy/docs/: {name}",
+            )
+            self.assertFalse(
+                (EXPERIMENT_DOCS / name).exists(),
+                f"archived doc still in active experiments/docs/: {name}",
             )
         for old_path in [
             ROOT / "experiments" / "hypotheses.md",
@@ -418,11 +432,11 @@ class TestTrainingContracts(unittest.TestCase):
             CLAUDE,
             EXPERIENCE,
             OPG_DOC,
-            ROOT / "experiments" / "components" / "README.md",
+            ROOT / "legacy" / "components" / "README.md",
             EXPERIMENT_DOCS / "README.md",
             EXPERIMENT_DOCS / "hypotheses.md",
-            EXPERIMENT_DOCS / "hypotheses_archive.md",
-            EXPERIMENT_DOCS / "iter103_chained_routing_plan.md",
+            LEGACY_DOCS / "hypotheses_archive.md",
+            LEGACY_DOCS / "iter103_chained_routing_plan.md",
         ]
         for path in checked_files:
             text = path.read_text()

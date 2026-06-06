@@ -1,0 +1,114 @@
+# Frozen metric lines — 2026-06-06 M0 half-LR DDP smoke (GPUs 6,7; 600 steps; k_set {32,64}; sweep K={4,8,16,32,64,128,256}; depth-sweep-every 200)
+# Source: background-task stdout (ephemeral /tmp); frozen here per committed-report tracked-evidence rule.
+
+=== SMOKE: half-LR DDP, EXTRAPOLATION sweep (K=128,256 > trained 64) + PERIODIC tracking ===
+step:1/600 k_hi:64 train_loss:6.9615 lambda_route:1.000e-03
+metrics: erank:635.7512 peak_vram:28301.0024 kv_bytes:768 params:9666338 router_entropy:2.4337 expert_util:2.7720 route_step_div:0.0453 expert_cos_div:0.9991 disp_tail:0.0235 recon_rel:0.00e+00 ops:tok_per_s:11954.2314 ops:vram_util_pct:34.9232 diag:active_frac:1.0000
+step:2/600 k_hi:64 train_loss:7.0020 lambda_route:1.000e-03
+metrics: erank:620.1984 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:2.1840 expert_util:2.7414 route_step_div:0.0421 expert_cos_div:0.9991 disp_tail:0.0204 recon_rel:0.00e+00 ops:tok_per_s:12602.5167 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:3/600 k_hi:32 train_loss:6.6477 lambda_route:1.000e-03
+metrics: erank:611.8615 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:2.1047 expert_util:2.7306 route_step_div:0.0699 expert_cos_div:0.9991 disp_tail:0.0355 recon_rel:0.00e+00 ops:tok_per_s:24492.9235 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:50/600 k_hi:64 train_loss:4.5904 lambda_route:1.000e-03
+metrics: erank:598.5038 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:1.0840 expert_util:2.6425 route_step_div:0.0304 expert_cos_div:0.9984 disp_tail:0.0184 recon_rel:0.00e+00 ops:tok_per_s:12614.5804 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:100/600 k_hi:32 train_loss:4.3505 lambda_route:1.000e-03
+metrics: erank:594.3981 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:1.0504 expert_util:2.6815 route_step_div:0.0650 expert_cos_div:0.9984 disp_tail:0.0349 recon_rel:0.00e+00 ops:tok_per_s:24512.2573 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:100/600 val_loss:4.1959 val_bpb:2.5140
+step:150/600 k_hi:32 train_loss:3.7496 lambda_route:1.000e-03
+metrics: erank:587.1369 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:1.1086 expert_util:2.7017 route_step_div:0.0648 expert_cos_div:0.9969 disp_tail:0.0350 recon_rel:0.00e+00 ops:tok_per_s:24513.9070 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:200/600 k_hi:64 train_loss:3.6449 lambda_route:1.000e-03
+metrics: erank:578.4828 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:1.0974 expert_util:2.6637 route_step_div:0.0342 expert_cos_div:0.9968 disp_tail:0.0185 recon_rel:0.00e+00 ops:tok_per_s:12611.4011 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:200/600 val_loss:3.5478 val_bpb:2.1307
+step:200 depth_sweep: K=4 val_bpb:2.5235 val_loss:4.1966
+step:200 depth_sweep: K=8 val_bpb:2.3139 val_loss:3.8481
+step:200 depth_sweep: K=16 val_bpb:2.1955 val_loss:3.6512
+step:200 depth_sweep: K=32 val_bpb:2.1451 val_loss:3.5674
+step:200 depth_sweep: K=64 val_bpb:2.1389 val_loss:3.5571
+step:200 depth_sweep: K=128 val_bpb:2.1750 val_loss:3.6171
+step:200 depth_sweep: K=256 val_bpb:2.2653 val_loss:3.7672
+step:200 depth_gain_GT:0.2582
+step:200 phi_eval:0.0950  # EVAL-K proxy (NOT phi_isodepth)
+step:200 usable_info: K=4 iv_bits:2.5718 val_loss:4.1966
+step:200 usable_info: K=8 iv_bits:3.0746 val_loss:3.8481
+step:200 usable_info: K=16 iv_bits:3.3586 val_loss:3.6512
+step:200 usable_info: K=32 iv_bits:3.4795 val_loss:3.5674
+step:200 usable_info: K=64 iv_bits:3.4944 val_loss:3.5571
+step:200 usable_info: K=128 iv_bits:3.4077 val_loss:3.6171
+step:200 usable_info: K=256 iv_bits:3.1912 val_loss:3.7672
+step:200 expressiveness_rho:0.5357
+step:200 iv_total_bits:0.6194
+step:250/600 k_hi:32 train_loss:3.4683 lambda_route:1.000e-03
+metrics: erank:569.0799 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:1.1929 expert_util:2.6914 route_step_div:0.0652 expert_cos_div:0.9968 disp_tail:0.0381 recon_rel:0.00e+00 ops:tok_per_s:24512.5096 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:300/600 k_hi:32 train_loss:3.3761 lambda_route:1.000e-03
+metrics: erank:560.2208 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:1.2778 expert_util:2.7047 route_step_div:0.0658 expert_cos_div:0.9969 disp_tail:0.0387 recon_rel:0.00e+00 ops:tok_per_s:24513.7090 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:300/600 val_loss:3.3716 val_bpb:2.0308
+step:350/600 k_hi:64 train_loss:3.3004 lambda_route:1.000e-03
+metrics: erank:556.3682 peak_vram:30459.9526 kv_bytes:768 params:9666338 router_entropy:1.3200 expert_util:2.6936 route_step_div:0.0343 expert_cos_div:0.9961 disp_tail:0.0193 recon_rel:0.00e+00 ops:tok_per_s:12612.6065 ops:vram_util_pct:37.5874 diag:active_frac:1.0000
+step:400/600 k_hi:64 train_loss:3.3702 lambda_route:1.000e-03
+metrics: erank:553.8369 peak_vram:30467.9526 kv_bytes:768 params:9666338 router_entropy:1.3399 expert_util:2.7045 route_step_div:0.0345 expert_cos_div:0.9978 disp_tail:0.0194 recon_rel:0.00e+00 ops:tok_per_s:12613.0172 ops:vram_util_pct:37.5972 diag:active_frac:1.0000
+step:400/600 val_loss:3.2672 val_bpb:1.9502
+step:400 depth_sweep: K=4 val_bpb:2.3565 val_loss:3.9149
+step:400 depth_sweep: K=8 val_bpb:2.1451 val_loss:3.5635
+step:400 depth_sweep: K=16 val_bpb:2.0413 val_loss:3.3911
+step:400 depth_sweep: K=32 val_bpb:2.0002 val_loss:3.3229
+step:400 depth_sweep: K=64 val_bpb:1.9949 val_loss:3.3141
+step:400 depth_sweep: K=128 val_bpb:2.0194 val_loss:3.3548
+step:400 depth_sweep: K=256 val_bpb:2.0787 val_loss:3.4533
+step:400 depth_gain_GT:0.2778
+step:400 phi_eval:0.0968  # EVAL-K proxy (NOT phi_isodepth)
+step:400 usable_info: K=4 iv_bits:2.9763 val_loss:3.9149
+step:400 usable_info: K=8 iv_bits:3.4832 val_loss:3.5635
+step:400 usable_info: K=16 iv_bits:3.7319 val_loss:3.3911
+step:400 usable_info: K=32 iv_bits:3.8303 val_loss:3.3229
+step:400 usable_info: K=64 iv_bits:3.8431 val_loss:3.3141
+step:400 usable_info: K=128 iv_bits:3.7844 val_loss:3.3548
+step:400 usable_info: K=256 iv_bits:3.6422 val_loss:3.4533
+step:400 expressiveness_rho:0.5357
+step:400 iv_total_bits:0.6659
+step:450/600 k_hi:64 train_loss:3.1921 lambda_route:1.000e-03
+metrics: erank:551.7587 peak_vram:30467.9526 kv_bytes:768 params:9666338 router_entropy:1.3363 expert_util:2.6972 route_step_div:0.0350 expert_cos_div:0.9987 disp_tail:0.0193 recon_rel:0.00e+00 ops:tok_per_s:12610.8628 ops:vram_util_pct:37.5972 diag:active_frac:1.0000
+step:500/600 k_hi:32 train_loss:3.2092 lambda_route:1.000e-03
+metrics: erank:550.4975 peak_vram:30467.9526 kv_bytes:768 params:9666338 router_entropy:1.4173 expert_util:2.7041 route_step_div:0.0671 expert_cos_div:0.9990 disp_tail:0.0390 recon_rel:0.00e+00 ops:tok_per_s:24513.6924 ops:vram_util_pct:37.5972 diag:active_frac:1.0000
+step:500/600 val_loss:3.1956 val_bpb:1.9129
+step:550/600 k_hi:64 train_loss:3.1747 lambda_route:1.000e-03
+metrics: erank:550.9103 peak_vram:30467.9526 kv_bytes:768 params:9666338 router_entropy:1.4351 expert_util:2.7062 route_step_div:0.0346 expert_cos_div:0.9996 disp_tail:0.0191 recon_rel:0.00e+00 ops:tok_per_s:12611.2945 ops:vram_util_pct:37.5972 diag:active_frac:1.0000
+step:600/600 k_hi:64 train_loss:3.1651 lambda_route:1.000e-03
+metrics: erank:550.3842 peak_vram:30467.9526 kv_bytes:768 params:9666338 router_entropy:1.3936 expert_util:2.7022 route_step_div:0.0345 expert_cos_div:0.9995 disp_tail:0.0189 recon_rel:0.00e+00 ops:tok_per_s:12610.9549 ops:vram_util_pct:37.5972 diag:active_frac:1.0000
+step:600/600 val_loss:3.0980 val_bpb:1.8657
+step:600 depth_sweep: K=4 val_bpb:2.2301 val_loss:3.7512
+step:600 depth_sweep: K=8 val_bpb:1.9988 val_loss:3.3621
+step:600 depth_sweep: K=16 val_bpb:1.8856 val_loss:3.1717
+step:600 depth_sweep: K=32 val_bpb:1.8405 val_loss:3.0958
+step:600 depth_sweep: K=64 val_bpb:1.8326 val_loss:3.0826
+step:600 depth_sweep: K=128 val_bpb:1.8531 val_loss:3.1170
+step:600 depth_sweep: K=256 val_bpb:1.9058 val_loss:3.2056
+step:600 depth_gain_GT:0.3244
+step:600 phi_eval:0.1142  # EVAL-K proxy (NOT phi_isodepth)
+step:600 usable_info: K=4 iv_bits:3.2132 val_loss:3.7512
+step:600 usable_info: K=8 iv_bits:3.7746 val_loss:3.3621
+step:600 usable_info: K=16 iv_bits:4.0492 val_loss:3.1717
+step:600 usable_info: K=32 iv_bits:4.1588 val_loss:3.0958
+step:600 usable_info: K=64 iv_bits:4.1777 val_loss:3.0826
+step:600 usable_info: K=128 iv_bits:4.1281 val_loss:3.1170
+step:600 usable_info: K=256 iv_bits:4.0003 val_loss:3.2056
+step:600 expressiveness_rho:0.5357
+step:600 iv_total_bits:0.7871
+final val_loss:3.0952 val_bpb:1.8280
+depth_sweep: K=4 val_bpb:2.2129 val_loss:3.7714
+depth_sweep: K=8 val_bpb:1.9842 val_loss:3.3817
+depth_sweep: K=16 val_bpb:1.8721 val_loss:3.1905
+depth_sweep: K=32 val_bpb:1.8269 val_loss:3.1136
+depth_sweep: K=64 val_bpb:1.8186 val_loss:3.0994
+depth_sweep: K=128 val_bpb:1.8379 val_loss:3.1323
+depth_sweep: K=256 val_bpb:1.8885 val_loss:3.2186
+depth_gain_GT:0.3243
+phi_eval:0.1158  # EVAL-K proxy (NOT phi_isodepth)
+usable_info: K=4 iv_bits:3.2002 val_loss:3.7714
+usable_info: K=8 iv_bits:3.7624 val_loss:3.3817
+usable_info: K=16 iv_bits:4.0382 val_loss:3.1905
+usable_info: K=32 iv_bits:4.1491 val_loss:3.1136
+usable_info: K=64 iv_bits:4.1697 val_loss:3.0994
+usable_info: K=128 iv_bits:4.1222 val_loss:3.1323
+usable_info: K=256 iv_bits:3.9977 val_loss:3.2186
+expressiveness_rho:0.5357
+iv_total_bits:0.7975
+peak_vram_mb:30467

@@ -87,7 +87,7 @@ ITERATIONS=200 \
 TRAIN_BATCH_TOKENS=8192 \
 VAL_LOSS_EVERY=0 \
 VAL_BATCH_SIZE=8192 \
-python3 train_gpt_mlx.py
+python3 legacy/train_gpt_mlx.py
 ```
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
@@ -201,7 +201,7 @@ Non-record submissions should be made in the same fashion as SOTA records, as de
 
 #### PRs on Core Code
 
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but the best models should stay in the `/records` folder.
+The `train_gpt.py` and `legacy/train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but the best models should stay in the `/records` folder.
 
 ## Support
 

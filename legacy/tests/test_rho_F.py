@@ -28,7 +28,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from experiments.test_arch import _make_model
+from legacy.tests.test_arch import _make_model
 from legacy.train_gpt_rich import _rho_F_at_saved_fp, _sigma_max_F_at_saved_fp
 
 

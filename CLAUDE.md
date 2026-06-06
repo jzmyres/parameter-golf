@@ -9,7 +9,7 @@ This file is the **single binding directive** for working in this repo, and a th
 ## Project Invariants
 
 - **Challenge constraints.** Artifact ≤ 16,000,000 bytes; submission training fits the 600 s 8xH100 budget. Details: [`EXPERIENCE.md#project-constraints`](EXPERIENCE.md#project-constraints).
-- **No hard line cap on the research `train_gpt.py`.** The upstream ≤1500-line note in `train_gpt_mlx.py` targets a newcomer *reference*; the OPG research model carries the mandated resource/expressiveness mechanisms (reversible recurrence, MLA, MoE, MoS) and is not line-capped. Keep it as lean as the design allows with mechanisms in clearly-bounded modules. User directive 2026-06-04.
+- **No hard line cap on the research `train_gpt.py`.** The upstream ≤1500-line note in `legacy/train_gpt_mlx.py` targets a newcomer *reference*; the OPG research model carries the mandated resource/expressiveness mechanisms (reversible recurrence, MLA, MoE, MoS) and is not line-capped. Keep it as lean as the design allows with mechanisms in clearly-bounded modules. User directive 2026-06-04.
 - **Scoped edits.** Default writable surface is `train_gpt.py`, focused tests, and project docs. Do not modify `data/`, tokenizer/eval harness code, `records/`, package manifests, or dependencies without explicit user approval.
 - **No new packages by default.** If approved, install with `uv pip install <pkg>` and update requirements in the same commit.
 - **DDP first.** Training code works under single GPU and `torchrun` DDP; GPU-count-specific paths use `world_size`.
@@ -50,11 +50,12 @@ This file is the **single binding directive** for working in this repo, and a th
 - Conda env: `conda activate opg`.
 - Dependencies: `requirements.txt`; authorized installs use `uv`, not `pip`.
 - Data is read-only: `./data/datasets/fineweb10B_sp1024/`; tokenizer: `./data/tokenizers/fineweb_1024_bpe.model`.
-- Model source: `train_gpt.py`; focused tests under `experiments/test_*.py` or `tests/`.
+- Model source: `train_gpt.py`; **all active unit tests live under `tests/`** (single home; `experiments/` is test-free). `experiments/` is the active research workspace: harnesses (`p1_synthetic`, `p1_feedback_stages`, `measure_phi`), plotting, runners, and `experiments/docs/`.
 - Research docs: `EXPERIENCE.md` for details/rationale, `experiments/docs/hypotheses.md` for claims/results, `reports/opg_doc.tex` for paper-facing text.
-- Runtime outputs untracked unless promoted: `run.log`, `results.tsv`, `experiments/training_logs/*`, `experiments/weights/*`, `experiments/checkpoints/*`.
+- **Repo organization (ADR 0003).** Single `legacy/` archive holds ALL deprecated/non-active code, tests, docs, reports (incl. `legacy/train_gpt_rich.py`, `legacy/train_gpt_mlx.py`, `legacy/components/`, `legacy/tests/`, `legacy/results.tsv`, `legacy/RUN_RESULTS.md`). Invariant: **anything outside `legacy/` is actively used**; active code must NOT import from `legacy/` (legacy may import active modules). `legacy/` is not collected by default pytest.
+- **Run evidence lives in `results/<date>_<tag>/`** (tracked `summary.md` + `run_metrics.txt`): the durable home a committed citation must resolve to. Training logs (`run.log`, `experiments/training_logs/*`, `experiments/weights/*`, `experiments/checkpoints/*`) stay gitignored/ephemeral; freeze a snapshot into `results/` before citing numbers. The M0 promotion ledger is `experiments/docs/hypotheses.md` (the rich-era `results.tsv` is archived in `legacy/`).
 - Optional debug plotting via `auto_plot_on_val=True` (default): refreshes `experiments/*.png` per validation via `experiments/plotting_hook.py` (rank-0 only; silent no-op if matplotlib or `experiments/plot_*.py` modules are absent).
-- Historical submissions in `records/` are read-only.
+- **`records/` is the official submission archive — read-only, and NOT `legacy/`.** It preserves shipped competition submissions (deliverables), a distinct concept from `legacy/` (deprecated dev code). Never move `records/` into `legacy/` or modify it without explicit approval.
 - External baseline references live in the `baselines/` workspace (pinned manifest + smoke scripts) and are catalogued in `experiments/docs/recurrent_depth_baselines.md` (RevDEQ, RevFFN, MoEUT, ReMoE, Universal Transformer, Parcae, Iso-Depth/φ, etc.). The former local `/home/mzhong4/work/research/{rdeq,tsu}/...` reference paths are gone; do not cite them.
 - `baselines/` is the external recurrent-depth replication workspace (pinned manifest + fetch/smoke scripts + docs). Heavy/regenerable subtrees (`worktrees/`, `runs/`, `.envs/`) are gitignored; commit only manifest+scripts+docs and verify with `git add -An`. See [`EXPERIENCE.md#vendored-workspace-hygiene`](EXPERIENCE.md#vendored-workspace-hygiene). `CONTEXT.md` holds cross-iteration baseline vocabulary; per-baseline inventory is `experiments/docs/recurrent_depth_baselines.md`.
 
@@ -175,7 +176,7 @@ Full environment, file, logging, and plotting details: [`EXPERIENCE.md#environme
 
 ## Research Protocol
 
-- **Setup discipline.** Read branch state, recent commits, `results.tsv`, `run.log`, and relevant hypothesis entries before changing code.
+- **Setup discipline.** Read branch state, recent commits, `experiments/docs/hypotheses.md`, `results/` snapshots, and relevant hypothesis entries before changing code.
 - **One focused change per iteration.** A clean hypothesis needs a single controlled variable unless explicitly testing a bundle.
 - **TDD for architecture.** Add or update focused tests first when feasible — shape, gradients through FP, quantization roundtrip, DDP, artifact size.
 - **30-iter smoke gate before every full run.** ALWAYS run a ≥30-iteration smoke first and confirm it is *correctly performing* before launching the full rigorous run — never go straight to the long run. "Correctly performing" means **consistent, effective improvement across ALL eval metrics for both goals** — not just the metric the change targets, and not just "loss went down". Expressiveness: `val_bpb`↓, depth-gain `G_T`/`phi`↑, `erank` healthy, `disp_tail` non-decaying. Resource: `peak_vram`/`R_act` flat in recurrent depth, VRAM-vs-batch slope flat (improve, or hold at target for flat-goal metrics). Plus finite grads, no NaN/Inf, healthy routing. **A regression in ANY eval metric fails the gate.** A full run is justified only after the gate passes; if any metric regresses or the fix does not show, iterate on the fix — do not spend the full run. Reconstruction-near-precision only expected in full-BPTT smoke.

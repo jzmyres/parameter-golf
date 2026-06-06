@@ -1952,7 +1952,7 @@ def encode_scored_artifact(
         "codec": codec,
     }
     if use_grouped_artifact_compression:
-        from experiments.components.artifact_compression import grouped_compress_int6_payload
+        from legacy.components.artifact_compression import grouped_compress_int6_payload
         grouped_compressed, grouped_stats = grouped_compress_int6_payload(
             qsd, meta, compressor=_COMPRESSOR,
         )
@@ -3730,7 +3730,7 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.rope_dim, base=rope_base)
         self.gate_bias = nn.Parameter(torch.zeros(num_experts * num_heads, dtype=torch.float32))
         if self.use_sparse_attn_head_gate:
-            from experiments.components.sparse_attn_head_gate import SparseAttnHeadGate
+            from legacy.components.sparse_attn_head_gate import SparseAttnHeadGate
             self.sparse_attn_head_gate = SparseAttnHeadGate(
                 num_heads=num_experts * num_heads,
                 gate_window=int(sparse_attn_gate_window),
@@ -3871,7 +3871,7 @@ class CausalSelfAttention(nn.Module):
                 sliding_window_size=self.nsa_sliding_window_size,
             )
         elif self.use_rr_attention:
-            from experiments.components.rr_attention import rr_attention
+            from legacy.components.rr_attention import rr_attention
             k_use, v_use = k_full, v_full
             if H_kv != H:
                 rep = H // H_kv
@@ -4055,7 +4055,7 @@ class MLP(nn.Module):
             and h.shape[2] <= 128       # R_PAD register-pressure bound
             and E <= 64
         ):
-            from experiments.components.fused_routed_down import fused_routed_down
+            from legacy.components.fused_routed_down import fused_routed_down
             if S > 0 and shared_gate is not None:
                 num_routed = E - S
                 w_combined = torch.empty(N, E, dtype=h.dtype, device=h.device)
@@ -4572,7 +4572,7 @@ class Block(nn.Module):
         self._shared_gate_diag_step: int | None = None
 
         if self.expert_slots > 1 or self.expert_slot_order != "parallel":
-            from experiments.components.expert_layout import ExpertSlotStack, make_uniform_expert_layout
+            from legacy.components.expert_layout import ExpertSlotStack, make_uniform_expert_layout
 
             self.expert_stack = ExpertSlotStack(
                 dim=dim,
@@ -5906,7 +5906,7 @@ class GPT(nn.Module):
         self.use_smear_gate = bool(use_smear_gate)
         self.smear_gate_bos_id = int(smear_gate_bos_id)
         if self.use_smear_gate:
-            from experiments.components.smear_gate import SmearGate
+            from legacy.components.smear_gate import SmearGate
             self.smear_gate = SmearGate(
                 dim=model_dim,
                 window=int(smear_gate_window),
@@ -7852,7 +7852,7 @@ def _validate_hyperparameters(args) -> None:
     # last in the rr block so the more specific divisibility errors fire first
     # when both conditions are violated.
     if bool(getattr(args, "use_rr_attention", False)):
-        from experiments.components.rr_attention import _RR_MAX_TOKEN_MASK_TOKENS
+        from legacy.components.rr_attention import _RR_MAX_TOKEN_MASK_TOKENS
         rr_T_cap = int(_RR_MAX_TOKEN_MASK_TOKENS)
         if int(getattr(args, "train_seq_len", 1)) > rr_T_cap:
             raise SystemExit(
@@ -7955,13 +7955,13 @@ def main() -> None:
     )
     # iter 118a Phase A3: fused routed-down kernel toggle. Same pattern.
     _set_unified_routed_down(getattr(args, "use_unified_routed_down", False))
-    from experiments.components.artifact_compression import set_grouped_artifact_compression_enabled
-    from experiments.components.caseops_tokenizer import set_caseops_enabled
-    from experiments.components.gptq_lqer import set_gptq_lqer_enabled
-    from experiments.components.phased_ttt import set_ttt_eval_enabled
-    from experiments.components.rr_attention import set_rr_attention
-    from experiments.components.smear_gate import set_smear_gate_enabled
-    from experiments.components.sparse_attn_head_gate import set_sparse_attn_head_gate_enabled
+    from legacy.components.artifact_compression import set_grouped_artifact_compression_enabled
+    from legacy.components.caseops_tokenizer import set_caseops_enabled
+    from legacy.components.gptq_lqer import set_gptq_lqer_enabled
+    from legacy.components.phased_ttt import set_ttt_eval_enabled
+    from legacy.components.rr_attention import set_rr_attention
+    from legacy.components.smear_gate import set_smear_gate_enabled
+    from legacy.components.sparse_attn_head_gate import set_sparse_attn_head_gate_enabled
     set_smear_gate_enabled(
         getattr(args, "use_smear_gate", False),
         window=getattr(args, "smear_gate_window", 12),

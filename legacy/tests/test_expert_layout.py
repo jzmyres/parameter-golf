@@ -16,7 +16,7 @@ def _classes():
 
 
 def test_uniform_expert_layout_preserves_slot_counts():
-    from experiments.components.expert_layout import make_uniform_expert_layout
+    from legacy.components.expert_layout import make_uniform_expert_layout
 
     slots = make_uniform_expert_layout(
         experts_per_slot=4,
@@ -31,7 +31,7 @@ def test_uniform_expert_layout_preserves_slot_counts():
 
 
 def test_uniform_expert_layout_applies_shared_experts_per_slot():
-    from experiments.components.expert_layout import make_uniform_expert_layout
+    from legacy.components.expert_layout import make_uniform_expert_layout
 
     slots = make_uniform_expert_layout(
         experts_per_slot=4,
@@ -95,7 +95,7 @@ class _IdentityNorm(nn.Module):
 
 
 def _make_fake_stack(order: str):
-    from experiments.components.expert_layout import ExpertSlotStack, make_uniform_expert_layout
+    from legacy.components.expert_layout import ExpertSlotStack, make_uniform_expert_layout
 
     return ExpertSlotStack(
         dim=8,
@@ -137,7 +137,7 @@ def test_attn_mlp_slot_order_feeds_mlp_the_attention_updated_state():
 
 
 def test_expert_slot_stack_forward_backward_for_4x4_layout():
-    from experiments.components.expert_layout import ExpertSlotStack, make_uniform_expert_layout
+    from legacy.components.expert_layout import ExpertSlotStack, make_uniform_expert_layout
 
     soft_router, attn_cls, mlp_cls, norm_cls = _classes()
     stack = ExpertSlotStack(

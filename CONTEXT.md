@@ -33,6 +33,9 @@ iteration ledger entry. Operational rules remain in `CLAUDE.md` and
 | Expert Slot Order | The within-slot ordering of attention and MLP expert updates: parallel, attention then MLP, or MLP then attention. |
 | Exact Multi-Depth Cache | Autoregressive inference cache that preserves each recurrent depth's token states or K/V tensors. It is the exact finite-horizon cache policy and is expected to scale linearly with recurrent depth. |
 | Terminal Hidden-State Cache | The first constant-KV candidate: store previous tokens' terminal `z_K` state, or K/V derived from that state, and measure quality gap against the exact multi-depth cache. |
+| Legacy Archive | `legacy/`, the single folder for all deprecated / non-active code, tests, docs, and reports (incl. the rich `train_gpt_rich.py`). Invariant: anything *outside* `legacy/` is actively used; active code never imports from `legacy/` (but `legacy/` may import active modules). Distinct from `records/`/`baselines/`, which are read-only *reference* archives, not deprecated code. See ADR 0003. |
+| Active Tree | Everything outside `legacy/`, `records/`, `baselines/`, and `data/`: code/docs/tests in current use. `train_gpt.py` (M0) is at root; `experiments/` is the active research workspace (harnesses, plotting, research docs) and is test-free; `tests/` is the single home for active unit tests. |
+| Run Evidence Snapshot | `results/<date>_<tag>/` — a tracked, frozen record of a run's config + metrics (`summary.md` + `run_metrics.txt`). The durable home a committed citation must resolve to, since training logs are gitignored and background-run stdout is ephemeral. See ADR 0003. |
 
 ## Current Comparison Question
 

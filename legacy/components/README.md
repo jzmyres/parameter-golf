@@ -44,7 +44,7 @@ For a new component `foo.py`:
    - A test in `experiments/test_foo.py` that runs CPU-only where possible.
 2. **Test the component** standalone (CPU first, GPU when free).
 3. **Wire into `train_gpt.py`** by adding three things:
-   - `from experiments.components.foo import set_foo_enabled, foo_helper`
+   - `from legacy.components.foo import set_foo_enabled, foo_helper`
    - `Hyperparameters.use_foo = False` field + `--use-foo` CLI flag.
    - In `main()`: `set_foo_enabled(args.use_foo)` BEFORE model construction.
    - In the consumer (`Block.forward`, `MLP.forward`, etc.): conditional

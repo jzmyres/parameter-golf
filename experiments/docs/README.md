@@ -15,12 +15,11 @@ code or launching training.
   they are separate later-stage diagnostics and do not widen the P1 runner.
   Dense-MoE/Parcae/RevDEQ queue material in that file is legacy evidence unless
   explicitly pulled forward by `reports/opg_doc.tex`.
-- `hypotheses_archive.md` preserves historical records and long-form evidence
-  that no longer belongs in the active ledger.
 - `recurrent_depth_baselines.md` summarizes external recurrent-depth baselines
   and points to `baselines/` for source pins and replication status.
-- `iterNNN_*.md` files are focused design or implementation plans for a single
-  iteration.
+- Historical long-form evidence (`hypotheses_archive.md`) and superseded
+  per-iteration plans (`iterNNN_*.md`) were archived to `legacy/docs/` in the
+  2026-06-06 reorg (ADR 0003); they no longer live in this active tree.
 
 Keep generated artifacts outside this directory. Checkpoints, logs, plots,
 weights, and smoke outputs stay in their existing `experiments/` subfolders.

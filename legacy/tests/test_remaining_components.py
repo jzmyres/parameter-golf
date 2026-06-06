@@ -41,7 +41,7 @@ def _tiny_gpt(**overrides):
 
 
 def test_smear_gate_component_identity_and_bos_mask():
-    from experiments.components.smear_gate import SmearGate
+    from legacy.components.smear_gate import SmearGate
 
     torch.manual_seed(0)
     gate = SmearGate(dim=8, window=4, bos_id=1)
@@ -56,7 +56,7 @@ def test_smear_gate_component_identity_and_bos_mask():
 
 
 def test_sparse_attn_head_gate_component_identity():
-    from experiments.components.sparse_attn_head_gate import SparseAttnHeadGate
+    from legacy.components.sparse_attn_head_gate import SparseAttnHeadGate
 
     gate = SparseAttnHeadGate(num_heads=6, gate_window=4, gate_factor=2.0)
     x = torch.randn(2, 3, 8)
@@ -65,7 +65,7 @@ def test_sparse_attn_head_gate_component_identity():
 
 
 def test_rr_attention_component_tau_one_matches_dense():
-    from experiments.components.rr_attention import rr_attention
+    from legacy.components.rr_attention import rr_attention
 
     torch.manual_seed(1)
     q = torch.randn(1, 4, 64, 8)
@@ -149,7 +149,7 @@ def test_use_reverse_kl_balance_output_differs():
 
 
 def test_ttt_component_smoke():
-    from experiments.components.phased_ttt import run_ttt_component_smoke
+    from legacy.components.phased_ttt import run_ttt_component_smoke
 
     stats = run_ttt_component_smoke(device="cpu")
     assert stats["before_norm"] == 0.0
@@ -158,7 +158,7 @@ def test_ttt_component_smoke():
 
 
 def test_gptq_lqer_component_smoke():
-    from experiments.components.gptq_lqer import run_gptq_lqer_component_smoke
+    from legacy.components.gptq_lqer import run_gptq_lqer_component_smoke
 
     stats = run_gptq_lqer_component_smoke(device="cpu", use_gptq=True, use_lqer=True, lqer_rank=2)
     assert stats["mse_after_lqer"] <= stats["mse_before_lqer"]
@@ -166,7 +166,7 @@ def test_gptq_lqer_component_smoke():
 
 
 def test_grouped_artifact_compression_schema_roundtrip():
-    from experiments.components.artifact_compression import grouped_compress_int6_payload
+    from legacy.components.artifact_compression import grouped_compress_int6_payload
 
     qsd = {
         "a.scale": torch.ones(2, dtype=torch.float16),
@@ -188,7 +188,7 @@ def test_grouped_artifact_compression_flag_changes_payload_layout():
     # The Hyperparameters construction here is the witness the contract test
     # looks for; the codec call below proves the path actually differs.
     from legacy.train_gpt_rich import Hyperparameters, _validate_hyperparameters
-    from experiments.components.artifact_compression import grouped_compress_int6_payload
+    from legacy.components.artifact_compression import grouped_compress_int6_payload
 
     cfg = Hyperparameters()
     cfg.use_grouped_artifact_compression = True
@@ -218,7 +218,7 @@ def test_grouped_artifact_compression_flag_changes_payload_layout():
 
 
 def test_caseops_component_roundtrip():
-    from experiments.components.caseops_tokenizer import encode_caseops_text, restore_caseops_text
+    from legacy.components.caseops_tokenizer import encode_caseops_text, restore_caseops_text
 
     encoded = encode_caseops_text("Parameter Golf Smoke")
     assert encoded.normalized == "parameter golf smoke"
