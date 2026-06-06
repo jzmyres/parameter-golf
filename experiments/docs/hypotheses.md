@@ -75,10 +75,16 @@ made test-free (active tests → `tests/`, rich tests → `legacy/tests/`);
 `results.tsv`, `RUN_RESULTS.md`, `hypotheses_archive.md`,
 `iter103_chained_routing_plan.md`, `docs/superpowers/`, `advisor_progress_*` →
 `legacy/`. Active suite **470 passed**, audit gate **19 passed**.
-**Phase-B follow-up (open):** the test/contract/audit layer still validates the
-rich model — 17 of 26 `tests/` files (incl. 2 mandated audit-registry tests)
-import `legacy.train_gpt_rich`, and M0 has only ~5 unit tests. Port the
-contracts + audit registry to `train_gpt.py` (M0) and archive the rich versions.
+
+**Phase B (done):** the 17 rich-model tests were archived to `legacy/tests/`;
+`tests/test_m0_contracts.py` now provides real M0 contract coverage
+(removal-symmetry ledger over `train_gpt.py` + `opg_doc.tex`, exact optimizer
+param partition, int6 roundtrip, doc-code consistency); the audit registry was
+re-pointed to `[test_m0_contracts, test_m0_hot_path_sync,
+test_enforcement_config_staged, test_audit_test_execution]`. Active suite **365
+passed**, audit gate **17 passed**. `reports/opg_doc.tex` gained the M0
+empirical-results section (over-training trend + per-K validation) and a
+consolidated model/training-hyperparameter table.
 
 ## Current Feedback-Stage Verification (2026-06-04)
 
